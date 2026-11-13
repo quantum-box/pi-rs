@@ -2500,6 +2500,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
             request_id,
             context_head,
             context_sha256,
+            ..
         } => {
             json!({"event": "model_requested", "request_id": request_id, "context_head": context_head, "context_sha256": context_sha256, "model": model, "messages": messages, "tools": tools, "max_output_tokens": max_output_tokens})
         }

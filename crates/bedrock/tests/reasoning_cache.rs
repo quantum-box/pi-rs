@@ -68,19 +68,21 @@ where
         socket.write_all(&events).await.unwrap();
         body
     });
-    let config = aws_sdk_bedrockruntime::Config::builder()
-        .behavior_version_latest()
-        .region(aws_sdk_bedrockruntime::config::Region::new(
-            region.to_owned(),
-        ))
-        .credentials_provider(aws_credential_types::Credentials::new(
-            "test", "secret", None, None, "test",
-        ))
+    let config = aws_types::SdkConfig::builder()
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .region(aws_types::region::Region::new(region.to_owned()))
+        .credentials_provider(
+            aws_credential_types::provider::SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new("test", "secret", None, None, "test"),
+            ),
+        )
         .endpoint_url(format!("http://{addr}"))
         .build();
-    let model = setup(Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(
-        config,
-    )));
+    let model = setup(Bedrock::from_sdk_config(config))
+        .prepare_bedrock()
+        .await
+        .unwrap()
+        .unwrap();
     let stream = if summary {
         model
             .stream_for_summary(Uuid::nil(), Uuid::nil(), request)

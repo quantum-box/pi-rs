@@ -1,0 +1,502 @@
+//! Protected identities for effective model configuration.
+use hmac::{Hmac, Mac};
+use serde::Serialize;
+use sha2::Sha256;
+
+/// Returns None if a protected persistent key cannot be established.
+pub fn protected_model_fingerprint<T: Serialize>(value: &T) -> Option<String> {
+    let key = protected_key()?;
+    fingerprint_with_key(&key, value)
+}
+
+fn fingerprint_with_key<T: Serialize>(key: &[u8; 32], value: &T) -> Option<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(&serde_json::to_vec(value).ok()?);
+    Some(format!("{:x}", mac.finalize().into_bytes()))
+}
+
+#[cfg(unix)]
+fn protected_key() -> Option<[u8; 32]> {
+    load_or_create_key(&key_path())
+}
+
+#[cfg(windows)]
+fn protected_key() -> Option<[u8; 32]> {
+    load_or_create_windows_key(&key_path())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protected_key() -> Option<[u8; 32]> {
+    // Do not persist a key without a verified owner-only storage mechanism.
+    None
+}
+
+#[cfg(all(any(unix, windows), not(test)))]
+fn key_path() -> std::path::PathBuf {
+    std::env::var_os("PI_RS_HOME")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| std::path::PathBuf::from(home).join(".pi-rs"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("pi-rs"))
+        .join("context-fingerprint.key")
+}
+
+#[cfg(all(any(unix, windows), test))]
+fn key_path() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| tempfile::tempdir().unwrap())
+        .path()
+        .join("context-fingerprint.key")
+}
+
+#[cfg(unix)]
+fn load_or_create_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    load_or_create_key_with_sync(path, |parent| std::fs::File::open(parent)?.sync_all())
+}
+
+#[cfg(unix)]
+fn load_or_create_key_with_sync(
+    path: &std::path::Path,
+    sync_directory: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Option<[u8; 32]> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)
+        .ok()?;
+    // SAFETY: geteuid takes no arguments and has no memory-safety preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    let secure = |metadata: &std::fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == effective_uid
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o077 == 0
+    };
+    if !secure(&lock.metadata().ok()?) {
+        return None;
+    }
+    lock.lock().ok()?;
+    let open_existing = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    let mut published_path = path.as_os_str().to_os_string();
+    published_path.push(".v3");
+    let published_path = std::path::PathBuf::from(published_path);
+    let read_key = |mut file: std::fs::File| {
+        let metadata = file.metadata().ok()?;
+        if !secure(&metadata) || metadata.len() != 32 {
+            return None;
+        }
+        let mut key = [0_u8; 32];
+        file.read_exact(&mut key).ok()?;
+        Some(key)
+    };
+    match open_existing(&published_path) {
+        Ok(file) => {
+            let key = read_key(file)?;
+            // A previous publisher may have failed after rename and before
+            // syncing the directory, so retry the sync before any key is used.
+            sync_directory(path.parent()?).ok()?;
+            return Some(key);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return None,
+    }
+    // Pre-release versions used different names and did not coordinate with
+    // this lock. Ignore those files, which may still be actively written.
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let mut temp_path = path.as_os_str().to_os_string();
+    temp_path.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp_path = std::path::PathBuf::from(temp_path);
+    struct RemoveTemp(std::path::PathBuf);
+    impl Drop for RemoveTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = RemoveTemp(temp_path.clone());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp_path)
+        .ok()?;
+    file.write_all(&key).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+    std::fs::rename(temp_path, published_path).ok()?;
+    sync_directory(path.parent()?).ok()?;
+    Some(key)
+}
+
+#[cfg(windows)]
+fn dpapi_transform(input: &[u8], protect: bool) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(input.len()).ok()?,
+        pbData: input.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input points to live bytes and output is a valid out parameter;
+    // optional pointers are null, and Windows allocates output for LocalFree.
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    if ok == 0 || output.pbData.is_null() {
+        return None;
+    }
+    // SAFETY: successful DPAPI calls return cbData initialized bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    // SAFETY: the output buffer is writable and must be released with LocalFree.
+    unsafe {
+        for index in 0..output.cbData as usize {
+            std::ptr::write_volatile(output.pbData.add(index), 0);
+        }
+        LocalFree(output.pbData.cast());
+    }
+    Some(bytes)
+}
+
+#[cfg(windows)]
+fn load_or_create_windows_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::io::{Read, Write};
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    // All readers and creators hold the same persistent lock. The OS releases
+    // it on process exit, including crashes; never unlink the lock file.
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    lock.lock().ok()?;
+    let read_key = |file: std::fs::File| {
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut encrypted = Vec::new();
+        file.take(65537).read_to_end(&mut encrypted).ok()?;
+        if encrypted.len() > 65536 {
+            return None;
+        }
+        dpapi_transform(&encrypted, false)?.try_into().ok()
+    };
+    // Never overwrite a published key: a DPAPI error may mean this process
+    // lacks access to another user's key, rather than a damaged file.
+    let mut published_path = path.as_os_str().to_os_string();
+    published_path.push(".v3");
+    let published_path = std::path::PathBuf::from(published_path);
+    match std::fs::File::open(&published_path) {
+        Ok(file) => return read_key(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return None,
+    }
+    // Older pre-release files are not inspected: their writers did not all
+    // coordinate with this lock, and their contents may be incomplete.
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let encrypted = dpapi_transform(&key, true)?;
+    // Do not publish if DPAPI cannot recover the new key.
+    if dpapi_transform(&encrypted, false)?.as_slice() != key {
+        return None;
+    }
+    let mut temp_path = path.as_os_str().to_os_string();
+    temp_path.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp_path = std::path::PathBuf::from(temp_path);
+    struct RemoveTemp(std::path::PathBuf);
+    impl Drop for RemoveTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = RemoveTemp(temp_path.clone());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .ok()?;
+    file.write_all(&encrypted).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+    std::fs::rename(&temp_path, &published_path).ok()?;
+    Some(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_are_keyed_and_do_not_expose_values() {
+        let first = fingerprint_with_key(&[1; 32], &("x-routing", "low-entropy-secret")).unwrap();
+        let repeated =
+            fingerprint_with_key(&[1; 32], &("x-routing", "low-entropy-secret")).unwrap();
+        let other_key =
+            fingerprint_with_key(&[2; 32], &("x-routing", "low-entropy-secret")).unwrap();
+        let other_value = fingerprint_with_key(&[1; 32], &("x-routing", "other")).unwrap();
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_key);
+        assert_ne!(first, other_value);
+        assert!(!first.contains("low-entropy-secret"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn active_pre_release_writer_cannot_change_published_key() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let mut old_writer = std::fs::File::create(&path).unwrap();
+        old_writer.write_all(&[1]).unwrap();
+        std::fs::write(dir.path().join("key.abandoned.tmp"), b"partial").unwrap();
+        #[cfg(unix)]
+        let key = load_or_create_key(&path).unwrap();
+        #[cfg(windows)]
+        let key = load_or_create_windows_key(&path).unwrap();
+        old_writer.write_all(&[2; 31]).unwrap();
+        old_writer.sync_all().unwrap();
+        #[cfg(unix)]
+        assert_eq!(load_or_create_key(&path), Some(key));
+        #[cfg(windows)]
+        assert_eq!(load_or_create_windows_key(&path), Some(key));
+        let mut legacy_key = [2; 32];
+        legacy_key[0] = 1;
+        assert_ne!(key, legacy_key);
+        assert_eq!(
+            std::fs::read(dir.path().join("key.abandoned.tmp")).unwrap(),
+            b"partial"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_key_persists_without_plaintext_and_rejects_tampering() {
+        if let Some(path) = std::env::var_os("PI_RS_DPAPI_TEST_CHILD") {
+            let key = load_or_create_windows_key(std::path::Path::new(&path)).unwrap();
+            assert_eq!(
+                fingerprint_with_key(&key, &"fixture").unwrap(),
+                std::env::var("PI_RS_DPAPI_TEST_EXPECTED").unwrap()
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let key = load_or_create_windows_key(&path).unwrap();
+        assert_eq!(load_or_create_windows_key(&path), Some(key));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "context_fingerprint::tests::dpapi_key_persists_without_plaintext_and_rejects_tampering"])
+            .env("PI_RS_DPAPI_TEST_CHILD", &path)
+            .env("PI_RS_DPAPI_TEST_EXPECTED", fingerprint_with_key(&key, &"fixture").unwrap())
+            .status().unwrap();
+        assert!(status.success());
+        let first = protected_model_fingerprint(&("authorization", "pin"));
+        assert!(first.is_some());
+        assert_eq!(
+            first,
+            protected_model_fingerprint(&("authorization", "pin"))
+        );
+        let published_path = path.with_extension("v3");
+        let encrypted = std::fs::read(&published_path).unwrap();
+        assert!(!encrypted.windows(key.len()).any(|window| window == key));
+        std::fs::write(&published_path, b"tampered").unwrap();
+        assert_eq!(load_or_create_windows_key(&path), None);
+        assert_eq!(std::fs::read(&published_path).unwrap(), b"tampered");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_key_concurrent_creators_ignore_pre_release_files() {
+        if let Some(path) = std::env::var_os("PI_RS_DPAPI_RACE_PATH") {
+            let key = load_or_create_windows_key(std::path::Path::new(&path)).unwrap();
+            std::fs::write(
+                std::env::var_os("PI_RS_DPAPI_RACE_RESULT").unwrap(),
+                fingerprint_with_key(&key, &"race").unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let encrypted = dpapi_transform(&[7; 32], true).unwrap();
+        {
+            let length = 0;
+            let _ = std::fs::remove_file(path.with_extension("v3"));
+            std::fs::write(&path, &encrypted[..length]).unwrap();
+            let mut children = Vec::new();
+            for index in 0..8 {
+                let result = dir.path().join(format!("result-{index}"));
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "context_fingerprint::tests::windows_key_concurrent_creators_ignore_pre_release_files",
+                    ])
+                    .env("PI_RS_DPAPI_RACE_PATH", &path)
+                    .env("PI_RS_DPAPI_RACE_RESULT", &result)
+                    .spawn()
+                    .unwrap();
+                children.push((child, result));
+            }
+            let mut results = Vec::new();
+            for (mut child, result) in children {
+                assert!(child.wait().unwrap().success());
+                results.push(std::fs::read_to_string(result).unwrap());
+            }
+            assert!(results.iter().all(|result| result == &results[0]));
+            let key = load_or_create_windows_key(&path).unwrap();
+            assert_eq!(fingerprint_with_key(&key, &"race").unwrap(), results[0]);
+            assert_eq!(std::fs::read(&path).unwrap(), encrypted[..length]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ignores_pre_release_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let old_key = [42; 32];
+        let old_data = dpapi_transform(&old_key, true).unwrap();
+        std::fs::write(&path, &old_data).unwrap();
+        let key = load_or_create_windows_key(&path).unwrap();
+        assert_ne!(key, old_key);
+        assert_eq!(std::fs::read(path).unwrap(), old_data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_persists_and_rejects_insecure_storage() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let key = load_or_create_key(&path).unwrap();
+        assert_eq!(load_or_create_key(&path), Some(key));
+        let published = path.with_extension("v3");
+        assert_eq!(
+            std::fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_or_create_key(&path), None);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&published, link.with_extension("v3")).unwrap();
+        assert_eq!(load_or_create_key(&link), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_key_ignores_legacy_and_creates_concurrently() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = std::env::var_os("PI_RS_UNIX_KEY_RACE_PATH") {
+            let key = load_or_create_key(std::path::Path::new(&path)).unwrap();
+            std::fs::write(
+                std::env::var_os("PI_RS_UNIX_KEY_RACE_RESULT").unwrap(),
+                fingerprint_with_key(&key, &"race").unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let original = [42; 32];
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for length in [0, 1, 16, 31] {
+            std::fs::write(&path, &original[..length]).unwrap();
+            let mut children = Vec::new();
+            for index in 0..8 {
+                let result = dir.path().join(format!("result-{index}"));
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "context_fingerprint::tests::unix_key_ignores_legacy_and_creates_concurrently",
+                    ])
+                    .env("PI_RS_UNIX_KEY_RACE_PATH", &path)
+                    .env("PI_RS_UNIX_KEY_RACE_RESULT", &result)
+                    .spawn()
+                    .unwrap();
+                children.push((child, result));
+            }
+            let mut results = Vec::new();
+            for (mut child, result) in children {
+                assert!(child.wait().unwrap().success());
+                results.push(std::fs::read_to_string(result).unwrap());
+            }
+            assert!(results.iter().all(|result| result == &results[0]));
+            let key = load_or_create_key(&path).unwrap();
+            assert_eq!(fingerprint_with_key(&key, &"race").unwrap(), results[0]);
+            assert_eq!(std::fs::read(&path).unwrap(), original[..length]);
+            std::fs::remove_file(path.with_extension("v3")).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_key_requires_directory_sync_before_use() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let attempts = Cell::new(0);
+        let fail_sync = |parent: &std::path::Path| {
+            assert_eq!(parent, dir.path());
+            assert_eq!(
+                std::fs::metadata(path.with_extension("v3")).unwrap().len(),
+                32
+            );
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("simulated directory sync failure"))
+        };
+        assert_eq!(load_or_create_key_with_sync(&path, fail_sync), None);
+        assert!(path.with_extension("v3").exists());
+        assert_eq!(load_or_create_key_with_sync(&path, fail_sync), None);
+        assert_eq!(attempts.get(), 2);
+        let key = load_or_create_key(&path).unwrap();
+        assert_eq!(load_or_create_key(&path), Some(key));
+    }
+}

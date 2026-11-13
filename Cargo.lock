@@ -2788,6 +2788,7 @@ dependencies = [
  "futures-util",
  "pi-rs-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2801,7 +2802,9 @@ dependencies = [
  "cap-std",
  "chrono",
  "futures-util",
+ "hmac",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2810,6 +2813,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

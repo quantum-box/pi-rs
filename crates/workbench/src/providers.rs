@@ -8,7 +8,7 @@ use pi_rs::{CacheRetention, Error, Model, ModelRequest, ModelStream, Result};
 use reqwest::header::HeaderMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
 
@@ -272,15 +272,89 @@ pub(super) struct Deferred {
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
     observed: bool,
+    estimator: Arc<OnceLock<Option<Box<Client>>>>,
 }
 
 impl Deferred {
+    // Construct without resolving credentials or dynamic headers. Clones share
+    // the result until an option that affects serialization changes.
+    fn estimation_client(&self) -> Option<&Client> {
+        self.estimator
+            .get_or_init(|| {
+                let credential = (self.adapter != Adapter::Bedrock).then(|| "estimate".into());
+                self.provider
+                    .connect(self.adapter, &self.endpoint, credential, false)
+                    .and_then(|client| match &self.options {
+                        Some((args, reported)) => client.with_model_options(args, *reported),
+                        None => Ok(client),
+                    })
+                    .ok()
+                    .map(Box::new)
+            })
+            .as_deref()
+    }
+
+    fn context_identity(&self) -> Option<String> {
+        // Dynamic credential commands and headers may change on each request.
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(Credential::requires_resolution)
+            || self.headers.has_command()
+        {
+            return None;
+        }
+        let token = self.credential.as_ref().and_then(Credential::literal);
+        if token.is_none() && self.adapter != Adapter::ChatCompletions {
+            return None;
+        }
+        if !self
+            .headers
+            .static_headers(&self.provider, token)
+            .ok()?
+            .is_empty()
+        {
+            return None;
+        }
+        if let Some(settings) = &self.http_settings
+            && !super::http_proxy::configured(settings).ok()?.is_empty()
+        {
+            return None;
+        }
+        let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
+        pi_rs::protected_model_fingerprint(&(
+            "deferred-context-v1",
+            self.provider.id(),
+            self.adapter.api(),
+            &self.endpoint,
+            token,
+            bearer,
+            self.estimation_client()?.context_identity()?,
+            std::env::var_os("PI_CACHE_RETENTION")
+                .map(|value| value.to_string_lossy().into_owned()),
+        ))
+    }
+
     async fn resolve(&self) -> Result<Client> {
-        self.resolve_at(&super::config::agent_dir().join("auth.json"))
+        self.resolve_with_headers().await.map(|(client, _)| client)
+    }
+
+    #[cfg(test)]
+    async fn resolve_at(&self, auth_path: &std::path::Path) -> Result<Client> {
+        self.resolve_with_headers_at(auth_path)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    async fn resolve_with_headers(&self) -> Result<(Client, HeaderMap)> {
+        self.resolve_with_headers_at(&super::config::agent_dir().join("auth.json"))
             .await
     }
 
-    async fn resolve_at(&self, auth_path: &std::path::Path) -> Result<Client> {
+    async fn resolve_with_headers_at(
+        &self,
+        auth_path: &std::path::Path,
+    ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
@@ -320,7 +394,7 @@ impl Deferred {
         let mut client = self
             .provider
             .connect_prechecked(self.adapter, &self.endpoint, token, bearer, radius_checked)?
-            .with_headers(headers)
+            .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         if let Some(settings) = &self.http_settings {
             client = client.with_http_settings(settings)?;
@@ -328,11 +402,14 @@ impl Deferred {
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
         }
-        Ok(if self.observed {
-            client.observe()
-        } else {
-            client
-        })
+        Ok((
+            if self.observed {
+                client.observe()
+            } else {
+                client
+            },
+            headers,
+        ))
     }
 }
 
@@ -354,6 +431,7 @@ impl Client {
             options: None,
             probe_context: true,
             observed: false,
+            estimator: Arc::new(OnceLock::new()),
         }))
     }
 
@@ -383,6 +461,44 @@ impl Client {
                 Self::Deferred(client)
             }
         })
+    }
+
+    /// Resolve dynamic credentials and freeze any catalog route before estimating.
+    pub(super) async fn prepare_for_context(
+        &self,
+        model: &str,
+    ) -> Result<Option<(Client, Option<String>)>> {
+        let (client, headers) = match self {
+            Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
+            Self::Ollama(client) => (self.clone(), client.context_headers()),
+            Self::Anthropic(client) => (self.clone(), client.context_headers()),
+            Self::Google(client) => (self.clone(), client.context_headers()),
+            Self::OpenAi(client) => (self.clone(), client.context_headers()),
+            Self::PiMessages(client) => (self.clone(), client.context_headers()),
+            Self::Bedrock(_) => (self.clone(), HeaderMap::new()),
+        };
+        let client = match client {
+            Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
+            Self::Bedrock(client) => match client.prepare_bedrock().await? {
+                Some(prepared) => Self::Bedrock(prepared),
+                None => Self::Bedrock(client),
+            },
+            other => other,
+        };
+        // The keyed fingerprint protects low-entropy headers and adapter credentials.
+        let base = client
+            .clone()
+            .with_headers(HeaderMap::new())
+            .context_identity();
+        let mut header_values: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        header_values.sort();
+        let identity = base.and_then(|base| {
+            pi_rs::protected_model_fingerprint(&("resolved-client-v2", base, header_values))
+        });
+        Ok(Some((client, identity)))
     }
 
     pub async fn stream_with_headers(
@@ -715,6 +831,7 @@ impl Client {
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
+                client.estimator = Arc::new(OnceLock::new());
                 Self::Deferred(client)
             }
         })
@@ -767,6 +884,33 @@ impl Client {
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn context_identity(&self) -> Option<String> {
+        match self {
+            Self::Ollama(c) => c.context_identity(),
+            Self::Anthropic(c) => c.context_identity(),
+            Self::Google(c) => c.context_identity(),
+            Self::PiMessages(c) => c.context_identity(),
+            Self::OpenAi(c) => c.context_identity(),
+            Self::Bedrock(c) => c.context_identity(),
+            Self::Deferred(client) => client.context_identity(),
+        }
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &pi_rs::Message) -> u64 {
+        match self {
+            Self::Ollama(c) => c.estimate_message_tokens(request, message),
+            Self::Anthropic(c) => c.estimate_message_tokens(request, message),
+            Self::Google(c) => c.estimate_message_tokens(request, message),
+            Self::PiMessages(c) => c.estimate_message_tokens(request, message),
+            Self::OpenAi(c) => c.estimate_message_tokens(request, message),
+            Self::Bedrock(c) => c.estimate_message_tokens(request, message),
+            Self::Deferred(c) => c.estimation_client().map_or_else(
+                || pi_rs::estimate_message_tokens(message),
+                |client| client.estimate_message_tokens(request, message),
+            ),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         match self {
             Self::Ollama(client) => client.context_window(model).await,
@@ -843,6 +987,628 @@ mod contention_tests {
             waiting.await.unwrap().unwrap(),
             Client::PiMessages(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn kimi_oauth_prepare_preserves_protected_resolved_identity() {
+        const CHILD: &str = "PI_RS_TEST_KIMI_PREPARED_IDENTITY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let path = super::super::config::agent_dir().join("auth.json");
+            let save = |access: &str| {
+                std::fs::write(&path, json!({"kimi-coding":{
+                    "type":"oauth", "access":access, "refresh":"fixture-refresh", "expires":9_000_000_000_000_u64
+                }}).to_string()).unwrap();
+            };
+            save("fixture-first-access");
+            let provider = Provider::named("kimi-coding").unwrap();
+            let client = Client::deferred(
+                provider.clone(),
+                provider.adapter(),
+                provider.default_endpoint(),
+                Some(Credential::Kimi),
+                RequestHeaders::default(),
+            );
+            assert!(client.context_identity().is_none());
+            let (prepared, first) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, repeated) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(prepared, Client::Ollama(_)));
+            assert!(first.is_some());
+            assert_eq!(first, repeated);
+            save("fixture-second-access");
+            let (_, changed) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first, changed);
+            assert!(!first.unwrap().contains("fixture-first-access"));
+            assert!(!changed.unwrap().contains("fixture-second-access"));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::estimation_tests::kimi_oauth_prepare_preserves_protected_resolved_identity"])
+            .env(CHILD, "1")
+            .env("PI_RS_HOME", directory.path())
+            .env_remove("KIMI_API_KEY")
+            .current_dir(directory.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn deferred_bedrock_estimates_tool_images_without_synthetic_credentials() {
+        let client = Client::deferred(
+            Provider::Bedrock,
+            Adapter::Bedrock,
+            "",
+            None,
+            RequestHeaders::default(),
+        );
+        let Client::Deferred(deferred) = &client else {
+            unreachable!()
+        };
+        assert!(matches!(
+            deferred.estimation_client(),
+            Some(Client::Bedrock(_))
+        ));
+        assert!(client.context_identity().is_none());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let message = pi_rs::Message::Tool { call_id: "id".into(), is_error: false, is_structured: Some(true),
+            content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(20000)}]}}).to_string() };
+        assert!((1200..1300).contains(&client.estimate_message_tokens(&request, &message)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deferred_static_credentials_have_stable_route_bound_identity() {
+        let client = |provider, adapter, endpoint: &str, credential| {
+            Client::deferred(
+                provider,
+                adapter,
+                endpoint,
+                credential,
+                RequestHeaders::default(),
+            )
+        };
+        let anthropic = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Literal("key-a".into())),
+        );
+        let clone = anthropic.clone();
+        assert!(anthropic.context_identity().is_some());
+        assert_eq!(anthropic.context_identity(), clone.context_identity());
+        let other_key = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Literal("key-b".into())),
+        );
+        let other_route = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://example.com/v1/messages",
+            Some(Credential::Literal("key-a".into())),
+        );
+        assert_ne!(anthropic.context_identity(), other_key.context_identity());
+        assert_ne!(anthropic.context_identity(), other_route.context_identity());
+        let dynamic = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Command("!read-key".into())),
+        );
+        assert!(dynamic.context_identity().is_none());
+        let google = client(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            Some(Credential::Literal("key-a".into())),
+        );
+        assert!(google.context_identity().is_some());
+        assert_ne!(anthropic.context_identity(), google.context_identity());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn anthropic_direct_and_deferred_reuse_measured_baselines() {
+        struct MeasuredFixture {
+            wrapped: super::super::image_policy::WorkbenchModel,
+        }
+        #[async_trait::async_trait]
+        impl Model for MeasuredFixture {
+            fn context_identity(&self) -> Option<String> {
+                self.wrapped.context_identity()
+            }
+            fn estimate_message_tokens(
+                &self,
+                request: &ModelRequest,
+                message: &pi_rs::Message,
+            ) -> u64 {
+                self.wrapped.estimate_message_tokens(request, message)
+            }
+            fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+                self.wrapped.estimate_request_tokens(request)
+            }
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("reply".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(pi_rs::Usage {
+                            input_tokens: 3000,
+                            output_tokens: 8,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        for deferred in [false, true] {
+            let client = if deferred {
+                Client::deferred(
+                    Provider::Anthropic,
+                    Adapter::Anthropic,
+                    "https://api.anthropic.com/v1/messages",
+                    Some(Credential::Literal("key".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Anthropic(
+                    Anthropic::new("https://api.anthropic.com/v1/messages", "key").unwrap(),
+                )
+            };
+            let model = MeasuredFixture {
+                wrapped: super::super::image_policy::WorkbenchModel {
+                    client,
+                    block_images: false,
+                    supports_images: Some(true),
+                    session_affinity: &[],
+                    price: None,
+                },
+            };
+            assert!(model.context_identity().is_some());
+            let registry = pi_rs::Registry::default();
+            let mut agent = pi_rs::Agent {
+                registry: &registry,
+                system_prompt: "short",
+                model: &model,
+                model_name: "fixture",
+                limits: pi_rs::Limits::default(),
+            };
+            agent.limits.output_tokens_per_request = 64;
+            let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            session.auto_compaction_control().set_enabled(false);
+            let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+            agent
+                .run(
+                    &mut session,
+                    Some("first".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            agent.limits.context_window = Some(1000);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("next".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            assert!(
+                matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled")),
+                "deferred={deferred}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_command_credentials_resolve_with_protected_identity() {
+        let client = Client::deferred(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            Some(Credential::Command("!echo key-one".into())),
+            RequestHeaders::for_test("x-routing", "!echo route-one"),
+        );
+        let (prepared, identity) = client
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(prepared, Client::Google(_)));
+        assert!(identity.is_some());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[tokio::test]
+    async fn unprotected_platform_does_not_persist_header_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-routing",
+            reqwest::header::HeaderValue::from_static("secret"),
+        );
+        let client = Client::Google(
+            pi_rs::google::Google::new("https://example.com/v1", "key")
+                .unwrap()
+                .with_headers(headers),
+        );
+        let (_, identity) = client
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(identity.is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn direct_static_headers_reuse_baseline_without_unkeyed_header_fingerprint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let request = String::from_utf8_lossy(&bytes[..header_end]).to_lowercase();
+            let length = request
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + length {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.contains("x-routing: route-one"));
+            assert!(request.contains("x-goog-api-key: key-one"));
+            let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reply\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3000,\"candidatesTokenCount\":8}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut headers = HeaderMap::new();
+        let mut routing = reqwest::header::HeaderValue::from_static("route-one");
+        routing.set_sensitive(true);
+        headers.insert("x-routing", routing);
+        let client = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "key-one")
+                .unwrap()
+                .with_context_probe(false)
+                .with_headers(headers),
+        );
+        let model = super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: Some(true),
+            session_affinity: &[],
+            price: None,
+        };
+        let registry = pi_rs::Registry::default();
+        let mut agent = pi_rs::Agent {
+            registry: &registry,
+            system_prompt: "short",
+            model: &model,
+            model_name: "fixture",
+            limits: pi_rs::Limits::default(),
+        };
+        agent.limits.context_window = Some(5000);
+        agent.limits.output_tokens_per_request = 64;
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                pi_rs::Event::ModelRequested {
+                    context_configuration_sha256,
+                    ..
+                } => context_configuration_sha256.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        let base = model
+            .client
+            .clone()
+            .with_headers(HeaderMap::new())
+            .context_identity()
+            .unwrap();
+        let guessed = pi_rs::fingerprint_model_context(&(
+            "resolved-client-v2",
+            base,
+            vec![("x-routing".to_owned(), b"route-one".to_vec())],
+        ))
+        .unwrap();
+        let guessed_policy = pi_rs::fingerprint_model_context(&(
+            "workbench-policy-v2",
+            guessed,
+            false,
+            Some(true),
+            &[] as &[&str],
+        ))
+        .unwrap();
+        let guessed_journal = pi_rs::fingerprint_model_context(&(
+            "effective-context-v2",
+            guessed_policy,
+            "fixture",
+            vec!["short"],
+            Vec::<pi_rs::ToolSpec>::new(),
+        ))
+        .unwrap();
+        assert_ne!(*record, guessed_journal);
+        assert!(
+            !serde_json::to_string(&session.records())
+                .unwrap()
+                .contains("route-one")
+        );
+        agent.limits.context_window = Some(1000);
+        let result = agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled"))
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn dynamic_credentials_and_headers_reuse_measured_usage_after_dispatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let request = String::from_utf8_lossy(&bytes[..header_end]).to_lowercase();
+            let length = request
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + length {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.contains("x-routing: route-one"));
+            assert!(request.contains("x-goog-api-key: key-one"));
+            let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reply\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3000,\"candidatesTokenCount\":8}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = Client::deferred(
+            Provider::Google,
+            Adapter::Google,
+            &endpoint,
+            Some(Credential::Command("!echo key-one".into())),
+            RequestHeaders::for_test("x-routing", "!echo route-one"),
+        )
+        .with_context_probes(false);
+        let model = super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: Some(true),
+            session_affinity: &[],
+            price: None,
+        };
+        let registry = pi_rs::Registry::default();
+        let mut agent = pi_rs::Agent {
+            registry: &registry,
+            system_prompt: "short",
+            model: &model,
+            model_name: "fixture",
+            limits: pi_rs::Limits::default(),
+        };
+        agent.limits.context_window = Some(5000);
+        agent.limits.output_tokens_per_request = 64;
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        agent.limits.context_window = Some(1000);
+        let result = agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled"))
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn resolved_dynamic_headers_are_included_in_prepared_identity() {
+        let make = |header: &str| {
+            Client::deferred(
+                Provider::Google,
+                Adapter::Google,
+                "https://example.com/v1",
+                Some(Credential::Literal("key".into())),
+                RequestHeaders::for_test("x-routing", header),
+            )
+        };
+        let first = make("!echo route-one");
+        let second = make("!echo route-two");
+        let (_, a) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, same) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, b) = second
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(a.is_some());
+        assert_eq!(a, same);
+        assert_ne!(a, b);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn dynamic_credentials_are_resolved_once_for_each_prepared_client() {
+        let make = |command: &str| {
+            Client::deferred(
+                Provider::Google,
+                Adapter::Google,
+                "https://example.com/v1",
+                Some(Credential::Command(command.into())),
+                RequestHeaders::default(),
+            )
+        };
+        let first = make("!echo key-one");
+        let second = make("!echo key-two");
+        assert!(first.context_identity().is_none());
+        let (prepared, first_identity) =
+            first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, repeated_identity) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, second_identity) = second
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_identity.is_some());
+        assert_eq!(first_identity, repeated_identity);
+        assert_ne!(first_identity, second_identity);
+        assert!(prepared.context_identity().is_some());
+    }
+
+    #[test]
+    fn deferred_estimator_is_reused_and_options_invalidate_cache() {
+        let client = Client::deferred(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            None,
+            RequestHeaders::default(),
+        );
+        let Client::Deferred(deferred) = &client else {
+            panic!("expected deferred adapter")
+        };
+        assert!(deferred.estimator.get().is_none());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let message = pi_rs::Message::User {
+            content: "hello".into(),
+        };
+        assert!(client.estimate_message_tokens(&request, &message) > 0);
+        let first = deferred.estimation_client().unwrap();
+        for _ in 0..32 {
+            assert!(client.estimate_message_tokens(&request, &message) > 0);
+            assert!(std::ptr::eq(first, deferred.estimation_client().unwrap()));
+        }
+        let clone = client.clone();
+        let Client::Deferred(shared) = &clone else {
+            unreachable!()
+        };
+        assert!(std::ptr::eq(first, shared.estimation_client().unwrap()));
+        let changed = clone
+            .with_model_options(&Cli::parse_from(["pi"]), false)
+            .unwrap();
+        let Client::Deferred(changed) = &changed else {
+            unreachable!()
+        };
+        assert!(changed.estimator.get().is_none());
+        assert!(!std::ptr::eq(first, changed.estimation_client().unwrap()));
+        assert!(std::ptr::eq(first, deferred.estimation_client().unwrap()));
     }
 }
 

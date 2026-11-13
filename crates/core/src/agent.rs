@@ -558,7 +558,7 @@ impl Agent<'_> {
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let mut request = active
+                let (mut request, transformed) = active
                     .request(
                         session,
                         &states,
@@ -574,13 +574,69 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let capacity = active.context_capacity(&request, cancel).await?;
-                let estimate = session.context_budget_estimate();
-                let input_tokens = if estimate.last_usage_record.is_some() {
-                    estimate.tokens
-                } else {
-                    crate::estimate_request_tokens(&request)
+                let preparation = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = tokio::time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
+                        result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
+                let prepared = match preparation {
+                    Ok(prepared) => prepared,
+                    Err(Error::RetryableModel(message))
+                        if session.retry_control().settings().enabled
+                            && retry_attempt < session.retry_control().settings().max_retries
+                            && request_index + 1 < active.limits.model_requests =>
+                    {
+                        if lifecycle && retry_attempt == 0 {
+                            active
+                                .observe_lifecycle(
+                                    turn_start(false),
+                                    &states,
+                                    Some(cancel),
+                                    observer,
+                                )
+                                .await;
+                        }
+                        let control = session.retry_control();
+                        let settings = control.settings();
+                        retry_attempt += 1;
+                        let delay_ms = settings.delay_ms(retry_attempt);
+                        let retry_wait = control.begin_wait();
+                        observer(Notification::Retry(crate::RetryEvent::Start {
+                            attempt: retry_attempt,
+                            max_attempts: settings.max_retries,
+                            delay_ms,
+                            error_message: message,
+                        }));
+                        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                        tokio::pin!(sleep);
+                        let waited = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = &mut sleep => break Ok(()),
+                                Some(input) = followups.recv() => {
+                                    if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                                }
+                            }
+                        };
+                        drop(retry_wait);
+                        waited?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let active = Agent {
+                    model: prepared.as_deref().unwrap_or(active.model),
+                    limits: active.limits.clone(),
+                    ..active
+                };
+                let capacity = active.context_capacity(&request, cancel).await?;
+                let input_tokens = capacity.map_or(0, |_| {
+                    let estimate = session.context_budget_estimate();
+                    active.request_budget_tokens(session, &request, estimate, transformed)
+                });
                 let exceeds = capacity.is_some_and(|window| {
                     input_tokens.saturating_add(u64::from(request.max_output_tokens))
                         > u64::from(window)
@@ -646,7 +702,15 @@ impl Agent<'_> {
                         .await;
                 }
                 let result = active
-                    .reply(session, request, true, cancel, observer, Some(followups))
+                    .reply(
+                        session,
+                        request,
+                        true,
+                        transformed,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
                     .await?
                     .outcome;
                 let control = session.retry_control();
@@ -842,7 +906,7 @@ impl Agent<'_> {
         purpose: RequestPurpose,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<ModelRequest> {
+    ) -> Result<(ModelRequest, bool)> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -894,6 +958,7 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
+        let original = request.clone();
         for extension in &self.registry.extensions {
             let result = tokio::select! {
                 biased;
@@ -929,14 +994,73 @@ impl Agent<'_> {
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        Ok(request)
+        let transformed = request.model != original.model
+            || request.messages != original.messages
+            || request.tools != original.tools;
+        Ok((request, transformed))
     }
 
+    fn request_budget_tokens(
+        &self,
+        session: &Session,
+        request: &ModelRequest,
+        estimate: crate::ContextUsageEstimate,
+        transformed: bool,
+    ) -> u64 {
+        let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
+            return self.model.estimate_request_tokens(request);
+        };
+        let branch = session.branch();
+        let (request_id, output_tokens) = branch
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Assistant {
+                    request_id,
+                    usage: Some(usage),
+                    ..
+                } if record.id == anchor => Some((*request_id, usage.output_tokens)),
+                _ => None,
+            })
+            .unwrap_or((None, 0));
+        let configuration = request_configuration_hash(self.model, request);
+        let safe = configuration.as_ref().is_some_and(|configuration| {
+            request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
+                Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), context_configuration_sha256: Some(previous), .. }
+                    if *request_id == id && previous == configuration)))
+        });
+        if !safe {
+            return self.model.estimate_request_tokens(request);
+        }
+        let entries = model_conversation_entries(&branch, session.operations());
+        // The measured output already includes generated reasoning on providers
+        // such as Google. Only replay beyond that measurement is additional.
+        let anchor_extra =
+            entries
+                .iter()
+                .find(|(source, _)| *source == anchor)
+                .map_or(0, |(_, message)| {
+                    self.model
+                        .estimate_message_tokens(request, message)
+                        .saturating_sub(crate::estimate_message_tokens(message).max(output_tokens))
+                });
+        let trailing = entries
+            .into_iter()
+            .filter(|(source, _)| *source > anchor)
+            .map(|(_, message)| self.model.estimate_message_tokens(request, &message))
+            .fold(0_u64, u64::saturating_add);
+        estimate
+            .usage_tokens
+            .saturating_add(anchor_extra)
+            .saturating_add(trailing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn reply<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         request: ModelRequest,
         retain_reply: bool,
+        transformed: bool,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
@@ -960,6 +1084,8 @@ impl Agent<'_> {
                 request_id: Some(request_id),
                 context_head: Some(context_head),
                 context_sha256: Some(context_sha256),
+                context_transformed: Some(transformed),
+                context_configuration_sha256: request_configuration_hash(self.model, &request),
             },
             observer,
         )?;
@@ -1888,8 +2014,20 @@ impl Agent<'_> {
         if request.max_output_tokens == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
         }
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
         let capacity = u64::from(
-            self.context_capacity(&request, cancel)
+            active
+                .context_capacity(&request, cancel)
                 .await?
                 .unwrap_or(128_000),
         );
@@ -1910,7 +2048,7 @@ impl Agent<'_> {
         }
         let mut remaining = capacity
             .saturating_sub(reserve)
-            .saturating_sub(crate::estimate_request_tokens(&request))
+            .saturating_sub(active.model.estimate_request_tokens(&request))
             .saturating_sub(crate::estimate_message_tokens(&Message::User {
                 content: prompt.clone(),
             }))
@@ -1940,7 +2078,7 @@ impl Agent<'_> {
             ),
         });
         let allowance = request.max_output_tokens;
-        let reply = self
+        let reply = active
             .reply_for_branch_summary(session, request, cancel, observer)
             .await?;
         if reply.truncated {
@@ -2004,6 +2142,7 @@ impl Agent<'_> {
             let attempt = match Box::pin(self.reply::<AgentInput>(
                 session,
                 request.clone(),
+                false,
                 false,
                 cancel,
                 observer,
@@ -2155,7 +2294,7 @@ impl Agent<'_> {
                 "Nothing to compact (session too small)".into(),
             ));
         }
-        let mut request = self
+        let (mut request, transformed) = self
             .request(
                 session,
                 states,
@@ -2183,14 +2322,33 @@ impl Agent<'_> {
             content.push_str("\n\nAdditional focus: ");
             content.push_str(instructions);
         }
-        if self.exceeds_context(&request, cancel).await? {
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
+        if active.exceeds_context(&request, cancel).await? {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
             ));
         }
         let allowance = request.max_output_tokens;
-        let reply = self
-            .reply(session, request, false, cancel, observer, inputs)
+        let reply = active
+            .reply(
+                session,
+                request,
+                false,
+                transformed,
+                cancel,
+                observer,
+                inputs,
+            )
             .await?
             .outcome?;
         if reply.truncated {
@@ -2253,7 +2411,9 @@ impl Agent<'_> {
         let Some(window) = self.context_capacity(request, cancel).await? else {
             return Ok(false);
         };
-        Ok(crate::estimate_request_tokens(request)
+        Ok(self
+            .model
+            .estimate_request_tokens(request)
             .saturating_add(u64::from(request.max_output_tokens))
             > u64::from(window))
     }
@@ -3072,6 +3232,29 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
         }
     }
     ensure_settled(session.operations())
+}
+
+// Fingerprint only stable request configuration, excluding conversation and
+// output allowance, which legitimately change between turns.
+fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Option<String> {
+    let identity = model.context_identity()?;
+    let systems: Vec<_> = request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System { content } => Some(content),
+            _ => None,
+        })
+        .collect();
+    serde_json::to_vec(&(
+        "effective-context-v2",
+        identity,
+        &request.model,
+        systems,
+        &request.tools,
+    ))
+    .ok()
+    .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 #[cfg(test)]

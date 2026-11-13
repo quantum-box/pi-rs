@@ -1,6 +1,7 @@
 //! Model, session, and tool execution primitives for an embeddable agent.
 mod agent;
 mod context;
+mod context_fingerprint;
 mod extension;
 mod journal;
 mod lifecycle;
@@ -14,6 +15,7 @@ mod ui;
 
 pub use agent::*;
 pub use context::*;
+pub use context_fingerprint::protected_model_fingerprint;
 pub use extension::*;
 pub use journal::*;
 pub use lifecycle::{
@@ -25,7 +27,10 @@ pub use lifecycle::{
 pub use retry::*;
 pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};
-pub use tokens::{ContextUsageEstimate, estimate_message_tokens, estimate_request_tokens};
+pub use tokens::{
+    ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
+    fingerprint_model_context,
+};
 pub use tokio_util::sync::CancellationToken;
 pub use tool_arguments::parse_tool_arguments;
 pub use types::*;

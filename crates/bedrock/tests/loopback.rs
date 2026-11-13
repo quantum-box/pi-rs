@@ -587,3 +587,210 @@ async fn missing_region_and_credentials_are_actionable_but_connection_failures_r
         "{error:?}"
     );
 }
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn inspectable_sdk_credentials_and_bearer_reuse_measured_capacity() {
+    use aws_credential_types::provider::SharedCredentialsProvider;
+    for bearer in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0; 4096];
+            let (header_end, length) = loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buffer[..count]);
+                if let Some(pos) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    break (pos + 4, length);
+                }
+            };
+            while data.len() < header_end + length {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buffer[..count]);
+            }
+            let headers = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+            if bearer {
+                assert!(headers.contains("authorization: bearer private-token"));
+            } else {
+                assert!(headers.contains("authorization: aws4-hmac-sha256"));
+            }
+            let frames = [
+                event("messageStart", json!({"role":"assistant"})),
+                event("contentBlockDelta", json!({"contentBlockIndex":0,"delta":{"text":"done"}})),
+                event("contentBlockStop", json!({"contentBlockIndex":0})),
+                event("messageStop", json!({"stopReason":"end_turn"})),
+                event("metadata", json!({"usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28,"cacheReadInputTokens":2000,"cacheWriteInputTokens":1000},"metrics":{"latencyMs":1}})),
+            ].concat();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", frames.len()).as_bytes()).await.unwrap();
+            socket.write_all(&frames).await.unwrap();
+        });
+        let credentials = aws_credential_types::Credentials::new(
+            "access",
+            "private-secret",
+            None,
+            None,
+            "fixture",
+        );
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{address}"))
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .build();
+        let mut model = Bedrock::from_sdk_config(config);
+        if bearer {
+            model = model.with_bearer_token("private-token".into()).unwrap();
+        }
+        let registry = pi_rs_core::Registry::default();
+        let mut agent = pi_rs_core::Agent {
+            registry: &registry,
+            system_prompt: "short",
+            model: &model,
+            model_name: "fixture",
+            limits: pi_rs_core::Limits::default(),
+        };
+        agent.limits.context_window = Some(5000);
+        agent.limits.output_tokens_per_request = 64;
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &pi_rs_core::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let journal = serde_json::to_string(&session.records()).unwrap();
+        assert!(!journal.contains("private-secret") && !journal.contains("private-token"));
+        agent.limits.context_window = Some(1000);
+        let result = agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &pi_rs_core::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs_core::Error::Model(message)) if message.contains("automatic compaction is disabled")),
+            "bearer={bearer}"
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn prepared_bedrock_dispatch_uses_the_credential_it_fingerprinted() {
+    use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider, future};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Debug)]
+    struct Rotating(Arc<AtomicUsize>);
+    impl ProvideCredentials for Rotating {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+            future::ProvideCredentials::ready(Ok(aws_credential_types::Credentials::new(
+                if first { "FIRSTKEY" } else { "SECONDKEY" },
+                "secret",
+                None,
+                None,
+                "fixture",
+            )))
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            data.extend_from_slice(&buffer[..count]);
+            if let Some(pos) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..pos]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                break (pos + 4, length);
+            }
+        };
+        while data.len() < header_end + length {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            data.extend_from_slice(&buffer[..count]);
+        }
+        assert!(String::from_utf8_lossy(&data[..header_end]).contains("Credential=FIRSTKEY/"));
+        let frames = [
+            event("messageStart", json!({"role":"assistant"})),
+            event(
+                "contentBlockDelta",
+                json!({"contentBlockIndex":0,"delta":{"text":"done"}}),
+            ),
+            event("contentBlockStop", json!({"contentBlockIndex":0})),
+            event("messageStop", json!({"stopReason":"end_turn"})),
+        ]
+        .concat();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", frames.len()).as_bytes()).await.unwrap();
+        socket.write_all(&frames).await.unwrap();
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let config = aws_types::SdkConfig::builder()
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .region(aws_types::region::Region::new("us-east-1"))
+        .endpoint_url(format!("http://{address}"))
+        .credentials_provider(SharedCredentialsProvider::new(Rotating(calls.clone())))
+        .build();
+    let prepared = Bedrock::from_sdk_config(config)
+        .prepare_bedrock()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.context_identity().is_some());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let request = ModelRequest {
+        model: "fixture".into(),
+        messages: vec![Message::User {
+            content: "go".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 64,
+    };
+    let mut response = prepared.stream(request).await.unwrap();
+    while let Some(event) = response.next().await {
+        event.unwrap();
+    }
+    server.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

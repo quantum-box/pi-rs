@@ -43,6 +43,14 @@ pub(super) struct RequestHeaders {
 }
 
 impl RequestHeaders {
+    #[cfg(test)]
+    pub(super) fn for_test(name: &str, value: &str) -> Self {
+        Self {
+            values: [(name.to_owned(), value.to_owned())].into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
     pub fn with_environment(mut self, env: Option<&serde_json::Map<String, Value>>) -> Self {
         self.env = env.cloned();
         self
