@@ -249,7 +249,10 @@ fn auto_resources(root: &Path, kind: Kind, warnings: &mut Vec<String>) -> Result
     {
         match entry {
             Ok(entry)
-                if entry.depth() == 1 && entry.path().is_file() && kind.accepts(entry.path()) =>
+                if entry.depth() == 1
+                    && !entry.file_name().to_string_lossy().starts_with('.')
+                    && entry.path().is_file()
+                    && kind.accepts(entry.path()) =>
             {
                 files.push(entry.into_path());
             }
@@ -542,6 +545,22 @@ mod glob_tests {
                 .iter()
                 .any(|path| path.canonicalize().unwrap() == ignored.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn automatic_resources_never_include_dot_names_even_when_unignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in [".private.json", ".private.md", "visible.json", "visible.md"] {
+            std::fs::write(root.join(name), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".fdignore"), "!.private.json\n!.private.md\n").unwrap();
+        let mut warnings = Vec::new();
+        for (kind, expected) in [(Kind::Theme, "visible.json"), (Kind::Prompt, "visible.md")] {
+            let files = auto_resources(root, kind, &mut warnings).unwrap();
+            assert_eq!(files, [root.join(expected)]);
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

@@ -3357,6 +3357,26 @@ fn slash(
     Ok(None)
 }
 
+// Resolve the same theme set as the regular interactive startup. In particular,
+// ignored automatic themes must not be reopened by a separate directory scan.
+fn startup_picker_theme(args: &Cli) -> Result<Theme> {
+    let resources = super::resources::Resources::load(args)?;
+    Theme::load(
+        args.use_theme.as_deref().unwrap_or("system"),
+        &resources.themes,
+        &args.workspace,
+        args.trusted,
+        false,
+    )
+    .or_else(|error| {
+        if !resources.extensions.is_empty() {
+            Ok(Theme::system())
+        } else {
+            Err(error)
+        }
+    })
+}
+
 /// Run the startup session picker on the controlling terminal, leaving stdout
 /// and stdin available for print/JSON/RPC mode protocols.
 pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> {
@@ -3396,23 +3416,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     execute!(screen.0, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
     let mut input = crate::ui::input::Reader::new()?;
     let keys = Keys::load()?;
-    let mut theme = Theme::load(
-        args.use_theme.as_deref().unwrap_or("system"),
-        &args.themes,
-        &args.workspace,
-        args.trusted,
-        !args.no_themes,
-    )
-    .or_else(|error| {
-        if !super::resources::Resources::load(args)?
-            .extensions
-            .is_empty()
-        {
-            Ok(Theme::system())
-        } else {
-            Err(error)
-        }
-    })?;
+    let mut theme = startup_picker_theme(args)?;
     let mut view = View::default();
     slash("/resume", args, &mut view, None)?;
     let mut worker = None;
@@ -7814,6 +7818,43 @@ mod tests {
             Some("ollama/offline-fixture")
         );
     }
+    #[test]
+    fn startup_picker_uses_resolved_themes_and_skips_malformed_ignored_files() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let themes = workspace.join(".pi/themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join(".fdignore"), "ignored.json\n").unwrap();
+        std::fs::write(themes.join("ignored.json"), "not valid JSON").unwrap();
+        let mut selected: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        selected["name"] = serde_json::json!("selected");
+        std::fs::write(themes.join("selected.json"), selected.to_string()).unwrap();
+        let mut args = super::Cli::parse_from([
+            "pi",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = super::super::config::Settings::default();
+        args.use_theme = Some("ignored".into());
+        let error = match super::startup_picker_theme(&args) {
+            Ok(_) => panic!("ignored theme loaded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("was not found"), "{error}");
+        args.use_theme = Some("selected".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
+        args.no_themes = true;
+        assert!(super::startup_picker_theme(&args).is_err());
+        args.themes.push(themes.join("selected.json"));
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
+    }
+
     #[test]
     fn theme_settings_previews_selection_without_changing_original() {
         use clap::Parser;
