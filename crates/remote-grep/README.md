@@ -1,0 +1,9 @@
+# Prepared remote grep operations
+
+This prototype delegates search to a backend instead of starting local ripgrep. It is kept in a nested workspace for independent preparation; it is not yet part of the repository's standard workspace or public CI.
+
+`create_grep_tool` and `GrepExtension` accept a `GrepOperations` implementation. The backend receives an absolute path in its own namespace and must implement the requested regex or literal matching, case handling, glob filter, ignore-file behavior, binary-file policy, and result ordering. It streams UTF-8 match paths and lines through the supplied bounded channel; each match includes adjacent context. For directory searches a match path is relative to the requested directory or an absolute path beneath it. For file searches it must be the file basename or its exact absolute path. `~` is available only when an absolute backend home is configured; host HOME is never used.
+
+The host validates paths and context lengths, formats Pi-style markers, bounds display output and 500-UTF-16-unit lines, reports truncation and match-limit details, and cancels or drops the backend future on cancellation or when the match limit is reached. The channel bounds the number of pending messages, but a backend can allocate arbitrarily large individual messages before sending them; backend implementations must bound their own data. This interface extends the pinned Pi grep hooks: those hooks still launch local ripgrep and therefore cannot by themselves search a remote workspace. Exact ripgrep compatibility depends on the backend's implementation.
+
+A coherent remote read-only factory is a follow-up. It must use one explicitly shared backend for read, grep, find and ls, a common root and remote home, avoid duplicate tool registration, and preserve #116's rejection of mixed local search and remote read. It cannot be safely enabled until #119's remote ls integration is available.
