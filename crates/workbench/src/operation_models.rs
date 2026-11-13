@@ -236,12 +236,15 @@ impl Catalogue {
                         Error::Config(format!("invalid operation provider headers for {name}"))
                     })?
                 };
-                let mut headers = inherited;
-                headers.append(&mut configured.headers);
-                for header in headers.keys() {
-                    HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                let mut headers = BTreeMap::new();
+                for (header, value) in inherited
+                    .into_iter()
+                    .chain(std::mem::take(&mut configured.headers))
+                {
+                    let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                         Error::Config(format!("invalid operation provider header name for {name}"))
                     })?;
+                    headers.insert(header.as_str().to_owned(), value);
                 }
                 configured.headers = headers;
                 let inherited: Compat = if provider["compat"].is_null() {
@@ -687,12 +690,6 @@ impl Operations {
             .map_err(|_| Error::Config("invalid model operation credential".into()))?;
         authorization.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        if image_opt_in {
-            headers.insert(
-                "typesafe-danger-zone-images",
-                HeaderValue::from_static("true"),
-            );
-        }
         for (name, value) in &entry.model.headers {
             let value = resolve_header(value, credential_env).await.ok_or_else(|| {
                 Error::Config(format!("could not resolve operation model header {name}"))
@@ -703,6 +700,14 @@ impl Operations {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
                 value,
+            );
+        }
+        // Pi adds the automatic classifier image opt-in as request options,
+        // after provider and model headers have been combined.
+        if image_opt_in {
+            headers.insert(
+                "typesafe-danger-zone-images",
+                HeaderValue::from_static("true"),
             );
         }
         let mut response = self
@@ -785,13 +790,117 @@ mod tests {
     async fn classifier_image_header_defaults_are_independent_of_wire_format() {
         use clap::Parser;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (provider, mode, override_header, with_image, expected) in [
-            ("typesafe", "state-image-urls", None, true, true),
-            ("openrouter", "assets", None, true, false),
-            ("openrouter", "assets", Some(true), true, true),
-            ("typesafe", "images", Some(false), true, false),
-            ("typesafe", "state-image-urls", None, false, false),
-            ("openrouter", "assets", Some(true), false, false),
+        for (
+            provider,
+            mode,
+            override_header,
+            with_image,
+            expected,
+            provider_header,
+            model_header,
+            expected_custom,
+        ) in [
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            ("openrouter", "assets", None, true, None, None, None, None),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "images",
+                Some(false),
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                Some(false),
+                true,
+                Some("false"),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                false,
+                Some("false"),
+                None,
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("x-fixture", "provider")),
+                Some(("X-Fixture", "model")),
+                Some("model"),
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("X-Fixture", "provider")),
+                Some(("x-fixture", "model")),
+                Some("model"),
+            ),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -832,8 +941,10 @@ mod tests {
             if let Some(value) = override_header {
                 compat["sendImageOptInHeader"] = json!(value);
             }
-            let config = json!({provider:{"baseUrl":format!("http://{address}/v1"), "apiKey":"test-key", "models":[{
-                "type":"classifier", "id":"parity-fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":compat
+            let provider_headers: BTreeMap<_, _> = provider_header.into_iter().collect();
+            let model_headers: BTreeMap<_, _> = model_header.into_iter().collect();
+            let config = json!({provider:{"baseUrl":format!("http://{address}/v1"), "apiKey":"test-key", "headers":provider_headers, "models":[{
+                "type":"classifier", "id":"parity-fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":compat, "headers":model_headers
             }]}});
             let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
             let entry = catalogue
@@ -864,13 +975,24 @@ mod tests {
                 .position(|part| part == b"\r\n\r\n")
                 .unwrap()
                 + 4;
-            let headers = std::str::from_utf8(&request[..end])
-                .unwrap()
-                .to_ascii_lowercase();
+            let headers = std::str::from_utf8(&request[..end]).unwrap();
+            let header_values = |wanted: &str| {
+                headers
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(
-                headers.contains("typesafe-danger-zone-images: true"),
-                expected,
+                header_values("typesafe-danger-zone-images"),
+                expected.into_iter().collect::<Vec<_>>(),
                 "{provider} {mode} {override_header:?}"
+            );
+            assert_eq!(
+                header_values("x-fixture"),
+                expected_custom.into_iter().collect::<Vec<_>>()
             );
             let body: Value = serde_json::from_slice(&request[end..]).unwrap();
             assert_eq!(body["questions"]["ok"]["type"], "noul");
