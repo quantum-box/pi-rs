@@ -162,6 +162,7 @@ const MAX_IDLE_INPUT_DEPTH: usize = 16;
 struct IdleChildRequest {
     input: crate::AgentInput,
     reply: tokio::sync::oneshot::Sender<Result<()>>,
+    lifetime: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -171,6 +172,7 @@ struct IdleInputScope {
     host: Arc<dyn crate::ToolHost>,
     states: crate::ExtensionStates,
     cancellation: CancellationToken,
+    lifetime: CancellationToken,
     depth: usize,
 }
 
@@ -182,11 +184,16 @@ impl IdleInputScope {
     async fn submit(&self, input: crate::AgentInput) -> Result<()> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         self.children
-            .send(IdleChildRequest { input, reply })
+            .send(IdleChildRequest {
+                input,
+                reply,
+                lifetime: self.lifetime.clone(),
+            })
             .map_err(|_| Error::Config("idle input callback has finished".into()))?;
         tokio::select! {
             biased;
             result = receiver => result.map_err(|_| Error::Config("idle input response was lost".into()))?,
+            _ = self.lifetime.cancelled() => Err(Error::Config("idle input callback has finished".into())),
             _ = self.cancellation.cancelled() => Err(Error::Cancelled),
         }
     }
@@ -194,6 +201,7 @@ impl IdleInputScope {
 
 #[derive(Clone)]
 pub struct SessionControl {
+    scope: Option<IdleInputScope>,
     owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
@@ -281,6 +289,39 @@ impl InputHooks {
 }
 
 impl SessionControl {
+    /// Capture the current idle callback's child lane for use in a spawned task.
+    /// The returned control is valid only until that callback finishes.
+    pub fn scoped(&self) -> Result<Self> {
+        let scope = self
+            .callback_scope()
+            .ok_or_else(|| Error::Config("no idle input callback scope".into()))?;
+        if scope.lifetime.is_cancelled() {
+            return Err(Error::Config("idle input callback has finished".into()));
+        }
+        let mut control = self.clone();
+        control.scope = Some(scope);
+        Ok(control)
+    }
+
+    fn callback_scope(&self) -> Option<IdleInputScope> {
+        let local = IDLE_INPUT_SCOPE
+            .try_with(|scope| scope.clone())
+            .ok()
+            .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
+        match (local, self.scope.as_ref()) {
+            (Some(local), Some(explicit))
+                if Arc::ptr_eq(&explicit.owner, &self.owner) && explicit.depth > local.depth =>
+            {
+                Some(explicit.clone())
+            }
+            (Some(local), _) => Some(local),
+            (None, Some(explicit)) if Arc::ptr_eq(&explicit.owner, &self.owner) => {
+                Some(explicit.clone())
+            }
+            _ => None,
+        }
+    }
+
     pub fn set_retry_settings(&self, settings: crate::RetrySettings) -> Result<()> {
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
@@ -344,10 +385,7 @@ impl SessionControl {
             images,
         };
         message.validate()?;
-        let child = IDLE_INPUT_SCOPE
-            .try_with(|scope| scope.clone())
-            .ok()
-            .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
+        let child = self.callback_scope();
         if let Some(scope) = child {
             return self.enqueue_child(message, scope).await;
         }
@@ -400,6 +438,9 @@ impl SessionControl {
         mut message: QueuedMessage,
         mut scope: IdleInputScope,
     ) -> Result<Uuid> {
+        if scope.lifetime.is_cancelled() {
+            return Err(Error::Config("idle input callback has finished".into()));
+        }
         if scope.depth >= MAX_IDLE_INPUT_DEPTH {
             return Err(Error::Config(
                 "idle input callback nesting limit exceeded".into(),
@@ -415,17 +456,13 @@ impl SessionControl {
                 source: crate::InputSource::Extension,
                 streaming_behavior: None,
             };
-            let prepared = IDLE_INPUT_SCOPE
-                .scope(
-                    scope.clone(),
-                    crate::extension::prepare_input_with_host(
-                        &hooks.extensions,
-                        event,
-                        &scope.states,
-                        scope.host.clone(),
-                    ),
-                )
-                .await?;
+            let prepared = tokio::select! {
+                biased;
+                _ = scope.lifetime.cancelled() => return Err(Error::Config("idle input callback has finished".into())),
+                _ = scope.cancellation.cancelled() => return Err(Error::Cancelled),
+                result = IDLE_INPUT_SCOPE.scope(scope.clone(),
+                    crate::extension::prepare_input_with_host(&hooks.extensions, event, &scope.states, scope.host.clone())) => result?,
+            };
             let Some(prepared) = prepared else {
                 return Ok(id);
             };
@@ -487,6 +524,11 @@ impl SessionControl {
                 self.owner.config.lock().expect("run config").model_name = model;
             }
         }
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host: Arc<dyn crate::ToolHost> =
+            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let (children, mut child_requests) = mpsc::unbounded_channel();
+        let states = journal.extension_states();
         let startup = self
             .owner
             .pending_start
@@ -500,12 +542,57 @@ impl SessionControl {
                 .upgrade()
                 .ok_or_else(|| Error::Config("session is closed".into()))?;
             if registry.has_session_lifecycle_hooks() {
-                tokio::select! {
-                    _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
-                    _ = active.token.cancelled() => return Err(Error::Cancelled),
-                    result = crate::lifecycle::notify_idle_with_host(&registry, &mut journal,
-                        crate::LifecycleEvent::SessionStart { reason, previous_session_file },
-                        config.limits.tool_timeout, &mut observe) => result?,
+                let scope = IdleInputScope {
+                    owner: self.owner.clone(),
+                    children: children.clone(),
+                    host: host.clone(),
+                    states: states.clone(),
+                    cancellation: active.token.clone(),
+                    lifetime: CancellationToken::new(),
+                    depth: 0,
+                };
+                let mut errors = Vec::new();
+                let mut collect = |event: Notification<'_>| {
+                    if let Notification::ExtensionLifecycleError {
+                        extension,
+                        event,
+                        message,
+                    } = event
+                    {
+                        errors.push((extension.to_owned(), event, message.to_owned()));
+                    }
+                };
+                let future = IDLE_INPUT_SCOPE.scope(scope.clone(), async {
+                    crate::lifecycle::notify_with_host(
+                        &registry,
+                        crate::LifecycleEvent::SessionStart {
+                            reason,
+                            previous_session_file,
+                        },
+                        &states,
+                        config.limits.tool_timeout,
+                        &mut collect,
+                        host.clone(),
+                    )
+                    .await;
+                    Ok(())
+                });
+                pump_idle_callback(
+                    &mut journal,
+                    &mut observe,
+                    &mut incoming,
+                    &mut child_requests,
+                    closed,
+                    &scope,
+                    future,
+                )
+                .await?;
+                for (extension, event, message) in &errors {
+                    observe(Notification::ExtensionLifecycleError {
+                        extension,
+                        event,
+                        message,
+                    });
                 }
             }
         }
@@ -515,10 +602,6 @@ impl SessionControl {
             source: crate::InputSource::Extension,
             streaming_behavior: None,
         };
-        let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn crate::ToolHost> =
-            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
-        let (children, mut child_requests) = mpsc::unbounded_channel();
         let states = journal.extension_states();
         let scope = IdleInputScope {
             owner: self.owner.clone(),
@@ -526,43 +609,24 @@ impl SessionControl {
             host: host.clone(),
             states: states.clone(),
             cancellation: active.token.clone(),
+            lifetime: CancellationToken::new(),
             depth: 0,
         };
         let future = IDLE_INPUT_SCOPE.scope(
-            scope,
+            scope.clone(),
             crate::extension::prepare_input_with_host(&hooks.extensions, event, &states, host),
         );
-        tokio::pin!(future);
-        let prepared = loop {
-            tokio::select! {
-                biased;
-                Some((input, reply)) = incoming.recv() => {
-                    let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
-                        crate::agent::queue_custom_message(&mut journal, input, &mut observe)
-                    } else {
-                        journal.append_custom_message(input.message).map(|()| observe(Notification::Committed(journal.records().last().expect("appended custom message"))))
-                    };
-                    match result {
-                        Ok(()) => { let _ = reply.send(Ok(())); }
-                        Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
-                    }
-                }
-                Some(child) = child_requests.recv() => {
-                    if child.reply.is_closed() {
-                        continue;
-                    }
-                    if active.token.is_cancelled() || closed.is_cancelled() {
-                        let _ = child.reply.send(Err(Error::Cancelled));
-                        continue;
-                    }
-                    let result = child.input.apply(&mut journal, &mut observe);
-                    let _ = child.reply.send(result);
-                }
-                _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
-                _ = active.token.cancelled() => return Err(Error::Cancelled),
-                result = &mut future => break result?,
-            }
-        };
+        let prepared = pump_idle_callback(
+            &mut journal,
+            &mut observe,
+            &mut incoming,
+            &mut child_requests,
+            closed,
+            &scope,
+            future,
+        )
+        .await?;
+        drop(child_requests);
         if let Some(prepared) = prepared {
             message.input.content = prepared.text;
             message.images = prepared.images;
@@ -663,12 +727,8 @@ impl SessionControl {
                         emit(events, &notification);
                     }
                 },
-                IDLE_INPUT_SCOPE
-                    .try_with(|scope| {
-                        Arc::ptr_eq(&scope.owner, &self.owner).then(|| scope.host.clone())
-                    })
-                    .ok()
-                    .flatten()
+                self.callback_scope()
+                    .map(|scope| scope.host)
                     .unwrap_or_else(|| {
                         Arc::new(InputMessageHost {
                             input: self.input.clone(),
@@ -684,10 +744,7 @@ impl SessionControl {
         input: impl FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> crate::AgentInput,
     ) -> Result<T> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
-        let child = IDLE_INPUT_SCOPE
-            .try_with(|scope| scope.clone())
-            .ok()
-            .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
+        let child = self.callback_scope();
         if let Some(scope) = child {
             scope.submit(input(reply)).await?;
             return receiver
@@ -878,6 +935,7 @@ impl SessionBuilder {
             input,
             events: Some(events),
             control: SessionControl {
+                scope: None,
                 owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
@@ -2038,6 +2096,60 @@ impl Drop for AgentSession {
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
+struct IdleScopeGuard(CancellationToken);
+impl Drop for IdleScopeGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+async fn pump_idle_callback<T, F>(
+    journal: &mut Session,
+    observer: &mut Observer<'_>,
+    incoming: &mut mpsc::Receiver<(
+        crate::QueuedCustomMessage,
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+    children: &mut mpsc::UnboundedReceiver<IdleChildRequest>,
+    closed: &CancellationToken,
+    scope: &IdleInputScope,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let _scope_guard = IdleScopeGuard(scope.lifetime.clone());
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            Some((input, reply)) = incoming.recv() => {
+                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    crate::agent::queue_custom_message(journal, input, observer)
+                } else {
+                    journal.append_custom_message(input.message).map(|()| observer(Notification::Committed(journal.records().last().expect("appended custom message"))))
+                };
+                match result {
+                    Ok(()) => { let _ = reply.send(Ok(())); }
+                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                }
+            }
+            Some(child) = children.recv() => {
+                if child.reply.is_closed() { continue; }
+                if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || closed.is_cancelled() {
+                    let _ = child.reply.send(Err(Error::Cancelled));
+                    continue;
+                }
+                let result = child.input.apply(journal, observer);
+                let _ = child.reply.send(result);
+            }
+            _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
+            _ = scope.cancellation.cancelled() => return Err(Error::Cancelled),
+            result = &mut future => return result,
+        }
+    }
+}
+
 /// Prepare an input while the session owner services durable extension messages.
 /// The owner must continue polling this future until completion or cancellation;
 /// acknowledging a host call before its journal write would lose messages on restart.
@@ -8989,6 +9101,136 @@ mod tests {
                 usize::from(after_commit)
             );
         }
+    }
+
+    struct SpawnScopedHook {
+        control: Arc<Mutex<Option<SessionControl>>>,
+        saved: Arc<Mutex<Option<SessionControl>>>,
+        startup: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for SpawnScopedHook {
+        fn id(&self) -> &str {
+            "spawn-scoped-hook"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn input(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if event.text == "parent" && !self.startup {
+                let control = self
+                    .control
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap()
+                    .scoped()
+                    .map_err(|error| error.to_string())?;
+                *self.saved.lock().unwrap() = Some(control.clone());
+                tokio::spawn(async move { control.steer("spawned child").await })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if self.startup && matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let control = self
+                    .control
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap()
+                    .scoped()
+                    .map_err(|error| error.to_string())?;
+                *self.saved.lock().unwrap() = Some(control.clone());
+                tokio::spawn(async move {
+                    control.follow_up("startup child").await?;
+                    control
+                        .set_queue_mode(InputKind::Steer, crate::QueueMode::All)
+                        .await
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn scoped_control_can_move_into_spawned_input_callback_task() {
+        let slot = Arc::new(Mutex::new(None));
+        let saved = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(SpawnScopedHook {
+                control: slot.clone(),
+                saved: saved.clone(),
+                startup: false,
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        *slot.lock().unwrap() = Some(control.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+            .await
+            .expect("spawned child deadlocked")
+            .unwrap();
+        let queued = session.clear_queued_inputs().unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.input.content.as_str())
+                .collect::<Vec<_>>(),
+            ["spawned child", "parent"]
+        );
+        let stale = saved.lock().unwrap().clone().unwrap();
+        assert!(stale.steer("late").await.is_err());
+    }
+    #[tokio::test]
+    async fn first_session_start_services_spawned_scoped_controls() {
+        let slot = Arc::new(Mutex::new(None));
+        let saved = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(SpawnScopedHook {
+                control: slot.clone(),
+                saved: saved.clone(),
+                startup: true,
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        *slot.lock().unwrap() = Some(control.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+            .await
+            .expect("startup child deadlocked")
+            .unwrap();
+        let queued = session.clear_queued_inputs().unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.input.content.as_str())
+                .collect::<Vec<_>>(),
+            ["startup child", "parent"]
+        );
+        let stale = saved.lock().unwrap().clone().unwrap();
+        assert!(stale.follow_up("late").await.is_err());
     }
 
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);

@@ -2830,8 +2830,10 @@ The SDK supplies a message host to initial input hooks and to `SessionControl`
 input hooks while idle or during a run. Idle host sends are acknowledged after
 journaling, and trigger messages start a run through the shared session owner.
 Directly awaited control calls from an idle input callback use a bounded
-callback-scoped child lane; independently spawned tasks enter the normal FIFO
-admission queue because Tokio task-local scope is not inherited by spawned tasks.
+callback-scoped child lane. To await a control call in a spawned task, capture
+`SessionControl::scoped()` inside the callback and move the returned control
+into that task. The scoped control expires when the callback finishes; ordinary
+clones used by independently spawned tasks enter the normal FIFO queue.
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
