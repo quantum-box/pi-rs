@@ -179,19 +179,33 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for BedrockConnector {
                 ))))
             });
         };
-        let metadata = matches!(
-            url.host_str().map(|h| h.trim_matches(['[', ']'])),
-            Some(
-                "169.254.169.254"
-                    | "fd00:ec2::254"
-                    | "169.254.170.2"
-                    | "169.254.170.23"
-                    | "fd00:ec2::23"
+        // The SDK also permits an IMDS endpoint in an AWS profile, which is
+        // not available in the process environment. Recognize IMDSv2's token
+        // and authenticated metadata requests so those remain direct too.
+        let imds_request = (request.method() == "PUT"
+            && url.path().ends_with("/latest/api/token")
+            && request
+                .headers()
+                .get("x-aws-ec2-metadata-token-ttl-seconds")
+                .is_some())
+            || (request.method() == "GET"
+                && url.path().contains("/latest/meta-data/")
+                && request.headers().get("x-aws-ec2-metadata-token").is_some());
+        let metadata = imds_request
+            || matches!(
+                url.host_str().map(|h| h.trim_matches(['[', ']'])),
+                Some(
+                    "169.254.169.254"
+                        | "fd00:ec2::254"
+                        | "169.254.170.2"
+                        | "169.254.170.23"
+                        | "fd00:ec2::23"
+                )
             )
-        ) || self
-            .metadata_origins
-            .iter()
-            .any(|endpoint| endpoint.origin() == url.origin());
+            || self
+                .metadata_origins
+                .iter()
+                .any(|endpoint| endpoint.origin() == url.origin());
         let proxy = if metadata || bedrock_bypasses_proxy(&url, &self.excluded) {
             None
         } else {
