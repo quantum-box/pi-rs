@@ -34,15 +34,20 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
     if input.is_file() || input.components().count() != 1 {
         return Ok(input.to_path_buf());
     }
+    let explicit_filename = input
+        .extension()
+        .is_some_and(|extension| extension == "jsonl");
     let Some(query) = input.to_str().filter(|query| !query.is_empty()) else {
         return Ok(input.to_path_buf());
     };
-    if !directory.is_dir() {
-        return Ok(input.to_path_buf());
-    }
     let mut matches = Vec::new();
     let mut exact_ids = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.into_iter().flatten() {
         let path = entry?.path();
         if path
             .extension()
@@ -62,7 +67,7 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
         if id == query {
             exact_ids.push(path.clone());
         }
-        if stem.starts_with(query) || id.starts_with(query) {
+        if !explicit_filename && (stem.starts_with(query) || id.starts_with(query)) {
             matches.push(path);
         }
     }
@@ -70,7 +75,10 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
         matches = exact_ids;
     }
     match matches.len() {
-        0 => Ok(input.to_path_buf()),
+        0 if explicit_filename => Ok(input.to_path_buf()),
+        0 => Err(Error::Config(format!(
+            "No session found matching '{query}'"
+        ))),
         1 => Ok(matches.remove(0)),
         _ => Err(Error::Config(format!(
             "ambiguous session ID {query:?}; use a longer ID or a file path"
@@ -1112,6 +1120,51 @@ mod tests {
         for valid in ["one", "Run_2.3", "a-b"] {
             assert!(validate_id(valid).is_ok());
         }
+    }
+
+    #[test]
+    fn missing_session_id_is_not_treated_as_a_new_file() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [root.path().to_path_buf(), root.path().join("missing")] {
+            let error = resolve_reference(Path::new("unknown-id"), &directory).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("No session found matching 'unknown-id'")
+            );
+            assert_eq!(
+                resolve_reference(Path::new("new.jsonl"), &directory).unwrap(),
+                Path::new("new.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    fn jsonl_reference_prefers_exact_stored_stem_before_filename_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("work.jsonl.jsonl");
+        drop(Session::open(&path).unwrap());
+        assert_eq!(
+            resolve_reference(Path::new("work.jsonl"), root.path()).unwrap(),
+            path
+        );
+        assert_eq!(
+            resolve_reference(Path::new("other.jsonl"), root.path()).unwrap(),
+            Path::new("other.jsonl")
+        );
+        let other = tempfile::tempdir().unwrap();
+        drop(Session::open(other.path().join("work.jsonl-extra.jsonl")).unwrap());
+        // An explicit filename must not select a longer, merely prefix-matching stem.
+        assert_eq!(
+            resolve_reference(Path::new("work.jsonl"), other.path()).unwrap(),
+            Path::new("work.jsonl")
+        );
+        let header_path = other.path().join("header.jsonl");
+        std::fs::write(&header_path, "{\"id\":\"journal.jsonl\"}\n").unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("journal.jsonl"), other.path()).unwrap(),
+            header_path
+        );
     }
 
     #[test]

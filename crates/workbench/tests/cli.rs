@@ -10,6 +10,66 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn jsonl_session_id_can_be_opened_by_session_and_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let sessions = root.path().join("sessions");
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+            .arg(&sessions)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let created = run(&["--session-id", "work.jsonl", "name", "existing-marker"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(sessions.join("work.jsonl.jsonl").is_file());
+    for reference in [vec!["--session", "work.jsonl"], vec!["--resume=work.jsonl"]] {
+        let mut arguments = reference;
+        arguments.push("inspect");
+        let output = run(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("existing-marker"));
+    }
+    assert!(!root.path().join("work.jsonl").exists());
+}
+
+#[test]
+fn missing_session_id_does_not_create_a_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--session",
+            "missing-id",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No session found matching 'missing-id'")
+    );
+    assert!(!root.path().join("missing-id").exists());
+}
+
+#[test]
 fn uninstall_alias_removes_packages_in_the_selected_scope() {
     for command in ["remove", "uninstall"] {
         let root = tempfile::tempdir().unwrap();
