@@ -6924,6 +6924,86 @@ mod tests {
             )])))
         }
     }
+    struct PrepareRetryModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for PrepareRetryModel {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::RetryableModel("prepare again".into()))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::iter([Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    struct RetryTurnStartHook;
+    #[async_trait::async_trait]
+    impl Extension for RetryTurnStartHook {
+        fn id(&self) -> &str {
+            "retry-turn-start"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::TurnStart { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "retry-turn-start".into(),
+                        content: crate::ContextContent::Text("delivered".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn retryable_prepare_context_keeps_turn_start_host() {
+        let mut session =
+            SessionBuilder::new(Arc::new(PrepareRetryModel(AtomicUsize::new(0))), "fixture")
+                .extension(Arc::new(RetryTurnStartHook))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+        session
+            .controls()
+            .set_retry_settings(crate::RetrySettings {
+                enabled: true,
+                max_retries: 1,
+                base_delay_ms: 0,
+                max_agent_delay_ms: 0,
+            })
+            .unwrap();
+        session.prompt("prompt").await.unwrap();
+        let queued = session.journal().unwrap().queued_custom_messages();
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|(_, item)| item.message.custom_type == "retry-turn-start")
+                .count(),
+            1
+        );
+    }
+
     struct RetryRequestHook(AtomicUsize);
     #[async_trait::async_trait]
     impl Extension for RetryRequestHook {

@@ -1189,13 +1189,14 @@ impl Agent<'_> {
                     {
                         if lifecycle && retry_attempt == 0 {
                             active
-                                .observe_lifecycle(
+                                .observe_active_lifecycle(
+                                    session,
                                     turn_start(false),
                                     &states,
-                                    Some(cancel),
+                                    cancel,
                                     observer,
                                 )
-                                .await;
+                                .await?;
                         }
                         let control = session.retry_control();
                         let settings = control.settings();

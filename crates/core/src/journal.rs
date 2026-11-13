@@ -1740,6 +1740,17 @@ impl Session {
             .enumerate()
             .map(|(index, record)| (record.id, index as u64 + 1))
             .collect();
+        // Tree messages are consumed session-wide, even when their delivery is
+        // on a branch that is absent from the fork's ancestry.
+        let globally_consumed: std::collections::HashSet<Uuid> = self
+            .records
+            .iter()
+            .flat_map(|record| match &record.event {
+                Event::CustomMessageDelivered { id, .. } => vec![*id],
+                Event::InputQueueCleared { ids } => ids.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
         let mut records = Vec::new();
         for record in branch {
             let summary_metadata = record
@@ -1748,6 +1759,13 @@ impl Session {
             let mut record = record.clone();
             record.id = ids[&record.id];
             record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
+            if matches!(&record.event, Event::TreeMessageQueued { input } if globally_consumed.contains(&input.id))
+            {
+                record.event = Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                };
+            }
             match &mut record.event {
                 Event::Created { session_id } => {
                     *session_id = Uuid::new_v4();
@@ -2883,6 +2901,42 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn fork_does_not_resurrect_tree_message_consumed_on_another_branch() {
+        for delivery in [
+            crate::CustomMessageDelivery::TriggerTurn,
+            crate::CustomMessageDelivery::NextTurn,
+        ] {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "tree".into(),
+                content: crate::ContextContent::Text("once".into()),
+                display: false,
+                details: None,
+            };
+            session
+                .append(Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id,
+                        message: message.clone(),
+                        delivery,
+                    },
+                })
+                .unwrap();
+            let source = session.head();
+            session.checkout(1).unwrap();
+            session
+                .append(Event::CustomMessageDelivered { id, message })
+                .unwrap();
+            session.checkout(source).unwrap();
+            assert!(session.queued_custom_messages().is_empty());
+            let fork = Session::from_records(session.fork_records(source).unwrap()).unwrap();
+            assert!(fork.queued_custom_messages().is_empty());
+            assert_eq!(fork.pending_custom_trigger(), None);
+        }
+    }
 
     #[test]
     fn tree_trigger_restore_rejects_an_unsettled_current_branch() {
