@@ -1428,6 +1428,8 @@ struct DuplexRequest {
     has_progress: bool,
     #[serde(default)]
     has_custom_messages: bool,
+    #[serde(default)]
+    has_keyed_messages: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1435,6 +1437,8 @@ enum DuplexFrame {
     SendMessage {
         message: pi_rs_core::CustomMessage,
         delivery: pi_rs_core::CustomMessageDelivery,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Progress {
         partial_result: Value,
@@ -1625,6 +1629,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_ui: host.has_ui(),
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
+                has_keyed_messages: host.supports_keyed_messages(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -1639,12 +1644,16 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
-            Ok(Ok(DuplexFrame::SendMessage { message, delivery })) => {
+            Ok(Ok(DuplexFrame::SendMessage {
+                message,
+                delivery,
+                key,
+            })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during message delivery".to_owned()),
-                        result = host.send_message(message, delivery) => result,
+                        result = async { match key { Some(key) => host.send_message_with_key(message, delivery, &key).await, None => host.send_message(message, delivery).await } } => result,
                     }
                 });
                 writer
@@ -1712,6 +1721,7 @@ struct RemoteHost {
     has_ui: bool,
     has_progress: bool,
     has_custom_messages: bool,
+    has_keyed_messages: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
 }
 #[async_trait::async_trait]
@@ -1772,7 +1782,45 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::SendMessage { message, delivery })?;
+            write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: None,
+                },
+            )?;
+            read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.has_keyed_messages
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        if !self.has_keyed_messages {
+            return Err("keyed custom messages are unavailable".into());
+        }
+        let io = self.io.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: Some(key),
+                },
+            )?;
             read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
@@ -1811,6 +1859,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         has_ui: request.has_ui,
         has_progress: request.has_progress,
         has_custom_messages: request.has_custom_messages,
+        has_keyed_messages: request.has_keyed_messages,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2590,6 +2639,20 @@ mod tests {
         }))
         .unwrap();
         assert!(!request.has_progress);
+        assert!(!request.has_keyed_messages);
+        let legacy: DuplexFrame = serde_json::from_value(serde_json::json!({"type":"send_message","message":{"customType":"test","content":"hello","display":false},"delivery":"steer"})).unwrap();
+        assert!(matches!(legacy, DuplexFrame::SendMessage { key: None, .. }));
+        let keyed = DuplexFrame::SendMessage {
+            message: pi_rs_core::CustomMessage {
+                custom_type: "test".into(),
+                content: pi_rs_core::ContextContent::Text("hello".into()),
+                display: false,
+                details: None,
+            },
+            delivery: pi_rs_core::CustomMessageDelivery::Steer,
+            key: Some("stable".into()),
+        };
+        assert_eq!(serde_json::to_value(keyed).unwrap()["key"], "stable");
         let frame = DuplexFrame::Progress {
             partial_result: serde_json::json!({"text":"halfway"}),
         };
@@ -3085,14 +3148,19 @@ else:
             fn supports_custom_messages(&self) -> bool {
                 true
             }
+            fn supports_keyed_messages(&self) -> bool {
+                true
+            }
             async fn call(&self, _: &str, _: Value) -> Outcome {
                 Outcome::Skipped("unused".into())
             }
-            async fn send_message(
+            async fn send_message_with_key(
                 &self,
                 message: pi_rs_core::CustomMessage,
                 delivery: pi_rs_core::CustomMessageDelivery,
+                key: &str,
             ) -> ExtensionResult<()> {
+                assert_eq!(key, "stable");
                 assert_eq!(message.custom_type, "from-hook");
                 assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::TriggerTurn);
                 Ok(())
@@ -3106,8 +3174,8 @@ if '--pi-rs-extension-v1' in sys.argv:
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     r=json.loads(sys.stdin.readline())
-    assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True
-    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
+    assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True and r['has_keyed_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','key':'stable','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
     assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
 "##;

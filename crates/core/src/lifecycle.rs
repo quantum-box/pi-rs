@@ -425,7 +425,12 @@ async fn notify_inner(
             match &host {
                 Some(host) => {
                     extension
-                        .lifecycle_with_host(&event, states.get(extension.id()), host.clone())
+                        .lifecycle_with_host(
+                            &event,
+                            states.get(extension.id()),
+                            host.for_extension(extension.id())
+                                .unwrap_or_else(|| host.clone()),
+                        )
                         .await
                 }
                 None => {

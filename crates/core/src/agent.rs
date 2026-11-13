@@ -301,7 +301,7 @@ impl Agent<'_> {
             observer,
         )?;
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        if lifecycle {
+        let start_result = if lifecycle {
             let states = session.extension_states();
             self.observe_active_lifecycle(
                 session,
@@ -314,8 +314,10 @@ impl Agent<'_> {
                 cancel,
                 observer,
             )
-            .await?;
-        }
+            .await
+        } else {
+            Ok(())
+        };
         let mut retry_attempt = 0;
         let mut retry_observer = |event: Notification<'_>| {
             match &event {
@@ -327,16 +329,20 @@ impl Agent<'_> {
             }
             observer(event);
         };
-        let mut result = self
-            .drive(
-                session,
-                run_id,
-                effective_input,
-                followups,
-                cancel,
-                &mut retry_observer,
-            )
-            .await;
+        let mut result = match start_result {
+            Ok(()) => {
+                self.drive(
+                    session,
+                    run_id,
+                    effective_input,
+                    followups,
+                    cancel,
+                    &mut retry_observer,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         if retry_attempt > 0 {
             observer(Notification::Retry(crate::RetryEvent::End {
                 success: result.is_ok(),
@@ -454,40 +460,13 @@ impl Agent<'_> {
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn ToolHost> = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
-                let branch = session.branch();
-                let prior_ids = branch
-                    .iter()
-                    .position(|record| {
-                        record.run_id == Some(*run_id)
-                            && matches!(
-                                record.event,
-                                Event::Run {
-                                    state: RunState::Running,
-                                    ..
-                                }
-                            )
-                    })
-                    .map(|start| {
-                        branch
-                            .iter()
-                            .skip(start + 1)
-                            .take_while(|record| {
-                                record.run_id == Some(*run_id)
-                                    && matches!(record.event, Event::CustomMessageQueued { .. })
-                            })
-                            .filter_map(|record| match &record.event {
-                                Event::CustomMessageQueued { input } => Some(input.id),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Arc::new(ReplayLifecycleMessageHost {
-                    sender,
-                    run_id: *run_id,
-                    prior_ids,
-                    ordinal: AtomicUsize::new(0),
-                })
+                callback_root_host(session, sender, *run_id, "agent_start")
+            }
+            crate::LifecycleEvent::TurnStart { run_id, .. } => {
+                callback_root_host(session, sender, *run_id, "turn_start")
+            }
+            crate::LifecycleEvent::TurnEnd { run_id, .. } => {
+                callback_root_host(session, sender, *run_id, "turn_end")
             }
             _ => Arc::new(LifecycleMessageHost {
                 sender,
@@ -1152,10 +1131,15 @@ impl Agent<'_> {
         };
         for extension in &self.registry.extensions {
             let (sender, mut incoming) = mpsc::channel(32);
-            let host = Arc::new(LifecycleMessageHost {
-                sender,
-                idle: false,
-            });
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(session, sender, run_id, "before_request")
+                    .for_extension(extension.id())
+                    .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
+            };
             let result = {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
@@ -1190,10 +1174,15 @@ impl Agent<'_> {
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
             let (sender, mut incoming) = mpsc::channel(32);
-            let host = Arc::new(LifecycleMessageHost {
-                sender,
-                idle: false,
-            });
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(session, sender, run_id, "context_with_system")
+                    .for_extension(extension.id())
+                    .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
+            };
             let result = {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
@@ -2941,49 +2930,86 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
-struct ReplayLifecycleMessageHost {
-    sender: mpsc::Sender<(
-        crate::QueuedCustomMessage,
-        oneshot::Sender<std::result::Result<(), String>>,
-    )>,
+type CallbackMessageSender = mpsc::Sender<(
+    crate::QueuedCustomMessage,
+    oneshot::Sender<std::result::Result<(), String>>,
+)>;
+
+fn callback_root_host(
+    session: &Session,
+    sender: CallbackMessageSender,
     run_id: Uuid,
-    prior_ids: Vec<Uuid>,
-    ordinal: AtomicUsize,
+    phase: &'static str,
+) -> Arc<dyn ToolHost> {
+    let replay = session
+        .branch()
+        .iter()
+        .filter(|record| {
+            record.run_id == Some(run_id)
+                && matches!(
+                    record.event,
+                    Event::Run {
+                        state: RunState::Running,
+                        ..
+                    }
+                )
+        })
+        .count()
+        > 1;
+    Arc::new(CallbackRootHost {
+        sender,
+        run_id,
+        phase,
+        replay,
+    })
+}
+
+struct CallbackRootHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: &'static str,
+    replay: bool,
 }
 #[async_trait::async_trait]
-impl ToolHost for ReplayLifecycleMessageHost {
+impl ToolHost for CallbackRootHost {
     fn tools(&self) -> Vec<ToolSpec> {
         Vec::new()
     }
-    fn supports_custom_messages(&self) -> bool {
-        true
+    fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        Some(Arc::new(ScopedCallbackHost {
+            sender: self.sender.clone(),
+            run_id: self.run_id,
+            phase: self.phase,
+            extension_id: extension_id.to_owned(),
+            replay: self.replay,
+        }))
     }
     async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
-        Outcome::Skipped("tool calls unavailable in lifecycle hooks".into())
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
     }
-    async fn send_message(
+}
+
+struct ScopedCallbackHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: &'static str,
+    extension_id: String,
+    replay: bool,
+}
+impl ScopedCallbackHost {
+    async fn submit(
         &self,
         message: crate::CustomMessage,
         delivery: crate::CustomMessageDelivery,
+        id: Uuid,
     ) -> crate::ExtensionResult<()> {
-        use sha2::{Digest, Sha256};
         crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
-        let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst);
-        let mut digest = Sha256::new();
-        digest.update(b"pi-rs:agent-start-message:v1");
-        digest.update(self.run_id.as_bytes());
-        digest.update((ordinal as u64).to_be_bytes());
-        let bytes = digest.finalize();
-        let id =
-            self.prior_ids.get(ordinal).copied().unwrap_or_else(|| {
-                Uuid::from_bytes(bytes[..16].try_into().expect("digest length"))
-            });
         let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
             crate::CustomMessageDelivery::Steer
         } else {
             delivery
         };
-        let (reply, result) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
         self.sender
             .send((
                 crate::QueuedCustomMessage {
@@ -2994,10 +3020,60 @@ impl ToolHost for ReplayLifecycleMessageHost {
                 reply,
             ))
             .await
-            .map_err(|_| "lifecycle hook has finished".to_owned())?;
-        result
+            .map_err(|_| "callback has finished".to_owned())?;
+        response
             .await
-            .map_err(|_| "lifecycle message response was lost".to_owned())?
+            .map_err(|_| "callback message acknowledgement was lost".to_owned())?
+    }
+}
+#[async_trait::async_trait]
+impl ToolHost for ScopedCallbackHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        if self.replay {
+            return Err("unkeyed callback messages are unavailable during recovery; use a stable message key".into());
+        }
+        self.submit(message, delivery, Uuid::new_v4()).await
+    }
+    async fn send_message_with_key(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        key: &str,
+    ) -> crate::ExtensionResult<()> {
+        use sha2::{Digest, Sha256};
+        if key.is_empty() || key.len() > 256 {
+            return Err("message key must contain 1 to 256 bytes".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"pi-rs:callback-message:v2");
+        digest.update(self.run_id.as_bytes());
+        for value in [self.phase, self.extension_id.as_str(), key] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        let bytes = digest.finalize();
+        self.submit(
+            message,
+            delivery,
+            Uuid::from_bytes(bytes[..16].try_into().expect("digest length")),
+        )
+        .await
     }
 }
 

@@ -523,6 +523,10 @@ impl Session {
         self.run_id = run_id;
     }
 
+    pub(crate) fn current_run_id(&self) -> Option<Uuid> {
+        self.run_id
+    }
+
     /// Bind an otherwise empty session to a host security scope. Reopening
     /// requires the same scope. A local CLI cannot resume a bound session.
     pub fn bind_host(&mut self, scope_digest: &str) -> Result<()> {

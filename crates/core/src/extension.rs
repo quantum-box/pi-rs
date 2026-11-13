@@ -287,6 +287,23 @@ pub trait ToolHost: Send + Sync {
     ) -> ExtensionResult<()> {
         Err("custom message delivery is unavailable".into())
     }
+    /// Whether stable, extension-supplied message keys are supported here.
+    fn supports_keyed_messages(&self) -> bool {
+        false
+    }
+    /// Send with a stable key unique to this extension and callback phase within a run.
+    async fn send_message_with_key(
+        &self,
+        _message: CustomMessage,
+        _delivery: CustomMessageDelivery,
+        _key: &str,
+    ) -> ExtensionResult<()> {
+        Err("keyed custom messages are unavailable".into())
+    }
+    /// Scope a callback host to the extension being invoked.
+    fn for_extension(&self, _extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        None
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
     /// Submit an ordered group together so compatible reads can overlap.
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
