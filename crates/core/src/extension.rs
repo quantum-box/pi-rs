@@ -362,6 +362,230 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
+/// A hook's reported change status. The host tracks mutable access separately;
+/// this status never proves that assistant messages were left unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextChange {
+    Unchanged,
+    Changed,
+}
+
+/// An index-relative edit that can only insert or remove user messages.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextUserEdit {
+    Insert {
+        index: usize,
+        message: crate::Message,
+    },
+    Remove {
+        index: usize,
+    },
+}
+
+/// A host-owned record of mutable access, retained independently of the wrapper.
+#[derive(Clone, Default)]
+pub struct ContextAccess {
+    assistant_accessed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    touched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    user_edits: std::sync::Arc<std::sync::Mutex<Vec<ContextUserEdit>>>,
+}
+impl ContextAccess {
+    pub fn assistant_accessed(&self) -> bool {
+        self.assistant_accessed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn touched(&self) -> bool {
+        self.touched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn user_edits(&self) -> Vec<ContextUserEdit> {
+        self.user_edits.lock().expect("context edits").clone()
+    }
+    fn record_user_edit(&self, edit: ContextUserEdit) -> ExtensionResult<()> {
+        let mut edits = self
+            .user_edits
+            .lock()
+            .map_err(|_| "context edit tracker failed".to_owned())?;
+        if edits.len() >= 4096 {
+            return Err("too many context user edits".into());
+        }
+        edits.push(edit);
+        self.mark_safe();
+        Ok(())
+    }
+    fn mark_safe(&self) {
+        self.touched
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn mark_assistant(&self) {
+        self.mark_safe();
+        self.assistant_accessed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// A tool-call assistant and its contiguous results are one provider turn.
+// Do not insert while any of its calls are still awaiting results, or between
+// contiguous results (including malformed/extra results already in history).
+fn splits_tool_group(messages: &[crate::Message], index: usize) -> bool {
+    if index > 0
+        && matches!(messages.get(index), Some(crate::Message::Tool { .. }))
+        && (matches!(messages.get(index - 1), Some(crate::Message::Tool { .. }))
+            || matches!(messages.get(index - 1), Some(crate::Message::Assistant { calls, .. }) if !calls.is_empty()))
+    {
+        return true;
+    }
+    let mut start = index;
+    while start > 0 && matches!(messages[start - 1], crate::Message::Tool { .. }) {
+        start -= 1;
+    }
+    let Some(crate::Message::Assistant { calls, .. }) =
+        start.checked_sub(1).and_then(|i| messages.get(i))
+    else {
+        return false;
+    };
+    let mut outstanding = BTreeMap::<&str, usize>::new();
+    for call in calls {
+        *outstanding.entry(&call.id).or_default() += 1;
+    }
+    for message in &messages[start..index] {
+        if let crate::Message::Tool { call_id, .. } = message
+            && let Some(count) = outstanding.get_mut(call_id.as_str())
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+    outstanding.values().any(|count| *count != 0)
+}
+
+fn insert_context_user(
+    messages: &mut Vec<crate::Message>,
+    access: &ContextAccess,
+    index: usize,
+    message: crate::Message,
+) -> ExtensionResult<()> {
+    if index > messages.len()
+        || !matches!(
+            message,
+            crate::Message::User { .. } | crate::Message::UserWithImages { .. }
+        )
+    {
+        return Err("context insertion must be a user message at a valid index".into());
+    }
+    if splits_tool_group(messages, index) {
+        return Err("context insertion cannot split an assistant tool-call/result group".into());
+    }
+    access.record_user_edit(ContextUserEdit::Insert {
+        index,
+        message: message.clone(),
+    })?;
+    messages.insert(index, message);
+    Ok(())
+}
+fn remove_context_user(
+    messages: &mut Vec<crate::Message>,
+    access: &ContextAccess,
+    index: usize,
+) -> ExtensionResult<crate::Message> {
+    if !matches!(
+        messages.get(index),
+        Some(crate::Message::User { .. } | crate::Message::UserWithImages { .. })
+    ) {
+        return Err("context removal must target a user message".into());
+    }
+    access.record_user_edit(ContextUserEdit::Remove { index })?;
+    Ok(messages.remove(index))
+}
+
+/// A portable request with host-tracked mutable access. General mutable access
+/// invalidates private assistant replay, even if the result compares equal.
+pub struct ContextRequest<'a> {
+    request: &'a mut ModelRequest,
+    access: ContextAccess,
+}
+impl<'a> ContextRequest<'a> {
+    pub fn new(request: &'a mut ModelRequest) -> Self {
+        Self {
+            request,
+            access: ContextAccess::default(),
+        }
+    }
+    pub fn access(&self) -> ContextAccess {
+        self.access.clone()
+    }
+    pub fn insert_user(&mut self, index: usize, message: crate::Message) -> ExtensionResult<()> {
+        insert_context_user(&mut self.request.messages, &self.access, index, message)
+    }
+    pub fn remove_user(&mut self, index: usize) -> ExtensionResult<crate::Message> {
+        remove_context_user(&mut self.request.messages, &self.access, index)
+    }
+    pub fn tools_mut(&mut self) -> &mut Vec<crate::ToolSpec> {
+        self.access.mark_safe();
+        &mut self.request.tools
+    }
+    pub fn system_content_mut(&mut self) -> Option<&mut String> {
+        self.access.mark_safe();
+        match self.request.messages.first_mut() {
+            Some(crate::Message::System { content }) => Some(content),
+            _ => None,
+        }
+    }
+}
+impl std::ops::Deref for ContextRequest<'_> {
+    type Target = ModelRequest;
+    fn deref(&self) -> &Self::Target {
+        self.request
+    }
+}
+impl std::ops::DerefMut for ContextRequest<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.access.mark_assistant();
+        self.request
+    }
+}
+
+/// A portable message list; general mutable access invalidates assistant replay.
+pub struct ContextMessages<'a> {
+    messages: &'a mut Vec<crate::Message>,
+    access: ContextAccess,
+}
+impl<'a> ContextMessages<'a> {
+    pub fn new(messages: &'a mut Vec<crate::Message>) -> Self {
+        Self {
+            messages,
+            access: ContextAccess::default(),
+        }
+    }
+    pub fn access(&self) -> ContextAccess {
+        self.access.clone()
+    }
+    pub fn insert_user(&mut self, index: usize, message: crate::Message) -> ExtensionResult<()> {
+        insert_context_user(self.messages, &self.access, index, message)
+    }
+    pub fn remove_user(&mut self, index: usize) -> ExtensionResult<crate::Message> {
+        remove_context_user(self.messages, &self.access, index)
+    }
+    pub fn system_content_mut(&mut self) -> Option<&mut String> {
+        self.access.mark_safe();
+        match self.messages.first_mut() {
+            Some(crate::Message::System { content }) => Some(content),
+            _ => None,
+        }
+    }
+}
+impl std::ops::Deref for ContextMessages<'_> {
+    type Target = Vec<crate::Message>;
+    fn deref(&self) -> &Self::Target {
+        self.messages
+    }
+}
+impl std::ops::DerefMut for ContextMessages<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.access.mark_assistant();
+        self.messages
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestPurpose {
     Turn,
@@ -679,18 +903,18 @@ pub trait Extension: Send + Sync {
 
     fn context(
         &self,
-        _request: &mut ModelRequest,
+        _request: &mut ContextRequest<'_>,
         _state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        Ok(())
+    ) -> ExtensionResult<ContextChange> {
+        Ok(ContextChange::Unchanged)
     }
 
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut ContextRequest<'_>,
         _purpose: RequestPurpose,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<ContextChange> {
         self.context(request, state)
     }
 
@@ -702,10 +926,10 @@ pub trait Extension: Send + Sync {
     /// Transform the provider-visible messages, including system messages.
     async fn context_with_system(
         &self,
-        _messages: &mut Vec<crate::Message>,
+        _messages: &mut ContextMessages<'_>,
         _state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        Ok(())
+    ) -> ExtensionResult<ContextChange> {
+        Ok(ContextChange::Unchanged)
     }
 
     async fn before_tool(

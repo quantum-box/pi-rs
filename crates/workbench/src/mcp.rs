@@ -1015,18 +1015,19 @@ impl Extension for McpExtension {
     }
     fn context(
         &self,
-        request: &mut pi_rs::ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&pi_rs::ExtensionState>,
-    ) -> pi_rs::ExtensionResult<()> {
+    ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
         if !self.description.is_empty()
-            && let Some(pi_rs::Message::System { content }) = request.messages.first_mut()
+            && let Some(content) = request.system_content_mut()
         {
             content.push_str(&format!(
                 "\n\nMCP server {}: {}",
                 self.server_name, self.description
             ));
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 }
 struct McpTool {

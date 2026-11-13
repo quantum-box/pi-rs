@@ -202,7 +202,7 @@ pub(crate) fn estimate_source_tokens(
             let reasoning = match replacement {
                 Some(Some(crate::ContextContent::Blocks(blocks))) => {
                     blocks.iter().fold(0_u64, |chars, block| match block {
-                        crate::ContentBlock::Thinking { thinking } => {
+                        crate::ContentBlock::Thinking { thinking, .. } => {
                             chars.saturating_add(text_chars(thinking))
                         }
                         _ => chars,

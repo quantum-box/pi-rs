@@ -1012,23 +1012,23 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut pi_rs::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<pi_rs::ContextChange> {
             request.messages.push(Message::User {
                 content: format!("context-{}", self.0),
             });
-            Ok(())
+            Ok(pi_rs::ContextChange::Changed)
         }
         fn handles_context_with_system(&self) -> bool {
             true
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut pi_rs::ContextMessages<'_>,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<pi_rs::ContextChange> {
             assert!(matches!(messages.first(), Some(Message::System { .. })));
             assert!(messages.iter().any(
                 |message| matches!(message, Message::User { content } if content == "context-b")
@@ -1036,7 +1036,7 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
             messages.push(Message::User {
                 content: format!("system-{}", self.0),
             });
-            Ok(())
+            Ok(pi_rs::ContextChange::Changed)
         }
     }
     let model = Script::new(vec![answer("done")]);
@@ -1092,9 +1092,9 @@ async fn context_with_system_reports_each_removed_leading_system_without_blockin
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut pi_rs::ContextMessages<'_>,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<pi_rs::ContextChange> {
             match self.0 {
                 "remove" | "remove-again" => {
                     messages.remove(0);
@@ -1108,7 +1108,7 @@ async fn context_with_system_reports_each_removed_leading_system_without_blockin
                 ),
                 _ => unreachable!(),
             }
-            Ok(())
+            Ok(pi_rs::ContextChange::Changed)
         }
     }
     let model = Script::new(vec![answer("done")]);
@@ -2157,10 +2157,10 @@ async fn transformed_requests_invalidate_current_and_prior_measured_baselines() 
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut pi_rs::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<pi_rs::ContextChange> {
             if self.0.load(Ordering::SeqCst) {
                 request
                     .messages
@@ -2169,7 +2169,7 @@ async fn transformed_requests_invalidate_current_and_prior_measured_baselines() 
                     content: "short".into(),
                 });
             }
-            Ok(())
+            Ok(pi_rs::ContextChange::Changed)
         }
     }
     for initially_transformed in [false, true] {

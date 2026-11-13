@@ -727,7 +727,36 @@ as pairs before sending context to a provider.
 Native entry points are `context-edit <id> <text>`, `context-edit <id> --delete`,
 `/context-edit`, `/context-delete` and the RPC `edit_context` request with a
 `target` record ID and `replacement`. Pi `context_edit` entries use the same
-projection when imported, including text and image replacements.
+projection when imported, including text and image replacements. Assistant
+replacement thinking retains its signature and redaction flag and is replayed
+in block order to the original provider, API and model after tool-pair repair.
+Provider replay stays private to the adapter; native and executable request
+hooks and request notifications receive portable copies. Host-tracked hook
+wrappers invalidate replay whenever a hook obtains general mutable access to
+assistant messages, irrespective of the hook's reported status or the resulting
+values. Narrow tool and system-content accessors, plus tracked insertion and
+removal of user messages, retain replay for untouched assistant messages.
+Tracked insertions are rejected if they would split an assistant tool call from
+its results, including parallel results. Executables can
+negotiate the versioned context protocol and return a payload-free unchanged
+response; the host retains its original request in that case. Executables set
+`context_provenance_v1` for payload-free unchanged responses. Executables also
+advertising `context_safe_patch_v1` receive `context_v3`, `before_request_v3`
+and `context_with_system_v3` and can return `{"change":"safe_patch","patch":...}`.
+The v2 protocol supports unchanged or full replacement responses; full
+replacements use `{"change":"changed","value":...}`. A safe patch can replace tools or the
+leading system text and apply indexed user-message insertions or removals. The
+host validates it on a detached copy before applying tracked operations; it
+cannot replace or remove an assistant. An unchanged response cannot carry a
+value. Full replacements and legacy protocol responses are treated as changed.
+Native extension hook signatures use the tracked wrappers.
+Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
+endpoint binding; chat-completions replay is also bound to the configured
+provider. Older and imported histories without that binding omit edited thinking
+rather than send it to an unverified destination. Legacy unedited chat-completions
+replay without a provider binding stops with an explanatory error when its
+endpoint and model match the request; editing or removing the affected assistant
+context or starting a new session clears the ambiguity. Google text and tool-call signatures remain attached to their blocks.
 
 ### Multimodal input checkpoint
 
@@ -2477,8 +2506,9 @@ Unsupported levels follow the shared model-aware controls.
 
 Signed and redacted blocks are retained in the original assistant block order
 for the same provider and model. Tool continuations replay those blocks along
-with the tool use and result. A context edit invalidates replay when it
-changes the assistant text or tool calls. Native executable context hooks
+with the tool use and result. Assistant context edits replace the original
+replay with the edited block sequence, preserving signed and redacted thinking
+and excluding tool calls removed by repair. Native executable context hooks
 receive the portable messages and retain replay for unchanged turns.
 
 A loopback fixture verified adaptive effort, signed and redacted block replay

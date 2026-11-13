@@ -352,6 +352,7 @@ impl PiMessages {
                         .filter(|replay| {
                             replay.identity.provider == self.identity
                                 && replay.identity.model == request.model
+                                && replay.supports_api(pi_rs::ModelApi::PiMessages)
                                 && replay.blocks.first().is_some_and(|marker| {
                                     marker["type"] == REPLAY_ORIGIN
                                         && marker["endpoint"] == self.origin_hash
@@ -366,8 +367,17 @@ impl PiMessages {
                                 blocks.extend(calls.iter().map(super::rpc_events::tool_call_value));
                                 blocks
                             },
-                            |replay| replay.blocks[1..].to_vec(),
+                            |replay| {
+                                replay.blocks[1..]
+                                    .iter()
+                                    .filter(|block| block.get("_pi_context_edit_api").is_none())
+                                    .cloned()
+                                    .collect()
+                            },
                         );
+                    if blocks.is_empty() {
+                        continue;
+                    }
                     json!({
                         "role":"assistant","content":blocks,"provider":self.identity,"api":"pi-messages","model":request.model,
                         "timestamp":0,"stopReason":if calls.is_empty() {"stop"} else {"toolUse"},
@@ -851,6 +861,40 @@ mod tool_status_tests {
         assert_eq!(
             second.encode(request)["context"]["messages"][0]["content"][0]["type"],
             "text"
+        );
+        let thinking_only = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":REPLAY_ORIGIN,"endpoint":first.origin_hash}),
+                    json!({"type":"thinking","thinking":"private"}),
+                    json!({"_pi_context_edit_api":"pi-messages"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![thinking_only],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        assert_eq!(
+            first.encode(request.clone())["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            second.encode(request)["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         #[cfg(any(unix, windows))]
         assert_ne!(first.context_identity(), second.context_identity());

@@ -1820,6 +1820,7 @@ fn validate_context_edit(
                         id,
                         name,
                         arguments,
+                        ..
                     } if id.is_empty() || name.is_empty() || !arguments.is_object() => {
                         return Err(Error::Session("invalid replacement tool call".into()));
                     }
@@ -2285,6 +2286,18 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
+    let metadata_by_request: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                failure: None,
+                ..
+            } => Some((*request_id, metadata)),
+            _ => None,
+        })
+        .collect();
     let replay_by_request: BTreeMap<_, _> = path
         .iter()
         .filter_map(|record| match &record.event {
@@ -2509,12 +2522,58 @@ fn conversation_entries_since_inner(
         })
         .collect();
     if repair && !edits.is_empty() {
-        messages = repair_tool_pairs(messages);
+        let thinking_sources: BTreeSet<_> = messages
+            .iter()
+            .filter_map(|(source, message)| {
+                let (
+                    Some(Some(replacement @ crate::ContextContent::Blocks(blocks))),
+                    Message::Assistant { calls, .. },
+                ) = (edits.get(source), message)
+                else {
+                    return None;
+                };
+                if !blocks
+                    .iter()
+                    .any(|b| matches!(b, crate::ContentBlock::Thinking { .. }))
+                {
+                    return None;
+                }
+                let Event::Assistant {
+                    request_id: Some(request_id),
+                    ..
+                } = &path.iter().find(|r| r.id == *source)?.event
+                else {
+                    return None;
+                };
+                crate::context_replay::replacement_replay(
+                    replacement,
+                    metadata_by_request.get(request_id)?,
+                    calls,
+                )
+                .map(|_| *source)
+            })
+            .collect();
+        messages = repair_tool_pairs(messages, &thinking_sources);
+    }
+    for (source, message) in &mut messages {
+        if let (Some(Some(replacement)), Message::Assistant { calls, replay, .. }) =
+            (edits.get(source), message)
+            && let Some(Event::Assistant {
+                request_id: Some(request_id),
+                ..
+            }) = path.iter().find(|r| r.id == *source).map(|r| &r.event)
+            && let Some(metadata) = metadata_by_request.get(request_id)
+        {
+            *replay = crate::context_replay::replacement_replay(replacement, metadata, calls);
+        }
     }
     messages
 }
 
-fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
+fn repair_tool_pairs(
+    messages: Vec<(u64, Message)>,
+    thinking_sources: &BTreeSet<u64>,
+) -> Vec<(u64, Message)> {
     let mut projected = Vec::new();
     let mut messages = messages.into_iter().peekable();
     while let Some((source, message)) = messages.next() {
@@ -2542,7 +2601,7 @@ fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
                 }
                 let call_ids: std::collections::BTreeSet<_> =
                     calls.iter().map(|call| call.id.clone()).collect();
-                if !content.is_empty() || !calls.is_empty() {
+                if !content.is_empty() || !calls.is_empty() || thinking_sources.contains(&source) {
                     projected.push((
                         source,
                         Message::Assistant {
@@ -2564,13 +2623,16 @@ fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
 fn project_content(message: Message, replacement: &crate::ContextContent) -> Message {
     use crate::{ContentBlock, ContextContent};
     let blocks = match replacement {
-        ContextContent::Text(text) => vec![ContentBlock::Text { text: text.clone() }],
+        ContextContent::Text(text) => vec![ContentBlock::Text {
+            text: text.clone(),
+            text_signature: None,
+        }],
         ContextContent::Blocks(blocks) => blocks.clone(),
     };
     let text = blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -2603,6 +2665,7 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
                         id,
                         name,
                         arguments,
+                        ..
                     } => Some(crate::ToolCall {
                         id,
                         name,
