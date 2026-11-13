@@ -35,6 +35,25 @@ impl BashOperations for EnvironmentCapture {
     }
 }
 
+struct LocalEnvironmentCapture(Arc<EnvironmentCapture>);
+
+#[async_trait::async_trait]
+impl BashOperations for LocalEnvironmentCapture {
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        timeout: Option<Duration>,
+        cancellation: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        self.0.exec(context, timeout, cancellation, output).await
+    }
+}
+
 #[tokio::test]
 async fn remote_environment_is_opt_in_and_hook_can_supply_variables() {
     let capture = Arc::new(EnvironmentCapture::default());
@@ -62,6 +81,13 @@ async fn remote_environment_is_opt_in_and_hook_can_supply_variables() {
     )
     .unwrap();
     tool.invoke(json!({"command":"test"}), context()).await;
+    let tool = create_bash_tool(
+        std::env::temp_dir().as_path(),
+        ShellConfig::default(),
+        Arc::new(LocalEnvironmentCapture(capture.clone())),
+    )
+    .unwrap();
+    tool.invoke(json!({"command":"test"}), context()).await;
     let captured = capture.0.lock().unwrap();
     assert_eq!(captured[0].len(), 1);
     assert_eq!(
@@ -70,8 +96,21 @@ async fn remote_environment_is_opt_in_and_hook_can_supply_variables() {
             .unwrap(),
         "allowed"
     );
-    if std::env::var_os("PATH").is_some() {
-        assert!(captured[1].contains_key(std::ffi::OsStr::new("PATH")));
+    assert!(
+        captured[1] == captured[2],
+        "opt-in remote and local environments must match"
+    );
+    if let Some(host_path) = std::env::var_os("PATH") {
+        let path = captured[1]
+            .iter()
+            .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .expect("host PATH must be inherited");
+        let inherited: Vec<_> = std::env::split_paths(path.1).collect();
+        let original: Vec<_> = std::env::split_paths(&host_path).collect();
+        assert!(
+            inherited.ends_with(&original),
+            "host PATH entries must be preserved"
+        );
     }
 }
 
