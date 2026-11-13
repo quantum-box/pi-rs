@@ -10,7 +10,7 @@ description = "Amazon Bedrock Converse streaming adapter for pi-rs"
 async-stream = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
-aws-smithy-runtime-api = "1"
+aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-config = { version = "=1.8.1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-sdk-bedrockruntime = "=1.124.0"
@@ -21,9 +21,12 @@ http = "1"
 pi-rs-core = { path = "../core", version = "0.1.0" }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+tracing-core = "0.1"
 uuid = "1"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tempfile = "3"
 aws-smithy-eventstream = "0.60"
 bytes = "1"

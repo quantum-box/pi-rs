@@ -469,7 +469,17 @@ fn required_text(text: String) -> String {
 fn diagnostic(
     meta: &aws_smithy_types::error::metadata::ErrorMetadata,
     fallback_id: Option<&str>,
+    secrets: &[String],
 ) -> String {
+    let redact = |value: &str| {
+        let mut value = value.to_owned();
+        for secret in secrets {
+            if !secret.is_empty() {
+                value = value.replace(secret, "[REDACTED]");
+            }
+        }
+        value
+    };
     let clean = |s: &str| {
         s.chars()
             .filter(|c| !c.is_control())
@@ -485,7 +495,11 @@ fn diagnostic(
     }) {
         parts.push(code.into());
     }
-    if let Some(message) = meta.message().map(clean).filter(|s| !s.trim().is_empty()) {
+    if let Some(message) = meta
+        .message()
+        .map(|message| clean(&redact(message)))
+        .filter(|s| !s.trim().is_empty())
+    {
         parts.push(message);
     }
     if let Some(id) = meta.request_id().or(fallback_id).filter(|s| {
@@ -495,7 +509,7 @@ fn diagnostic(
     }) {
         parts.push(format!("request id: {id}"));
     }
-    parts.join(": ")
+    redact(&parts.join(": "))
 }
 fn bearer_client(builder: aws_sdk_bedrockruntime::config::Builder, token: &str) -> Client {
     let config = builder
@@ -688,9 +702,10 @@ fn request_error(
     e: aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
     >,
+    secrets: &[String],
 ) -> Error {
     if let Some(service) = e.as_service_error() {
-        let message = diagnostic(service.meta(), service.request_id());
+        let message = diagnostic(service.meta(), service.request_id(), secrets);
         if service.is_throttling_exception()
             || service.is_model_timeout_exception()
             || service.is_service_unavailable_exception()
@@ -1117,16 +1132,44 @@ impl Model for Bedrock {
             );
         }
         let headers = self.headers.clone();
-        let mut response = command
+        let mut secrets: Vec<_> = self
+            .headers
+            .values()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        if let Some(token) = self.bearer.as_ref().filter(|token| !token.is_empty()) {
+            secrets.push(token.clone());
+        }
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        use tracing::instrument::WithSubscriber;
+        let has_secrets = !secrets.is_empty();
+        let request = command
             .customize()
-            .mutate_request(move |request| {
+            .map_request(move |request| {
+                let mut request = request.try_into_http1x()?;
                 for (name, value) in &headers {
-                    request.headers_mut().insert(name.clone(), value.clone());
+                    let mut value =
+                        http::HeaderValue::from_str(value).expect("validated header value");
+                    value.set_sensitive(true);
+                    request.headers_mut().insert(
+                        http::HeaderName::from_bytes(name.as_bytes())
+                            .expect("validated header name"),
+                        value,
+                    );
                 }
+                aws_smithy_runtime_api::http::Request::try_from(request)
             })
-            .send()
-            .await
-            .map_err(request_error)?;
+            .send();
+        let response = if has_secrets {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            request
+                .with_subscriber(headers::SigningTraceGuard(dispatch))
+                .await
+        } else {
+            request.await
+        };
+        let mut response = response.map_err(|error| request_error(error, &secrets))?;
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
@@ -1137,7 +1180,7 @@ impl Model for Bedrock {
             let mut stopped_blocks = BTreeSet::new();
             while let Some(event)=response.stream.recv().await.map_err(|e| {
                 if let Some(service) = e.as_service_error() {
-                    let mut message=diagnostic(service.meta(), request_id.as_deref());
+                    let mut message=diagnostic(service.meta(), request_id.as_deref(), &secrets);
                     if service.meta().code().is_none() {
                         let code = if service.is_validation_exception() { Some("ValidationException") } else if service.is_throttling_exception() { Some("ThrottlingException") } else if service.is_service_unavailable_exception() { Some("ServiceUnavailableException") } else if service.is_internal_server_exception() { Some("InternalServerException") } else if service.is_model_stream_error_exception() { Some("ModelStreamErrorException") } else { None };
                         if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
@@ -2116,13 +2159,13 @@ mod tests {
             ErrorKind::ServerError,
         ] {
             assert!(matches!(
-                request_error(error(Some(kind))),
+                request_error(error(Some(kind)), &[]),
                 Error::RetryableModel(_)
             ));
         }
-        assert!(matches!(request_error(error(None)), Error::Config(_)));
+        assert!(matches!(request_error(error(None), &[]), Error::Config(_)));
         assert!(matches!(
-            request_error(error(Some(ErrorKind::ClientError))),
+            request_error(error(Some(ErrorKind::ClientError)), &[]),
             Error::Config(_)
         ));
     }
@@ -2133,7 +2176,7 @@ mod tests {
             .code("ValidationException")
             .message("bad\u{1b}[31m input\nnext")
             .build();
-        let text = diagnostic(&meta, Some("unsafe\nrequest-id"));
+        let text = diagnostic(&meta, Some("unsafe\nrequest-id"), &[]);
         assert_eq!(
             text,
             "Bedrock error: ValidationException: bad[31m inputnext"

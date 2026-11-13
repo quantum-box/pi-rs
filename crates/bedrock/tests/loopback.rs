@@ -794,3 +794,167 @@ async fn prepared_bedrock_dispatch_uses_the_credential_it_fingerprinted() {
     server.await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn configured_header_secrets_are_redacted_from_service_errors() {
+    for streaming in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 8192];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            let body =
+                br#"{"message":"rejected header confidential-route-987 and fallback-token-654"}"#;
+            if streaming {
+                let frame = Frame::new(bytes::Bytes::from_static(body))
+                    .add_header(Header::new(
+                        ":message-type",
+                        HeaderValue::String("exception".into()),
+                    ))
+                    .add_header(Header::new(
+                        ":exception-type",
+                        HeaderValue::String("validationException".into()),
+                    ))
+                    .add_header(Header::new(
+                        ":content-type",
+                        HeaderValue::String("application/json".into()),
+                    ));
+                let mut bytes = Vec::new();
+                write_message_to(&frame, &mut bytes).unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nx-amzn-requestid: stream-request\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            } else {
+                socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nx-amzn-requestid: request-123\r\nx-amzn-errortype: ValidationException\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "test", "secret", None, None, "test",
+            ))
+            .endpoint_url(format!("http://{address}"))
+            .build();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-route",
+            http::HeaderValue::from_static("confidential-route-987"),
+        );
+        let mut defaults = http::HeaderMap::new();
+        defaults.insert(
+            "x-default",
+            http::HeaderValue::from_static("fallback-token-654"),
+        );
+        let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+            .with_headers(headers)
+            .unwrap()
+            .with_default_headers(&defaults)
+            .unwrap();
+        let request = ModelRequest {
+            model: "test-model".into(),
+            messages: vec![Message::User {
+                content: "hi".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let error = match model.stream(request).await {
+            Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("rejected header"), "{message}");
+        assert!(message.contains("[REDACTED]"), "{message}");
+        assert!(!message.contains("confidential-route-987"), "{message}");
+        assert!(!message.contains("fallback-token-654"), "{message}");
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sdk_trace_does_not_expose_configured_header_values() {
+    #[derive(Clone)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Captured(Default::default());
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = [0; 8192];
+        let count = socket.read(&mut data).await.unwrap();
+        let request = String::from_utf8_lossy(&data[..count]);
+        assert!(
+            request.contains("trace-secret-91ab"),
+            "wire must retain the value"
+        );
+        let frame = event("messageStop", json!({"stopReason":"end_turn"}));
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n",frame.len()).as_bytes()).await.unwrap();
+        socket.write_all(&frame).await.unwrap();
+    });
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "test", "secret", None, None, "test",
+        ))
+        .endpoint_url(format!("http://{address}"))
+        .build();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-private",
+        http::HeaderValue::from_static("trace-secret-91ab"),
+    );
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+        .with_headers(headers)
+        .unwrap();
+    model
+        .stream(ModelRequest {
+            model: "test-model".into(),
+            messages: vec![Message::User {
+                content: "hi".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        })
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    server.await.unwrap();
+    let trace = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.contains("transmitting request") && line.contains("x-private")),
+        "expected SDK request trace containing the custom header"
+    );
+    assert!(
+        !trace.contains("trace-secret-91ab"),
+        "configured header leaked to trace: {}",
+        trace
+            .lines()
+            .filter(|line| line.contains("trace-secret-91ab"))
+            .map(|line| line.replace("trace-secret-91ab", "[secret]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
