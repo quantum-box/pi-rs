@@ -80,6 +80,10 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
                 );
                 assert_eq!(blocks[1]["text"], "answer");
                 assert_eq!(blocks[2]["reasoningContent"]["redactedContent"], "AQIDBA==");
+                assert_eq!(
+                    blocks[3]["reasoningContent"]["reasoningText"],
+                    json!({"text":"", "signature":"omitted-sig"})
+                );
             }
             let frames=if round==0 { vec![
                 event("messageStart",json!({"role":"assistant"})),
@@ -92,6 +96,8 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AQI="}}})),
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AwQ="}}})),
                 event("contentBlockStop",json!({"contentBlockIndex":2})),
+                event("contentBlockDelta",json!({"contentBlockIndex":3,"delta":{"reasoningContent":{"signature":"omitted-sig"}}})),
+                event("contentBlockStop",json!({"contentBlockIndex":3})),
                 event("messageStop",json!({"stopReason":"end_turn"})),
             ] } else {vec![event("messageStop",json!({"stopReason":"end_turn"}))]}.concat();
             socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n",frames.len()).as_bytes()).await.unwrap();

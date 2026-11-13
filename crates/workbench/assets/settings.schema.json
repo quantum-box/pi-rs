@@ -141,6 +141,15 @@
         "type": "string"
       }
     },
+    "thinkingBudgets": {
+      "type": "object",
+      "properties": {
+        "minimal": {"type": "number"},
+        "low": {"type": "number"},
+        "medium": {"type": "number"},
+        "high": {"type": "number"}
+      }
+    },
     "defaultThinkingLevel": {
       "enum": [
         null,

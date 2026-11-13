@@ -821,6 +821,13 @@ impl Client {
                 let long_cache_override = args
                     .model_profiles
                     .bedrock_long_cache_override(&args.provider, metadata.as_ref());
+                let budgets = args
+                    .settings
+                    .value()
+                    .get("thinkingBudgets")
+                    .map(pi_rs::bedrock::ThinkingBudgets::from_json)
+                    .transpose()?
+                    .unwrap_or_default();
                 let client = client
                     .with_model_name(
                         &args.model,
@@ -828,6 +835,7 @@ impl Client {
                     )
                     .with_cache_retention(cache_retention(true))
                     .with_long_cache_support(long_cache_override)
+                    .with_thinking_budgets(budgets)
                     .with_reasoning(level, mapped.flatten())?;
                 Self::Bedrock(client)
             }
@@ -1754,16 +1762,37 @@ mod bedrock_tests {
                         .unwrap();
                 }
             }
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::create_dir(workspace.path().join(".pi")).unwrap();
+            std::fs::write(
+                workspace.path().join(".pi/settings.json"),
+                r#"{"thinkingBudgets":{"high":3456}}"#,
+            )
+            .unwrap();
+            args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+            args.model = "anthropic.claude-sonnet-4-5".into();
+            args.thinking = Some("high".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let mut req = request(&args.model);
+            req.max_output_tokens = 8192;
+            let _stream = client
+                .stream_with_headers(req, &HeaderMap::new(), false)
+                .await
+                .unwrap();
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "providers::bedrock_tests::bedrock_summary_and_configured_effort_reach_workbench",
             ])
             .env(CHILD, "1")
+            .env("PI_RS_HOME", agent_dir.path())
             .env("AWS_REGION", "us-east-1")
             .env("AWS_DEFAULT_REGION", "us-east-1")
             .env("AWS_ACCESS_KEY_ID", "SYNTHETIC_ACCESS_KEY")
@@ -1780,7 +1809,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..18 {
+            for _ in 0..19 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -1893,5 +1922,9 @@ mod bedrock_tests {
             );
             assert_eq!(requests[summary]["inferenceConfig"]["maxTokens"], 512);
         }
+        assert_eq!(
+            requests[18]["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            3456
+        );
     }
 }

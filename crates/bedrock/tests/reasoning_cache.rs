@@ -1,7 +1,7 @@
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message as Frame};
 use futures_util::StreamExt;
-use pi_rs_bedrock::Bedrock;
+use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay};
 use pi_rs_core::{CacheRetention, Message, Model, ModelEvent, ModelRequest, ToolSpec};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -144,6 +144,91 @@ async fn budgeted_claude_fits_host_limit_and_adds_short_checkpoints() {
     );
     assert_eq!(body["toolConfig"]["tools"].as_array().unwrap().len(), 1);
     assert!(events.iter().any(|e|matches!(e,ModelEvent::Metadata(m) if m.cache_write_1h_tokens==Some(3) && m.cache_creation_input_tokens==Some(5))));
+}
+
+#[tokio::test]
+async fn custom_budgets_display_and_interleaved_follow_claude_mode() {
+    let budgets = ThinkingBudgets {
+        low: Some(1500),
+        high: Some(6000),
+        ..Default::default()
+    };
+    for (level, max, expected) in [
+        ("low", 4096, 1500),
+        ("xhigh", 4096, 3072),
+        ("max", 10000, 6000),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_thinking_budgets(budgets.clone())
+                    .with_thinking_display(ThinkingDisplay::Omitted)
+                    .with_interleaved_thinking(false)
+                    .with_reasoning(Some(level), None)
+                    .unwrap()
+            },
+            request("anthropic.claude-sonnet-4-5", max),
+            false,
+        )
+        .await;
+        assert_eq!(body["inferenceConfig"]["maxTokens"], max);
+        assert_eq!(
+            body["additionalModelRequestFields"],
+            json!({"thinking":{"type":"enabled","budget_tokens":expected,"display":"omitted"}})
+        );
+    }
+    let (adaptive, _) = capture(
+        "us-east-1",
+        |c| {
+            c.with_thinking_budgets(budgets)
+                .with_thinking_display(ThinkingDisplay::Omitted)
+                .with_interleaved_thinking(false)
+                .with_reasoning(Some("medium"), None)
+                .unwrap()
+        },
+        request("anthropic.claude-sonnet-4-6", 512),
+        false,
+    )
+    .await;
+    assert_eq!(
+        adaptive["additionalModelRequestFields"],
+        json!({"thinking":{"type":"adaptive","display":"omitted"},"output_config":{"effort":"medium"}})
+    );
+    let (gov, _) = capture(
+        "us-gov-west-1",
+        |c| {
+            c.with_thinking_display(ThinkingDisplay::Omitted)
+                .with_interleaved_thinking(false)
+                .with_reasoning(Some("low"), None)
+                .unwrap()
+        },
+        request("anthropic.claude-sonnet-4-5", 4096),
+        false,
+    )
+    .await;
+    assert_eq!(
+        gov["additionalModelRequestFields"],
+        json!({"thinking":{"type":"enabled","budget_tokens":2048}})
+    );
+}
+
+#[test]
+fn custom_budget_settings_reject_invalid_values() {
+    assert_eq!(
+        ThinkingBudgets::from_json(&json!({"low":1500.0,"high":4096}))
+            .unwrap()
+            .low,
+        Some(1500)
+    );
+    for value in [
+        json!([]),
+        json!({"low":1023}),
+        json!({"low":1024.5}),
+        json!({"low":null}),
+        json!({"high":4294967296_u64}),
+    ] {
+        assert!(ThinkingBudgets::from_json(&value).is_err(), "{value}");
+    }
 }
 
 #[tokio::test]

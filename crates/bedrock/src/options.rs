@@ -2,6 +2,76 @@
 use pi_rs_core::{CacheRetention, Error, Result};
 use serde_json::{Value, json};
 
+/// Optional token budgets for Claude's non-adaptive thinking levels.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThinkingBudgets {
+    pub minimal: Option<u32>,
+    pub low: Option<u32>,
+    pub medium: Option<u32>,
+    pub high: Option<u32>,
+}
+impl ThinkingBudgets {
+    /// Parse Pi's `thinkingBudgets` settings; Bedrock requires integer token counts.
+    pub fn from_json(value: &Value) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::Config("thinkingBudgets must be an object".into()))?;
+        let read = |key: &str| -> Result<Option<u32>> {
+            object
+                .get(key)
+                .map(|value| {
+                    let number = value
+                        .as_f64()
+                        .filter(|n| {
+                            n.is_finite()
+                                && n.fract() == 0.0
+                                && *n >= 1024.0
+                                && *n <= f64::from(u32::MAX)
+                        })
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "thinkingBudgets.{key} must be an integer between 1024 and {}",
+                                u32::MAX
+                            ))
+                        })?;
+                    Ok(number as u32)
+                })
+                .transpose()
+        };
+        Ok(Self {
+            minimal: read("minimal")?,
+            low: read("low")?,
+            medium: read("medium")?,
+            high: read("high")?,
+        })
+    }
+    fn for_level(&self, level: ReasoningLevel) -> Option<u32> {
+        match level {
+            ReasoningLevel::Minimal => self.minimal,
+            ReasoningLevel::Low => self.low,
+            ReasoningLevel::Medium => self.medium,
+            ReasoningLevel::High | ReasoningLevel::Xhigh | ReasoningLevel::Max => self.high,
+            ReasoningLevel::Off => None,
+        }
+    }
+}
+
+/// Whether Claude returns a readable thinking summary or only its signature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+pub(crate) struct ReasoningContext<'a> {
+    pub region: Option<&'a str>,
+    pub tool_free: bool,
+    pub budgets: &'a ThinkingBudgets,
+    pub display: ThinkingDisplay,
+    pub interleaved: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningLevel {
     Off,
@@ -179,8 +249,7 @@ pub(crate) fn reasoning_fields(
     level: Option<ReasoningLevel>,
     mapped: Option<&str>,
     max_tokens: u32,
-    region: Option<&str>,
-    tool_free: bool,
+    context: ReasoningContext<'_>,
 ) -> Result<Option<Value>> {
     let items = candidates(model, name);
     if has_any(&items, &["claude"]) {
@@ -193,7 +262,7 @@ pub(crate) fn reasoning_fields(
                 return Err(Error::Config("This Bedrock Claude model cannot disable thinking; select a reasoning level or use a different model".into()));
             }
             if has_any(&items, &["sonnet-5-5"]) {
-                return if tool_free {
+                return if context.tool_free {
                     Ok(Some(json!({"thinking":{"type":"between_tools"}})))
                 } else {
                     Err(Error::Config("Claude Sonnet 5.5 cannot disable thinking between tool calls; select a reasoning level or use a different model".into()))
@@ -204,7 +273,9 @@ pub(crate) fn reasoning_fields(
             }
             return Ok(None);
         }
-        let gov = region.is_some_and(|r| r.to_ascii_lowercase().starts_with("us-gov-"))
+        let gov = context
+            .region
+            .is_some_and(|r| r.to_ascii_lowercase().starts_with("us-gov-"))
             || model.to_ascii_lowercase().starts_with("us-gov.")
             || model.to_ascii_lowercase().starts_with("arn:aws-us-gov:");
         let adaptive = has_any(&items, ADAPTIVE);
@@ -212,14 +283,26 @@ pub(crate) fn reasoning_fields(
         let mut thinking = if adaptive {
             json!({"type":"adaptive"})
         } else {
-            let budget = level.budget().min(max_tokens.saturating_sub(1024));
+            let requested = context
+                .budgets
+                .for_level(level)
+                .unwrap_or_else(|| level.budget());
+            if requested < 1024 {
+                return Err(Error::Config(
+                    "Bedrock Claude thinking budget must be at least 1024 tokens".into(),
+                ));
+            }
+            let budget = requested.min(max_tokens.saturating_sub(1024));
             if budget < 1024 {
                 return Err(Error::Config("Bedrock Claude thinking requires at least 2048 max output tokens (1024 for thinking and 1024 for the answer)".into()));
             }
             json!({"type":"enabled","budget_tokens":budget})
         };
         if !gov {
-            thinking["display"] = json!("summarized");
+            thinking["display"] = json!(match context.display {
+                ThinkingDisplay::Summarized => "summarized",
+                ThinkingDisplay::Omitted => "omitted",
+            });
         }
         if binding {
             thinking["block_binding"] = json!({"prefix_mismatch_behavior":"drop_block"});
@@ -242,7 +325,7 @@ pub(crate) fn reasoning_fields(
             if binding {
                 fields["anthropic_beta"] = json!(["thinking-binding-controls-2026-08-01"]);
             }
-        } else {
+        } else if context.interleaved {
             fields["anthropic_beta"] = json!(["interleaved-thinking-2025-05-14"]);
         }
         return Ok(Some(fields));
@@ -267,6 +350,20 @@ pub(crate) fn reasoning_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn context() -> ReasoningContext<'static> {
+        ReasoningContext {
+            region: None,
+            tool_free: true,
+            budgets: &ThinkingBudgets {
+                minimal: None,
+                low: None,
+                medium: None,
+                high: None,
+            },
+            display: ThinkingDisplay::Summarized,
+            interleaved: true,
+        }
+    }
     #[test]
     fn model_support_and_effort_selection_follow_pi_families() {
         assert!(supports_cache(
@@ -285,8 +382,7 @@ mod tests {
                 Some(ReasoningLevel::Xhigh),
                 None,
                 1024,
-                None,
-                true
+                context()
             )
             .unwrap(),
             Some(
@@ -300,8 +396,7 @@ mod tests {
                 Some(ReasoningLevel::Minimal),
                 None,
                 1024,
-                None,
-                true
+                context()
             )
             .unwrap(),
             Some(json!({"reasoning":{"effort":"low"}}))
@@ -313,8 +408,7 @@ mod tests {
                 Some(ReasoningLevel::High),
                 None,
                 1024,
-                None,
-                true
+                context()
             )
             .unwrap(),
             None
@@ -326,8 +420,7 @@ mod tests {
                 None,
                 None,
                 1024,
-                None,
-                true
+                context()
             )
             .unwrap(),
             None
