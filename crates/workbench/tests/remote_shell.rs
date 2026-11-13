@@ -1,0 +1,210 @@
+use futures_util::stream;
+use pi_rs::*;
+use pi_rs_workbench::coding::{
+    BashOperations, CodingTools, ShellConfig, ShellSpawnContext, create_bash_tool,
+};
+use serde_json::json;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[derive(Default)]
+struct Remote {
+    calls: Mutex<Vec<(String, PathBuf)>>,
+}
+#[async_trait::async_trait]
+impl BashOperations for Remote {
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        _: Option<Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((context.command.clone(), context.cwd));
+        output.send(b"first".to_vec()).await.unwrap();
+        if context.command.contains("wait") {
+            cancel.cancelled().await;
+            return Ok(None);
+        }
+        if context.command.contains("error") {
+            return Err(Error::Config("remote failure".into()));
+        }
+        if context.command.contains("large") {
+            output.send(vec![b'x'; 60_000]).await.unwrap();
+        }
+        output.send(b"second".to_vec()).await.unwrap();
+        Ok(Some(if context.command.contains("fail") {
+            7
+        } else {
+            0
+        }))
+    }
+}
+struct Script(Mutex<Vec<ModelRequest>>);
+#[async_trait::async_trait]
+impl Model for Script {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let mut requests = self.0.lock().unwrap();
+        requests.push(request);
+        let events = if requests.len() == 1 {
+            vec![ModelEvent::Complete {
+                calls: vec![
+                    ToolCall {
+                        id: "one".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command":"run"}).to_string(),
+                    },
+                    ToolCall {
+                        id: "invalid".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command":"bad", "timeout":0}).to_string(),
+                    },
+                ],
+                usage: None,
+            }]
+        } else {
+            vec![
+                ModelEvent::Text("done".into()),
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            ]
+        };
+        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+#[tokio::test]
+async fn model_calls_remote_shell_with_validation_and_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(Remote::default());
+    let config = ShellConfig::new(None, Some("setup"));
+    let extension = CodingTools::local(root.path())
+        .unwrap()
+        .with_shell_config(config)
+        .with_bash_operations(remote.clone())
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register(Arc::new(extension)).unwrap();
+    let model = Script(Mutex::new(Vec::new()));
+    let agent = Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "fixture",
+        limits: Limits::default(),
+    };
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    agent
+        .run(
+            &mut session,
+            Some("run".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |_: Notification<'_>| {},
+        )
+        .await
+        .unwrap();
+    let requests = model.0.lock().unwrap();
+    let results: Vec<_> = requests[1]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } => Some((call_id.as_str(), content.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        results
+            .iter()
+            .any(|(id, text, error)| *id == "one" && *text == "firstsecond" && !error)
+    );
+    assert!(
+        results
+            .iter()
+            .any(|(id, _, error)| *id == "invalid" && *error)
+    );
+    assert_eq!(
+        remote.calls.lock().unwrap().as_slice(),
+        &[("setup\nrun".into(), root.path().canonicalize().unwrap())]
+    );
+}
+#[tokio::test]
+async fn remote_shell_cancellation_timeout_exit_and_truncation() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(Remote::default());
+    assert!(
+        CodingTools::new(root.path())
+            .unwrap()
+            .with_bash_operations(remote.clone())
+            .is_err()
+    );
+    let tool = create_bash_tool(Path::new("/remote"), ShellConfig::default(), remote).unwrap();
+    let context = || ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    assert!(
+        matches!(tool.invoke(json!({"command":"fail"}), context()).await, Outcome::Failed(text) if text.contains("firstsecond") && text.contains("code 7"))
+    );
+    assert!(
+        matches!(tool.invoke(json!({"command":"large"}), context()).await, Outcome::SucceededWithDetails { details, .. } if details["truncation"]["truncated"] == true)
+    );
+    assert!(
+        matches!(tool.invoke(json!({"command":"wait", "timeout":0.01}), context()).await, Outcome::Failed(text) if text.contains("first") && text.contains("timed out"))
+    );
+    let token = CancellationToken::new();
+    let t = token.clone();
+    let task = tokio::spawn(async move {
+        tool.invoke(
+            json!({"command":"wait"}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: t,
+            },
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    token.cancel();
+    assert!(
+        matches!(task.await.unwrap(), Outcome::Failed(text) if text.contains("aborted") || text.contains("cancelled"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_shell_operations_factory_streams_and_applies_exit_status() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_bash_tool(
+        root.path(),
+        ShellConfig::new(None, Some("export REMOTE_TEST=ok")),
+        pi_rs_workbench::coding::create_local_bash_operations(None),
+    )
+    .unwrap();
+    let context = ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    let result = tool
+        .invoke(
+            json!({"command":"printf %s \\\"$REMOTE_TEST\\\"; printf err >&2; exit 4"}),
+            context,
+        )
+        .await;
+    assert!(
+        matches!(result, Outcome::Failed(text) if text.contains("ok") && text.contains("err") && text.contains("code 4"))
+    );
+}

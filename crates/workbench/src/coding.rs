@@ -29,6 +29,7 @@ pub struct CodingTools {
     model_supports_images: Option<bool>,
     read_operations: Option<Arc<dyn ReadOperations>>,
     write_operations: Option<Arc<dyn WriteOperations>>,
+    bash_operations: Option<Arc<dyn BashOperations>>,
     edit_operations: Option<Arc<dyn EditOperations>>,
     edit_options: EditToolOptions,
 }
@@ -48,6 +49,7 @@ impl CodingTools {
             model_supports_images: None,
             read_operations: None,
             write_operations: None,
+            bash_operations: None,
             edit_operations: None,
             edit_options: EditToolOptions::default(),
         })
@@ -98,6 +100,18 @@ impl CodingTools {
     pub fn with_edit_options(mut self, options: EditToolOptions) -> Self {
         self.edit_options = options;
         self
+    }
+
+    /// Inject model shell operations in the unrestricted profile. The backend
+    /// must enforce its own access policy and stop work when cancelled.
+    pub fn with_bash_operations(mut self, operations: Arc<dyn BashOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom shell operations require the unrestricted profile".into(),
+            ));
+        }
+        self.bash_operations = Some(operations);
+        Ok(self)
     }
 
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
@@ -459,6 +473,13 @@ impl Extension for CodingTools {
                         tool,
                         operations: operations.clone(),
                         options: self.edit_options,
+                    }) as Arc<dyn Tool>
+                } else if matches!(kind, Kind::Bash | Kind::PowerShell)
+                    && let Some(operations) = &self.bash_operations
+                {
+                    Arc::new(RemoteShellTool {
+                        tool,
+                        operations: operations.clone(),
                     }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
@@ -1299,6 +1320,323 @@ fn edit_success(display_path: &str, original: &str, output: &str, count: usize) 
     }
 }
 
+/// Asynchronous streaming model-shell execution. The backend owns remote
+/// access control and must stop work when the cancellation token is cancelled
+/// or the returned future is dropped. Output must be sent before returning.
+#[async_trait::async_trait]
+pub trait BashOperations: Send + Sync {
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        timeout: Option<Duration>,
+        cancellation: pi_rs::CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>>;
+}
+
+/// Create Pi-style local bash operations for hosts that wrap the shell backend.
+/// Command prefixes and spawn hooks belong to the calling tool and are not
+/// applied again here.
+pub fn create_local_bash_operations(shell_path: Option<&str>) -> Arc<dyn BashOperations> {
+    Arc::new(LocalBashOperations {
+        shell: ShellConfig::new(shell_path, None),
+    })
+}
+
+struct LocalBashOperations {
+    shell: ShellConfig,
+}
+
+#[async_trait::async_trait]
+impl BashOperations for LocalBashOperations {
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        timeout: Option<Duration>,
+        cancellation: pi_rs::CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let crate::shell_config::Launch {
+            mut command,
+            input,
+            cwd,
+        } = self
+            .shell
+            .launch(&context.cwd, false, true, &context.command, false)?;
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .envs(context.env)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut process = ProcessGroup::spawn(command)?;
+        let input_task = input.map(|input| {
+            let mut stdin = process.stdin();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(input.as_bytes()).await;
+            })
+        });
+        let mut stdout = process.stdout();
+        let mut stderr = process.stderr();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut stdout_buffer = [0u8; 8192];
+        let mut stderr_buffer = [0u8; 8192];
+        let mut status = None;
+        let mut drain_deadline = None;
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        while status.is_none() || stdout_open || stderr_open {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                result = process.wait(), if status.is_none() => {
+                    status = Some(result?); process.finished = true;
+                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                },
+                count = stdout.read(&mut stdout_buffer), if stdout_open => {
+                    let count = count?; stdout_open = count != 0;
+                    if count != 0 && output.send(stdout_buffer[..count].to_vec()).await.is_err() { return Err(Error::Cancelled); }
+                },
+                count = stderr.read(&mut stderr_buffer), if stderr_open => {
+                    let count = count?; stderr_open = count != 0;
+                    if count != 0 && output.send(stderr_buffer[..count].to_vec()).await.is_err() { return Err(Error::Cancelled); }
+                },
+                _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
+            }
+        }
+        if let Some(task) = input_task {
+            task.abort();
+        }
+        Ok(Some(exit_code(status.expect("shell status observed"))))
+    }
+}
+
+/// Construct a model-facing bash tool for an absolute remote working directory.
+/// The backend is responsible for access control. User shell commands are separate.
+pub fn create_bash_tool(
+    root: &Path,
+    shell: ShellConfig,
+    operations: Arc<dyn BashOperations>,
+) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteShellTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell,
+            kind: Kind::Bash,
+        },
+        operations,
+    }))
+}
+
+struct RemoteShellTool {
+    tool: CodingTool,
+    operations: Arc<dyn BashOperations>,
+}
+struct RemoteShellResult {
+    output: crate::shell_output::Output,
+    exit_code: i32,
+    elapsed: f64,
+}
+
+impl RemoteShellTool {
+    async fn run(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Result<RemoteShellResult> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let started = std::time::Instant::now();
+        let timeout = shell_timeout(args)?;
+        let context =
+            self.tool
+                .shell
+                .spawn_context(&self.tool.root, true, string(args, "command")?, true)?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let child = cancellation.child_token();
+        let _guard = child.clone().drop_guard();
+        let mut output = crate::shell_output::Accumulator::default();
+        let progress = host.filter(|host| host.supports_progress()).map(|host| {
+            let (sender, mut receiver) = tokio::sync::watch::channel::<Option<Value>>(None);
+            let worker = tokio::spawn(async move {
+                let _ = host.report_progress(json!({"content":[]})).await;
+                while receiver.changed().await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let value = receiver.borrow_and_update().clone();
+                    if let Some(value) = value {
+                        let _ = host.report_progress(value).await;
+                    }
+                }
+            });
+            (sender, worker)
+        });
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let operation = self
+            .operations
+            .exec(context, timeout, child.clone(), sender);
+        tokio::pin!(operation);
+        let mut open = true;
+        let (code, cancelled, timed_out) = loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
+                _ = &mut deadline => { child.cancel(); break (Ok(None), true, true); }
+                chunk = receiver.recv(), if open => match chunk {
+                    Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
+                    None => open = false,
+                },
+                result = &mut operation => { break (result, false, false); }
+            }
+        };
+        while let Ok(chunk) = receiver.try_recv() {
+            output.append(&chunk)?;
+            if let Some((sender, _)) = &progress {
+                let _ = sender.send_replace(Some(output.partial_result()));
+            }
+        }
+        if let Some((sender, mut worker)) = progress {
+            drop(sender);
+            if tokio::time::timeout(Duration::from_secs(1), &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+            }
+        }
+        let output = output.finish()?;
+        if timed_out {
+            return Err(Error::Config(shell_status(
+                &output.display,
+                &format!(
+                    "Command timed out after {} seconds",
+                    timeout.expect("timeout").as_secs_f64()
+                ),
+            )));
+        }
+        if cancelled {
+            return Err(Error::Config(shell_status(
+                &output.display,
+                "Command aborted",
+            )));
+        }
+        let code =
+            code.map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?;
+        Ok(RemoteShellResult {
+            output,
+            exit_code: code.unwrap_or(1),
+            elapsed: started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteShellTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        match self.run(&args, &context.cancellation, None).await {
+            Ok(result) => shell_outcome(result.output, result.exit_code),
+            Err(Error::Config(message)) => Outcome::Failed(message),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_with_host(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        match self.run(&args, &context.cancellation, Some(host)).await {
+            Ok(result) => shell_outcome(result.output, result.exit_code),
+            Err(Error::Config(message)) => Outcome::Failed(message),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        match self.run(&args, &context.cancellation, Some(host)).await {
+            Ok(result) => {
+                let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":result.exit_code,"wall_time_seconds":(result.elapsed * 10.0).round() / 10.0});
+                if result.output.script_truncated {
+                    data["full_output_path"] = json!(result.output.path);
+                }
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+                .into()
+            }
+            Err(error) => Outcome::Failed(error.to_string()).into(),
+        }
+    }
+}
+
+fn shell_outcome(output: crate::shell_output::Output, code: i32) -> Outcome {
+    let text = if output.display.is_empty() {
+        "(no output)".into()
+    } else {
+        output.display
+    };
+    match code {
+        0 => match output.details {
+            Some(details) => Outcome::SucceededWithDetails {
+                output: text,
+                details,
+            },
+            None => Outcome::Succeeded(text),
+        },
+        code => Outcome::Failed(shell_status(
+            &text,
+            &format!("Command exited with code {code}"),
+        )),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Read {
@@ -2128,21 +2466,7 @@ impl CodingTool {
                 Outcome::Failed(Error::Config(output).to_string())
             };
         }
-        let output = if result.output.display.is_empty() {
-            "(no output)".into()
-        } else {
-            result.output.display
-        };
-        match exit_code(result.status) {
-            0 => match result.output.details {
-                Some(details) => Outcome::SucceededWithDetails { output, details },
-                None => Outcome::Succeeded(output),
-            },
-            code => Outcome::Failed(shell_status(
-                &output,
-                &format!("Command exited with code {code}"),
-            )),
-        }
+        shell_outcome(result.output, exit_code(result.status))
     }
 
     #[cfg(test)]

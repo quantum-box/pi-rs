@@ -102,6 +102,50 @@ impl ShellConfig {
         script: &str,
         model_tool: bool,
     ) -> Result<Launch> {
+        let context = self.spawn_context(root, local, script, model_tool)?;
+        let script = context.command;
+        let mut launch = if powershell {
+            let executable = powershell_executable();
+            let mut command = Command::new(executable);
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+                .arg(format!("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {script}"));
+            Launch {
+                command,
+                input: None,
+                cwd: context.cwd,
+            }
+        } else {
+            let executable = if local {
+                self.bash_executable(root)?
+            } else {
+                "bash".into()
+            };
+            let legacy_wsl = is_legacy_wsl_bash(&executable);
+            let mut command = Command::new(executable);
+            let input = if legacy_wsl {
+                command.arg("-s");
+                Some(script)
+            } else {
+                command.args(["-c", &script]);
+                None
+            };
+            Launch {
+                command,
+                input,
+                cwd: context.cwd,
+            }
+        };
+        launch.command.env_clear().envs(context.env);
+        Ok(launch)
+    }
+
+    pub(super) fn spawn_context(
+        &self,
+        root: &Path,
+        local: bool,
+        script: &str,
+        model_tool: bool,
+    ) -> Result<ShellSpawnContext> {
         let mut context = ShellSpawnContext {
             command: self.command_with_prefix(script),
             cwd: root.to_path_buf(),
@@ -157,40 +201,7 @@ impl ShellConfig {
         if model_tool && let Some(hook) = &self.spawn_hook {
             context = hook(context)?;
         }
-        let script = context.command;
-        let mut launch = if powershell {
-            let executable = powershell_executable();
-            let mut command = Command::new(executable);
-            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-                .arg(format!("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {script}"));
-            Launch {
-                command,
-                input: None,
-                cwd: context.cwd,
-            }
-        } else {
-            let executable = if local {
-                self.bash_executable(root)?
-            } else {
-                "bash".into()
-            };
-            let legacy_wsl = is_legacy_wsl_bash(&executable);
-            let mut command = Command::new(executable);
-            let input = if legacy_wsl {
-                command.arg("-s");
-                Some(script)
-            } else {
-                command.args(["-c", &script]);
-                None
-            };
-            Launch {
-                command,
-                input,
-                cwd: context.cwd,
-            }
-        };
-        launch.command.env_clear().envs(context.env);
-        Ok(launch)
+        Ok(context)
     }
 
     fn bash_executable(&self, root: &Path) -> Result<PathBuf> {
