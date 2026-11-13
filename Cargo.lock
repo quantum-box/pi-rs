@@ -2938,6 +2938,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-rs-remote-grep"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "pi-rs",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "pi-rs-remote-ls"
 version = "0.1.0"
 dependencies = [
