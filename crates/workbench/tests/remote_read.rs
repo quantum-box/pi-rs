@@ -258,3 +258,95 @@ async fn injectable_local_adapter_rejects_large_image_and_pages_text() {
         matches!(tool.invoke(json!({"path":"large.png"}), context()).await, Outcome::Failed(text) if text.contains("image exceeds 20 MiB"))
     );
 }
+
+struct SlowImageState {
+    reads: std::sync::atomic::AtomicUsize,
+    started: tokio::sync::Notify,
+    dropped: tokio::sync::Notify,
+    released: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+struct SlowImageReader {
+    state: Arc<SlowImageState>,
+    source: std::io::Cursor<Vec<u8>>,
+}
+impl std::io::Read for SlowImageReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.state
+            .reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.state.started.notify_one();
+        let (lock, ready) = &self.state.released;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+        let count = buffer.len().min(1024);
+        std::io::Read::read(&mut self.source, &mut buffer[..count])
+    }
+}
+impl std::io::Seek for SlowImageReader {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.source, position)
+    }
+}
+impl Drop for SlowImageReader {
+    fn drop(&mut self) {
+        self.state.dropped.notify_one();
+    }
+}
+struct SlowImage(Arc<SlowImageState>);
+#[async_trait::async_trait]
+impl ReadOperations for SlowImage {
+    async fn access(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+        unreachable!()
+    }
+    async fn detect_image_mime_type(&self, _: &Path) -> Result<Option<String>> {
+        Ok(Some("image/png".into()))
+    }
+    async fn open_file(
+        &self,
+        _: &Path,
+    ) -> Result<Option<Box<dyn pi_rs_workbench::coding::ReadSeek>>> {
+        Ok(Some(Box::new(SlowImageReader {
+            state: self.0.clone(),
+            source: std::io::Cursor::new(vec![0; 100_000]),
+        })))
+    }
+}
+#[tokio::test]
+async fn cancelling_image_stops_subsequent_stream_reads() {
+    let state = Arc::new(SlowImageState {
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+        dropped: tokio::sync::Notify::new(),
+        released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_read_tool(root.path(), Arc::new(SlowImage(state.clone()))).unwrap();
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let task = tokio::spawn(async move {
+        tool.invoke(
+            json!({"path":"image.png"}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: token,
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), state.started.notified())
+        .await
+        .unwrap();
+    cancellation.cancel();
+    assert!(matches!(task.await.unwrap(), Outcome::Failed(text) if text.contains("aborted")));
+    *state.released.0.lock().unwrap() = true;
+    state.released.1.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), state.dropped.notified())
+        .await
+        .expect("blocking reader must be dropped after its current read");
+    assert_eq!(state.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

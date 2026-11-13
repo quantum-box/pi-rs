@@ -502,6 +502,35 @@ struct RemoteReadTool {
     operations: Arc<dyn ReadOperations>,
 }
 
+// A blocking read cannot be interrupted in progress, but no further backend
+// reads or seeks should begin after cancellation.
+struct CancellableReader<R> {
+    inner: R,
+    cancellation: pi_rs::CancellationToken,
+}
+impl<R> CancellableReader<R> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            // Interrupted would cause read_to_end to retry indefinitely.
+            Err(std::io::Error::other("operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(buffer)
+    }
+}
+impl<R: Seek> Seek for CancellableReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(position)
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
@@ -531,7 +560,7 @@ impl Tool for RemoteReadTool {
             tokio::task::spawn_blocking(move || -> Result<Outcome> {
                 if token.is_cancelled() { return Err(Error::Cancelled); }
                 if let Some(mime) = mime {
-                    let mut source = source;
+                    let mut source = CancellableReader { inner: source, cancellation: token.clone() };
                     if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
                     source.seek(SeekFrom::Start(0))?;
                     let format = image::ImageFormat::from_mime_type(&mime)
