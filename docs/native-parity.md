@@ -3761,3 +3761,11 @@ choice/strict sampling, guardrails, prompt management ARNs, live account-specifi
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
+
+### Editor kill ring checkpoint
+
+Consecutive editor kill commands now combine their removed text in deletion
+order, including newline joins. Cursor movement or another editing action
+starts a separate kill. Yank-pop rotates the ring and is undoable, matching
+Pi's editor behavior. Focused editor tests cover both directions, multiline
+text, interrupted kills and yank cycling; other editor parity gaps remain open.

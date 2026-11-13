@@ -18,6 +18,7 @@ pub struct Editor {
     pub cursor: usize,
     undo: Vec<Snapshot>,
     kills: Vec<String>,
+    last_kill: bool,
     yank: Option<(Range<usize>, usize)>,
     preferred_column: Option<usize>,
     scroll_offset: usize,
@@ -33,6 +34,7 @@ impl Editor {
             self.undo.remove(0);
         }
         self.yank = None;
+        self.last_kill = false;
         self.preferred_column = None;
         self.jump_forward = None;
     }
@@ -106,14 +108,25 @@ impl Editor {
             self.right();
         }
     }
-    fn remove(&mut self, range: Range<usize>, kill: bool) {
+    fn remove(&mut self, range: Range<usize>, kill: Option<bool>) {
         if range.is_empty() {
             return;
         }
+        let accumulate = self.last_kill;
         self.remember();
-        if kill {
-            self.kills.insert(0, self.text[range.clone()].into());
-            self.kills.truncate(30);
+        if let Some(backward) = kill {
+            let removed = &self.text[range.clone()];
+            if accumulate && !self.kills.is_empty() {
+                if backward {
+                    self.kills[0].insert_str(0, removed);
+                } else {
+                    self.kills[0].push_str(removed);
+                }
+            } else {
+                self.kills.insert(0, removed.into());
+                self.kills.truncate(30);
+            }
+            self.last_kill = true;
         }
         self.text.replace_range(range.clone(), "");
         self.cursor = range.start;
@@ -121,12 +134,16 @@ impl Editor {
     pub fn backspace(&mut self) {
         let end = self.cursor;
         self.left();
-        self.remove(self.cursor..end, false);
+        let start = self.cursor;
+        self.cursor = end;
+        self.remove(start..end, None);
     }
     pub fn delete(&mut self) {
         let start = self.cursor;
         self.right();
-        self.remove(start..self.cursor, false);
+        let end = self.cursor;
+        self.cursor = start;
+        self.remove(start..end, None);
     }
     pub fn take(&mut self) -> String {
         self.remember();
@@ -135,6 +152,8 @@ impl Editor {
     }
     /// Returns false at the first/last logical line so the caller can browse history.
     pub fn vertical(&mut self, down: bool) -> bool {
+        self.last_kill = false;
+        self.yank = None;
         let start = self.line_start();
         let end = self.line_end();
         let target = if down {
@@ -183,6 +202,8 @@ impl Editor {
 
     /// False at a viewport boundary, where the caller may switch to history navigation.
     pub fn visual_move(&mut self, width: usize, delta: isize) -> bool {
+        self.last_kill = false;
+        self.yank = None;
         let layout = Layout::new(&self.text, width);
         let row = layout.row(self.cursor);
         let target = row.saturating_add_signed(delta).min(layout.len() - 1);
@@ -205,6 +226,8 @@ impl Editor {
             _ => None,
         };
         if let Some(direction) = direction {
+            self.last_kill = false;
+            self.yank = None;
             self.jump_forward = if self.jump_forward.is_some() {
                 None
             } else {
@@ -247,6 +270,15 @@ impl Editor {
     }
 
     pub fn action(&mut self, action: &str) -> bool {
+        if !matches!(
+            action,
+            "tui.editor.deleteWordBackward"
+                | "tui.editor.deleteWordForward"
+                | "tui.editor.deleteToLineStart"
+                | "tui.editor.deleteToLineEnd"
+        ) {
+            self.last_kill = false;
+        }
         match action {
             "tui.editor.cursorLeft" => self.left(),
             "tui.editor.cursorRight" => self.right(),
@@ -258,15 +290,41 @@ impl Editor {
             "tui.editor.deleteCharForward" => self.delete(),
             "tui.editor.deleteWordBackward" => {
                 let end = self.cursor;
-                self.word_left();
-                self.remove(self.cursor..end, true);
+                if self.cursor == self.line_start() && self.cursor > 0 {
+                    self.left();
+                } else {
+                    let line_start = self.line_start();
+                    self.word_left();
+                    self.cursor = self.cursor.max(line_start);
+                }
+                let start = self.cursor;
+                self.cursor = end;
+                self.remove(start..end, Some(true));
             }
             "tui.editor.deleteWordForward" => {
                 let start = self.cursor;
-                self.word_right();
-                self.remove(start..self.cursor, true);
+                let line_end = self.line_end();
+                if self.cursor == line_end && self.cursor < self.text.len() {
+                    self.right();
+                } else {
+                    self.word_right();
+                    self.cursor = self.cursor.min(line_end);
+                }
+                let end = self.cursor;
+                self.cursor = start;
+                self.remove(start..end, Some(false));
             }
-            "tui.editor.deleteToLineStart" => self.remove(self.line_start()..self.cursor, true),
+            "tui.editor.deleteToLineStart" => {
+                let start = self.line_start();
+                self.remove(
+                    if start == self.cursor {
+                        start.saturating_sub(1)
+                    } else {
+                        start
+                    }..self.cursor,
+                    Some(true),
+                );
+            }
             "tui.editor.deleteToLineEnd" => {
                 let end = self.line_end();
                 self.remove(
@@ -275,7 +333,7 @@ impl Editor {
                     } else {
                         end
                     },
-                    true,
+                    Some(false),
                 );
             }
             "tui.editor.yank" => {
@@ -286,11 +344,12 @@ impl Editor {
                 }
             }
             "tui.editor.yankPop" => {
-                if let Some((range, index)) = self.yank.take() {
-                    let index = (index + 1) % self.kills.len();
-                    self.text.replace_range(range.clone(), &self.kills[index]);
-                    self.cursor = range.start + self.kills[index].len();
-                    self.yank = Some((range.start..self.cursor, index));
+                if let Some((range, _)) = self.yank.take().filter(|_| self.kills.len() > 1) {
+                    self.remember();
+                    self.kills.rotate_left(1);
+                    self.text.replace_range(range.clone(), &self.kills[0]);
+                    self.cursor = range.start + self.kills[0].len();
+                    self.yank = Some((range.start..self.cursor, 0));
                 }
             }
             "tui.editor.undo" => {
@@ -313,6 +372,115 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consecutive_kills_accumulate_in_direction_and_across_lines() {
+        let mut editor = Editor::default();
+        editor.insert("one two\n三 four");
+        for _ in 0..4 {
+            editor.action("tui.editor.deleteWordBackward");
+        }
+        assert_eq!(editor.text, "one ");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "one two\n三 four");
+
+        editor.action("tui.editor.cursorLineStart");
+        editor.action("tui.editor.deleteToLineStart");
+        editor.action("tui.editor.deleteToLineStart");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "one two\n三 four");
+
+        editor.cursor = 0;
+        editor.action("tui.editor.cursorLineStart");
+        editor.action("tui.editor.deleteToLineEnd");
+        editor.action("tui.editor.deleteToLineEnd");
+        editor.action("tui.editor.deleteToLineEnd");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "one two\n三 four");
+    }
+
+    #[test]
+    fn kill_ring_limits_separate_entries_but_accumulates_consecutive_kills() {
+        let mut editor = Editor::default();
+        for index in 0..35 {
+            editor.replace(format!("entry{index}"));
+            editor.action("tui.editor.deleteToLineStart");
+        }
+        assert_eq!(editor.kills.len(), 30);
+        assert_eq!(editor.kills.first().unwrap(), "entry34");
+        assert_eq!(editor.kills.last().unwrap(), "entry5");
+
+        editor.replace("joined tail".into());
+        editor.action("tui.editor.deleteWordBackward");
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.kills.len(), 30);
+        assert_eq!(editor.kills.first().unwrap(), "joined tail");
+        assert_eq!(editor.kills.last().unwrap(), "entry6");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "joined tail");
+    }
+
+    #[test]
+    fn undo_word_deletion_restores_original_cursor_in_both_directions() {
+        for (action, cursor, result) in [
+            (
+                "tui.editor.deleteWordBackward",
+                "first\n".len(),
+                "firstsecond",
+            ),
+            ("tui.editor.deleteWordForward", "first".len(), "firstsecond"),
+            (
+                "tui.editor.deleteWordBackward",
+                "first\nsecond".len(),
+                "first\n",
+            ),
+            ("tui.editor.deleteWordForward", 0, "\nsecond"),
+        ] {
+            let mut editor = Editor::default();
+            editor.insert("first\nsecond");
+            editor.cursor = cursor;
+            editor.action(action);
+            assert_eq!(editor.text, result, "{action}");
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, "first\nsecond", "{action}");
+            assert_eq!(editor.cursor, cursor, "{action}");
+        }
+    }
+
+    #[test]
+    fn undo_character_deletion_restores_original_cursor() {
+        for (action, cursor) in [
+            ("tui.editor.deleteCharBackward", 1),
+            ("tui.editor.deleteCharForward", 0),
+        ] {
+            let mut editor = Editor::default();
+            editor.insert("ab");
+            editor.cursor = cursor;
+            editor.action(action);
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, "ab");
+            assert_eq!(editor.cursor, cursor, "{action}");
+        }
+    }
+
+    #[test]
+    fn interrupted_kills_rotate_yanks_and_yank_pop_is_undoable() {
+        let mut editor = Editor::default();
+        editor.insert("alpha beta gamma");
+        editor.action("tui.editor.deleteWordBackward");
+        editor.action("tui.editor.cursorLeft");
+        editor.action("tui.editor.cursorRight");
+        editor.action("tui.editor.deleteWordBackward");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "alpha beta ");
+        editor.action("tui.editor.yankPop");
+        assert_eq!(editor.text, "alpha gamma");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "alpha beta ");
+        // Pi rotates the ring itself, so a later yank uses the rotated entry.
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "alpha beta gamma");
+    }
+
     #[test]
     fn jumps_across_lines_without_inserting_the_target() {
         let mut editor = Editor::default();
