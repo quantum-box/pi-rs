@@ -367,19 +367,34 @@ struct FrameWriter<W: Write> {
     armed: bool,
 }
 
+fn synchronized_updates_supported() -> bool {
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 impl<W: Write> FrameWriter<W> {
-    fn new(output: W, buffered: bool) -> std::io::Result<Self> {
+    fn new(output: W, buffered: bool, synchronized: bool) -> std::io::Result<Self> {
         let mut frame = Self {
             output,
             buffer: buffered.then(Vec::new),
-            armed: true,
+            armed: synchronized,
         };
-        queue!(frame, BeginSynchronizedUpdate)?;
+        if synchronized {
+            queue!(frame, BeginSynchronizedUpdate)?;
+        }
         Ok(frame)
     }
 
     fn finish(mut self) -> std::io::Result<()> {
-        queue!(self, EndSynchronizedUpdate)?;
+        if self.armed {
+            queue!(self, EndSynchronizedUpdate)?;
+        }
         if let Some(buffer) = self.buffer.take() {
             self.output.write_all(&buffer)?;
         }
@@ -2015,7 +2030,11 @@ impl View {
             }
         }
         let stdout = std::io::stdout();
-        let mut out = FrameWriter::new(stdout.lock(), !cfg!(windows))?;
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         let elapsed = self
             .request_started
             .map(|start| start.elapsed())
@@ -2427,7 +2446,11 @@ impl View {
                 && rows_to_match > 0
                 && (!committing || pending().take(rows_to_match).count() < rows_to_match));
         let stdout = std::io::stdout();
-        let mut out = FrameWriter::new(stdout.lock(), !cfg!(windows))?;
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         if redraw {
             self.graphics.clear_placements(&mut out)?;
             queue!(
@@ -7063,13 +7086,32 @@ mod tests {
                 Ok(())
             }
         }
-        let mut frame = super::FrameWriter::new(Sink(output.clone()), false).unwrap();
+        let mut frame = super::FrameWriter::new(Sink(output.clone()), false, true).unwrap();
         write!(frame, "preceding text").unwrap();
         // Crossterm flushes the writer immediately before a WinAPI command.
         frame.flush().unwrap();
         assert!(output.borrow().ends_with(b"preceding text"));
         frame.finish().unwrap();
         assert!(output.borrow().ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn frame_without_ansi_never_emits_synchronization_sequences() {
+        use std::io::Write;
+        let mut output = Vec::new();
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "first").unwrap();
+            frame.flush().unwrap();
+            write!(frame, "second").unwrap();
+            frame.finish().unwrap();
+        }
+        assert_eq!(output, b"firstsecond");
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "aborted").unwrap();
+        }
+        assert_eq!(output, b"firstsecondaborted");
     }
 
     #[test]
@@ -7108,6 +7150,7 @@ mod tests {
                     failed: false,
                 },
                 buffered,
+                true,
             )
             .unwrap();
             let result = write!(frame, "some frame content").and_then(|()| frame.finish());
