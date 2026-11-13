@@ -3381,7 +3381,7 @@ fn load_resolved_theme(
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
-    let resources = super::resources::Resources::load(args)?;
+    let resources = super::resources::Resources::load_for_startup(args)?;
     Ok(load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
         &resources.themes,
@@ -7849,12 +7849,12 @@ mod tests {
     }
 
     #[test]
-    fn resume_picker_skips_unprepared_package_and_uses_it_after_preparation() {
+    fn resume_picker_loads_unprepared_local_package_without_installing() {
         const CHILD: &str = "PI_RS_TEST_RESUME_PACKAGE_THEME_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let home = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "interactive::tests::resume_picker_skips_unprepared_package_and_uses_it_after_preparation", "--nocapture"])
+                .args(["--exact", "interactive::tests::resume_picker_loads_unprepared_local_package_without_installing", "--nocapture"])
                 .env("PI_RS_HOME", home.path())
                 .env(CHILD, "1")
                 .output().unwrap();
@@ -7894,8 +7894,103 @@ mod tests {
         args.settings = super::super::config::Settings::default();
         args.use_theme = Some("package-theme".into());
         let index = home.join("packages/index.json");
-        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
         assert!(!index.exists(), "picker must not prepare packages");
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":["cargo:never-install-this-package"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            !index.exists(),
+            "missing remote packages must not be installed"
+        );
+
+        // A directly selected local package remains explicit with auto-discovery off.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        args.no_themes = true;
+        args.extensions.push(source.to_string_lossy().into_owned());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.extensions.clear();
+        args.no_themes = false;
+
+        // Global declarations work without project trust, but package filters
+        // still apply before any local theme enters the picker.
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        std::fs::write(home.join("settings.json"), serde_json::json!({"packages":[{"source":source,"autoload":false,"themes":["+themes/theme.json"]},"cargo:never-install-this-package"]}).to_string()).unwrap();
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        assert!(!index.exists());
+
+        // A project package is visible only after project trust is granted.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        let project = args.workspace.join(".pi");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        args.trusted = true;
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.trusted = false;
+
+        // Cargo metadata is parsed as data: even a build script is never run.
+        let cargo_source = home.join("cargo-package");
+        std::fs::create_dir_all(cargo_source.join("palette")).unwrap();
+        std::fs::write(cargo_source.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        let sentinel = home.join("build-ran");
+        std::fs::write(
+            cargo_source.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                sentinel
+            ),
+        )
+        .unwrap();
+        selected["name"] = serde_json::json!("cargo-theme");
+        std::fs::write(
+            cargo_source.join("palette/theme.json"),
+            selected.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[cargo_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("cargo-theme".into());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "cargo-theme"
+        );
+        assert!(!sentinel.exists());
+        assert!(!index.exists());
+
+        args.use_theme = Some("package-theme".into());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7914,6 +8009,52 @@ mod tests {
             super::startup_picker_theme(&args).unwrap().name,
             "package-theme"
         );
+
+        // Pi package.json manifests work before and after normal preparation,
+        // including a BOM; scripts are data and are never executed.
+        let pi_source = home.join("pi-package");
+        std::fs::create_dir_all(pi_source.join("assets")).unwrap();
+        selected["name"] = serde_json::json!("pi-theme");
+        std::fs::write(pi_source.join("assets/visual.json"), selected.to_string()).unwrap();
+        std::fs::create_dir_all(pi_source.join("extensions")).unwrap();
+        let extension = pi_source.join("extensions/unexpected");
+        std::fs::write(
+            &extension,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pi_manifest = serde_json::json!({"version":"1.0.0", "pi":{"themes":["assets/visual.json"],"extensions":["extensions/unexpected"]},
+            "scripts":{"prepare":"must-not-run"}});
+        std::fs::write(
+            pi_source.join("package.json"),
+            format!("\u{feff}{pi_manifest}"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("pi-theme".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(
+            !sentinel.exists(),
+            "picker must not execute package extensions"
+        );
+        std::fs::remove_file(extension).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(!sentinel.exists());
     }
 
     #[test]

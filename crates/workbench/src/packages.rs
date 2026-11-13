@@ -235,6 +235,168 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     }
     Ok(result)
 }
+/// Resolve themes for the startup picker without preparing packages or executing
+/// their extensions. Unindexed local sources can be inspected directly; missing
+/// remote packages remain unavailable until normal package preparation.
+pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>> {
+    let installed = index()?;
+    let mut themes = Vec::new();
+    for declaration in declarations(args)?
+        .into_iter()
+        .filter(|entry| entry.transient == transient)
+    {
+        let package = if let Some(value) = installed.get(&key(&declaration.source)) {
+            serde_json::from_value::<Installed>(value.clone())?
+        } else if !remote(&declaration.source) {
+            let root = PathBuf::from(&declaration.source);
+            if !root.is_dir() {
+                continue;
+            }
+            let manifest = match local_startup_manifest(&root) {
+                Ok(manifest) => manifest,
+                Err(_) => continue,
+            };
+            let pi = manifest
+                .get("pi")
+                .filter(|value| value.is_object())
+                .unwrap_or(&manifest);
+            let themes = match collect_package_themes(&root, pi) {
+                Ok(themes) => themes,
+                Err(_) => continue,
+            };
+            let resources = PackageResources {
+                themes,
+                ..PackageResources::default()
+            };
+            Installed {
+                source: declaration.source.clone(),
+                root,
+                version: None,
+                resources,
+            }
+        } else {
+            continue;
+        };
+        let filter = ResourceFilter::new(&declaration.value, "themes")?;
+        let inherited = declaration
+            .inherited
+            .as_ref()
+            .map(|value| ResourceFilter::new(value, "themes"))
+            .transpose()?;
+        for path in package.resources.themes {
+            let inherited_enabled = inherited
+                .as_ref()
+                .is_some_and(|filter| filter.includes(&path, &package.root, false));
+            if filter.includes(&path, &package.root, inherited_enabled) && !themes.contains(&path) {
+                themes.push(path);
+            }
+        }
+    }
+    Ok(themes)
+}
+
+fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
+    let explicit = ["extensions", "skills", "prompts", "themes"]
+        .iter()
+        .any(|name| pi.get(name).is_some());
+    let patterns = pi
+        .get("themes")
+        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+        .transpose()?
+        .unwrap_or_else(|| {
+            if explicit {
+                Vec::new()
+            } else {
+                vec!["themes".into()]
+            }
+        });
+    validate_patterns(&patterns)?;
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut themes = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            )
+        })
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && entry.file_name().to_string_lossy().ends_with(".json")
+            && manifest_selected(entry.path(), root, &patterns)
+        {
+            themes.push(entry.into_path());
+        }
+    }
+    Ok(themes)
+}
+
+// Mirror the manifest precedence used during installation, without invoking
+// cargo metadata/build or loading any executable from the source directory.
+fn local_startup_manifest(root: &Path) -> Result<Value> {
+    let pi_manifest = root.join("pi-package.json");
+    if pi_manifest.is_file() {
+        return config::read_object(&pi_manifest);
+    }
+    let cargo_manifest = root.join("Cargo.toml");
+    if cargo_manifest.is_file() {
+        let text = std::fs::read_to_string(cargo_manifest)?;
+        let manifest: toml::Value = toml::from_str(&text)
+            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        let metadata = manifest
+            .get("package")
+            .and_then(|value| value.get("metadata"))
+            .and_then(|value| value.get("pi"));
+        return Ok(json!({"pi": metadata}));
+    }
+    if root.join("package.json").is_file() {
+        return read_pi_package_json(&root.join("package.json"));
+    }
+    Ok(json!({}))
+}
+
+// Pi packages describe resources in package.json's `pi` object. Never run
+// package scripts while reading it, and accept Pi's UTF-8 BOM handling.
+fn read_pi_package_json(path: &Path) -> Result<Value> {
+    let bytes = std::fs::read(path)?;
+    let value: Value =
+        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))?;
+    if !value.is_object() {
+        return Err(Error::Config(format!(
+            "{} must contain an object",
+            path.display()
+        )));
+    }
+    let pi = value.get("pi").filter(|pi| pi.is_object());
+    let explicit = pi.is_some_and(|pi| {
+        ["extensions", "skills", "prompts", "themes"]
+            .iter()
+            .any(|name| pi.get(name).is_some())
+    });
+    let themes = pi
+        .and_then(|pi| pi.get("themes"))
+        .cloned()
+        .unwrap_or_else(|| {
+            if explicit {
+                json!([])
+            } else {
+                json!(["themes"])
+            }
+        });
+    // Only theme support is opted in here. In particular, reading a Pi
+    // package must not enable its executable extensions during preparation.
+    Ok(
+        json!({"pi": {"extensions": [], "skills": [], "prompts": [], "themes": themes},
+        "version": value.get("version")}),
+    )
+}
+
 struct ResourceFilter {
     patterns: Option<Vec<String>>,
     autoload: bool,
@@ -838,7 +1000,16 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         .get("pi")
         .filter(|value| value.is_object())
         .unwrap_or(&manifest);
-    let resources = collect_package_resources(&root, pi, installed_binaries)?;
+    let mut resources = collect_package_resources(&root, pi, installed_binaries)?;
+    // Keep native default handling for other resource types while honoring
+    // theme declarations from a Pi package.json during normal preparation.
+    if !root.join("pi-package.json").is_file()
+        && !root.join("Cargo.toml").is_file()
+        && root.join("package.json").is_file()
+        && let Ok(manifest) = read_pi_package_json(&root.join("package.json"))
+    {
+        resources.themes = collect_package_themes(&root, &manifest["pi"])?;
+    }
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
     }
@@ -919,6 +1090,10 @@ fn collect_package_resources(
                 }
             });
         validate_patterns(&patterns)?;
+        if name == "themes" {
+            *target = collect_package_themes(root, pi)?;
+            continue;
+        }
         if name == "prompts" {
             *target = collect_package_prompts(root, &patterns);
             continue;
