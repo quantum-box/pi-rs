@@ -2857,7 +2857,8 @@ the caller's blocked executor should use `compact_with_hooks()` instead. Legacy
 synchronous compaction hooks keep their signatures but execute on that worker
 thread when called through SDK `compact()`. Cooperative asynchronous hooks are
 bounded by the tool timeout; a legacy hook that blocks its worker thread cannot
-be preempted. Async `session_compact` and
+be preempted. Tasks spawned on the private runtime do not outlive the call;
+extensions needing longer-lived tasks should use the async API. Async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
