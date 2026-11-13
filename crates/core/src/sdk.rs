@@ -157,6 +157,41 @@ struct SessionOwner {
     config: Mutex<RunConfig>,
 }
 
+const MAX_IDLE_INPUT_DEPTH: usize = 16;
+
+struct IdleChildRequest {
+    input: crate::AgentInput,
+    reply: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+#[derive(Clone)]
+struct IdleInputScope {
+    owner: Arc<SessionOwner>,
+    children: mpsc::UnboundedSender<IdleChildRequest>,
+    host: Arc<dyn crate::ToolHost>,
+    states: crate::ExtensionStates,
+    cancellation: CancellationToken,
+    depth: usize,
+}
+
+tokio::task_local! {
+    static IDLE_INPUT_SCOPE: IdleInputScope;
+}
+
+impl IdleInputScope {
+    async fn submit(&self, input: crate::AgentInput) -> Result<()> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.children
+            .send(IdleChildRequest { input, reply })
+            .map_err(|_| Error::Config("idle input callback has finished".into()))?;
+        tokio::select! {
+            biased;
+            result = receiver => result.map_err(|_| Error::Config("idle input response was lost".into()))?,
+            _ = self.cancellation.cancelled() => Err(Error::Cancelled),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionControl {
     owner: Arc<SessionOwner>,
@@ -309,6 +344,13 @@ impl SessionControl {
             images,
         };
         message.validate()?;
+        let child = IDLE_INPUT_SCOPE
+            .try_with(|scope| scope.clone())
+            .ok()
+            .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
+        if let Some(scope) = child {
+            return self.enqueue_child(message, scope).await;
+        }
         let order = self.input_order.acquire().await?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
@@ -353,6 +395,48 @@ impl SessionControl {
             .map_err(|_| Error::Config("session is closed".into()))?;
         Ok(id)
     }
+    async fn enqueue_child(
+        &self,
+        mut message: QueuedMessage,
+        mut scope: IdleInputScope,
+    ) -> Result<Uuid> {
+        if scope.depth >= MAX_IDLE_INPUT_DEPTH {
+            return Err(Error::Config(
+                "idle input callback nesting limit exceeded".into(),
+            ));
+        }
+        scope.depth += 1;
+        let id = message.input.id;
+        let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
+        if !hooks.extensions.is_empty() {
+            let event = crate::InputEvent {
+                text: std::mem::take(&mut message.input.content),
+                images: std::mem::take(&mut message.images),
+                source: crate::InputSource::Extension,
+                streaming_behavior: None,
+            };
+            let prepared = IDLE_INPUT_SCOPE
+                .scope(
+                    scope.clone(),
+                    crate::extension::prepare_input_with_host(
+                        &hooks.extensions,
+                        event,
+                        &scope.states,
+                        scope.host.clone(),
+                    ),
+                )
+                .await?;
+            let Some(prepared) = prepared else {
+                return Ok(id);
+            };
+            message.input.content = prepared.text;
+            message.images = prepared.images;
+            message.validate()?;
+        }
+        scope.submit(message.into()).await?;
+        Ok(id)
+    }
+
     async fn enqueue_idle(
         &self,
         mut message: QueuedMessage,
@@ -432,10 +516,22 @@ impl SessionControl {
             streaming_behavior: None,
         };
         let (sender, mut incoming) = mpsc::channel(32);
-        let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let host: Arc<dyn crate::ToolHost> =
+            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let (children, mut child_requests) = mpsc::unbounded_channel();
         let states = journal.extension_states();
-        let future =
-            crate::extension::prepare_input_with_host(&hooks.extensions, event, &states, host);
+        let scope = IdleInputScope {
+            owner: self.owner.clone(),
+            children,
+            host: host.clone(),
+            states: states.clone(),
+            cancellation: active.token.clone(),
+            depth: 0,
+        };
+        let future = IDLE_INPUT_SCOPE.scope(
+            scope,
+            crate::extension::prepare_input_with_host(&hooks.extensions, event, &states, host),
+        );
         tokio::pin!(future);
         let prepared = loop {
             tokio::select! {
@@ -450,6 +546,17 @@ impl SessionControl {
                         Ok(()) => { let _ = reply.send(Ok(())); }
                         Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
                     }
+                }
+                Some(child) = child_requests.recv() => {
+                    if child.reply.is_closed() {
+                        continue;
+                    }
+                    if active.token.is_cancelled() || closed.is_cancelled() {
+                        let _ = child.reply.send(Err(Error::Cancelled));
+                        continue;
+                    }
+                    let result = child.input.apply(&mut journal, &mut observe);
+                    let _ = child.reply.send(result);
                 }
                 _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
                 _ = active.token.cancelled() => return Err(Error::Cancelled),
@@ -556,9 +663,17 @@ impl SessionControl {
                         emit(events, &notification);
                     }
                 },
-                Arc::new(InputMessageHost {
-                    input: self.input.clone(),
-                }),
+                IDLE_INPUT_SCOPE
+                    .try_with(|scope| {
+                        Arc::ptr_eq(&scope.owner, &self.owner).then(|| scope.host.clone())
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        Arc::new(InputMessageHost {
+                            input: self.input.clone(),
+                        })
+                    }),
             )
             .await;
         }
@@ -569,6 +684,16 @@ impl SessionControl {
         input: impl FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> crate::AgentInput,
     ) -> Result<T> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
+        let child = IDLE_INPUT_SCOPE
+            .try_with(|scope| scope.clone())
+            .ok()
+            .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
+        if let Some(scope) = child {
+            scope.submit(input(reply)).await?;
+            return receiver
+                .await
+                .map_err(|_| Error::Config("queue control response was lost".into()))?;
+        }
         let token = {
             let _order = self.input_order.acquire().await?;
             let state = self.active.lock().expect("session control");
@@ -8657,6 +8782,170 @@ mod tests {
         .expect("session close deadlocked");
         assert!(result.is_err());
         closed.unwrap();
+    }
+
+    struct ScopedIdleControlHook {
+        control: Arc<Mutex<Option<SessionControl>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedIdleControlHook {
+        fn id(&self) -> &str {
+            "scoped-idle-control"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            self.events.lock().unwrap().push(event.text.clone());
+            if event.text == "parent" {
+                self.entered.notify_one();
+                self.release.notified().await;
+                let control = self.control.lock().unwrap().clone().unwrap();
+                control
+                    .steer("child")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                control
+                    .set_queue_mode(InputKind::Steer, crate::QueueMode::All)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.events.lock().unwrap().push("parent-finished".into());
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn idle_scoped_child_input_and_control_precede_waiting_external_ticket() {
+        let slot = Arc::new(Mutex::new(None));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(ScopedIdleControlHook {
+                control: slot.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+                events: events.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        *slot.lock().unwrap() = Some(control.clone());
+        let parent = control.clone();
+        let external = control.clone();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(parent.steer("parent"), async {
+                entered.notified().await;
+                let task = tokio::spawn(async move { external.follow_up("external").await });
+                loop {
+                    if control.input_order.state.lock().unwrap().next >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                release.notify_one();
+                task.await.unwrap()
+            })
+        })
+        .await
+        .expect("scoped idle control deadlocked");
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            &*events.lock().unwrap(),
+            &["parent", "child", "parent-finished", "external"]
+        );
+        let queued = session.clear_queued_inputs().unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|message| message.input.content.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "parent", "external"]
+        );
+    }
+
+    struct CancelScopedIdleHook {
+        control: Arc<Mutex<Option<SessionControl>>>,
+        ready: Arc<tokio::sync::Notify>,
+        after_commit: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for CancelScopedIdleHook {
+        fn id(&self) -> &str {
+            "cancel-scoped-idle"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if event.text == "parent" {
+                if self.after_commit {
+                    let control = self.control.lock().unwrap().clone().unwrap();
+                    control
+                        .steer("child")
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                self.ready.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn scoped_child_cancellation_respects_journal_commit_boundary() {
+        for after_commit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scoped-cancel.jsonl");
+            let slot = Arc::new(Mutex::new(None));
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .extension(Arc::new(CancelScopedIdleHook {
+                    control: slot.clone(),
+                    ready: ready.clone(),
+                    after_commit,
+                }))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+            let control = session.controls();
+            *slot.lock().unwrap() = Some(control.clone());
+            let parent = control.clone();
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(parent.steer("parent"), async {
+                    ready.notified().await;
+                    control.abort();
+                })
+            })
+            .await
+            .expect("scoped cancellation deadlocked");
+            assert!(matches!(result, Err(Error::Cancelled)));
+            session.close().await.unwrap();
+            drop(session);
+            let restored = Session::open(&path).unwrap();
+            assert_eq!(
+                restored
+                    .queued_inputs()
+                    .iter()
+                    .filter(|input| input.input.content == "child")
+                    .count(),
+                usize::from(after_commit)
+            );
+        }
     }
 
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);

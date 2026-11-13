@@ -2799,6 +2799,9 @@ host-call capability and report it unavailable with older hosts.
 The SDK supplies a message host to initial input hooks and to `SessionControl`
 input hooks while idle or during a run. Idle host sends are acknowledged after
 journaling, and trigger messages start a run through the shared session owner.
+Directly awaited control calls from an idle input callback use a bounded
+callback-scoped child lane; independently spawned tasks enter the normal FIFO
+admission queue because Tokio task-local scope is not inherited by spawned tasks.
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
