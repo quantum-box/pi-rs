@@ -57,6 +57,14 @@ fn key_path() -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn load_or_create_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    load_or_create_key_with_sync(path, |parent| std::fs::File::open(parent)?.sync_all())
+}
+
+#[cfg(unix)]
+fn load_or_create_key_with_sync(
+    path: &std::path::Path,
+    sync_directory: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Option<[u8; 32]> {
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     std::fs::create_dir_all(path.parent()?).ok()?;
@@ -90,7 +98,7 @@ fn load_or_create_key(path: &std::path::Path) -> Option<[u8; 32]> {
             .open(path)
     };
     let mut published_path = path.as_os_str().to_os_string();
-    published_path.push(".v2");
+    published_path.push(".v3");
     let published_path = std::path::PathBuf::from(published_path);
     let read_key = |mut file: std::fs::File| {
         let metadata = file.metadata().ok()?;
@@ -102,31 +110,21 @@ fn load_or_create_key(path: &std::path::Path) -> Option<[u8; 32]> {
         Some(key)
     };
     match open_existing(&published_path) {
-        Ok(file) => return read_key(file),
+        Ok(file) => {
+            let key = read_key(file)?;
+            // A previous publisher may have failed after rename and before
+            // syncing the directory, so retry the sync before any key is used.
+            sync_directory(path.parent()?).ok()?;
+            return Some(key);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(_) => return None,
     }
-    let legacy = match open_existing(path) {
-        Ok(file) => {
-            let metadata = file.metadata().ok()?;
-            if !secure(&metadata) || metadata.len() > 32 {
-                return None;
-            }
-            if metadata.len() == 32 {
-                Some(read_key(file)?)
-            } else {
-                None // An old, incomplete key cannot have produced a fingerprint.
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
-    };
-    let key = legacy.unwrap_or_else(|| {
-        let mut key = [0_u8; 32];
-        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key
-    });
+    // Pre-release versions used different names and did not coordinate with
+    // this lock. Ignore those files, which may still be actively written.
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let mut temp_path = path.as_os_str().to_os_string();
     temp_path.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let temp_path = std::path::PathBuf::from(temp_path);
@@ -148,6 +146,7 @@ fn load_or_create_key(path: &std::path::Path) -> Option<[u8; 32]> {
     file.sync_all().ok()?;
     drop(file);
     std::fs::rename(temp_path, published_path).ok()?;
+    sync_directory(path.parent()?).ok()?;
     Some(key)
 }
 
@@ -233,38 +232,20 @@ fn load_or_create_windows_key(path: &std::path::Path) -> Option<[u8; 32]> {
     // Never overwrite a published key: a DPAPI error may mean this process
     // lacks access to another user's key, rather than a damaged file.
     let mut published_path = path.as_os_str().to_os_string();
-    published_path.push(".v2");
+    published_path.push(".v3");
     let published_path = std::path::PathBuf::from(published_path);
     match std::fs::File::open(&published_path) {
         Ok(file) => return read_key(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(_) => return None,
     }
-    // Only an empty legacy file is provably incomplete without interpreting
-    // DPAPI's opaque format. Other decryption and I/O failures fail closed.
-    let legacy = match std::fs::File::open(path) {
-        Ok(file) => {
-            let metadata = file.metadata().ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            if metadata.len() == 0 {
-                None
-            } else {
-                Some(read_key(file)?)
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
-    };
-    let key = legacy.unwrap_or_else(|| {
-        let mut key = [0_u8; 32];
-        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key
-    });
+    // Older pre-release files are not inspected: their writers did not all
+    // coordinate with this lock, and their contents may be incomplete.
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let encrypted = dpapi_transform(&key, true)?;
-    // Do not replace an unreadable legacy file if DPAPI is unavailable.
+    // Do not publish if DPAPI cannot recover the new key.
     if dpapi_transform(&encrypted, false)?.as_slice() != key {
         return None;
     }
@@ -308,6 +289,34 @@ mod tests {
         assert!(!first.contains("low-entropy-secret"));
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn active_pre_release_writer_cannot_change_published_key() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let mut old_writer = std::fs::File::create(&path).unwrap();
+        old_writer.write_all(&[1]).unwrap();
+        std::fs::write(dir.path().join("key.abandoned.tmp"), b"partial").unwrap();
+        #[cfg(unix)]
+        let key = load_or_create_key(&path).unwrap();
+        #[cfg(windows)]
+        let key = load_or_create_windows_key(&path).unwrap();
+        old_writer.write_all(&[2; 31]).unwrap();
+        old_writer.sync_all().unwrap();
+        #[cfg(unix)]
+        assert_eq!(load_or_create_key(&path), Some(key));
+        #[cfg(windows)]
+        assert_eq!(load_or_create_windows_key(&path), Some(key));
+        let mut legacy_key = [2; 32];
+        legacy_key[0] = 1;
+        assert_ne!(key, legacy_key);
+        assert_eq!(
+            std::fs::read(dir.path().join("key.abandoned.tmp")).unwrap(),
+            b"partial"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn dpapi_key_persists_without_plaintext_and_rejects_tampering() {
@@ -335,7 +344,7 @@ mod tests {
             first,
             protected_model_fingerprint(&("authorization", "pin"))
         );
-        let published_path = path.with_extension("v2");
+        let published_path = path.with_extension("v3");
         let encrypted = std::fs::read(&published_path).unwrap();
         assert!(!encrypted.windows(key.len()).any(|window| window == key));
         std::fs::write(&published_path, b"tampered").unwrap();
@@ -345,7 +354,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_key_concurrent_creators_recover_incomplete_files() {
+    fn windows_key_concurrent_creators_ignore_pre_release_files() {
         if let Some(path) = std::env::var_os("PI_RS_DPAPI_RACE_PATH") {
             let key = load_or_create_windows_key(std::path::Path::new(&path)).unwrap();
             std::fs::write(
@@ -360,7 +369,7 @@ mod tests {
         let encrypted = dpapi_transform(&[7; 32], true).unwrap();
         {
             let length = 0;
-            let _ = std::fs::remove_file(path.with_extension("v2"));
+            let _ = std::fs::remove_file(path.with_extension("v3"));
             std::fs::write(&path, &encrypted[..length]).unwrap();
             let mut children = Vec::new();
             for index in 0..8 {
@@ -368,7 +377,7 @@ mod tests {
                 let child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "context_fingerprint::tests::windows_key_concurrent_creators_recover_incomplete_files",
+                        "context_fingerprint::tests::windows_key_concurrent_creators_ignore_pre_release_files",
                     ])
                     .env("PI_RS_DPAPI_RACE_PATH", &path)
                     .env("PI_RS_DPAPI_RACE_RESULT", &result)
@@ -390,39 +399,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_key_migrates_readable_legacy_key() {
+    fn windows_ignores_pre_release_key_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key");
-        let key = [42; 32];
-        std::fs::write(&path, dpapi_transform(&key, true).unwrap()).unwrap();
-        assert_eq!(load_or_create_windows_key(&path), Some(key));
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            load_or_create_windows_key(&dir.path().join("key")),
-            Some(key)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_key_fails_closed_for_unreadable_legacy_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("key");
-        let encrypted = dpapi_transform(&[7; 32], true).unwrap();
-        for length in [1, encrypted.len() / 2, encrypted.len() - 1] {
-            std::fs::write(&path, &encrypted[..length]).unwrap();
-            assert_eq!(load_or_create_windows_key(&path), None);
-            assert!(!path.with_extension("v2").exists());
-        }
-        // A structurally complete blob which DPAPI cannot authenticate models
-        // a key protected by another Windows user or a damaged key.
-        let mut inaccessible = encrypted;
-        let last = inaccessible.len() - 1;
-        inaccessible[last] ^= 0xff;
-        std::fs::write(&path, &inaccessible).unwrap();
-        assert_eq!(load_or_create_windows_key(&path), None);
-        assert!(!path.with_extension("v2").exists());
-        assert_eq!(std::fs::read(path).unwrap(), inaccessible);
+        let old_key = [42; 32];
+        let old_data = dpapi_transform(&old_key, true).unwrap();
+        std::fs::write(&path, &old_data).unwrap();
+        let key = load_or_create_windows_key(&path).unwrap();
+        assert_ne!(key, old_key);
+        assert_eq!(std::fs::read(path).unwrap(), old_data);
     }
 
     #[cfg(unix)]
@@ -433,7 +418,7 @@ mod tests {
         let path = dir.path().join("key");
         let key = load_or_create_key(&path).unwrap();
         assert_eq!(load_or_create_key(&path), Some(key));
-        let published = path.with_extension("v2");
+        let published = path.with_extension("v3");
         assert_eq!(
             std::fs::metadata(&published).unwrap().permissions().mode() & 0o777,
             0o600
@@ -441,13 +426,13 @@ mod tests {
         std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(load_or_create_key(&path), None);
         let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&published, &link).unwrap();
+        std::os::unix::fs::symlink(&published, link.with_extension("v3")).unwrap();
         assert_eq!(load_or_create_key(&link), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_key_migrates_and_recovers_concurrently() {
+    fn unix_key_ignores_legacy_and_creates_concurrently() {
         use std::os::unix::fs::PermissionsExt;
         if let Some(path) = std::env::var_os("PI_RS_UNIX_KEY_RACE_PATH") {
             let key = load_or_create_key(std::path::Path::new(&path)).unwrap();
@@ -463,8 +448,6 @@ mod tests {
         let original = [42; 32];
         std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(load_or_create_key(&path), Some(original));
-        std::fs::remove_file(path.with_extension("v2")).unwrap();
         for length in [0, 1, 16, 31] {
             std::fs::write(&path, &original[..length]).unwrap();
             let mut children = Vec::new();
@@ -473,7 +456,7 @@ mod tests {
                 let child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "context_fingerprint::tests::unix_key_migrates_and_recovers_concurrently",
+                        "context_fingerprint::tests::unix_key_ignores_legacy_and_creates_concurrently",
                     ])
                     .env("PI_RS_UNIX_KEY_RACE_PATH", &path)
                     .env("PI_RS_UNIX_KEY_RACE_RESULT", &result)
@@ -490,7 +473,30 @@ mod tests {
             let key = load_or_create_key(&path).unwrap();
             assert_eq!(fingerprint_with_key(&key, &"race").unwrap(), results[0]);
             assert_eq!(std::fs::read(&path).unwrap(), original[..length]);
-            std::fs::remove_file(path.with_extension("v2")).unwrap();
+            std::fs::remove_file(path.with_extension("v3")).unwrap();
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_key_requires_directory_sync_before_use() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let attempts = Cell::new(0);
+        let fail_sync = |parent: &std::path::Path| {
+            assert_eq!(parent, dir.path());
+            assert_eq!(
+                std::fs::metadata(path.with_extension("v3")).unwrap().len(),
+                32
+            );
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("simulated directory sync failure"))
+        };
+        assert_eq!(load_or_create_key_with_sync(&path, fail_sync), None);
+        assert!(path.with_extension("v3").exists());
+        assert_eq!(load_or_create_key_with_sync(&path, fail_sync), None);
+        assert_eq!(attempts.get(), 2);
+        let key = load_or_create_key(&path).unwrap();
+        assert_eq!(load_or_create_key(&path), Some(key));
     }
 }
