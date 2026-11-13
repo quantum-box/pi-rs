@@ -1179,6 +1179,30 @@ impl AgentSession {
             emit(&events, &event)
         })
     }
+    /// Compact a supplied summary while servicing asynchronous extension host calls.
+    pub async fn compact_with_hooks(&mut self, compaction: Compaction) -> Result<()> {
+        self.start().await?;
+        let active = self.begin_run();
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let mut observer = |event: Notification<'_>| {
+            self.control.observe(&event);
+            emit(&events, &event);
+        };
+        let result = agent
+            .compact_with_host(&mut self.session, compaction, &active.token, &mut observer)
+            .await;
+        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
+        let result = result.and(final_inputs);
+        let triggered = self.drain_idle_triggers().await.map(|_| ());
+        result.and(triggered)
+    }
     pub async fn summarize(&mut self, keep_turns: usize) -> Result<()> {
         self.summarize_with_instructions(keep_turns, None).await
     }
@@ -2543,6 +2567,42 @@ mod tests {
         assert!(restored.pending_custom_trigger().is_none());
         assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
             crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn supplied_compaction_summary_can_service_host_calls() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(Arc::new(CompactionHookMessages))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.compact_with_hooks(Compaction {
+                summary: "supplied".into(),
+                keep_turns: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let snapshots = requests.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let texts: Vec<_> = snapshots[1]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.ends_with(&["compact trigger", "compact next"]),
+            "{texts:?}"
+        );
+        assert!(session.journal().pending_custom_trigger().is_none());
     }
 
     struct CompactionLifecycleMessage;

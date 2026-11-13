@@ -2180,6 +2180,21 @@ impl Agent<'_> {
             .map(|_| ())
     }
 
+    /// Compact a supplied summary while servicing asynchronous extension host calls.
+    pub async fn compact_with_host(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host(session, compaction, &states, None, None, cancel, observer)
+            .await
+            .map(|_| ())
+    }
+
     /// Commit a caller-supplied summary using configured token retention.
     pub fn compact_configured(
         &self,
