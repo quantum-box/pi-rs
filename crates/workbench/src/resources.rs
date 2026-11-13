@@ -25,10 +25,24 @@ pub struct Resources {
     pub skills: BTreeMap<String, Skill>,
     pub prompts: BTreeMap<String, Prompt>,
     pub warnings: Vec<String>,
+    collisions: Vec<ResourceCollision>,
     pub packages: super::packages::PackageResources,
     pub extensions: Vec<PathBuf>,
     pub themes: Vec<PathBuf>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollisionKind {
+    Skill,
+    Prompt,
+}
+
+#[derive(Clone)]
+struct ResourceCollision {
+    kind: CollisionKind,
+    name: String,
+    loser: PathBuf,
+}
+
 #[derive(Default)]
 struct Frontmatter {
     name: Option<String>,
@@ -40,11 +54,12 @@ impl Resources {
         args: &Cli,
         discovered: &pi_rs::DiscoveredResources,
     ) -> Result<Self> {
-        let mut resources = Self::load(args)?;
+        let mut resources = Self::load_inner(args)?;
         if discovered.skill_paths.is_empty()
             && discovered.prompt_paths.is_empty()
             && discovered.theme_paths.is_empty()
         {
+            resources.finish_collisions();
             return Ok(resources);
         }
         let mut augmented = args.clone();
@@ -61,7 +76,7 @@ impl Resources {
             .collect();
         augmented.prompt_template = discovered.prompt_paths.clone();
         augmented.themes = discovered.theme_paths.clone();
-        let additions = match Self::load(&augmented) {
+        let additions = match Self::load_inner(&augmented) {
             Ok(additional) => vec![additional],
             Err(_) => {
                 // A resource can disappear or become unreadable between the
@@ -84,7 +99,7 @@ impl Resources {
                             1 => one.prompt_template.push(path.clone()),
                             _ => one.themes.push(path.clone()),
                         }
-                        match Self::load(&one) {
+                        match Self::load_inner(&one) {
                             Ok(additional) => loaded.push(additional),
                             Err(error) => resources.warnings.push(format!(
                                 "Could not load discovered resource {}: {error}",
@@ -105,12 +120,11 @@ impl Resources {
                     std::collections::btree_map::Entry::Occupied(entry)
                         if !same_resource_file(&entry.get().path, &skill.path) =>
                     {
-                        resources.warnings.push(resource_collision(
-                            "skill",
-                            &name,
-                            &entry.get().path,
-                            &skill.path,
-                        ));
+                        resources.collisions.push(ResourceCollision {
+                            kind: CollisionKind::Skill,
+                            name,
+                            loser: skill.path,
+                        });
                     }
                     _ => {}
                 }
@@ -123,12 +137,11 @@ impl Resources {
                     std::collections::btree_map::Entry::Occupied(entry)
                         if !same_resource_file(&entry.get().path, &prompt.path) =>
                     {
-                        resources.warnings.push(resource_collision(
-                            "prompt",
-                            &name,
-                            &entry.get().path,
-                            &prompt.path,
-                        ));
+                        resources.collisions.push(ResourceCollision {
+                            kind: CollisionKind::Prompt,
+                            name,
+                            loser: prompt.path,
+                        });
                     }
                     _ => {}
                 }
@@ -139,11 +152,52 @@ impl Resources {
                 }
             }
             resources.warnings.extend(additional.warnings);
+            resources.collisions.extend(additional.collisions);
         }
+        resources.finish_collisions();
         Ok(resources)
     }
 
     pub fn load(args: &Cli) -> Result<Self> {
+        let mut resources = Self::load_inner(args)?;
+        resources.finish_collisions();
+        Ok(resources)
+    }
+
+    fn finish_collisions(&mut self) {
+        let mut reported: Vec<ResourceCollision> = Vec::new();
+        for collision in self.collisions.drain(..) {
+            let (kind, winner) = match collision.kind {
+                CollisionKind::Skill => (
+                    "skill",
+                    self.skills.get(&collision.name).map(|skill| &skill.path),
+                ),
+                CollisionKind::Prompt => (
+                    "prompt",
+                    self.prompts.get(&collision.name).map(|prompt| &prompt.path),
+                ),
+            };
+            let Some(winner) = winner else { continue };
+            if same_resource_file(winner, &collision.loser)
+                || reported.iter().any(|existing| {
+                    existing.kind == collision.kind
+                        && existing.name == collision.name
+                        && same_resource_file(&existing.loser, &collision.loser)
+                })
+            {
+                continue;
+            }
+            self.warnings.push(resource_collision(
+                kind,
+                &collision.name,
+                winner,
+                &collision.loser,
+            ));
+            reported.push(collision);
+        }
+    }
+
+    fn load_inner(args: &Cli) -> Result<Self> {
         let mut resources = Self {
             packages: super::packages::resources(args)?,
             ..Self::default()
@@ -281,12 +335,11 @@ impl Resources {
                         std::collections::btree_map::Entry::Occupied(entry)
                             if !same_resource_file(&entry.get().path, &skill.path) =>
                         {
-                            resources.warnings.push(resource_collision(
-                                "skill",
-                                &name,
-                                &entry.get().path,
-                                &skill.path,
-                            ));
+                            resources.collisions.push(ResourceCollision {
+                                kind: CollisionKind::Skill,
+                                name: name.clone(),
+                                loser: skill.path,
+                            });
                         }
                         _ => {}
                     }
@@ -333,12 +386,11 @@ impl Resources {
                         std::collections::btree_map::Entry::Occupied(entry)
                             if !same_resource_file(&entry.get().path, &prompt.path) =>
                         {
-                            resources.warnings.push(resource_collision(
-                                "prompt",
-                                name,
-                                &entry.get().path,
-                                &prompt.path,
-                            ));
+                            resources.collisions.push(ResourceCollision {
+                                kind: CollisionKind::Prompt,
+                                name: name.into(),
+                                loser: prompt.path,
+                            });
                         }
                         _ => {}
                     },
@@ -864,9 +916,13 @@ mod tests {
         let root = directory.path();
         let skill_a = root.join("first/SKILL.md");
         let skill_b = root.join("second/SKILL.md");
+        let skill_c = root.join("third/SKILL.md");
         let prompt_a = root.join("first/greet.md");
         let prompt_b = root.join("second/greet.md");
-        for path in [&skill_a, &skill_b, &prompt_a, &prompt_b] {
+        let prompt_c = root.join("third/greet.md");
+        for path in [
+            &skill_a, &skill_b, &skill_c, &prompt_a, &prompt_b, &prompt_c,
+        ] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
         std::fs::write(
@@ -879,6 +935,12 @@ mod tests {
             "---\nname: shared\ndescription: second\n---\nSecond",
         )
         .unwrap();
+        std::fs::write(
+            &skill_c,
+            "---\nname: shared\ndescription: third\n---\nThird",
+        )
+        .unwrap();
+        std::fs::write(&prompt_c, "third prompt").unwrap();
         std::fs::write(&prompt_a, "first prompt").unwrap();
         std::fs::write(&prompt_b, "second prompt").unwrap();
         let mut args = Cli::parse_from([
@@ -898,6 +960,7 @@ mod tests {
         let resources = Resources::load(&args).unwrap();
         let skill_a = skill_a.canonicalize().unwrap();
         let skill_b = skill_b.canonicalize().unwrap();
+        let skill_c = skill_c.canonicalize().unwrap();
         let skill_warning = format!(
             "Duplicate skill shared at {}; using {}",
             skill_b.display(),
@@ -924,8 +987,8 @@ mod tests {
         args.skill.truncate(1);
         args.prompt_template.truncate(1);
         let discovered = pi_rs::DiscoveredResources {
-            skill_paths: vec![skill_b.clone()],
-            prompt_paths: vec![prompt_b.clone()],
+            skill_paths: vec![skill_b.clone(), skill_c.clone()],
+            prompt_paths: vec![prompt_b.clone(), prompt_c.clone()],
             theme_paths: vec![],
         };
         let resources = Resources::load_with_discovered(&args, &discovered).unwrap();
@@ -941,6 +1004,48 @@ mod tests {
         );
         assert_eq!(resources.skills["shared"].path, skill_a);
         assert_eq!(resources.prompts["greet"].body, "first prompt");
+        let third_skill_warning = format!(
+            "Duplicate skill shared at {}; using {}",
+            skill_c.display(),
+            skill_a.display()
+        );
+        let third_prompt_warning = format!(
+            "Duplicate prompt greet at {}; using {}",
+            prompt_c.display(),
+            prompt_a.display()
+        );
+        assert!(
+            resources.warnings.contains(&third_skill_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert!(
+            resources.warnings.contains(&third_prompt_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert!(!resources.warnings.iter().any(|warning| {
+            warning.contains(&format!("using {}", skill_b.display()))
+                || warning.contains(&format!("using {}", prompt_b.display()))
+        }));
+
+        // A missing path triggers individual-load recovery; both later files
+        // must still report the winner from the original resource set.
+        let mut recovered = discovered.clone();
+        recovered.skill_paths.push(root.join("missing/SKILL.md"));
+        let resources = Resources::load_with_discovered(&args, &recovered).unwrap();
+        for warning in [
+            &skill_warning,
+            &prompt_warning,
+            &third_skill_warning,
+            &third_prompt_warning,
+        ] {
+            assert!(
+                resources.warnings.contains(warning),
+                "{:?}",
+                resources.warnings
+            );
+        }
     }
 
     #[cfg(unix)]
