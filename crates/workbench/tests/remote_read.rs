@@ -150,7 +150,7 @@ async fn remote_read_cancellation_and_scope() {
             .with_read_operations(remote.clone())
             .is_err()
     );
-    let tool = create_read_tool(Path::new("/remote"), remote).unwrap();
+    let tool = create_read_tool(root.path(), remote).unwrap();
     let token = CancellationToken::new();
     let task_token = token.clone();
     let task = tokio::spawn(async move {
@@ -170,7 +170,8 @@ async fn remote_read_cancellation_and_scope() {
 
 #[tokio::test]
 async fn remote_read_uses_shared_truncation_and_image_processing() {
-    let tool = create_read_tool(Path::new("/remote"), Arc::new(Remote::default())).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_read_tool(root.path(), Arc::new(Remote::default())).unwrap();
     let context = || ToolContext {
         operation_id: uuid::Uuid::new_v4(),
         cancellation: CancellationToken::new(),
@@ -217,7 +218,8 @@ impl ReadOperations for StreamOnly {
 }
 #[tokio::test]
 async fn streaming_backend_uses_bounded_pagination_buffers() {
-    let tool = create_read_tool(Path::new("/remote"), Arc::new(StreamOnly)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_read_tool(root.path(), Arc::new(StreamOnly)).unwrap();
     let result = tool
         .invoke(
             json!({"path":"long", "offset":2, "limit":2}),
