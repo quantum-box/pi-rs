@@ -410,6 +410,19 @@ struct ReasoningBlock {
     redacted: Vec<u8>,
 }
 
+fn push_replay_text(out: &mut Vec<ContentBlock>, pending_whitespace: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        if let Some(ContentBlock::Text(previous)) = out.last_mut() {
+            previous.push_str(text);
+        } else {
+            pending_whitespace.push_str(text);
+        }
+    } else {
+        pending_whitespace.push_str(text);
+        out.push(ContentBlock::Text(std::mem::take(pending_whitespace)));
+    }
+}
+
 fn replay_blocks(
     replay: &ProviderReplay,
     model: &str,
@@ -460,19 +473,7 @@ fn replay_blocks(
             pending_whitespace.clear();
         }
         match b["type"].as_str()? {
-            "text" => {
-                let text = b["text"].as_str()?;
-                if text.trim().is_empty() {
-                    if let Some(ContentBlock::Text(previous)) = out.last_mut() {
-                        previous.push_str(text);
-                    } else {
-                        pending_whitespace.push_str(text);
-                    }
-                } else {
-                    pending_whitespace.push_str(text);
-                    out.push(ContentBlock::Text(std::mem::take(&mut pending_whitespace)));
-                }
-            }
+            "text" => push_replay_text(&mut out, &mut pending_whitespace, b["text"].as_str()?),
             "tool_use" => out.push(ContentBlock::ToolUse(
                 types::ToolUseBlock::builder()
                     .tool_use_id(ids.get(b["id"].as_str()?))
@@ -497,7 +498,7 @@ fn replay_blocks(
                         return None;
                     }
                     if is_claude && signature.is_none() {
-                        out.push(ContentBlock::Text(text.to_owned()));
+                        push_replay_text(&mut out, &mut pending_whitespace, text);
                         continue;
                     }
                     let sig = if is_claude {
@@ -1399,6 +1400,56 @@ mod tests {
                 .iter()
                 .all(|block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty()))
         );
+    }
+
+    #[test]
+    fn unsigned_whitespace_reasoning_never_emits_blank_text_blocks() {
+        for thinking_first in [true, false] {
+            let thinking = serde_json::json!({"type":"reasoning","text":" \n","signature":""});
+            let visible = serde_json::json!({"type":"text","text":"visible"});
+            let mut blocks = if thinking_first {
+                vec![thinking, visible]
+            } else {
+                vec![visible, thinking]
+            };
+            blocks
+                .push(serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}));
+            blocks.push(serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}));
+            let replay = ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "amazon-bedrock".into(),
+                    model: "anthropic.claude-test".into(),
+                },
+                blocks,
+            };
+            let call = ToolCall {
+                id: "id".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            };
+            let blocks = replay_blocks(
+                &replay,
+                "anthropic.claude-test",
+                true,
+                "visible",
+                &[call],
+                &mut ToolIds::default(),
+            )
+            .unwrap();
+            assert!(
+                blocks.iter().all(
+                    |block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty())
+                )
+            );
+            assert!(blocks.iter().any(
+                |block| matches!(block, ContentBlock::Text(text) if text.contains("visible"))
+            ));
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+            );
+        }
     }
 
     #[test]
