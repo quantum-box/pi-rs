@@ -19,6 +19,8 @@ use wire::{classifier_answers, classifier_payload, image_output, image_payload, 
 
 pub(super) const TOOL: &str = "pi_model_operation";
 const RESPONSE_LIMIT: usize = 7 * 1024 * 1024;
+const CLASSIFIER_MAX_RETRIES: usize = 2;
+const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +52,96 @@ impl Api {
             Self::OpenRouterImages => "chat/completions",
         }
     }
+}
+
+fn retryable_classifier_response(response: &reqwest::Response) -> bool {
+    match response
+        .headers()
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("true") => return true,
+        Some("false") => return false,
+        _ => {}
+    }
+    matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599)
+}
+
+fn classifier_retry_delay(
+    headers: &HeaderMap,
+    retry_index: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Duration> {
+    let numeric = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    };
+    let delay_ms = numeric("retry-after-ms").or_else(|| {
+        numeric("retry-after")
+            .map(|seconds| seconds * 1000.0)
+            .or_else(|| {
+                headers
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+                    .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
+            })
+    });
+    if let Some(delay_ms) = delay_ms {
+        if delay_ms > MAX_SERVER_RETRY_DELAY.as_millis() as f64 {
+            return Err(Error::Model(
+                "model operation requested a retry delay over 60 seconds".into(),
+            ));
+        }
+        return Ok(Duration::from_secs_f64(delay_ms.max(0.0) / 1000.0));
+    }
+    let base_ms = 500 * (1u64 << retry_index.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % u128::from(base_ms / 4 + 1)) as u64;
+    Ok(Duration::from_millis(base_ms - jitter))
+}
+
+async fn send_model_request(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    api: Api,
+) -> Result<reqwest::Response> {
+    let retries = if matches!(api, Api::SystemOne) {
+        CLASSIFIER_MAX_RETRIES
+    } else {
+        0
+    };
+    for attempt in 0..=retries {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| Error::Config("model operation request cannot be retried".into()))?;
+        let response = client.execute(request).await.map_err(|error| {
+            Error::Model(
+                if error.is_timeout() {
+                    "model operation timed out"
+                } else {
+                    "model operation could not connect"
+                }
+                .into(),
+            )
+        })?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        if attempt == retries || !retryable_classifier_response(&response) {
+            return Err(Error::Model(format!(
+                "model operation returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let delay = classifier_retry_delay(response.headers(), attempt, chrono::Utc::now())?;
+        drop(response);
+        // Dropping this future on operation cancellation also drops the sleep.
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("retry loop returns on its last attempt")
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -710,30 +802,15 @@ impl Operations {
                 HeaderValue::from_static("true"),
             );
         }
-        let mut response = self
+        let request = self
             .client
             .post(entry.endpoint.clone())
             .headers(headers)
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&payload)?)
-            .send()
-            .await
-            .map_err(|error| {
-                Error::Model(
-                    if error.is_timeout() {
-                        "model operation timed out"
-                    } else {
-                        "model operation could not connect"
-                    }
-                    .into(),
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err(Error::Model(format!(
-                "model operation returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
+            .build()
+            .map_err(|_| Error::Config("invalid model operation request".into()))?;
+        let mut response = send_model_request(&self.client, request, entry.api).await?;
         if response
             .content_length()
             .is_some_and(|length| length > RESPONSE_LIMIT as u64)
@@ -785,6 +862,201 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn classifier_retries_transient_http_failures_with_server_controls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (api, responses, expected_success, expected_error) in [
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![
+                    (400, "x-should-retry: true\r\nretry-after-ms: 0\r\n"),
+                    (200, ""),
+                ],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![(503, "x-should-retry: false\r\n")],
+                false,
+                "HTTP 503",
+            ),
+            (Api::SystemOne, vec![(400, "")], false, "HTTP 400"),
+            (
+                Api::SystemOne,
+                vec![
+                    (429, "retry-after-ms: 0\r\n"),
+                    (429, "retry-after-ms: 0\r\n"),
+                    (429, "retry-after-ms: 0\r\n"),
+                ],
+                false,
+                "HTTP 429",
+            ),
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after-ms: 60001\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
+                Api::OpenRouterImages,
+                vec![(429, "retry-after-ms: 0\r\n")],
+                false,
+                "HTTP 429",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for (status, headers) in responses {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let (end, length) = loop {
+                        let mut chunk = [0u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(position) =
+                            request.windows(4).position(|part| part == b"\r\n\r\n")
+                        {
+                            let end = position + 4;
+                            let header = std::str::from_utf8(&request[..end]).unwrap();
+                            let length = header
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            break (end, length);
+                        }
+                    };
+                    while request.len() < end + length {
+                        let mut chunk = [0u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(request[end..end + length].to_vec());
+                    stream.write_all(format!("HTTP/1.1 {status} Fixture\r\n{headers}content-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let request = client
+                .post(format!("http://{address}/test"))
+                .header("authorization", "Bearer fixture")
+                .body("fixture-body")
+                .build()
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                send_model_request(&client, request, api),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), expected_success);
+            if let Err(error) = result {
+                assert!(error.to_string().contains(expected_error), "{error}");
+            }
+            let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(requests.iter().all(|request| request == b"fixture-body"));
+        }
+    }
+
+    #[test]
+    fn classifier_retry_delays_honor_server_limit_and_dates() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:28:00 GMT")
+            .unwrap()
+            .to_utc();
+        let mut headers = HeaderMap::new();
+        assert!(
+            (Duration::from_millis(375)..=Duration::from_millis(500))
+                .contains(&classifier_retry_delay(&headers, 0, now).unwrap())
+        );
+        assert!(
+            (Duration::from_millis(750)..=Duration::from_secs(1))
+                .contains(&classifier_retry_delay(&headers, 1, now).unwrap())
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:05 GMT"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("12.5"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_micros(12500)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("60001"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_classifier_retry_wait() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 429 Fixture\r\nretry-after-ms: 5000\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            sent.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = client
+            .post(format!("http://{address}/test"))
+            .body("")
+            .build()
+            .unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        let operation = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => true,
+                    _ = send_model_request(&client, request, Api::SystemOne) => false,
+                }
+            }
+        });
+        received.await.unwrap();
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn classifier_image_header_defaults_are_independent_of_wire_format() {
