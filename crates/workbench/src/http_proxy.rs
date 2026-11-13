@@ -106,16 +106,19 @@ pub(super) fn bedrock_client(
         .or(all)
         .or_else(|| fallback.map(str::to_owned));
     let excluded = env("no_proxy", "NO_PROXY").unwrap_or_default();
-    // Credentials from instance/container metadata must never traverse a proxy.
-    // Custom endpoints are matched by origin, not by URL prefix.
-    let metadata_origins = [
-        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    ]
-    .into_iter()
-    .filter_map(|name| std::env::var(name).ok())
-    .filter_map(|value| Url::parse(&value).ok())
-    .collect::<Vec<_>>();
+    // Match the container credential endpoint itself, not its origin: STS or
+    // other SDK services may be configured on the same host and port.
+    let container_endpoint =
+        if let Ok(relative) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+            let base = Url::parse("http://169.254.170.2/").expect("valid ECS endpoint");
+            base.join(&relative)
+                .ok()
+                .filter(|url| url.origin() == base.origin())
+        } else {
+            std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+                .ok()
+                .and_then(|value| Url::parse(&value).ok())
+        };
     let http = parse_proxy(http.as_deref())?;
     let https = parse_proxy(https.as_deref())?;
     if http.is_none() && https.is_none() {
@@ -135,7 +138,7 @@ pub(super) fn bedrock_client(
         let http = http.clone();
         let https = https.clone();
         let excluded = excluded.clone();
-        let metadata_origins = metadata_origins.clone();
+        let container_endpoint = container_endpoint.clone();
         http_client_fn(move |settings, _components| {
             let connector = |config: ProxyConfig| {
                 SharedHttpConnector::new(
@@ -156,7 +159,7 @@ pub(super) fn bedrock_client(
                 http,
                 https,
                 excluded: excluded.clone(),
-                metadata_origins: metadata_origins.clone(),
+                container_endpoint: container_endpoint.clone(),
                 credential_traffic,
             })
         })
@@ -169,7 +172,7 @@ struct BedrockConnector {
     http: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
     https: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
     excluded: String,
-    metadata_origins: Vec<Url>,
+    container_endpoint: Option<Url>,
     credential_traffic: bool,
 }
 impl std::fmt::Debug for BedrockConnector {
@@ -205,21 +208,12 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for BedrockConnector {
             || (request.method() == "GET"
                 && url.path().contains("/latest/meta-data/")
                 && request.headers().get("x-aws-ec2-metadata-token").is_some());
-        let metadata = imds_request
-            || matches!(
-                url.host_str().map(|h| h.trim_matches(['[', ']'])),
-                Some(
-                    "169.254.169.254"
-                        | "fd00:ec2::254"
-                        | "169.254.170.2"
-                        | "169.254.170.23"
-                        | "fd00:ec2::23"
-                )
-            )
-            || self
-                .metadata_origins
-                .iter()
-                .any(|endpoint| endpoint.origin() == url.origin());
+        let container_request = request.method() == "GET"
+            && self
+                .container_endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint == &url);
+        let metadata = imds_request || container_request;
         let proxy = if (self.credential_traffic && metadata)
             || bedrock_bypasses_proxy(&url, &self.excluded)
         {
@@ -242,7 +236,7 @@ fn bedrock_bypasses_proxy(url: &Url, excluded: &str) -> bool {
         .map(|entry| {
             entry
                 .strip_prefix('*')
-                .filter(|_| entry != "*")
+                .filter(|tail| !tail.is_empty() && !tail.starts_with(':'))
                 .map_or_else(
                     || entry.to_owned(),
                     |tail| {
@@ -428,6 +422,16 @@ mod tests {
             "*example.com"
         ));
         assert!(bedrock_bypasses_proxy(&apex, "*"));
+        assert!(bedrock_bypasses_proxy(&apex, "*:443"));
+        assert!(!bedrock_bypasses_proxy(&apex, "*:80"));
+        assert!(bedrock_bypasses_proxy(
+            &Url::parse("http://example.com:8080").unwrap(),
+            "other.test, *:8080"
+        ));
+        assert!(!bedrock_bypasses_proxy(
+            &Url::parse("http://example.com:8081").unwrap(),
+            "other.test, *:8080"
+        ));
         assert!(!bedrock_bypasses_proxy(&apex, "*.example.com:80"));
     }
 
