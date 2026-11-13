@@ -149,6 +149,17 @@ impl Provider {
         token: Option<String>,
         bearer: bool,
     ) -> Result<Client> {
+        self.connect_prechecked(adapter, endpoint, token, bearer, false)
+    }
+
+    fn connect_prechecked(
+        &self,
+        adapter: Adapter,
+        endpoint: &str,
+        token: Option<String>,
+        bearer: bool,
+        radius_checked: bool,
+    ) -> Result<Client> {
         let missing_key = || {
             Error::Config(match self {
                 Self::Anthropic => "set ANTHROPIC_API_KEY or pass --api-key".into(),
@@ -221,7 +232,7 @@ impl Provider {
                 if self == &Self::Radius {
                     let gateway = super::radius_auth::Gateway::configured()?;
                     if gateway.model_endpoint().as_str() == endpoint {
-                        if token.is_none() && !gateway.has_credential()? {
+                        if token.is_none() && !radius_checked && !gateway.has_credential()? {
                             return Err(missing_key());
                         }
                         return Ok(Client::PiMessages(PiMessages::radius(
@@ -328,11 +339,34 @@ impl Deferred {
         self.resolve_with_headers().await.map(|(client, _)| client)
     }
 
+    #[cfg(test)]
+    async fn resolve_at(&self, auth_path: &std::path::Path) -> Result<Client> {
+        self.resolve_with_headers_at(auth_path)
+            .await
+            .map(|(client, _)| client)
+    }
+
     async fn resolve_with_headers(&self) -> Result<(Client, HeaderMap)> {
+        self.resolve_with_headers_at(&super::config::agent_dir().join("auth.json"))
+            .await
+    }
+
+    async fn resolve_with_headers_at(
+        &self,
+        auth_path: &std::path::Path,
+    ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
+            ),
+            Some(Credential::Kimi) if self.http_settings.is_some() => Some(
+                super::kimi_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
             ),
             Some(credential) => Some(credential.resolve().await?),
             None => None,
@@ -342,9 +376,24 @@ impl Deferred {
             .resolve(&self.provider, token.as_deref())
             .await?;
         let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
+        let mut radius_checked = false;
+        if self.provider == Provider::Radius
+            && self.adapter == Adapter::PiMessages
+            && token.is_none()
+        {
+            let gateway = super::radius_auth::Gateway::configured()?;
+            if gateway.model_endpoint().as_str() == self.endpoint {
+                if gateway.cached_access_at(auth_path).await?.is_none() {
+                    return Err(Error::Config(
+                        "sign in with /login radius, set RADIUS_API_KEY, or pass --api-key".into(),
+                    ));
+                }
+                radius_checked = true;
+            }
+        }
         let mut client = self
             .provider
-            .connect(self.adapter, &self.endpoint, token, bearer)?
+            .connect_prechecked(self.adapter, &self.endpoint, token, bearer, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         if let Some(settings) = &self.http_settings {
@@ -891,9 +940,121 @@ impl Model for Client {
 }
 
 #[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn deferred_radius_connect_waits_for_shared_credentials_and_can_cancel() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let gateway = super::super::radius_auth::Gateway::configured().unwrap();
+        std::fs::write(
+            &path,
+            json!({"radius":{
+                "type":"oauth", "gateway":gateway.url("/").as_str(),
+                "access":"cached", "refresh":"refresh", "expires":0
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let Client::Deferred(deferred) = Client::deferred(
+            Provider::Radius,
+            Adapter::PiMessages,
+            gateway.model_endpoint().as_str(),
+            None,
+            RequestHeaders::default(),
+        ) else {
+            panic!("expected deferred provider");
+        };
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), deferred.resolve_at(&path))
+                .await
+                .is_err()
+        );
+        let mut waiting = tokio::spawn({
+            let path = path.clone();
+            async move { deferred.resolve_at(&path).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(matches!(
+            waiting.await.unwrap().unwrap(),
+            Client::PiMessages(_)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn kimi_oauth_prepare_preserves_protected_resolved_identity() {
+        const CHILD: &str = "PI_RS_TEST_KIMI_PREPARED_IDENTITY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let path = super::super::config::agent_dir().join("auth.json");
+            let save = |access: &str| {
+                std::fs::write(&path, json!({"kimi-coding":{
+                    "type":"oauth", "access":access, "refresh":"fixture-refresh", "expires":9_000_000_000_000_u64
+                }}).to_string()).unwrap();
+            };
+            save("fixture-first-access");
+            let provider = Provider::named("kimi-coding").unwrap();
+            let client = Client::deferred(
+                provider.clone(),
+                provider.adapter(),
+                provider.default_endpoint(),
+                Some(Credential::Kimi),
+                RequestHeaders::default(),
+            );
+            assert!(client.context_identity().is_none());
+            let (prepared, first) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, repeated) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(prepared, Client::Ollama(_)));
+            assert!(first.is_some());
+            assert_eq!(first, repeated);
+            save("fixture-second-access");
+            let (_, changed) = client
+                .prepare_for_context("kimi-for-coding")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first, changed);
+            assert!(!first.unwrap().contains("fixture-first-access"));
+            assert!(!changed.unwrap().contains("fixture-second-access"));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::estimation_tests::kimi_oauth_prepare_preserves_protected_resolved_identity"])
+            .env(CHILD, "1")
+            .env("PI_RS_HOME", directory.path())
+            .env_remove("KIMI_API_KEY")
+            .current_dir(directory.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn deferred_bedrock_estimates_tool_images_without_synthetic_credentials() {

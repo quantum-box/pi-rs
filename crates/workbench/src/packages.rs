@@ -672,12 +672,16 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         .read(true)
         .write(true)
         .open(directory.join("install.lock"))?;
-    let _lock = tokio::task::spawn_blocking(move || {
-        lock.lock()?;
-        Ok::<_, std::io::Error>(lock)
-    })
-    .await
-    .map_err(|error| Error::Config(error.to_string()))??;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
+    }
+    let _lock = lock;
     let generation = tempfile::Builder::new()
         .prefix("install-")
         .tempdir_in(&directory)?;

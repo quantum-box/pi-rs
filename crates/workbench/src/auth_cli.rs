@@ -127,7 +127,16 @@ async fn resolve(
         if wanted.is_some_and(|wanted| wanted != kind) {
             return Ok(None);
         }
-        let value = credential.resolve().await?;
+        let value = if matches!(credential, super::model_auth::Credential::Kimi) {
+            super::kimi_auth::access(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
+        } else {
+            credential.resolve().await?
+        };
         if !super::model_auth::valid_key(&value) {
             return Err(Error::Config("invalid provider credential".into()));
         }
@@ -137,7 +146,7 @@ async fn resolve(
         let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
         if gateway.model_endpoint().as_str() == endpoint {
             let access = if no_refresh {
-                gateway.cached_access()?
+                gateway.cached_access().await?
             } else {
                 gateway.access(minimum).await?
             };
@@ -157,7 +166,7 @@ fn emit(line: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
+pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     // Auth commands are dispatched before normal interactive configuration is loaded.
     // Honor existing trust decisions without prompting in this noninteractive command.
     let explicit = if args.no_trust {
@@ -180,8 +189,12 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
         .or_else(|| args.model_explicit.then_some(args.model.as_str()))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| Error::Config("auth requires --provider or --model".into()))?;
-    let configuration = super::model_profiles::Profiles::load()
-        .and_then(|profiles| Ok((profiles, super::model_auth::Keys::load()?)));
+    let configuration = match super::model_profiles::Profiles::load() {
+        Ok(profiles) => super::model_auth::Keys::load_async()
+            .await
+            .map(|keys| (profiles, keys)),
+        Err(error) => Err(error),
+    };
     match configuration {
         Ok((profiles, keys)) => {
             args.model_profiles = profiles;
@@ -197,7 +210,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
                 } else {
                     emit("invalid")?;
                 }
-                std::process::exit(2);
+                return Ok(2);
             }
             return Err(error);
         }
@@ -255,9 +268,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
             emit(output_credential.as_deref().unwrap_or(status))?;
         }
         match status {
-            "ready" => return Ok(()),
-            "not_ready" => std::process::exit(1),
-            _ => std::process::exit(2),
+            "ready" => return Ok(0),
+            "not_ready" => return Ok(1),
+            _ => return Ok(2),
         }
     }
 
@@ -277,7 +290,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
         }
     }
     match matches.as_slice() {
-        [(_, credential)] => emit(credential),
+        [(_, credential)] => emit(credential).map(|()| 0),
         [] => Err(Error::Config(format!(
             "No usable {description} is configured for {name}"
         ))),

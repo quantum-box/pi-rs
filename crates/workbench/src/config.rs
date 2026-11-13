@@ -450,6 +450,19 @@ pub fn update_object(
     path: &Path,
     update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
 ) -> Result<()> {
+    let shared = if path.file_name().is_some_and(|name| name == "auth.json") {
+        Some(super::auth_lock::acquire(path)?)
+    } else {
+        None
+    };
+    update_object_locked(path, shared.as_ref(), update)
+}
+
+pub(super) fn update_object_locked(
+    path: &Path,
+    shared: Option<&super::auth_lock::Guard>,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let lock = std::fs::OpenOptions::new()
@@ -459,12 +472,143 @@ pub fn update_object(
         .write(true)
         .open(path.with_extension("lock"))?;
     lock.lock()?;
-    let mut value = read_object(path)?;
+    let mut value = read_object_unlocked(path)?;
     update(value.as_object_mut().expect("object"))?;
+    if let Some(guard) = shared {
+        guard.check()?;
+    }
     write_json(path, &value)
 }
 
+pub(super) async fn update_auth_object(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    let guard = super::auth_lock::acquire_async(path).await?;
+    update_object_locked(path, Some(&guard), update)
+}
+
 pub fn read_object(path: &Path) -> Result<Value> {
+    if path.file_name().is_none_or(|name| name != "auth.json") {
+        return read_object_unlocked(path);
+    }
+    match super::auth_lock::acquire(path) {
+        Ok(guard) => {
+            let value = read_object_unlocked(path)?;
+            guard.check()?;
+            Ok(value)
+        }
+        Err(error) => read_readonly_auth(path, error),
+    }
+}
+
+pub(super) async fn read_auth_object(path: &Path) -> Result<Value> {
+    match super::auth_lock::acquire_async(path).await {
+        Ok(guard) => {
+            let value = read_object_unlocked(path)?;
+            guard.check()?;
+            Ok(value)
+        }
+        Err(error) => read_readonly_auth(path, error),
+    }
+}
+
+fn same_auth_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    if a.len() != b.len() || a.modified().ok() != b.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        a.created().ok() == b.created().ok()
+    }
+}
+
+// If lock creation is denied, use checked snapshots. Any observed lock or
+// concurrent change fails closed; do not infer access from Unix mode bits.
+pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
+    let denied = matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::EROFS));
+    if !denied {
+        return Err(error);
+    }
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let lock = std::path::PathBuf::from(lock);
+    let unlocked = || match std::fs::symlink_metadata(&lock) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::Config(
+            "auth.json is locked; cannot read a read-only store safely".into(),
+        )),
+        Err(e) => Err(Error::Io(e)),
+    };
+    let snapshot = || -> Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let before = file.metadata()?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let after = file.metadata()?;
+                if !same_auth_metadata(&before, &after) {
+                    return Err(Error::Config("auth.json changed while reading".into()));
+                }
+                Ok(Some((bytes, after)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    unlocked()?;
+    let first = snapshot()?;
+    unlocked()?;
+    let second = snapshot()?;
+    unlocked()?;
+    let same = match (&first, &second) {
+        (None, None) => true,
+        (Some((a, ma)), Some((b, mb))) => a == b && same_auth_metadata(ma, mb),
+        _ => false,
+    };
+    if !same {
+        return Err(Error::Config("auth.json changed while reading".into()));
+    }
+    // A writer could finish and remove its lock after the second read; compare
+    // the path again after the final lock check before accepting the snapshot.
+    let current = match std::fs::metadata(path) {
+        Ok(value) => Some(value),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if !match (&second, current.as_ref()) {
+        (None, None) => true,
+        (Some((_, before)), Some(after)) => same_auth_metadata(before, after),
+        _ => false,
+    } {
+        return Err(Error::Config("auth.json changed while reading".into()));
+    }
+    match second {
+        None => Ok(Value::Object(Map::new())),
+        Some((bytes, _)) => {
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            if !value.is_object() {
+                return Err(Error::Config(format!(
+                    "{} must contain an object",
+                    path.display()
+                )));
+            }
+            Ok(value)
+        }
+    }
+}
+
+pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let value: Value = serde_json::from_slice(&bytes)
@@ -540,6 +684,54 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn auth_read_waits_asynchronously_until_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        let guard = super::super::auth_lock::acquire(&path).unwrap();
+        let reader_path = path.clone();
+        let reader = tokio::spawn(async move { super::read_auth_object(&reader_path).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!reader.is_finished());
+        drop(guard);
+        assert_eq!(reader.await.unwrap().unwrap()["provider"]["key"], "fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_lock_allows_checked_snapshot_with_owner_writable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        let denied = pi_rs::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::read_readonly_auth(&path, denied).unwrap()["provider"]["key"],
+            "fixture"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn readonly_auth_snapshot_rejects_active_pi_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let denied =
+            || pi_rs::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::read_readonly_auth(&path, denied()).unwrap()["provider"]["key"],
+            "fixture"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(dir.path().join("auth.json.lock")).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(super::read_readonly_auth(&path, denied()).is_err());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     #[test]
     fn global_updates_preserve_project_precedence_in_memory_and_on_disk() {
         use super::*;

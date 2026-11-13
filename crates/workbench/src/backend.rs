@@ -216,12 +216,18 @@ struct ShellCompletion {
     result: Result<pi_rs::BashExecution>,
 }
 
-pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
+pub fn run(
+    args: Cli,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
     // Keep the long-lived worker's future out of the frontend stack frame.
-    Box::pin(run_worker(args))
+    Box::pin(run_worker(args, ready))
 }
 
-async fn run_worker(mut args: Cli) -> Result<()> {
+async fn run_worker(
+    mut args: Cli,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
@@ -282,13 +288,13 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_stopping.store(true, Ordering::SeqCst);
-            signal_notify.notify_one();
-            cancel_active(&signal_active);
-        }
-    });
+    super::install_ctrl_c(move || {
+        signal_stopping.store(true, Ordering::SeqCst);
+        signal_notify.notify_one();
+        cancel_active(&signal_active);
+    })
+    .await;
+    super::startup_ready(&mut ready);
     notify_session_lifecycle(
         &args,
         &runtime,
@@ -382,24 +388,22 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             continue;
         }
         if let Request::CheckSessionTransition { id, event } = request {
-            let result = if runtime.registry.has_session_transition_hooks() {
-                match Session::snapshot(&args.session) {
-                    Ok(session) if session.host_binding().is_none() => Ok(runtime
-                        .registry
-                        .session_transition_cancelled(
-                            &event,
-                            &session.extension_states(),
-                            args.tool_timeout(),
-                            &mut |notification| observe(notification, args.trace),
-                        )
-                        .await),
-                    Ok(_) => Err(Error::Session(
-                        "managed session transitions require their host".into(),
-                    )),
-                    Err(error) => Err(error),
-                }
-            } else {
-                Ok(false)
+            let result = tokio::select! {
+                result = async {
+                    if runtime.registry.has_session_transition_hooks() {
+                        match Session::snapshot(&args.session) {
+                            Ok(session) if session.host_binding().is_none() => Ok(runtime.registry.session_transition_cancelled(
+                                &event, &session.extension_states(), args.tool_timeout(),
+                                &mut |notification| observe(notification, args.trace),
+                            ).await),
+                            Ok(_) => Err(Error::Session("managed session transitions require their host".into())),
+                            Err(error) => Err(error),
+                        }
+                    } else { Ok(false) }
+                } => result,
+                _ = async {
+                    while !stopping.load(Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+                } => Err(Error::Cancelled),
             };
             match result {
                 Ok(cancelled) => output(
@@ -432,14 +436,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. }
                 )
             {
-                pi_rs::notify_extension_lifecycle(
-                    &runtime.registry,
-                    event,
-                    &session.extension_states(),
-                    args.tool_timeout(),
-                    &mut |notification| observe(notification, args.trace),
-                )
-                .await;
+                let states = session.extension_states();
+                let mut observer =
+                    |notification: pi_rs::Notification<'_>| observe(notification, args.trace);
+                tokio::select! {
+                    _ = pi_rs::notify_extension_lifecycle(
+                        &runtime.registry, event, &states, args.tool_timeout(),
+                        &mut observer,
+                    ) => (),
+                    _ = async {
+                        while !stopping.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => (),
+                }
             }
             output(json!({"type":"selection_notified","id":id}));
             continue;

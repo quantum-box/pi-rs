@@ -22,7 +22,11 @@ mod file_search;
 pub mod image_profile;
 pub mod mcp;
 pub mod mcp_auth;
+#[doc(hidden)]
+pub mod mcp_oauth_client;
 mod mcp_provider_auth;
+#[doc(hidden)]
+pub mod mcp_refresh;
 #[doc(hidden)]
 pub mod oauth_callback;
 mod shell_config;

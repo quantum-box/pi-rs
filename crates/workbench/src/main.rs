@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod attachments;
 mod auth_cli;
+mod auth_lock;
 mod backend;
 mod builtin_chat;
 mod cache_stats;
@@ -27,6 +28,7 @@ mod extension_ui;
 mod http_proxy;
 mod image_policy;
 mod interactive;
+mod kimi_auth;
 mod mcp_config;
 mod model_auth;
 mod model_listing;
@@ -1134,7 +1136,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1150,7 +1152,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
         provider: String,
     },
     Run {
@@ -1240,9 +1242,37 @@ enum Control {
     Cancel,
 }
 
+// Return only after Tokio has polled and registered the signal listener.
+async fn install_ctrl_c(callback: impl FnOnce() + Send + 'static) {
+    use std::future::Future;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut signal = Box::pin(tokio::signal::ctrl_c());
+        let mut ready = Some(ready_tx);
+        let result = std::future::poll_fn(|context| {
+            let result = signal.as_mut().poll(context);
+            if let Some(sender) = ready.take() {
+                let _ = sender.send(());
+            }
+            result
+        })
+        .await;
+        if result.is_ok() {
+            callback();
+        }
+    });
+    let _ = ready_rx.await;
+}
+
+fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(sender) = ready.take() {
+        let _ = sender.send(());
+    }
+}
+
 fn main() {
     #[cfg(windows)]
-    {
+    let code = {
         // Windows executables start with a smaller stack than Unix binaries.
         std::thread::Builder::new()
             .name("pi".into())
@@ -1250,14 +1280,29 @@ fn main() {
             .spawn(run_cli)
             .expect("start Pi runtime thread")
             .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    }
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    };
     #[cfg(not(windows))]
-    run_cli();
+    let code = run_cli();
+    // Detached discovery threads may still be finishing. Wait for any token
+    // rotation and prevent another one from starting before process exit.
+    let _refreshes = process::stop_new_refreshes();
+    pi_rs_workbench::mcp_refresh::finish_refreshes();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli() {
+async fn run_cli() -> i32 {
+    // Register before parsing or starting any operation, including auth commands.
+    let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_tx.send(());
+        }
+    });
+    tokio::task::yield_now().await;
     let argv: Vec<_> = std::env::args_os().collect();
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
@@ -1266,11 +1311,12 @@ async fn run_cli() {
             if let Some(help) = cli_compat::extension_help(&argv) {
                 print!("{help}");
             }
-            return;
+            return 0;
         }
         Err(error) => error.exit(),
     };
     let mut output_truncated = false;
+    let mut cli_exit_code = 0;
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
@@ -1319,7 +1365,10 @@ async fn run_cli() {
                 ));
             }
             let command = command.clone();
-            return auth_cli::run(args, command).await;
+            return tokio::select! {
+                result = auth_cli::run(args, command) => result.map(|code| { cli_exit_code = code; }),
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            };
         }
         let decision = config::project_trust(
             &args.workspace,
@@ -1335,7 +1384,10 @@ async fn run_cli() {
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
         args.model_profiles = model_profiles::Profiles::load()?;
-        args.model_keys = model_auth::Keys::load()?;
+        args.model_keys = tokio::select! {
+            result = model_auth::Keys::load_async() => result?,
+            _ = &mut signal_rx => return Err(Error::Cancelled),
+        };
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -1400,21 +1452,39 @@ async fn run_cli() {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        Box::pin(execute(args, &mut output_truncated)).await
+        let managed = args.list_models.is_none() && matches!(&args.command,
+            None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
+        );
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
+        if managed {
+            tokio::select! {
+                biased;
+                _ = &mut signal_rx => Err(Error::Cancelled),
+                result = &mut execution => result,
+                _ = ready_rx => execution.await,
+            }
+        } else {
+            tokio::select! {
+                result = &mut execution => result,
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            }
+        }
     }
     .await;
     if let Err(err) = result {
         eprintln!("{err}");
-        std::process::exit(if matches!(err, Error::Cancelled) {
+        return if matches!(err, Error::Cancelled) {
             130
         } else {
             1
-        });
+        };
     }
     if output_truncated {
         eprintln!("Response was truncated: the model reached its output token limit.");
-        std::process::exit(1);
+        return 1;
     }
+    cli_exit_code
 }
 
 fn export_from_file(paths: &[PathBuf]) -> Result<()> {
@@ -1451,7 +1521,32 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
+async fn read_piped_stdin() -> Result<Vec<u8>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::stdin().read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+        .await
+        .map_err(|_| Error::Config("stdin reader stopped".into()))?
+        .map_err(Error::Io)
+}
+
+struct RpcCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RpcCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+        process::RPC_INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn execute(
+    mut args: Cli,
+    output_truncated: &mut bool,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
         patterns.split(',').collect()
@@ -1589,7 +1684,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             args.model_explicit = model_explicit;
             args.thinking_explicit = thinking_explicit;
         }
-        return backend::run(args).await;
+        return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
         return mcp_config::command(&args, command.clone()).await;
@@ -1629,6 +1724,11 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "kimi-coding" {
+                    kimi_auth::login(&args.settings, |url, code| {
+                        eprintln!("Enter code {code} at {url}")
+                    })
+                    .await
                 } else if provider == "openrouter" {
                     if *device_code {
                         return Err(Error::Config(
@@ -1664,6 +1764,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         Some(Command::Logout { provider }) => {
             let removed = if provider == "openai-chatgpt" {
                 chatgpt_auth::logout(&args.settings).await?
+            } else if provider == "kimi-coding" {
+                kimi_auth::logout().await?
             } else if provider == "openrouter" {
                 model_auth::remove(
                     &Provider::named(provider).expect("built-in OpenRouter provider"),
@@ -1728,7 +1830,12 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 "RPC mode accepts images in prompt requests, not @file arguments".into(),
             ));
         }
-        return rpc::run(args);
+        process::RPC_INTERRUPTED.store(false, Ordering::SeqCst);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _guard = RpcCancellation(cancelled.clone());
+        return tokio::task::spawn_blocking(move || rpc::run(args, cancelled))
+            .await
+            .map_err(|_| Error::Config("RPC worker stopped".into()))?;
     }
     let mut follow_up_prompts = Vec::new();
     let mut skip_initial_prompt = false;
@@ -1757,8 +1864,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
+            let input = read_piped_stdin().await?;
             let input = String::from_utf8_lossy(&input);
             let input = input
                 .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
@@ -1788,7 +1894,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args, follow_up_prompts).await;
+        return interactive::run(args, follow_up_prompts, ready).await;
     }
     if let Some(parent) = args
         .session
@@ -2024,11 +2130,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.cancel();
-        }
-    });
+    install_ctrl_c(move || signal.cancel()).await;
+    startup_ready(&mut ready);
     let (sender, mut receiver) = mpsc::channel(32);
     if args.stdin_control {
         read_controls(sender, cancel.clone());

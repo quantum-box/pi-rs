@@ -8,9 +8,96 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+
+pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(super) static RPC_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(super) static TERMINAL_SIGNAL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn terminal_signal_enabled() -> bool {
+    TERMINAL_SIGNAL_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static IN_FLIGHT_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) struct RefreshBarrier {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _worker: Option<std::fs::File>,
+}
+
+pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
+    IN_FLIGHT_REFRESH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(super) fn refresh_barrier() -> Result<RefreshBarrier> {
+    let process = stop_new_refreshes();
+    let worker = std::env::var_os(REFRESH_BARRIER_ENV)
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .transpose()?;
+    if let Some(file) = &worker {
+        file.lock()?;
+    }
+    Ok(RefreshBarrier {
+        _process: process,
+        _worker: worker,
+    })
+}
+
+// Used for operations that remain cancellable until their irreversible step.
+pub(super) fn refresh_barrier_cancellable(
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<RefreshBarrier>> {
+    let process = loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        match IN_FLIGHT_REFRESH.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(25))
+            }
+        }
+    };
+    let worker = std::env::var_os(REFRESH_BARRIER_ENV)
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .transpose()?;
+    if let Some(file) = &worker {
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+            }
+        }
+    }
+    Ok(Some(RefreshBarrier {
+        _process: process,
+        _worker: worker,
+    }))
+}
 
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
     match reason {
@@ -31,10 +118,12 @@ pub(super) struct Worker {
     session: std::path::PathBuf,
     pub(super) busy: bool,
     persistent: bool,
+    prompt_shutdown: bool,
     shutdown: Option<(SessionShutdownReason, Option<std::path::PathBuf>)>,
     configuration: Value,
     pub(super) child: Child,
     stdin: Option<ChildStdin>,
+    refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
@@ -51,7 +140,9 @@ impl Worker {
     ) -> Result<Self> {
         let steering_mode = session_queue_mode(args, pi_rs::InputKind::Steer)?;
         let follow_up_mode = session_queue_mode(args, pi_rs::InputKind::FollowUp)?;
+        let refresh_barrier = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(std::env::current_exe()?);
+        command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
         command.env(
@@ -225,10 +316,12 @@ impl Worker {
             session: args.session.clone(),
             busy: !persistent,
             persistent,
+            prompt_shutdown: false,
             shutdown: None,
             configuration: configuration(args),
             child,
             stdin,
+            refresh_barrier,
             events,
             pending_events: Vec::new(),
             readers,
@@ -320,7 +413,20 @@ impl Worker {
         events
     }
 
+    pub(super) fn interrupt_shutdown(&mut self) {
+        self.prompt_shutdown = true;
+    }
+
     pub(super) fn check_session_transition(
+        slot: Option<&mut Option<Self>>,
+        args: &Cli,
+        event: pi_rs::BeforeSessionTransition,
+    ) -> Result<bool> {
+        Self::check_session_transition_cancellable(None, slot, args, event)
+    }
+
+    pub(super) fn check_session_transition_cancellable(
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
         slot: Option<&mut Option<Self>>,
         args: &Cli,
         event: pi_rs::BeforeSessionTransition,
@@ -335,12 +441,30 @@ impl Worker {
         active.send(json!({"type":"check_session_transition","id":id,"event":event}))?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let event = active
-                .events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|error| {
-                    Error::Config(format!("could not check the session transition: {error}"))
-                })?;
+            if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                active.interrupt_shutdown();
+                return Err(Error::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Config("session transition check timed out".into()));
+            }
+            let wait = if cancelled.is_some() || terminal_signal_enabled() {
+                remaining.min(Duration::from_millis(50))
+            } else {
+                remaining
+            };
+            let event = match active.events.recv_timeout(wait) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "could not check the session transition: {error}"
+                    )));
+                }
+            };
             if event["type"] == "session_transition_checked" {
                 if event["id"] != id {
                     continue;
@@ -391,6 +515,15 @@ impl Worker {
         args: &Cli,
         event: &pi_rs::LifecycleEvent,
     ) -> Result<()> {
+        Self::notify_selection_cancellable(None, slot, args, event)
+    }
+
+    pub(super) fn notify_selection_cancellable(
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        slot: &mut Option<Self>,
+        args: &Cli,
+        event: &pi_rs::LifecycleEvent,
+    ) -> Result<()> {
         let Some(active) = Self::extension_worker(slot, args)? else {
             return Ok(());
         };
@@ -403,12 +536,32 @@ impl Worker {
         )?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let received = active
-                .events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|error| {
-                    Error::Config(format!("could not notify model selection: {error}"))
-                })?;
+            if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                active.interrupt_shutdown();
+                return Err(Error::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Config(
+                    "model selection notification timed out".into(),
+                ));
+            }
+            let wait = if terminal_signal_enabled() || cancelled.is_some() {
+                remaining.min(Duration::from_millis(50))
+            } else {
+                remaining
+            };
+            let received = match active.events.recv_timeout(wait) {
+                Ok(value) => value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "could not notify model selection: {error}"
+                    )));
+                }
+            };
             if received["type"] == "selection_notified" && received["id"] == id {
                 return Ok(());
             }
@@ -541,12 +694,20 @@ impl Drop for Worker {
             };
             let _ = self.send(message);
             self.stdin.take();
-            let deadline =
-                Instant::now() + Duration::from_secs(if self.persistent { 30 } else { 5 });
-            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = self.child.kill();
+            let deadline = Instant::now()
+                + Duration::from_secs(
+                    if self.prompt_shutdown
+                        || TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                        || RPC_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        2
+                    } else if self.persistent {
+                        30
+                    } else {
+                        5
+                    },
+                );
+            terminate_after_grace(&mut self.child, self.refresh_barrier.as_file(), deadline);
         }
         let _ = self.child.wait();
         for reader in self.readers.drain(..) {
@@ -555,9 +716,147 @@ impl Drop for Worker {
     }
 }
 
+fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: Instant) {
+    let mut deadline = deadline;
+    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+        if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+            || RPC_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        // The child locks this file before the token exchange. Holding it while
+        // killing prevents a new exchange from starting after the grace period.
+        if barrier.lock().is_ok() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = barrier.unlock();
+        } else {
+            let _ = child.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[cfg(unix)]
+    #[test]
+    fn rpc_transition_wait_and_worker_shutdown_respond_to_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = root.path().join("session.jsonl");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let (sender, events) = mpsc::channel();
+        let worker = super::Worker {
+            compacting: false,
+            retrying: false,
+            bashing: false,
+            steering_mode: pi_rs::QueueMode::All,
+            follow_up_mode: pi_rs::QueueMode::All,
+            session: args.session.clone(),
+            busy: false,
+            persistent: true,
+            prompt_shutdown: false,
+            shutdown: None,
+            configuration: serde_json::Value::Null,
+            child,
+            stdin,
+            events,
+            pending_events: Vec::new(),
+            readers: Vec::new(),
+            refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let flag = cancelled.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _sender = sender;
+                let mut slot = Some(worker);
+                let result = super::Worker::check_session_transition_cancellable(
+                    Some(&flag),
+                    Some(&mut slot),
+                    &args,
+                    pi_rs::BeforeSessionTransition::Switch {
+                        reason: pi_rs::SessionSwitchReason::New,
+                        target_session_file: None,
+                    },
+                );
+                assert!(matches!(result, Err(pi_rs::Error::Cancelled)));
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancelled.store(true, Ordering::SeqCst);
+            drop(task);
+        });
+        let start = Instant::now();
+        drop(runtime);
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "RPC transition delayed runtime shutdown"
+        );
+    }
+
+    #[test]
+    fn process_shutdown_waits_for_detached_refresh() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let active = super::refresh_barrier().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _shutdown = super::stop_new_refreshes();
+            sender.send(()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(active);
+        receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_teardown_waits_for_refresh_barrier_after_grace() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(barrier.path())
+            .unwrap();
+        held.lock().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            super::terminate_after_grace(&mut child, barrier.as_file(), Instant::now());
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        held.unlock().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.join().unwrap();
+    }
     #[test]
     fn queue_mode_uses_current_branch_even_when_session_is_locked() {
         let root = tempfile::tempdir().unwrap();

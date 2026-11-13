@@ -4491,3 +4491,834 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
         assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
     }
 }
+
+#[test]
+fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
+    for (minimum, expires_in, succeeds) in [
+        ("30s", 120, false),
+        ("3m", 120, false),
+        ("30s", 600, true),
+        ("15m", 600, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("token request not received: {error}"),
+                }
+            };
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let body = format!(
+                r#"{{"access_token":"new","refresh_token":"rotated","expires_in":{expires_in}}}"#
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .env_remove("KIMI_API_KEY")
+            .args([
+                "--provider",
+                "kimi-coding",
+                "auth",
+                "print-bearer-token",
+                "--min-expiry",
+                minimum,
+            ])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if succeeds {
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new");
+        }
+        let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn kimi_auth_commands_wait_for_refresh_after_sigint() {
+    for command in ["check", "print-bearer-token"] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_WORKER_REFRESH_BARRIER", barrier.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .args(["--provider", "kimi-coding", "auth", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            barrier.as_file().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{command} exited during refresh"
+        );
+        release_tx.send(()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stored: Value = serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        barrier.as_file().try_lock().unwrap();
+        barrier.as_file().unlock().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_readonly_store_and_environment_keys() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let auth = home.join("auth.json");
+    std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let kimi = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    let env_key = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        &auth,
+        json!({"kimi-coding":{"type":"oauth","access":"expired","refresh":"refresh","expires":0}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let expired = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&auth).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let missing = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(expired.status.code(), Some(2));
+    assert!(missing.status.success());
+    assert!(
+        kimi.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kimi.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kimi.stdout).unwrap()["status"],
+        "ready"
+    );
+    assert!(
+        env_key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_key.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&env_key.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_child_open_file(child: &mut std::process::Child, path: &std::path::Path) {
+    let path = std::fs::canonicalize(path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        #[cfg(target_os = "linux")]
+        let opened = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .ok()
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    std::fs::read_link(entry.path())
+                        .ok()
+                        .is_some_and(|target| target == path)
+                })
+            });
+        #[cfg(target_os = "macos")]
+        let opened = Command::new("/usr/sbin/lsof")
+            .args(["-Fn", "-p", &child.id().to_string()])
+            .output()
+            .ok()
+            .is_some_and(|output| {
+                let expected = format!("n{}", path.display());
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == expected)
+            });
+        if opened {
+            return;
+        }
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("child never opened lock file {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancelled_chatgpt_login_and_logout_do_not_wait_for_held_refresh_lock() {
+    for action in ["login", "logout"] {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("chatgpt-refresh.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([action, "openai-chatgpt"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_child_open_file(&mut child, &lock_path);
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        lock.unlock().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some(),
+            "{action} did not cancel while the lock was held"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_waiting_for_auth_json_lock() {
+    for arguments in [
+        vec!["--provider", "kimi-coding", "auth", "check"],
+        vec!["login", "openai-chatgpt"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(root.path().join("auth.json"), "{}").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "auth lock wait ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(lock.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_running_package_install() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = root.path().join("git-started");
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\nprintf ready > \"$PI_TEST_GIT_STARTED\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("PATH", path)
+        .env("PI_TEST_GIT_STARTED", &marker)
+        .args(["install", "git:https://example.invalid/pkg.git"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "package did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "package ignored SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_root_owned_0755_directory_when_unprivileged() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("auth.json"), json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    let binary = root.path().join("pi-test");
+    std::fs::copy(env!("CARGO_BIN_EXE_pi"), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(&binary)
+        .uid(65534)
+        .gid(65534)
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--provider",
+            "kimi-coding",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_package_install_waiting_for_package_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let source = "git:https://example.invalid/pkg.git";
+    let directory = root
+        .path()
+        .join("packages")
+        .join(format!("{:x}", Sha256::digest(source.as_bytes())));
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("install.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["install", source])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "package lock wait ignored SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_managed_model_discovery() {
+    for mode in [vec!["--mode", "rpc"], vec!["--models", "ollama/*", "serve"]] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args(["--no-mcp", "--provider", "ollama", "--endpoint", &endpoint])
+            .args(&mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        let _ = release_tx.send(());
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert!(status.is_some(), "model discovery ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_open_rpc_and_piped_stdin() {
+    for args in [vec!["--mode", "rpc"], vec!["--print"]] {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(["--no-mcp", "--offline", "--model", "fixture"])
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "{args:?} ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn radius_refresh_survives_sigint_and_persists_rotated_token() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}/", listener.local_addr().unwrap());
+    let auth = root.path().join("auth.json");
+    std::fs::write(&auth, json!({"radius":{"type":"oauth","gateway":gateway,"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        assert!(socket.read(&mut buffer).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", &gateway)
+        .args(["--provider", "radius", "auth", "print-bearer-token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+    release_tx.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+    assert_eq!(stored["radius"]["refresh"], "rotated");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_rpc_session_transition_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("slow-transition.py");
+    let marker = root.path().join("transition-started");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys, time
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'slow-transition', 'dependencies':[], 'commands':[], 'tools':[], 'session_transition_hook':True}
+elif request['type'] == 'before_session_transition':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'transition-started'), 'w') as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+    result = False
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--model",
+            "fixture",
+            "--extension",
+        ])
+        .arg(extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", json!({"type":"new_session", "id":"test"})).unwrap();
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "transition hook did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "RPC transition wait ignored SIGINT");
+    let extension_pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(extension_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(extension_pid, 0) },
+        0,
+        "transition extension survived shutdown"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
+    for login in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":4_000_000_000u64,"scopes":["chatgpt.tokens.use.direct"]});
+        std::fs::write(root.path().join("auth.json"), json!({"openai-chatgpt":{"type":"oauth","credential":credential},"kimi-coding":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        std::fs::write(
+            root.path().join("chatgpt-sessions.json"),
+            json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("chatgpt-registrations.json"), json!({"active":"client","accounts":[{"client_id":"client","subject":"subject","email":null}]}).to_string()).unwrap();
+        let chat_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.path().join("chatgpt-refresh.lock"))
+            .unwrap();
+        chat_lock.lock().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if login {
+            command.args(["login", "openai-chatgpt", "--account", "client"]);
+        } else {
+            command.args(["--provider", "openai-chatgpt", "auth", "check", "--json"]);
+        }
+        let mut child = command.spawn().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        let shared = root.path().join("auth.json.lock");
+        std::fs::create_dir(&shared).unwrap();
+        chat_lock.unlock().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let waited = child.try_wait().unwrap().is_none();
+        std::fs::remove_dir(shared).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            waited,
+            "ChatGPT exited instead of waiting for the shared auth lock"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(value["kimi-coding"]["key"], "keep");
+        assert_eq!(
+            value["openai-chatgpt"]["credential"]["refresh_token"],
+            "refresh"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancelled_mcp_logout_does_not_wait_for_held_refresh_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let name = "fixture";
+    let url = "http://127.0.0.1:8765/mcp";
+    std::fs::write(
+        root.path().join("mcp.json"),
+        json!({"mcpServers":{name:{"url":url,"oauth":true}}}).to_string(),
+    )
+    .unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&(name, url)).unwrap());
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let credentials = directory.join(format!("{digest:x}.json"));
+    let lock_path = credentials.with_extension("lock");
+    std::fs::write(&credentials, b"unchanged").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "logout", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_child_open_file(&mut child, &lock_path);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        status.is_some(),
+        "MCP logout did not cancel while the lock was held"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(credentials).unwrap(), b"unchanged");
+}

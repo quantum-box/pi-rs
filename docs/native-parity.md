@@ -170,8 +170,9 @@ and live acceptance with a Vercel account remain open.
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
 and the six pinned Kimi chat models. Their image limits, prices, context windows,
 and per-model reasoning settings remain distinct; the high-speed coding model
-uses its DeepSeek-style thinking switch. Subscription OAuth and live Kimi
-acceptance remain open.
+uses its DeepSeek-style thinking switch. Subscription OAuth supports device
+login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
+remains open.
 
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
@@ -2919,8 +2920,33 @@ hidden files and dependency directories.
 or model. It supports JSON output and a read-only `--no-refresh` check.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
-tokens use the normal refresh path and accept `--min-expiry`. The default
+tokens use the normal refresh path and accept `--min-expiry`. Kimi bearer
+exports follow the pinned Pi resolver: after refresh, an explicit minimum is
+checked with a five-minute floor, even when a shorter minimum was requested.
+The rotated credential is saved before that check. The default
 check output contains only status and metadata.
+
+pi-rs does not automatically remove stale `auth.json.lock` directories.
+To recover one safely, stop **all** Pi and pi-rs processes that can access
+that credential store, including background or waiting processes on other
+hosts sharing the filesystem. Once they have exited, either remove the stale
+directory or run a single Pi process to recover it; wait for recovery to
+finish before restarting any other process.
+
+This restriction matters even when no process currently holds the lock. Pi's
+`proper-lockfile` can observe a stale directory, pause, and later remove by
+path after another process has replaced it with a live pi-rs lock. Concurrent
+Pi stale recovery can therefore still compromise a pi-rs credential refresh
+and lose a rotated token. pi-rs cannot serialize an already-running Pi
+reclaimer with a separate lock or a path identity check; a complete fix
+must prevent Pi's delayed removal from deleting a live lock. The current
+protocol provides no such guarantee.
+
+One possible defense to investigate is publishing a prepopulated lock
+directory with an atomic no-replace operation, so a delayed `rmdir` fails while
+the directory is held. That approach would change crash recovery and depends
+on operating-system and filesystem behavior; it has not been implemented or
+validated and is not protection in the current release.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid

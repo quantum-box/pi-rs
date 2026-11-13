@@ -52,7 +52,7 @@ pub(super) async fn login(
         let code =
             code.ok_or_else(|| Error::Config("Missing OpenRouter authorization code".into()))?;
         let key = exchange(EXCHANGE, &code, &verifier, &proxies, idle_timeout).await?;
-        super::model_auth::save_openrouter_oauth(&key)
+        super::model_auth::save_openrouter_oauth(&key).await
     }
     .await;
     if let Authorization::Browser(redirect) = incoming {
