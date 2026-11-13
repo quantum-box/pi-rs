@@ -292,11 +292,15 @@ impl Agent<'_> {
                 .model_provider()
                 .and_then(|provider| {
                     self.registry
-                        .provider_branch_model(session.session_id(), provider, name)
+                        .provider_branch_config(session.session_id(), provider, name)
                 })
                 .or_else(|| {
                     (!provider_changed)
-                        .then(|| self.registry.branch_model(session.session_id(), name))
+                        .then(|| {
+                            self.registry
+                                .branch_model(session.session_id(), name)
+                                .map(|model| (model, None))
+                        })
                         .flatten()
                 }) {
                 Some(model) => Some(model),
@@ -329,11 +333,17 @@ impl Agent<'_> {
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
         let branch_agent = Agent {
-            model: model.as_deref().unwrap_or(self.model),
+            model: model
+                .as_ref()
+                .map(|(model, _)| model.as_ref())
+                .unwrap_or(self.model),
             model_name: branch_model.as_deref().unwrap_or(self.model_name),
             registry: self.registry,
             system_prompt: self.system_prompt,
-            limits: self.limits.clone(),
+            limits: model
+                .as_ref()
+                .and_then(|(_, limits)| limits.clone())
+                .unwrap_or_else(|| self.limits.clone()),
         };
         let mut result = branch_agent
             .run_turns(session, run_id, input, followups, cancel, observer)
@@ -390,11 +400,15 @@ impl Agent<'_> {
                     .model_provider()
                     .and_then(|provider| {
                         self.registry
-                            .provider_branch_model(session.session_id(), provider, name)
+                            .provider_branch_config(session.session_id(), provider, name)
                     })
                     .or_else(|| {
                         (!provider_changed)
-                            .then(|| self.registry.branch_model(session.session_id(), name))
+                            .then(|| {
+                                self.registry
+                                    .branch_model(session.session_id(), name)
+                                    .map(|model| (model, None))
+                            })
                             .flatten()
                     }) {
                     Some(model) => Some(model),
@@ -421,11 +435,17 @@ impl Agent<'_> {
                 None => None,
             };
             let branch_agent = Agent {
-                model: model.as_deref().unwrap_or(self.model),
+                model: model
+                    .as_ref()
+                    .map(|(model, _)| model.as_ref())
+                    .unwrap_or(self.model),
                 model_name: branch_model.as_deref().unwrap_or(self.model_name),
                 registry: self.registry,
                 system_prompt: self.system_prompt,
-                limits: self.limits.clone(),
+                limits: model
+                    .as_ref()
+                    .and_then(|(_, limits)| limits.clone())
+                    .unwrap_or_else(|| self.limits.clone()),
             };
             let mut trigger_result = branch_agent
                 .run_turns(session, trigger_id, None, followups, cancel, observer)

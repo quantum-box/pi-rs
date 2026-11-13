@@ -5644,8 +5644,8 @@ fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
     let endpoint_a = format!("http://{}/v1", origin.local_addr().unwrap());
     let endpoint_b = format!("http://{}/v1", selected.local_addr().unwrap());
     std::fs::write(home.join("models.json"), json!({"providers":{
-        "relay-a":{"api":"openai-completions","baseUrl":endpoint_a,"apiKey":"key-a","models":[{"id":"shared"}]},
-        "relay-b":{"api":"openai-completions","baseUrl":endpoint_b,"apiKey":"key-b","models":[{"id":"shared"}]}
+        "relay-a":{"api":"openai-completions","baseUrl":endpoint_a,"apiKey":"key-a","models":[{"id":"shared","maxTokens":64,"contextWindow":12000}]},
+        "relay-b":{"api":"openai-completions","baseUrl":endpoint_b,"apiKey":"key-b","models":[{"id":"shared","maxTokens":128,"contextWindow":24000}]}
     }}).to_string()).unwrap();
     let trigger = uuid::Uuid::new_v4();
     let message = CustomMessage {
@@ -5734,7 +5734,7 @@ fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
         .unwrap()
         .export_jsonl(&path)
         .unwrap();
-    let serve = |listener: TcpListener, expected: &'static str| {
+    let serve = |listener: TcpListener, expected: &'static str, max_tokens: u64| {
         std::thread::spawn(move || {
             let (mut socket, mut reader, request) = accept_proxy_request(listener);
             assert!(request.starts_with("POST "), "{request}");
@@ -5762,12 +5762,13 @@ fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
             reader.read_exact(&mut body).unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["model"], "shared");
+            assert_eq!(body["max_tokens"], max_tokens);
             let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
         })
     };
-    let a = serve(origin, "key-a");
-    let b = serve(selected, "key-b");
+    let a = serve(origin, "key-a", 64);
+    let b = serve(selected, "key-b", 128);
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
         .env("PI_RS_HOME", &home)

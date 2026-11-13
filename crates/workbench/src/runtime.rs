@@ -272,11 +272,12 @@ impl Runtime {
                 super::thinking::reported(&branch_args).is_some(),
                 true,
             ) {
-                let _ = self.registry.register_session_provider_model(
+                let _ = self.registry.register_session_provider_model_with_limits(
                     session_id,
                     provider,
                     model,
                     Arc::new(client),
+                    Some(effective_limits(&branch_args)),
                 );
             }
         }
@@ -297,14 +298,7 @@ impl Runtime {
             model_name: &args.model,
             registry: &self.registry,
             system_prompt: &self.system_prompt,
-            limits: Limits {
-                model_requests: args.max_requests,
-                output_tokens_per_request: args.effective_max_output_tokens(),
-                output_tokens_per_run: args.output_budget,
-                model_timeout: Duration::from_secs(args.model_timeout_secs),
-                tool_timeout: args.tool_timeout(),
-                context_window: args.effective_context_window(),
-            },
+            limits: effective_limits(args),
         }
     }
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
@@ -757,6 +751,17 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         }
     }
     result
+}
+
+fn effective_limits(args: &Cli) -> Limits {
+    Limits {
+        model_requests: args.max_requests,
+        output_tokens_per_request: args.effective_max_output_tokens(),
+        output_tokens_per_run: args.output_budget,
+        model_timeout: Duration::from_secs(args.model_timeout_secs),
+        tool_timeout: args.tool_timeout(),
+        context_window: args.effective_context_window(),
+    }
 }
 
 pub(super) fn model_client(

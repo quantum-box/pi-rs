@@ -10,7 +10,10 @@ use crate::{
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
-type BranchModels = BTreeMap<(Option<Uuid>, Option<String>, String), Arc<dyn crate::Model>>;
+type BranchModels = BTreeMap<
+    (Option<Uuid>, Option<String>, String),
+    (Arc<dyn crate::Model>, Option<crate::Limits>),
+>;
 
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
@@ -1087,7 +1090,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
-            .insert((None, None, name), model);
+            .insert((None, None, name), (model, None));
         Ok(())
     }
 
@@ -1103,7 +1106,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
-            .insert((Some(session_id), None, name), model);
+            .insert((Some(session_id), None, name), (model, None));
         Ok(())
     }
     /// Register an exact provider/model identity for a single journal.
@@ -1114,21 +1117,32 @@ impl Registry {
         name: &str,
         model: Arc<dyn crate::Model>,
     ) -> Result<()> {
+        self.register_session_provider_model_with_limits(session_id, provider, name, model, None)
+    }
+    /// Register a session-specific provider client and its effective run limits.
+    pub fn register_session_provider_model_with_limits(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        limits: Option<crate::Limits>,
+    ) -> Result<()> {
         if provider.trim().is_empty() || name.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
         }
         self.branch_models.write().expect("branch models").insert(
             (Some(session_id), Some(provider.to_owned()), name.to_owned()),
-            model,
+            (model, limits),
         );
         Ok(())
     }
-    pub(crate) fn provider_branch_model(
+    pub(crate) fn provider_branch_config(
         &self,
         session_id: Uuid,
         provider: &str,
         name: &str,
-    ) -> Option<Arc<dyn crate::Model>> {
+    ) -> Option<(Arc<dyn crate::Model>, Option<crate::Limits>)> {
         self.branch_models
             .read()
             .expect("branch models")
@@ -1144,7 +1158,7 @@ impl Registry {
         models
             .get(&(Some(session_id), None, name.to_owned()))
             .or_else(|| models.get(&(None, None, name.to_owned())))
-            .cloned()
+            .map(|(model, _)| model.clone())
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
         let mut models = self.branch_models.write().expect("branch models");

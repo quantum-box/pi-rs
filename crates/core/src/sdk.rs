@@ -3448,26 +3448,66 @@ mod tests {
         let first: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
         let second: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
         registry
-            .register_session_provider_model(session_id, "provider-a", "shared", first.clone())
+            .register_session_provider_model_with_limits(
+                session_id,
+                "provider-a",
+                "shared",
+                first.clone(),
+                Some(Limits {
+                    context_window: Some(12000),
+                    output_tokens_per_request: 64,
+                    ..Limits::default()
+                }),
+            )
             .unwrap();
         registry
-            .register_session_provider_model(session_id, "provider-b", "shared", second.clone())
+            .register_session_provider_model_with_limits(
+                session_id,
+                "provider-b",
+                "shared",
+                second.clone(),
+                Some(Limits {
+                    context_window: Some(24000),
+                    output_tokens_per_request: 128,
+                    ..Limits::default()
+                }),
+            )
             .unwrap();
         assert!(Arc::ptr_eq(
             &registry
-                .provider_branch_model(session_id, "provider-a", "shared")
-                .unwrap(),
+                .provider_branch_config(session_id, "provider-a", "shared")
+                .unwrap()
+                .0,
             &first
         ));
         assert!(Arc::ptr_eq(
             &registry
-                .provider_branch_model(session_id, "provider-b", "shared")
-                .unwrap(),
+                .provider_branch_config(session_id, "provider-b", "shared")
+                .unwrap()
+                .0,
             &second
         ));
+        let limits_a = registry
+            .provider_branch_config(session_id, "provider-a", "shared")
+            .unwrap()
+            .1
+            .unwrap();
+        let limits_b = registry
+            .provider_branch_config(session_id, "provider-b", "shared")
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(
+            (limits_a.context_window, limits_a.output_tokens_per_request),
+            (Some(12000), 64)
+        );
+        assert_eq!(
+            (limits_b.context_window, limits_b.output_tokens_per_request),
+            (Some(24000), 128)
+        );
         assert!(
             registry
-                .provider_branch_model(Uuid::new_v4(), "provider-a", "shared")
+                .provider_branch_config(Uuid::new_v4(), "provider-a", "shared")
                 .is_none()
         );
     }
