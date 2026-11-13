@@ -29,8 +29,8 @@
     };
     globalThis.store = (key, value) => {
         checkKey("store", key);
-        const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
         if (value === undefined) {
+            const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
             delete values[key];
             storedChars -= previous;
             changed = true;
@@ -41,6 +41,8 @@
         catch (_) { throw new TypeError("stored value is not JSON serializable"); }
         if (encoded === undefined) throw new TypeError("stored value is not JSON serializable");
         if (encoded.length > 262144) throw new RangeError("stored value exceeds size limit");
+        // JSON.stringify can invoke toJSON, which may mutate this same key.
+        const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
         const size = storedChars - previous + key.length + encoded.length;
         if (size > 1048576) throw new RangeError("store exceeds size limit");
         values[key] = encoded;

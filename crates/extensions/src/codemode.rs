@@ -1682,6 +1682,55 @@ mod tests {
         assert!(next.data.get("b").is_none());
         assert_eq!(next.data["c"].as_str().unwrap().len(), 210000);
     }
+    #[test]
+    fn reentrant_store_serialization_uses_current_entry_size() {
+        let replacement = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            store('target', 'small');
+            text(attempt(() => store('target', {toJSON() {
+                store('target', 'y'.repeat(262130));
+                return 'z'.repeat(100);
+            }})));
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &replacement.outcome else {
+            panic!("{:?}", replacement.outcome)
+        };
+        assert!(data["content"][0]["text"].as_str().unwrap().ends_with("ok"));
+        assert_eq!(
+            replacement.state.unwrap().data["target"]
+                .as_str()
+                .unwrap()
+                .len(),
+            100
+        );
+
+        let deletion = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            store('target', 'y'.repeat(262130));
+            store('target', {toJSON() { store('target', undefined); return 'n'; }});
+            text(attempt(() => store('overflow', 'z'.repeat(262140))));
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &deletion.outcome else {
+            panic!("{:?}", deletion.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("RangeError")
+        );
+        let state = deletion.state.unwrap();
+        assert_eq!(state.data["target"], "n");
+        assert!(state.data.get("overflow").is_none());
+    }
     #[tokio::test]
     async fn output_limits_terminate_even_when_caught() {
         use std::sync::atomic::{AtomicUsize, Ordering};
