@@ -54,6 +54,9 @@ pi-rs-extensions = { path = "../extensions" }
 pi-rs-fixture-tools = { path = "../fixture-tools", optional = true }
 pi-rs-plan-mode = { path = "../plan-mode" }
 pi-rs-review = { path = "../review" }
+pi-rs-remote-find = { path = "../remote-find" }
+pi-rs-remote-grep = { path = "../remote-grep" }
+pi-rs-remote-ls = { path = "../remote-ls" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 regex = "1"
 process-wrap = { version = "10", features = ["tokio1"] }
