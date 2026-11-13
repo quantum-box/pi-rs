@@ -83,7 +83,7 @@ without `defaultProvider` are still accepted.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection, Kimi Code device OAuth with refresh | OAuth and refresh for other model providers; ChatGPT live acceptance |
-| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, model shell, write, edit, grep, find and ls remote backend injection and factories, resource provenance in other surfaces and general component render callbacks |
+| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read and write operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, model shell, edit, grep, find and ls remote backend injection and factories, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
@@ -467,14 +467,27 @@ Backends that provide only `read_file` still return a complete in-memory buffer.
 Dropping an operation future must cancel backend work. Blocking reader methods
 must themselves return in bounded time; cancellation stops scans between reads
 and is checked between image processing phases. The factory uses unrestricted Pi
-path semantics and
-the backend enforces its own access policy. Scoped `CodingTools::new` rejects
+path semantics and the backend enforces its own access policy. Scoped
+`CodingTools::new` rejects
 custom operations because local canonicalization cannot establish remote
 symlink boundaries. This injection does not affect attachments or other tools.
 
-Remote model shell operations and public shell factories remain incomplete, as
-do backend injection and factories for write, edit, grep, find, and ls. User
-shell extension operations are a separate existing interface.
+
+### Remote model write operations
+
+Native hosts can inject async `WriteOperations` through
+`CodingTools::local(...).with_write_operations(...)` or create a standalone
+model-facing write tool with `create_write_tool`. The backend creates parent
+directories and writes content; the host validates model arguments and keeps a
+per-path mutation lock until each in-flight backend operation settles, even
+when the caller drops its future. Cancellation is observed between operations.
+The backend is responsible for its access policy and must not return before its
+write has settled. Scoped profiles reject custom operations because local path
+checks cannot verify remote symlinks. `LocalWriteOperations` is a basic Pi-style
+filesystem adapter; the default local tool retains its atomic-write behavior.
+
+Remote injection and factories for model shell, edit, grep, find and ls remain
+incomplete. User-shell extension operations are a separate existing interface.
 
 ### Image and file-tool checkpoint
 

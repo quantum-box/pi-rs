@@ -28,6 +28,7 @@ pub struct CodingTools {
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
     model_supports_images: Option<bool>,
     read_operations: Option<Arc<dyn ReadOperations>>,
+    write_operations: Option<Arc<dyn WriteOperations>>,
 }
 
 impl CodingTools {
@@ -44,6 +45,7 @@ impl CodingTools {
             image_profile: None,
             model_supports_images: None,
             read_operations: None,
+            write_operations: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -62,6 +64,18 @@ impl CodingTools {
             ));
         }
         self.read_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Inject model-facing writes in the unrestricted profile. The backend is
+    /// responsible for its own remote access policy.
+    pub fn with_write_operations(mut self, operations: Arc<dyn WriteOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom write operations require the unrestricted profile".into(),
+            ));
+        }
+        self.write_operations = Some(operations);
         Ok(self)
     }
 
@@ -410,6 +424,13 @@ impl Extension for CodingTools {
                         tool,
                         operations: operations.clone(),
                     }) as Arc<dyn Tool>
+                } else if matches!(kind, Kind::Write)
+                    && let Some(operations) = &self.write_operations
+                {
+                    Arc::new(RemoteWriteTool {
+                        tool,
+                        operations: operations.clone(),
+                    }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
                 }
@@ -658,6 +679,113 @@ impl Tool for RemoteReadTool {
                 .into()
             }
             outcome => outcome.into(),
+        }
+    }
+}
+
+/// Asynchronous operations for a model-facing write tool. Paths are absolute
+/// and the backend must enforce its own access policy. Operations must not
+/// return until their externally visible effects have settled; a cancellation
+/// can be observed after an in-flight operation completes.
+#[async_trait::async_trait]
+pub trait WriteOperations: Send + Sync {
+    async fn mkdir(&self, directory: &Path) -> Result<()>;
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
+}
+
+/// Local filesystem implementation of Pi's write operations interface.
+pub struct LocalWriteOperations;
+
+#[async_trait::async_trait]
+impl WriteOperations for LocalWriteOperations {
+    async fn mkdir(&self, directory: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(directory).await?;
+        Ok(())
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        tokio::fs::write(path, content).await?;
+        Ok(())
+    }
+}
+
+/// Create an unrestricted model-facing write tool for a remote directory.
+/// The backend is responsible for access control and filesystem semantics.
+pub fn create_write_tool(
+    root: &Path,
+    operations: Arc<dyn WriteOperations>,
+) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteWriteTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        },
+        operations,
+    }))
+}
+
+struct RemoteWriteTool {
+    tool: CodingTool,
+    operations: Arc<dyn WriteOperations>,
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteWriteTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let result = async {
+            let display = string(&args, "path")?.to_owned();
+            let content = string(&args, "content")?.to_owned();
+            let path = crate::coding_paths::resolve(
+                &self.tool.root,
+                &crate::coding_paths::normalize(&display)?,
+            );
+            let parent = path
+                .parent()
+                .ok_or_else(|| Error::Config("file needs a parent".into()))?
+                .to_owned();
+            let cancellation = context.cancellation.child_token();
+            let _guard = cancellation.clone().drop_guard();
+            let operations = self.operations.clone();
+            // The detached worker owns the lock while an operation is in flight.
+            // Dropping the caller never releases it before a backend has settled.
+            let worker = tokio::spawn(async move {
+                let lock_path = path.clone();
+                let lock_cancel = cancellation.clone();
+                let _lock =
+                    tokio::task::spawn_blocking(move || mutation_lock(&lock_path, &lock_cancel))
+                        .await
+                        .map_err(|error| Error::Config(error.to_string()))??;
+                check_mutation_cancelled(&cancellation)?;
+                operations.mkdir(&parent).await?;
+                check_mutation_cancelled(&cancellation)?;
+                operations.write_file(&path, &content).await?;
+                check_mutation_cancelled(&cancellation)?;
+                Ok::<_, Error>(format!("Successfully wrote to {display}"))
+            });
+            worker
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?
+        }
+        .await;
+        match result {
+            Ok(output) => Outcome::Succeeded(output),
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
         }
     }
 }
