@@ -598,6 +598,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             request => request,
         };
         continue_queue = false;
+        let tree_navigation = matches!(&request, Request::BranchSummary { .. });
         let resume_queued = matches!(
             &request,
             Request::Prompt { .. }
@@ -995,6 +996,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     json!({"type":"error","message":format!("Could not record shell output: {error}")}),
                 );
             }
+        }
+        if tree_navigation {
+            pending_discovery_trigger = run_session
+                .as_ref()
+                .and_then(Session::pending_custom_trigger);
         }
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))

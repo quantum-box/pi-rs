@@ -715,6 +715,7 @@ impl AgentSession {
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
             .cloned()
             .map(Box::new);
+        let _ = self.drain_idle_triggers().await?;
         Ok(TreeNavigationResult {
             editor_text,
             summary_entry,
@@ -1790,6 +1791,78 @@ mod tests {
     }
 
     struct TreeOptionsHook;
+    struct TreeLifecycleMessage;
+    #[async_trait::async_trait]
+    impl Extension for TreeLifecycleMessage {
+        fn id(&self) -> &str {
+            "tree-lifecycle-message"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionTree { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("tree trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::TriggerTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_lifecycle_trigger_runs_on_destination_branch() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree.jsonl");
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TreeLifecycleMessage))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let selected = session
+            .journal()
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, crate::Event::User { .. }))
+            .unwrap()
+            .id;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.navigate_tree(selected, crate::TreeNavigationOptions::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        assert!(session.journal().pending_custom_trigger().is_none());
+        assert_eq!(session.journal().branch().iter().filter(|record|
+            matches!(&record.event, crate::Event::CustomMessageDelivered { message, .. }
+                if message.custom_type == "tree")).count(), 1);
+        drop(session);
+        let restored = Session::open(&path).unwrap();
+        assert!(restored.pending_custom_trigger().is_none());
+        assert_eq!(restored.branch().iter().filter(|record|
+            matches!(&record.event, crate::Event::CustomMessageDelivered { message, .. }
+                if message.custom_type == "tree")).count(), 1);
+    }
+
     #[async_trait::async_trait]
     impl Extension for TreeOptionsHook {
         fn id(&self) -> &str {

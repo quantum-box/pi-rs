@@ -2187,20 +2187,21 @@ impl Agent<'_> {
             .iter()
             .any(|extension| extension.handles_tree_navigation() && extension.handles_lifecycle())
         {
-            crate::lifecycle::notify(
+            let event = crate::LifecycleEvent::SessionTree {
+                new_leaf_id: session.head(),
+                old_leaf_id: from,
+                summary_entry: summary_id
+                    .map(|id| Box::new(session.records()[id as usize - 1].clone())),
+                from_extension,
+            };
+            crate::lifecycle::notify_idle_with_host(
                 self.registry,
-                crate::LifecycleEvent::SessionTree {
-                    new_leaf_id: session.head(),
-                    old_leaf_id: from,
-                    summary_entry: summary_id
-                        .map(|id| Box::new(session.records()[id as usize - 1].clone())),
-                    from_extension,
-                },
-                &session.extension_states(),
+                session,
+                event,
                 self.limits.tool_timeout,
                 observer,
             )
-            .await;
+            .await?;
         }
         Ok(())
     }

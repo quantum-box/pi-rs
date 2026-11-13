@@ -2786,7 +2786,8 @@ and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
 `agent_settled`; and SDK-owned session and model-selection notifications,
-including active control rename notifications. SDK and workbench transition
+including active control rename and post-navigation `session_tree`
+notifications. SDK and workbench transition
 checks, workbench resource discovery, and user-bash replacement, operation
 selection, and streamed execution hooks also service messages through the
 session owner. Streamed output and message calls share the negotiated process
@@ -2832,7 +2833,7 @@ order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
-compaction, and tree hooks. For host-bound workbench sessions, resource discovery
+compaction, and pre-navigation `session_before_tree` hooks. For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their
