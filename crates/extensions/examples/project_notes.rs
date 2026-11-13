@@ -24,7 +24,7 @@ impl Extension for ProjectNotes {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         Notes.context(request, state)
     }
 }

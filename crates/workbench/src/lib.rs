@@ -129,7 +129,7 @@ impl Extension for ProjectInstructions {
         &self,
         request: &mut ModelRequest,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
         let Some(Message::System { content }) = request.messages.first_mut() else {
             return Err("system message missing".into());
         };
@@ -139,7 +139,7 @@ impl Extension for ProjectInstructions {
                 .context(&self.skills)
                 .map_err(|error| error.to_string())?,
         );
-        Ok(())
+        Ok(pi_rs::ContextChange::Changed)
     }
 }
 
@@ -175,15 +175,16 @@ impl Extension for WorkbenchContext {
         &self,
         request: &mut ModelRequest,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
         if let Some(instruction) = &self.instruction {
             let Some(Message::System { content }) = request.messages.first_mut() else {
                 return Err("system message missing".into());
             };
             content.push_str("\n\n");
             content.push_str(instruction);
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 
     fn after_tool(

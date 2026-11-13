@@ -92,7 +92,7 @@ impl Extension for ReferenceMemory {
         request: &mut ModelRequest,
         purpose: RequestPurpose,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let keys = Self::decode(state)?;
         let mut context = String::new();
         for key in keys {
@@ -125,7 +125,7 @@ impl Extension for ReferenceMemory {
                 Message::User { content: context },
             );
         }
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
 
     fn before_compaction(

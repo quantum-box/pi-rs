@@ -362,6 +362,18 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
+/// Whether a request hook modified its input.
+///
+/// `Unchanged` certifies that the hook did not modify, replace, remove, or
+/// reorder any part of its input, including changes that compare equal. The
+/// host retains private provider replay only on that explicit certification.
+/// Return `Changed` for every transformation; replay is then dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextChange {
+    Unchanged,
+    Changed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestPurpose {
     Turn,
@@ -681,8 +693,8 @@ pub trait Extension: Send + Sync {
         &self,
         _request: &mut ModelRequest,
         _state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        Ok(())
+    ) -> ExtensionResult<ContextChange> {
+        Ok(ContextChange::Unchanged)
     }
 
     async fn before_request(
@@ -690,7 +702,7 @@ pub trait Extension: Send + Sync {
         request: &mut ModelRequest,
         _purpose: RequestPurpose,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<ContextChange> {
         self.context(request, state)
     }
 
@@ -704,8 +716,8 @@ pub trait Extension: Send + Sync {
         &self,
         _messages: &mut Vec<crate::Message>,
         _state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        Ok(())
+    ) -> ExtensionResult<ContextChange> {
+        Ok(ContextChange::Unchanged)
     }
 
     async fn before_tool(

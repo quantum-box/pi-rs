@@ -83,10 +83,6 @@ fn extension_context(request: &ModelRequest) -> ModelRequest {
     }
 }
 
-fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) {
-    pi_rs_core::restore_request_replay(original, updated);
-}
-
 // Older executable hooks discard unknown tool-message fields. Retain provenance
 // only for unchanged content; rewrites have unknown legacy provenance.
 fn restore_legacy_tool_metadata(
@@ -690,12 +686,11 @@ impl Extension for ExecutableExtension {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let mut updated = self.request(ProtocolRequest::Context {
             request: extension_context(request),
             state: state.cloned(),
         })?;
-        restore_provider_replay(request, &mut updated);
         restore_legacy_tool_metadata(
             request,
             &mut updated,
@@ -703,21 +698,20 @@ impl Extension for ExecutableExtension {
             !self.description.tool_message_provenance_v2,
         );
         *request = updated;
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     async fn before_request(
         &self,
         request: &mut ModelRequest,
         purpose: RequestPurpose,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let message = ProtocolRequest::BeforeRequest {
             request: extension_context(request),
             summary: purpose == RequestPurpose::Summary,
             state: state.cloned(),
         };
         let mut updated = self.request_async(message).await?;
-        restore_provider_replay(request, &mut updated);
         restore_legacy_tool_metadata(
             request,
             &mut updated,
@@ -725,7 +719,7 @@ impl Extension for ExecutableExtension {
             !self.description.tool_message_provenance_v2,
         );
         *request = updated;
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     fn handles_context_with_system(&self) -> bool {
         self.description.context_with_system_hook
@@ -734,7 +728,7 @@ impl Extension for ExecutableExtension {
         &self,
         messages: &mut Vec<Message>,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let original = ModelRequest {
             model: String::new(),
             messages: messages.clone(),
@@ -751,7 +745,6 @@ impl Extension for ExecutableExtension {
             messages: updated,
             ..original.clone()
         };
-        restore_provider_replay(&original, &mut updated);
         restore_legacy_tool_metadata(
             &original,
             &mut updated,
@@ -759,7 +752,7 @@ impl Extension for ExecutableExtension {
             !self.description.tool_message_provenance_v2,
         );
         *messages = updated.messages;
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     fn command(
         &self,
@@ -3135,13 +3128,13 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
                 &self,
                 messages: &mut Vec<Message>,
                 state: Option<&ExtensionState>,
-            ) -> ExtensionResult<()> {
+            ) -> ExtensionResult<pi_rs_core::ContextChange> {
                 assert_eq!(state.unwrap().data["value"], "saved");
                 assert!(matches!(messages.first(), Some(Message::System { .. })));
                 messages.push(Message::User {
                     content: "added".into(),
                 });
-                Ok(())
+                Ok(pi_rs_core::ContextChange::Changed)
             }
         }
         let runtime = tokio::runtime::Builder::new_current_thread()

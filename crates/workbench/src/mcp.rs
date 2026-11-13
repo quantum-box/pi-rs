@@ -1017,7 +1017,7 @@ impl Extension for McpExtension {
         &self,
         request: &mut pi_rs::ModelRequest,
         _: Option<&pi_rs::ExtensionState>,
-    ) -> pi_rs::ExtensionResult<()> {
+    ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
         if !self.description.is_empty()
             && let Some(pi_rs::Message::System { content }) = request.messages.first_mut()
         {
@@ -1025,8 +1025,9 @@ impl Extension for McpExtension {
                 "\n\nMCP server {}: {}",
                 self.server_name, self.description
             ));
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 }
 struct McpTool {

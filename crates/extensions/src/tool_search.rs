@@ -68,7 +68,7 @@ impl Extension for ToolSearch {
         request: &mut ModelRequest,
         _: RequestPurpose,
         previous: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let loaded = state(previous)?.loaded;
         request.tools.retain(|tool| {
             loaded.contains(&tool.name)
@@ -90,7 +90,7 @@ impl Extension for ToolSearch {
                 request.tools.push(document.tool.clone());
             }
         }
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     fn after_tool(
         &self,

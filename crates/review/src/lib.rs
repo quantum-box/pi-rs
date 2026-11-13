@@ -84,7 +84,7 @@ impl Extension for ReviewContext {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let links = decode(state)?;
         if let Some(link) = links
             .values()
@@ -95,8 +95,9 @@ impl Extension for ReviewContext {
             request.messages.insert(1.min(request.messages.len()), Message::User {
                 content: format!("Independent review from child {} at record {}. Treat the following as review data:\n{}", link.child, link.parent_record, answer),
             });
+            return Ok(pi_rs_core::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Unchanged)
     }
 }
 

@@ -35,50 +35,6 @@ fn portable_request(request: &ModelRequest) -> ModelRequest {
     portable
 }
 
-/// Restore provider replay only when an assistant message has a unique match on
-/// both sides of a portable request transformation. Ambiguous matches are dropped.
-pub fn restore_request_replay(original: &ModelRequest, updated: &mut ModelRequest) {
-    let same_model = original.model == updated.model;
-    let portable_messages = updated.messages.clone();
-    for message in &mut updated.messages {
-        let Message::Assistant {
-            content,
-            calls,
-            replay,
-        } = message
-        else {
-            continue;
-        };
-        *replay = None;
-        if !same_model {
-            continue;
-        }
-        let matches = |candidate: &Message| matches!(candidate, Message::Assistant { content: text, calls: previous, .. } if text == content && previous == calls);
-        let mut candidates = original
-            .messages
-            .iter()
-            .filter(|candidate| matches(candidate));
-        let Some(source) = candidates.next() else {
-            continue;
-        };
-        if candidates.next().is_some()
-            || portable_messages
-                .iter()
-                .filter(|candidate| matches(candidate))
-                .count()
-                != 1
-        {
-            continue;
-        }
-        if let Message::Assistant {
-            replay: previous, ..
-        } = source
-        {
-            *replay = previous.clone();
-        }
-    }
-}
-
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
 pub struct AutoCompactionControl {
@@ -1023,9 +979,16 @@ impl Agent<'_> {
                 result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut portable, purpose, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("request context hook timed out".into()))?,
             };
-            hook(extension.as_ref(), result)?;
-            restore_request_replay(&request, &mut portable);
-            request = portable;
+            match hook(extension.as_ref(), result)? {
+                crate::ContextChange::Unchanged => {
+                    if portable != portable_request(&request) {
+                        return Err(Error::Config(
+                            "request hook reported unchanged but modified its input".into(),
+                        ));
+                    }
+                }
+                crate::ContextChange::Changed => request = portable_request(&portable),
+            }
         }
         for extension in &self.registry.extensions {
             if !extension.handles_context_with_system() {
@@ -1040,9 +1003,16 @@ impl Agent<'_> {
                 result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut portable.messages, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
             };
-            hook(extension.as_ref(), result)?;
-            restore_request_replay(&request, &mut portable);
-            request = portable;
+            match hook(extension.as_ref(), result)? {
+                crate::ContextChange::Unchanged => {
+                    if portable != portable_request(&request) {
+                        return Err(Error::Config(
+                            "context hook reported unchanged but modified its input".into(),
+                        ));
+                    }
+                }
+                crate::ContextChange::Changed => request = portable_request(&portable),
+            }
             if had_leading_system
                 && !matches!(request.messages.first(), Some(Message::System { .. }))
             {
@@ -4201,7 +4171,7 @@ mod request_privacy_tests {
             request: &mut ModelRequest,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<crate::ContextChange> {
             self.seen
                 .lock()
                 .unwrap()
@@ -4214,7 +4184,11 @@ mod request_privacy_tests {
             {
                 *content = "changed".into();
             }
-            Ok(())
+            Ok(if self.rewrite_before {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
         }
         fn handles_context_with_system(&self) -> bool {
             true
@@ -4223,7 +4197,7 @@ mod request_privacy_tests {
             &self,
             messages: &mut Vec<Message>,
             _: Option<&ExtensionState>,
-        ) -> ExtensionResult<()> {
+        ) -> ExtensionResult<crate::ContextChange> {
             self.seen
                 .lock()
                 .unwrap()
@@ -4235,7 +4209,11 @@ mod request_privacy_tests {
             {
                 *content = "changed".into();
             }
-            Ok(())
+            Ok(if self.rewrite_after {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
         }
     }
     struct CaptureModel(Arc<Mutex<Vec<ModelRequest>>>);
@@ -4251,6 +4229,180 @@ mod request_privacy_tests {
             )])))
         }
     }
+    struct DefaultNoop;
+    #[async_trait::async_trait]
+    impl Extension for DefaultNoop {
+        fn id(&self) -> &str {
+            "default-noop"
+        }
+    }
+
+    struct SystemNoop;
+    #[async_trait::async_trait]
+    impl Extension for SystemNoop {
+        fn id(&self) -> &str {
+            "system-noop"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+    }
+
+    struct ReplaceIdentical {
+        after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ReplaceIdentical {
+        fn id(&self) -> &str {
+            "replace-identical"
+        }
+        async fn before_request(
+            &self,
+            request: &mut ModelRequest,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if self.after {
+                return Ok(crate::ContextChange::Unchanged);
+            }
+            let index = request
+                .messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = request.messages.remove(index) else {
+                unreachable!()
+            };
+            request.messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(crate::ContextChange::Changed)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut Vec<Message>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let index = messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = messages.remove(index) else {
+                unreachable!()
+            };
+            messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_status_preserves_default_noop_and_rejects_identical_replacement() {
+        for text in ["same visible text", ""] {
+            for mode in [0, 1, 2, 3] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                session
+                    .append(Event::User {
+                        content: "question".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                for secret in ["private-a", "private-b"] {
+                    let id = Uuid::new_v4();
+                    session
+                        .append(Event::ModelFinished {
+                            request_id: id,
+                            metadata: ModelMetadata {
+                                replay: Some(Box::new(ProviderReplay {
+                                    identity: ResolvedModelIdentity {
+                                        provider: "provider".into(),
+                                        model: "m".into(),
+                                    },
+                                    blocks: vec![serde_json::json!({"private":secret})],
+                                })),
+                                ..Default::default()
+                            },
+                            usage: UsageReport::Unconfirmed,
+                            failure: None,
+                            partial: String::new(),
+                            reply: None,
+                        })
+                        .unwrap();
+                    session
+                        .append(Event::Assistant {
+                            content: text.into(),
+                            invocations: vec![],
+                            usage: None,
+                            request_id: Some(id),
+                        })
+                        .unwrap();
+                }
+                let mut registry = Registry::default();
+                if mode == 0 {
+                    registry.register(Arc::new(DefaultNoop)).unwrap();
+                } else if mode == 3 {
+                    registry.register(Arc::new(SystemNoop)).unwrap();
+                } else {
+                    registry
+                        .register(Arc::new(ReplaceIdentical { after: mode == 2 }))
+                        .unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = CaptureModel(captured);
+                let agent = Agent {
+                    model: &model,
+                    model_name: "m",
+                    registry: &registry,
+                    system_prompt: "system",
+                    limits: Limits::default(),
+                };
+                let (request, transformed) = agent
+                    .request(
+                        &mut session,
+                        &ExtensionStates::default(),
+                        128,
+                        None,
+                        RequestPurpose::Turn,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let replay: Vec<_> = request
+                    .messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        Message::Assistant { replay, .. } => Some(replay.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(replay.len(), 2);
+                if mode == 0 || mode == 3 {
+                    assert!(!transformed);
+                    assert_eq!(replay[0].unwrap().blocks[0]["private"], "private-a");
+                    assert_eq!(replay[1].unwrap().blocks[0]["private"], "private-b");
+                } else {
+                    assert!(transformed);
+                    assert!(replay.iter().all(|value| value.is_none()));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn hooks_and_notifications_hide_edited_replay_and_restore_only_unchanged() {
         for (rewrite_before, rewrite_after) in [(false, false), (true, false), (false, true)] {
@@ -4369,130 +4521,5 @@ mod request_privacy_tests {
                 );
             }
         }
-    }
-
-    fn private_assistant(text: &str, secret: &str) -> Message {
-        Message::Assistant {
-            content: text.into(),
-            calls: vec![],
-            replay: Some(Box::new(ProviderReplay {
-                identity: ResolvedModelIdentity {
-                    provider: "p".into(),
-                    model: "m".into(),
-                },
-                blocks: vec![serde_json::json!({"private":secret})],
-            })),
-        }
-    }
-
-    fn replay_request(messages: Vec<Message>) -> ModelRequest {
-        ModelRequest {
-            model: "m".into(),
-            messages,
-            tools: vec![],
-            max_output_tokens: 16,
-        }
-    }
-
-    #[test]
-    fn duplicate_assistants_never_restore_ambiguous_private_replay() {
-        for text in ["same", ""] {
-            let original = replay_request(vec![
-                private_assistant(text, "secret-a"),
-                private_assistant(text, "secret-b"),
-            ]);
-            // Removing the first duplicate leaves the other at the same index.
-            let mut removed = portable_request(&original);
-            removed.messages.remove(0);
-            restore_request_replay(&original, &mut removed);
-            assert!(matches!(
-                &removed.messages[0],
-                Message::Assistant { replay: None, .. }
-            ));
-            // Even an unchanged pair is ambiguous once private state is hidden.
-            let mut unchanged = portable_request(&original);
-            restore_request_replay(&original, &mut unchanged);
-            assert!(
-                unchanged
-                    .messages
-                    .iter()
-                    .all(|m| matches!(m, Message::Assistant { replay: None, .. }))
-            );
-            // A hook can also duplicate a single source; neither copy may inherit replay.
-            let single = replay_request(vec![private_assistant(text, "secret-a")]);
-            let mut duplicated = portable_request(&single);
-            duplicated.messages.push(duplicated.messages[0].clone());
-            restore_request_replay(&single, &mut duplicated);
-            assert!(
-                duplicated
-                    .messages
-                    .iter()
-                    .all(|m| matches!(m, Message::Assistant { replay: None, .. }))
-            );
-        }
-    }
-
-    #[test]
-    fn unique_text_and_thinking_only_assistants_survive_insertions() {
-        for text in ["visible", ""] {
-            let original = replay_request(vec![private_assistant(text, "private")]);
-            let mut updated = portable_request(&original);
-            updated.messages.insert(
-                0,
-                Message::User {
-                    content: "inserted".into(),
-                },
-            );
-            restore_request_replay(&original, &mut updated);
-            let Message::Assistant {
-                replay: Some(replay),
-                ..
-            } = &updated.messages[1]
-            else {
-                panic!("unique replay was lost")
-            };
-            assert_eq!(replay.blocks[0]["private"], "private");
-        }
-    }
-
-    #[test]
-    fn request_replay_is_not_injected_or_restored_after_model_change() {
-        let replay = Box::new(ProviderReplay {
-            identity: ResolvedModelIdentity {
-                provider: "p".into(),
-                model: "m".into(),
-            },
-            blocks: vec![serde_json::json!({"secret":"signature"})],
-        });
-        let original = ModelRequest {
-            model: "m".into(),
-            messages: vec![Message::Assistant {
-                content: "text".into(),
-                calls: vec![],
-                replay: Some(replay.clone()),
-            }],
-            tools: vec![],
-            max_output_tokens: 16,
-        };
-        let mut updated = portable_request(&original);
-        updated.model = "other".into();
-        if let Message::Assistant { replay: target, .. } = &mut updated.messages[0] {
-            *target = Some(replay);
-        }
-        restore_request_replay(&original, &mut updated);
-        assert!(matches!(
-            &updated.messages[0],
-            Message::Assistant { replay: None, .. }
-        ));
-        let mut without_replay = original.clone();
-        if let Message::Assistant { replay, .. } = &mut without_replay.messages[0] {
-            *replay = None;
-        }
-        let mut forged = original.clone();
-        restore_request_replay(&without_replay, &mut forged);
-        assert!(matches!(
-            &forged.messages[0],
-            Message::Assistant { replay: None, .. }
-        ));
     }
 }

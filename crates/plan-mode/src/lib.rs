@@ -84,9 +84,9 @@ impl Extension for PlanMode {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let plan = match decode(state)? {
-            PlanState::Normal => return Ok(()),
+            PlanState::Normal => return Ok(pi_rs_core::ContextChange::Unchanged),
             PlanState::Planning { plan } => {
                 request
                     .tools
@@ -103,7 +103,7 @@ impl Extension for PlanMode {
             1.min(request.messages.len()),
             Message::User { content: plan },
         );
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
 
     async fn before_tool(

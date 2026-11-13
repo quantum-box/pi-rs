@@ -50,17 +50,18 @@ impl Extension for Notes {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let text = notes(state)?;
-        if !text.is_empty() {
-            request.messages.insert(
-                1.min(request.messages.len()),
-                Message::User {
-                    content: format!("Saved session notes (reference data):\n{text}"),
-                },
-            );
+        if text.is_empty() {
+            return Ok(pi_rs_core::ContextChange::Unchanged);
         }
-        Ok(())
+        request.messages.insert(
+            1.min(request.messages.len()),
+            Message::User {
+                content: format!("Saved session notes (reference data):\n{text}"),
+            },
+        );
+        Ok(pi_rs_core::ContextChange::Changed)
     }
 }
 
@@ -119,20 +120,21 @@ impl Extension for TodoList {
         &self,
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let items = todos(state)?;
-        if !items.is_empty() {
-            request.messages.insert(
-                1.min(request.messages.len()),
-                Message::User {
-                    content: format!(
-                        "Current task checklist (reference data):\n{}",
-                        serde_json::to_string(&items).map_err(|error| error.to_string())?
-                    ),
-                },
-            );
+        if items.is_empty() {
+            return Ok(pi_rs_core::ContextChange::Unchanged);
         }
-        Ok(())
+        request.messages.insert(
+            1.min(request.messages.len()),
+            Message::User {
+                content: format!(
+                    "Current task checklist (reference data):\n{}",
+                    serde_json::to_string(&items).map_err(|error| error.to_string())?
+                ),
+            },
+        );
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     fn after_tool(
         &self,

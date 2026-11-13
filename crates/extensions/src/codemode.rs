@@ -64,7 +64,7 @@ impl Extension for Codemode {
         request: &mut ModelRequest,
         _: RequestPurpose,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let mut declarations = String::new();
         for tool in request.tools.iter().filter(|tool| {
             !matches!(
@@ -93,7 +93,7 @@ impl Extension for Codemode {
                     .retain(|tool| matches!(tool.name.as_str(), "codemode" | "tool_search"));
             }
         }
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Changed)
     }
 }
 struct ScriptTool {
