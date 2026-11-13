@@ -469,6 +469,7 @@ impl SessionBuilder {
             system_prompt: self.system_prompt,
             registry: Arc::new(self.registry),
             limits: self.limits,
+            session_id: session.session_id(),
             session: Arc::new(tokio::sync::Mutex::new(session)),
             input,
             events: Some(events),
@@ -497,6 +498,7 @@ pub struct AgentSession {
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
+    session_id: Uuid,
     session: Arc<tokio::sync::Mutex<Session>>,
     input: mpsc::Receiver<crate::AgentInput>,
     control: SessionControl,
@@ -507,11 +509,7 @@ pub struct AgentSession {
 }
 impl AgentSession {
     pub fn auto_compaction_enabled(&self) -> bool {
-        self.session
-            .try_lock()
-            .expect("session journal is in use")
-            .auto_compaction_control()
-            .enabled()
+        self.control.auto_compaction.enabled()
     }
     pub fn controls(&self) -> SessionControl {
         self.control.clone()
@@ -545,11 +543,8 @@ impl AgentSession {
         }
     }
     /// Usage and message counts across the complete durable session.
-    pub fn statistics(&self) -> crate::SessionStats {
-        self.session
-            .try_lock()
-            .expect("session journal is in use")
-            .statistics()
+    pub fn statistics(&self) -> Result<crate::SessionStats> {
+        Ok(self.journal()?.statistics())
     }
 
     /// Resolve the configured or provider-reported context window within the model timeout.
@@ -565,55 +560,48 @@ impl AgentSession {
             .ok()
             .flatten(),
         };
-        Ok(window.and_then(|window| {
-            self.session
-                .try_lock()
-                .expect("session journal is in use")
-                .context_usage(window)
-        }))
+        let journal = self.session.lock().await;
+        Ok(window.and_then(|window| journal.context_usage(window)))
     }
 
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
-    pub fn pending_inputs(&self) -> usize {
-        self.input.len()
-            + self
-                .session
-                .try_lock()
-                .expect("session journal is in use")
-                .queued_inputs()
-                .len()
+    pub fn pending_inputs(&self) -> Result<usize> {
+        Ok(self.input.len() + self.journal()?.queued_inputs().len())
     }
     /// Clear pending input while this owned session is idle, retaining each removal in the journal.
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<QueuedMessage>> {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
         crate::agent::queue_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut *self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?,
             &mut self.input,
             &mut |event| emit(&events, &event),
         )?;
         let count = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .records()
             .len();
         let pending = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .clear_queued_inputs()?;
         if self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .records()
             .len()
             > count
         {
-            self.emit_last();
+            self.emit_last()?;
         }
         Ok(pending)
     }
@@ -622,22 +610,22 @@ impl AgentSession {
         let count = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .records()
             .len();
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .set_queue_mode(kind, mode)?;
         if count
             != self
                 .session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .records()
                 .len()
         {
-            self.emit_last();
+            self.emit_last()?;
         }
         Ok(())
     }
@@ -655,7 +643,7 @@ impl AgentSession {
         self.registry.register_session_branch_model(
             self.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
             name.into(),
             model,
@@ -668,7 +656,7 @@ impl AgentSession {
         self.registry.register_session_branch_model(
             self.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
             name.clone(),
             model.clone(),
@@ -676,22 +664,22 @@ impl AgentSession {
         let count = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .records()
             .len();
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .select_model(&name, None)?;
         if count
             != self
                 .session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .records()
                 .len()
         {
-            self.emit_last();
+            self.emit_last()?;
         }
         self.model = model;
         self.model_name = name;
@@ -714,7 +702,7 @@ impl AgentSession {
         let previous_level = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .model_selection()
             .and_then(|(_, level)| level)
             .unwrap_or_else(|| "off".into());
@@ -753,7 +741,10 @@ impl AgentSession {
             let events = self.events.as_ref().expect("open session");
             crate::lifecycle::notify_idle_with_host(
                 &self.registry,
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *self
+                    .session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?,
                 event,
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
@@ -775,21 +766,21 @@ impl AgentSession {
                 Error::Config("register extensions before sharing this session with a fork".into())
             })?
             .register(extension)?;
-        self.refresh_input_hooks();
+        self.refresh_input_hooks()?;
         Ok(())
     }
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .checkout(record)?;
-        self.refresh_input_hooks();
-        self.emit_last();
+        self.refresh_input_hooks()?;
+        self.emit_last()?;
         if let Some((model, _)) = self
             .session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .model_selection()
         {
             self.model_name = model;
@@ -870,9 +861,9 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .set_name(name)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
 
@@ -890,21 +881,21 @@ impl AgentSession {
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
         self.ensure_open()?;
-        if let Some(record) = self
+        let recovered = self
             .session
-            .try_lock()
-            .expect("session journal is in use")
+            .lock()
+            .await
             .recover_tree_trigger_handoff()?
-            .cloned()
-        {
+            .cloned();
+        if let Some(record) = recovered {
             if let Some(events) = &self.events {
                 emit(events, &Notification::Committed(&record));
             }
-            self.refresh_input_hooks();
+            self.refresh_input_hooks()?;
             if let Some((model, _)) = self
                 .session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .model_selection()
             {
                 self.model_name = model;
@@ -960,7 +951,10 @@ impl AgentSession {
             let events = self.events.as_ref().expect("open session");
             crate::lifecycle::notify_idle_with_host(
                 &self.registry,
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *self
+                    .session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?,
                 event,
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
@@ -978,9 +972,9 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .edit_context(target, replacement)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
     /// Record a user shell result and notify subscribers without requesting a model turn.
@@ -988,9 +982,9 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .append_bash_execution(execution)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
 
@@ -999,9 +993,9 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .append_custom_entry(entry)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
 
@@ -1010,9 +1004,9 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .append_custom_message(message)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
 
@@ -1030,7 +1024,10 @@ impl AgentSession {
         if trigger_turn {
             let events = self.events.as_ref().expect("open session").clone();
             crate::agent::queue_custom_message(
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *self
+                    .session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?,
                 crate::QueuedCustomMessage {
                     id: Uuid::new_v4(),
                     delivery: crate::CustomMessageDelivery::TriggerTurn,
@@ -1049,7 +1046,10 @@ impl AgentSession {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
         crate::agent::queue_custom_message(
-            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut *self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?,
             crate::QueuedCustomMessage {
                 id: Uuid::new_v4(),
                 delivery: crate::CustomMessageDelivery::NextTurn,
@@ -1062,19 +1062,14 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .set_label(target, label)?;
-        self.emit_last();
+        self.emit_last()?;
         Ok(())
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(
-            self.session
-                .try_lock()
-                .expect("session journal is in use")
-                .fork_records(record)?,
-        )?;
+        let session = Session::from_records(self.journal()?.fork_records(record)?)?;
         self.fork_session(session)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
@@ -1112,7 +1107,10 @@ impl AgentSession {
                 .registry
                 .session_transition_cancelled_in_session(
                     &transition,
-                    &mut *self.session.try_lock().expect("session journal is in use"),
+                    &mut *self
+                        .session
+                        .try_lock()
+                        .map_err(|_| Error::Session("session journal is in use".into()))?,
                     self.limits.tool_timeout,
                     &mut |event| emit(events, &event),
                 )
@@ -1131,14 +1129,14 @@ impl AgentSession {
         self.ensure_open()?;
         self.session
             .try_lock()
-            .expect("session journal is in use")
+            .map_err(|_| Error::Session("session journal is in use".into()))?
             .export_jsonl(destination)
     }
     fn fork_session(&self, session: Session) -> Result<Self> {
         session.retry_control().configure(
             self.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .retry_control()
                 .settings(),
         );
@@ -1152,7 +1150,7 @@ impl AgentSession {
         session.auto_compaction_control().set_token_settings(
             self.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .auto_compaction_control()
                 .token_settings(),
         );
@@ -1163,16 +1161,16 @@ impl AgentSession {
         self.registry.copy_session_branch_models(
             self.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
             fork.session
                 .try_lock()
-                .expect("session journal is in use")
+                .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
         );
         fork.registry = self.registry.clone();
         fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
-        fork.refresh_input_hooks();
+        fork.refresh_input_hooks()?;
         Ok(fork)
     }
 
@@ -1323,7 +1321,10 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         agent.extension_command(
-            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut *self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?,
             extension,
             command,
             arguments,
@@ -1351,7 +1352,10 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         let trigger = agent.extension_command_with_trigger(
-            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut *self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?,
             extension,
             command,
             arguments,
@@ -1515,23 +1519,18 @@ impl AgentSession {
         }
         notification_result.and(result)
     }
-    fn emit_last(&self) {
-        if let (Some(events), Some(record)) = (
-            &self.events,
-            self.session
-                .try_lock()
-                .expect("session journal is in use")
-                .records()
-                .last(),
-        ) {
+    fn emit_last(&self) -> Result<()> {
+        let journal = self.journal()?;
+        if let (Some(events), Some(record)) = (&self.events, journal.records().last()) {
             emit(events, &Notification::Committed(record));
         }
+        Ok(())
     }
-    fn refresh_input_hooks(&self) {
-        *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::new(
-            &self.registry,
-            &*self.session.try_lock().expect("session journal is in use"),
-        );
+    fn refresh_input_hooks(&self) -> Result<()> {
+        let journal = self.journal()?;
+        *self.control.input_hooks.lock().expect("SDK input hooks") =
+            InputHooks::new(&self.registry, &journal);
+        Ok(())
     }
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
@@ -1552,12 +1551,7 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         self.control.abort();
-        self.registry.remove_session_branch_models(
-            self.session
-                .try_lock()
-                .expect("session journal is in use")
-                .session_id(),
-        );
+        self.registry.remove_session_branch_models(self.session_id);
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
@@ -2934,6 +2928,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn start_restores_interrupted_tree_handoff_without_relocking_journal() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "handoff-start".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(run_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: run_id,
+                message,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let branch_b = journal.head();
+        assert!(
+            journal
+                .begin_tree_trigger_handoff(run_id)
+                .unwrap()
+                .is_some()
+        );
+        journal.set_run_id(Some(run_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Completed,
+                initial: None,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .build(journal)
+            .unwrap();
+        session.start().await.unwrap();
+        assert_eq!(session.journal().unwrap().head(), branch_b);
+    }
+
+    #[test]
+    fn nested_journal_reads_return_busy_instead_of_panicking() {
+        let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        assert!(session.fork_at(session.journal().unwrap().head()).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            session
+                .fork_to(
+                    session.journal().unwrap().head(),
+                    dir.path().join("fork.jsonl")
+                )
+                .is_err()
+        );
+        let guard = session.journal().unwrap();
+        assert!(session.statistics().is_err());
+        assert!(session.pending_inputs().is_err());
+        drop(guard);
+    }
+
     #[test]
     fn interrupted_tree_handoff_reopens_on_originally_selected_branch() {
         for completed in [false, true] {
@@ -3429,10 +3506,10 @@ mod tests {
         let model = Arc::new(EchoModel(AtomicUsize::new(0)));
         let mut session = SessionBuilder::new(model, "fixture").in_memory().unwrap();
         session.controls().follow_up("queued").await.unwrap();
-        assert_eq!(session.pending_inputs(), 1);
+        assert_eq!(session.pending_inputs().unwrap(), 1);
         let removed = session.clear_queued_inputs().unwrap();
         assert_eq!(removed[0].input.content, "queued");
-        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(session.pending_inputs().unwrap(), 0);
         assert!(session.messages().unwrap().is_empty());
         session.close().await.unwrap();
     }
@@ -4002,9 +4079,9 @@ mod tests {
         })
         .in_memory()
         .unwrap();
-        assert_eq!(session.statistics().cost, Some(0.0));
+        assert_eq!(session.statistics().unwrap().cost, Some(0.0));
         session.prompt("hello").await.unwrap();
-        let stats = session.statistics();
+        let stats = session.statistics().unwrap();
         assert_eq!(stats, session.journal().unwrap().statistics());
         assert_eq!(stats.session_id, session.journal().unwrap().session_id());
         assert_eq!((stats.user_messages, stats.assistant_messages), (1, 1));
@@ -4023,10 +4100,10 @@ mod tests {
         assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
         let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
-        assert_eq!(fork.statistics().tokens, stats.tokens);
-        assert_ne!(fork.statistics().session_id, stats.session_id);
+        assert_eq!(fork.statistics().unwrap().tokens, stats.tokens);
+        assert_ne!(fork.statistics().unwrap().session_id, stats.session_id);
         session.summarize(0).await.unwrap();
-        assert_eq!(session.statistics().tokens.total, 26);
+        assert_eq!(session.statistics().unwrap().tokens.total, 26);
         assert_eq!(session.context_usage().await.unwrap().unwrap().tokens, None);
         fork.close().await.unwrap();
         session.close().await.unwrap();
@@ -4290,7 +4367,7 @@ mod tests {
             .unwrap();
         let controls = session.controls();
         controls.follow_up("handled").await.unwrap();
-        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(session.pending_inputs().unwrap(), 0);
         let image = crate::ImageContent {
             data: "aGVsbG8=".into(),
             mime_type: "image/png".into(),
@@ -4366,7 +4443,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(session.pending_inputs().unwrap(), 0);
         assert!(matches!(
             events.try_recv().unwrap(),
             SessionEvent::RunStarted { .. }
@@ -8249,7 +8326,7 @@ mod tests {
         };
         let (result, ()) = tokio::join!(session.prompt("start"), driver);
         assert!(matches!(result, Err(Error::Cancelled)));
-        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(session.pending_inputs().unwrap(), 0);
         assert_eq!(
             session.journal().unwrap().queue_mode(InputKind::FollowUp),
             crate::QueueMode::OneAtATime
@@ -8286,7 +8363,7 @@ mod tests {
         };
         let (result, ()) = tokio::join!(session.summarize(1), driver);
         assert!(matches!(result, Err(Error::Cancelled)));
-        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(session.pending_inputs().unwrap(), 0);
         session.close().await.unwrap();
     }
 
