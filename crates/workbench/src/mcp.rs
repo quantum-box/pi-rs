@@ -1,5 +1,6 @@
 //! Native MCP client connections exposed through the shared tool contract.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -312,6 +313,7 @@ struct Connection {
     provider_token: Option<TokenResolver>,
     http_options: Option<HttpOptionsWithProxyHosts>,
     closed: AtomicBool,
+    page_outputs: PageOutputs,
 }
 impl Connection {
     fn identity(&self) -> ConnectionIdentity {
@@ -762,6 +764,7 @@ impl McpExtension {
             provider_token,
             http_options,
             closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
         Self::discover(connection).await
     }
@@ -865,34 +868,49 @@ impl McpExtension {
             .clone()
             .is_some_and(|info| info.capabilities.resources.is_some())
         {
-            for (name, description, parameters) in [
+            for (name, policy, description, parameters) in [
                 (
+                    "list_resources",
                     "list_resources",
                     "List this MCP server's available resources",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
                     "list_resource_templates",
+                    "list_resource_templates",
                     "List parameterized resource URI templates from this MCP server",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
+                    "list_resources_page",
+                    "list_resources",
+                    "List one page of this MCP server's resources; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
+                ),
+                (
+                    "list_resource_templates_page",
+                    "list_resource_templates",
+                    "List one page of this MCP server's resource templates; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
+                ),
+                (
+                    "read_resource",
                     "read_resource",
                     "Read a resource URI from this MCP server",
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
-                if !tool_enabled(&config, name) {
+                if !tool_enabled(&config, policy) {
                     continue;
                 }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
                 }
-                if is_deferred(&config, name) {
-                    has_deferred |= exposure(&config, name) == "deferred";
+                if is_deferred(&config, policy) {
+                    has_deferred |= exposure(&config, policy) == "deferred";
                     has_codemode |=
-                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
+                        matches!(exposure(&config, policy), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -989,6 +1007,11 @@ impl McpExtension {
     }
     pub async fn close(&self) {
         self.connection.closed.store(true, Ordering::SeqCst);
+        self.connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let _ = self
             .connection
             .service
@@ -1036,6 +1059,79 @@ struct McpTool {
     spec: ToolSpec,
     resource: bool,
 }
+enum PreparedPage {
+    Inline(Value),
+    Saved {
+        file: tempfile::NamedTempFile,
+        bytes: usize,
+        cursor: Option<String>,
+    },
+}
+
+type PageOutputs = std::sync::Mutex<VecDeque<(Uuid, String, tempfile::NamedTempFile)>>;
+
+async fn run_page_preparation<F>(
+    cancellation: &pi_rs::CancellationToken,
+    work: F,
+) -> Result<PreparedPage>
+where
+    F: FnOnce(pi_rs::CancellationToken) -> Result<PreparedPage> + Send + 'static,
+{
+    let worker_cancel = cancellation.child_token();
+    let _cancel_on_drop = worker_cancel.clone().drop_guard();
+    let task = tokio::task::spawn_blocking(move || work(worker_cancel));
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = task => result.map_err(|e| Error::Config(format!("MCP page preparation failed: {e}")))?,
+    }
+}
+
+// Serde may pass an entire large string to Write at once. Split those writes
+// so a dropped or cancelled invocation stops serialization cooperatively.
+struct CancellableWriter<W> {
+    inner: W,
+    cancellation: pi_rs::CancellationToken,
+}
+impl<W: Write> Write for CancellableWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("MCP page preparation cancelled"));
+        }
+        self.inner.write(&bytes[..bytes.len().min(64 * 1024)])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn publish_page_output(
+    outputs: &PageOutputs,
+    closed: &AtomicBool,
+    cancellation: &pi_rs::CancellationToken,
+    id: Uuid,
+    kind: String,
+    file: tempfile::NamedTempFile,
+) -> Result<()> {
+    let mut outputs = outputs.lock().unwrap_or_else(|e| e.into_inner());
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if closed.load(Ordering::SeqCst) {
+        return Err(Error::Config("MCP connection is closed".into()));
+    }
+    if outputs.len() >= 8 {
+        outputs.pop_front();
+    }
+    outputs.push_back((id, kind, file));
+    // Cancellation can arrive from another thread while this lock is held.
+    if cancellation.is_cancelled() {
+        outputs.pop_back();
+        return Err(Error::Cancelled);
+    }
+    Ok(())
+}
+
 enum CallError {
     Other(String),
     Scope(Option<String>),
@@ -1094,6 +1190,27 @@ impl McpTool {
         context: ToolContext,
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
+        let page_tool = self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources_page" | "list_resource_templates_page"
+            );
+        if page_tool && arguments.get("outputId").is_some() {
+            if context.cancellation.is_cancelled() || self.connection.closed.load(Ordering::SeqCst)
+            {
+                return Outcome::Failed("MCP page retrieval cancelled or connection closed".into());
+            }
+            return match self.read_page_output(&arguments) {
+                Ok(data) => Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                },
+                Err(error) => Outcome::Failed(error.to_string()),
+            };
+        }
+        if page_tool && let Err(error) = resource_page_params(&arguments) {
+            return Outcome::Failed(error.to_string());
+        }
         let attempt = || async {
             let dispatch_cancel = context.cancellation.child_token();
             tokio::select! {
@@ -1129,16 +1246,165 @@ impl McpTool {
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
             }
-            Ok(CallResult::Data(data)) => Outcome::Structured {
-                data,
-                attachments: vec![],
-            },
+            Ok(CallResult::Data(data)) => {
+                let data = if page_tool {
+                    match self.save_large_page(data, &context.cancellation).await {
+                        Ok(data) => data,
+                        Err(error) => return Outcome::Failed(error.to_string()),
+                    }
+                } else {
+                    data
+                };
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+            }
             Ok(CallResult::Task(reference)) => Outcome::Pending { reference },
             Err(CallError::Scope(_)) => Outcome::Failed(
                 "MCP server still requires additional OAuth scopes after reauthorization".into(),
             ),
             Err(CallError::Other(error)) => Outcome::Unknown(error),
         }
+    }
+
+    // Preparation can serialize and write arbitrarily large pages. Run it off
+    // the async runtime and publish only after cancellation and close checks.
+    async fn save_large_page(
+        &self,
+        data: Value,
+        cancellation: &pi_rs::CancellationToken,
+    ) -> Result<Value> {
+        let prepared = run_page_preparation(cancellation, move |worker_cancel| {
+            let mut writer = CancellableWriter {
+                inner: Vec::new(),
+                cancellation: worker_cancel.clone(),
+            };
+            if let Err(error) = serde_json::to_writer(&mut writer, &data) {
+                return if worker_cancel.is_cancelled() {
+                    Err(Error::Cancelled)
+                } else {
+                    Err(error.into())
+                };
+            }
+            let text = writer.inner;
+            if worker_cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if text.len() <= 512 * 1024 {
+                return Ok(PreparedPage::Inline(data));
+            }
+            let mut file = tempfile::NamedTempFile::new()
+                .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+            for chunk in text.chunks(64 * 1024) {
+                if worker_cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                file.write_all(chunk)
+                    .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+            }
+            if worker_cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let cursor = data
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|c| c.len() <= 16 * 1024)
+                .map(str::to_owned);
+            Ok(PreparedPage::Saved {
+                file,
+                bytes: text.len(),
+                cursor,
+            })
+        })
+        .await?;
+        match prepared {
+            PreparedPage::Inline(data) => {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if self.connection.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Config("MCP connection is closed".into()));
+                }
+                Ok(data)
+            }
+            PreparedPage::Saved {
+                file,
+                bytes,
+                cursor,
+            } => {
+                let id = Uuid::new_v4();
+                publish_page_output(
+                    &self.connection.page_outputs,
+                    &self.connection.closed,
+                    cancellation,
+                    id,
+                    self.remote_name.clone(),
+                    file,
+                )?;
+                let mut result = json!({"server": self.connection.name, "outputId": id.to_string(),
+                    "outputBytes": bytes, "readTool": self.spec.name,
+                    "message": "Full page saved; call this tool with outputId and byte offset to retrieve JSON chunks."});
+                if let Some(cursor) = cursor {
+                    result["nextCursor"] = json!(cursor);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    fn read_page_output(&self, arguments: &Value) -> Result<Value> {
+        if arguments.get("cursor").is_some() {
+            return Err(Error::Config(
+                "cursor cannot be combined with outputId".into(),
+            ));
+        }
+        let id = arguments
+            .get("outputId")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| Error::Config("invalid outputId".into()))?;
+        let offset = match arguments.get("offset") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| Error::Config("offset must be a non-negative integer".into()))?,
+        };
+        let mut outputs = self
+            .connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_, _, file) = outputs
+            .iter_mut()
+            .find(|(key, kind, _)| *key == id && *kind == self.remote_name)
+            .ok_or_else(|| Error::Config("MCP page output expired or unknown".into()))?;
+        let size = file
+            .as_file()
+            .metadata()
+            .map_err(|e| Error::Config(e.to_string()))?
+            .len();
+        if offset > size {
+            return Err(Error::Config("offset exceeds page output".into()));
+        }
+        let file = file.as_file_mut();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let mut bytes = vec![0; (size - offset).min(16 * 1024) as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let valid = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => return Err(Error::Config("offset is not a UTF-8 boundary".into())),
+        };
+        let chunk = std::str::from_utf8(&bytes[..valid]).expect("valid UTF-8");
+        let next = offset + valid as u64;
+        let mut result = json!({"outputId": id.to_string(), "offset": offset, "text": chunk});
+        if next < size {
+            result["nextOffset"] = json!(next);
+        }
+        Ok(result)
     }
 
     async fn authorize_scopes(
@@ -1254,6 +1520,30 @@ impl McpTool {
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
             }
+            "list_resources_page" => {
+                let result = service
+                    .list_resources(Some(resource_page_params(arguments)?))
+                    .await
+                    .map_err(call_error)?;
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resources",
+                    serde_json::to_value(result.resources)?,
+                    result.next_cursor,
+                ))
+            }
+            "list_resource_templates_page" => {
+                let result = service
+                    .list_resource_templates(Some(resource_page_params(arguments)?))
+                    .await
+                    .map_err(call_error)?;
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resourceTemplates",
+                    serde_json::to_value(result.resource_templates)?,
+                    result.next_cursor,
+                ))
+            }
             "list_prompts" => {
                 let prompts = service.list_all_prompts().await.map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
@@ -1283,6 +1573,33 @@ impl McpTool {
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
     }
+}
+
+fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {
+    let cursor = match arguments.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::Config("cursor must be a string".into())),
+    };
+    let mut params = rmcp::model::PaginatedRequestParams::default();
+    params.cursor = cursor;
+    Ok(params)
+}
+
+fn resource_page(server: &str, key: &str, items: Value, cursor: Option<String>) -> Value {
+    let items: Vec<_> = visible_resource_listing(items)
+        .into_iter()
+        .map(|mut item| {
+            item["server"] = json!(server);
+            item
+        })
+        .collect();
+    let mut result = json!({"server": server});
+    result[key] = json!(items);
+    if let Some(cursor) = cursor {
+        result["nextCursor"] = json!(cursor);
+    }
+    result
 }
 
 /// Match Pi's MCP App listing filter, including its MIME-profile prefix matching.
@@ -1547,6 +1864,167 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_page_preparation_does_not_block_or_leak_file() {
+        let cancellation = pi_rs::CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_page_preparation(&worker_token, move |_worker_cancel| {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                started_tx.send(file.path().to_owned()).unwrap();
+                release_rx.recv().unwrap();
+                let _ = finished_tx.send(());
+                Ok(PreparedPage::Saved {
+                    file,
+                    bytes: 1,
+                    cursor: None,
+                })
+            })
+            .await
+        });
+        let path = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(path.exists());
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_preparation_cancels_worker_without_cancelling_parent() {
+        let parent = pi_rs::CancellationToken::new();
+        let caller_parent = parent.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_page_preparation(&caller_parent, move |worker_cancel| {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                started_tx.send(file.path().to_owned()).unwrap();
+                while !worker_cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(file);
+                let _ = stopped_tx.send(());
+                Err(Error::Cancelled)
+            })
+            .await
+        });
+        let path = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!parent.is_cancelled());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn serialization_checks_cancellation_during_large_string() {
+        struct CancellingSink {
+            token: pi_rs::CancellationToken,
+            bytes: usize,
+        }
+        impl Write for CancellingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len();
+                if self.bytes >= 64 * 1024 {
+                    self.token.cancel();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let token = pi_rs::CancellationToken::new();
+        let sink = CancellingSink {
+            token: token.clone(),
+            bytes: 0,
+        };
+        let mut writer = CancellableWriter {
+            inner: sink,
+            cancellation: token,
+        };
+        assert!(
+            serde_json::to_writer(&mut writer, &json!({"large": "x".repeat(1024 * 1024)})).is_err()
+        );
+        assert!(writer.inner.bytes < 128 * 1024);
+    }
+
+    #[test]
+    fn closing_while_page_waits_to_publish_discards_file() {
+        let outputs = Arc::new(PageOutputs::default());
+        let closed = Arc::new(AtomicBool::new(false));
+        let guard = outputs.lock().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let other_outputs = outputs.clone();
+        let other_closed = closed.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            publish_page_output(
+                &other_outputs,
+                &other_closed,
+                &pi_rs::CancellationToken::new(),
+                Uuid::new_v4(),
+                "list_resources_page".into(),
+                file,
+            )
+        });
+        started_rx.recv().unwrap();
+        // close sets the flag before taking the same cache lock and clearing it.
+        closed.store(true, Ordering::SeqCst);
+        drop(guard);
+        assert!(worker.join().unwrap().is_err());
+        assert!(outputs.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelled_page_is_not_published() {
+        let outputs = PageOutputs::default();
+        let token = pi_rs::CancellationToken::new();
+        token.cancel();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        assert!(matches!(
+            publish_page_output(
+                &outputs,
+                &AtomicBool::new(false),
+                &token,
+                Uuid::new_v4(),
+                "list_resources_page".into(),
+                file
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(outputs.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
     struct ReleaseTestLatch(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
     impl Drop for ReleaseTestLatch {
         fn drop(&mut self) {
@@ -1744,6 +2222,7 @@ mod tests {
             provider_token: None,
             http_options: None,
             closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
         let peer = connection.service.lock().await.peer().clone();
         let tool = McpTool {
