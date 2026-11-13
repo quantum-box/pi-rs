@@ -3,7 +3,7 @@
 //! Credential acquisition and renewal are the responsibility of the caller.
 pub mod oauth;
 
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
@@ -16,6 +16,12 @@ use std::collections::BTreeMap;
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
+
+#[derive(Debug)]
+enum RawStreamError {
+    LimitExceeded,
+    Transport,
+}
 
 #[derive(Clone)]
 pub struct OpenAiResponses {
@@ -449,18 +455,48 @@ impl Model for OpenAiResponses {
         {
             return Err(Error::Model("expected OpenAI event stream".into()));
         }
-        let mut source = response.bytes_stream().eventsource();
+        // Bound wire bytes before the SSE parser sees them. Coalesce incomplete
+        // lines so its parser does not repeatedly rescan a growing line.
+        let bytes = async_stream::stream! {
+            let mut source = response.bytes_stream();
+            let mut bytes_seen = 0usize;
+            let mut pending = Vec::new();
+            while let Some(chunk) = source.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => { yield Err(RawStreamError::Transport); return; }
+                };
+                bytes_seen = bytes_seen.saturating_add(chunk.len());
+                if bytes_seen > MAX_STREAM {
+                    yield Err(RawStreamError::LimitExceeded);
+                    return;
+                }
+                if let Some(end) = chunk.iter().rposition(|byte| matches!(byte, b'\n' | b'\r')) {
+                    pending.extend_from_slice(&chunk[..=end]);
+                    yield Ok(std::mem::take(&mut pending));
+                    pending.extend_from_slice(&chunk[end + 1..]);
+                } else {
+                    pending.extend_from_slice(&chunk);
+                }
+            }
+            if !pending.is_empty() { yield Ok(pending); }
+        };
+        let mut source = Box::pin(bytes.eventsource());
         Ok(Box::pin(async_stream::try_stream! {
-            let mut size = 0usize;
+            let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut reasoning = String::new();
             while let Some(item) = source.next().await {
-                let item = item.map_err(|_| Error::RetryableModel("OpenAI stream interrupted".into()))?;
-                size = size.saturating_add(item.data.len());
-                if size > MAX_STREAM { Err(Error::Model("OpenAI stream exceeds 32 MiB".into()))?; }
+                let item = item.map_err(|error| match error {
+                    EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
+                    EventStreamError::Transport(RawStreamError::Transport) => Error::RetryableModel("OpenAI stream interrupted".into()),
+                    _ => Error::Model("invalid OpenAI event stream".into()),
+                })?;
                 if item.data == "[DONE]" { continue; }
                 let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
-                match field(&event, "type")? {
+                let kind = field(&event, "type")?;
+                started = true;
+                match kind {
                     "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
                     "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
@@ -503,7 +539,11 @@ impl Model for OpenAiResponses {
                     _ => {}
                 }
             }
-            Err(Error::RetryableModel("OpenAI stream ended without response.completed".into()))?;
+            if started {
+                Err(Error::RetryableModel("OpenAI stream ended without response.completed".into()))?;
+            } else {
+                Err(Error::Model("invalid OpenAI event stream".into()))?;
+            }
         }))
     }
 }
@@ -822,20 +862,131 @@ mod tests {
 
         let (client, server) =
             fixture_with_content_type("<html>not an event stream</html>", None).await;
+        let error = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Model(message) if message == "invalid OpenAI event stream"));
+        server.await.unwrap();
+
+        let (client, server) =
+            fixture_with_content_type("data: {\"type\":\"response.created\"}\n\n", None).await;
+        let error = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
         assert!(
-            client
-                .stream(request())
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .is_err()
+            matches!(error, Error::RetryableModel(message) if message.contains("without response.completed"))
         );
         server.await.unwrap();
 
         let (client, server) =
             fixture_with_content_type("<html>wrong content type</html>", Some("text/html")).await;
         assert!(client.stream(request()).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headerless_unterminated_body_is_limited_before_sse_parsing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpenAiResponses::new(
+            &format!("http://{}/responses", listener.local_addr().unwrap()),
+            "fixture".into(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buffer[..n]);
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_STREAM + 65536
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            let block = vec![b'x'; 65536];
+            for _ in 0..=(MAX_STREAM / block.len()) {
+                if socket.write_all(&block).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let error = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Model(message) if message == "OpenAI stream exceeds 32 MiB")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headerless_stream_handles_split_utf8_and_line_endings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpenAiResponses::new(
+            &format!("http://{}/responses", listener.local_addr().unwrap()),
+            "fixture".into(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buffer[..n]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunks: &[&[u8]] = &[
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"",
+                &[0xe6], &[0x97, 0xa5],
+                b"\"}\r", b"\n\r", b"\n",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\r\n\r\n",
+            ];
+            for chunk in chunks {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Text(text) if text == "日"))
+        );
+        assert!(matches!(events.last(), Some(ModelEvent::Complete { .. })));
         server.await.unwrap();
     }
 
