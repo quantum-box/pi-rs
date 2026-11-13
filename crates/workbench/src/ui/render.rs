@@ -692,7 +692,33 @@ impl Table {
                     .max(1)
             })
             .collect();
-        let mut widths = minimum;
+        // Keep whole words where the columns can all accommodate them, as Pi does.
+        // Join styled spans before measuring so emphasis inside a word does not
+        // create an artificial break. Very long tokens are still allowed to wrap.
+        let word_minimum: Vec<usize> = (0..columns)
+            .map(|column| {
+                let longest = self
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| {
+                        let text: String = cell.iter().map(|span| span.text.as_str()).collect();
+                        text.split_whitespace()
+                            .map(UnicodeWidthStr::width)
+                            .max()
+                            .unwrap_or(1)
+                            .min(30)
+                    })
+                    .max()
+                    .unwrap_or(1);
+                minimum[column].max(longest)
+            })
+            .collect();
+        let mut widths = if word_minimum.iter().sum::<usize>() <= available {
+            word_minimum
+        } else {
+            minimum
+        };
         for _ in widths.iter().sum::<usize>()..available {
             let Some(column) = (0..columns)
                 .filter(|&column| widths[column] < natural[column])
@@ -1633,6 +1659,64 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.text.contains("https://example.com"))
         );
+    }
+
+    #[test]
+    fn markdown_table_keeps_longest_words_when_columns_fit() {
+        let source = "| Column One | Column Two With Detail |\n| --- | --- |\n| super**califra**gil short | otherword |\n| small | tiny |";
+        let lines = markdown(source, &Theme::system(), 32);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("supercalifragil") && line.contains("otherword")),
+            "{text:#?}"
+        );
+        assert!(
+            text.iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 32)
+        );
+        let unicode =
+            "| Header | Other Column Name |\n| --- | --- |\n| 日本**語文**字列 | example |";
+        let lines = markdown(unicode, &Theme::system(), 32);
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+                .contains("日本語文字列")
+        }));
+        // When words cannot all fit, preserve the width bound and all content.
+        let lines = markdown(
+            "| A | B |\n| - | - |\n| abcdefghijk | xyzabcdefgh |",
+            &Theme::system(),
+            12,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(
+            text.iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 12)
+        );
+        assert!(text.iter().any(|line| line.starts_with('│')));
+        let mut cells = [String::new(), String::new()];
+        for line in text
+            .iter()
+            .skip_while(|line| !line.starts_with('├'))
+            .skip(1)
+        {
+            if line.starts_with('└') {
+                break;
+            }
+            for (cell, part) in cells.iter_mut().zip(line.split('│').skip(1)) {
+                cell.push_str(part.trim());
+            }
+        }
+        assert_eq!(cells, ["abcdefghijk", "xyzabcdefgh"]);
     }
 
     #[test]
