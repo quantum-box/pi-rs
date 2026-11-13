@@ -314,15 +314,26 @@ pub trait ToolHost: Send + Sync {
         None
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
+    /// Opt in only when dropping a pending `call` future prevents any work
+    /// that has not already begun from starting later.
+    fn cancellation_safe_calls(&self) -> bool {
+        false
+    }
     /// Call with a token derived from this invocation's `ToolContext` token.
-    /// Hosts that queue work must propagate it to queued requests, rather than
-    /// merely dropping the waiting future when the token is cancelled.
+    /// Hosts that queue work must override this method and propagate the token
+    /// to queued requests. The default fails closed unless the host explicitly
+    /// guarantees that dropping its call future retracts unstarted work.
     async fn call_with_cancellation(
         &self,
         name: &str,
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Outcome {
+        if !self.cancellation_safe_calls() {
+            return Outcome::Skipped(
+                "host does not support cancellation-aware nested calls".into(),
+            );
+        }
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Outcome::Skipped("cancelled before nested dispatch".into()),

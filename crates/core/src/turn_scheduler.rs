@@ -978,7 +978,7 @@ impl Agent<'_> {
                     TurnEvent::Normalized(index, normalized, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
                         match normalized {
-                            Err(error) => { let reason = error.to_string(); record_turn_error(&mut first_error, &mut error_origin, index, error); calls[index].phase = TurnPhase::NotStarted(reason); }
+                            Err(error) => { let reason = error.to_string(); if !(matches!(error, Error::Cancelled) && calls[index].lane.is_some() && calls[index].cancellation.is_cancelled() && !scope.cancellation.is_cancelled()) { record_turn_error(&mut first_error, &mut error_origin, index, error); } calls[index].phase = TurnPhase::NotStarted(reason); }
                             Ok(normalized) => {
                                 let registry = self.registry.clone(); let snapshot = states.clone();
                                 let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
@@ -995,7 +995,7 @@ impl Agent<'_> {
                     TurnEvent::Prepared(index, prepared, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
                         match prepared {
-                            Err(error) => { let reason = error.to_string(); record_turn_error(&mut first_error, &mut error_origin, index, error); calls[index].phase = TurnPhase::NotStarted(reason); }
+                            Err(error) => { let reason = error.to_string(); if !(matches!(error, Error::Cancelled) && calls[index].lane.is_some() && calls[index].cancellation.is_cancelled() && !scope.cancellation.is_cancelled()) { record_turn_error(&mut first_error, &mut error_origin, index, error); } calls[index].phase = TurnPhase::NotStarted(reason); }
                             Ok(prepared) => { calls[index].phase = TurnPhase::Prepared(prepared); }
                         }
                     }
@@ -1006,7 +1006,9 @@ impl Agent<'_> {
                                     continue;
                                 }
                                 if calls[index].cancellation.is_cancelled() {
-                                    record_turn_error(&mut first_error, &mut error_origin, index, Error::Cancelled);
+                                    if calls[index].lane.is_none() || scope.cancellation.is_cancelled() {
+                                        record_turn_error(&mut first_error, &mut error_origin, index, Error::Cancelled);
+                                    }
                                     calls[index].phase = TurnPhase::NotStarted("cancelled before dispatch".into());
                                     continue;
                                 }

@@ -5481,6 +5481,29 @@ mod nested_host_tests {
     use super::*;
 
     #[tokio::test]
+    async fn custom_host_without_cancellation_guarantee_fails_closed() {
+        struct UnsafeHost(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for UnsafeHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("unexpected".into())
+            }
+        }
+        let host = UnsafeHost(AtomicUsize::new(0));
+        let result = host
+            .call_with_cancellation("write", serde_json::json!({}), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Outcome::Skipped(message) if message.contains("cancellation-aware"))
+        );
+        assert_eq!(host.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn invocation_cancellation_reaches_queued_write_behind_active_call() {
         let (requests, mut incoming) = mpsc::channel(4);
         let parent = CancellationToken::new();

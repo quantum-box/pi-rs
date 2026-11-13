@@ -935,6 +935,9 @@ mod tests {
         struct ErrorHost(bool);
         #[async_trait::async_trait]
         impl ToolHost for ErrorHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
             fn tools(&self) -> Vec<ToolSpec> {
                 vec![ToolSpec {
                     name: "broken".into(),
@@ -985,6 +988,9 @@ mod tests {
         struct PatchedHost;
         #[async_trait::async_trait]
         impl ToolHost for PatchedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
             fn tools(&self) -> Vec<ToolSpec> {
                 ["recovered", "failed"]
                     .into_iter()
@@ -1025,6 +1031,9 @@ mod tests {
     struct Host;
     #[async_trait::async_trait]
     impl ToolHost for Host {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
         fn tools(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: "echo".into(),
@@ -1139,6 +1148,9 @@ mod tests {
     struct StartedHost(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl ToolHost for StartedHost {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
         fn tools(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: "started".into(),
@@ -1296,6 +1308,9 @@ mod tests {
         struct CountingHost(Arc<AtomicUsize>);
         #[async_trait::async_trait]
         impl ToolHost for CountingHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
             fn tools(&self) -> Vec<ToolSpec> {
                 ["side_effect", MODEL_OPERATION]
                     .into_iter()
@@ -1779,6 +1794,114 @@ mod tests {
             .unwrap();
         assert_eq!(result, "done");
         assert_eq!(session.journal().unwrap().operations().len(), 3);
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn output_breach_skips_queued_write_and_returns_tool_failure_to_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct QueueTool {
+            name: &'static str,
+            writes: Arc<AtomicUsize>,
+            prepared: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for QueueTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+                if self.name == "hold" {
+                    self.prepared.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                Ok(arguments)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("done".into())
+            }
+        }
+        struct QueueExtension(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl Extension for QueueExtension {
+            fn id(&self) -> &str {
+                "queue-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["hold", "write"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(QueueTool {
+                            name,
+                            writes: self.0.clone(),
+                            prepared: self.1.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct QueueModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for QueueModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(
+                        content.contains("Script output limit exceeded"),
+                        "{content}"
+                    );
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete { calls: vec![ToolCall {
+                        id:"script".into(), name:"codemode".into(),
+                        arguments: json!({"code":"tools.hold({}); tools.write({}); await Promise.resolve(); text('x'.repeat(16 * 1024 * 1024 + 1));"}).to_string(),
+                    }], usage: None })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let writes = Arc::new(AtomicUsize::new(0));
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(QueueModel), "fixture")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .extension(Arc::new(QueueExtension(writes.clone(), prepared.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), session.prompt("test"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(prepared.load(Ordering::SeqCst), 1);
+        let operations = session.journal().unwrap().operations();
+        assert!(
+            operations
+                .iter()
+                .any(|(invocation, state)| invocation.call.name == "write"
+                    && matches!(
+                        state,
+                        pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                    ))
+        );
         session.close().await.unwrap();
     }
     #[test]
