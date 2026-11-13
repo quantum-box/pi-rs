@@ -527,6 +527,8 @@ impl AgentSession {
             }
         }
     }
+    /// Borrow the journal while the session is idle. Drop the guard before
+    /// invoking another session operation. Panics if the journal is in use.
     pub fn journal(&self) -> tokio::sync::MutexGuard<'_, Session> {
         self.session.try_lock().expect("session journal is in use")
     }
@@ -803,26 +805,18 @@ impl AgentSession {
             .expect("session journal is in use")
             .records()
             .len();
-        let editor_text = self
-            .session
-            .try_lock()
-            .expect("session journal is in use")
-            .records()
-            .iter()
-            .find(|record| {
-                record.id == selected
-                    && selected
-                        != self
-                            .session
-                            .try_lock()
-                            .expect("session journal is in use")
-                            .head()
-            })
-            .and_then(|record| match &record.event {
-                crate::Event::User { content, .. }
-                | crate::Event::UserWithImages { content, .. } => Some(content.clone()),
-                _ => None,
-            });
+        let editor_text = {
+            let journal = self.journal();
+            journal
+                .records()
+                .iter()
+                .find(|record| record.id == selected && selected != journal.head())
+                .and_then(|record| match &record.event {
+                    crate::Event::User { content, .. }
+                    | crate::Event::UserWithImages { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+        };
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1103,12 +1097,8 @@ impl AgentSession {
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
-        let mut fork = self.fork_session(
-            self.session
-                .try_lock()
-                .expect("session journal is in use")
-                .fork_to(record, &destination)?,
-        )?;
+        let forked = self.journal().fork_to(record, &destination)?;
+        let mut fork = self.fork_session(forked)?;
         fork.session_file = Some(destination);
         Ok(fork)
     }
@@ -1251,6 +1241,7 @@ impl AgentSession {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         self.start().await?;
+        let mut journal = self.session.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -1275,21 +1266,17 @@ impl AgentSession {
                 };
                 let prepared = prepare_idle_input_with_host(
                     &self.registry,
-                    &mut *self.session.try_lock().expect("session journal is in use"),
+                    &mut *journal,
                     event,
                     &active.token,
                     &mut observe,
                 )
                 .await?;
-                if let Some(trigger_id) = self
-                    .session
-                    .try_lock()
-                    .expect("session journal is in use")
-                    .pending_custom_trigger()
-                {
+                let pending_trigger = journal.pending_custom_trigger();
+                if let Some(trigger_id) = pending_trigger {
                     agent
                         .run_correlated(
-                            &mut *self.session.try_lock().expect("session journal is in use"),
+                            &mut *journal,
                             trigger_id,
                             None,
                             &mut self.input,
@@ -1306,33 +1293,20 @@ impl AgentSession {
             }
             if let Some(images) = images {
                 agent
-                    .resolve_prior_turn_end(
-                        &mut *self.session.try_lock().expect("session journal is in use"),
-                        run_id,
-                        &active.token,
-                        &mut observe,
-                    )
+                    .resolve_prior_turn_end(&mut *journal, run_id, &active.token, &mut observe)
                     .await?;
-                self.session
-                    .try_lock()
-                    .expect("session journal is in use")
-                    .append_user_with_images(
-                        input.take().unwrap_or_default(),
-                        images,
-                        Some(run_id),
-                    )?;
+                journal.append_user_with_images(
+                    input.take().unwrap_or_default(),
+                    images,
+                    Some(run_id),
+                )?;
                 observe(Notification::Committed(
-                    self.session
-                        .try_lock()
-                        .expect("session journal is in use")
-                        .records()
-                        .last()
-                        .expect("appended user message"),
+                    journal.records().last().expect("appended user message"),
                 ));
             }
             agent
                 .run_correlated(
-                    &mut *self.session.try_lock().expect("session journal is in use"),
+                    &mut *journal,
                     run_id,
                     input,
                     &mut self.input,
@@ -1342,11 +1316,7 @@ impl AgentSession {
                 .await
         }
         .await;
-        let final_inputs = active.finish_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
-            &mut self.input,
-            &mut observe,
-        );
+        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observe);
         if result.is_ok()
             && let Err(error) = final_inputs
         {
@@ -2125,11 +2095,9 @@ mod tests {
             );
         }
         session.start().await.unwrap();
+        let head = session.journal().head();
         let mut fork = session
-            .fork_to(
-                session.journal().head(),
-                directory.path().join("fork.jsonl"),
-            )
+            .fork_to(head, directory.path().join("fork.jsonl"))
             .unwrap();
         fork.prompt("begin fork").await.unwrap();
         fork.close().await.unwrap();
@@ -3144,7 +3112,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.journal().queued_custom_messages().len(), 1);
-        let fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let fork = session.fork_at(head).unwrap();
         assert_eq!(fork.journal().queued_custom_messages().len(), 1);
         drop(fork);
         drop(session);
@@ -3413,7 +3382,8 @@ mod tests {
             })
             .unwrap();
         session.prompt("fork point").await.unwrap();
-        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_at(head).unwrap();
         assert!(!fork.auto_compaction_enabled());
         assert_eq!(
             fork.journal()
@@ -3940,7 +3910,8 @@ mod tests {
         let usage = session.context_usage().await.unwrap().unwrap();
         assert_eq!((usage.context_window, usage.tokens), (4096, Some(13)));
         assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
-        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.statistics().tokens, stats.tokens);
         assert_ne!(fork.statistics().session_id, stats.session_id);
         session.summarize(0).await.unwrap();
@@ -4222,7 +4193,8 @@ mod tests {
         assert_eq!(queued[0].input.id, id);
         assert_eq!(queued[0].input.content, "branch:FIXTURE");
         assert_eq!(queued[0].images, vec![image]);
-        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_at(head).unwrap();
         fork.controls().follow_up("forked").await.unwrap();
         assert_eq!(
             fork.clear_queued_inputs().unwrap()[0].input.content,
@@ -4316,9 +4288,11 @@ mod tests {
             session.messages().unwrap()
         );
         let path = directory.path().join("fork.jsonl");
-        let mut fork = session.fork_to(session.journal().head(), &path).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_to(head, &path).unwrap();
         assert_ne!(fork.journal().session_id(), session.journal().session_id());
-        assert!(session.fork_to(session.journal().head(), &path).is_err());
+        let head = session.journal().head();
+        assert!(session.fork_to(head, &path).is_err());
         fork.prompt("second").await.unwrap();
         fork.close().await.unwrap();
         drop(fork);
@@ -4336,7 +4310,8 @@ mod tests {
             .in_memory()
             .unwrap();
         session.prompt("first").await.unwrap();
-        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.messages().unwrap(), session.messages().unwrap());
         assert_ne!(fork.journal().session_id(), session.journal().session_id());
         session.close().await.unwrap();
@@ -8431,7 +8406,8 @@ mod tests {
                 .count(),
             2
         );
-        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        let head = session.journal().head();
+        let mut fork = session.fork_at(head).unwrap();
         assert!(fork.messages().unwrap().iter().any(
             |message| matches!(message, Message::UserWithImages { images, .. } if images.len() == 1)
         ));
