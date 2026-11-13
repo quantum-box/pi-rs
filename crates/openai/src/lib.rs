@@ -439,11 +439,13 @@ impl Model for OpenAiResponses {
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
-        if !response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
+        // ChatGPT plan responses can be valid SSE without a Content-Type header.
+        // The event parser still requires a valid response.completed event.
+        if !(content_type
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"))
+            || (content_type.is_none() && provider == "openai-chatgpt"))
         {
             return Err(Error::Model("expected OpenAI event stream".into()));
         }
@@ -756,6 +758,13 @@ mod tests {
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
+        fixture_with_content_type(events, Some("text/event-stream")).await
+    }
+
+    async fn fixture_with_content_type(
+        events: &str,
+        content_type: Option<&str>,
+    ) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = OpenAiResponses::new(
             &format!("http://{}/responses", listener.local_addr().unwrap()),
@@ -763,6 +772,7 @@ mod tests {
         )
         .unwrap();
         let body = events.to_owned();
+        let content_type = content_type.map(str::to_owned);
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
@@ -777,14 +787,56 @@ mod tests {
             }
             let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
             assert!(headers.contains("authorization: bearer fixture"));
+            let header =
+                content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn chatgpt_accepts_missing_content_type_only_for_a_valid_stream() {
+        let (client, server) = fixture_with_content_type(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+            None,
+        ).await;
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Text(text) if text == "hello"))
+        );
+        assert!(matches!(events.last(), Some(ModelEvent::Complete { .. })));
+        server.await.unwrap();
+
+        let (client, server) =
+            fixture_with_content_type("<html>not an event stream</html>", None).await;
+        assert!(
+            client
+                .stream(request())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+
+        let (client, server) =
+            fixture_with_content_type("<html>wrong content type</html>", Some("text/html")).await;
+        assert!(client.stream(request()).await.is_err());
+        server.await.unwrap();
     }
 
     #[tokio::test]
