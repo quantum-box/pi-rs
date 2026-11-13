@@ -176,6 +176,15 @@ pub struct Agent<'a> {
     pub limits: Limits,
 }
 
+/// Runtime registry selection point. These snapshots do not grant access to tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolInventoryPhase {
+    /// Registry selected before request hooks prepare a new model request.
+    RequestPreparation,
+    /// Registry selected for dispatch after any dispatch-time refresh.
+    Dispatch,
+}
+
 pub enum Notification<'a> {
     RunStarted {
         run_id: Uuid,
@@ -195,6 +204,12 @@ pub enum Notification<'a> {
     QueueUpdated {
         steering: Vec<&'a str>,
         follow_up: Vec<&'a str>,
+    },
+    /// Registry selected at a runtime boundary; may include private source paths.
+    ToolInventory {
+        run_id: Uuid,
+        phase: ToolInventoryPhase,
+        registry: &'a Registry,
     },
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
@@ -1288,6 +1303,11 @@ impl Agent<'_> {
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
+                observer(Notification::ToolInventory {
+                    run_id,
+                    phase: ToolInventoryPhase::RequestPreparation,
+                    registry: active.registry,
+                });
                 let (mut request, transformed) = active
                     .request(
                         session,
@@ -1547,6 +1567,13 @@ impl Agent<'_> {
                 model_name: active.model_name,
                 limits: active.limits.clone(),
             };
+            if !invocations.is_empty() && !truncated {
+                observer(Notification::ToolInventory {
+                    run_id,
+                    phase: ToolInventoryPhase::Dispatch,
+                    registry: dispatcher.registry,
+                });
+            }
             let dispatched = if truncated {
                 dispatcher
                     .reject_truncated_tools(session, &invocations, &states, cancel, observer)

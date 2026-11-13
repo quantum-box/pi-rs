@@ -23,6 +23,13 @@ pub enum SessionEvent {
     SessionInfoChanged {
         name: Option<String>,
     },
+    /// Selected runtime registry at request preparation or dispatch. It may
+    /// differ from the configured registry and contains extension source paths.
+    ToolInventory {
+        run_id: Uuid,
+        phase: crate::ToolInventoryPhase,
+        tools: Arc<Vec<crate::RegisteredToolInfo>>,
+    },
     Request(Arc<ModelRequest>),
     Text(String),
     Reasoning(String),
@@ -2526,6 +2533,15 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
             succeeded: *succeeded,
         },
         Notification::Committed(record) => SessionEvent::Record(Arc::new((*record).clone())),
+        Notification::ToolInventory {
+            run_id,
+            phase,
+            registry,
+        } => SessionEvent::ToolInventory {
+            run_id: *run_id,
+            phase: *phase,
+            tools: Arc::new(registry.registered_tool_info()),
+        },
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
         Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
