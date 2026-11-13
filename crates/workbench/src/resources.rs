@@ -98,35 +98,39 @@ impl Resources {
         };
         for additional in additions {
             for (name, skill) in additional.skills {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    resources.skills.entry(name.clone())
-                {
-                    entry.insert(skill);
-                } else if resources
-                    .skills
-                    .get(&name)
-                    .is_some_and(|existing| existing.path != skill.path)
-                {
-                    resources.warnings.push(format!(
-                        "Duplicate skill {name} at {}",
-                        skill.path.display()
-                    ));
+                match resources.skills.entry(name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(skill);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if !same_resource_file(&entry.get().path, &skill.path) =>
+                    {
+                        resources.warnings.push(resource_collision(
+                            "skill",
+                            &name,
+                            &entry.get().path,
+                            &skill.path,
+                        ));
+                    }
+                    _ => {}
                 }
             }
             for (name, prompt) in additional.prompts {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    resources.prompts.entry(name.clone())
-                {
-                    entry.insert(prompt);
-                } else if resources
-                    .prompts
-                    .get(&name)
-                    .is_some_and(|existing| existing.path != prompt.path)
-                {
-                    resources.warnings.push(format!(
-                        "Duplicate prompt {name} at {}",
-                        prompt.path.display()
-                    ));
+                match resources.prompts.entry(name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(prompt);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if !same_resource_file(&entry.get().path, &prompt.path) =>
+                    {
+                        resources.warnings.push(resource_collision(
+                            "prompt",
+                            &name,
+                            &entry.get().path,
+                            &prompt.path,
+                        ));
+                    }
+                    _ => {}
                 }
             }
             for theme in additional.themes {
@@ -275,11 +279,14 @@ impl Resources {
                             entry.insert(skill);
                         }
                         std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get().path != skill.path =>
+                            if !same_resource_file(&entry.get().path, &skill.path) =>
                         {
-                            resources
-                                .warnings
-                                .push(format!("Duplicate skill {name} at {}", path.display()));
+                            resources.warnings.push(resource_collision(
+                                "skill",
+                                &name,
+                                &entry.get().path,
+                                &skill.path,
+                            ));
                         }
                         _ => {}
                     }
@@ -324,11 +331,14 @@ impl Resources {
                             entry.insert(prompt);
                         }
                         std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get().path != prompt.path =>
+                            if !same_resource_file(&entry.get().path, &prompt.path) =>
                         {
-                            resources
-                                .warnings
-                                .push(format!("Duplicate prompt {name} at {}", path.display()));
+                            resources.warnings.push(resource_collision(
+                                "prompt",
+                                name,
+                                &entry.get().path,
+                                &prompt.path,
+                            ));
                         }
                         _ => {}
                     },
@@ -450,6 +460,20 @@ fn resource_path(workspace: &Path, path: &str) -> PathBuf {
         workspace.join(path)
     }
 }
+// Pi's collision diagnostics identify both the resource in use and the one
+// ignored. Treat aliases to the same file as one resource.
+fn same_resource_file(left: &Path, right: &Path) -> bool {
+    left == right || matches!((left.canonicalize(), right.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+fn resource_collision(kind: &str, name: &str, winner: &Path, loser: &Path) -> String {
+    format!(
+        "Duplicate {kind} {name} at {}; using {}",
+        loser.display(),
+        winner.display()
+    )
+}
+
 fn validate_skill(name: &str, skill: &Skill, warnings: &mut Vec<String>) {
     let mut warning = |message: &str| warnings.push(format!("{}: {message}", skill.path.display()));
     let name_length = name.encode_utf16().count();
@@ -831,6 +855,123 @@ mod tests {
         );
         let declared = root.join("declared");
         assert_eq!(skill_files(&declared), [declared.join("SKILL.md")]);
+    }
+
+    #[test]
+    fn duplicate_resources_report_winner_and_ignored_path_for_explicit_and_discovered() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let skill_a = root.join("first/SKILL.md");
+        let skill_b = root.join("second/SKILL.md");
+        let prompt_a = root.join("first/greet.md");
+        let prompt_b = root.join("second/greet.md");
+        for path in [&skill_a, &skill_b, &prompt_a, &prompt_b] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            &skill_a,
+            "---\nname: shared\ndescription: first\n---\nFirst",
+        )
+        .unwrap();
+        std::fs::write(
+            &skill_b,
+            "---\nname: shared\ndescription: second\n---\nSecond",
+        )
+        .unwrap();
+        std::fs::write(&prompt_a, "first prompt").unwrap();
+        std::fs::write(&prompt_b, "second prompt").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root.into();
+        args.skill = vec![
+            skill_a.to_string_lossy().into_owned(),
+            skill_b.to_string_lossy().into_owned(),
+        ];
+        args.prompt_template = vec![prompt_a.clone(), prompt_b.clone()];
+        let resources = Resources::load(&args).unwrap();
+        let skill_a = skill_a.canonicalize().unwrap();
+        let skill_b = skill_b.canonicalize().unwrap();
+        let skill_warning = format!(
+            "Duplicate skill shared at {}; using {}",
+            skill_b.display(),
+            skill_a.display()
+        );
+        let prompt_warning = format!(
+            "Duplicate prompt greet at {}; using {}",
+            prompt_b.display(),
+            prompt_a.display()
+        );
+        assert!(
+            resources.warnings.contains(&skill_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert!(
+            resources.warnings.contains(&prompt_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert_eq!(resources.skills["shared"].path, skill_a);
+        assert_eq!(resources.prompts["greet"].body, "first prompt");
+
+        args.skill.truncate(1);
+        args.prompt_template.truncate(1);
+        let discovered = pi_rs::DiscoveredResources {
+            skill_paths: vec![skill_b.clone()],
+            prompt_paths: vec![prompt_b.clone()],
+            theme_paths: vec![],
+        };
+        let resources = Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert!(
+            resources.warnings.contains(&skill_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert!(
+            resources.warnings.contains(&prompt_warning),
+            "{:?}",
+            resources.warnings
+        );
+        assert_eq!(resources.skills["shared"].path, skill_a);
+        assert_eq!(resources.prompts["greet"].body, "first prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_symlink_alias_does_not_report_a_collision() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("greet.md"), "hello").unwrap();
+        std::os::unix::fs::symlink(first.join("greet.md"), second.join("greet.md")).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().into();
+        args.prompt_template = vec![first, second];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.prompts["greet"].body, "hello");
+        assert!(
+            !resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate prompt greet"))
+        );
     }
 
     #[test]
