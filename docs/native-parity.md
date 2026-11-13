@@ -3620,8 +3620,7 @@ During requests and stream reads with custom values, SDK and HTTP transport
 events are suppressed because signing and error traces can contain unredacted
 headers or echoed response frames; application tracing remains enabled.
 
-Not yet supported: Pi's interactive AWS profile login/storage, non-image
-multimodal inputs, workbench-specific thinking display controls, tool
+Not yet supported: non-image multimodal inputs, workbench-specific thinking display controls, tool
 choice/strict sampling, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a

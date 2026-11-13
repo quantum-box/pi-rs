@@ -1358,7 +1358,15 @@ mod tests {
                 .unwrap();
             assert_eq!(prepared.context_identity(), fresh.context_identity());
             assert!(prepared.context_identity().is_some());
-            let profile = chain.with_profile("selected".into());
+            let mut custom = http::HeaderMap::new();
+            custom.append("x-profile-route", http::HeaderValue::from_static("first"));
+            custom.append("x-profile-route", http::HeaderValue::from_static("second"));
+            let profile = chain
+                .with_headers(custom)
+                .unwrap()
+                .with_profile("selected".into());
+            let prepared = profile.prepare_bedrock().await.unwrap().unwrap();
+            assert_eq!(prepared.headers["x-profile-route"], ["first", "second"]);
             let credentials = profile
                 .load_config()
                 .await
