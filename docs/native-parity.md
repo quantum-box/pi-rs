@@ -647,6 +647,11 @@ mutation lock. Hosts must ensure the backend enforces the intended access policy
 `coding_tools_from` accepts an injected shell only when read, write, edit and
 non-local bash use the same backend `Arc`; hosts must ensure that all four
 operations actually target the same environment and enforce its access policy.
+For a working directory that exists only on the backend,
+`create_remote_coding_tools` builds the set without looking up or canonicalizing
+the directory on the host. Its path options configure the backend home for `~`;
+without a configured home, home-relative file paths fail. Its read and shell
+tools share a host-side transcript capability, as in the standalone factories.
 `coding_tools_from_with_local_shell` explicitly adds a host-local, unsandboxed
 shell to injected file tools and rejects a separately injected shell. Partial or
 independently allocated injected backends are rejected. The read-only set rejects custom read operations because
