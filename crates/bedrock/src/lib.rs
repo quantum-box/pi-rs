@@ -35,6 +35,7 @@ pub struct Bedrock {
     prepared_identity: Option<String>,
     environment_config: bool,
     http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+    credentials_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
     thinking_budgets: ThinkingBudgets,
@@ -61,6 +62,7 @@ impl Bedrock {
             prepared_identity: None,
             environment_config: true,
             http_client: None,
+            credentials_http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -87,6 +89,7 @@ impl Bedrock {
             prepared_identity: None,
             environment_config: false,
             http_client: None,
+            credentials_http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -117,6 +120,7 @@ impl Bedrock {
             prepared_identity: None,
             environment_config: false,
             http_client: None,
+            credentials_http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -184,7 +188,7 @@ impl Bedrock {
 
     async fn load_config(&self) -> aws_types::SdkConfig {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(client) = &self.http_client {
+        if let Some(client) = &self.credentials_http_client {
             loader = loader.http_client(client.clone());
         }
         if let Some(profile) = &self.profile {
@@ -193,7 +197,7 @@ impl Bedrock {
             let config = loader.profile_name(profile).load().await;
             let mut provider_config = aws_config::provider_config::ProviderConfig::without_region()
                 .with_region(config.region().cloned());
-            if let Some(client) = &self.http_client {
+            if let Some(client) = &self.credentials_http_client {
                 provider_config = provider_config.with_http_client(client.clone());
             }
             let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
@@ -419,8 +423,17 @@ impl Bedrock {
     }
     /// Route requests through a caller-supplied Smithy HTTP client.
     pub fn with_http_client(
+        self,
+        client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    ) -> Self {
+        self.with_http_clients(client.clone(), client)
+    }
+
+    /// Route Runtime and SDK credential-provider traffic through separate transports.
+    pub fn with_http_clients(
         mut self,
         client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+        credentials_client: aws_smithy_runtime_api::client::http::SharedHttpClient,
     ) -> Self {
         // Environment-backed credential providers must be rebuilt with the
         // transport as well, including any previously loaded SDK config.
@@ -440,6 +453,7 @@ impl Bedrock {
         };
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(existing));
         self.http_client = Some(client);
+        self.credentials_http_client = Some(credentials_client);
         self.prepared_identity = None;
         self
     }

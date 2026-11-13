@@ -695,3 +695,126 @@ fn https_connect_validates_tls_and_keeps_proxy_auth_out_of_origin_request() {
         assert!(!output.status.success());
     }
 }
+
+#[test]
+fn container_credentials_are_direct_when_runtime_on_same_origin_uses_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"retry":{"enabled":false}}).to_string(),
+    )
+    .unwrap();
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_url = format!("http://{}", origin.local_addr().unwrap());
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let metadata_task = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(origin);
+        assert!(first.starts_with("GET /credentials"), "{first}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let body = json!({"AccessKeyId":"ECSKEY","SecretAccessKey":"ECSSECRET","Token":"SESSION","Expiration":"2099-01-01T00:00:00Z"}).to_string();
+        write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let expected = origin_url.clone();
+    let proxy_task = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(proxy);
+        assert!(
+            first.starts_with(&format!("POST {expected}/runtime/model/")),
+            "{first}"
+        );
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        assert!(headers.contains("Credential=ECSKEY/"), "{headers}");
+        write!(
+            socket,
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_MAX_ATTEMPTS", "1")
+        .env(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            format!("{origin_url}/credentials"),
+        )
+        .env(
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+            format!("{origin_url}/runtime"),
+        )
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+        .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            root.path().join("missing-credentials"),
+        )
+        .env("http_proxy", proxy_url);
+    for key in [
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "amazon.nova-2-lite-v1:0",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    metadata_task.join().unwrap_or_else(|_| {
+        panic!(
+            "container credential fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    proxy_task.join().unwrap_or_else(|_| {
+        panic!(
+            "Runtime proxy fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(!output.status.success());
+}

@@ -459,7 +459,9 @@ impl Client {
         let this = match self {
             Self::Bedrock(client) => {
                 return Ok(match super::http_proxy::bedrock_client(settings, env)? {
-                    Some(http) => Self::Bedrock(client.with_http_client(http)),
+                    Some((runtime, credentials)) => {
+                        Self::Bedrock(client.with_http_clients(runtime, credentials))
+                    }
                     None => Self::Bedrock(client),
                 });
             }

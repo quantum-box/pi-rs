@@ -66,7 +66,12 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
 pub(super) fn bedrock_client(
     settings: &crate::config::Settings,
     provider_env: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Result<Option<aws_smithy_runtime_api::client::http::SharedHttpClient>> {
+) -> Result<
+    Option<(
+        aws_smithy_runtime_api::client::http::SharedHttpClient,
+        aws_smithy_runtime_api::client::http::SharedHttpClient,
+    )>,
+> {
     use aws_smithy_http_client::{Connector, proxy::ProxyConfig, tls};
     use aws_smithy_runtime_api::client::http::{SharedHttpConnector, http_client_fn};
     let env = |lower, upper| {
@@ -126,29 +131,37 @@ pub(super) fn bedrock_client(
     };
     let http = proxy(http)?;
     let https = proxy(https)?;
-    Ok(Some(http_client_fn(move |settings, _components| {
-        let connector = |config: ProxyConfig| {
-            SharedHttpConnector::new(
-                Connector::builder()
-                    .connector_settings(settings.clone())
-                    .proxy_config(config)
-                    .tls_provider(tls::Provider::Rustls(
-                        tls::rustls_provider::CryptoMode::AwsLc,
-                    ))
-                    .build(),
-            )
-        };
-        let direct = connector(ProxyConfig::disabled());
-        let http = http.clone().map(connector);
-        let https = https.clone().map(connector);
-        SharedHttpConnector::new(BedrockConnector {
-            direct,
-            http,
-            https,
-            excluded: excluded.clone(),
-            metadata_origins: metadata_origins.clone(),
+    let make_client = |credential_traffic: bool| {
+        let http = http.clone();
+        let https = https.clone();
+        let excluded = excluded.clone();
+        let metadata_origins = metadata_origins.clone();
+        http_client_fn(move |settings, _components| {
+            let connector = |config: ProxyConfig| {
+                SharedHttpConnector::new(
+                    Connector::builder()
+                        .connector_settings(settings.clone())
+                        .proxy_config(config)
+                        .tls_provider(tls::Provider::Rustls(
+                            tls::rustls_provider::CryptoMode::AwsLc,
+                        ))
+                        .build(),
+                )
+            };
+            let direct = connector(ProxyConfig::disabled());
+            let http = http.clone().map(connector);
+            let https = https.clone().map(connector);
+            SharedHttpConnector::new(BedrockConnector {
+                direct,
+                http,
+                https,
+                excluded: excluded.clone(),
+                metadata_origins: metadata_origins.clone(),
+                credential_traffic,
+            })
         })
-    })))
+    };
+    Ok(Some((make_client(false), make_client(true))))
 }
 
 struct BedrockConnector {
@@ -157,6 +170,7 @@ struct BedrockConnector {
     https: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
     excluded: String,
     metadata_origins: Vec<Url>,
+    credential_traffic: bool,
 }
 impl std::fmt::Debug for BedrockConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -206,7 +220,9 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for BedrockConnector {
                 .metadata_origins
                 .iter()
                 .any(|endpoint| endpoint.origin() == url.origin());
-        let proxy = if metadata || bedrock_bypasses_proxy(&url, &self.excluded) {
+        let proxy = if (self.credential_traffic && metadata)
+            || bedrock_bypasses_proxy(&url, &self.excluded)
+        {
             None
         } else {
             match url.scheme() {
