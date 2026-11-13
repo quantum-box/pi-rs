@@ -2589,11 +2589,21 @@ impl CodingTool {
                 .map_err(|error| Error::Config(error.to_string()))?;
             walker.overrides(overrides);
         }
+        let mut find_error = None;
         for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if is_find => {
+                    // fd can return useful matches alongside a traversal error.
+                    // Preserve the error only if no matching path is produced.
+                    find_error.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+                Err(error) => return Err(Error::Config(error.to_string())),
+            };
             if (is_find && entry.depth() == 0)
                 || (!is_find && !entry.file_type().is_some_and(|kind| kind.is_file()))
             {
@@ -2640,6 +2650,9 @@ impl CodingTool {
             Some(grep) => grep.finish(),
             None => {
                 if results.is_empty() {
+                    if let Some(error) = find_error {
+                        return Err(Error::Config(error));
+                    }
                     return Ok(Outcome::Succeeded("No files found matching pattern".into()));
                 }
                 results.sort();
@@ -4668,6 +4681,41 @@ mod tests {
             .tool_content(),
             "nested/sample.rs"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_returns_partial_matches_when_a_subdirectory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let inaccessible = root.path().join("z-inaccessible");
+        std::fs::create_dir(&inaccessible).unwrap();
+        std::fs::write(root.path().join("a-readable.txt"), "content").unwrap();
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged test runners can bypass directory permissions.
+        if std::fs::read_dir(&inaccessible).is_ok() {
+            std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            return;
+        }
+        let tool = CodingTool {
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        let partial = tool.search(&json!({"pattern":"*.txt"}), &token);
+        let no_match = tool.search(&json!({"pattern":"*.missing"}), &token);
+        let grep = CodingTool {
+            kind: Kind::Grep,
+            ..tool
+        };
+        let grep_error = grep.search(&json!({"pattern":"content"}), &token);
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(partial.unwrap().tool_content(), "a-readable.txt");
+        assert!(no_match.is_err());
+        assert!(grep_error.is_err());
     }
 
     #[test]
