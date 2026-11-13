@@ -88,7 +88,7 @@ impl Bedrock {
         mapped_effort: Option<&str>,
     ) -> Result<Self> {
         self.reasoning = level
-            .filter(|level| *level != "off")
+            .filter(|level| *level != "off" || mapped_effort.is_some())
             .map(ReasoningLevel::parse)
             .transpose()?;
         self.mapped_effort = mapped_effort.map(str::to_owned);

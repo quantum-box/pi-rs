@@ -649,12 +649,15 @@ impl Client {
                         .and_then(|model| model.mapped_effort(level))
                 });
                 let level = if mapped == Some(None) { None } else { thinking };
+                let (supports_long, _) = args
+                    .model_profiles
+                    .messages_cache_support(&args.provider, metadata.as_ref());
                 let client = client
                     .with_model_name(
                         &args.model,
                         metadata.as_ref().and_then(|model| model.name.as_deref()),
                     )
-                    .with_cache_retention(cache_retention(true))
+                    .with_cache_retention(cache_retention(supports_long))
                     .with_reasoning(level, mapped.flatten())?;
                 Self::Bedrock(client)
             }
@@ -751,7 +754,12 @@ mod bedrock_tests {
         const CHILD: &str = "PI_RS_BEDROCK_WORKBENCH_SUMMARY_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let mut args = super::super::Cli::try_parse_from(["pi", "--offline"]).unwrap();
-            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"models":[{"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"thinkingLevelMap":{"xhigh":"high"}}]}}})).unwrap();
+            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"compat":{"supportsLongCacheRetention":false},"models":[
+                {"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"thinkingLevelMap":{"xhigh":"high"}},
+                {"id":"anthropic.claude-sonnet-4-6","name":"Claude Sonnet 4.6","reasoning":true,"compat":{"supportsLongCacheRetention":true}},
+                {"id":"openai.gpt-5-test","reasoning":true,"thinkingLevelMap":{"off":"none"}},
+                {"id":"openai.gpt-5-null","reasoning":true,"thinkingLevelMap":{"off":null}}
+            ]}}})).unwrap();
             args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
             let request = |model: &str| ModelRequest {
                 model: model.into(),
@@ -784,6 +792,31 @@ mod bedrock_tests {
                 .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
                 .await
                 .unwrap();
+            for (model, level) in [
+                ("anthropic.claude-sonnet-4-6", "high"),
+                ("openai.gpt-5-test", "off"),
+                ("openai.gpt-5-null", "off"),
+            ] {
+                args.model = model.into();
+                args.thinking = Some(level.into());
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
+            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"compat":{"supportsLongCacheRetention":true},"models":[{"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"compat":{"supportsLongCacheRetention":false}}]}}})).unwrap();
+            args.model = "anthropic.claude-opus-4-8".into();
+            args.thinking = Some("high".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .await
+                .unwrap();
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -801,6 +834,7 @@ mod bedrock_tests {
             .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", format!("http://{addr}"))
             .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
             .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("PI_CACHE_RETENTION", "long")
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env_remove("AWS_BEARER_TOKEN_BEDROCK")
             .env_remove("AWS_SESSION_TOKEN")
@@ -809,7 +843,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..6 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -863,6 +897,23 @@ mod bedrock_tests {
         assert_eq!(
             requests[1]["additionalModelRequestFields"]["output_config"]["effort"],
             "high"
+        );
+        assert_eq!(
+            requests[1]["system"][1]["cachePoint"],
+            json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[2]["system"][1]["cachePoint"],
+            json!({"type":"default","ttl":"1h"})
+        );
+        assert_eq!(
+            requests[3]["additionalModelRequestFields"]["reasoning"]["effort"],
+            "none"
+        );
+        assert!(requests[4].get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            requests[5]["system"][1]["cachePoint"],
+            json!({"type":"default"})
         );
     }
 }

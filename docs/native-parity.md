@@ -3366,7 +3366,8 @@ bearer token. No AWS resources are created.
 Claude and GPT-family models support the Pi reasoning levels and configured
 thinking-level mappings. Claude uses adaptive thinking on the supported newer
 families and budgeted thinking on earlier models; GPT and GPT-OSS use their
-respective effort fields. The output limit supplied by the host remains a hard
+respective effort fields, including explicit mappings such as GPT `off` to
+`none`. The output limit supplied by the host remains a hard
 ceiling. Budgeted Claude thinking reserves at least 1,024 tokens for the answer
 and requires an output limit of at least 2,048; unlike Pi's simple API, this
 adapter does not increase the host's output budget automatically. Reasoning
@@ -3375,7 +3376,8 @@ options for other model families are not sent, matching Pi's Bedrock adapter.
 For supported Claude models, the provider adds default five-minute cache
 checkpoints after the system content and at the end of the final user message.
 Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
-support that TTL, or use `with_cache_retention` in the library. Set
+support that TTL; workbench model and provider compatibility can opt out of
+one-hour retention. Library callers can use `with_cache_retention`. Set
 `AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
 a supported model. Tool-free summaries disable checkpoints and reasoning so
 that their smaller output limit remains usable. Cache usage includes

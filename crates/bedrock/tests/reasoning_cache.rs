@@ -250,6 +250,25 @@ async fn gpt_mapping_summary_and_unsupported_cache_models() {
         json!({"reasoning":{"effort":"medium"}})
     );
     assert!(gpt["messages"][0]["content"][1].get("cachePoint").is_some());
+    let (off_mapped, _) = capture(
+        "us-east-1",
+        |c| c.with_reasoning(Some("off"), Some("none")).unwrap(),
+        request("openai.gpt-5", 1024),
+        false,
+    )
+    .await;
+    assert_eq!(
+        off_mapped["additionalModelRequestFields"]["reasoning"]["effort"],
+        "none"
+    );
+    let (off_unmapped, _) = capture(
+        "us-east-1",
+        |c| c.with_reasoning(Some("off"), None).unwrap(),
+        request("openai.gpt-5", 1024),
+        false,
+    )
+    .await;
+    assert!(off_unmapped.get("additionalModelRequestFields").is_none());
     let (summary, _) = capture(
         "us-east-1",
         |c| {

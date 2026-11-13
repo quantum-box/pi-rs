@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningLevel {
+    Off,
     Minimal,
     Low,
     Medium,
@@ -14,6 +15,7 @@ pub enum ReasoningLevel {
 impl ReasoningLevel {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
+            "off" => Ok(Self::Off),
             "minimal" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
@@ -27,6 +29,7 @@ impl ReasoningLevel {
     }
     fn budget(self) -> u32 {
         match self {
+            Self::Off => 0,
             Self::Minimal => 1024,
             Self::Low => 2048,
             Self::Medium => 8192,
@@ -35,6 +38,7 @@ impl ReasoningLevel {
     }
     fn gpt_effort(self) -> &'static str {
         match self {
+            Self::Off => "none",
             Self::Minimal | Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -44,6 +48,7 @@ impl ReasoningLevel {
     }
     fn oss_effort(self) -> &'static str {
         match self {
+            Self::Off => "none",
             Self::Minimal | Self::Low => "low",
             Self::Medium => "medium",
             _ => "high",
@@ -139,6 +144,9 @@ pub(crate) fn reasoning_fields(
     let Some(level) = level else { return Ok(None) };
     let items = candidates(model, name);
     if has_any(&items, &["claude"]) {
+        if level == ReasoningLevel::Off {
+            return Ok(None);
+        }
         let gov = region.is_some_and(|r| r.to_ascii_lowercase().starts_with("us-gov-"))
             || model.to_ascii_lowercase().starts_with("us-gov.")
             || model.to_ascii_lowercase().starts_with("arn:aws-us-gov:");
@@ -167,7 +175,7 @@ pub(crate) fn reasoning_fields(
                 "xhigh"
             } else {
                 match level {
-                    ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
+                    ReasoningLevel::Off | ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
                     ReasoningLevel::Medium => "medium",
                     _ => "high",
                 }
