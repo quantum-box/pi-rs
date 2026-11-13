@@ -7853,11 +7853,24 @@ mod tests {
         const CHILD: &str = "PI_RS_TEST_RESUME_PACKAGE_THEME_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let home = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "interactive::tests::resume_picker_loads_unprepared_local_package_without_installing", "--nocapture"])
                 .env("PI_RS_HOME", home.path())
+                .env("CARGO_NET_OFFLINE", "true")
                 .env(CHILD, "1")
-                .output().unwrap();
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("package preparation blocked past the deadline");
+            }
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "{}\n{}",
@@ -8115,6 +8128,83 @@ mod tests {
                 "{case} package was indexed"
             );
         }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            for name in ["pi-package.json", "Cargo.toml"] {
+                for kind in ["fifo", "broken-link"] {
+                    let invalid = home.join(format!("invalid-{name}-{kind}"));
+                    std::fs::create_dir_all(invalid.join("extensions")).unwrap();
+                    let unexpected = invalid.join("extensions/unexpected");
+                    std::fs::write(
+                        &unexpected,
+                        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let path = invalid.join(name);
+                    if kind == "fifo" {
+                        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    } else {
+                        symlink(invalid.join("missing"), &path).unwrap();
+                    }
+                    std::fs::write(
+                        home.join("settings.json"),
+                        serde_json::json!({"packages":[invalid]}).to_string(),
+                    )
+                    .unwrap();
+                    let before = std::fs::read(&index).unwrap();
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(super::super::packages::prepare(&args))
+                        .unwrap();
+                    assert!(!sentinel.exists(), "{name} {kind} executed an extension");
+                    assert_eq!(
+                        std::fs::read(&index).unwrap(),
+                        before,
+                        "{name} {kind} was indexed"
+                    );
+                }
+            }
+        }
+
+        // A regular Cargo manifest still follows the normal offline build path.
+        let valid_cargo = home.join("valid-cargo");
+        std::fs::create_dir_all(valid_cargo.join("src")).unwrap();
+        std::fs::create_dir_all(valid_cargo.join("palette")).unwrap();
+        std::fs::write(valid_cargo.join("Cargo.toml"), "[package]\nname='local-theme-fixture'\nversion='0.1.0'\nedition='2021'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        std::fs::write(valid_cargo.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        selected["name"] = serde_json::json!("prepared-cargo-theme");
+        std::fs::write(valid_cargo.join("palette/theme.json"), selected.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[valid_cargo]}).to_string(),
+        )
+        .unwrap();
+        args.offline = true;
+        args.use_theme = Some("prepared-cargo-theme".into());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&index)
+                .unwrap()
+                .contains("valid-cargo")
+        );
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "prepared-cargo-theme"
+        );
+        assert!(!sentinel.exists());
     }
 
     #[test]

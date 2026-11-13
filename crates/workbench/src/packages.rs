@@ -1012,9 +1012,16 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         installed_binaries.push(root.clone());
         root = root.parent().unwrap_or(Path::new(".")).into();
     }
-    let mut manifest = if root.join("pi-package.json").is_file() {
-        config::read_object(&root.join("pi-package.json"))?
-    } else if !root.join("Cargo.toml").is_file() {
+    // Check both files through the nonblocking descriptor reader before any
+    // executable discovery or Cargo invocation. A present but unusable file
+    // is an error, never an absent manifest that enables defaults.
+    let pi_bytes = read_optional_manifest(&root, "pi-package.json")?;
+    let cargo_bytes = read_optional_manifest(&root, "Cargo.toml")?;
+    let has_pi_manifest = pi_bytes.is_some();
+    let has_cargo_manifest = cargo_bytes.is_some();
+    let mut manifest = if let Some(bytes) = pi_bytes {
+        parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?
+    } else if !has_cargo_manifest {
         read_optional_pi_package_json(&root)?.unwrap_or_else(|| json!({}))
     } else {
         json!({})
@@ -1023,7 +1030,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if root.join("Cargo.toml").is_file() {
+    if has_cargo_manifest {
         let mut metadata = tokio::process::Command::new("cargo");
         metadata
             .args([
@@ -1045,7 +1052,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 })
             })
         }) {
-            if !root.join("pi-package.json").is_file() {
+            if !has_pi_manifest {
                 manifest = json!({"pi":package["metadata"]["pi"]});
             }
             version = package["version"].as_str().map(str::to_owned);
@@ -1836,31 +1843,33 @@ mod tests {
     fn manifest_replaced_with_fifo_after_probe_is_rejected() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().to_path_buf();
-        let path = root.join("package.json");
-        std::fs::write(&path, "{}").unwrap();
-        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let result = read_optional_manifest_after_probe(&root, "package.json", || {
-                std::fs::remove_file(root.join("package.json")).unwrap();
-                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for manifest_name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let path = root.join(manifest_name);
+            std::fs::write(&path, "{}").unwrap();
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = read_optional_manifest_after_probe(&root, manifest_name, || {
+                    std::fs::remove_file(root.join(manifest_name)).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                });
+                let _ = sender.send(result);
             });
-            let _ = sender.send(result);
-        });
-        let result = receiver.recv_timeout(Duration::from_secs(5));
-        if result.is_err() {
-            let _writer = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path);
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            if result.is_err() {
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path);
+            }
+            let error = result
+                .expect("replacement FIFO blocked manifest inspection")
+                .unwrap_err();
+            assert!(error.to_string().contains("regular file"), "{error}");
+            worker.join().unwrap();
         }
-        let error = result
-            .expect("replacement FIFO blocked manifest inspection")
-            .unwrap_err();
-        assert!(error.to_string().contains("regular file"), "{error}");
-        worker.join().unwrap();
     }
 
     #[cfg(unix)]
