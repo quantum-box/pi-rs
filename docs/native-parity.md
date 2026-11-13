@@ -3769,3 +3769,11 @@ order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching
 Pi's editor behavior. Focused editor tests cover both directions, multiline
 text, interrupted kills and yank cycling; other editor parity gaps remain open.
+
+### Session tree branch navigation checkpoint
+
+Tree fold and jump keys now follow visible branch segments rather than folding
+or stepping through every record. Filtered-out intermediate records attach to
+nearest visible ancestors for navigation; changing the search clears folds.
+Focused selector tests cover linear chains, branches, hidden records, search,
+and fold/unfold behavior. Other tree layout and navigation differences remain.

@@ -230,6 +230,14 @@ impl Picker {
         self.query
             .extend(text.chars().filter(|character| !character.is_control()));
         self.selected = 0;
+        self.unfold_tree_for_search();
+    }
+
+    fn unfold_tree_for_search(&mut self) {
+        if let Some(tree) = &mut self.tree {
+            tree.collapsed.clear();
+            tree.rebuild_visible();
+        }
     }
 
     /// Handle pointer input in the rendered selector body, with row zero at its title.
@@ -590,8 +598,7 @@ impl Picker {
                     return false;
                 }
                 if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
-                    && (!tree.passes_filter(*id)
-                        || (query.is_empty() && !tree.visible.contains(id)))
+                    && (!tree.passes_filter(*id) || !tree.visible.contains(id))
                 {
                     return false;
                 }
@@ -766,13 +773,15 @@ impl Picker {
             }
         }
         if self.session_action.is_none() && self.tree.is_some() {
-            let selected =
-                self.matches()
-                    .get(self.selected)
-                    .and_then(|item| match item.selection {
-                        Selection::Checkout(id) => Some(id),
-                        _ => None,
-                    });
+            let visible: Vec<u64> = self
+                .matches()
+                .iter()
+                .filter_map(|item| match item.selection {
+                    Selection::Checkout(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            let selected = visible.get(self.selected).copied();
             let tree = self.tree.as_mut().expect("tree picker");
             if keys.matches("app.tree.toggleLabelTimestamp", key) {
                 tree.show_label_timestamps = !tree.show_label_timestamps;
@@ -802,16 +811,26 @@ impl Picker {
                 }
                 if keys.matches("app.tree.foldOrUp", key) {
                     let tree = self.tree.as_mut().expect("tree picker");
-                    let target = if tree
-                        .children
-                        .get(&id)
-                        .is_some_and(|children| !children.is_empty())
-                        && tree.collapsed.insert(id)
-                    {
+                    let (parents, children) = tree.navigation_graph(&visible);
+                    let parent = parents.get(&id).copied().flatten();
+                    let foldable = children.get(&id).is_some_and(|list| !list.is_empty())
+                        && parent.is_none_or(|parent| {
+                            children.get(&parent).is_some_and(|list| list.len() > 1)
+                        });
+                    let target = if foldable && tree.collapsed.insert(id) {
                         tree.rebuild_visible();
                         id
                     } else {
-                        tree.parents.get(&id).copied().flatten().unwrap_or(id)
+                        let mut current = id;
+                        while let Some(parent) = parents.get(&current).copied().flatten() {
+                            if children.get(&parent).is_some_and(|list| list.len() > 1)
+                                && current != id
+                            {
+                                break;
+                            }
+                            current = parent;
+                        }
+                        current
                     };
                     self.focus_record(target);
                     return Input::Continue;
@@ -822,11 +841,17 @@ impl Picker {
                         tree.rebuild_visible();
                         id
                     } else {
-                        tree.children
-                            .get(&id)
-                            .and_then(|children| children.first())
-                            .copied()
-                            .unwrap_or(id)
+                        let (_, children) = tree.navigation_graph(&visible);
+                        let mut current = id;
+                        while let Some(list) =
+                            children.get(&current).filter(|list| !list.is_empty())
+                        {
+                            current = list[0];
+                            if list.len() > 1 {
+                                break;
+                            }
+                        }
+                        current
                     };
                     self.focus_record(target);
                     return Input::Continue;
@@ -888,6 +913,7 @@ impl Picker {
         if keys.matches("tui.editor.deleteCharBackward", key) {
             if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
                 self.query.truncate(index);
+                self.unfold_tree_for_search();
             }
             self.selected = 0;
             return Input::Continue;
@@ -895,6 +921,7 @@ impl Picker {
         if keys.matches("tui.editor.deleteWordBackward", key) {
             self.query.truncate(previous_word_start(&self.query));
             self.selected = 0;
+            self.unfold_tree_for_search();
             return Input::Continue;
         }
         match key.code {
@@ -907,6 +934,7 @@ impl Picker {
             {
                 self.query.push(character);
                 self.selected = 0;
+                self.unfold_tree_for_search();
             }
             _ => {}
         }
@@ -1378,6 +1406,32 @@ impl TreeState {
         tree.rebuild_visible();
         tree
     }
+    fn navigation_graph(
+        &self,
+        visible: &[u64],
+    ) -> (
+        std::collections::BTreeMap<u64, Option<u64>>,
+        std::collections::BTreeMap<u64, Vec<u64>>,
+    ) {
+        let ids: std::collections::BTreeSet<_> = visible.iter().copied().collect();
+        let mut parents = std::collections::BTreeMap::new();
+        let mut children = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+        for &id in visible {
+            let mut parent = self.parents.get(&id).copied().flatten();
+            while let Some(candidate) = parent {
+                if ids.contains(&candidate) {
+                    break;
+                }
+                parent = self.parents.get(&candidate).copied().flatten();
+            }
+            parents.insert(id, parent);
+            if let Some(parent) = parent {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        (parents, children)
+    }
+
     fn passes_filter(&self, id: u64) -> bool {
         let kind = self.kinds[&id];
         if kind == TreeEntryKind::Hidden {
@@ -1646,9 +1700,11 @@ mod tests {
         picker.focus_record(1);
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
         assert_eq!(picker.matches().len(), 1);
-        picker.query = "3".into();
+        picker.paste("3");
         assert_eq!(picker.matches()[0].label, "node 3");
         picker.query.clear();
+        picker.focus_record(1);
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
         picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
         assert_eq!(picker.matches().len(), 5);
         picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
@@ -1670,6 +1726,85 @@ mod tests {
         picker.query = "updated".into();
         assert!(
             matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
+        );
+    }
+
+    #[test]
+    fn tree_navigation_uses_visible_branch_segments() {
+        use TreeEntryKind::{Bookkeeping, Message};
+        let entries = [
+            (1, None, Message),
+            (2, Some(1), Bookkeeping),
+            (3, Some(2), Message),
+            (4, Some(3), Message),
+            (5, Some(4), Message),
+            (6, Some(3), Message),
+            (7, Some(6), Message),
+        ]
+        .into_iter()
+        .map(|(id, parent, kind)| (id, (parent, kind)))
+        .collect();
+        let items = (1..=7)
+            .map(|id| Item {
+                label: format!("node {id}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::tree(items, entries, Default::default(), 1, TreeFilter::Default);
+        let keys = Keys::default();
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        let selected = |picker: &Picker| match picker.matches()[picker.selected].selection {
+            Selection::Checkout(id) => id,
+            _ => unreachable!(),
+        };
+        picker.input(right, &keys);
+        assert_eq!(
+            selected(&picker),
+            4,
+            "down skips the single-child chain and enters the first branch"
+        );
+        picker.input(right, &keys);
+        assert_eq!(selected(&picker), 5);
+        picker.input(left, &keys);
+        assert_eq!(selected(&picker), 4);
+        picker.input(left, &keys);
+        assert_eq!(
+            picker.matches().len(),
+            5,
+            "a branch segment start folds its descendants"
+        );
+        picker.input(right, &keys);
+        assert_eq!(picker.matches().len(), 6);
+        picker.input(left, &keys);
+        picker.input(left, &keys);
+        assert_eq!(
+            selected(&picker),
+            1,
+            "up from a folded segment reaches the visible root"
+        );
+
+        picker.paste("node");
+        picker.focus_record(3);
+        picker.input(left, &keys);
+        assert_eq!(
+            selected(&picker),
+            1,
+            "a linear node is navigated instead of folded"
+        );
+        picker.focus_record(4);
+        picker.input(left, &keys);
+        assert!(
+            !picker
+                .matches()
+                .iter()
+                .any(|item| matches!(item.selection, Selection::Checkout(5))),
+            "folding also applies while searching"
+        );
+        picker.input(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE), &keys);
+        assert!(
+            picker.tree.as_ref().unwrap().collapsed.is_empty(),
+            "editing search clears folds"
         );
     }
 
