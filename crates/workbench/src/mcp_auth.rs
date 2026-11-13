@@ -512,21 +512,25 @@ impl CredentialStore for FileCredentials {
         &self,
     ) -> std::result::Result<Option<CredentialRefreshGuard>, AuthError> {
         let path = self.path.with_extension("lock");
-        let file = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
-                .map_err(|_| store_error())?;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(|_| store_error())?;
-            file.lock().map_err(|_| store_error())?;
-            Ok::<_, AuthError>(Arc::new(file))
-        })
-        .await
-        .map_err(|_| store_error())??;
+        std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
+            .map_err(|_| store_error())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| store_error())?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                }
+                Err(std::fs::TryLockError::Error(_)) => return Err(store_error()),
+            }
+        }
+        let file = Arc::new(file);
         *self.lease.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&file);
         Ok(Some(CredentialRefreshGuard::new(file)))
     }
@@ -1624,6 +1628,46 @@ mod tests {
         std::fs::write(&client.path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(client.read().unwrap().unwrap().registration.is_none());
         assert_eq!(client.load().await.unwrap().unwrap().client_id, "recovered");
+    }
+
+    #[test]
+    fn cancelled_refresh_guard_wait_does_not_delay_runtime_shutdown() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        std::fs::write(&path, b"unchanged").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        held.lock().unwrap();
+        let store = FileCredentials {
+            path: path.clone(),
+            generation: None,
+            new_login: false,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let waiting = tokio::spawn(async move { store.acquire_refresh_guard().await });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!waiting.is_finished());
+            waiting.abort();
+            let _ = waiting.await;
+        });
+        let started = Instant::now();
+        drop(runtime);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged");
+        held.unlock().unwrap();
     }
 
     #[tokio::test]

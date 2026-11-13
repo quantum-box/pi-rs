@@ -408,12 +408,36 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
     Ok(credential.access_token)
 }
 
+#[derive(Clone, Default)]
+pub(super) struct LogoutControl(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl LogoutControl {
+    // The same atomic transition arbitrates UI cancellation and revocation.
+    pub(super) fn cancel_before_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
 pub(super) async fn logout(settings: &super::config::Settings) -> Result<bool> {
+    logout_controlled(settings, LogoutControl::default()).await
+}
+
+pub(super) async fn logout_controlled(
+    settings: &super::config::Settings,
+    control: LogoutControl,
+) -> Result<bool> {
     let chat_lock = lock().await?;
     let http = client(settings);
     logout_with(
         super::config::agent_dir(),
         chat_lock,
+        control,
         move |credential| async move {
             match http {
                 Ok(client) => credential.revoke(&client).await,
@@ -439,9 +463,10 @@ impl Drop for LogoutCancellation {
 
 // Cancellation can interrupt lock acquisition. Once remote revocation begins,
 // finish local removal under both locks, even if the caller is cancelled.
-async fn logout_with<F, Fut>(
+pub(super) async fn logout_with<F, Fut>(
     directory: std::path::PathBuf,
     chat_lock: std::fs::File,
+    control: LogoutControl,
     revoke: F,
 ) -> Result<bool>
 where
@@ -455,7 +480,7 @@ where
     let Some(credential) = credential else {
         return Ok(false);
     };
-    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let state = control.0;
     let _cancellation = LogoutCancellation(state.clone());
     tokio::task::spawn_blocking(move || {
         use std::sync::atomic::Ordering;
@@ -528,6 +553,7 @@ mod tests {
         let task = tokio::spawn(logout_with(
             dir.path().to_owned(),
             chat_lock,
+            LogoutControl::default(),
             move |_| async move {
                 let _ = started_tx.send(());
                 Ok(())
@@ -571,6 +597,7 @@ mod tests {
         let task = tokio::spawn(logout_with(
             dir.path().to_owned(),
             chat_lock,
+            LogoutControl::default(),
             move |_| async move {
                 let _ = started_tx.send(());
                 Ok(())
@@ -616,6 +643,7 @@ mod tests {
                 let task = tokio::spawn(logout_with(
                     directory.clone(),
                     chat_lock,
+                    LogoutControl::default(),
                     move |_| async move {
                         started_tx.send(()).unwrap();
                         release_rx.await.unwrap();
@@ -662,9 +690,12 @@ mod tests {
         let lock = lock_path(dir.path().join("chatgpt-refresh.lock"))
             .await
             .unwrap();
-        let error = logout_with(dir.path().to_owned(), lock, |_| async {
-            Err(Error::Config("fixture failure".into()))
-        })
+        let error = logout_with(
+            dir.path().to_owned(),
+            lock,
+            LogoutControl::default(),
+            |_| async { Err(Error::Config("fixture failure".into())) },
+        )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("local credentials removed"));

@@ -519,6 +519,7 @@ struct RemoteTask {
     started: Instant,
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
     _cancel: tokio::sync::oneshot::Sender<()>,
+    logout_control: Option<super::chatgpt_auth::LogoutControl>,
 }
 
 impl RemoteTask {
@@ -558,7 +559,14 @@ impl RemoteTask {
             started: Instant::now(),
             receiver,
             _cancel: cancel,
+            logout_control: None,
         }
+    }
+
+    fn cancel_before_commit(&self) -> bool {
+        self.logout_control
+            .as_ref()
+            .is_none_or(|control| control.cancel_before_commit())
     }
 }
 
@@ -3852,10 +3860,7 @@ pub(super) async fn run(
                 Ok(RemoteEvent::RefreshModelKeys) => {
                     view.invalidate_model_catalog();
                     args.thinking_profile = None;
-                    match super::model_auth::Keys::load() {
-                        Ok(keys) => args.model_keys = keys,
-                        Err(error) => view.append(&error.to_string()),
-                    }
+                    auth_reload = Some(AuthReload::start(args.model_keys.revision().to_owned()));
                     dirty = true;
                 }
                 Ok(RemoteEvent::Finished(result)) => {
@@ -4167,12 +4172,9 @@ pub(super) async fn run(
                 if !mouse_activate && let Some(picker) = &mut view.picker {
                     picker.clear_mouse_press();
                 }
-                if let Some(task) = &view.remote_task {
+                if view.remote_task.is_some() {
                     if keys.action(key, true) == Some("app.interrupt") {
-                        let message = task.cancelled;
-                        view.remote_task = None;
-                        clear_openrouter_editor(&mut view);
-                        view.append(message);
+                        interrupt_remote_task(&mut view);
                         continue;
                     }
                     if view.local_editor.is_none() {
@@ -5354,13 +5356,17 @@ fn start_chatgpt_login(
     ));
 }
 
-fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
-    let settings = settings.clone();
-    view.remote_task = Some(RemoteTask::start(
+fn chatgpt_logout_task<F, Fut>(control: super::chatgpt_auth::LogoutControl, logout: F) -> RemoteTask
+where
+    F: FnOnce(super::chatgpt_auth::LogoutControl) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool>> + 'static,
+{
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
         "Signing out of ChatGPT",
         "ChatGPT sign-out cancelled",
         move |sender| async move {
-            let result = super::chatgpt_auth::logout(&settings).await;
+            let result = logout(task_control).await;
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             result.map(|removed| {
                 vec![
@@ -5373,7 +5379,31 @@ fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
                 ]
             })
         },
+    );
+    task.logout_control = Some(control);
+    task
+}
+
+fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(chatgpt_logout_task(
+        super::chatgpt_auth::LogoutControl::default(),
+        move |control| async move { super::chatgpt_auth::logout_controlled(&settings, control).await },
     ));
+}
+
+fn interrupt_remote_task(view: &mut View) {
+    let Some(task) = &view.remote_task else {
+        return;
+    };
+    if task.cancel_before_commit() {
+        let message = task.cancelled;
+        view.remote_task = None;
+        clear_openrouter_editor(view);
+        view.append(message);
+    } else {
+        view.append("ChatGPT sign-out is completing; waiting for the result");
+    }
 }
 
 fn clear_openrouter_editor(view: &mut View) {
@@ -6845,6 +6875,139 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    fn chatgpt_logout_fixture(directory: &std::path::Path) {
+        let credential = pi_rs::openai::oauth::Credential {
+            client_id: "client".into(),
+            subject: "subject".into(),
+            email: None,
+            id_token: "id".into(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            scopes: vec!["chatgpt.tokens.use.direct".into()],
+        };
+        std::fs::write(
+            directory.join("auth.json"),
+            serde_json::json!({"openai-chatgpt":{"type":"oauth","credential":credential}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("chatgpt-sessions.json"),
+            serde_json::json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn committed_chatgpt_logout_remains_observed_after_escape() {
+        for success in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            chatgpt_logout_fixture(directory.path());
+            let path = directory.path().to_owned();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path.join("chatgpt-refresh.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let control = super::super::chatgpt_auth::LogoutControl::default();
+            let task = super::chatgpt_logout_task(control, move |control| async move {
+                super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    if success {
+                        Ok(())
+                    } else {
+                        Err(pi_rs::Error::Config("fixture failure".into()))
+                    }
+                })
+                .await
+            });
+            let mut view = super::View {
+                remote_task: Some(task),
+                ..Default::default()
+            };
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            super::interrupt_remote_task(&mut view);
+            assert!(
+                view.remote_task.is_some(),
+                "committed logout must remain observed"
+            );
+            release_tx.send(()).unwrap();
+            let task = view.remote_task.take().unwrap();
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::RefreshModelKeys
+            ));
+            match task
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+            {
+                super::RemoteEvent::Finished(Ok(lines)) if success => {
+                    assert!(lines.iter().any(|line| line.contains("Signed out")))
+                }
+                super::RemoteEvent::Finished(Err(error)) if !success => assert!(
+                    error
+                        .to_string()
+                        .contains("remote revocation was not confirmed")
+                ),
+                _ => panic!("logout did not report its final result"),
+            }
+            let auth =
+                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+            assert!(auth.get("openai-chatgpt").is_none());
+        }
+    }
+
+    #[test]
+    fn uncommitted_chatgpt_logout_is_cancelled_by_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        chatgpt_logout_fixture(directory.path());
+        let path = directory.path().to_owned();
+        let shared = super::super::auth_lock::acquire(&path.join("auth.json")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.join("chatgpt-refresh.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let control = super::super::chatgpt_auth::LogoutControl::default();
+        let task = super::chatgpt_logout_task(control, move |control| async move {
+            super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
+                let _ = started_tx.send(());
+                Ok(())
+            })
+            .await
+        });
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        super::interrupt_remote_task(&mut view);
+        assert!(view.remote_task.is_none());
+        drop(shared);
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+        );
+        let auth = super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+        assert!(auth.get("openai-chatgpt").is_some());
+    }
+
     #[test]
     fn queued_escape_wins_over_ready_new_session() {
         use clap::Parser;

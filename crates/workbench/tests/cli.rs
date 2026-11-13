@@ -4627,17 +4627,55 @@ fn auth_check_reads_readonly_store_and_environment_keys() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_child_open_file(child: &mut std::process::Child, path: &std::path::Path) {
+    let path = std::fs::canonicalize(path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        #[cfg(target_os = "linux")]
+        let opened = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .ok()
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    std::fs::read_link(entry.path())
+                        .ok()
+                        .is_some_and(|target| target == path)
+                })
+            });
+        #[cfg(target_os = "macos")]
+        let opened = Command::new("/usr/sbin/lsof")
+            .args(["-Fn", "-p", &child.id().to_string()])
+            .output()
+            .ok()
+            .is_some_and(|output| {
+                let expected = format!("n{}", path.display());
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == expected)
+            });
+        if opened {
+            return;
+        }
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("child never opened lock file {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn cancelled_chatgpt_login_and_logout_do_not_wait_for_held_refresh_lock() {
     for action in ["login", "logout"] {
         let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("chatgpt-refresh.lock");
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.path().join("chatgpt-refresh.lock"))
+            .open(&lock_path)
             .unwrap();
         lock.lock().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
@@ -4647,7 +4685,7 @@ fn cancelled_chatgpt_login_and_logout_do_not_wait_for_held_refresh_lock() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        std::thread::sleep(Duration::from_secs(2));
+        wait_for_child_open_file(&mut child, &lock_path);
         assert!(child.try_wait().unwrap().is_none());
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -5153,4 +5191,63 @@ fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
             "refresh"
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancelled_mcp_logout_does_not_wait_for_held_refresh_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let name = "fixture";
+    let url = "http://127.0.0.1:8765/mcp";
+    std::fs::write(
+        root.path().join("mcp.json"),
+        json!({"mcpServers":{name:{"url":url,"oauth":true}}}).to_string(),
+    )
+    .unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&(name, url)).unwrap());
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let credentials = directory.join(format!("{digest:x}.json"));
+    let lock_path = credentials.with_extension("lock");
+    std::fs::write(&credentials, b"unchanged").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "logout", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_child_open_file(&mut child, &lock_path);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        status.is_some(),
+        "MCP logout did not cancel while the lock was held"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(credentials).unwrap(), b"unchanged");
 }
