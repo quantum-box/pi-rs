@@ -1591,6 +1591,97 @@ mod tests {
         );
         assert_eq!(state.data["value"], 1);
     }
+    #[test]
+    fn store_requires_string_keys_and_enforces_value_boundaries() {
+        let reply = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            const longKey = 'k'.repeat(1100);
+            text([
+                attempt(() => store(1, 'bad')),
+                attempt(() => load({})),
+                attempt(() => store('function', () => 1)),
+                attempt(() => store('maximum', 'x'.repeat(262142))),
+                attempt(() => store('too-big', 'x'.repeat(262143))),
+                attempt(() => store(longKey, 7)),
+                load(longKey)
+            ]);
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"["TypeError","TypeError","TypeError","ok","RangeError","ok",7]"#),
+            "{data}"
+        );
+        let state = reply.state.unwrap();
+        assert_eq!(state.data["k".repeat(1100)], 7);
+        assert!(state.data.get("1").is_none());
+        assert!(state.data.get("too-big").is_none());
+    }
+
+    #[test]
+    fn store_counts_special_keys_and_rolls_back_rejected_replacements() {
+        let reply = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            text([
+                attempt(() => store('__proto__', 'y'.repeat(262131))),
+                attempt(() => store('__proto__', 'y'.repeat(262130))),
+                attempt(() => store('z', 0)),
+                load('__proto__').length
+            ]);
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"["RangeError","ok","RangeError",262130]"#),
+            "{data}"
+        );
+        let state = reply.state.unwrap();
+        assert_eq!(state.data["__proto__"].as_str().unwrap().len(), 262130);
+        assert!(state.data.get("z").is_none());
+        let next = run(
+            "text(load('__proto__').length); store('a', 'small'); store('z', 0); store('__proto__', undefined);",
+            Some(&state),
+        );
+        assert!(next.outcome.tool_content().contains("262130"));
+        let next_state = next.state.unwrap();
+        assert_eq!(next_state.data["z"], 0);
+        assert!(next_state.data.get("__proto__").is_none());
+    }
+
+    #[test]
+    fn oversized_restored_store_can_be_reduced_one_key_at_a_time() {
+        let state = ExtensionState {
+            version: 1,
+            data: json!({
+                "a":"x".repeat(210000), "b":"x".repeat(210000), "c":"x".repeat(210000),
+                "d":"x".repeat(210000), "e":"x".repeat(210000), "f":"x".repeat(210000)
+            }),
+        };
+        let reply = run(
+            "store('a', undefined); store('b', undefined); return load('c').length",
+            Some(&state),
+        );
+        assert!(matches!(&reply.outcome, Outcome::Structured { .. }));
+        let next = reply.state.unwrap();
+        assert!(next.data.get("a").is_none());
+        assert!(next.data.get("b").is_none());
+        assert_eq!(next.data["c"].as_str().unwrap().len(), 210000);
+    }
     #[tokio::test]
     async fn output_limits_terminate_even_when_caught() {
         use std::sync::atomic::{AtomicUsize, Ordering};
