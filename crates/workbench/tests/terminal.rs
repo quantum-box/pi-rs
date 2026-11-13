@@ -1006,6 +1006,129 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
 }
 
 #[test]
+fn resume_picker_and_runtime_skip_malformed_theme_before_journal_update() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let sessions = root.path().join("sessions");
+    let seed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .args(["--session-id", "target", "name", "Resume Fixture"])
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let journal = sessions.join("target.jsonl");
+    let original = std::fs::read(&journal).unwrap();
+    let bad = root.path().join("broken.json");
+    let good = root.path().join("good.json");
+    std::fs::write(&bad, "not JSON").unwrap();
+    let mut theme: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+    theme["name"] = serde_json::json!("fixture-theme");
+    std::fs::write(&good, theme.to_string()).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = Process(
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-extensions",
+                "--tui-mode",
+                "fullscreen",
+                "--session-dir",
+            ])
+            .arg(&sessions)
+            .args([
+                "--resume",
+                "--name",
+                "Resumed Fixture",
+                "--use-theme",
+                "fixture-theme",
+                "--theme",
+            ])
+            .arg(&bad)
+            .arg("--theme")
+            .arg(&good)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Resume session"));
+    assert_eq!(std::fs::read(&journal).unwrap(), original);
+    master.write_all(b"Resume Fixture").unwrap();
+    output_until(&mut master, |text| text.contains("Resume Fixture"));
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/quit\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut buf = [0; 8192];
+        let _ = master.read(&mut buf);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success())
+    );
+    assert_eq!(
+        pi_rs::Session::open(&journal).unwrap().name(),
+        Some("Resumed Fixture")
+    );
+    assert!(std::fs::read(&journal).unwrap().starts_with(&original));
+}
+
+#[test]
 fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

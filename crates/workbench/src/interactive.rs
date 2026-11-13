@@ -1,7 +1,7 @@
 //! Terminal presentation over the same journaled CLI used by automation.
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::ui::{
@@ -3357,27 +3357,38 @@ fn slash(
     Ok(None)
 }
 
+// Resolve each theme independently: a malformed resource should not hide a
+// valid selected theme or prevent opening a session.
+fn load_resolved_theme(
+    name: &str,
+    paths: &[PathBuf],
+    workspace: &Path,
+    trusted: bool,
+) -> Result<Theme> {
+    let error = match Theme::load(name, &[], workspace, trusted, false) {
+        Ok(theme) => return Ok(theme),
+        Err(error) => error,
+    };
+    for path in paths {
+        if let Ok(theme) = Theme::load(name, std::slice::from_ref(path), workspace, trusted, false)
+        {
+            return Ok(theme);
+        }
+    }
+    Err(error)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
     let resources = super::resources::Resources::load(args)?;
-    let name = args.use_theme.as_deref().unwrap_or("system");
-    if let Ok(theme) = Theme::load(name, &[], &args.workspace, args.trusted, false) {
-        return Ok(theme);
-    }
-    // One bad theme should not hide a valid theme later in the resolved list.
-    for path in &resources.themes {
-        if let Ok(theme) = Theme::load(
-            name,
-            std::slice::from_ref(path),
-            &args.workspace,
-            args.trusted,
-            false,
-        ) {
-            return Ok(theme);
-        }
-    }
-    Ok(Theme::system())
+    Ok(load_resolved_theme(
+        args.use_theme.as_deref().unwrap_or("system"),
+        &resources.themes,
+        &args.workspace,
+        args.trusted,
+    )
+    .unwrap_or_else(|_| Theme::system()))
 }
 
 /// Run the startup session picker on the controlling terminal, leaving stdout
@@ -3506,19 +3517,19 @@ pub(super) async fn run(
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
     let mut deferred_theme_error = None;
-    let mut theme = match Theme::load(
+    let mut theme = match load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
         &args.theme_paths,
         &args.workspace,
         args.trusted,
-        false,
     ) {
         Ok(theme) => theme,
-        Err(error) if !initial_resources.extensions.is_empty() => {
-            deferred_theme_error = Some(error.to_string());
+        Err(error) => {
+            if !initial_resources.extensions.is_empty() {
+                deferred_theme_error = Some(error.to_string());
+            }
             Theme::system()
         }
-        Err(error) => return Err(error),
     };
     let mut view = View {
         async_transitions: true,
@@ -3881,12 +3892,11 @@ pub(super) async fn run(
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
                 if resources_changed && let Some(name) = args.use_theme.as_deref() {
-                    match Theme::load(
+                    match load_resolved_theme(
                         name,
                         &args.theme_paths,
                         &args.workspace,
                         args.trusted,
-                        false,
                     ) {
                         Ok(next) => {
                             theme = next;
