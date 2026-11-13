@@ -754,6 +754,7 @@ struct RemoteWriteTool {
 struct InjectedWriteGuard {
     _local: Option<std::fs::File>,
     _remote: Option<tokio::sync::OwnedMutexGuard<()>>,
+    local_target: Option<PathBuf>,
 }
 
 fn canonical_local_target(path: &Path) -> Result<PathBuf> {
@@ -790,6 +791,18 @@ fn canonical_local_target(path: &Path) -> Result<PathBuf> {
     }
 }
 
+#[cfg(test)]
+static LOCAL_LOCK_RESOLVED: std::sync::Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+fn notify_local_lock_resolved(path: &Path) {
+    if let Some((expected, sender)) = LOCAL_LOCK_RESOLVED.lock().unwrap().as_ref()
+        && expected == path
+    {
+        let _ = sender.send(());
+    }
+}
+
 async fn injected_write_lock(
     operations: &Arc<dyn WriteOperations>,
     path: &Path,
@@ -798,15 +811,19 @@ async fn injected_write_lock(
     if operations.uses_local_filesystem() {
         let path = path.to_owned();
         let token = cancellation.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            let path = canonical_local_target(&path)?;
-            mutation_lock(&path, &token)
+        let (file, target) = tokio::task::spawn_blocking(move || {
+            let target = canonical_local_target(&path)?;
+            #[cfg(test)]
+            notify_local_lock_resolved(&path);
+            let file = mutation_lock(&target, &token)?;
+            Ok::<_, Error>((file, target))
         })
         .await
         .map_err(|error| Error::Config(error.to_string()))??;
         Ok(InjectedWriteGuard {
             _local: Some(file),
             _remote: None,
+            local_target: Some(target),
         })
     } else {
         type Key = (usize, PathBuf);
@@ -839,6 +856,7 @@ async fn injected_write_lock(
         Ok(InjectedWriteGuard {
             _local: None,
             _remote: Some(guard),
+            local_target: None,
         })
     }
 }
@@ -862,10 +880,6 @@ impl Tool for RemoteWriteTool {
                 &self.tool.root,
                 &crate::coding_paths::normalize(&display)?,
             );
-            let parent = path
-                .parent()
-                .ok_or_else(|| Error::Config("file needs a parent".into()))?
-                .to_owned();
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();
             let operations = self.operations.clone();
@@ -874,9 +888,13 @@ impl Tool for RemoteWriteTool {
             let worker = tokio::spawn(async move {
                 let _lock = injected_write_lock(&operations, &path, &cancellation).await?;
                 check_mutation_cancelled(&cancellation)?;
-                operations.mkdir(&parent).await?;
+                let path = _lock.local_target.as_deref().unwrap_or(&path);
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| Error::Config("file needs a parent".into()))?;
+                operations.mkdir(parent).await?;
                 check_mutation_cancelled(&cancellation)?;
-                operations.write_file(&path, &content).await?;
+                operations.write_file(path, &content).await?;
                 check_mutation_cancelled(&cancellation)?;
                 Ok::<_, Error>(format!("Successfully wrote to {display}"))
             });
@@ -2366,6 +2384,48 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_injected_write_binds_target_before_waiting_for_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let alias = root.join("alias");
+        std::fs::write(&a, "before").unwrap();
+        std::fs::write(&b, "before").unwrap();
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let held = mutation_lock(&a, &pi_rs::CancellationToken::new()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
+        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"path":"alias", "content":"after"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("tool resolved its target");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&b, &alias).unwrap();
+        *LOCAL_LOCK_RESOLVED.lock().unwrap() = None;
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Succeeded(_)));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "before");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
