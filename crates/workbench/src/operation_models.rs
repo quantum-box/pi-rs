@@ -387,14 +387,23 @@ impl Catalogue {
                     })?
                 };
                 let mut headers = BTreeMap::new();
-                for (header, value) in inherited
+                let inherit_headers = !matches!(api, Api::WorkersAiSystemOne)
+                    || key_endpoint.as_ref() == Some(&endpoint);
+                for (inherited, header, value) in inherited
                     .into_iter()
-                    .chain(std::mem::take(&mut configured.headers))
+                    .map(|(header, value)| (true, header, value))
+                    .chain(
+                        std::mem::take(&mut configured.headers)
+                            .into_iter()
+                            .map(|(header, value)| (false, header, value)),
+                    )
                 {
                     let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                         Error::Config(format!("invalid operation provider header name for {name}"))
                     })?;
-                    headers.insert(header.as_str().to_owned(), value);
+                    if !inherited || inherit_headers {
+                        headers.insert(header.as_str().to_owned(), value);
+                    }
                 }
                 configured.headers = headers;
                 let inherited: Compat = if provider["compat"].is_null() {
@@ -1073,6 +1082,130 @@ mod tests {
                 .credential_with_env(&keys, |_| Some("ambient-secret".into()))
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn workers_ai_model_endpoint_override_does_not_receive_provider_headers() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for overridden in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, length) = loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < end + length {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body =
+                    r#"{"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}}}}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            let provider_base = format!("http://{address}/provider");
+            let model_base = if overridden {
+                format!("http://{address}/model")
+            } else {
+                format!("{provider_base}/")
+            };
+            let config = json!({"cloudflare-workers-ai":{
+                "baseUrl":provider_base, "apiKey":"provider-key",
+                "headers":{"X-Provider-Secret":"provider-value", "Authorization":"Bearer provider-secret", "x-shared":"provider"},
+                "models":[{"type":"classifier", "id":"fixture", "api":"cloudflare-workers-ai-system-one", "baseUrl":model_base,
+                    "headers":{"X-Model-Secret":"model-value", "X-Shared":"model"}}]
+            }});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == "cloudflare-workers-ai")
+                .unwrap();
+            let keys = Keys::parse(
+                &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"destination-key", "endpoint":entry.endpoint.as_str()}}),
+            );
+            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &keys, &mut json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("x-model-secret: model-value"));
+            assert!(headers.contains("x-shared: model"));
+            assert!(!headers.contains("x-shared: provider"));
+            assert_eq!(
+                headers.contains("x-provider-secret: provider-value"),
+                !overridden
+            );
+            if overridden {
+                assert!(headers.contains("authorization: bearer destination-key"));
+                assert!(!headers.contains("provider-secret"));
+                assert!(!headers.contains("provider-key"));
+            } else {
+                assert!(headers.contains("authorization: bearer provider-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn workers_ai_header_scope_does_not_change_other_apis() {
+        let config = json!({"relay":{"baseUrl":"https://provider.example/ai", "headers":{"X-Provider":"value"}, "models":[
+            {"type":"classifier", "id":"workers", "api":"cloudflare-workers-ai-system-one", "baseUrl":"https://other.example/ai", "headers":{"X-Model":"kept"}},
+            {"type":"classifier", "id":"system", "api":"typesafe-system-one", "baseUrl":"https://other.example/ai"}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let workers = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "workers")
+            .unwrap();
+        assert!(!workers.model.headers.contains_key("x-provider"));
+        assert_eq!(workers.model.headers["x-model"], "kept");
+        let system = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "system")
+            .unwrap();
+        assert_eq!(system.model.headers["x-provider"], "value");
     }
     #[test]
     fn workers_ai_classifier_honors_image_format_override() {
