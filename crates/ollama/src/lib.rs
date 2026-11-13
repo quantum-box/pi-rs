@@ -9,6 +9,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 mod compatibility;
 mod reasoning_details;
@@ -248,6 +249,14 @@ impl Ollama {
             provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
             model: model.to_owned(),
         }
+    }
+
+    fn has_ambiguous_legacy_replay(&self, request: &ModelRequest) -> bool {
+        let scope = format!(
+            "chat-completions+sha256:{:x}",
+            Sha256::digest(self.endpoint.as_str().as_bytes())
+        );
+        request.messages.iter().any(|message| matches!(message, Message::Assistant { replay: Some(replay), .. } if replay.identity.model == request.model && replay.identity.provider == scope))
     }
 
     fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
@@ -643,6 +652,7 @@ impl Model for Ollama {
             headers,
             "chat-completions-v1",
             self.endpoint.as_str(),
+            &self.provider,
             &self.token,
             format!("{:?}", self.compatibility),
             self.supports_reasoning,
@@ -715,7 +725,7 @@ impl Model for Ollama {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-        if request.messages.iter().any(|message| matches!(message, Message::Assistant { replay: Some(replay), .. } if replay.identity.provider.starts_with("chat-completions+sha256:"))) {
+        if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
         }
         let requested_model = request.model.clone();
@@ -1191,6 +1201,23 @@ mod content_tests {
         );
     }
     #[test]
+    fn context_identity_distinguishes_shared_gateway_providers() {
+        let first = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("first");
+        let same = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("first");
+        let other = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("other");
+        if let Some(identity) = first.context_identity() {
+            assert_eq!(Some(identity.clone()), same.context_identity());
+            assert_ne!(Some(identity), other.context_identity());
+        }
+    }
+
+    #[test]
     fn context_capacity_uses_matching_running_models_and_rejects_invalid_sizes() {
         let value = json!({"models": [
             {"name":"other:latest", "context_length": 1},
@@ -1269,7 +1296,10 @@ mod content_tests {
             calls: vec![],
             replay: Some(Box::new(ProviderReplay {
                 identity: ResolvedModelIdentity {
-                    provider: "chat-completions+sha256:old".into(),
+                    provider: format!(
+                        "chat-completions+sha256:{:x}",
+                        Sha256::digest(b"https://gateway.example/")
+                    ),
                     model: "m".into(),
                 },
                 blocks: vec![json!({"type":"reasoning_content","text":"secret"})],
@@ -1285,6 +1315,20 @@ mod content_tests {
             let model = Ollama::new("https://gateway.example", None)
                 .unwrap()
                 .with_provider(provider);
+            assert!(model.has_ambiguous_legacy_replay(&request));
+            let mut different_model = request.clone();
+            different_model.model = "other".into();
+            assert!(!model.has_ambiguous_legacy_replay(&different_model));
+            let encoded = model.compatible_message(
+                different_model.messages[0].clone(),
+                &model.replay_identity("other"),
+            );
+            assert_eq!(encoded[0]["content"], "answer");
+            assert!(!encoded[0].to_string().contains("secret"));
+            let other_endpoint = Ollama::new("https://other.example", None)
+                .unwrap()
+                .with_provider(provider);
+            assert!(!other_endpoint.has_ambiguous_legacy_replay(&request));
             let error = match model.stream(request.clone()).await {
                 Err(error) => error.to_string(),
                 Ok(_) => panic!("legacy replay must be rejected"),

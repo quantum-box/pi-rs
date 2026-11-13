@@ -23,6 +23,68 @@ use crate::{
     UsageReport,
 };
 
+// Provider replay may contain private thinking and opaque signatures. Hooks and
+// observers receive portable messages; only unchanged messages regain replay.
+fn portable_request(request: &ModelRequest) -> ModelRequest {
+    let mut portable = request.clone();
+    for message in &mut portable.messages {
+        if let Message::Assistant { replay, .. } = message {
+            *replay = None;
+        }
+    }
+    portable
+}
+
+fn restore_request_replay(original: &ModelRequest, updated: &mut ModelRequest) {
+    let same_model = original.model == updated.model;
+    let portable_messages = updated.messages.clone();
+    for (index, message) in updated.messages.iter_mut().enumerate() {
+        let Message::Assistant {
+            content,
+            calls,
+            replay,
+        } = message
+        else {
+            continue;
+        };
+        *replay = None;
+        if !same_model {
+            continue;
+        }
+        let matches = |candidate: &Message| matches!(candidate, Message::Assistant { content: text, calls: previous, .. } if text == content && previous == calls);
+        let source = original
+            .messages
+            .get(index)
+            .filter(|candidate| matches(candidate))
+            .or_else(|| {
+                if calls.is_empty() {
+                    return None;
+                }
+                let mut candidates = original
+                    .messages
+                    .iter()
+                    .filter(|candidate| matches(candidate));
+                let candidate = candidates.next()?;
+                if candidates.next().is_some()
+                    || portable_messages
+                        .iter()
+                        .filter(|candidate| matches(candidate))
+                        .count()
+                        != 1
+                {
+                    return None;
+                }
+                Some(candidate)
+            });
+        if let Some(Message::Assistant {
+            replay: previous, ..
+        }) = source
+        {
+            *replay = previous.clone();
+        }
+    }
+}
+
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
 pub struct AutoCompactionControl {
@@ -960,13 +1022,16 @@ impl Agent<'_> {
         };
         let original = request.clone();
         for extension in &self.registry.extensions {
+            let mut portable = portable_request(&request);
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut request, purpose, states.get(extension.id()))) =>
+                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut portable, purpose, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("request context hook timed out".into()))?,
             };
             hook(extension.as_ref(), result)?;
+            restore_request_replay(&request, &mut portable);
+            request = portable;
         }
         for extension in &self.registry.extensions {
             if !extension.handles_context_with_system() {
@@ -974,13 +1039,16 @@ impl Agent<'_> {
             }
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
+            let mut portable = portable_request(&request);
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut request.messages, states.get(extension.id()))) =>
+                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut portable.messages, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
             };
             hook(extension.as_ref(), result)?;
+            restore_request_replay(&request, &mut portable);
+            request = portable;
             if had_leading_system
                 && !matches!(request.messages.first(), Some(Message::System { .. }))
             {
@@ -1089,7 +1157,7 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        observer(Notification::Request(&request));
+        observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
         let mut content = String::new();
         let mut metadata = ModelMetadata::default();
@@ -4112,5 +4180,241 @@ mod queue_tests {
             crate::QueueMode::OneAtATime
         );
         assert_eq!(fork.queue_mode(InputKind::Steer), crate::QueueMode::All);
+    }
+}
+
+#[cfg(test)]
+mod request_privacy_tests {
+    use super::*;
+    use crate::{
+        Extension, ExtensionResult, ExtensionState, MemoryStore, ModelApi, ProviderReplay,
+        ResolvedModelIdentity,
+    };
+    use std::sync::Mutex;
+
+    struct Hook {
+        seen: Arc<Mutex<Vec<String>>>,
+        rewrite_before: bool,
+        rewrite_after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "privacy-test"
+        }
+        async fn before_request(
+            &self,
+            request: &mut ModelRequest,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&*request).unwrap());
+            if self.rewrite_before
+                && let Some(Message::Assistant { content, .. }) = request
+                    .messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(())
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut Vec<Message>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(messages).unwrap());
+            if self.rewrite_after
+                && let Some(Message::Assistant { content, .. }) = messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(())
+        }
+    }
+    struct CaptureModel(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for CaptureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    #[tokio::test]
+    async fn hooks_and_notifications_hide_edited_replay_and_restore_only_unchanged() {
+        for (rewrite_before, rewrite_after) in [(false, false), (true, false), (false, true)] {
+            let rewrite = rewrite_before || rewrite_after;
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "question".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        provider_api: Some(ModelApi::GoogleGenerativeAi),
+                        replay_identity: Some(ResolvedModelIdentity {
+                            provider: crate::endpoint_replay_scope("google", "https://example.com"),
+                            model: "m".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            let target = session
+                .append(Event::Assistant {
+                    content: "old".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap()
+                .id;
+            let replacement = serde_json::from_value(serde_json::json!([{"type":"thinking","thinking":"private-thinking","thinkingSignature":"private-signature"},{"type":"text","text":"visible"}])).unwrap();
+            session.edit_context(target, Some(replacement)).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(Hook {
+                    seen: seen.clone(),
+                    rewrite_before,
+                    rewrite_after,
+                }))
+                .unwrap();
+            let model = CaptureModel(captured.clone());
+            let agent = Agent {
+                model: &model,
+                model_name: "m",
+                registry: &registry,
+                system_prompt: "system",
+                limits: Limits::default(),
+            };
+            let cancel = CancellationToken::new();
+            let mut notifications = Vec::new();
+            let mut observer = |event: Notification<'_>| {
+                if let Notification::Request(request) = event {
+                    notifications.push(serde_json::to_string(request).unwrap());
+                }
+            };
+            let (request, transformed) = agent
+                .request(
+                    &mut session,
+                    &ExtensionStates::default(),
+                    128,
+                    None,
+                    RequestPurpose::Turn,
+                    &cancel,
+                    &mut observer,
+                )
+                .await
+                .unwrap();
+            assert_eq!(transformed, rewrite);
+            agent
+                .reply::<AgentInput>(
+                    &mut session,
+                    request,
+                    true,
+                    transformed,
+                    &cancel,
+                    &mut observer,
+                    None,
+                )
+                .await
+                .unwrap();
+            let hooks = seen.lock().unwrap();
+            assert_eq!(hooks.len(), 2);
+            for exposed in hooks.iter().chain(notifications.iter()) {
+                assert!(!exposed.contains("private-thinking"));
+                assert!(!exposed.contains("private-signature"));
+            }
+            assert_eq!(notifications.len(), 1);
+            let captured = captured.lock().unwrap();
+            let Message::Assistant {
+                content, replay, ..
+            } = captured[0]
+                .messages
+                .iter()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(content, if rewrite { "changed" } else { "visible" });
+            assert_eq!(replay.is_some(), !rewrite);
+            if let Some(replay) = replay {
+                assert!(
+                    serde_json::to_string(replay)
+                        .unwrap()
+                        .contains("private-signature")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_replay_is_not_injected_or_restored_after_model_change() {
+        let replay = Box::new(ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "p".into(),
+                model: "m".into(),
+            },
+            blocks: vec![serde_json::json!({"secret":"signature"})],
+        });
+        let original = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "text".into(),
+                calls: vec![],
+                replay: Some(replay.clone()),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let mut updated = portable_request(&original);
+        updated.model = "other".into();
+        if let Message::Assistant { replay: target, .. } = &mut updated.messages[0] {
+            *target = Some(replay);
+        }
+        restore_request_replay(&original, &mut updated);
+        assert!(matches!(
+            &updated.messages[0],
+            Message::Assistant { replay: None, .. }
+        ));
+        let mut without_replay = original.clone();
+        if let Message::Assistant { replay, .. } = &mut without_replay.messages[0] {
+            *replay = None;
+        }
+        let mut forged = original.clone();
+        restore_request_replay(&without_replay, &mut forged);
+        assert!(matches!(
+            &forged.messages[0],
+            Message::Assistant { replay: None, .. }
+        ));
     }
 }
