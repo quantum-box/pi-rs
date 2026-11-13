@@ -56,6 +56,23 @@ pub fn normalize<R: BufRead + Seek>(
     reader: ImageReader<R>,
     profile: ImageResizeProfile,
 ) -> Result<ModelImage> {
+    normalize_cancellable(reader, profile, None)
+}
+
+pub(super) fn check_cancelled(token: Option<&pi_rs::CancellationToken>) -> Result<()> {
+    if token.is_some_and(|token| token.is_cancelled()) {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn normalize_cancellable<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    profile: ImageResizeProfile,
+    token: Option<&pi_rs::CancellationToken>,
+) -> Result<ModelImage> {
+    check_cancelled(token)?;
     let format = reader
         .format()
         .ok_or_else(|| Error::Config("unknown image format".into()))?;
@@ -64,10 +81,11 @@ pub fn normalize<R: BufRead + Seek>(
         .into_inner()
         .take((MAX_IMAGE_SOURCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
+    check_cancelled(token)?;
     if bytes.len() > MAX_IMAGE_SOURCE_BYTES {
         return Err(Error::Config("image exceeds 20 MiB".into()));
     }
-    normalize_encoded(bytes, format, profile)
+    normalize_encoded(bytes, format, profile, token)
 }
 
 pub fn normalize_content(
@@ -84,7 +102,7 @@ pub fn normalize_content(
         .decode(content.data)
         .map_err(|_| Error::Config("invalid image data".into()))?;
     let format = image::guess_format(&bytes).map_err(image_error)?;
-    let prepared = normalize_encoded(bytes, format, profile)?;
+    let prepared = normalize_encoded(bytes, format, profile, None)?;
     Ok(ImageContent {
         data: encoding.encode(prepared.bytes),
         mime_type: prepared.mime_type.into(),
@@ -95,27 +113,34 @@ fn normalize_encoded(
     bytes: Vec<u8>,
     format: ImageFormat,
     profile: ImageResizeProfile,
+    token: Option<&pi_rs::CancellationToken>,
 ) -> Result<ModelImage> {
+    check_cancelled(token)?;
     let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().map_err(image_error)?;
     let orientation = decoder.orientation().map_err(image_error)?;
+    check_cancelled(token)?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(image_error)?;
+    check_cancelled(token)?;
     image.apply_orientation(orientation);
-    prepare(image, Some((bytes, format.to_mime_type())), profile)
+    check_cancelled(token)?;
+    prepare(image, Some((bytes, format.to_mime_type())), profile, token)
 }
 
 pub fn prepare_pixels(image: DynamicImage, profile: ImageResizeProfile) -> Result<ModelImage> {
-    prepare(image, None, profile)
+    prepare(image, None, profile, None)
 }
 
 fn prepare(
     original: DynamicImage,
     encoded: Option<(Vec<u8>, &'static str)>,
     profile: ImageResizeProfile,
+    token: Option<&pi_rs::CancellationToken>,
 ) -> Result<ModelImage> {
+    check_cancelled(token)?;
     if !profile.valid() {
         return Err(Error::Config("invalid model image resize profile".into()));
     }
@@ -147,6 +172,7 @@ fn prepare(
     let mut target = (source.0.min(max_width), source.1.min(max_height));
     let qualities = [profile.jpeg_quality.unwrap_or(80), 85, 70, 55, 40];
     loop {
+        check_cancelled(token)?;
         let resized = if target == source {
             std::borrow::Cow::Borrowed(&original)
         } else {
@@ -156,13 +182,16 @@ fn prepare(
                 image::imageops::FilterType::Lanczos3,
             ))
         };
+        check_cancelled(token)?;
         let output = (resized.width(), resized.height());
         let mut png = Vec::new();
         resized
             .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
             .map_err(image_error)?;
+        check_cancelled(token)?;
         let has_alpha =
             resized.color().has_alpha() && resized.pixels().any(|(_, _, pixel)| pixel[3] != 255);
+        check_cancelled(token)?;
         if has_alpha {
             if fits(&png) {
                 return Ok(ModelImage {
@@ -174,7 +203,9 @@ fn prepare(
             }
         } else {
             let rgb = resized.to_rgb8();
+            check_cancelled(token)?;
             for (index, &quality) in qualities.iter().enumerate() {
+                check_cancelled(token)?;
                 if index > 0 && quality == qualities[0] {
                     continue;
                 }
@@ -182,6 +213,7 @@ fn prepare(
                 JpegEncoder::new_with_quality(&mut jpeg, quality)
                     .encode_image(&rgb)
                     .map_err(image_error)?;
+                check_cancelled(token)?;
                 if index == 0 && fits(&png) && png.len() <= jpeg.len() {
                     return Ok(ModelImage {
                         bytes: png,
@@ -211,4 +243,45 @@ fn prepare(
 
 fn image_error(error: image::ImageError) -> Error {
     Error::Config(format!("cannot prepare model image: {error}"))
+}
+
+#[cfg(test)]
+mod cancellation_phase_tests {
+    use super::*;
+    struct CancelOnEof {
+        inner: Cursor<Vec<u8>>,
+        token: pi_rs::CancellationToken,
+    }
+    impl Read for CancelOnEof {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            if count == 0 {
+                self.token.cancel();
+            }
+            Ok(count)
+        }
+    }
+    impl Seek for CancelOnEof {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+    #[test]
+    fn cancellation_after_fetch_stops_before_decode_and_resize() {
+        let token = pi_rs::CancellationToken::new();
+        let source = CancelOnEof {
+            inner: Cursor::new(vec![1, 2, 3]),
+            token: token.clone(),
+        };
+        let reader = ImageReader::with_format(std::io::BufReader::new(source), ImageFormat::Png);
+        assert!(matches!(
+            normalize_cancellable(reader, ImageResizeProfile::default(), Some(&token)),
+            Err(Error::Cancelled)
+        ));
+        let image = DynamicImage::new_rgb8(1, 1);
+        assert!(matches!(
+            prepare(image, None, ImageResizeProfile::default(), Some(&token)),
+            Err(Error::Cancelled)
+        ));
+    }
 }

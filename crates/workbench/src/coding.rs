@@ -1,7 +1,7 @@
 //! Local coding tools. Hosted callers opt into their own execution profile.
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,6 +27,7 @@ pub struct CodingTools {
     auto_resize_images: bool,
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
     model_supports_images: Option<bool>,
+    read_operations: Option<Arc<dyn ReadOperations>>,
 }
 
 impl CodingTools {
@@ -42,6 +43,7 @@ impl CodingTools {
             auto_resize_images: true,
             image_profile: None,
             model_supports_images: None,
+            read_operations: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -50,6 +52,19 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    /// Replace model-facing read operations in the unrestricted local Pi profile.
+    /// A remote backend controls its own access policy; scoped profiles cannot use it
+    /// because local canonicalization cannot establish remote symlink boundaries.
+    pub fn with_read_operations(mut self, operations: Arc<dyn ReadOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom read operations require the unrestricted profile".into(),
+            ));
+        }
+        self.read_operations = Some(operations);
+        Ok(self)
+    }
+
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
         self.shell = shell;
         self
@@ -382,14 +397,268 @@ impl Extension for CodingTools {
         kinds
             .into_iter()
             .map(|kind| {
-                Arc::new(CodingTool {
+                let tool = CodingTool {
                     root: self.root.clone(),
                     unrestricted: self.unrestricted,
                     shell: self.shell.clone(),
                     kind,
-                }) as Arc<dyn Tool>
+                };
+                if matches!(kind, Kind::Read { .. })
+                    && let Some(operations) = &self.read_operations
+                {
+                    Arc::new(RemoteReadTool {
+                        tool,
+                        operations: operations.clone(),
+                    }) as Arc<dyn Tool>
+                } else {
+                    Arc::new(tool) as Arc<dyn Tool>
+                }
             })
             .collect()
+    }
+}
+
+/// File operations for an unrestricted model-facing read tool. Paths are absolute
+/// and normalized relative to the configured working directory. Implementations
+/// are responsible for enforcing any remote access policy and for cancelling work
+/// when their futures are dropped.
+/// A seekable blocking reader consumed on the blocking worker pool.
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+#[async_trait::async_trait]
+pub trait ReadOperations: Send + Sync {
+    /// Return `Error::Io` with `NotFound` to allow filename fallback probing.
+    /// Other errors stop resolution immediately.
+    async fn access(&self, path: &Path) -> Result<()>;
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    /// Optionally provide a seekable reader so large files need not be buffered
+    /// in memory. Reader methods run on a blocking worker and must return in
+    /// bounded time; cancellation is observed between reads. When absent,
+    /// `read_file` is used.
+    async fn open_file(&self, _path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        Ok(None)
+    }
+    async fn detect_image_mime_type(&self, _path: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Local implementation of the read operations interface.
+pub struct LocalReadOperations;
+
+// Inspect before and after opening, and use nonblocking open on Unix so a
+// replacement with a FIFO cannot strand a worker between those checks.
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+async fn open_local_read_file(path: &Path) -> Result<std::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || open_regular_file(&path))
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+}
+#[async_trait::async_trait]
+impl ReadOperations for LocalReadOperations {
+    async fn access(&self, path: &Path) -> Result<()> {
+        open_local_read_file(path).await?;
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let file = open_local_read_file(path).await?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+    async fn open_file(&self, path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        Ok(Some(Box::new(open_local_read_file(path).await?)))
+    }
+    async fn detect_image_mime_type(&self, path: &Path) -> Result<Option<String>> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let file = open_regular_file(&path)?;
+            let reader =
+                image::ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()?;
+            Ok(reader
+                .format()
+                .map(|format| format.to_mime_type().to_owned()))
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+    }
+}
+
+/// Construct a model-facing read tool backed by custom operations. This factory
+/// uses Pi's unrestricted path semantics; the backend owns access enforcement.
+pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteReadTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        },
+        operations,
+    }))
+}
+
+struct RemoteReadTool {
+    tool: CodingTool,
+    operations: Arc<dyn ReadOperations>,
+}
+
+// A blocking read cannot be interrupted in progress, but no further backend
+// reads or seeks should begin after cancellation.
+struct CancellableReader<R> {
+    inner: R,
+    cancellation: pi_rs::CancellationToken,
+}
+impl<R> CancellableReader<R> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            // Interrupted would cause read_to_end to retry indefinitely.
+            Err(std::io::Error::other("operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(buffer)
+    }
+}
+impl<R: Seek> Seek for CancellableReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(position)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteReadTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let cancellation = context.cancellation.child_token();
+        let _guard = cancellation.clone().drop_guard();
+        let operation = async {
+            let name = string(&args, "path")?.to_owned();
+            let input = crate::coding_paths::normalize(&name)?;
+            let requested = crate::coding_paths::resolve(&self.tool.root, &input);
+            let mut candidates = crate::coding_paths::read_candidates(&requested).into_iter();
+            let mut path = candidates.next().expect("exact candidate");
+            loop {
+                match self.operations.access(&path).await {
+                    Ok(()) => break,
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(next) = candidates.next() {
+                            path = next;
+                        } else {
+                            return Err(Error::Io(error));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let mime = self.operations.detect_image_mime_type(&path).await?;
+            let source: Box<dyn ReadSeek> = match self.operations.open_file(&path).await? {
+                Some(reader) => reader,
+                None => Box::new(Cursor::new(self.operations.read_file(&path).await?)),
+            };
+            let tool = self.tool.clone();
+            let token = cancellation.clone();
+            tokio::task::spawn_blocking(move || -> Result<Outcome> {
+                if token.is_cancelled() { return Err(Error::Cancelled); }
+                if let Some(mime) = mime {
+                    let mut source = CancellableReader { inner: source, cancellation: token.clone() };
+                    if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
+                    source.seek(SeekFrom::Start(0))?;
+                    let format = image::ImageFormat::from_mime_type(&mime)
+                        .ok_or_else(|| Error::Config(format!("unsupported image MIME type: {mime}")))?;
+                    let reader = image::ImageReader::with_format(std::io::BufReader::new(source), format);
+                    let mut data = tool.process_image(&path, reader, format, Some(&token))?;
+                    if matches!(tool.kind, Kind::Read { model_supports_images: Some(false), .. })
+                        && let Some(note) = data["content"][0]["text"].as_str() {
+                        data["content"][0]["text"] = json!(format!("{note}\n[Current model does not support images. The image will be omitted from this request.]"));
+                    }
+                    Ok(Outcome::Structured { data, attachments: vec![] })
+                } else {
+                    let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1)).unwrap_or(usize::MAX);
+                    let limit = args["limit"].as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    crate::text_page::read_from(std::io::BufReader::new(source), &name, offset, limit, &token)
+                }
+            }).await.map_err(|error| Error::Config(error.to_string()))?
+        };
+        let result = tokio::select! { biased; _ = cancellation.cancelled() => Err(Error::Cancelled), result = operation => result };
+        match result {
+            Ok(outcome) => outcome,
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        _: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        match self.invoke(args, context).await {
+            Outcome::Structured { data, attachments } => {
+                let mut image = data["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.iter().find(|b| b["type"] == "image"))
+                    .cloned()
+                    .unwrap_or_else(|| data.clone());
+                if image["type"] == "image" {
+                    image["note"] = json!(
+                        data["content"]
+                            .as_array()
+                            .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+                            .unwrap_or_default()
+                    );
+                }
+                Outcome::Structured {
+                    data: image,
+                    attachments,
+                }
+                .into()
+            }
+            outcome => outcome.into(),
+        }
     }
 }
 
@@ -722,6 +991,17 @@ impl CodingTool {
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
+        self.process_image(path, reader, format, None).map(Some)
+    }
+
+    fn process_image<R: std::io::BufRead + std::io::Seek>(
+        &self,
+        path: &Path,
+        reader: image::ImageReader<R>,
+        format: image::ImageFormat,
+        cancellation: Option<&pi_rs::CancellationToken>,
+    ) -> Result<Value> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if self.unrestricted
             && let Kind::Read {
                 auto_resize: true,
@@ -730,7 +1010,12 @@ impl CodingTool {
             } = self.kind
         {
             let original_mime = format.to_mime_type();
-            let prepared = crate::image_profile::normalize(reader, profile.unwrap_or_default())?;
+            let prepared = crate::image_profile::normalize_cancellable(
+                reader,
+                profile.unwrap_or_default(),
+                cancellation,
+            )?;
+            crate::image_profile::check_cancelled(cancellation)?;
             let mut note = format!("Read image file [{}]", prepared.mime_type);
             if !matches!(
                 original_mime,
@@ -754,10 +1039,10 @@ impl CodingTool {
                     prepared.source.0, prepared.source.1, prepared.output.0, prepared.output.1
                 ));
             }
-            return Ok(Some(json!({"content":[
+            return Ok(json!({"content":[
                 {"type":"text", "text":note},
                 {"type":"image", "mimeType":prepared.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(prepared.bytes)}
-            ]})));
+            ]}));
         }
         let (bytes, mime_type, source, output) = if matches!(
             self.kind,
@@ -778,6 +1063,7 @@ impl CodingTool {
                 .into_inner()
                 .take((MAX_ORIGINAL_IMAGE_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)?;
+            crate::image_profile::check_cancelled(cancellation)?;
             if bytes.len() > MAX_ORIGINAL_IMAGE_BYTES {
                 return Err(Error::Config(
                     "image exceeds the 6 MiB original image limit".into(),
@@ -786,13 +1072,15 @@ impl CodingTool {
             let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
                 .into_dimensions()
                 .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+            crate::image_profile::check_cancelled(cancellation)?;
             (bytes, mime_type, dimensions, dimensions)
         } else if let Kind::Read {
             profile: Some(profile),
             ..
         } = self.kind
         {
-            let prepared = crate::image_profile::normalize(reader, profile)?;
+            let prepared =
+                crate::image_profile::normalize_cancellable(reader, profile, cancellation)?;
             (
                 prepared.bytes,
                 prepared.mime_type,
@@ -808,6 +1096,7 @@ impl CodingTool {
                 (prepared.width, prepared.height),
             )
         };
+        crate::image_profile::check_cancelled(cancellation)?;
         let note = if self.unrestricted {
             format!("Read image file [{mime_type}]")
         } else {
@@ -820,10 +1109,10 @@ impl CodingTool {
                 output.1
             )
         };
-        Ok(Some(json!({"content":[
+        Ok(json!({"content":[
             {"type":"text","text":note},
             {"type":"image","mimeType":mime_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}
-        ]})))
+        ]}))
     }
 
     fn read(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
