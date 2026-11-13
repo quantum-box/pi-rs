@@ -358,6 +358,79 @@ impl Drop for Terminal {
     }
 }
 
+// On Windows, Crossterm may execute commands through the console API instead of
+// writing escape sequences. Keep the writer live there so its flush before a
+// console API call also flushes all preceding text.
+struct FrameWriter<W: Write> {
+    output: W,
+    buffer: Option<Vec<u8>>,
+    armed: bool,
+}
+
+fn synchronized_updates_supported() -> bool {
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+impl<W: Write> FrameWriter<W> {
+    fn new(output: W, buffered: bool, synchronized: bool) -> std::io::Result<Self> {
+        let mut frame = Self {
+            output,
+            buffer: buffered.then(Vec::new),
+            armed: synchronized,
+        };
+        if synchronized {
+            queue!(frame, BeginSynchronizedUpdate)?;
+        }
+        Ok(frame)
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if self.armed {
+            queue!(self, EndSynchronizedUpdate)?;
+        }
+        if let Some(buffer) = self.buffer.take() {
+            self.output.write_all(&buffer)?;
+        }
+        self.output.flush()?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for FrameWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match &mut self.buffer {
+            Some(buffer) => buffer.write(bytes),
+            None => self.output.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.buffer {
+            Some(buffer) => buffer.flush(),
+            None => self.output.flush(),
+        }
+    }
+}
+
+impl<W: Write> Drop for FrameWriter<W> {
+    fn drop(&mut self) {
+        if self.armed {
+            // A partial write may already have enabled synchronized updates.
+            // Preserve the original error and make a best-effort recovery.
+            let _ = queue!(self.output, EndSynchronizedUpdate);
+            let _ = self.output.flush();
+        }
+    }
+}
+
 #[derive(PartialEq)]
 struct RegularLayout {
     width: usize,
@@ -1956,8 +2029,12 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
-        let mut out = Vec::new();
-        queue!(out, BeginSynchronizedUpdate)?;
+        let stdout = std::io::stdout();
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         let elapsed = self
             .request_started
             .map(|start| start.elapsed())
@@ -2112,10 +2189,7 @@ impl View {
                 queue!(out, Show)?;
             }
         }
-        queue!(out, EndSynchronizedUpdate)?;
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&out)?;
-        stdout.flush()?;
+        out.finish()?;
         Ok(())
     }
     fn finish_regular(&mut self) -> Result<()> {
@@ -2371,8 +2445,12 @@ impl View {
                 && !modal
                 && rows_to_match > 0
                 && (!committing || pending().take(rows_to_match).count() < rows_to_match));
-        let mut out = Vec::new();
-        queue!(out, BeginSynchronizedUpdate)?;
+        let stdout = std::io::stdout();
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         if redraw {
             self.graphics.clear_placements(&mut out)?;
             queue!(
@@ -2517,10 +2595,7 @@ impl View {
             queue!(out, Hide)?;
         }
         self.regular.started = true;
-        queue!(out, EndSynchronizedUpdate)?;
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&out)?;
-        stdout.flush()?;
+        out.finish()?;
         Ok(())
     }
 }
@@ -6997,6 +7072,95 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_frame_flushes_text_before_console_side_effects() {
+        use std::io::Write;
+        let output = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut frame = super::FrameWriter::new(Sink(output.clone()), false, true).unwrap();
+        write!(frame, "preceding text").unwrap();
+        // Crossterm flushes the writer immediately before a WinAPI command.
+        frame.flush().unwrap();
+        assert!(output.borrow().ends_with(b"preceding text"));
+        frame.finish().unwrap();
+        assert!(output.borrow().ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn frame_without_ansi_never_emits_synchronization_sequences() {
+        use std::io::Write;
+        let mut output = Vec::new();
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "first").unwrap();
+            frame.flush().unwrap();
+            write!(frame, "second").unwrap();
+            frame.finish().unwrap();
+        }
+        assert_eq!(output, b"firstsecond");
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "aborted").unwrap();
+        }
+        assert_eq!(output, b"firstsecondaborted");
+    }
+
+    #[test]
+    fn failed_frame_write_attempts_to_end_synchronized_update() {
+        use std::io::Write;
+        for buffered in [false, true] {
+            let output = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            struct FailOnce {
+                output: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+                remaining: usize,
+                failed: bool,
+            }
+            impl Write for FailOnce {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    if self.remaining == 0 && !self.failed {
+                        self.failed = true;
+                        return Err(std::io::Error::other("injected write failure"));
+                    }
+                    let count = if self.failed {
+                        bytes.len()
+                    } else {
+                        bytes.len().min(self.remaining)
+                    };
+                    self.output.borrow_mut().extend_from_slice(&bytes[..count]);
+                    self.remaining = self.remaining.saturating_sub(count);
+                    Ok(count)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut frame = super::FrameWriter::new(
+                FailOnce {
+                    output: output.clone(),
+                    remaining: 10,
+                    failed: false,
+                },
+                buffered,
+                true,
+            )
+            .unwrap();
+            let result = write!(frame, "some frame content").and_then(|()| frame.finish());
+            assert!(result.is_err());
+            let bytes = output.borrow();
+            assert!(bytes.starts_with(b"\x1b[?2026h"));
+            assert!(bytes.ends_with(b"\x1b[?2026l"));
+        }
+    }
+
     #[test]
     fn cancelled_logout_reload_keeps_removed_key_unavailable() {
         let directory = tempfile::tempdir().unwrap();
