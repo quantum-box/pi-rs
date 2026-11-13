@@ -1165,18 +1165,23 @@ impl AgentSession {
         }
     }
     pub fn compact(&mut self, compaction: Compaction) -> Result<()> {
-        self.ensure_open()?;
-        let events = self.events.as_ref().expect("open session").clone();
-        let agent = Agent {
-            model: self.model.as_ref(),
-            model_name: &self.model_name,
-            registry: &self.registry,
-            system_prompt: &self.system_prompt,
-            limits: self.limits.clone(),
-        };
-        agent.compact(&mut self.session, compaction, &mut |event| {
-            self.control.observe(&event);
-            emit(&events, &event)
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            Error::Config(format!("could not start compaction runtime: {error}"))
+                        })?;
+                    let result = runtime.block_on(self.compact_with_hooks(compaction));
+                    // A timed-out extension may have spawned blocking work that
+                    // cannot be cancelled. Do not wait forever for it at shutdown.
+                    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+                    result
+                })
+                .join()
+                .map_err(|_| Error::Config("compaction worker panicked".into()))?
         })
     }
     /// Compact a supplied summary while servicing asynchronous extension host calls.
@@ -2603,6 +2608,89 @@ mod tests {
             "{texts:?}"
         );
         assert!(session.journal().pending_custom_trigger().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_sdk_compact_services_reentrant_hooks_and_trigger() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(Arc::new(CompactionHookMessages))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        session
+            .compact(Compaction {
+                summary: "supplied".into(),
+                keep_turns: 0,
+            })
+            .unwrap();
+        assert!(session.journal().pending_custom_trigger().is_none());
+        let snapshots = requests.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let texts: Vec<_> = snapshots[1]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.ends_with(&["compact trigger", "compact next"]),
+            "{texts:?}"
+        );
+    }
+
+    struct NeverReturningCompaction(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Extension for NeverReturningCompaction {
+        fn id(&self) -> &str {
+            "never-returning-compaction"
+        }
+        async fn before_compaction_with_host(
+            &self,
+            _: &mut Compaction,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            let released = self.0.clone();
+            tokio::task::spawn_blocking(move || {
+                while !released.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            });
+            std::future::pending().await
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_compaction_times_out_unresponsive_hook() {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = released.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            watchdog.store(true, Ordering::SeqCst);
+        });
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .limits(Limits {
+                tool_timeout: std::time::Duration::from_millis(30),
+                ..Limits::default()
+            })
+            .extension(Arc::new(NeverReturningCompaction(released.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let started = std::time::Instant::now();
+        let error = session
+            .compact(Compaction {
+                summary: "summary".into(),
+                keep_turns: 0,
+            })
+            .unwrap_err();
+        released.store(true, Ordering::SeqCst);
+        assert!(error.to_string().contains("compaction hook timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     struct CompactionLifecycleMessage;

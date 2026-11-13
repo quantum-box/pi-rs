@@ -2848,10 +2848,16 @@ even when the latter were queued earlier. The native scheduler follows that
 order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
-Host calls also remain unavailable in idle `SessionControl` input hooks and
-caller-supplied synchronous `compact()` operations. Model-generated summary
-compaction and the asynchronous `compact_with_hooks()` SDK alternative run
-host-aware before/after hooks, and async `session_compact` and
+Host calls also remain unavailable in idle `SessionControl` input hooks.
+Model-generated summary compaction, synchronous SDK `compact()`, and the
+asynchronous `compact_with_hooks()` SDK alternative run host-aware before/after
+hooks. Synchronous SDK `compact()` blocks its caller while a separate runtime
+services those hooks and triggered turns; callbacks that need work scheduled on
+the caller's blocked executor should use `compact_with_hooks()` instead. Legacy
+synchronous compaction hooks keep their signatures but execute on that worker
+thread when called through SDK `compact()`. Cooperative asynchronous hooks are
+bounded by the tool timeout; a legacy hook that blocks its worker thread cannot
+be preempted. Async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
