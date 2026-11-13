@@ -1287,6 +1287,7 @@ fn main() {
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
+    pi_rs_workbench::mcp_refresh::finish_refreshes();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(code);

@@ -123,7 +123,11 @@ impl Keys {
     }
 
     pub async fn load_async() -> Result<Self> {
-        let value = config::read_auth_object(&config::agent_dir().join("auth.json")).await?;
+        Self::load_path_async(&config::agent_dir().join("auth.json")).await
+    }
+
+    pub(super) async fn load_path_async(path: &std::path::Path) -> Result<Self> {
+        let value = config::read_auth_object(path).await?;
         Ok(Self::parse(&value))
     }
 
@@ -219,6 +223,15 @@ impl Keys {
 
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    pub(super) fn forget(&mut self, provider: &str) {
+        if self.entries.remove(provider).is_some() {
+            self.revision = format!(
+                "{:x}",
+                Sha256::digest(format!("{}:{provider}", self.revision))
+            );
+        }
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
@@ -394,6 +407,30 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_forgets_key_before_a_reload_can_be_cancelled() {
+        let endpoint = Provider::named("openrouter").unwrap().default_endpoint();
+        let mut keys = Keys::parse(&json!({
+            "openrouter": {"type":"oauth", "access":"old", "endpoint":endpoint},
+            "other": {"type":"api_key", "key":"keep", "endpoint":"https://example.test"}
+        }));
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_some()
+        );
+        let old_revision = keys.revision().to_owned();
+        keys.forget("openrouter");
+        assert_ne!(keys.revision(), old_revision);
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_none()
+        );
+        assert!(
+            keys.operation_credential("other", "https://example.test", false)
+                .is_some()
+        );
+    }
 
     #[test]
     fn saved_operation_endpoint_ignores_trailing_slashes_only() {

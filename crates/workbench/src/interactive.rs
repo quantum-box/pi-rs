@@ -436,6 +436,7 @@ struct PendingThinking {
 enum RemoteEvent {
     Notice(String),
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
 }
@@ -447,6 +448,10 @@ struct AuthReload {
 }
 impl AuthReload {
     fn start(revision: String) -> Self {
+        Self::start_path(revision, crate::config::agent_dir().join("auth.json"))
+    }
+
+    fn start_path(revision: String, path: PathBuf) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -458,7 +463,7 @@ impl AuthReload {
                     tokio::select! {
                         biased;
                         _ = cancelled => Ok(None),
-                        result = super::model_auth::Keys::load_async() => result.map(Some),
+                        result = super::model_auth::Keys::load_path_async(&path) => result.map(Some),
                     }
                 })
             })();
@@ -3857,6 +3862,11 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::ForgetModelKey(provider)) => {
+                    args.model_keys.forget(provider);
+                    view.invalidate_model_catalog();
+                    dirty = true;
+                }
                 Ok(RemoteEvent::RefreshModelKeys) => {
                     view.invalidate_model_catalog();
                     args.thinking_profile = None;
@@ -5156,7 +5166,8 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys = super::model_auth::Keys::load()?;
+    args.model_keys.forget(provider.id());
+    view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
         if removed {
@@ -5285,6 +5296,7 @@ fn start_kimi_logout(view: &mut View) {
         "Kimi Code logout cancelled",
         move |sender| async move {
             let removed = super::kimi_auth::logout().await?;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("kimi-coding"));
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             Ok(vec![
                 if removed {
@@ -5367,6 +5379,7 @@ where
         "ChatGPT sign-out cancelled",
         move |sender| async move {
             let result = logout(task_control).await;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("openai-chatgpt"));
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             result.map(|removed| {
                 vec![
@@ -6875,6 +6888,38 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_logout_reload_keeps_removed_key_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = super::super::auth_lock::acquire(&path).unwrap();
+        let endpoint = super::super::Provider::named("openrouter")
+            .unwrap()
+            .default_endpoint();
+        let mut keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "openrouter": {"type":"oauth", "access":"old", "endpoint":endpoint}
+        }));
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_some()
+        );
+        keys.forget("openrouter");
+        let reload = super::AuthReload::start_path(keys.revision().to_owned(), path);
+        assert!(
+            reload
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        drop(reload);
+        drop(held);
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_none()
+        );
+    }
+
     fn chatgpt_logout_fixture(directory: &std::path::Path) {
         let credential = pi_rs::openai::oauth::Credential {
             client_id: "client".into(),
@@ -6942,6 +6987,12 @@ mod tests {
             );
             release_tx.send(()).unwrap();
             let task = view.remote_task.take().unwrap();
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::ForgetModelKey("openai-chatgpt")
+            ));
             assert!(matches!(
                 task.receiver
                     .recv_timeout(std::time::Duration::from_secs(3))

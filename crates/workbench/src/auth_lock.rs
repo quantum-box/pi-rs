@@ -12,19 +12,71 @@ const WAIT: Duration = Duration::from_secs(30);
 const STALE: Duration = Duration::from_secs(30);
 
 #[cfg(unix)]
-fn same_dir(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+type Identity = std::fs::Metadata;
+#[cfg(unix)]
+fn identity(path: &Path) -> std::io::Result<Identity> {
+    std::fs::metadata(path)
+}
+#[cfg(unix)]
+fn same_dir(a: &Identity, b: &Identity) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
 }
-#[cfg(not(unix))]
-fn same_dir(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+#[cfg(windows)]
+struct Identity {
+    // Keep the handle open so Windows cannot reuse its identity while held.
+    _handle: std::fs::File,
+    volume: u64,
+    id: [u8; 16],
+}
+#[cfg(windows)]
+fn identity(path: &Path) -> std::io::Result<Identity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let handle = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = FILE_ID_INFO::default();
+    // The handle is valid and info is a writable buffer of the specified size.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle() as _,
+            FileIdInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Identity {
+        _handle: handle,
+        volume: info.VolumeSerialNumber,
+        id: info.FileId.Identifier,
+    })
+}
+#[cfg(windows)]
+fn same_dir(a: &Identity, b: &Identity) -> bool {
+    a.volume == b.volume && a.id == b.id
+}
+#[cfg(not(any(unix, windows)))]
+type Identity = std::fs::Metadata;
+#[cfg(not(any(unix, windows)))]
+fn identity(path: &Path) -> std::io::Result<Identity> {
+    std::fs::metadata(path)
+}
+#[cfg(not(any(unix, windows)))]
+fn same_dir(a: &Identity, b: &Identity) -> bool {
     a.created()
         .ok()
         .zip(b.created().ok())
         .is_some_and(|(a, b)| a == b)
 }
-fn owns(path: &Path, identity: &std::fs::Metadata) -> bool {
-    std::fs::metadata(path).is_ok_and(|current| same_dir(identity, &current))
+fn owns(path: &Path, held: &Identity) -> bool {
+    identity(path).is_ok_and(|current| same_dir(held, &current))
 }
 fn busy() -> Error {
     Error::Config("auth.json lock is busy or compromised".into())
@@ -32,7 +84,7 @@ fn busy() -> Error {
 
 pub(super) struct Guard {
     path: PathBuf,
-    identity: std::fs::Metadata,
+    identity: Arc<Identity>,
     compromised: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -66,8 +118,8 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
     let lock_path = PathBuf::from(name);
     match std::fs::create_dir(&lock_path) {
         Ok(()) => {
-            let identity = std::fs::metadata(&lock_path)?;
-            let thread_identity = std::fs::metadata(&lock_path)?;
+            let identity = Arc::new(identity(&lock_path)?);
+            let thread_identity = identity.clone();
             let thread_path = lock_path.clone();
             let compromised = Arc::new(AtomicBool::new(false));
             let flag = compromised.clone();
@@ -156,6 +208,46 @@ mod tests {
         let lock = dir.path().join("auth.json.lock");
         std::fs::rename(&lock, dir.path().join("old-lock")).unwrap();
         std::fs::create_dir(&lock).unwrap();
+        // Windows can assign equal creation times to different directories.
+        // Force that collision so the test cannot pass using timestamps as identity.
+        #[cfg(windows)]
+        {
+            use std::os::windows::{
+                fs::{MetadataExt, OpenOptionsExt},
+                io::AsRawHandle,
+            };
+            use windows_sys::Win32::{
+                Foundation::FILETIME,
+                Storage::FileSystem::{
+                    FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, SetFileTime,
+                },
+            };
+            let created = std::fs::metadata(dir.path().join("old-lock"))
+                .unwrap()
+                .creation_time();
+            let time = FILETIME {
+                dwLowDateTime: created as u32,
+                dwHighDateTime: (created >> 32) as u32,
+            };
+            let replacement = std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&lock)
+                .unwrap();
+            // Both the handle and the FILETIME pointer remain valid for this call.
+            assert_ne!(
+                unsafe {
+                    SetFileTime(
+                        replacement.as_raw_handle() as _,
+                        &time,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            assert_eq!(std::fs::metadata(&lock).unwrap().creation_time(), created);
+        }
         assert!(first.check().is_err());
         drop(first);
         assert!(lock.exists());
