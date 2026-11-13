@@ -224,7 +224,14 @@ impl Tool for ScriptTool {
         })
         .await
         .unwrap_or_else(|error| Err(format!("Codemode worker failed: {error}")));
+        let limit_exceeded = sink.lock().expect("codemode output").limit_exceeded;
         let (success, changed, store, error) = match result {
+            _ if limit_exceeded => (
+                false,
+                false,
+                json!({}),
+                Some("Script output limit exceeded".into()),
+            ),
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
         };
@@ -395,9 +402,10 @@ async fn evaluate(
             .collect(),
     );
     let code = format!("__run(async () => {{\n{source}\n}})");
+    let output_cancellation = context.cancellation.clone();
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            install_globals(&ctx, documents, host, store, sink)?;
+            install_globals(&ctx, documents, host, store, sink, output_cancellation)?;
             match ctx.eval::<Promise, _>(code) {
                 Ok(promise) => promise.into_future::<String>().await,
                 Err(error) => Err(error),
@@ -440,6 +448,7 @@ fn install_globals(
     host: Arc<dyn ToolHost>,
     store: Value,
     sink: Arc<Mutex<Output>>,
+    cancellation: pi_rs_core::CancellationToken,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let catalogue: Vec<_> = documents
@@ -452,14 +461,18 @@ fn install_globals(
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
     let model_usage = sink.clone();
+    let tool_output = sink.clone();
+    let output_cancel = cancellation.clone();
+    let model_cancel = cancellation.clone();
     globals.set(
         "__emit",
         Func::from(move |kind: String, value: String| {
-            sink.lock()
-                .expect("codemode output")
-                .emit(&kind, value)
-                .err()
-                .unwrap_or_default()
+            let mut output = sink.lock().expect("codemode output");
+            let error = output.emit(&kind, value).err().unwrap_or_default();
+            if output.limit_exceeded {
+                output_cancel.cancel();
+            }
+            error
         }),
     )?;
     let model_host = host.clone();
@@ -474,11 +487,20 @@ fn install_globals(
             let model_host = model_host.clone();
             let slots = model_slots.clone();
             let model_usage = model_usage.clone();
+            let cancellation = model_cancel.clone();
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
                         let _permit = slots.acquire().await.expect("model operation slots");
-                        let outcome = model_host.call(MODEL_OPERATION, args).await;
+                        if model_usage.lock().expect("codemode output").limit_exceeded {
+                            return Ok::<_, rquickjs::Error>(
+                                json!({"ok":false,"error":"Script output limit exceeded"})
+                                    .to_string(),
+                            );
+                        }
+                        let outcome = model_host
+                            .call_with_cancellation(MODEL_OPERATION, args, cancellation)
+                            .await;
                         if let Some(usage) = ModelUsage::from_outcome(&outcome) {
                             model_usage
                                 .lock()
@@ -500,7 +522,14 @@ fn install_globals(
         "__call_tool",
         Func::from(Async(move |name: String, arguments: String| {
             let host = host.clone();
+            let output = tool_output.clone();
+            let cancellation = cancellation.clone();
             async move {
+                if output.lock().expect("codemode output").limit_exceeded {
+                    return Ok::<_, rquickjs::Error>(
+                        json!({"ok":false,"error":"Script output limit exceeded"}).to_string(),
+                    );
+                }
                 let result = match serde_json::from_str(&arguments) {
                     Ok(_)
                         if matches!(
@@ -510,7 +539,10 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => tool_value(host.call(&name, arguments).await),
+                    Ok(arguments) => tool_value(
+                        host.call_with_cancellation(&name, arguments, cancellation)
+                            .await,
+                    ),
                     Err(error) => json!({"ok":false,"error":error.to_string()}),
                 };
                 Ok::<_, rquickjs::Error>(result.to_string())
@@ -668,6 +700,7 @@ struct Output {
     console: Vec<String>,
     bytes: usize,
     calls: usize,
+    limit_exceeded: bool,
     model_usage: ModelUsage,
     saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
@@ -684,6 +717,7 @@ impl Output {
         self.calls += 1;
         self.bytes = self.bytes.saturating_add(value.len());
         if self.calls > MAX_ITEMS || self.bytes > MAX_OUTPUT {
+            self.limit_exceeded = true;
             return Err("Script output limit exceeded".into());
         }
         match kind {
@@ -901,6 +935,9 @@ mod tests {
         struct ErrorHost(bool);
         #[async_trait::async_trait]
         impl ToolHost for ErrorHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
             fn tools(&self) -> Vec<ToolSpec> {
                 vec![ToolSpec {
                     name: "broken".into(),
@@ -951,6 +988,9 @@ mod tests {
         struct PatchedHost;
         #[async_trait::async_trait]
         impl ToolHost for PatchedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
             fn tools(&self) -> Vec<ToolSpec> {
                 ["recovered", "failed"]
                     .into_iter()
@@ -991,6 +1031,9 @@ mod tests {
     struct Host;
     #[async_trait::async_trait]
     impl ToolHost for Host {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
         fn tools(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: "echo".into(),
@@ -1105,6 +1148,9 @@ mod tests {
     struct StartedHost(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl ToolHost for StartedHost {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
         fn tools(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: "started".into(),
@@ -1255,6 +1301,148 @@ mod tests {
             matches!(&reply.outcome, Outcome::Failed(message) if message.contains("partial output") && message.contains("fixture failure"))
         );
         assert_eq!(state.data["value"], 1);
+    }
+    #[tokio::test]
+    async fn output_limits_terminate_even_when_caught() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CountingHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["side_effect", MODEL_OPERATION]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(String::new())
+            }
+        }
+        for (overflow, after, calls_before) in [
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "await tools.side_effect({})",
+                0,
+            ),
+            (
+                "text('')",
+                "await models.getModelsOfType('image')",
+                MAX_ITEMS,
+            ),
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "while (true) {}",
+                0,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let code = format!(
+                "store('uncommitted', true); try {{ {overflow}; }} catch (_) {{}} {after}; store('later', true);"
+            );
+            let sink = Arc::new(Mutex::new(Output {
+                calls: calls_before,
+                ..Output::default()
+            }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                evaluate(
+                    &code,
+                    json!({}),
+                    Arc::new(CountingHost(calls.clone())),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    sink.clone(),
+                ),
+            )
+            .await
+            .expect("output limit must stop the worker");
+            assert!(result.is_err());
+            assert!(sink.lock().unwrap().limit_exceeded);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        let reply = ScriptTool { timeout: None }
+            .invoke_transaction(
+                json!({"code":"store('uncommitted', true); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) { exit(); }"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() },
+                None,
+                Arc::new(Host),
+            )
+            .await;
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(reply.state.is_none());
+    }
+    #[tokio::test]
+    async fn output_breach_cancels_tokens_of_already_queued_calls() {
+        struct QueuedHost {
+            tokens: Mutex<Vec<pi_rs_core::CancellationToken>>,
+            changed: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for QueuedHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["hold", "write", "ready"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("codemode must pass its invocation cancellation token")
+            }
+            async fn call_with_cancellation(
+                &self,
+                name: &str,
+                _: Value,
+                cancellation: pi_rs_core::CancellationToken,
+            ) -> Outcome {
+                if name == "ready" {
+                    loop {
+                        let notified = self.changed.notified();
+                        if self.tokens.lock().unwrap().len() == 2 {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    return Outcome::Succeeded("queued".into());
+                }
+                self.tokens.lock().unwrap().push(cancellation.clone());
+                self.changed.notify_one();
+                cancellation.cancelled().await;
+                Outcome::Skipped("cancelled".into())
+            }
+        }
+        let host = Arc::new(QueuedHost {
+            tokens: Mutex::new(vec![]),
+            changed: tokio::sync::Notify::new(),
+        });
+        let parent = pi_rs_core::CancellationToken::new();
+        let reply = tokio::time::timeout(Duration::from_secs(10), ScriptTool { timeout: None }.invoke_transaction(
+            json!({"code":"tools.hold({}); tools.write({}); await tools.ready({}); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) {}"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: parent.clone() }, None, host.clone(),
+        )).await.expect("script stalled before output breach");
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(!parent.is_cancelled());
+        let tokens = host.tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| token.is_cancelled()));
     }
     #[test]
     fn deadline_interrupts_busy_loops_and_unresolved_promises() {
@@ -1606,6 +1794,256 @@ mod tests {
             .unwrap();
         assert_eq!(result, "done");
         assert_eq!(session.journal().unwrap().operations().len(), 3);
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn output_breach_skips_queued_write_and_returns_tool_failure_to_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct QueueTool {
+            name: &'static str,
+            writes: Arc<AtomicUsize>,
+            prepared: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for QueueTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+                if self.name == "hold" {
+                    self.prepared.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                Ok(arguments)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("done".into())
+            }
+        }
+        struct QueueExtension(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl Extension for QueueExtension {
+            fn id(&self) -> &str {
+                "queue-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["hold", "write"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(QueueTool {
+                            name,
+                            writes: self.0.clone(),
+                            prepared: self.1.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct QueueModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for QueueModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(
+                        content.contains("Script output limit exceeded"),
+                        "{content}"
+                    );
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete { calls: vec![ToolCall {
+                        id:"script".into(), name:"codemode".into(),
+                        arguments: json!({"code":"tools.hold({}); tools.write({}); await Promise.resolve(); text('x'.repeat(16 * 1024 * 1024 + 1));"}).to_string(),
+                    }], usage: None })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let writes = Arc::new(AtomicUsize::new(0));
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(QueueModel), "fixture")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .extension(Arc::new(QueueExtension(writes.clone(), prepared.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), session.prompt("test"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(prepared.load(Ordering::SeqCst), 1);
+        let operations = session.journal().unwrap().operations();
+        assert!(
+            operations
+                .iter()
+                .any(|(invocation, state)| invocation.call.name == "write"
+                    && matches!(
+                        state,
+                        pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                    ))
+        );
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_nested_read_batch_retires_prepared_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct BatchTool {
+            name: &'static str,
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for BatchTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            fn execution(&self) -> pi_rs_core::ToolExecution {
+                if self.name == "batch" {
+                    pi_rs_core::ToolExecution::Sequential
+                } else {
+                    pi_rs_core::ToolExecution::ParallelRead
+                }
+            }
+            async fn prepare_arguments(&self, args: Value) -> ExtensionResult<Value> {
+                if self.name == "slow_read" {
+                    self.slow_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(args)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("unexpected".into())
+            }
+            async fn invoke_with_host(
+                &self,
+                _: Value,
+                context: ToolContext,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> Outcome {
+                if self.name != "batch" {
+                    return self.invoke(json!({}), context).await;
+                }
+                let pending = tokio::spawn(async move {
+                    host.call_batch(vec![
+                        ("fast_read".into(), json!({})),
+                        ("slow_read".into(), json!({})),
+                    ])
+                    .await
+                });
+                self.slow_started.notified().await;
+                context.cancellation.cancel();
+                let _ = pending.await;
+                Outcome::Failed("batch cancelled".into())
+            }
+        }
+        struct BatchExtension {
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Extension for BatchExtension {
+            fn id(&self) -> &str {
+                "batch-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["batch", "fast_read", "slow_read"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(BatchTool {
+                            name,
+                            slow_started: self.slow_started.clone(),
+                            calls: self.calls.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct BatchModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for BatchModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(content.contains("batch cancelled"), "{content}");
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete {
+                        calls: vec![ToolCall {
+                            id: "batch".into(),
+                            name: "batch".into(),
+                            arguments: "{}".into(),
+                        }],
+                        usage: None,
+                    })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(BatchModel), "fixture")
+            .extension(Arc::new(BatchExtension {
+                slow_started: Arc::new(tokio::sync::Notify::new()),
+                calls: calls.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), session.prompt("test"))
+            .await
+            .expect("cancelled batch stranded scheduler")
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let operations = session.journal().unwrap().operations();
+        for name in ["fast_read", "slow_read"] {
+            assert!(
+                operations
+                    .iter()
+                    .any(|(invocation, state)| invocation.call.name == name
+                        && matches!(
+                            state,
+                            pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                        ))
+            );
+        }
         session.close().await.unwrap();
     }
     #[test]
