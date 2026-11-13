@@ -166,6 +166,7 @@ async fn cancelled_inflight_write_retains_lock_until_backend_settles() {
     });
     let tool = create_write_tool(root.path(), backend.clone()).unwrap();
     let first_tool = tool.clone();
+    let tool = create_write_tool(root.path(), backend.clone()).unwrap();
     let first = tokio::spawn(async move {
         first_tool
             .invoke(
@@ -234,4 +235,110 @@ async fn cancellation_during_mkdir_prevents_write_after_it_settles() {
     backend.release.notify_one();
     assert!(matches!(task.await.unwrap(), Outcome::Failed(text) if text.contains("aborted")));
     assert_eq!(backend.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn distinct_remote_backends_do_not_share_a_path_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let slow = Arc::new(Blocking {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        calls: Mutex::new(vec![]),
+    });
+    let fast = Arc::new(Remote::default());
+    let first_tool = create_write_tool(root.path(), slow.clone()).unwrap();
+    let second_tool = create_write_tool(root.path(), fast.clone()).unwrap();
+    let first = tokio::spawn(async move {
+        first_tool
+            .invoke(
+                json!({"path":"same", "content":"first"}),
+                context(CancellationToken::new()),
+            )
+            .await
+    });
+    slow.started.notified().await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        second_tool.invoke(
+            json!({"path":"same", "content":"second"}),
+            context(CancellationToken::new()),
+        ),
+    )
+    .await;
+    slow.release.notify_one();
+    assert!(
+        matches!(second, Ok(Outcome::Succeeded(_))),
+        "unrelated backend should not wait"
+    );
+    assert!(matches!(first.await.unwrap(), Outcome::Succeeded(_)));
+}
+
+#[cfg(unix)]
+struct BlockingLocal {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl WriteOperations for BlockingLocal {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
+    async fn mkdir(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        self.started.notify_one();
+        self.release.notified().await;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn local_alias_write_serializes_with_real_path_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("real.txt");
+    std::fs::write(&target, "before").unwrap();
+    std::os::unix::fs::symlink(&target, root.path().join("alias.txt")).unwrap();
+    let backend = Arc::new(BlockingLocal {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let write = create_write_tool(root.path(), backend.clone()).unwrap();
+    let extension = CodingTools::local(root.path()).unwrap();
+    let edit = extension
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "edit")
+        .unwrap();
+    let first = tokio::spawn(async move {
+        write
+            .invoke(
+                json!({"path":"alias.txt", "content":"written"}),
+                context(CancellationToken::new()),
+            )
+            .await
+    });
+    backend.started.notified().await;
+    let second = tokio::spawn(async move {
+        edit.invoke(
+            json!({"path":"real.txt", "edits":[{"oldText":"written", "newText":"edited"}]}),
+            context(CancellationToken::new()),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let finished_early = second.is_finished();
+    backend.release.notify_one();
+    assert!(!finished_early, "edit must wait for the alias write");
+    assert!(matches!(first.await.unwrap(), Outcome::Succeeded(_)));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap(),
+        Outcome::SucceededWithDetails { .. }
+    ));
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "edited");
 }

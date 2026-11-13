@@ -479,8 +479,10 @@ Native hosts can inject async `WriteOperations` through
 `CodingTools::local(...).with_write_operations(...)` or create a standalone
 model-facing write tool with `create_write_tool`. The backend creates parent
 directories and writes content; the host validates model arguments and keeps a
-per-path mutation lock until each in-flight backend operation settles, even
-when the caller drops its future. Cancellation is observed between operations.
+mutation lock until each in-flight backend operation settles, even when the
+caller drops its future. Local filesystem adapters use the canonical path and
+share the local edit lock; remote locks are scoped to the backend instance and
+path within this process. Cancellation is observed between operations.
 The backend is responsible for its access policy and must not return before its
 write has settled. Scoped profiles reject custom operations because local path
 checks cannot verify remote symlinks. `LocalWriteOperations` is a basic Pi-style

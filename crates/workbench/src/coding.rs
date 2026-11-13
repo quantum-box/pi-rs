@@ -689,6 +689,11 @@ impl Tool for RemoteReadTool {
 /// can be observed after an in-flight operation completes.
 #[async_trait::async_trait]
 pub trait WriteOperations: Send + Sync {
+    /// Return true only when paths address this host's local filesystem. This
+    /// makes writes share the canonicalized cross-process lock used by local edits.
+    fn uses_local_filesystem(&self) -> bool {
+        false
+    }
     async fn mkdir(&self, directory: &Path) -> Result<()>;
     async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
 }
@@ -698,6 +703,9 @@ pub struct LocalWriteOperations;
 
 #[async_trait::async_trait]
 impl WriteOperations for LocalWriteOperations {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
     async fn mkdir(&self, directory: &Path) -> Result<()> {
         tokio::fs::create_dir_all(directory).await?;
         Ok(())
@@ -735,6 +743,93 @@ struct RemoteWriteTool {
     operations: Arc<dyn WriteOperations>,
 }
 
+// Local operations participate in the existing OS-file lock shared with edits.
+// Remote operations are serialized per backend allocation and path, rather
+// than treating identical paths in unrelated stores as the same resource.
+struct InjectedWriteGuard {
+    _local: Option<std::fs::File>,
+    _remote: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn canonical_local_target(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| Error::Config("invalid target path".into()))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| Error::Config("invalid target path".into()))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn injected_write_lock(
+    operations: &Arc<dyn WriteOperations>,
+    path: &Path,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<InjectedWriteGuard> {
+    if operations.uses_local_filesystem() {
+        let path = path.to_owned();
+        let token = cancellation.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            let path = canonical_local_target(&path)?;
+            mutation_lock(&path, &token)
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??;
+        Ok(InjectedWriteGuard {
+            _local: Some(file),
+            _remote: None,
+        })
+    } else {
+        type Key = (usize, PathBuf);
+        type WeakLock = std::sync::Weak<tokio::sync::Mutex<()>>;
+        static LOCKS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<Key, WeakLock>>,
+        > = std::sync::OnceLock::new();
+        let identity = Arc::as_ptr(operations) as *const () as usize;
+        let key = (identity, path.to_owned());
+        let lock = {
+            let mut locks = LOCKS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("remote write locks");
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            guard = lock.lock_owned() => guard,
+        };
+        Ok(InjectedWriteGuard {
+            _local: None,
+            _remote: Some(guard),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for RemoteWriteTool {
     fn spec(&self) -> ToolSpec {
@@ -764,12 +859,7 @@ impl Tool for RemoteWriteTool {
             // The detached worker owns the lock while an operation is in flight.
             // Dropping the caller never releases it before a backend has settled.
             let worker = tokio::spawn(async move {
-                let lock_path = path.clone();
-                let lock_cancel = cancellation.clone();
-                let _lock =
-                    tokio::task::spawn_blocking(move || mutation_lock(&lock_path, &lock_cancel))
-                        .await
-                        .map_err(|error| Error::Config(error.to_string()))??;
+                let _lock = injected_write_lock(&operations, &path, &cancellation).await?;
                 check_mutation_cancelled(&cancellation)?;
                 operations.mkdir(&parent).await?;
                 check_mutation_cancelled(&cancellation)?;
