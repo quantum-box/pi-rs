@@ -354,17 +354,75 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
     Ok(themes)
 }
 
-// Mirror the manifest precedence used during installation, without invoking
-// cargo metadata/build or loading any executable from the source directory.
-fn local_startup_manifest(root: &Path) -> Result<Value> {
-    let pi_manifest = root.join("pi-package.json");
-    if pi_manifest.is_file() {
-        return config::read_object(&pi_manifest);
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+// Open nonblocking before checking the opened descriptor, so a FIFO or device
+// substituted between path inspection and open cannot hang the startup UI.
+fn read_optional_manifest(root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    read_optional_manifest_after_probe(root, name, || {})
+}
+
+fn read_optional_manifest_after_probe(
+    root: &Path,
+    name: &str,
+    after_probe: impl FnOnce(),
+) -> Result<Option<Vec<u8>>> {
+    let path = root.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Config(format!("{}: {error}", path.display()))),
     }
-    let cargo_manifest = root.join("Cargo.toml");
-    if cargo_manifest.is_file() {
-        let text = std::fs::read_to_string(cargo_manifest)?;
-        let manifest: toml::Value = toml::from_str(&text)
+    after_probe();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(Error::Config(format!(
+            "{} exceeds the package manifest size limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_PACKAGE_MANIFEST_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    if bytes.len() as u64 > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(Error::Config(format!(
+            "{} exceeds the package manifest size limit",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+// Mirror installation precedence without running Cargo or loading executables.
+fn local_startup_manifest(root: &Path) -> Result<Value> {
+    if let Some(bytes) = read_optional_manifest(root, "pi-package.json")? {
+        return parse_manifest_object(&root.join("pi-package.json"), &bytes, false);
+    }
+    if let Some(bytes) = read_optional_manifest(root, "Cargo.toml")? {
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        let manifest: toml::Value = toml::from_str(text)
             .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
         let metadata = manifest
             .get("package")
@@ -375,30 +433,34 @@ fn local_startup_manifest(root: &Path) -> Result<Value> {
     Ok(read_optional_pi_package_json(root)?.unwrap_or_else(|| json!({})))
 }
 
-// A present manifest is authoritative, even when it is unreadable, a broken
-// symlink, or not a regular file. Never treat an inspection failure as absence.
+// A present manifest is authoritative, including broken links or devices.
 fn read_optional_pi_package_json(root: &Path) -> Result<Option<Value>> {
-    let path = root.join("package.json");
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => read_pi_package_json(&path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::Config(format!("{}: {error}", path.display()))),
-    }
+    read_optional_manifest(root, "package.json")?
+        .map(|bytes| parse_pi_package_json(&root.join("package.json"), &bytes))
+        .transpose()
 }
 
-// Pi packages describe resources in package.json's `pi` object. Never run
-// package scripts while reading it, and accept Pi's UTF-8 BOM handling.
-fn read_pi_package_json(path: &Path) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
-    let value: Value =
-        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
-            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+fn parse_manifest_object(path: &Path, bytes: &[u8], strip_bom: bool) -> Result<Value> {
+    let input = if strip_bom {
+        bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)
+    } else {
+        bytes
+    };
+    let value: Value = serde_json::from_slice(input)
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
     if !value.is_object() {
         return Err(Error::Config(format!(
             "{} must contain an object",
             path.display()
         )));
     }
+    Ok(value)
+}
+
+// Pi packages describe resources in package.json's `pi` object. Never run
+// package scripts while reading it, and accept Pi's UTF-8 BOM handling.
+fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
+    let value = parse_manifest_object(path, bytes, true)?;
     let pi = match value.get("pi") {
         Some(pi) if !pi.is_object() => {
             return Err(Error::Config(format!(
@@ -1719,6 +1781,88 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_manifest_keeps_default_discovery_and_oversized_manifests_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("themes")).unwrap();
+        let theme = root.join("themes/default.json");
+        std::fs::write(&theme, "{}").unwrap();
+        assert!(read_optional_pi_package_json(root).unwrap().is_none());
+        assert_eq!(
+            collect_package_themes(root, &local_startup_manifest(root).unwrap()).unwrap(),
+            [theme]
+        );
+        for name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let path = root.join(name);
+            std::fs::write(&path, vec![b'x'; MAX_PACKAGE_MANIFEST_BYTES as usize + 1]).unwrap();
+            let error = local_startup_manifest(root).unwrap_err().to_string();
+            assert!(error.contains("size limit"), "{name}: {error}");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_manifests_are_rejected_before_a_deadline() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        for name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let path = root.join(name);
+            let name_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name_bytes.as_ptr(), 0o600) }, 0);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = sender.send(local_startup_manifest(&root));
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            if result.is_err() {
+                // Release a regressed blocking FIFO open so the test fails cleanly.
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path);
+            }
+            let result = result.expect("manifest inspection blocked on FIFO");
+            assert!(result.is_err(), "FIFO {name} must be rejected");
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_replaced_with_fifo_after_probe_is_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let path = root.join("package.json");
+        std::fs::write(&path, "{}").unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = read_optional_manifest_after_probe(&root, "package.json", || {
+                std::fs::remove_file(root.join("package.json")).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            });
+            let _ = sender.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+        }
+        let error = result
+            .expect("replacement FIFO blocked manifest inspection")
+            .unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+        worker.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn broken_pi_manifest_symlink_is_not_treated_as_absent() {
