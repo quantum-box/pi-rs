@@ -10,6 +10,45 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn uninstall_alias_removes_packages_in_the_selected_scope() {
+    for command in ["remove", "uninstall"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join(".pi");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let source = "git:https://example.com/team/package.git";
+        let settings = json!({"packages": [source, "git:https://example.com/team/other.git"]});
+        for directory in [&home, &project] {
+            std::fs::write(directory.join("settings.json"), settings.to_string()).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args([command, source, "--local"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let local: Value =
+            serde_json::from_slice(&std::fs::read(project.join("settings.json")).unwrap()).unwrap();
+        let global: Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            local["packages"],
+            json!(["git:https://example.com/team/other.git"])
+        );
+        assert_eq!(global, settings);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["type"], "package_removed");
+        assert_eq!(result["source"], source);
+    }
+}
+
+#[test]
 fn offline_package_update_is_a_noop_but_checks_requested_source() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
