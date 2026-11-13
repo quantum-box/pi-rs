@@ -469,19 +469,19 @@ fn replay_blocks(
         if b.get("_pi_context_edit_api").is_some() {
             continue;
         }
-        if b["type"] != "text" {
-            pending_whitespace.clear();
-        }
         match b["type"].as_str()? {
             "text" => push_replay_text(&mut out, &mut pending_whitespace, b["text"].as_str()?),
-            "tool_use" => out.push(ContentBlock::ToolUse(
-                types::ToolUseBlock::builder()
-                    .tool_use_id(ids.get(b["id"].as_str()?))
-                    .name(b["name"].as_str()?)
-                    .input(doc(b["input"].clone()))
-                    .build()
-                    .ok()?,
-            )),
+            "tool_use" => {
+                pending_whitespace.clear();
+                out.push(ContentBlock::ToolUse(
+                    types::ToolUseBlock::builder()
+                        .tool_use_id(ids.get(b["id"].as_str()?))
+                        .name(b["name"].as_str()?)
+                        .input(doc(b["input"].clone()))
+                        .build()
+                        .ok()?,
+                ));
+            }
             "reasoning" => {
                 let reasoning = if let Some(encoded) = b["redacted"].as_str() {
                     let bytes = base64::engine::general_purpose::STANDARD
@@ -514,6 +514,7 @@ fn replay_blocks(
                             .ok()?,
                     )
                 };
+                pending_whitespace.clear();
                 out.push(ContentBlock::ReasoningContent(reasoning));
             }
             _ => return None,
@@ -1400,6 +1401,55 @@ mod tests {
                 .iter()
                 .all(|block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty()))
         );
+    }
+
+    #[test]
+    fn whitespace_before_unsigned_reasoning_is_preserved_as_text() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-test".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"text","text":" \n"}),
+                serde_json::json!({"type":"reasoning","text":"reason","signature":""}),
+                serde_json::json!({"type":"text","text":"visible"}),
+                serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}),
+                serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        };
+        let blocks = replay_blocks(
+            &replay,
+            "anthropic.claude-test",
+            true,
+            " \nvisible",
+            std::slice::from_ref(&call),
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text == " \nreason"));
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "visible"));
+        assert!(matches!(&blocks[2], ContentBlock::ToolUse(_)));
+        let mut signed = replay.clone();
+        signed.blocks[1]["signature"] = serde_json::json!("sig");
+        let blocks = replay_blocks(
+            &signed,
+            "anthropic.claude-test",
+            true,
+            " \nvisible",
+            &[call],
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&blocks[0], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(text)) if text.signature() == Some("sig"))
+        );
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "visible"));
     }
 
     #[test]
