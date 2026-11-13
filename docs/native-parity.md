@@ -3116,6 +3116,9 @@ One classifiers with `models.classify` and OpenRouter image models with
 provider responses enter the same journal as other nested tool calls. Native
 `models.json` also accepts configured entries with `type: "classifier"` or
 `type: "image"` for supported endpoints.
+Configured Cloudflare Workers AI System One classifiers support the `/run`
+request and response envelopes. They require an explicit resolved endpoint and
+credential; automatic Cloudflare catalog and account discovery remain open.
 Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published

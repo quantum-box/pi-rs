@@ -15,7 +15,9 @@ use super::{
 };
 
 mod wire;
-use wire::{classifier_answers, classifier_payload, image_output, image_payload, usage};
+use wire::{
+    classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
+};
 
 pub(super) const TOOL: &str = "pi_model_operation";
 const RESPONSE_LIMIT: usize = 7 * 1024 * 1024;
@@ -34,6 +36,8 @@ enum Kind {
 enum Api {
     #[serde(rename = "typesafe-system-one")]
     SystemOne,
+    #[serde(rename = "cloudflare-workers-ai-system-one")]
+    WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
 }
@@ -41,7 +45,7 @@ enum Api {
 impl Api {
     fn kind(self) -> Kind {
         match self {
-            Self::SystemOne => Kind::Classifier,
+            Self::SystemOne | Self::WorkersAiSystemOne => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
     }
@@ -49,6 +53,7 @@ impl Api {
     fn route(self) -> &'static str {
         match self {
             Self::SystemOne => "systemone",
+            Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
         }
     }
@@ -108,7 +113,7 @@ async fn send_model_request(
     request: reqwest::Request,
     api: Api,
 ) -> Result<Vec<u8>> {
-    let retries = if matches!(api, Api::SystemOne) {
+    let retries = if api.kind() == Kind::Classifier {
         CLASSIFIER_MAX_RETRIES
     } else {
         0
@@ -603,7 +608,13 @@ impl Entry {
 
     fn image_input(&self) -> ImageInput {
         self.model.compat.image_input.unwrap_or_else(|| {
-            if self.openrouter_compat() {
+            if matches!(self.api, Api::WorkersAiSystemOne) {
+                if self.model.id.starts_with("@cf/cloudflare/clef") {
+                    ImageInput::Images
+                } else {
+                    ImageInput::Assets
+                }
+            } else if self.openrouter_compat() {
                 ImageInput::StateImageUrls
             } else {
                 ImageInput::Assets
@@ -818,7 +829,7 @@ impl Operations {
         data: &mut Value,
     ) -> Result<()> {
         let (payload, image_opt_in) = match entry.api {
-            Api::SystemOne => classifier_payload(entry, context)?,
+            Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
         let credential = entry
@@ -873,12 +884,18 @@ impl Operations {
                 .unwrap_or_default()
                 .as_millis() as u64
         );
-        if let Some(usage) = usage(entry, &body["usage"]) {
+        let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
+            classifier_response(&body)?
+        } else {
+            &body
+        };
+        if let Some(usage) = usage(entry, &result_body["usage"]) {
             data["usage"] = usage;
         }
         match entry.api {
-            Api::SystemOne => {
-                data["answers"] = classifier_answers(&context["questions"], &body["answers"])?
+            Api::SystemOne | Api::WorkersAiSystemOne => {
+                data["answers"] =
+                    classifier_answers(&context["questions"], &result_body["answers"])?
             }
             Api::OpenRouterImages => {
                 data["output"] = json!(image_output(&body)?);
@@ -894,6 +911,192 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_workers_ai_classifiers_use_cloudflare_protocol() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let direct = json!({"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}},"usage":{"input_tokens":8,"output_tokens":3}}});
+        let nested = json!({"success":true,"result":{"state":"Completed","result":{"answers":{"ok":{"type":"noul","noul":0.7}},"usage":{"input_tokens":4,"output_tokens":2}}}});
+        for (id, body, opt_in, expected_probability, expected_error) in [
+            ("@cf/cloudflare/clef-1", direct, false, Some(0.8), None),
+            ("@cf/typesafe/jev", nested.clone(), false, Some(0.7), None),
+            ("@cf/typesafe/jev", nested, true, Some(0.7), None),
+            (
+                "@cf/typesafe/jev",
+                json!({"success":true,"result":{"state":"Running"}}),
+                false,
+                None,
+                Some("did not complete"),
+            ),
+            (
+                "@cf/typesafe/jev",
+                json!({"success":false,"errors":[{"message":"private provider detail"}]}),
+                false,
+                None,
+                Some("request failed"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, length) = loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < end + length {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            let compat = if opt_in {
+                json!({"sendImageOptInHeader":true})
+            } else {
+                json!({})
+            };
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":format!("http://{address}/ai"),"apiKey":"test-key","models":[{
+                "type":"classifier","id":id,"api":"cloudflare-workers-ai-system-one", "input":["text","image"],
+                "compat":compat, "cost":{"input":1.0,"output":2.0}
+            }]}});
+            let profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":config}))
+                    .unwrap();
+            let entry = profiles
+                .operations()
+                .0
+                .iter()
+                .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == id)
+                .unwrap();
+            assert_eq!(entry.endpoint.path(), "/ai/run");
+            assert_eq!(
+                entry.descriptor()["api"],
+                "cloudflare-workers-ai-system-one"
+            );
+            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+                "images":[{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let mut data = json!({});
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+            )
+            .await
+            .unwrap();
+            if let Some(message) = expected_error {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(message), "{error}");
+                assert!(!error.contains("private provider detail"));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    data["answers"]["ok"]["probability"],
+                    expected_probability.unwrap()
+                );
+                assert!(data["usage"]["totalTokens"].as_u64().unwrap() > 0);
+            }
+            let request = server.await.unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.starts_with("post /ai/run "));
+            assert!(headers.contains("authorization: bearer test-key"));
+            assert_eq!(
+                headers.contains("typesafe-danger-zone-images: true"),
+                opt_in
+            );
+            let request: Value = serde_json::from_slice(&request[end..]).unwrap();
+            assert_eq!(request["model"], id);
+            assert_eq!(request["input"]["questions"]["ok"]["type"], "noul");
+            if id.starts_with("@cf/cloudflare/clef") {
+                assert!(
+                    request["input"]["images"][0]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/png;base64,")
+                );
+            } else {
+                assert!(request["input"]["assets"]["<image-1>"].is_object());
+                assert_eq!(request["input"]["state"][0], "<image-1>");
+            }
+        }
+    }
+
+    #[test]
+    fn workers_ai_classifier_credentials_remain_endpoint_bound() {
+        let config = json!({"cloudflare-workers-ai":{
+            "baseUrl":"http://127.0.0.1:1111/ai", "apiKey":"provider-secret", "models":[{
+                "type":"classifier", "id":"fixture", "api":"cloudflare-workers-ai-system-one", "baseUrl":"http://127.0.0.1:2222/ai"
+            }]
+        }});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "cloudflare-workers-ai")
+            .unwrap();
+        assert!(entry.api_key.is_none());
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"saved-secret", "endpoint":"http://127.0.0.1:1111/ai"}}),
+        );
+        assert!(
+            entry
+                .credential_with_env(&keys, |_| Some("ambient-secret".into()))
+                .is_none()
+        );
+    }
+    #[test]
+    fn workers_ai_classifier_honors_image_format_override() {
+        let config = json!({"relay": {"baseUrl":"http://127.0.0.1:1234/ai", "models":[{
+            "type":"classifier", "id":"@cf/typesafe/jev", "api":"cloudflare-workers-ai-system-one", "input":["text","image"],
+            "compat":{"imageInput":"state-image-urls"}
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"test", "criteria":{"true":"yes", "false":"no"}}},
+            "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let (body, opt_in) = classifier_payload(entry, &context).unwrap();
+        assert_eq!(body["input"]["state"][0]["type"], "image_url");
+        assert!(!opt_in);
+        let mut without_image = context;
+        without_image["images"] = json!([]);
+        let (body, opt_in) = classifier_payload(entry, &without_image).unwrap();
+        assert_eq!(body["input"]["state"], "test");
+        assert!(!opt_in);
+    }
 
     #[tokio::test]
     async fn classifier_retries_transient_http_failures_with_server_controls() {
