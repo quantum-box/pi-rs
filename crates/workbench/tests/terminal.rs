@@ -1492,10 +1492,18 @@ fn check_per_model_thinking_settings(project_override: bool, model_fallback: boo
 import json, os, socket, sys
 request = json.load(sys.stdin)
 if request['type'] == 'describe':
-    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True, 'session_lifecycle_hook':bool(os.environ.get('PI_RS_TEST_SELECTION_GATE'))}
 elif request['type'] == 'lifecycle':
     event = request['event']
     address = os.environ.get('PI_RS_TEST_SELECTION_GATE')
+    if address and event.get('type') == 'session_start':
+        host, port = address.rsplit(':', 1)
+        with socket.create_connection((host, int(port)), timeout=15) as gate:
+            gate.sendall(b'R')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('startup gate was not released')
+        print(json.dumps({'version':1, 'response':{'Ok':None}}))
+        sys.exit(0)
     if address and event.get('type') == 'thinking_level_select' and event.get('level') == 'high':
         host, port = address.rsplit(':', 1)
         with socket.create_connection((host, int(port)), timeout=10) as gate:
@@ -1587,6 +1595,33 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
+    if let Some(listener) = &listener {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut output = Vec::new();
+        let mut startup = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    let mut chunk = [0; 8192];
+                    if let Ok(count) = master.read(&mut chunk) {
+                        output.extend_from_slice(&chunk[..count]);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!(
+                    "extension session startup did not reach gate: {error}; terminal: {}",
+                    String::from_utf8_lossy(&output)
+                ),
+            }
+        };
+        prepare_gate(&startup);
+        let mut ready = [0];
+        startup.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"R");
+        startup.write_all(b"G").unwrap();
+    }
     master.write_all(b"/settings\r").unwrap();
     output_until(&mut master, |text| text.contains("HTTP idle timeout"));
     master
@@ -1656,6 +1691,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     };
     if let Some(listener) = listener {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed_output = Vec::new();
         let mut gate = loop {
             match listener.accept() {
                 Ok((socket, _)) => break socket,
@@ -1663,10 +1699,16 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                     if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
                 {
                     let mut output = [0; 8192];
-                    let _ = master.read(&mut output);
+                    if let Ok(count) = master.read(&mut output) {
+                        observed_output.extend_from_slice(&output[..count]);
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(error) => panic!("first per-model callback did not start: {error}"),
+                Err(error) => panic!(
+                    "first per-model callback did not start: {error}; terminal: {}; events: {}",
+                    String::from_utf8_lossy(&observed_output),
+                    std::fs::read_to_string(home.join("events.jsonl")).unwrap_or_default()
+                ),
             }
         };
         prepare_gate(&gate);
