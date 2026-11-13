@@ -916,55 +916,16 @@ impl AgentSession {
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
             let events = self.events.as_ref().expect("open session");
-            let states = self.session.extension_states();
             let transition = crate::BeforeSessionTransition::Fork { entry_id, position };
-            let (sender, mut incoming) = mpsc::channel(32);
-            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
-            let mut errors = Vec::new();
-            let mut collect = |event: Notification<'_>| {
-                if let Notification::ExtensionLifecycleError {
-                    extension,
-                    event,
-                    message,
-                } = event
-                {
-                    errors.push((extension.to_owned(), event, message.to_owned()));
-                }
-            };
-            let cancelled = {
-                let future = self.registry.session_transition_cancelled_with_host(
+            let cancelled = self
+                .registry
+                .session_transition_cancelled_in_session(
                     &transition,
-                    &states,
+                    &mut self.session,
                     self.limits.tool_timeout,
-                    &mut collect,
-                    host,
-                );
-                tokio::pin!(future);
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some((input, reply)) = incoming.recv() => {
-                            let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
-                                crate::agent::queue_custom_message(&mut self.session, input, &mut |event| emit(events, &event))
-                            } else {
-                                self.session.append_custom_message(input.message).map(|()| emit(events, &Notification::Committed(self.session.records().last().expect("appended custom message"))))
-                            };
-                            match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                        }
-                        result = &mut future => break result,
-                    }
-                }
-            };
-            for (extension, event, message) in &errors {
-                emit(
-                    events,
-                    &Notification::ExtensionLifecycleError {
-                        extension,
-                        event,
-                        message,
-                    },
-                );
-            }
+                    &mut |event| emit(events, &event),
+                )
+                .await?;
             let _ = self.drain_idle_triggers().await?;
             if cancelled {
                 return Err(Error::Cancelled);

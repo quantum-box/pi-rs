@@ -613,6 +613,15 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    async fn user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<UserBashResult>> {
+        self.user_bash(event, state).await
+    }
+
     /// Opt in to selecting a custom streaming implementation of user shell execution.
     fn handles_user_bash_operations(&self) -> bool {
         false
@@ -627,6 +636,15 @@ pub trait Extension: Send + Sync {
         Ok(false)
     }
 
+    async fn user_bash_operations_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        self.user_bash_operations(event, state).await
+    }
+
     /// Execute the command, sending combined output bytes as they become available.
     async fn execute_user_bash(
         &self,
@@ -637,6 +655,19 @@ pub trait Extension: Send + Sync {
         _output: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> ExtensionResult<Option<i32>> {
         Err("user shell operations unavailable".into())
+    }
+
+    async fn execute_user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<std::time::Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<i32>> {
+        self.execute_user_bash(event, state, timeout, cancel, output)
+            .await
     }
 
     fn handles_lifecycle(&self) -> bool {
@@ -669,6 +700,15 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<DiscoveredResources> {
         Ok(DiscoveredResources::default())
+    }
+
+    async fn discover_resources_with_host(
+        &self,
+        event: &ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<DiscoveredResources> {
+        self.discover_resources(event, state).await
     }
 
     /// Opt in to session start and shutdown events in addition to run and turn events.
@@ -1047,6 +1087,57 @@ impl Registry {
         }
         result
     }
+    /// Discover resources while journaling custom messages sent by callbacks.
+    pub async fn discover_resources_in_session(
+        &self,
+        event: &ResourceDiscoveryEvent,
+        session: &mut crate::Session,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        mut on_error: impl FnMut(&str, &str),
+    ) -> Result<Vec<ExtensionResources>> {
+        let states = session.extension_states();
+        let mut result = Vec::new();
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|item| item.handles_resource_discovery())
+        {
+            let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+            let outcome = {
+                let future = tokio::time::timeout(
+                    timeout,
+                    extension.discover_resources_with_host(event, states.get(extension.id()), host),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, reply)) = incoming.recv() => {
+                            let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
+                                crate::agent::queue_custom_message(session, input, observer)
+                            } else {
+                                session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
+                            };
+                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        result = &mut future => break result,
+                    }
+                }
+            };
+            match outcome {
+                Ok(Ok(resources)) => result.push(ExtensionResources {
+                    extension_id: extension.id().into(),
+                    source: extension.command_source().map(std::path::Path::to_path_buf),
+                    resources,
+                }),
+                Ok(Err(error)) => on_error(extension.id(), &error),
+                Err(_) => on_error(extension.id(), "resource discovery timed out"),
+            }
+        }
+        Ok(result)
+    }
     pub fn has_session_transition_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -1124,6 +1215,61 @@ impl Registry {
         }
         false
     }
+    /// Check a transition while the session owner journals callback messages.
+    pub async fn session_transition_cancelled_in_session(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        session: &mut crate::Session,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+    ) -> Result<bool> {
+        let states = session.extension_states();
+        let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+        let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let mut errors = Vec::new();
+        let mut collect = |event: crate::Notification<'_>| {
+            if let crate::Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        let cancelled = {
+            let future = self.session_transition_cancelled_with_host(
+                event,
+                &states,
+                timeout,
+                &mut collect,
+                host,
+            );
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((input, reply)) = incoming.recv() => {
+                        let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
+                            crate::agent::queue_custom_message(session, input, observer)
+                        } else {
+                            session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
+                        };
+                        match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                    }
+                    result = &mut future => break result,
+                }
+            }
+        };
+        for (extension, event, message) in &errors {
+            observer(crate::Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(cancelled)
+    }
     pub fn has_session_lifecycle_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -1186,13 +1332,35 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
     ) -> Result<Option<UserBashReplacement>> {
+        self.prepare_user_bash_inner(event, states, cancel, None)
+            .await
+    }
+
+    pub async fn prepare_user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<UserBashReplacement>> {
+        self.prepare_user_bash_inner(event, states, cancel, Some(host))
+            .await
+    }
+
+    async fn prepare_user_bash_inner(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Result<Option<UserBashReplacement>> {
         for extension in &self.extensions {
             let state = states.get(extension.id());
             if extension.handles_user_bash() {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = extension.user_bash(event, state) => result,
+                    result = async { match &host { Some(host) => extension.user_bash_with_host(event, state, host.clone()).await, None => extension.user_bash(event, state).await } } => result,
                 };
                 if let Some(result) = hook(extension.as_ref(), result)? {
                     return Ok(Some(UserBashReplacement::Result(result)));
@@ -1202,7 +1370,7 @@ impl Registry {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = extension.user_bash_operations(event, state) => result,
+                    result = async { match &host { Some(host) => extension.user_bash_operations_with_host(event, state, host.clone()).await, None => extension.user_bash_operations(event, state).await } } => result,
                 };
                 if hook(extension.as_ref(), result)? {
                     return Ok(Some(UserBashReplacement::Operations {
@@ -1810,6 +1978,70 @@ mod replacement_tests {
             result[0].resources.prompt_paths,
             [std::path::PathBuf::from("relative.md")]
         );
+    }
+
+    struct ResourceMessageHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceMessageHook {
+        fn id(&self) -> &str {
+            "resource-message"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            host.send_message(
+                CustomMessage {
+                    custom_type: "resource".into(),
+                    content: crate::ContextContent::Text("discovery".into()),
+                    display: false,
+                    details: Some(json!({"id":1})),
+                },
+                CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources {
+                prompt_paths: vec!["fixture.md".into()],
+                ..Default::default()
+            })
+        }
+    }
+    #[tokio::test]
+    async fn resource_discovery_journals_trigger_before_acknowledging_callback() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceMessageHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(1),
+                &mut |_| {},
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result[0].resources.prompt_paths,
+            [std::path::PathBuf::from("fixture.md")]
+        );
+        let restored = crate::Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.details,
+            Some(json!({"id":1}))
+        );
+        assert!(restored.pending_custom_trigger().is_some());
     }
 
     struct TestExtension(&'static str, &'static str);

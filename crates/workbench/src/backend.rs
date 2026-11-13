@@ -23,6 +23,10 @@ mod queue;
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
+    #[serde(skip)]
+    TriggerCustom {
+        run_id: Uuid,
+    },
     Configure {
         model: String,
         thinking: Option<String>,
@@ -210,6 +214,40 @@ struct ShellRunner {
     completed: mpsc::Sender<ShellCompletion>,
 }
 
+struct QueueMessageHost {
+    inputs: mpsc::Sender<AgentInput>,
+    cancellation: CancellationToken,
+}
+#[async_trait::async_trait]
+impl pi_rs::ToolHost for QueueMessageHost {
+    fn tools(&self) -> Vec<pi_rs::ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> pi_rs::Outcome {
+        pi_rs::Outcome::Skipped("tool calls unavailable in shell hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs::CustomMessage,
+        delivery: pi_rs::CustomMessageDelivery,
+    ) -> pi_rs::ExtensionResult<()> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let input = AgentInput::EnqueueCustom {
+            message: pi_rs::QueuedCustomMessage {
+                id: Uuid::new_v4(),
+                delivery,
+                message,
+            },
+            reply,
+        };
+        tokio::select! { biased; _ = self.cancellation.cancelled() => return Err("shell callback cancelled".into()), result = self.inputs.send(input) => result.map_err(|_| "session owner unavailable".to_owned())? }
+        tokio::select! { biased; result = response => result.map_err(|_| "message acknowledgement lost".to_owned())?.map_err(|error| error.to_string()), _ = self.cancellation.cancelled() => Err("shell callback cancelled".into()) }
+    }
+}
+
 struct ShellCompletion {
     id: Uuid,
     request_id: Option<serde_json::Value>,
@@ -298,11 +336,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         },
     )
     .await;
-    let session = Session::snapshot(&args.session)?;
+    let mut session = Session::snapshot(&args.session)?;
+    if session.host_binding().is_none() {
+        session = Session::open(&args.session)?;
+    }
     let discovered = runtime
         .discover_resources(
             &args,
-            &session,
+            &mut session,
             if matches!(startup_reason, SessionStartReason::Reload) {
                 pi_rs::ResourceDiscoveryReason::Reload
             } else {
@@ -310,6 +351,13 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
         )
         .await?;
+    snapshot.lock().expect("session snapshot").refresh(&session);
+    let startup_trigger = session
+        .host_binding()
+        .is_none()
+        .then(|| session.pending_custom_trigger())
+        .flatten();
+    drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
     resources_ready.send_replace(true);
@@ -318,61 +366,67 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     }
     output(json!({"type":"backend_ready"}));
     let mut continue_queue = false;
+    let mut pending_discovery_trigger = startup_trigger;
     let cache = super::cache_warming::Controller::default();
     while !stopping.load(Ordering::SeqCst) {
-        let (request, scheduled) = tokio::select! {
-            _ = stop_notify.notified() => break,
-            Some(shell) = shell_results.recv() => {
-                cache.clear(&args.session, "conversation context changed");
-                save_shell(shell, &args, &snapshot, &active);
-                continue;
-            }
-            receipt = cache.wait() => {
-                if let Some(receipt) = receipt {
-                    receipt.persist(&args.session, &cache, |record| {
-                        observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
-                    });
-                }
-                continue;
-            }
-            request = requests.recv() => match request { Some(request) => (request, true), None => break },
-            input = queued.recv() => match input {
-                Some(input) => {
+        let (request, scheduled) = if let Some(run_id) = pending_discovery_trigger.take() {
+            (Request::TriggerCustom { run_id }, false)
+        } else {
+            tokio::select! {
+                _ = stop_notify.notified() => break,
+                Some(shell) = shell_results.recv() => {
                     cache.clear(&args.session, "conversation context changed");
-                    let mut replies = Vec::new();
-                    let result = Session::open(&args.session).and_then(|mut session| {
-                        if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
-                        snapshot.lock().expect("session snapshot").refresh(&session);
-                        let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
-                        let capacity = queued.max_capacity();
-                        let pending = std::iter::from_fn(|| queued.try_recv().ok()).take(capacity);
-                        let mut starts_run = false;
-                        for input in std::iter::once(input).chain(pending) {
-                            match input {
-                                AgentInput::Enqueue { message, reply } => {
-                                    let result = AgentInput::from(message).apply(&mut session, &mut observer);
-                                    replies.push((reply, result));
-                                }
-                                input => {
-                                    starts_run |= matches!(input, AgentInput::Message(_));
-                                    input.apply(&mut session, &mut observer)?;
+                    save_shell(shell, &args, &snapshot, &active);
+                    continue;
+                }
+                receipt = cache.wait() => {
+                    if let Some(receipt) = receipt {
+                        receipt.persist(&args.session, &cache, |record| {
+                            observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
+                        });
+                    }
+                    continue;
+                }
+                request = requests.recv() => match request { Some(request) => (request, true), None => break },
+                input = queued.recv() => match input {
+                    Some(input) => {
+                        cache.clear(&args.session, "conversation context changed");
+                        let mut replies = Vec::new();
+                        let result = Session::open(&args.session).and_then(|mut session| {
+                            if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
+                            snapshot.lock().expect("session snapshot").refresh(&session);
+                            let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
+                            let capacity = queued.max_capacity();
+                            let pending = std::iter::from_fn(|| queued.try_recv().ok()).take(capacity);
+                            let mut starts_run = false;
+                            for input in std::iter::once(input).chain(pending) {
+                                match input {
+                                    AgentInput::Enqueue { message, reply } => {
+                                        let result = AgentInput::from(message).apply(&mut session, &mut observer);
+                                        replies.push((reply, result));
+                                    }
+                                    input => {
+                                        starts_run |= matches!(input, AgentInput::Message(_));
+                                        input.apply(&mut session, &mut observer)?;
+                                    }
                                 }
                             }
+                            Ok((starts_run && !session.queued_inputs().is_empty(), session.pending_custom_trigger()))
+                        });
+                        for (reply, result) in replies {
+                            let _ = reply.send(result);
                         }
-                        Ok(starts_run && !session.queued_inputs().is_empty())
-                    });
-                    for (reply, result) in replies {
-                        let _ = reply.send(result);
+                        match result {
+                            Ok((_, Some(run_id))) => (Request::TriggerCustom { run_id }, false),
+                            Ok((true, None)) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+                            Ok((false, None)) => continue,
+                            Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
+                        }
                     }
-                    match result {
-                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
-                        Ok(false) => continue,
-                        Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
-                    }
-                }
-                None => break,
-            },
-            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+                    None => break,
+                },
+                _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+            }
         };
         cache.clear(&args.session, "conversation context changed");
         if stopping.load(Ordering::SeqCst) {
@@ -383,16 +437,26 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         }
         if let Request::CheckSessionTransition { id, event } = request {
             let result = if runtime.registry.has_session_transition_hooks() {
-                match Session::snapshot(&args.session) {
-                    Ok(session) if session.host_binding().is_none() => Ok(runtime
-                        .registry
-                        .session_transition_cancelled(
-                            &event,
-                            &session.extension_states(),
-                            args.tool_timeout(),
-                            &mut |notification| observe(notification, args.trace),
-                        )
-                        .await),
+                match Session::open(&args.session) {
+                    Ok(mut session) if session.host_binding().is_none() => {
+                        let result = runtime
+                            .registry
+                            .session_transition_cancelled_in_session(
+                                &event,
+                                &mut session,
+                                args.tool_timeout(),
+                                &mut |notification| {
+                                    observe_snapshot(notification, args.trace, &snapshot)
+                                },
+                            )
+                            .await;
+                        pending_discovery_trigger = session
+                            .host_binding()
+                            .is_none()
+                            .then(|| session.pending_custom_trigger())
+                            .flatten();
+                        result
+                    }
                     Ok(_) => Err(Error::Session(
                         "managed session transitions require their host".into(),
                     )),
@@ -485,10 +549,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     },
                 )
                 .await;
-                let session = Session::snapshot(&args.session)?;
+                let mut session = Session::snapshot(&args.session)?;
+                if session.host_binding().is_none() {
+                    session = Session::open(&args.session)?;
+                }
                 let discovered = runtime
-                    .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+                    .discover_resources(
+                        &args,
+                        &mut session,
+                        pi_rs::ResourceDiscoveryReason::Startup,
+                    )
                     .await?;
+                snapshot.lock().expect("session snapshot").refresh(&session);
+                pending_discovery_trigger = session.pending_custom_trigger();
+                drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
                 resources_ready.send_replace(true);
@@ -527,6 +601,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         let resume_queued = matches!(
             &request,
             Request::Prompt { .. }
+                | Request::TriggerCustom { .. }
                 | Request::Compact { .. }
                 | Request::Review { .. }
                 | Request::Extension { .. }
@@ -563,7 +638,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             cache.clone(),
         );
         let mut operation = Box::pin(async {
-            if matches!(&request, Request::Prompt { .. } | Request::McpStatus) {
+            if matches!(
+                &request,
+                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus
+            ) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -594,6 +672,21 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 observe_snapshot(event, args.trace, &snapshot);
             };
             match request {
+                Request::TriggerCustom { run_id } => {
+                    if session.pending_custom_trigger() != Some(run_id) {
+                        return Err(Error::Session("custom trigger is no longer pending".into()));
+                    }
+                    let answer = Box::pin(agent.run_correlated(
+                        session,
+                        run_id,
+                        None,
+                        &mut queued,
+                        &cancel,
+                        &mut observer,
+                    ))
+                    .await?;
+                    output(json!({"type":"answer","content":answer}));
+                }
                 Request::Prompt {
                     mut content,
                     mut images,
@@ -1210,6 +1303,7 @@ fn read_requests(
                     let timeout = shell.timeout;
                     let completed = shell.completed.clone();
                     let registry = processor.registry.clone();
+                    let host_inputs = processor.inputs.clone();
                     let snapshot = snapshot.clone();
                     let mut ready = resources_ready.clone();
                     runtime.spawn(async move {
@@ -1230,7 +1324,8 @@ fn read_requests(
                                 let records = snapshot.lock().expect("session snapshot").records.clone();
                                 let states = pi_rs::Session::from_records(records)?.extension_states();
                                 let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
-                                match registry.prepare_user_bash(&event, &states, &cancel).await? {
+                                let host = Arc::new(QueueMessageHost { inputs: host_inputs, cancellation: cancel.clone() });
+                                match registry.prepare_user_bash_with_host(&event, &states, &cancel, host.clone()).await? {
                                     Some(pi_rs::UserBashReplacement::Result(result)) => {
                                         if !result.output.is_empty() {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
@@ -1242,9 +1337,9 @@ fn read_requests(
                                         });
                                     }
                                     Some(pi_rs::UserBashReplacement::Operations { extension, state }) => {
-                                        return tools.execute_shell_operations(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
+                                        return tools.execute_shell_operations_with_host(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
-                                        }).await;
+                                        }, host).await;
                                     }
                                     None => {}
                                 }
@@ -1379,4 +1474,78 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod message_host_tests {
+    use super::*;
+
+    struct BashHook;
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for BashHook {
+        fn id(&self) -> &str {
+            "bash-message"
+        }
+        fn handles_user_bash(&self) -> bool {
+            true
+        }
+        async fn user_bash_with_host(
+            &self,
+            _: &pi_rs::UserBashEvent,
+            _: Option<&pi_rs::ExtensionState>,
+            host: Arc<dyn pi_rs::ToolHost>,
+        ) -> pi_rs::ExtensionResult<Option<pi_rs::UserBashResult>> {
+            host.send_message(
+                pi_rs::CustomMessage {
+                    custom_type: "bash".into(),
+                    content: pi_rs::ContextContent::Text("from shell".into()),
+                    display: false,
+                    details: None,
+                },
+                pi_rs::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_callback_waits_until_idle_owner_journals_trigger() {
+        let mut registry = pi_rs::Registry::default();
+        registry.register(Arc::new(BashHook)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let host = Arc::new(QueueMessageHost {
+            inputs: sender,
+            cancellation: CancellationToken::new(),
+        });
+        let event = pi_rs::UserBashEvent {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/".into(),
+        };
+        let states = pi_rs::ExtensionStates::new();
+        let cancel = CancellationToken::new();
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let operation = registry.prepare_user_bash_with_host(&event, &states, &cancel, host);
+        let owner = async {
+            receiver
+                .recv()
+                .await
+                .unwrap()
+                .apply(&mut session, &mut |_| {})
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(operation, owner)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap().is_none());
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.pending_custom_trigger().is_some());
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.content,
+            pi_rs::ContextContent::Text("from shell".into())
+        );
+    }
 }

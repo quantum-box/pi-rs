@@ -2786,8 +2786,13 @@ and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
 `agent_settled`; and SDK-owned session and model-selection notifications,
-including active control rename notifications. Idle callbacks append messages
-without starting a model turn, except `NextTurn`, which is queued, and
+including active control rename notifications. SDK and workbench transition
+checks, workbench resource discovery, and user-bash replacement, operation
+selection, and streamed execution hooks also service messages through the
+session owner. Streamed output and message calls share the negotiated process
+channel. A workbench discovery or shell callback can schedule a triggered run
+before the next user operation. Idle callbacks append messages without starting
+a model turn, except `NextTurn`, which is queued, and
 `TriggerTurn`, which starts a separate run. A trigger's queued message UUID is
 also its run ID. Reopening a session resumes an interrupted triggered run with
 that same ID and does not redeliver its message or repeat a recorded answer.
@@ -2812,8 +2817,10 @@ Exactly-once recovery is not possible for unkeyed callback sends when a process
 stops between sends or the callback takes a different path. On a resumed run,
 unkeyed sends from these callbacks return an error and do not append anything;
 this avoids duplicates but may omit sends that had not completed before the
-interruption. Extensions should use stable keys for recovery-safe delivery and
-must not switch an interrupted run's sends from unkeyed to keyed: older journals
+interruption. Unkeyed sends can also repeat if the callback is invoked again
+within the same uninterrupted run. Extensions should use stable keys for
+recovery-safe delivery and must not switch an interrupted run's sends from
+unkeyed to keyed: older journals
 do not contain enough information to match those identities. Automatic trigger
 runs retain their own SDK run events and do not replace the initiating run's
 result.
@@ -2821,11 +2828,15 @@ result.
 The pinned Pi [`_prepareRun` implementation](https://github.com/badlogic/pi-mono/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/agent-session.ts#L1941-L1982)
 places the starting user or custom message before pending `nextTurn` messages,
 even when the latter were queued earlier. The native scheduler follows that
-order; it is covered for both user and custom starting messages. Host-aware `before_tool` policies can opt in with
+order; it is covered for both user and custom starting messages. Host-aware
+`before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
-user-bash, resource discovery, compaction, tree, and workbench
-session-transition hooks.
+compaction, and tree hooks. For host-bound workbench sessions, resource discovery
+uses the state-only API and session transitions require the owning host. The
+state-only `Registry::discover_resources` and `session_transition_cancelled`
+APIs do not have a session owner; hosts that need message delivery use their
+session-owned counterparts.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message

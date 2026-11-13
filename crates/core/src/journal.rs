@@ -1242,7 +1242,7 @@ impl Session {
     }
 
     /// Find a callback-triggered run that has not started or was interrupted.
-    pub(crate) fn pending_custom_trigger(&self) -> Option<Uuid> {
+    pub fn pending_custom_trigger(&self) -> Option<Uuid> {
         let branch = self.branch();
         branch.iter().find_map(|record| {
             let Event::CustomMessageQueued { input } = &record.event else {

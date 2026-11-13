@@ -137,6 +137,52 @@ impl CodingTools {
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_operations_inner(
+            event,
+            extension,
+            state,
+            timeout,
+            cancellation,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_shell_operations_with_host(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+        host: Arc<dyn pi_rs::ToolHost>,
+    ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_operations_inner(
+            event,
+            extension,
+            state,
+            timeout,
+            cancellation,
+            progress,
+            Some(host),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_shell_operations_inner(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+        host: Option<Arc<dyn pi_rs::ToolHost>>,
+    ) -> Result<pi_rs::BashExecution> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -153,13 +199,33 @@ impl CodingTools {
         let mut operation_event = event.clone();
         operation_event.command = self.shell.command_with_prefix(&event.command);
         let exit_code = {
-            let operation = extension.execute_user_bash(
-                &operation_event,
-                state,
-                timeout,
-                operation_cancel.clone(),
-                sender,
-            );
+            let operation = async {
+                match host {
+                    Some(host) => {
+                        extension
+                            .execute_user_bash_with_host(
+                                &operation_event,
+                                state,
+                                timeout,
+                                operation_cancel.clone(),
+                                sender,
+                                host,
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .execute_user_bash(
+                                &operation_event,
+                                state,
+                                timeout,
+                                operation_cancel.clone(),
+                                sender,
+                            )
+                            .await
+                    }
+                }
+            };
             tokio::pin!(operation);
             let deadline = async {
                 match timeout {

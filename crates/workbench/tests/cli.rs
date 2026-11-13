@@ -4491,3 +4491,251 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
         assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn resource_discovery_trigger_runs_before_print_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("resources.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'resources','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'resources_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let branch = session.branch();
+    let custom = branch.iter().position(|r| matches!(&r.event, pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "resources")).unwrap();
+    let user = branch
+        .iter()
+        .position(
+            |r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "same input"),
+        )
+        .unwrap();
+    assert!(custom < user);
+    assert!(session.pending_custom_trigger().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_shell_hook_journals_custom_message_before_reply() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-message.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='user_bash'
+    print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'shell','content':'queued from shell','display':False,'details':{'source':'shell'}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'output':'intercepted','exitCode':0}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-message','dependencies':[],'commands':[],'tools':[],'user_bash_hook':True,'user_bash_hook_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("shell callback timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    let pending = session.queued_custom_messages();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1.message.custom_type, "shell");
+    assert_eq!(
+        pending[0].1.message.details,
+        Some(json!({"source":"shell"}))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_streamed_shell_operation_can_send_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-stream.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); kind=frame['request']['type']
+    if kind=='user_bash_operations': result=True
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'before')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'stream-shell','content':'queued','display':False}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'after')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-stream','dependencies':[],'commands':[],'tools':[],'user_bash_operations_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("streamed shell timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            assert_eq!(event["data"]["output"], "beforeafter");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    assert_eq!(session.queued_custom_messages().len(), 1);
+    assert_eq!(
+        session.queued_custom_messages()[0].1.message.custom_type,
+        "stream-shell"
+    );
+}

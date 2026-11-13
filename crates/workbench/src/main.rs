@@ -1990,8 +1990,9 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         )
         .await;
     runtime
-        .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+        .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
+    run_pending_custom_trigger(&args, &runtime, &mut session).await?;
     let result = async {
         if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
             if let Some(run_id) = args.run_id
@@ -2015,7 +2016,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 runtime = runtime::configure(&args, false).await?;
                 session.set_auto_compaction_control(runtime.auto_compaction.clone());
                 session.set_retry_control(runtime.retry.clone());
-                runtime.discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                runtime.discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                run_pending_custom_trigger(&args, &runtime, &mut session).await?;
             }
             command = Command::Resume;
         }
@@ -2294,6 +2296,33 @@ fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) 
         }
         _ => {}
     }
+}
+
+async fn run_pending_custom_trigger(
+    args: &Cli,
+    runtime: &runtime::Runtime,
+    session: &mut Session,
+) -> Result<()> {
+    let Some(run_id) = session.pending_custom_trigger() else {
+        return Ok(());
+    };
+    if args.run_id == Some(run_id) {
+        return Ok(());
+    }
+    let agent = runtime.agent(args, session.session_id());
+    let (_sender, mut inputs) = mpsc::channel::<pi_rs::AgentInput>(32);
+    let answer = agent
+        .run_correlated(
+            session,
+            run_id,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| observe(event, args.trace),
+        )
+        .await?;
+    output(json!({"type":"answer", "content":answer}));
+    Ok(())
 }
 
 fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {

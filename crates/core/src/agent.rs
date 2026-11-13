@@ -3452,7 +3452,23 @@ fn reply_to_control<T>(result: Result<T>, reply: oneshot::Sender<Result<T>>) -> 
 impl AgentInput {
     /// Apply one message or queue control from an embedding application's event loop.
     pub fn apply(self, session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
-        queue_input(session, self, observer)
+        if let AgentInput::EnqueueCustom { message, reply } = self {
+            let result = if matches!(
+                message.delivery,
+                crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn
+            ) {
+                queue_custom_message(session, message, observer)
+            } else {
+                session.append_custom_message(message.message).map(|()| {
+                    observer(Notification::Committed(
+                        session.records().last().expect("appended custom message"),
+                    ))
+                })
+            };
+            reply_to_control(result, reply)
+        } else {
+            queue_input(session, self, observer)
+        }
     }
 }
 
@@ -4531,6 +4547,34 @@ mod queue_tests {
             std::future::pending().await
         }
     }
+    #[test]
+    fn idle_owner_applies_custom_message_controls_at_idle_boundaries() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for (text, delivery) in [
+            ("immediate", crate::CustomMessageDelivery::Steer),
+            ("next", crate::CustomMessageDelivery::NextTurn),
+            ("trigger", crate::CustomMessageDelivery::TriggerTurn),
+        ] {
+            let (reply, mut response) = oneshot::channel();
+            AgentInput::EnqueueCustom {
+                message: custom(text, delivery),
+                reply,
+            }
+            .apply(&mut session, &mut |_| {})
+            .unwrap();
+            assert!(response.try_recv().unwrap().is_ok());
+        }
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(
+            restored
+                .current_messages()
+                .iter()
+                .any(|m| matches!(m, crate::Message::User { content } if content == "immediate"))
+        );
+        assert_eq!(restored.queued_custom_messages().len(), 2);
+        assert!(restored.pending_custom_trigger().is_some());
+    }
+
     #[tokio::test]
     async fn truncated_tool_lifecycle_hooks_can_send_messages() {
         struct Hook;

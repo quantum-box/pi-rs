@@ -56,7 +56,7 @@ impl Runtime {
     pub async fn discover_resources(
         &mut self,
         args: &Cli,
-        session: &Session,
+        session: &mut Session,
         reason: pi_rs::ResourceDiscoveryReason,
     ) -> Result<pi_rs::DiscoveredResources> {
         if !self.registry.has_resource_discovery_hooks() {
@@ -69,15 +69,30 @@ impl Runtime {
                 .unwrap_or_else(|_| args.workspace.clone()),
             reason,
         };
-        let results = self
-            .registry
-            .discover_resources(
-                &event,
-                &session.extension_states(),
-                args.tool_timeout(),
-                |extension, error| eprintln!("Extension {extension} (resources_discover): {error}"),
-            )
-            .await;
+        let results = if session.host_binding().is_some() {
+            self.registry
+                .discover_resources(
+                    &event,
+                    &session.extension_states(),
+                    args.tool_timeout(),
+                    |extension, error| {
+                        eprintln!("Extension {extension} (resources_discover): {error}")
+                    },
+                )
+                .await
+        } else {
+            self.registry
+                .discover_resources_in_session(
+                    &event,
+                    session,
+                    args.tool_timeout(),
+                    &mut |event| super::observe(event, args.trace),
+                    |extension, error| {
+                        eprintln!("Extension {extension} (resources_discover): {error}")
+                    },
+                )
+                .await?
+        };
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {

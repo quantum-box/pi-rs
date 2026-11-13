@@ -188,6 +188,11 @@ enum ProtocolRequest {
         event: pi_rs_core::UserBashEvent,
         state: Option<ExtensionState>,
     },
+    ExecuteUserBash {
+        event: pi_rs_core::UserBashEvent,
+        state: Option<ExtensionState>,
+        timeout_secs: Option<f64>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -332,6 +337,12 @@ struct Description {
     context_hook_host_calls: bool,
     #[serde(default)]
     transition_hook_host_calls: bool,
+    #[serde(default)]
+    resources_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_stream_host_calls: bool,
     #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
@@ -596,6 +607,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash(event, state).await;
+        }
+        let request = ProtocolRequest::UserBash {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn handles_user_bash_operations(&self) -> bool {
         self.description.user_bash_operations_hook
     }
@@ -609,6 +641,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn user_bash_operations_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash_operations(event, state).await;
+        }
+        let request = ProtocolRequest::UserBashOperations {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     async fn execute_user_bash(
         &self,
@@ -631,6 +684,37 @@ impl Extension for ExecutableExtension {
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+    async fn execute_user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<i32>> {
+        if !self.description.user_bash_stream_host_calls {
+            return self
+                .execute_user_bash(event, state, timeout, cancel, output)
+                .await;
+        }
+        let request = ProtocolRequest::ExecuteUserBash {
+            event: event.clone(),
+            state: state.cloned(),
+            timeout_secs: timeout.map(|duration| duration.as_secs_f64()),
+        };
+        let host = Arc::new(ShellProgressHost {
+            inner: host,
+            output,
+        });
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(cancel.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
@@ -657,6 +741,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn discover_resources_with_host(
+        &self,
+        event: &pi_rs_core::ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::DiscoveredResources> {
+        if !self.description.resources_hook_host_calls {
+            return self.discover_resources(event, state).await;
+        }
+        let request = ProtocolRequest::DiscoverResources {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
@@ -1407,6 +1512,59 @@ impl Tool for ExecutableTool {
             .flatten()
     }
 }
+struct ShellProgressHost {
+    inner: Arc<dyn ToolHost>,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+#[async_trait::async_trait]
+impl ToolHost for ShellProgressHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.inner.tools()
+    }
+    fn supports_progress(&self) -> bool {
+        true
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.inner.supports_keyed_messages()
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        self.inner
+            .send_message_with_key(message, delivery, key)
+            .await
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.inner.send_message(message, delivery).await
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.inner.call(name, arguments).await
+    }
+    async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+        let data: Vec<u8> = serde_json::from_value(
+            value
+                .get("shellOutput")
+                .cloned()
+                .ok_or_else(|| "invalid shell progress".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        self.output
+            .send(data)
+            .await
+            .map_err(|_| "shell output consumer closed".to_owned())
+    }
+}
+
 struct DetachedHost;
 #[async_trait::async_trait]
 impl ToolHost for DetachedHost {
@@ -2210,6 +2368,9 @@ async fn dispatch_with_host(
             input_hook_host_calls: true,
             context_hook_host_calls: true,
             transition_hook_host_calls: true,
+            resources_hook_host_calls: true,
+            user_bash_hook_host_calls: true,
+            user_bash_stream_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -2259,10 +2420,57 @@ async fn dispatch_with_host(
             }
         }
         ProtocolRequest::UserBash { event, state } => {
-            encode(extension.user_bash(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBashOperations { event, state } => {
-            encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_operations_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            }
+        }
+        ProtocolRequest::ExecuteUserBash {
+            event,
+            state,
+            timeout_secs,
+        } => {
+            let timeout = timeout_secs
+                .map(Duration::try_from_secs_f64)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let result = extension.execute_user_bash_with_host(
+                &event,
+                state.as_ref(),
+                timeout,
+                CancellationToken::new(),
+                sender,
+                host.clone(),
+            );
+            tokio::pin!(result);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    data = receiver.recv(), if open => match data { Some(data) => host.report_progress(serde_json::json!({"shellOutput":data})).await?, None => open = false },
+                    response = &mut result => {
+                        while let Ok(data) = receiver.try_recv() { host.report_progress(serde_json::json!({"shellOutput":data})).await?; }
+                        break encode(response);
+                    }
+                }
+            }
         }
         ProtocolRequest::Lifecycle { event, state } => {
             if host.supports_custom_messages() {
@@ -2276,7 +2484,15 @@ async fn dispatch_with_host(
             }
         }
         ProtocolRequest::DiscoverResources { event, state } => {
-            encode(extension.discover_resources(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .discover_resources_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.discover_resources(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::CacheWarmingDecision { event, state } => encode(
             extension
@@ -3223,7 +3439,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3233,6 +3449,13 @@ else:
     if kind=='input': result={'action':'continue'}
     elif kind=='before_request': result=r['request']
     elif kind=='context_with_system': result=r['messages']
+    elif kind=='user_bash': result=None
+    elif kind=='user_bash_operations': result=False
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':[111,107]}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
     elif kind=='before_tool': result={'allow':True,'reason':None}
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
@@ -3275,6 +3498,55 @@ else:
             .context_with_system_with_host(&mut request.messages, None, host.clone())
             .await
             .unwrap();
+        let bash = pi_rs_core::UserBashEvent {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/workspace".into(),
+        };
+        assert!(
+            extension
+                .user_bash_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !extension
+                .user_bash_operations_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+        );
+        let (output, mut received) = tokio::sync::mpsc::channel(4);
+        assert_eq!(
+            extension
+                .execute_user_bash_with_host(
+                    &bash,
+                    None,
+                    None,
+                    CancellationToken::new(),
+                    output,
+                    host.clone()
+                )
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(received.recv().await.unwrap(), b"ok");
+        let discovered = extension
+            .discover_resources_with_host(
+                &pi_rs_core::ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: pi_rs_core::ResourceDiscoveryReason::Startup,
+                },
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered.prompt_paths,
+            [std::path::PathBuf::from("fixture.md")]
+        );
         assert!(
             !extension
                 .before_session_transition_with_host(
@@ -3325,7 +3597,93 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 7);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test]
+    async fn streamed_shell_dispatch_forwards_output_and_message_host_calls() {
+        struct Host(std::sync::Mutex<Vec<u8>>, std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                self.0.lock().unwrap().extend(
+                    serde_json::from_value::<Vec<u8>>(value["shellOutput"].clone()).unwrap(),
+                );
+                Ok(())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct Shell;
+        #[async_trait::async_trait]
+        impl Extension for Shell {
+            fn id(&self) -> &str {
+                "shell"
+            }
+            async fn execute_user_bash_with_host(
+                &self,
+                _: &pi_rs_core::UserBashEvent,
+                _: Option<&ExtensionState>,
+                _: Option<Duration>,
+                _: CancellationToken,
+                output: tokio::sync::mpsc::Sender<Vec<u8>>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<Option<i32>> {
+                output.send(b"before".to_vec()).await.unwrap();
+                host.send_message(
+                    pi_rs_core::CustomMessage {
+                        custom_type: "shell".into(),
+                        content: pi_rs_core::ContextContent::Text("message".into()),
+                        display: false,
+                        details: None,
+                    },
+                    pi_rs_core::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+                output.send(b"after".to_vec()).await.unwrap();
+                Ok(Some(0))
+            }
+        }
+        let host = Arc::new(Host(
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let result = dispatch_with_host(
+            Arc::new(Shell),
+            ProtocolRequest::ExecuteUserBash {
+                event: pi_rs_core::UserBashEvent {
+                    command: "echo".into(),
+                    exclude_from_context: false,
+                    cwd: "/".into(),
+                },
+                state: None,
+                timeout_secs: None,
+            },
+            host.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!(0));
+        assert_eq!(&*host.0.lock().unwrap(), b"beforeafter");
+        assert_eq!(host.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
