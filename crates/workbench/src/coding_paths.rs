@@ -21,7 +21,15 @@ fn home() -> Option<std::ffi::OsString> {
     home
 }
 
-fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+pub(super) fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    input_with_policy(value, home, false)
+}
+
+pub(super) fn remote_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    input_with_policy(value, home, true)
+}
+
+fn input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Result<PathBuf> {
     let value: String = value
         .chars()
         .map(|ch| match ch {
@@ -29,10 +37,14 @@ fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
             ch => ch,
         })
         .collect();
-    plain_input(value.strip_prefix('@').unwrap_or(&value), home)
+    plain_input_with_policy(value.strip_prefix('@').unwrap_or(&value), home, remote)
 }
 
 fn plain_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    plain_input_with_policy(value, home, false)
+}
+
+fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Result<PathBuf> {
     #[cfg(windows)]
     let windows_value = windows_shell_path(value);
     #[cfg(windows)]
@@ -42,7 +54,14 @@ fn plain_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
         return Ok(if value == "~" {
             home.to_path_buf()
         } else {
-            home.join(&value[2..])
+            let tail = Path::new(&value[2..]);
+            if remote
+                && (tail.has_root()
+                    || matches!(tail.components().next(), Some(Component::Prefix(_))))
+            {
+                return Err(Error::Config("invalid backend home-relative path".into()));
+            }
+            home.join(tail)
         });
     }
     if value.starts_with("file://") {
@@ -71,6 +90,19 @@ pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
         }
     }
     resolved
+}
+
+pub(super) fn resolve_remote(root: &Path, input: &Path) -> Result<PathBuf> {
+    if !input.is_absolute() && matches!(input.components().next(), Some(Component::Prefix(_))) {
+        return Err(Error::Config(
+            "drive-relative backend path is not supported".into(),
+        ));
+    }
+    let path = resolve(root, input);
+    if !path.is_absolute() {
+        return Err(Error::Config("backend path must be absolute".into()));
+    }
+    Ok(path)
 }
 
 pub(super) fn read_candidates(path: &Path) -> Vec<PathBuf> {
