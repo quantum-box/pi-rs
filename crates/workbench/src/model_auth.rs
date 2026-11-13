@@ -17,6 +17,7 @@ pub(super) enum Credential {
     Invalid,
     ChatGpt,
     Kimi,
+    BedrockProfile(String),
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -49,7 +50,8 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
-            | Self::Kimi => None,
+            | Self::Kimi
+            | Self::BedrockProfile(_) => None,
         }
     }
 
@@ -62,12 +64,21 @@ impl Credential {
     }
 
     pub fn requires_resolution(&self) -> bool {
-        self.is_command() || matches!(self, Self::ChatGpt | Self::Kimi | Self::Invalid)
+        self.is_command()
+            || matches!(
+                self,
+                Self::ChatGpt | Self::Kimi | Self::Invalid | Self::BedrockProfile(_)
+            )
     }
 
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
+            Self::BedrockProfile(_) => {
+                return Err(Error::Config(
+                    "AWS profile cannot be used as an API key".into(),
+                ));
+            }
             Self::Invalid => return Err(Error::Config("Invalid model credential".into())),
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -167,26 +178,39 @@ impl Keys {
                     if entry["type"] != "api_key" {
                         return None;
                     }
-                    entry.get("key").map(|key| {
-                        key.as_str().map_or(Credential::Invalid, |value| {
-                            if entry["literal"] == true {
-                                return if valid_key(value) {
-                                    Credential::Literal(value.into())
-                                } else {
-                                    Credential::Invalid
-                                };
-                            }
-                            match Credential::configured_with_env(value, entry["env"].as_object()) {
-                                Some(Credential::Command(command)) => {
-                                    Credential::StoredCommand(command)
-                                }
-                                Some(Credential::Literal(value)) if valid_key(&value) => {
-                                    Credential::Literal(value)
-                                }
-                                _ => Credential::Invalid,
+                    if name.eq_ignore_ascii_case("amazon-bedrock") && entry.get("key").is_none() {
+                        entry["env"]["AWS_PROFILE"].as_str().map(|profile| {
+                            if valid_profile(profile) {
+                                Credential::BedrockProfile(profile.into())
+                            } else {
+                                Credential::Invalid
                             }
                         })
-                    })
+                    } else {
+                        entry.get("key").map(|key| {
+                            key.as_str().map_or(Credential::Invalid, |value| {
+                                if entry["literal"] == true {
+                                    return if valid_key(value) {
+                                        Credential::Literal(value.into())
+                                    } else {
+                                        Credential::Invalid
+                                    };
+                                }
+                                match Credential::configured_with_env(
+                                    value,
+                                    entry["env"].as_object(),
+                                ) {
+                                    Some(Credential::Command(command)) => {
+                                        Credential::StoredCommand(command)
+                                    }
+                                    Some(Credential::Literal(value)) if valid_key(&value) => {
+                                        Credential::Literal(value)
+                                    }
+                                    _ => Credential::Invalid,
+                                }
+                            })
+                        })
+                    }
                 };
                 let endpoint = match entry.get("endpoint") {
                     None => Provider::named(name)
@@ -388,6 +412,31 @@ async fn save_openrouter_oauth_at(path: &std::path::Path, key: &str) -> Result<(
     .await
 }
 
+pub(super) fn valid_profile(profile: &str) -> bool {
+    !profile.trim().is_empty() && profile.len() <= 1024 && !profile.chars().any(char::is_control)
+}
+
+pub(super) fn save_bedrock_profile(profile: Option<&str>) -> Result<()> {
+    if profile.is_some_and(|profile| !valid_profile(profile)) {
+        return Err(Error::Config("Enter a valid AWS profile name".into()));
+    }
+    save_bedrock_profile_at(&config::agent_dir().join("auth.json"), profile)
+}
+
+fn save_bedrock_profile_at(path: &std::path::Path, profile: Option<&str>) -> Result<()> {
+    if profile.is_some_and(|profile| !valid_profile(profile)) {
+        return Err(Error::Config("Enter a valid AWS profile name".into()));
+    }
+    config::update_object(path, |data| {
+        let value = match profile {
+            Some(profile) => json!({"type":"api_key", "env":{"AWS_PROFILE":profile}}),
+            None => json!({"type":"api_key"}),
+        };
+        data.insert("amazon-bedrock".into(), value);
+        Ok(())
+    })
+}
+
 pub(super) fn remove(provider: &Provider) -> Result<bool> {
     let mut removed = false;
     config::update_object(&config::agent_dir().join("auth.json"), |data| {
@@ -411,6 +460,33 @@ pub(super) fn valid_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bedrock_profile_and_chain_restore_in_pi_format() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"other":{"type":"api_key","key":"keep"}}"#).unwrap();
+        save_bedrock_profile_at(&path, Some("work profile")).unwrap();
+        let value = config::read_object(&path).unwrap();
+        assert_eq!(
+            value["amazon-bedrock"],
+            json!({"type":"api_key","env":{"AWS_PROFILE":"work profile"}})
+        );
+        assert_eq!(value["other"]["key"], "keep");
+        let keys = Keys::load_path(&path).unwrap();
+        assert!(
+            matches!(keys.credential(&Provider::Bedrock, ""), Some(Credential::BedrockProfile(profile)) if profile == "work profile")
+        );
+        assert!(save_bedrock_profile_at(&path, Some("bad\nprofile")).is_err());
+        save_bedrock_profile_at(&path, None).unwrap();
+        let keys = Keys::load_path(&path).unwrap();
+        assert!(keys.has(&Provider::Bedrock));
+        assert!(keys.credential(&Provider::Bedrock, "").is_none());
+        assert_eq!(
+            config::read_object(&path).unwrap()["amazon-bedrock"],
+            json!({"type":"api_key"})
+        );
+    }
     use super::*;
 
     #[tokio::test]
