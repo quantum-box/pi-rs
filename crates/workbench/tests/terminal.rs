@@ -258,6 +258,157 @@ fn debug_command_writes_session_snapshot() {
 }
 
 #[test]
+fn delayed_thinking_callback_preserves_the_next_selection() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let session_path = root.path().join("session.jsonl");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#,
+    ).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let extension = root.path().join("selection.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, socket, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+elif request['type'] == 'lifecycle':
+    event = request['event']
+    if event.get('type') == 'thinking_level_select' and event.get('level') == 'low':
+        host, port = os.environ['PI_RS_TEST_SELECTION_GATE'].rsplit(':', 1)
+        with socket.create_connection((host, int(port)), timeout=10) as gate:
+            gate.sendall(b'S')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('selection gate was not released')
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    result = None
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env(
+                "PI_RS_TEST_SELECTION_GATE",
+                listener.local_addr().unwrap().to_string(),
+            )
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--thinking",
+                "off",
+                "--session",
+            ])
+            .arg(&session_path)
+            .arg("--extension")
+            .arg(&extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/thinking low\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut gate = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                let mut output = [0; 8192];
+                let _ = master.read(&mut output);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("first selection callback did not start: {error}"),
+        }
+    };
+    gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut started = [0];
+    gate.read_exact(&mut started).unwrap();
+    assert_eq!(&started, b"S");
+    // Queue the second selection while the first callback is still held.
+    master.write_all(b"/thinking high\r").unwrap();
+    assert!(!home.join("events.jsonl").exists());
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(
+        session
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some("low")),
+        "the UI must not apply the queued selection before the callback completes"
+    );
+    gate.write_all(b"G").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let events = loop {
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if events.len() >= 2 {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "selection callbacks did not complete: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        events,
+        vec![
+            serde_json::json!({"type":"thinking_level_select", "level":"low", "previousLevel":"off"}),
+            serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"}),
+        ]
+    );
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(
+        session
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some("high"))
+    );
+}
+
+#[test]
 fn thinking_command_notifies_native_extension_from_terminal() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
