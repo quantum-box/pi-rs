@@ -676,7 +676,8 @@ fn imported_message(
     let mut message = if source["type"] == "custom_message" {
         let mut custom = json!({
             "role":"custom","customType":source["customType"],
-            "content":source["content"],"display":source["display"],"timestamp":timestamp
+            "content":source.get("content").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!([])),
+            "display":source["display"],"timestamp":timestamp
         });
         if let Some(details) = source.get("details") {
             custom["details"] = details.clone();
