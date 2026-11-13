@@ -10,7 +10,7 @@ use crate::{
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
-type BranchModels = BTreeMap<(Option<Uuid>, String), Arc<dyn crate::Model>>;
+type BranchModels = BTreeMap<(Option<Uuid>, Option<String>, String), Arc<dyn crate::Model>>;
 
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
@@ -1087,7 +1087,7 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
-            .insert((None, name), model);
+            .insert((None, None, name), model);
         Ok(())
     }
 
@@ -1103,8 +1103,37 @@ impl Registry {
         self.branch_models
             .write()
             .expect("branch models")
-            .insert((Some(session_id), name), model);
+            .insert((Some(session_id), None, name), model);
         Ok(())
+    }
+    /// Register an exact provider/model identity for a single journal.
+    pub fn register_session_provider_model(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        if provider.trim().is_empty() || name.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        self.branch_models.write().expect("branch models").insert(
+            (Some(session_id), Some(provider.to_owned()), name.to_owned()),
+            model,
+        );
+        Ok(())
+    }
+    pub(crate) fn provider_branch_model(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+    ) -> Option<Arc<dyn crate::Model>> {
+        self.branch_models
+            .read()
+            .expect("branch models")
+            .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+            .cloned()
     }
     pub(crate) fn branch_model(
         &self,
@@ -1113,26 +1142,27 @@ impl Registry {
     ) -> Option<Arc<dyn crate::Model>> {
         let models = self.branch_models.read().expect("branch models");
         models
-            .get(&(Some(session_id), name.to_owned()))
-            .or_else(|| models.get(&(None, name.to_owned())))
+            .get(&(Some(session_id), None, name.to_owned()))
+            .or_else(|| models.get(&(None, None, name.to_owned())))
             .cloned()
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
         let mut models = self.branch_models.write().expect("branch models");
         let copies: Vec<_> = models
             .iter()
-            .filter(|((owner, _), _)| *owner == Some(source))
-            .map(|((_, name), model)| (name.clone(), model.clone()))
+            .filter(|((owner, _, _), _)| *owner == Some(source))
+            .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
             .collect();
-        for (name, model) in copies {
-            models.insert((Some(destination), name), model);
+        for (provider, name, model) in copies {
+            models.insert((Some(destination), provider, name), model);
         }
     }
-    pub(crate) fn remove_session_branch_models(&self, session_id: Uuid) {
+    /// Remove recovery clients for a session before rebuilding its host configuration.
+    pub fn remove_session_branch_models(&self, session_id: Uuid) {
         self.branch_models
             .write()
             .expect("branch models")
-            .retain(|(owner, _), _| *owner != Some(session_id));
+            .retain(|(owner, _, _), _| *owner != Some(session_id));
     }
     /// Allow tools that opt out to run without the host's default timeout.
     /// Explicitly configured host timeouts should leave this disabled.

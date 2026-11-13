@@ -234,6 +234,7 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let selected_provider = session.model_provider().map(str::to_owned);
         let handoff = if input.is_none() {
             match session.begin_tree_trigger_handoff(run_id) {
                 Ok(handoff) => handoff,
@@ -281,11 +282,23 @@ impl Agent<'_> {
         let branch_model = handoff
             .as_ref()
             .and_then(|_| session.model_selection().map(|selection| selection.0));
+        let provider_changed =
+            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
         let model = match branch_model
             .as_deref()
-            .filter(|name| *name != self.model_name)
+            .filter(|name| *name != self.model_name || provider_changed)
         {
-            Some(name) => match self.registry.branch_model(session.session_id(), name) {
+            Some(name) => match session
+                .model_provider()
+                .and_then(|provider| {
+                    self.registry
+                        .provider_branch_model(session.session_id(), provider, name)
+                })
+                .or_else(|| {
+                    (!provider_changed)
+                        .then(|| self.registry.branch_model(session.session_id(), name))
+                        .flatten()
+                }) {
                 Some(model) => Some(model),
                 None => {
                     let error = if let Some((return_to, _)) = handoff {
@@ -341,6 +354,7 @@ impl Agent<'_> {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
+            let selected_provider = session.model_provider().map(str::to_owned);
             let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
                 Ok(Some((return_to, records))) => {
                     for record in &records {
@@ -366,11 +380,23 @@ impl Agent<'_> {
             observer(Notification::RunStarted { run_id: trigger_id });
             let branch_model =
                 handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
+            let provider_changed =
+                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
             let model = match branch_model
                 .as_deref()
-                .filter(|name| *name != self.model_name)
+                .filter(|name| *name != self.model_name || provider_changed)
             {
-                Some(name) => match self.registry.branch_model(session.session_id(), name) {
+                Some(name) => match session
+                    .model_provider()
+                    .and_then(|provider| {
+                        self.registry
+                            .provider_branch_model(session.session_id(), provider, name)
+                    })
+                    .or_else(|| {
+                        (!provider_changed)
+                            .then(|| self.registry.branch_model(session.session_id(), name))
+                            .flatten()
+                    }) {
                     Some(model) => Some(model),
                     None => {
                         session.set_run_id(None);

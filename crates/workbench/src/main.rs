@@ -2106,7 +2106,7 @@ async fn execute(
             {
                 return Err(Error::DuplicateRun(run_id));
             }
-            let trigger = runtime.agent(&args, session.session_id()).extension_command_with_trigger(
+            let trigger = runtime.agent(&args, &session).extension_command_with_trigger(
                 &mut session, extension_id, extension_command, arguments,
                 &mut |event| observe(event, args.trace),
             )?;
@@ -2128,7 +2128,7 @@ async fn execute(
             command = Command::Resume;
         }
         let registry = &runtime.registry;
-        let agent = runtime.agent(&args, session.session_id());
+        let agent = runtime.agent(&args, &session);
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
@@ -2416,7 +2416,7 @@ async fn run_pending_custom_trigger(
     if args.run_id == Some(run_id) {
         return Ok(());
     }
-    let agent = runtime.agent(args, session.session_id());
+    let agent = runtime.agent(args, session);
     let (_sender, mut inputs) = mpsc::channel::<pi_rs::AgentInput>(32);
     let answer = agent
         .run_correlated(

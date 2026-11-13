@@ -685,7 +685,7 @@ async fn run_worker(
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
             cache_capture.initialize(session, &runtime.registry);
-            let agent = runtime.agent(&args, session.session_id());
+            let agent = runtime.agent(&args, session);
             let mut observer = |event: pi_rs::Notification<'_>| {
                 cache_capture.observe(&event);
                 observe_snapshot(event, args.trace, &snapshot);
@@ -820,7 +820,7 @@ async fn run_worker(
                                 runtime.refresh_mcp(&args).await
                             } => result?,
                         }
-                        let agent = runtime.agent(&args, session.session_id());
+                        let agent = runtime.agent(&args, session);
                         let answer = Box::pin(agent.run_correlated(
                             session,
                             Uuid::new_v4(),

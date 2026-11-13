@@ -5629,3 +5629,173 @@ fn cancelled_mcp_logout_does_not_wait_for_held_refresh_lock() {
     );
     assert_eq!(std::fs::read(credentials).unwrap(), b"unchanged");
 }
+
+#[test]
+fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
+    use pi_rs::{
+        ContextContent, CustomMessage, CustomMessageDelivery, Event, QueuedCustomMessage, Record,
+        RunState,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let selected = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint_a = format!("http://{}/v1", origin.local_addr().unwrap());
+    let endpoint_b = format!("http://{}/v1", selected.local_addr().unwrap());
+    std::fs::write(home.join("models.json"), json!({"providers":{
+        "relay-a":{"api":"openai-completions","baseUrl":endpoint_a,"apiKey":"key-a","models":[{"id":"shared"}]},
+        "relay-b":{"api":"openai-completions","baseUrl":endpoint_b,"apiKey":"key-b","models":[{"id":"shared"}]}
+    }}).to_string()).unwrap();
+    let trigger = uuid::Uuid::new_v4();
+    let message = CustomMessage {
+        custom_type: "tree".into(),
+        content: ContextContent::Text("trigger from A".into()),
+        display: false,
+        details: None,
+    };
+    let events = vec![
+        (
+            None,
+            None,
+            Event::Created {
+                session_id: uuid::Uuid::new_v4(),
+            },
+        ),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-a".into()),
+            },
+        ),
+        (
+            Some(2),
+            None,
+            Event::TreeMessageQueued {
+                input: QueuedCustomMessage {
+                    id: trigger,
+                    delivery: CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+            },
+        ),
+        (
+            Some(3),
+            Some(trigger),
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+        ),
+        (
+            Some(4),
+            Some(trigger),
+            Event::CustomMessageDelivered {
+                id: trigger,
+                message,
+            },
+        ),
+        (Some(5), None, Event::Checkout { target: 1 }),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-b".into()),
+            },
+        ),
+        (
+            Some(7),
+            None,
+            Event::User {
+                content: "selected branch B".into(),
+                input_id: None,
+            },
+        ),
+    ];
+    let records: Vec<Record> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, (parent, run_id, event))| Record {
+            id: index as u64 + 1,
+            parent,
+            run_id,
+            event,
+            version: 3,
+            timestamp: None,
+        })
+        .collect();
+    let path = root.path().join("session.jsonl");
+    Session::from_records(records)
+        .unwrap()
+        .export_jsonl(&path)
+        .unwrap();
+    let serve = |listener: TcpListener, expected: &'static str| {
+        std::thread::spawn(move || {
+            let (mut socket, mut reader, request) = accept_proxy_request(listener);
+            assert!(request.starts_with("POST "), "{request}");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line.to_ascii_lowercase());
+            }
+            assert!(
+                headers.contains(&format!("authorization: bearer {expected}")),
+                "{headers}"
+            );
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "shared");
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        })
+    };
+    let a = serve(origin, "key-a");
+    let b = serve(selected, "key-b");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "relay-b",
+            "--model",
+            "shared",
+            "--print",
+            "new prompt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    a.join().unwrap();
+    b.join().unwrap();
+    let session = Session::open(&path).unwrap();
+    assert_eq!(session.model_provider(), Some("relay-b"));
+    assert!(session.branch().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "selected branch B")));
+    assert_eq!(session.pending_custom_trigger(), None);
+}

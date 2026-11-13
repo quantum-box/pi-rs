@@ -242,7 +242,44 @@ impl Runtime {
         json!({"commands":commands})
     }
 
-    pub fn agent<'a>(&'a self, args: &'a Cli, session_id: uuid::Uuid) -> Agent<'a> {
+    pub fn agent<'a>(&'a self, args: &'a Cli, session: &Session) -> Agent<'a> {
+        let session_id = session.session_id();
+        self.registry.remove_session_branch_models(session_id);
+        // Resolve every recorded identity through its own configured provider.
+        // The journal id scopes the cache so credentials cannot cross sessions.
+        for record in session.records() {
+            let pi_rs::Event::ModelSelected {
+                provider: Some(provider),
+                model,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            let Some(selected) = args.model_profiles.provider(provider) else {
+                continue;
+            };
+            let mut branch_args = args.clone();
+            if branch_args
+                .activate_provider(selected, Some(model))
+                .is_err()
+            {
+                continue;
+            }
+            branch_args.model = model.clone();
+            if let Ok(client) = model_client(
+                &branch_args,
+                super::thinking::reported(&branch_args).is_some(),
+                true,
+            ) {
+                let _ = self.registry.register_session_provider_model(
+                    session_id,
+                    provider,
+                    model,
+                    Arc::new(client),
+                );
+            }
+        }
         self.shell.set_context(ShellContext {
             id: session_id,
             path: (!args.no_session && !args.ephemeral_worker_session)

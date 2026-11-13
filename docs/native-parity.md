@@ -2826,10 +2826,11 @@ extension state is refreshed at both boundaries. If the originating branch
 selected a different model, the host must register its model instance with
 `SessionBuilder::branch_model`, `AgentSession::register_branch_model`, or
 `Registry::register_branch_model`; otherwise recovery reports an error without
-running the wrong model. Differently named providers require the host to switch
-the current provider before recovery. Registrations are scoped by session and
-model name; journals do not distinguish two runtime instances with the same
-provider and model name. Immediate idle messages remain on the branch where
+running the wrong model. The workbench resolves recorded provider/model selections
+from its current configuration and registers them per session for recovery.
+Cross-provider recovery requires an exact provider/model registration; absent
+credentials or configuration leave the trigger pending with an error. Journals
+do not distinguish two runtime instances with the same provider and model name. Immediate idle messages remain on the branch where
 they were sent.
 
 Focused tests cover queue and tool-result ordering, callback reentrancy,

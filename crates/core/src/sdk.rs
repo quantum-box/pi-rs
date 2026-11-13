@@ -3083,6 +3083,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_provider_tree_handoff_uses_registered_origin_after_reopen() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let model_a = Arc::new(BranchModelProbe {
+            expected: "model-A",
+            names: names.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            waits: AtomicUsize::new(0),
+        });
+        let model_b = Arc::new(BranchModelProbe {
+            expected: "model-B",
+            names: names.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            waits: AtomicUsize::new(0),
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("provider-a"), "model-A", None)
+            .unwrap();
+        journal
+            .append(crate::Event::ExtensionStates {
+                states: [(
+                    "branch-state-hook".into(),
+                    crate::ExtensionState {
+                        version: 1,
+                        data: serde_json::json!("A"),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+        journal
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let trigger_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "branch-trigger".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(trigger_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: trigger_id,
+                message,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("provider-b"), "model-B", None)
+            .unwrap();
+        journal
+            .append(crate::Event::ExtensionStates {
+                states: [(
+                    "branch-state-hook".into(),
+                    crate::ExtensionState {
+                        version: 1,
+                        data: serde_json::json!("B"),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+        journal
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let journal = Session::from_records(journal.records().to_vec()).unwrap();
+        let mut session = SessionBuilder::new(model_b, "model-B")
+            .extension(Arc::new(BranchStateHook(seen.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .registry
+            .register_session_provider_model(
+                session.session.session_id(),
+                "provider-a",
+                "model-A",
+                model_a.clone(),
+            )
+            .unwrap();
+        let active = session.begin_run();
+        let control = session.controls();
+        let observer_control = control.clone();
+        let mut observe = move |event: Notification<'_>| observer_control.observe(&event);
+        let agent = Agent {
+            model: session.model.as_ref(),
+            model_name: &session.model_name,
+            registry: &session.registry,
+            system_prompt: &session.system_prompt,
+            limits: session.limits.clone(),
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session.session,
+                    Uuid::new_v4(),
+                    Some("B prompt".into()),
+                    &mut session.input,
+                    &active.token,
+                    &mut observe
+                ),
+                async {
+                    model_a.entered.notified().await;
+                    control.steer("during A").await.unwrap();
+                    model_a.release.notify_one();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "done");
+        control.steer("after B").await.unwrap();
+        active
+            .finish_inputs(&mut session.session, &mut session.input, &mut observe)
+            .unwrap();
+        assert_eq!(&*seen.lock().unwrap(), &["A", "B"]);
+        let names = names.lock().unwrap();
+        assert_eq!(names[0], "model-B");
+        assert!(names[1..].iter().all(|name| name == "model-A"));
+        assert!(session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
+        assert!(!session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+    }
+
+    #[tokio::test]
     async fn missing_tree_branch_model_is_reported_then_recovers_after_registration() {
         let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
         journal
@@ -3161,6 +3307,37 @@ mod tests {
         );
         assert_eq!(model_a.0.load(Ordering::SeqCst), 1);
         assert_eq!(model_b.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn recovery_registry_separates_providers_with_the_same_model_name() {
+        let registry = Registry::default();
+        let session_id = Uuid::new_v4();
+        let first: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let second: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
+        registry
+            .register_session_provider_model(session_id, "provider-a", "shared", first.clone())
+            .unwrap();
+        registry
+            .register_session_provider_model(session_id, "provider-b", "shared", second.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &registry
+                .provider_branch_model(session_id, "provider-a", "shared")
+                .unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &registry
+                .provider_branch_model(session_id, "provider-b", "shared")
+                .unwrap(),
+            &second
+        ));
+        assert!(
+            registry
+                .provider_branch_model(Uuid::new_v4(), "provider-a", "shared")
+                .is_none()
+        );
     }
 
     #[test]

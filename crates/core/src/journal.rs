@@ -1357,23 +1357,6 @@ impl Session {
             return Ok(None);
         }
         ensure_settled(self.operations())?;
-        let current_provider = self.model_provider();
-        let target_provider = self
-            .path(target)
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
-                Event::ModelSelected { provider, .. } => Some(provider.as_deref()),
-                _ => None,
-            })
-            .flatten();
-        if let (Some(current), Some(target)) = (current_provider, target_provider)
-            && current != target
-        {
-            return Err(Error::Config(format!(
-                "tree trigger recovery requires provider {target}; current provider is {current}"
-            )));
-        }
         let return_to = self.head;
         let marker = self
             .append(Event::TreeTriggerHandoff { run_id, return_to })?
@@ -2991,7 +2974,7 @@ mod session_metadata_tests {
     }
 
     #[test]
-    fn tree_trigger_handoff_rejects_a_different_named_provider_without_switching() {
+    fn tree_trigger_handoff_can_checkout_a_different_named_provider() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session
             .select_provider_model(Some("provider-a"), "model-a", None)
@@ -3024,9 +3007,14 @@ mod session_metadata_tests {
             .select_provider_model(Some("provider-b"), "model-b", None)
             .unwrap();
         let before = session.head();
-        let error = session.begin_tree_trigger_handoff(trigger).unwrap_err();
-        assert!(error.to_string().contains("requires provider provider-a"));
-        assert_eq!(session.head(), before);
+        let (return_to, _) = session
+            .begin_tree_trigger_handoff(trigger)
+            .unwrap()
+            .unwrap();
+        assert_eq!(return_to, before);
+        assert_eq!(session.model_provider(), Some("provider-a"));
+        session.finish_tree_trigger_handoff(return_to).unwrap();
+        assert_eq!(session.model_provider(), Some("provider-b"));
         assert_eq!(session.pending_custom_trigger(), Some(trigger));
     }
 
