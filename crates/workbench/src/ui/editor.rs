@@ -124,6 +124,7 @@ impl Editor {
                 }
             } else {
                 self.kills.insert(0, removed.into());
+                self.kills.truncate(30);
             }
             self.last_kill = true;
         }
@@ -395,6 +396,27 @@ mod tests {
         editor.action("tui.editor.deleteToLineEnd");
         editor.action("tui.editor.yank");
         assert_eq!(editor.text, "one two\n三 four");
+    }
+
+    #[test]
+    fn kill_ring_limits_separate_entries_but_accumulates_consecutive_kills() {
+        let mut editor = Editor::default();
+        for index in 0..35 {
+            editor.replace(format!("entry{index}"));
+            editor.action("tui.editor.deleteToLineStart");
+        }
+        assert_eq!(editor.kills.len(), 30);
+        assert_eq!(editor.kills.first().unwrap(), "entry34");
+        assert_eq!(editor.kills.last().unwrap(), "entry5");
+
+        editor.replace("joined tail".into());
+        editor.action("tui.editor.deleteWordBackward");
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.kills.len(), 30);
+        assert_eq!(editor.kills.first().unwrap(), "joined tail");
+        assert_eq!(editor.kills.last().unwrap(), "entry6");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "joined tail");
     }
 
     #[test]
