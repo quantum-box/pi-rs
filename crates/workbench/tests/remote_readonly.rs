@@ -5,25 +5,36 @@ use pi_rs_remote_ls::{LsOperations, LsStat};
 use pi_rs_workbench::{coding::ReadOperations, coding_factories::create_remote_read_only_tools};
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 #[derive(Default)]
-struct Backend(Mutex<Vec<(&'static str, PathBuf)>>);
+struct Backend {
+    calls: Mutex<Vec<(&'static str, PathBuf)>>,
+    files: BTreeMap<PathBuf, String>,
+}
 impl Backend {
     fn record(&self, name: &'static str, path: &Path) {
-        self.0.lock().unwrap().push((name, path.into()));
+        self.calls.lock().unwrap().push((name, path.into()));
     }
 }
 #[async_trait::async_trait]
 impl ReadOperations for Backend {
     async fn access(&self, p: &Path) -> Result<()> {
         self.record("read", p);
-        Ok(())
+        if self.files.contains_key(p) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
     }
-    async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
-        Ok(b"remote".to_vec())
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        self.files
+            .get(path)
+            .map(|s| s.as_bytes().to_vec())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound).into())
     }
     async fn detect_image_mime_type(&self, _: &Path) -> Result<Option<String>> {
         Ok(None)
@@ -35,8 +46,12 @@ impl FindOperations for Backend {
         self.record("find", p);
         Ok(true)
     }
-    async fn glob(&self, _: &str, _: &Path, _: FindOptions) -> Result<Vec<PathBuf>> {
-        Ok(vec!["file".into()])
+    async fn glob(&self, _: &str, cwd: &Path, _: FindOptions) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .files
+            .keys()
+            .filter_map(|path| path.strip_prefix(cwd).ok().map(Path::to_owned))
+            .collect())
     }
 }
 #[async_trait::async_trait]
@@ -47,20 +62,28 @@ impl GrepOperations for Backend {
     }
     async fn search(
         &self,
-        _: GrepRequest,
+        request: GrepRequest,
         _: CancellationToken,
         output: tokio::sync::mpsc::Sender<GrepMatch>,
     ) -> Result<()> {
-        output
-            .send(GrepMatch {
-                path: "file".into(),
-                line_number: 1,
-                line: "remote".into(),
-                before: vec![],
-                after: vec![],
-            })
-            .await
-            .unwrap();
+        for (path, contents) in &self.files {
+            if let Ok(relative) = path.strip_prefix(&request.path) {
+                for (index, line) in contents.lines().enumerate() {
+                    if line.contains(&request.pattern) {
+                        output
+                            .send(GrepMatch {
+                                path: relative.to_string_lossy().into_owned(),
+                                line_number: index as u64 + 1,
+                                line: line.into(),
+                                before: vec![],
+                                after: vec![],
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -73,8 +96,12 @@ impl LsOperations for Backend {
     async fn stat(&self, _: &Path) -> Result<LsStat> {
         Ok(LsStat { is_directory: true })
     }
-    async fn readdir(&self, _: &Path) -> Result<Vec<String>> {
-        Ok(vec![])
+    async fn readdir(&self, path: &Path) -> Result<Vec<String>> {
+        Ok(self
+            .files
+            .keys()
+            .filter_map(|file| file.strip_prefix(path).ok()?.to_str().map(str::to_owned))
+            .collect())
     }
 }
 fn context() -> ToolContext {
@@ -88,7 +115,10 @@ async fn all_tools_share_backend_and_home_without_local_files() {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("remote-root");
     let home = base.path().join("remote-home");
-    let backend = Arc::new(Backend::default());
+    let backend = Arc::new(Backend {
+        calls: Mutex::new(vec![]),
+        files: [(home.join("dir/file"), "remote needle".into())].into(),
+    });
     let set = create_remote_read_only_tools(&root, backend.clone(), Some(home.clone())).unwrap();
     let tools = set.tools();
     assert_eq!(
@@ -98,23 +128,31 @@ async fn all_tools_share_backend_and_home_without_local_files() {
     for tool in tools {
         let name = tool.spec().name;
         let args = match name.as_str() {
-            "grep" => json!({"path":"~/dir", "pattern":"x"}),
+            "grep" => json!({"path":"~/dir", "pattern":"needle"}),
             "find" => json!({"path":"~/dir", "pattern":"*"}),
+            "read" => json!({"path":"~/dir/file"}),
             _ => json!({"path":"~/dir"}),
         };
         let result = tool.invoke(args, context()).await;
+        let output = match result {
+            Outcome::Succeeded(text) | Outcome::SucceededWithDetails { output: text, .. } => text,
+            other => panic!("{name}: {other:?}"),
+        };
         assert!(
-            matches!(
-                result,
-                Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
-            ),
-            "{name}: {result:?}"
+            output.contains(match name.as_str() {
+                "read" | "grep" => "remote needle",
+                _ => "file",
+            }),
+            "{name}: {output}"
         );
     }
-    let calls = backend.0.lock().unwrap();
+    let calls = backend.calls.lock().unwrap();
     assert_eq!(calls.len(), 4);
-    for (_, path) in calls.iter() {
-        assert_eq!(path, &home.join("dir"));
+    for (name, path) in calls.iter() {
+        assert_eq!(
+            path,
+            &home.join(if *name == "read" { "dir/file" } else { "dir" })
+        );
     }
 }
 #[tokio::test]
@@ -125,8 +163,9 @@ async fn absent_home_rejects_tilde_for_all_tools_before_backend_calls() {
     for tool in set.tools() {
         let name = tool.spec().name;
         let args = match name.as_str() {
-            "grep" => json!({"path":"~/dir", "pattern":"x"}),
+            "grep" => json!({"path":"~/dir", "pattern":"needle"}),
             "find" => json!({"path":"~/dir", "pattern":"*"}),
+            "read" => json!({"path":"~/dir/file"}),
             _ => json!({"path":"~/dir"}),
         };
         assert!(matches!(
@@ -134,7 +173,7 @@ async fn absent_home_rejects_tilde_for_all_tools_before_backend_calls() {
             Outcome::Failed(_)
         ));
     }
-    assert!(backend.0.lock().unwrap().is_empty());
+    assert!(backend.calls.lock().unwrap().is_empty());
 }
 
 struct ModelScript(Mutex<Vec<pi_rs::ModelRequest>>);
@@ -145,8 +184,8 @@ impl pi_rs::Model for ModelScript {
         requests.push(request);
         let calls = if requests.len() == 1 {
             [
-                ("read", json!({"path":"~/dir"})),
-                ("grep", json!({"path":"~/dir", "pattern":"x"})),
+                ("read", json!({"path":"~/dir/file"})),
+                ("grep", json!({"path":"~/dir", "pattern":"needle"})),
                 ("find", json!({"path":"~/dir", "pattern":"*"})),
                 ("ls", json!({"path":"~/dir"})),
             ]
@@ -168,8 +207,11 @@ impl pi_rs::Model for ModelScript {
 #[tokio::test]
 async fn model_calls_use_one_remote_namespace() {
     let base = tempfile::tempdir().unwrap();
-    let backend = Arc::new(Backend::default());
     let home = base.path().join("backend-home");
+    let backend = Arc::new(Backend {
+        calls: Mutex::new(vec![]),
+        files: [(home.join("dir/file"), "remote needle".into())].into(),
+    });
     let set = create_remote_read_only_tools(
         &base.path().join("backend-root"),
         backend.clone(),
@@ -203,15 +245,35 @@ async fn model_calls_use_one_remote_namespace() {
         .messages
         .iter()
         .filter_map(|m| {
-            if let pi_rs::Message::Tool { is_error, .. } = m {
-                Some(*is_error)
+            if let pi_rs::Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } = m
+            {
+                Some((call_id, content, is_error))
             } else {
                 None
             }
         })
         .collect();
-    assert_eq!(results, [false; 4]);
-    let calls = backend.0.lock().unwrap();
+    assert_eq!(results.len(), 4);
+    for (id, content, is_error) in results {
+        assert!(!is_error, "{id}: {content}");
+        assert!(
+            content.contains(match id.as_str() {
+                "read" | "grep" => "remote needle",
+                _ => "file",
+            }),
+            "{id}: {content}"
+        );
+    }
+    let calls = backend.calls.lock().unwrap();
     assert_eq!(calls.len(), 4);
-    assert!(calls.iter().all(|(_, path)| path == &home.join("dir")));
+    assert!(
+        calls.iter().all(
+            |(name, path)| path == &home.join(if *name == "read" { "dir/file" } else { "dir" })
+        )
+    );
 }
