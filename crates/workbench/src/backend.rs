@@ -839,7 +839,7 @@ async fn run_worker(
                     ..
                 } => {
                     agent
-                        .compact_with_host(
+                        .compact_with_host_and_inputs(
                             session,
                             Compaction {
                                 summary,
@@ -847,6 +847,7 @@ async fn run_worker(
                             },
                             &cancel,
                             &mut observer,
+                            &mut queued,
                         )
                         .await?
                 }

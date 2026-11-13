@@ -129,7 +129,7 @@ pub enum Notification<'a> {
     },
     Retry(crate::RetryEvent),
     Committed(&'a Record),
-    /// The session switched branch; host-side hook state must be replaced.
+    /// The session switched branch; replace host hook state. May contain private extension data.
     BranchState(&'a ExtensionStates),
     /// The following model request generates a compaction summary.
     SummaryRequest,
@@ -2463,9 +2463,36 @@ impl Agent<'_> {
     ) -> Result<()> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
-        self.commit_compaction_with_host(session, compaction, &states, None, None, cancel, observer)
-            .await
-            .map(|_| ())
+        self.commit_compaction_with_host::<AgentInput>(
+            session, compaction, &states, None, None, cancel, observer, None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Compact while also servicing queue controls submitted during hooks.
+    pub async fn compact_with_host_and_inputs(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: &mut mpsc::Receiver<AgentInput>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host(
+            session,
+            compaction,
+            &states,
+            None,
+            None,
+            cancel,
+            observer,
+            Some(inputs),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Commit a caller-supplied summary using configured token retention.
@@ -2517,7 +2544,7 @@ impl Agent<'_> {
                 .keep_recent_tokens,
             1,
         )?;
-        self.commit_compaction_with_host(
+        self.commit_compaction_with_host::<AgentInput>(
             session,
             Compaction {
                 summary,
@@ -2528,6 +2555,7 @@ impl Agent<'_> {
             Some(retention),
             cancel,
             observer,
+            None,
         )
         .await
         .map(|_| ())
@@ -3145,7 +3173,7 @@ impl Agent<'_> {
         states: &ExtensionStates,
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
-        inputs: Option<&mut mpsc::Receiver<T>>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<(u32, bool)> {
         let SummaryScope {
             retention,
@@ -3216,7 +3244,7 @@ impl Agent<'_> {
                 transformed,
                 cancel,
                 observer,
-                inputs,
+                inputs.as_deref_mut(),
             )
             .await?
             .outcome?;
@@ -3254,6 +3282,7 @@ impl Agent<'_> {
                 Some(retention),
                 cancel,
                 observer,
+                inputs,
             )
             .await?;
         Ok((output as u32, from_extension))
@@ -3291,7 +3320,7 @@ impl Agent<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn commit_compaction_with_host(
+    async fn commit_compaction_with_host<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         mut compaction: Compaction,
@@ -3300,6 +3329,7 @@ impl Agent<'_> {
         minimum_retention: Option<RetentionPlan>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<bool> {
         let original_summary = compaction.summary.clone();
         for extension in &self.registry.extensions {
@@ -3318,6 +3348,7 @@ impl Agent<'_> {
                 cancel,
                 self.limits.tool_timeout,
                 observer,
+                &mut inputs,
             )
             .await?;
             if let Decision::Deny(reason) = hook(extension.as_ref(), result)? {
@@ -3354,6 +3385,7 @@ impl Agent<'_> {
                 cancel,
                 self.limits.tool_timeout,
                 observer,
+                &mut inputs,
             )
             .await?;
             if let Some(state) = hook(extension.as_ref(), result)? {
@@ -3709,7 +3741,8 @@ type CallbackMessageSender = mpsc::Sender<(
     oneshot::Sender<std::result::Result<(), String>>,
 )>;
 
-async fn serve_compaction_hook<T>(
+#[allow(clippy::too_many_arguments)]
+async fn serve_compaction_hook<T, I: Into<AgentInput> + Send>(
     session: &mut Session,
     mut incoming: mpsc::Receiver<(
         crate::QueuedCustomMessage,
@@ -3720,6 +3753,7 @@ async fn serve_compaction_hook<T>(
     cancel: &CancellationToken,
     timeout: Duration,
     observer: &mut Observer<'_>,
+    inputs: &mut Option<&mut mpsc::Receiver<I>>,
 ) -> Result<crate::ExtensionResult<T>> {
     let future = tokio::time::timeout(timeout, future);
     tokio::pin!(future);
@@ -3735,6 +3769,7 @@ async fn serve_compaction_hook<T>(
                 };
                 match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
             }
+            Some(input) = receive_input(inputs) => queue_input(session, input.into(), observer)?,
             result = &mut future => return result.map_err(|_| Error::Config("compaction hook timed out".into())),
         }
     }

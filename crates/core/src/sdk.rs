@@ -1253,7 +1253,13 @@ impl AgentSession {
             emit(&events, &event);
         };
         let result = agent
-            .compact_with_host(&mut self.session, compaction, &active.token, &mut observer)
+            .compact_with_host_and_inputs(
+                &mut self.session,
+                compaction,
+                &active.token,
+                &mut observer,
+                &mut self.input,
+            )
             .await;
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
         let result = result.and(final_inputs);
@@ -3407,6 +3413,65 @@ mod tests {
         assert!(
             texts.ends_with(&["compact trigger", "compact next"]),
             "{texts:?}"
+        );
+    }
+
+    struct ReentrantCompactionControl(Arc<Mutex<Option<SessionControl>>>);
+    #[async_trait::async_trait]
+    impl Extension for ReentrantCompactionControl {
+        fn id(&self) -> &str {
+            "reentrant-compaction-control"
+        }
+        async fn before_compaction_with_host(
+            &self,
+            _: &mut Compaction,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            let control = self.0.lock().unwrap().clone().expect("control installed");
+            control
+                .steer("control input")
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(crate::Decision::Allow)
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_compaction_services_reentrant_control_input_hook() {
+        let slot = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .limits(Limits {
+                tool_timeout: std::time::Duration::from_secs(1),
+                ..Limits::default()
+            })
+            .extension(Arc::new(InputMessageHook))
+            .unwrap()
+            .extension(Arc::new(ReentrantCompactionControl(slot.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        *slot.lock().unwrap() = Some(session.controls());
+        session.prompt("first").await.unwrap();
+        session
+            .compact(Compaction {
+                summary: "summary".into(),
+                keep_turns: 0,
+            })
+            .unwrap();
+        assert!(
+            session
+                .journal()
+                .queued_custom_messages()
+                .iter()
+                .any(|(_, message)| message.message.content
+                    == crate::ContextContent::Text("streaming hook".into()))
+        );
+        assert!(
+            session
+                .journal()
+                .queued_inputs()
+                .iter()
+                .any(|input| input.input.content == "control input")
         );
     }
 
