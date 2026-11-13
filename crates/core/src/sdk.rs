@@ -1,4 +1,5 @@
 //! Owned session API for embedding the agent in long-lived native applications.
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +55,89 @@ pub struct TreeNavigationResult {
     pub summary_entry: Option<Box<Record>>,
 }
 
+// Admission tickets serialize independent control operations without holding a
+// mutex while extension callbacks are running. Host messages bypass admission
+// and are serviced by the session owner while its callback is pending.
+#[derive(Default)]
+struct InputAdmission {
+    state: Mutex<InputAdmissionState>,
+}
+
+#[derive(Default)]
+struct InputAdmissionState {
+    next: u64,
+    busy: bool,
+    waiting: VecDeque<(u64, tokio::sync::oneshot::Sender<InputPermit>)>,
+}
+
+struct InputPermit {
+    admission: Option<Arc<InputAdmission>>,
+    ticket: u64,
+}
+
+impl InputAdmission {
+    async fn acquire(self: &Arc<Self>) -> Result<InputPermit> {
+        let receiver = {
+            let mut state = self.state.lock().expect("input admission");
+            let ticket = state.next;
+            state.next = state
+                .next
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("input admission tickets exhausted".into()))?;
+            if !state.busy {
+                state.busy = true;
+                return Ok(InputPermit {
+                    admission: Some(self.clone()),
+                    ticket,
+                });
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            state.waiting.push_back((ticket, sender));
+            receiver
+        };
+        receiver
+            .await
+            .map_err(|_| Error::Config("input admission closed".into()))
+    }
+
+    fn release(self: &Arc<Self>) {
+        loop {
+            let next = {
+                let mut state = self.state.lock().expect("input admission");
+                match state.waiting.pop_front() {
+                    Some(next) => next,
+                    None => {
+                        state.busy = false;
+                        return;
+                    }
+                }
+            };
+            let (ticket, sender) = next;
+            let permit = InputPermit {
+                admission: Some(self.clone()),
+                ticket,
+            };
+            match sender.send(permit) {
+                Ok(()) => return,
+                Err(mut permit) => {
+                    // A cancelled waiter must not recursively release a long
+                    // chain of cancelled tickets or hold the queue lock.
+                    permit.admission = None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for InputPermit {
+    fn drop(&mut self) {
+        let _ = self.ticket;
+        if let Some(admission) = self.admission.take() {
+            admission.release();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionControl {
     input: mpsc::Sender<crate::AgentInput>,
@@ -61,7 +145,7 @@ pub struct SessionControl {
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
-    input_order: Arc<tokio::sync::Mutex<()>>,
+    input_order: Arc<InputAdmission>,
     events: broadcast::WeakSender<SessionEvent>,
     tool_timeout: std::time::Duration,
 }
@@ -205,7 +289,7 @@ impl SessionControl {
             images,
         };
         message.validate()?;
-        let _order = self.input_order.lock().await;
+        let _order = self.input_order.acquire().await?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
@@ -309,7 +393,7 @@ impl SessionControl {
     ) -> Result<T> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let token = {
-            let _order = self.input_order.lock().await;
+            let _order = self.input_order.acquire().await?;
             let state = self.active.lock().expect("session control");
             let active = state.as_ref().ok_or_else(|| {
                 Error::Config(
@@ -479,7 +563,7 @@ impl SessionBuilder {
                 auto_compaction,
                 retry,
                 input_hooks,
-                input_order: Arc::new(tokio::sync::Mutex::new(())),
+                input_order: Arc::new(InputAdmission::default()),
                 events: weak_events,
                 tool_timeout,
             },
@@ -1724,6 +1808,26 @@ mod tests {
             explicit.limits.tool_timeout,
             std::time::Duration::from_secs(30)
         );
+    }
+
+    #[tokio::test]
+    async fn admission_tickets_keep_order_and_skip_cancelled_waiters() {
+        let admission = Arc::new(InputAdmission::default());
+        let first = admission.acquire().await.unwrap();
+        let mut cancelled = Box::pin(admission.acquire());
+        let mut third = Box::pin(admission.acquire());
+        let mut fourth = Box::pin(admission.acquire());
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        assert!(futures_util::poll!(third.as_mut()).is_pending());
+        assert!(futures_util::poll!(fourth.as_mut()).is_pending());
+        assert_eq!(first.ticket, 0);
+        drop(cancelled);
+        drop(first);
+        let third = third.await.unwrap();
+        assert_eq!(third.ticket, 2);
+        assert!(futures_util::poll!(fourth.as_mut()).is_pending());
+        drop(third);
+        assert_eq!(fourth.await.unwrap().ticket, 3);
     }
 
     #[tokio::test]
