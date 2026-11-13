@@ -564,6 +564,29 @@ impl Agent<'_> {
             }
             Err(error) => return Err(error),
         };
+        if let Some(assistant_record) = session.branch().iter().rev().find_map(|record| {
+            (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
+                .then_some(record.id)
+        }) {
+            if !session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record)) {
+                if crate::lifecycle::enabled(self.registry) {
+                    let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
+                    self.observe_active_lifecycle(session, crate::LifecycleEvent::TurnEnd {
+                        run_id,
+                        turn_index: completed_run_turns(session, run_id).saturating_sub(1),
+                        messages,
+                    }, &states, cancel, observer).await?;
+                    if cancel.is_cancelled() { return Err(Error::Cancelled); }
+                }
+                commit(session, Event::TurnEndCallbacksCompleted { assistant_record }, observer)?;
+            }
+            if !session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record)) {
+                apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
+                commit(session, Event::TurnEndBoundaryApplied { assistant_record }, observer)?;
+            }
+        }
         // The trigger UUID is its run ID, so a restart resumes the same run.
         if let Some((_, message)) =
             session
@@ -679,13 +702,16 @@ impl Agent<'_> {
             .rev()
             .find_map(|record| match &record.event {
                 Event::CustomMessage { .. }
-                | Event::CustomMessageDelivered { .. }
                 | Event::User { .. }
                 | Event::UserWithImages { .. }
                     if current_entries.contains(&record.id) =>
                 {
                     Some(None)
                 }
+                Event::CustomMessageDelivered { id, .. }
+                    if current_entries.contains(&record.id)
+                        && !session.records().iter().any(|entry| matches!(&entry.event,
+                            Event::CustomMessageQueued { input } if input.id == *id && input.delivery == crate::CustomMessageDelivery::AfterTurn)) => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -1026,10 +1052,23 @@ impl Agent<'_> {
                         observer,
                     )
                     .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
             }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
             // Context-only messages must follow every tool result in the turn,
             // but do not themselves cause another model request.
             apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
+            commit(
+                session,
+                Event::TurnEndBoundaryApplied { assistant_record },
+                observer,
+            )?;
             turn_index += 1;
 
             if let Some(update) = dispatch_update {

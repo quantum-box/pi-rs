@@ -2379,6 +2379,12 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::RequestCallbackAbandoned { id } => {
             json!({"event":"request_callback_abandoned","invocation_id":id})
         }
+        Event::TurnEndCallbacksCompleted { assistant_record } => {
+            json!({"event":"turn_end_callbacks_completed","assistant_record":assistant_record})
+        }
+        Event::TurnEndBoundaryApplied { assistant_record } => {
+            json!({"event":"turn_end_boundary_applied","assistant_record":assistant_record})
+        }
         Event::InputQueueCleared { ids } => json!({"event":"input_queue_cleared","ids":ids}),
         Event::QueueModeSelected { kind, mode } => {
             json!({"event":"queue_mode_selected","kind":kind,"mode":mode})

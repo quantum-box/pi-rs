@@ -2774,6 +2774,82 @@ mod tests {
             vec![self.0.clone()]
         }
     }
+    struct LiveKeyResultHook(bool);
+    struct LiveKeyTool(bool);
+    #[async_trait::async_trait]
+    impl crate::Tool for LiveKeyTool {
+        fn spec(&self) -> crate::ToolSpec {
+            <LifecycleMessageTool as crate::Tool>::spec(&LifecycleMessageTool)
+        }
+        fn can_poll(&self) -> bool {
+            self.0
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            if self.0 {
+                crate::Outcome::Pending {
+                    reference: "live".into(),
+                }
+            } else {
+                crate::Outcome::Succeeded("done".into())
+            }
+        }
+        async fn poll(&self, _: &str, _: crate::ToolContext) -> Option<crate::Outcome> {
+            Some(crate::Outcome::Succeeded("done".into()))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for LiveKeyResultHook {
+        fn id(&self) -> &str {
+            "live-key-result"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(LiveKeyTool(self.0))]
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result_update_with_host(
+            &self,
+            _: &crate::ToolCall,
+            _: &crate::Outcome,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::Outcome>> {
+            if !host.supports_keyed_messages() {
+                return Err("keyed messages unavailable".into());
+            }
+            host.send_message_with_key(
+                crate::CustomMessage {
+                    custom_type: "live-key".into(),
+                    content: crate::ContextContent::Text("result".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+                "result",
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn live_and_live_polled_tool_results_support_keyed_messages() {
+        for polling in [false, true] {
+            let mut session = SessionBuilder::new(
+                Arc::new(MessageDeliveryModel(Arc::new(Mutex::new(Vec::new())))),
+                "fixture",
+            )
+            .extension(Arc::new(LiveKeyResultHook(polling)))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+            session.prompt("prompt").await.unwrap();
+            assert_eq!(session.journal().records().iter().filter(|record| matches!(&record.event,
+                crate::Event::CustomMessageQueued { input } if input.message.custom_type == "live-key")).count(), 1, "polling={polling}");
+        }
+    }
+
     struct PendingMessageHook;
     struct PendingKeyedResultHook {
         paused: tokio::sync::Notify,
@@ -4183,6 +4259,324 @@ mod tests {
             assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "keyed")).count(), 2, "{phase}");
             assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "keyed")).count(), 2, "{phase}");
         }
+    }
+
+    struct TurnEndRecoveryHook {
+        before_first: bool,
+        calls: AtomicUsize,
+        paused: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl Extension for TurnEndRecoveryHook {
+        fn id(&self) -> &str {
+            "turn-end-recovery"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::TurnEnd { turn_index: 0, .. }) {
+                return Ok(());
+            }
+            let first_attempt = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            for (index, key) in ["one", "two"].into_iter().enumerate() {
+                if first_attempt && (index == 0) == self.before_first {
+                    self.paused.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                host.send_message_with_key(
+                    crate::CustomMessage {
+                        custom_type: "turn-end-recovery".into(),
+                        content: crate::ContextContent::Text(key.into()),
+                        display: false,
+                        details: None,
+                    },
+                    if key == "two" {
+                        crate::CustomMessageDelivery::AfterTurn
+                    } else {
+                        crate::CustomMessageDelivery::NextTurn
+                    },
+                    key,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_end_recovers_before_and_between_keyed_sends() {
+        for before_first in [true, false] {
+            let hook = Arc::new(TurnEndRecoveryHook {
+                before_first,
+                calls: AtomicUsize::new(0),
+                paused: tokio::sync::Notify::new(),
+            });
+            let mut registry = Registry::default();
+            registry.register(hook.clone()).unwrap();
+            let model = EchoModel(AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "test",
+                limits: Limits::default(),
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let run_id = Uuid::new_v4();
+            session.set_run_id(Some(run_id));
+            session
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: Some("prompt".into()),
+                })
+                .unwrap();
+            session
+                .append(crate::Event::User {
+                    content: "prompt".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap();
+            session
+                .append(crate::Event::Assistant {
+                    content: "answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session.set_run_id(None);
+            let cancel = CancellationToken::new();
+            let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
+            let mut observer = |_: Notification<'_>| {};
+            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(
+                    agent.run_correlated(
+                        &mut session,
+                        run_id,
+                        None,
+                        &mut inputs,
+                        &cancel,
+                        &mut observer
+                    ),
+                    async {
+                        hook.paused.notified().await;
+                        cancel.cancel();
+                    }
+                )
+            })
+            .await
+            .unwrap();
+            assert!(matches!(first, Err(Error::Cancelled)));
+            let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+            let answer = agent
+                .run_correlated(
+                    &mut restored,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(answer, "answer");
+            assert_eq!(model.0.load(Ordering::SeqCst), 0);
+            assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+                crate::Event::CustomMessageQueued { input } if input.message.custom_type == "turn-end-recovery")).count(), 2);
+            assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+                crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "turn-end-recovery")).count(), 1);
+            assert_eq!(
+                restored
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(
+                        record.event,
+                        crate::Event::TurnEndCallbacksCompleted { .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_turn_end_runs_before_recovered_tool_turn_advances() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let agent = Agent {
+            model: &TaskModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        session
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: Some("prompt".into()),
+            })
+            .unwrap();
+        session
+            .append(crate::Event::User {
+                content: "prompt".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(crate::Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "job-call".into(),
+                        name: "job".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::ToolStarted { operation_id })
+            .unwrap();
+        session
+            .append(crate::Event::ToolFinished {
+                operation_id,
+                outcome: crate::Outcome::Succeeded("job result".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        session.set_run_id(None);
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        let answer = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+        let records = session.records();
+        let end = records
+            .iter()
+            .position(|record| {
+                matches!(record.event, crate::Event::TurnEndCallbacksCompleted { .. })
+            })
+            .unwrap();
+        let request = records
+            .iter()
+            .position(|record| matches!(record.event, crate::Event::ModelRequested { .. }))
+            .unwrap();
+        assert!(end < request);
+        assert_eq!(records.iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageQueued { input } if input.message.custom_type == "turn-end-recovery")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_applies_deferred_context_after_completed_turn_end_once() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: true,
+            calls: AtomicUsize::new(0),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        session
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: Some("prompt".into()),
+            })
+            .unwrap();
+        session
+            .append(crate::Event::User {
+                content: "prompt".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        let assistant_record = session
+            .append(crate::Event::Assistant {
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap()
+            .id;
+        let message_id = Uuid::new_v4();
+        session
+            .append(crate::Event::CustomMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: message_id,
+                    delivery: crate::CustomMessageDelivery::AfterTurn,
+                    message: crate::CustomMessage {
+                        custom_type: "deferred".into(),
+                        content: crate::ContextContent::Text("context".into()),
+                        display: false,
+                        details: None,
+                    },
+                },
+            })
+            .unwrap();
+        session
+            .append(crate::Event::TurnEndCallbacksCompleted { assistant_record })
+            .unwrap();
+        session.set_run_id(None);
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        let answer = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            restored
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event,
+            crate::Event::CustomMessageDelivered { id, .. } if id == message_id))
+                .count(),
+            1
+        );
     }
 
     struct ScopedKeyHook(&'static str);

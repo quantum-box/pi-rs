@@ -566,7 +566,7 @@ impl Agent<'_> {
         let (progress_output, mut progress) = mpsc::channel::<TurnProgress>(32);
         let (lifecycle_sender, mut lifecycle_messages) = mpsc::channel(32);
         let lifecycle_host = Arc::new(LifecycleMessageHost {
-            sender: lifecycle_sender,
+            sender: lifecycle_sender.clone(),
             idle: false,
         });
         let mut futures = FuturesUnordered::<TurnFuture>::new();
@@ -909,7 +909,12 @@ impl Agent<'_> {
                 let invocation = calls[index].invocation.clone();
                 let cancel = calls[index].cancellation.clone();
                 let timeout = self.limits.tool_timeout;
-                let hook_host = lifecycle_host.clone();
+                let hook_host = callback_root_host(
+                    session,
+                    lifecycle_sender.clone(),
+                    invocation.operation_id,
+                    "recovered_tool_result",
+                );
                 let future = async move {
                     let mut errors = Vec::new();
                     let mut collect = |event: Notification<'_>| {

@@ -2811,11 +2811,14 @@ and after the answer was recorded. During a run, `agent_start`, `turn_start`,
 `send_message_with_key`. Keys are scoped by run, extension, callback phase and
 turn; request hooks use a journaled invocation ID and distinguish abandoned
 preparations and completed attempts. Recovered
-pending tool-result hooks scope keys by operation and extension. The extension
+live and recovered tool-result hooks scope keys by operation and extension. The extension
 must supply a stable key unique for each logical send within that callback.
 Identical keyed replays reuse the journal entry even when callback order
 changes; reusing a key with different content fails the run instead of retrying
 indefinitely. Executable extensions negotiate keyed-message support.
+The journal records completion of turn-end callbacks and application of deferred
+context. Recovery reruns an unfinished callback before returning an existing
+answer or advancing the tool turn, then applies deferred context once.
 
 Exactly-once recovery is not possible for unkeyed callback sends when a process
 stops between sends or the callback takes a different path. Ordinary Pi-style

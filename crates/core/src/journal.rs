@@ -148,6 +148,14 @@ pub enum Event {
     RequestCallbackAbandoned {
         id: Uuid,
     },
+    /// The turn-end extension callbacks completed for this assistant entry.
+    TurnEndCallbacksCompleted {
+        assistant_record: u64,
+    },
+    /// Deferred context for the completed turn was applied.
+    TurnEndBoundaryApplied {
+        assistant_record: u64,
+    },
     /// Original external entry retained during an explicit session import.
     SourceEntry {
         format: String,
@@ -1615,7 +1623,9 @@ impl Session {
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
                 }
-                Event::TurnFinished { assistant_record } => {
+                Event::TurnFinished { assistant_record }
+                | Event::TurnEndCallbacksCompleted { assistant_record }
+                | Event::TurnEndBoundaryApplied { assistant_record } => {
                     *assistant_record = *ids
                         .get(assistant_record)
                         .ok_or_else(|| Error::Session("missing fork response".into()))?;
