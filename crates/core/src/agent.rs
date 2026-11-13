@@ -149,6 +149,9 @@ pub struct Limits {
     pub tool_timeout: Duration,
     /// Explicit input/output context capacity. Otherwise use provider discovery when available.
     pub context_window: Option<u32>,
+    /// Per-run compaction settings, used for a recovered model handoff.
+    /// None follows the session's live compaction control.
+    pub compaction_tokens: Option<CompactionTokens>,
 }
 
 impl Default for Limits {
@@ -160,6 +163,7 @@ impl Default for Limits {
             model_timeout: Duration::from_secs(120),
             tool_timeout: Duration::from_secs(30),
             context_window: None,
+            compaction_tokens: None,
         }
     }
 }
@@ -173,8 +177,18 @@ pub struct Agent<'a> {
 }
 
 pub enum Notification<'a> {
+    RunStarted {
+        run_id: Uuid,
+    },
+    RunEnded {
+        run_id: Uuid,
+        succeeded: bool,
+        error: Option<&'a str>,
+    },
     Retry(crate::RetryEvent),
     Committed(&'a Record),
+    /// The session switched branch; replace host hook state. May contain private extension data.
+    BranchState(&'a ExtensionStates),
     /// The following model request generates a compaction summary.
     SummaryRequest,
     /// Current queued text after a message was added, accepted, or cleared.
@@ -202,6 +216,19 @@ pub enum Notification<'a> {
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 
+fn finish_tree_handoff(
+    session: &mut Session,
+    return_to: u64,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    observer(Notification::Committed(
+        session.finish_tree_trigger_handoff(return_to)?,
+    ));
+    let states = session.extension_states();
+    observer(Notification::BranchState(&states));
+    Ok(())
+}
+
 /// Options for a model-generated branch summary when navigating the tree.
 #[derive(Clone, Copy, Debug)]
 pub struct BranchSummaryOptions<'a> {
@@ -218,6 +245,12 @@ pub struct TreeNavigationOptions<'a> {
 }
 
 impl Agent<'_> {
+    fn compaction_tokens(&self, session: &Session) -> CompactionTokens {
+        self.limits
+            .compaction_tokens
+            .unwrap_or_else(|| session.auto_compaction_control().token_settings())
+    }
+
     /// A fresh prompt appends a user message. Resume starts from the existing branch.
     /// Follow-ups are consumed at safe boundaries, in FIFO order. The sender owns
     /// any input left in the receiver when this call returns.
@@ -257,8 +290,38 @@ impl Agent<'_> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(Error::Config("empty user input".into()));
         }
+        if let Some(record) = session.recover_tree_trigger_handoff()? {
+            observer(Notification::Committed(record));
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
+        }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        let selected_provider = session.model_provider().map(str::to_owned);
+        let handoff = if input.is_none() {
+            match session.begin_tree_trigger_handoff(run_id) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((_, records)) = &handoff {
+            for record in records {
+                observer(Notification::Committed(record));
+            }
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
         }
         let recorded = session
             .records()
@@ -266,22 +329,207 @@ impl Agent<'_> {
             .any(|record| record.run_id == Some(run_id));
         if recorded {
             let branch = session.branch();
-            if input.is_some() || !branch.iter().any(|record| record.run_id == Some(run_id)) {
-                return Err(Error::DuplicateRun(run_id));
-            }
-            if branch.iter().rev().find_map(|record| match record.event {
-                Event::Run { .. } => record.run_id,
-                _ => None,
-            }) != Some(run_id)
-            {
+            let invalid = input.is_some()
+                || !branch.iter().any(|record| record.run_id == Some(run_id))
+                || (branch.iter().rev().find_map(|record| match record.event {
+                    Event::Run { .. } => record.run_id,
+                    _ => None,
+                }) != Some(run_id)
+                    && session.pending_custom_trigger() != Some(run_id));
+            if invalid {
+                if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)?;
+                }
                 return Err(Error::DuplicateRun(run_id));
             }
         }
+        let branch_model = handoff
+            .as_ref()
+            .and_then(|_| session.model_selection().map(|selection| selection.0));
+        let provider_changed =
+            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+        let model = match branch_model
+            .as_deref()
+            .filter(|name| *name != self.model_name || provider_changed)
+        {
+            Some(name) => match session
+                .model_provider()
+                .and_then(|provider| {
+                    self.registry
+                        .provider_branch_config(session.session_id(), provider, name)
+                })
+                .or_else(|| {
+                    (!provider_changed)
+                        .then(|| {
+                            self.registry
+                                .branch_model(session.session_id(), name)
+                                .map(|model| (model, None))
+                        })
+                        .flatten()
+                }) {
+                Some(model) => Some(model),
+                None => {
+                    let error = if let Some((return_to, _)) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or_else(|| {
+                                Error::Config(format!(
+                                    "tree trigger recovery requires registered model {name}"
+                                ))
+                            })
+                    } else {
+                        Error::Config(format!(
+                            "tree trigger recovery requires registered model {name}"
+                        ))
+                    };
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         session.set_run_id(Some(run_id));
-        let result = self
+        observer(Notification::RunStarted { run_id });
+        let branch_agent = Agent {
+            model: model
+                .as_ref()
+                .map(|(model, _)| model.as_ref())
+                .unwrap_or(self.model),
+            model_name: branch_model.as_deref().unwrap_or(self.model_name),
+            registry: self.registry,
+            system_prompt: self.system_prompt,
+            limits: model
+                .as_ref()
+                .and_then(|(_, limits)| limits.clone())
+                .unwrap_or_else(|| self.limits.clone()),
+        };
+        let mut result = branch_agent
             .run_turns(session, run_id, input, followups, cancel, observer)
             .await;
         session.set_run_id(None);
+        if let Some((return_to, _)) = handoff
+            && let Err(error) = finish_tree_handoff(session, return_to, observer)
+        {
+            result = Err(error);
+        }
+        let error = result.as_ref().err().map(ToString::to_string);
+        observer(Notification::RunEnded {
+            run_id,
+            succeeded: result.is_ok(),
+            error: error.as_deref(),
+        });
+        while !cancel.is_cancelled() && ensure_settled(session.operations()).is_ok() {
+            let Some(trigger_id) = session.pending_custom_trigger() else {
+                break;
+            };
+            let selected_provider = session.model_provider().map(str::to_owned);
+            let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
+                Ok(Some((return_to, records))) => {
+                    for record in &records {
+                        observer(Notification::Committed(record));
+                    }
+                    let states = session.extension_states();
+                    observer(Notification::BranchState(&states));
+                    Some(return_to)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id: trigger_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
+            };
+            session.set_run_id(Some(trigger_id));
+            observer(Notification::RunStarted { run_id: trigger_id });
+            let branch_model =
+                handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
+            let provider_changed =
+                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+            let model = match branch_model
+                .as_deref()
+                .filter(|name| *name != self.model_name || provider_changed)
+            {
+                Some(name) => match session
+                    .model_provider()
+                    .and_then(|provider| {
+                        self.registry
+                            .provider_branch_config(session.session_id(), provider, name)
+                    })
+                    .or_else(|| {
+                        (!provider_changed)
+                            .then(|| {
+                                self.registry
+                                    .branch_model(session.session_id(), name)
+                                    .map(|model| (model, None))
+                            })
+                            .flatten()
+                    }) {
+                    Some(model) => Some(model),
+                    None => {
+                        session.set_run_id(None);
+                        let message =
+                            format!("tree trigger recovery requires registered model {name}");
+                        let error = if let Some(return_to) = handoff {
+                            finish_tree_handoff(session, return_to, observer)
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or(message)
+                        } else {
+                            message
+                        };
+                        observer(Notification::RunEnded {
+                            run_id: trigger_id,
+                            succeeded: false,
+                            error: Some(&error),
+                        });
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let branch_agent = Agent {
+                model: model
+                    .as_ref()
+                    .map(|(model, _)| model.as_ref())
+                    .unwrap_or(self.model),
+                model_name: branch_model.as_deref().unwrap_or(self.model_name),
+                registry: self.registry,
+                system_prompt: self.system_prompt,
+                limits: model
+                    .as_ref()
+                    .and_then(|(_, limits)| limits.clone())
+                    .unwrap_or_else(|| self.limits.clone()),
+            };
+            let mut trigger_result = branch_agent
+                .run_turns(session, trigger_id, None, followups, cancel, observer)
+                .await;
+            session.set_run_id(None);
+            if let Some(return_to) = handoff
+                && let Err(error) = finish_tree_handoff(session, return_to, observer)
+            {
+                trigger_result = Err(error);
+            }
+            let trigger_error = trigger_result.as_ref().err().map(ToString::to_string);
+            observer(Notification::RunEnded {
+                run_id: trigger_id,
+                succeeded: trigger_result.is_ok(),
+                error: trigger_error.as_deref(),
+            });
+            if trigger_result.is_err() {
+                break;
+            }
+        }
         result
     }
 
@@ -318,20 +566,31 @@ impl Agent<'_> {
             },
             observer,
         )?;
+        let prior_result = self
+            .resolve_prior_turn_end(session, run_id, cancel, observer)
+            .await;
+        session.set_run_id(Some(run_id));
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        if lifecycle {
-            self.observe_lifecycle(
+        let start_result = if prior_result.is_err() {
+            prior_result
+        } else if lifecycle {
+            let states = session.extension_states();
+            self.observe_active_lifecycle_with_inputs(
+                session,
                 crate::LifecycleEvent::AgentStart {
                     session_id: session.session_id(),
                     run_id,
                     model: self.model_name.into(),
                 },
-                &session.extension_states(),
-                Some(cancel),
+                &states,
+                cancel,
                 observer,
+                Some(followups),
             )
-            .await;
-        }
+            .await
+        } else {
+            Ok(())
+        };
         let mut retry_attempt = 0;
         let mut retry_observer = |event: Notification<'_>| {
             match &event {
@@ -343,16 +602,20 @@ impl Agent<'_> {
             }
             observer(event);
         };
-        let mut result = self
-            .drive(
-                session,
-                run_id,
-                effective_input,
-                followups,
-                cancel,
-                &mut retry_observer,
-            )
-            .await;
+        let mut result = match start_result {
+            Ok(()) => {
+                self.drive(
+                    session,
+                    run_id,
+                    effective_input,
+                    followups,
+                    cancel,
+                    &mut retry_observer,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         if retry_attempt > 0 {
             observer(Notification::Retry(crate::RetryEvent::End {
                 success: result.is_ok(),
@@ -370,6 +633,9 @@ impl Agent<'_> {
             && result.is_ok()
         {
             result = Err(error);
+        }
+        if ensure_settled(session.operations()).is_ok() {
+            apply_settled_after_turn(session, observer)?;
         }
         let state = match &result {
             Ok(_) => RunState::Completed,
@@ -393,31 +659,39 @@ impl Agent<'_> {
                         || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
                 })
             });
-            self.observe_lifecycle(
-                crate::LifecycleEvent::AgentEnd {
-                    session_id: session.session_id(),
-                    run_id,
-                    state,
-                    messages,
-                },
-                &session.extension_states(),
-                None,
-                observer,
-            )
-            .await;
+            let end = crate::LifecycleEvent::AgentEnd {
+                session_id: session.session_id(),
+                run_id,
+                state,
+                messages,
+            };
+            if ensure_settled(session.operations()).is_ok() {
+                crate::lifecycle::notify_idle_with_host(
+                    self.registry,
+                    session,
+                    end,
+                    self.limits.model_timeout,
+                    observer,
+                )
+                .await?;
+            } else {
+                self.observe_lifecycle(end, &session.extension_states(), None, observer)
+                    .await;
+            }
             if !matches!(
                 state,
                 RunState::WaitingForOperation | RunState::WaitingForReconciliation
             ) {
-                self.observe_lifecycle(
+                crate::lifecycle::notify_idle_with_host(
+                    self.registry,
+                    session,
                     crate::LifecycleEvent::AgentSettled {
                         aborted: matches!(state, RunState::Cancelled),
                     },
-                    &session.extension_states(),
-                    None,
+                    self.limits.model_timeout,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
         result
@@ -446,6 +720,280 @@ impl Agent<'_> {
         } else {
             notify.await;
         }
+    }
+
+    async fn observe_active_lifecycle(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        self.observe_active_lifecycle_with_inputs::<AgentInput>(
+            session, event, states, cancel, observer, None,
+        )
+        .await
+    }
+
+    async fn observe_active_lifecycle_with_inputs<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<()> {
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host: Arc<dyn ToolHost> = match &event {
+            crate::LifecycleEvent::AgentStart { run_id, .. } => {
+                callback_root_host(session, sender, *run_id, "agent_start")
+            }
+            crate::LifecycleEvent::TurnStart {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_start", *turn_index),
+            ),
+            crate::LifecycleEvent::TurnEnd {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_end", *turn_index),
+            ),
+            _ => Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            }),
+        };
+        let mut errors = Vec::new();
+        let mut collect = |event: Notification<'_>| {
+            if let Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        {
+            let notify = crate::lifecycle::notify_with_host(
+                self.registry,
+                event,
+                states,
+                self.limits.model_timeout,
+                &mut collect,
+                host,
+            );
+            tokio::pin!(notify);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((message, reply)) = incoming.recv() => {
+                        match queue_custom_message(session, message, observer) {
+                            Ok(()) => { let _ = reply.send(Ok(())); }
+                            Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                        }
+                    }
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer)?;
+                    }
+                    _ = cancel.cancelled() => break,
+                    _ = &mut notify => break,
+                }
+            }
+        }
+        for (extension, event, message) in &errors {
+            observer(Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn resolve_prior_turn_end(
+        &self,
+        session: &mut Session,
+        incoming_run: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let branch = session.branch();
+        let pending = session.queued_custom_messages();
+        let previous: Vec<_> = branch
+            .iter()
+            .filter_map(|record| {
+                let run_id = record.run_id.filter(|id| *id != incoming_run)?;
+                if !matches!(record.event, Event::Assistant { .. })
+                    || branch.iter().any(|entry| {
+                        matches!(entry.event,
+                Event::TurnEndBoundaryApplied { assistant_record } if assistant_record == record.id)
+                    })
+                {
+                    return None;
+                }
+                if record.version < crate::journal::TURN_END_JOURNAL_VERSION {
+                    let later = branch.iter().any(|entry| {
+                        entry.id > record.id
+                            && entry.run_id == Some(run_id)
+                            && matches!(entry.event, Event::Assistant { .. })
+                    });
+                    let has_deferred = pending.iter().any(|(id, message)| {
+                        message.delivery == crate::CustomMessageDelivery::AfterTurn
+                            && session.records()[(*id - 1) as usize].run_id == Some(run_id)
+                    });
+                    if later || !has_deferred {
+                        return None;
+                    }
+                }
+                Some((run_id, record.id, record.version))
+            })
+            .collect();
+        for (run_id, assistant_record, version) in previous {
+            session.set_run_id(Some(run_id));
+            let result = async {
+                let mut states = self.migrate(session, observer)?;
+                match recover(session, observer) {
+                    Ok(()) => {}
+                    Err(Error::PendingOperation(_)) => {
+                        if let Some((invocation, _)) =
+                            session
+                                .operations()
+                                .into_iter()
+                                .find(|(invocation, state)| {
+                                    matches!(
+                                        state,
+                                        OperationState::Finished(Outcome::Pending { .. })
+                                    ) && !self
+                                        .registry
+                                        .tools
+                                        .get(&invocation.call.name)
+                                        .is_some_and(|tool| tool.tool.can_poll())
+                                })
+                        {
+                            return Err(Error::PendingOperation(invocation.operation_id));
+                        }
+                        self.poll_pending(session, &mut states, cancel, observer, None)
+                            .await?;
+                        recover(session, observer)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.finish_recovered_turn_end(
+                    session,
+                    run_id,
+                    assistant_record,
+                    version,
+                    &states,
+                    cancel,
+                    observer,
+                )
+                .await
+            }
+            .await;
+            session.set_run_id(None);
+            result?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_recovered_turn_end(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        assistant_record: u64,
+        version: u32,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let completed = session.branch().iter().any(|record| {
+            matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)
+        });
+        if !completed && version >= crate::journal::TURN_END_JOURNAL_VERSION {
+            if crate::lifecycle::enabled(self.registry) {
+                let next_assistant = session.branch().iter().find_map(|record| {
+                    (record.id > assistant_record
+                        && record.run_id == Some(run_id)
+                        && matches!(record.event, Event::Assistant { .. }))
+                    .then_some(record.id)
+                });
+                let turn_index = session
+                    .branch()
+                    .iter()
+                    .filter(|record| {
+                        record.id <= assistant_record
+                            && record.run_id == Some(run_id)
+                            && matches!(record.event, Event::Assistant { .. })
+                    })
+                    .count()
+                    .saturating_sub(1) as u32;
+                let messages = crate::lifecycle::messages(session, |id| {
+                    id >= assistant_record
+                        && next_assistant.is_none_or(|end| id < end)
+                        && session
+                            .records()
+                            .get((id - 1) as usize)
+                            .is_some_and(|record| record.run_id == Some(run_id))
+                });
+                self.observe_active_lifecycle(
+                    session,
+                    crate::LifecycleEvent::TurnEnd {
+                        run_id,
+                        turn_index,
+                        messages,
+                    },
+                    states,
+                    cancel,
+                    observer,
+                )
+                .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
+        }
+        let next_request = session.branch().iter().find_map(|record| {
+            (record.id > assistant_record
+                && record.run_id == Some(run_id)
+                && matches!(record.event, Event::ModelRequested { .. }))
+            .then_some(record.id)
+        });
+        for (queued_at, pending) in session.queued_custom_messages() {
+            if pending.delivery == crate::CustomMessageDelivery::AfterTurn
+                && session.records()[(queued_at - 1) as usize].run_id == Some(run_id)
+                && next_request.is_none_or(|boundary| queued_at < boundary)
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: pending.id,
+                        message: pending.message,
+                    },
+                    observer,
+                )?;
+            }
+        }
+        commit(
+            session,
+            Event::TurnEndBoundaryApplied { assistant_record },
+            observer,
+        )
     }
 
     async fn drive<T: Into<AgentInput> + Send>(
@@ -484,6 +1032,81 @@ impl Agent<'_> {
             }
             Err(error) => return Err(error),
         };
+        if let Some((assistant_record, version)) =
+            session.branch().iter().rev().find_map(|record| {
+                (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
+                    .then_some((record.id, record.version))
+            })
+            && !session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record))
+        {
+            self.finish_recovered_turn_end(session, run_id, assistant_record, version, &states, cancel, observer).await?;
+        }
+        // The trigger UUID is its run ID, so a restart resumes the same run.
+        if let Some((_, message)) =
+            session
+                .queued_custom_messages()
+                .into_iter()
+                .find(|(_, message)| {
+                    message.id == run_id
+                        && message.delivery == crate::CustomMessageDelivery::TriggerTurn
+                })
+        {
+            commit(
+                session,
+                Event::CustomMessageDelivered {
+                    id: message.id,
+                    message: message.message,
+                },
+                observer,
+            )?;
+        }
+        let trigger_started = session
+            .branch()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Run {
+                    state: RunState::Running,
+                    ..
+                } if record.run_id == Some(run_id) => Some(record.id),
+                _ => None,
+            });
+        if has_trigger_message(session, run_id)
+            && let Some(started_at) = trigger_started
+        {
+            for (queued_at, pending) in session.queued_custom_messages() {
+                if pending.delivery == crate::CustomMessageDelivery::NextTurn
+                    && queued_at < started_at
+                {
+                    commit(
+                        session,
+                        Event::CustomMessageDelivered {
+                            id: pending.id,
+                            message: pending.message,
+                        },
+                        observer,
+                    )?;
+                }
+            }
+        }
+        // A prior interrupted run may have left deferred messages while a tool
+        // needed reconciliation. Recovery above must finish before they appear.
+        for (queued_at, deferred) in session.queued_custom_messages() {
+            let origin = session.records()[(queued_at - 1) as usize].run_id;
+            if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
+                && origin != Some(run_id)
+                && !origin.is_some_and(|id| has_unfinished_turn_end(session, id))
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: deferred.id,
+                        message: deferred.message,
+                    },
+                    observer,
+                )?;
+            }
+        }
         if let Some((id, content)) = input {
             commit(
                 session,
@@ -493,6 +1116,38 @@ impl Agent<'_> {
                 },
                 observer,
             )?;
+        }
+        // Only messages queued before this run's initial user entry belong to it.
+        // This also covers image prompts and avoids consuming newly queued next-turn
+        // messages if a partially completed run is restored.
+        if let Some(initial_id) = session
+            .branch()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::User {
+                    input_id: Some(id), ..
+                }
+                | Event::UserWithImages {
+                    input_id: Some(id), ..
+                } if *id == run_id => Some(record.id),
+                _ => None,
+            })
+        {
+            for (queued_at, input) in session.queued_custom_messages() {
+                if queued_at < initial_id
+                    && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
+                    && input.delivery == crate::CustomMessageDelivery::NextTurn
+                {
+                    commit(
+                        session,
+                        Event::CustomMessageDelivered {
+                            id: input.id,
+                            message: input.message,
+                        },
+                        observer,
+                    )?;
+                }
+            }
         }
 
         let mut pending = pending_reply(session, run_id);
@@ -505,16 +1160,26 @@ impl Agent<'_> {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let trigger_unanswered = has_trigger_message(session, run_id)
+            && !session.branch().iter().any(|record| {
+                record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. })
+            });
         if let Some(answer) = session
             .branch()
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::CustomMessage { .. } | Event::User { .. } | Event::UserWithImages { .. }
+                Event::CustomMessage { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
                     if current_entries.contains(&record.id) =>
                 {
                     Some(None)
                 }
+                Event::CustomMessageDelivered { id, .. }
+                    if current_entries.contains(&record.id)
+                        && !session.records().iter().any(|entry| matches!(&entry.event,
+                            Event::CustomMessageQueued { input } if input.id == *id && input.delivery == crate::CustomMessageDelivery::AfterTurn)) => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -523,6 +1188,7 @@ impl Agent<'_> {
                 _ => None,
             })
             .flatten()
+            .filter(|_| !trigger_unanswered)
         {
             if !apply_inputs(session, true, observer)? {
                 return Ok(answer);
@@ -530,7 +1196,10 @@ impl Agent<'_> {
         } else if !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
+                Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
             ) && current_entries.contains(&record.id)
         }) {
             apply_inputs(session, true, observer)?;
@@ -542,7 +1211,7 @@ impl Agent<'_> {
         let mut compacted = false;
         let mut retry_attempt = 0;
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        let mut turn_index = 0;
+        let mut turn_index = completed_run_turns(session, run_id);
         for request_index in 0..self.limits.model_requests {
             let update = tokio::select! {
                 biased;
@@ -578,8 +1247,15 @@ impl Agent<'_> {
             {
                 if lifecycle {
                     active
-                        .observe_lifecycle(turn_start(true), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle_with_inputs(
+                            session,
+                            turn_start(true),
+                            &states,
+                            cancel,
+                            observer,
+                            Some(followups),
+                        )
+                        .await?;
                 }
                 active.settle_usage(request, &usage, &metadata).await?;
                 let allowance = recorded
@@ -643,13 +1319,15 @@ impl Agent<'_> {
                     {
                         if lifecycle && retry_attempt == 0 {
                             active
-                                .observe_lifecycle(
+                                .observe_active_lifecycle_with_inputs(
+                                    session,
                                     turn_start(false),
                                     &states,
-                                    Some(cancel),
+                                    cancel,
                                     observer,
+                                    Some(followups),
                                 )
-                                .await;
+                                .await?;
                         }
                         let control = session.retry_control();
                         let settings = control.settings();
@@ -696,7 +1374,7 @@ impl Agent<'_> {
                         > u64::from(window)
                 });
                 let control = session.auto_compaction_control();
-                let tokens = control.token_settings();
+                let tokens = active.compaction_tokens(session);
                 let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
                 let reserve_reached =
                     capacity
@@ -727,6 +1405,9 @@ impl Agent<'_> {
                         ));
                     }
                     let summary_limit = max_output_tokens.min(512).min(budget / 2);
+                    if let Some(id) = open_request_callback(session, run_id, RequestPurpose::Turn) {
+                        commit(session, Event::RequestCallbackAbandoned { id }, observer)?;
+                    }
                     let spent = active
                         .summarize_prefix(
                             session,
@@ -752,8 +1433,15 @@ impl Agent<'_> {
                 let allowance = request.max_output_tokens;
                 if lifecycle && retry_attempt == 0 {
                     active
-                        .observe_lifecycle(turn_start(false), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle_with_inputs(
+                            session,
+                            turn_start(false),
+                            &states,
+                            cancel,
+                            observer,
+                            Some(followups),
+                        )
+                        .await?;
                 }
                 let result = active
                     .reply(
@@ -861,7 +1549,7 @@ impl Agent<'_> {
             };
             let dispatched = if truncated {
                 dispatcher
-                    .reject_truncated_tools(session, &invocations, &states, observer)
+                    .reject_truncated_tools(session, &invocations, &states, cancel, observer)
                     .await
             } else {
                 dispatcher
@@ -888,18 +1576,36 @@ impl Agent<'_> {
             if lifecycle {
                 let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
                 dispatcher
-                    .observe_lifecycle(
+                    .observe_active_lifecycle_with_inputs(
+                        session,
                         crate::LifecycleEvent::TurnEnd {
                             run_id,
                             turn_index,
                             messages,
                         },
                         &states,
-                        Some(cancel),
+                        cancel,
                         observer,
+                        Some(followups),
                     )
-                    .await;
+                    .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
             }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
+            // Context-only messages must follow every tool result in the turn,
+            // but do not themselves cause another model request.
+            apply_settled_after_turn(session, observer)?;
+            commit(
+                session,
+                Event::TurnEndBoundaryApplied { assistant_record },
+                observer,
+            )?;
             turn_index += 1;
 
             if let Some(update) = dispatch_update {
@@ -1013,15 +1719,74 @@ impl Agent<'_> {
             max_output_tokens,
         };
         let original = request.clone();
+        let invocation = if let Some(run_id) = session.current_run_id()
+            && !self.registry.extensions.is_empty()
+        {
+            let id = match open_request_callback(session, run_id, purpose) {
+                Some(id) => id,
+                None => {
+                    let id = Uuid::new_v4();
+                    commit(
+                        session,
+                        Event::RequestCallbackStarted {
+                            id,
+                            purpose: request_purpose_name(purpose).to_owned(),
+                        },
+                        observer,
+                    )?;
+                    id
+                }
+            };
+            Some(id)
+        } else {
+            None
+        };
         for extension in &self.registry.extensions {
             let mut portable = portable_request(&request);
             let mut guarded = crate::ContextRequest::new(&mut portable);
             let access = guarded.access();
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut guarded, purpose, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    format!(
+                        "before_request:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
+            };
+            let result = {
+                let future = tokio::time::timeout(
+                    self.limits.model_timeout,
+                    extension.before_request_with_host(
+                        &mut guarded,
+                        purpose,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+                    }
+                }
             };
             let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
@@ -1041,11 +1806,47 @@ impl Agent<'_> {
             let mut portable = portable_request(&request);
             let mut guarded = crate::ContextMessages::new(&mut portable.messages);
             let access = guarded.access();
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut guarded, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    format!(
+                        "context_with_system:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
+            };
+            let result = {
+                let future = tokio::time::timeout(
+                    self.limits.model_timeout,
+                    extension.context_with_system_with_host(
+                        &mut guarded,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+                    }
+                }
             };
             let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
@@ -1322,6 +2123,7 @@ impl Agent<'_> {
         session: &mut Session,
         invocations: &[Invocation],
         states: &ExtensionStates,
+        cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         let observe_tools = self.registry.extensions.iter().any(|extension| {
@@ -1329,7 +2131,8 @@ impl Agent<'_> {
         });
         for invocation in invocations {
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionStart {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1338,10 +2141,10 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
             let outcome = Outcome::Failed(format!(
                 "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
@@ -1357,7 +2160,8 @@ impl Agent<'_> {
                 observer,
             )?;
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionEnd {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1367,10 +2171,10 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
         Ok(())
@@ -1398,24 +2202,82 @@ impl Agent<'_> {
                 cancel,
             )
             .await?;
-            let outcome = Self::turn_poll_authorize_and_run(
-                self.registry,
-                self.limits.tool_timeout,
-                &invocation,
-                &reference,
-                prepared,
-                states,
-                cancel,
-            )
-            .await?;
-            let mut reply = outcome.into();
-            self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
-                .await;
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(LifecycleMessageHost {
+                sender: sender.clone(),
+                idle: false,
+            });
+            let result_host = callback_root_host(
+                session,
+                sender,
+                invocation.operation_id,
+                "recovered_tool_result",
+            );
+            let mut errors = Vec::new();
+            let mut collect = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    errors.push((extension.to_owned(), event, message.to_owned()));
+                }
+            };
+            let reply = {
+                let future = async {
+                    let outcome = Self::turn_poll_authorize_and_run(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &reference,
+                        prepared,
+                        states,
+                        cancel,
+                        Some(host.clone()),
+                    )
+                    .await?;
+                    let mut reply = outcome.into();
+                    Self::turn_transform(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &mut reply,
+                        states,
+                        cancel,
+                        &mut collect,
+                        Some(result_host),
+                    )
+                    .await;
+                    Ok::<_, Error>(reply)
+                };
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, response)) = incoming.recv() => {
+                            match queue_custom_message(session, input, observer) {
+                                Ok(()) => { let _ = response.send(Ok(())); },
+                                Err(error) => { let _ = response.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        result = &mut future => break result?,
+                    }
+                }
+            };
+            for (extension, event, message) in &errors {
+                observer(Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                });
+            }
             self.finish_tool(session, &invocation, reply, states, observer, replies)?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     async fn transform_tool_result(
         &self,
         invocation: &Invocation,
@@ -1432,6 +2294,7 @@ impl Agent<'_> {
             states,
             cancel,
             observer,
+            None,
         )
         .await;
     }
@@ -1744,6 +2607,48 @@ impl Agent<'_> {
             .map(|_| ())
     }
 
+    /// Compact a supplied summary while servicing asynchronous extension host calls.
+    pub async fn compact_with_host(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host::<AgentInput>(
+            session, compaction, &states, None, None, cancel, observer, None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Compact while also servicing queue controls submitted during hooks.
+    pub async fn compact_with_host_and_inputs(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: &mut mpsc::Receiver<AgentInput>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host(
+            session,
+            compaction,
+            &states,
+            None,
+            None,
+            cancel,
+            observer,
+            Some(inputs),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Commit a caller-supplied summary using configured token retention.
     pub fn compact_configured(
         &self,
@@ -1755,10 +2660,7 @@ impl Agent<'_> {
         let states = self.migrate(session, observer)?;
         let retention = configured_retention(
             session,
-            session
-                .auto_compaction_control()
-                .token_settings()
-                .keep_recent_tokens,
+            self.compaction_tokens(session).keep_recent_tokens,
             1,
         )?;
         self.commit_compaction(
@@ -1772,6 +2674,38 @@ impl Agent<'_> {
             Some(retention),
             observer,
         )
+        .map(|_| ())
+    }
+
+    /// Compact a supplied summary with configured retention and host-aware hooks.
+    pub async fn compact_configured_with_host(
+        &self,
+        session: &mut Session,
+        summary: String,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        let retention = configured_retention(
+            session,
+            self.compaction_tokens(session).keep_recent_tokens,
+            1,
+        )?;
+        self.commit_compaction_with_host::<AgentInput>(
+            session,
+            Compaction {
+                summary,
+                keep_turns: retention.keep_turns,
+            },
+            &states,
+            None,
+            Some(retention),
+            cancel,
+            observer,
+            None,
+        )
+        .await
         .map(|_| ())
     }
 
@@ -1937,10 +2871,38 @@ impl Agent<'_> {
                 .iter()
                 .filter(|extension| extension.handles_tree_navigation())
             {
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = tokio::time::timeout_at(deadline, extension.before_tree(&preparation, states.get(extension.id()), cancel)) => result,
+                let (sender, mut incoming) = mpsc::channel(32);
+                let host = Arc::new(LifecycleMessageHost { sender, idle: true });
+                let result = {
+                    let future = tokio::time::timeout_at(
+                        deadline,
+                        extension.before_tree_with_host(
+                            &preparation,
+                            states.get(extension.id()),
+                            cancel,
+                            host,
+                        ),
+                    );
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            Some((input, reply)) = incoming.recv() => {
+                                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                                    commit(session, Event::TreeMessageQueued { input }, observer)
+                                } else {
+                                    session.append_custom_message(input.message)
+                                        .map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                                };
+                                match result {
+                                    Ok(()) => { let _ = reply.send(Ok(())); }
+                                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                                }
+                            }
+                            result = &mut future => break result,
+                        }
+                    }
                 };
                 let message = match result {
                     Ok(Ok(Some(next))) => {
@@ -2039,20 +3001,21 @@ impl Agent<'_> {
             .iter()
             .any(|extension| extension.handles_tree_navigation() && extension.handles_lifecycle())
         {
-            crate::lifecycle::notify(
+            let event = crate::LifecycleEvent::SessionTree {
+                new_leaf_id: session.head(),
+                old_leaf_id: from,
+                summary_entry: summary_id
+                    .map(|id| Box::new(session.records()[id as usize - 1].clone())),
+                from_extension,
+            };
+            crate::lifecycle::notify_idle_with_host(
                 self.registry,
-                crate::LifecycleEvent::SessionTree {
-                    new_leaf_id: session.head(),
-                    old_leaf_id: from,
-                    summary_entry: summary_id
-                        .map(|id| Box::new(session.records()[id as usize - 1].clone())),
-                    from_extension,
-                },
-                &session.extension_states(),
+                session,
+                event,
                 self.limits.tool_timeout,
                 observer,
             )
-            .await;
+            .await?;
         }
         Ok(())
     }
@@ -2278,10 +3241,7 @@ impl Agent<'_> {
             Some(turns) => RetentionPlan::turns(session, turns),
             None => configured_retention(
                 session,
-                session
-                    .auto_compaction_control()
-                    .token_settings()
-                    .keep_recent_tokens,
+                self.compaction_tokens(session).keep_recent_tokens,
                 1,
             )?,
         };
@@ -2339,8 +3299,16 @@ impl Agent<'_> {
                 from_extension: false,
             },
         };
-        self.observe_lifecycle(event, &session.extension_states(), None, observer)
-            .await;
+        let idle = session.current_run_id().is_none();
+        crate::lifecycle::notify_session_with_host(
+            self.registry,
+            session,
+            event,
+            self.limits.model_timeout,
+            observer,
+            idle,
+        )
+        .await?;
         result.map(|(spent, _)| spent)
     }
 
@@ -2350,7 +3318,7 @@ impl Agent<'_> {
         states: &ExtensionStates,
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
-        inputs: Option<&mut mpsc::Receiver<T>>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<(u32, bool)> {
         let SummaryScope {
             retention,
@@ -2421,7 +3389,7 @@ impl Agent<'_> {
                 transformed,
                 cancel,
                 observer,
-                inputs,
+                inputs.as_deref_mut(),
             )
             .await?
             .outcome?;
@@ -2447,17 +3415,21 @@ impl Agent<'_> {
         let billing = reply
             .usage
             .map(|usage| (usage, summary_usage_metadata(session, &reply)));
-        let from_extension = self.commit_compaction(
-            session,
-            Compaction {
-                summary: reply.content,
-                keep_turns: retention.keep_turns,
-            },
-            states,
-            billing,
-            Some(retention),
-            observer,
-        )?;
+        let from_extension = self
+            .commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary: reply.content,
+                    keep_turns: retention.keep_turns,
+                },
+                states,
+                billing,
+                Some(retention),
+                cancel,
+                observer,
+                inputs,
+            )
+            .await?;
         Ok((output as u32, from_extension))
     }
 
@@ -2490,6 +3462,99 @@ impl Agent<'_> {
             .estimate_request_tokens(request)
             .saturating_add(u64::from(request.max_output_tokens))
             > u64::from(window))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_compaction_with_host<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        mut compaction: Compaction,
+        states: &ExtensionStates,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+        minimum_retention: Option<RetentionPlan>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<bool> {
+        let original_summary = compaction.summary.clone();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.before_compaction_with_host(
+                    &mut compaction,
+                    states.get(extension.id()),
+                    host,
+                ),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            if let Decision::Deny(reason) = hook(extension.as_ref(), result)? {
+                return Err(Error::Extension {
+                    id: extension.id().into(),
+                    message: reason,
+                });
+            }
+        }
+        if compaction.summary.trim().is_empty() || compaction.summary.len() > 64 * 1024 {
+            return Err(Error::Config(
+                "summary must contain between 1 and 65536 bytes".into(),
+            ));
+        }
+        if minimum_retention.is_some_and(|minimum| compaction.keep_turns < minimum.keep_turns) {
+            return Err(Error::Config(
+                "compaction would drop turns absent from the summary".into(),
+            ));
+        }
+        let retain_from = match minimum_retention {
+            Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            _ => retain_from(&session.branch(), compaction.keep_turns),
+        };
+        let mut changes = ExtensionStates::new();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.after_compaction_with_host(&compaction, states.get(extension.id()), host),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            if let Some(state) = hook(extension.as_ref(), result)? {
+                changes.insert(extension.id().into(), state);
+            }
+        }
+        let (usage, usage_metadata) =
+            billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
+        let tokens_before = session.context_usage_estimate().tokens;
+        let from_extension = original_summary != compaction.summary;
+        commit(
+            session,
+            Event::Compacted {
+                summary: compaction.summary,
+                system_prompt: None,
+                retain_from,
+                tokens_before: Some(tokens_before),
+                states: changes,
+                usage,
+                usage_metadata,
+            },
+            observer,
+        )?;
+        Ok(from_extension)
     }
 
     fn commit_compaction(
@@ -2816,6 +3881,287 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
+type CallbackMessageSender = mpsc::Sender<(
+    crate::QueuedCustomMessage,
+    oneshot::Sender<std::result::Result<(), String>>,
+)>;
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_compaction_hook<T, I: Into<AgentInput> + Send>(
+    session: &mut Session,
+    mut incoming: mpsc::Receiver<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+    future: impl std::future::Future<Output = crate::ExtensionResult<T>>,
+    idle: bool,
+    cancel: &CancellationToken,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    inputs: &mut Option<&mut mpsc::Receiver<I>>,
+) -> Result<crate::ExtensionResult<T>> {
+    let future = tokio::time::timeout(timeout, future);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            Some((input, reply)) = incoming.recv() => {
+                let result = if !idle || matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    queue_custom_message(session, input, observer)
+                } else {
+                    session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                };
+                match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+            }
+            Some(input) = receive_input(inputs) => queue_input(session, input.into(), observer)?,
+            result = &mut future => return result.map_err(|_| Error::Config("compaction hook timed out".into())),
+        }
+    }
+}
+
+fn completed_run_turns(session: &Session, run_id: Uuid) -> u32 {
+    session
+        .branch()
+        .iter()
+        .filter(|record| {
+            record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+        })
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn has_unfinished_turn_end(session: &Session, run_id: Uuid) -> bool {
+    let branch = session.branch();
+    let Some(assistant) = branch.iter().rev().find(|record| {
+        record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+    }) else {
+        return false;
+    };
+    assistant.version >= crate::journal::TURN_END_JOURNAL_VERSION
+        && !branch.iter().any(|record| matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record } if assistant_record == assistant.id))
+}
+
+fn has_trigger_message(session: &Session, run_id: Uuid) -> bool {
+    session.branch().iter().any(|record| matches!(&record.event,
+        Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+        || session.records().iter().any(|record| matches!(&record.event,
+            Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+}
+
+fn callback_turn_phase(phase: &str, turn_index: u32) -> String {
+    if turn_index == 0 {
+        phase.to_owned()
+    } else {
+        format!("{phase}:turn:{turn_index}")
+    }
+}
+
+fn request_purpose_name(purpose: RequestPurpose) -> &'static str {
+    match purpose {
+        RequestPurpose::Turn => "turn",
+        RequestPurpose::Summary => "summary",
+    }
+}
+
+fn open_request_callback(session: &Session, run_id: Uuid, purpose: RequestPurpose) -> Option<Uuid> {
+    let mut abandoned = HashSet::new();
+    for record in session
+        .branch()
+        .into_iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+    {
+        match &record.event {
+            Event::ModelFinished {
+                failure: None | Some(ModelFailure::Retryable),
+                ..
+            }
+            | Event::Assistant { .. } => return None,
+            Event::RequestCallbackAbandoned { id } => {
+                abandoned.insert(*id);
+            }
+            Event::RequestCallbackStarted {
+                id,
+                purpose: recorded,
+            } if recorded == request_purpose_name(purpose) && !abandoned.contains(id) => {
+                return Some(*id);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn callback_root_host(
+    _session: &Session,
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: impl Into<String>,
+) -> Arc<dyn ToolHost> {
+    Arc::new(CallbackRootHost {
+        sender,
+        run_id,
+        phase: phase.into(),
+    })
+}
+
+struct CallbackRootHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: String,
+}
+#[async_trait::async_trait]
+impl ToolHost for CallbackRootHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        Some(Arc::new(ScopedCallbackHost {
+            sender: self.sender.clone(),
+            run_id: self.run_id,
+            phase: self.phase.clone(),
+            extension_id: extension_id.to_owned(),
+        }))
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
+    }
+}
+
+struct ScopedCallbackHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: String,
+    extension_id: String,
+}
+impl ScopedCallbackHost {
+    async fn submit(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        id: Uuid,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "callback has finished".to_owned())?;
+        response
+            .await
+            .map_err(|_| "callback message acknowledgement was lost".to_owned())?
+    }
+}
+#[async_trait::async_trait]
+impl ToolHost for ScopedCallbackHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        self.submit(message, delivery, Uuid::new_v4()).await
+    }
+    async fn send_message_with_key(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        key: &str,
+    ) -> crate::ExtensionResult<()> {
+        use sha2::{Digest, Sha256};
+        if key.is_empty() || key.len() > 256 {
+            return Err("message key must contain 1 to 256 bytes".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"pi-rs:callback-message:v2");
+        digest.update(self.run_id.as_bytes());
+        for value in [self.phase.as_str(), self.extension_id.as_str(), key] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        let bytes = digest.finalize();
+        self.submit(
+            message,
+            delivery,
+            Uuid::from_bytes(bytes[..16].try_into().expect("digest length")),
+        )
+        .await
+    }
+}
+
+pub(crate) struct LifecycleMessageHost {
+    pub(crate) idle: bool,
+    pub(crate) sender: mpsc::Sender<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+}
+#[async_trait::async_trait]
+impl ToolHost for LifecycleMessageHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls are unavailable in lifecycle hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if !self.idle && delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "lifecycle hook has finished".to_owned())?;
+        result
+            .await
+            .map_err(|_| "lifecycle message response was lost".to_owned())?
+    }
+}
+
 struct NestedHost {
     ui: Option<Arc<dyn crate::ExtensionUi>>,
     requests: mpsc::Sender<Vec<NestedRequest>>,
@@ -2837,6 +4183,10 @@ enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
 }
 enum TurnProgress {
+    Custom(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    ),
     Event(Box<crate::LifecycleEvent>),
     Flush(oneshot::Sender<()>),
 }
@@ -2899,6 +4249,42 @@ impl ToolHost for NestedHost {
     }
     fn tools(&self) -> Vec<ToolSpec> {
         self.specs.as_ref().clone()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.progress.is_some()
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let Some(progress) = &self.progress else {
+            return Err("custom message delivery is unavailable".into());
+        };
+        let (reply, result) = oneshot::channel();
+        let input = crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message,
+        };
+        match &progress.sender {
+            ProgressSink::Turn(sender) => tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err("custom message cancelled".into()),
+                result = sender.send(TurnProgress::Custom(input, reply)) => result.map_err(|_| "tool has finished".to_owned())?,
+            },
+        }
+        tokio::select! {
+            biased;
+            result = result => result.map_err(|_| "custom message response lost".to_owned())?,
+            _ = self.cancellation.cancelled() => Err("custom message cancelled".into()),
+        }
     }
     async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
@@ -3104,7 +4490,23 @@ fn reply_to_control<T>(result: Result<T>, reply: oneshot::Sender<Result<T>>) -> 
 impl AgentInput {
     /// Apply one message or queue control from an embedding application's event loop.
     pub fn apply(self, session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
-        queue_input(session, self, observer)
+        if let AgentInput::EnqueueCustom { message, reply } = self {
+            let result = if matches!(
+                message.delivery,
+                crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn
+            ) {
+                queue_custom_message(session, message, observer)
+            } else {
+                session.append_custom_message(message.message).map(|()| {
+                    observer(Notification::Committed(
+                        session.records().last().expect("appended custom message"),
+                    ))
+                })
+            };
+            reply_to_control(result, reply)
+        } else {
+            queue_input(session, self, observer)
+        }
     }
 }
 
@@ -3130,6 +4532,12 @@ fn queue_input(
         }
         AgentInput::Enqueue { message, reply } => {
             return reply_to_control(queue_message(session, message, observer), reply);
+        }
+        AgentInput::EnqueueCustom { mut message, reply } => {
+            if message.delivery == crate::CustomMessageDelivery::TriggerTurn {
+                message.delivery = crate::CustomMessageDelivery::Steer;
+            }
+            return reply_to_control(queue_custom_message(session, message, observer), reply);
         }
         AgentInput::ClearQueue { reply } => {
             let count = session.records().len();
@@ -3224,46 +4632,128 @@ fn queue_message(
     Ok(())
 }
 
+pub(crate) fn queue_custom_message(
+    session: &mut Session,
+    input: crate::QueuedCustomMessage,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    crate::journal::validate_custom_message(&input.message)?;
+    if let Some(existing) = session
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::CustomMessageQueued { input: existing } if existing.id == input.id => {
+                Some(existing)
+            }
+            _ => None,
+        })
+    {
+        if serde_json::to_value(existing)? != serde_json::to_value(&input)? {
+            return Err(Error::Config(
+                "custom message ID already exists with different content".into(),
+            ));
+        }
+        if session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input: existing } if existing.id == input.id)) {
+            return Ok(());
+        }
+    }
+    commit(session, Event::CustomMessageQueued { input }, observer)?;
+    Ok(())
+}
+
+fn apply_settled_after_turn(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
+    for (queued_at, input) in session.queued_custom_messages() {
+        let origin = session.records()[(queued_at - 1) as usize].run_id;
+        if input.delivery == crate::CustomMessageDelivery::AfterTurn
+            && !origin.is_some_and(|run_id| has_unfinished_turn_end(session, run_id))
+        {
+            commit(
+                session,
+                Event::CustomMessageDelivered {
+                    id: input.id,
+                    message: input.message,
+                },
+                observer,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_inputs(
     session: &mut Session,
     include_followups: bool,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let pending: Vec<_> = session
-        .queued_inputs()
-        .into_iter()
-        .filter(|message| include_followups || message.input.kind == InputKind::Steer)
-        .collect();
+    enum Pending {
+        User(QueuedMessage),
+        Custom(crate::QueuedCustomMessage),
+    }
+    let users = session.queued_inputs();
+    let customs = session.queued_custom_messages();
+    let mut pending = Vec::new();
+    for record in session.branch() {
+        match &record.event {
+            Event::InputQueued { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::InputQueuedWithImages { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::CustomMessageQueued { input } => {
+                if let Some((_, message)) = customs.iter().find(|(_, m)| m.id == input.id) {
+                    pending.push(Pending::Custom(message.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
     let mut accepted = false;
-    let steering_mode = session.queue_mode(InputKind::Steer);
-    let follow_up_mode = session.queue_mode(InputKind::FollowUp);
     let mut seen = HashSet::new();
     for message in pending {
-        let kind = message.input.kind;
-        let seen_kind = if kind == InputKind::Steer { 0 } else { 1 };
-        let mode = if kind == InputKind::Steer {
-            steering_mode
-        } else {
-            follow_up_mode
+        let kind = match &message {
+            Pending::User(message) => message.input.kind,
+            Pending::Custom(message) => match message.delivery {
+                crate::CustomMessageDelivery::Steer => InputKind::Steer,
+                crate::CustomMessageDelivery::FollowUp => InputKind::FollowUp,
+                _ => continue,
+            },
         };
-        if mode == crate::QueueMode::OneAtATime && !seen.insert(seen_kind) {
+        if !include_followups && kind == InputKind::FollowUp {
             continue;
         }
-        accepted = true;
-        message.validate()?;
-        let event = if message.images.is_empty() {
-            Event::User {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-            }
-        } else {
-            Event::UserWithImages {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-                images: message.images,
+        if session.queue_mode(kind) == crate::QueueMode::OneAtATime
+            && !seen.insert(kind == InputKind::Steer)
+        {
+            continue;
+        }
+        let event = match message {
+            Pending::Custom(input) => Event::CustomMessageDelivered {
+                id: input.id,
+                message: input.message,
+            },
+            Pending::User(message) => {
+                message.validate()?;
+                if message.images.is_empty() {
+                    Event::User {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                    }
+                } else {
+                    Event::UserWithImages {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                        images: message.images,
+                    }
+                }
             }
         };
         commit(session, event, observer)?;
+        accepted = true;
     }
     if accepted {
         notify_queue(session, observer);
@@ -3329,6 +4819,46 @@ fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Opti
     ))
     .ok()
     .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod request_callback_marker_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_request_and_restarted_request_keep_distinct_durable_identities() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        let first = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: first,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(first)
+        );
+        session
+            .append(Event::RequestCallbackAbandoned { id: first })
+            .unwrap();
+        let second = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: second,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(second)
+        );
+        assert_ne!(first, second);
+    }
 }
 
 #[cfg(test)]
@@ -4009,6 +5539,106 @@ mod nested_host_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    fn custom(text: &str, delivery: crate::CustomMessageDelivery) -> crate::QueuedCustomMessage {
+        crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message: crate::CustomMessage {
+                custom_type: "fixture".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: Some(serde_json::json!({"key":text})),
+            },
+        }
+    }
+
+    #[test]
+    fn custom_queue_is_durable_and_shares_fifo_and_mode_with_users() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .set_queue_mode(InputKind::Steer, crate::QueueMode::OneAtATime)
+            .unwrap();
+        let first = custom("custom first", crate::CustomMessageDelivery::Steer);
+        let first_id = first.id;
+        queue_custom_message(&mut session, first, &mut |_| {}).unwrap();
+        queue_message(
+            &mut session,
+            QueuedMessage::from(crate::QueuedInput {
+                id: Uuid::new_v4(),
+                kind: InputKind::Steer,
+                content: "user second".into(),
+            }),
+            &mut |_| {},
+        )
+        .unwrap();
+        let follow = custom("later", crate::CustomMessageDelivery::FollowUp);
+        queue_custom_message(&mut session, follow, &mut |_| {}).unwrap();
+        let mut session = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(apply_inputs(&mut session, false, &mut |_| {}).unwrap());
+        assert_eq!(session.queued_inputs().len(), 1);
+        assert_eq!(session.queued_custom_messages().len(), 1);
+        let delivered = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::CustomMessageDelivered { id, message } if *id == first_id => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            delivered.details,
+            Some(serde_json::json!({"key":"custom first"}))
+        );
+        let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        assert!(apply_inputs(&mut restored, false, &mut |_| {}).unwrap());
+        assert!(apply_inputs(&mut restored, true, &mut |_| {}).unwrap());
+        assert!(restored.queued_custom_messages().is_empty());
+        assert_eq!(restored.records().iter().filter(|r| matches!(r.event, Event::CustomMessageDelivered { id, .. } if id == first_id)).count(), 1);
+        let texts: Vec<_> = restored
+            .current_messages()
+            .into_iter()
+            .filter_map(|m| {
+                if let crate::Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["custom first", "user second", "later"]);
+    }
+
+    #[test]
+    fn clearing_steering_and_followups_preserves_next_turn_and_branch_history() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("steer", crate::CustomMessageDelivery::Steer),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("follow", crate::CustomMessageDelivery::FollowUp),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("next", crate::CustomMessageDelivery::NextTurn),
+            &mut |_| {},
+        )
+        .unwrap();
+        let before_clear = session.head();
+        session.clear_queued_inputs().unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        let old_branch =
+            Session::from_records(restored.fork_records(before_clear).unwrap()).unwrap();
+        assert_eq!(old_branch.queued_custom_messages().len(), 3);
+    }
+
     struct WaitingModel(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl Model for WaitingModel {
@@ -4017,6 +5647,121 @@ mod queue_tests {
             std::future::pending().await
         }
     }
+    #[test]
+    fn idle_owner_applies_custom_message_controls_at_idle_boundaries() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for (text, delivery) in [
+            ("immediate", crate::CustomMessageDelivery::Steer),
+            ("next", crate::CustomMessageDelivery::NextTurn),
+            ("trigger", crate::CustomMessageDelivery::TriggerTurn),
+        ] {
+            let (reply, mut response) = oneshot::channel();
+            AgentInput::EnqueueCustom {
+                message: custom(text, delivery),
+                reply,
+            }
+            .apply(&mut session, &mut |_| {})
+            .unwrap();
+            assert!(response.try_recv().unwrap().is_ok());
+        }
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(
+            restored
+                .current_messages()
+                .iter()
+                .any(|m| matches!(m, crate::Message::User { content } if content == "immediate"))
+        );
+        assert_eq!(restored.queued_custom_messages().len(), 2);
+        assert!(restored.pending_custom_trigger().is_some());
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_lifecycle_hooks_can_send_messages() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "truncated-hook"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_tool_execution_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                let text = match event {
+                    crate::LifecycleEvent::ToolExecutionStart { .. } => "start",
+                    crate::LifecycleEvent::ToolExecutionEnd { .. } => "end",
+                    _ => return Ok(()),
+                };
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "hook".into(),
+                        content: crate::ContextContent::Text(text.into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await
+            }
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Hook)).unwrap();
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "test".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::ToolPlanned {
+                invocation: invocation.clone(),
+                parent_operation: Uuid::nil(),
+            })
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            agent.reject_truncated_tools(
+                &mut session,
+                &[invocation],
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pending = session.queued_custom_messages();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].1.message.content,
+            crate::ContextContent::Text("start".into())
+        );
+        assert_eq!(
+            pending[1].1.message.content,
+            crate::ContextContent::Text("end".into())
+        );
+    }
+
     #[tokio::test]
     async fn queue_controls_are_acknowledged_while_a_model_request_is_waiting() {
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -4232,6 +5977,26 @@ mod request_privacy_tests {
                 crate::ContextChange::Unchanged
             })
         }
+        async fn before_request_with_host(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            purpose: RequestPurpose,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.before_request(request, purpose, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("request hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
+        }
         fn handles_context_with_system(&self) -> bool {
             true
         }
@@ -4256,6 +6021,25 @@ mod request_privacy_tests {
             } else {
                 crate::ContextChange::Unchanged
             })
+        }
+        async fn context_with_system_with_host(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.context_with_system(messages, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("context hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
         }
     }
     struct CaptureModel(Arc<Mutex<Vec<ModelRequest>>>);
@@ -4866,6 +6650,14 @@ mod request_privacy_tests {
                 assert!(!exposed.contains("private-signature"));
             }
             assert_eq!(notifications.len(), 1);
+            assert_eq!(
+                session
+                    .queued_custom_messages()
+                    .iter()
+                    .filter(|(_, input)| input.message.custom_type == "privacy-host")
+                    .count(),
+                2
+            );
             let captured = captured.lock().unwrap();
             let Message::Assistant {
                 content, replay, ..

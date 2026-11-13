@@ -476,7 +476,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-            let initial = session.journal().head();
+            let initial = session.journal().unwrap().head();
             assert_eq!(session.prompt("first").await.unwrap(), "done");
             let mut fork = session.fork_at(initial).unwrap();
             assert_eq!(fork.prompt("fork").await.unwrap(), "done");

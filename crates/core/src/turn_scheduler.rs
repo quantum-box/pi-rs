@@ -47,6 +47,7 @@ impl Agent<'_> {
         Ok((tool, args))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn turn_poll_authorize_and_run(
         registry: &Registry,
         timeout: Duration,
@@ -55,6 +56,7 @@ impl Agent<'_> {
         prepared: (Arc<RegisteredTool>, serde_json::Value),
         states: &ExtensionStates,
         cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<Outcome> {
         let (tool, args) = prepared;
         let pending = || Error::PendingOperation(invocation.operation_id);
@@ -68,14 +70,29 @@ impl Agent<'_> {
             for extension in &registry.extensions {
                 let decision = hook(
                     extension.as_ref(),
-                    extension
-                        .before_tool(
-                            &invocation.call.name,
-                            &args,
-                            &context,
-                            states.get(extension.id()),
-                        )
-                        .await,
+                    match &host {
+                        Some(host) => {
+                            extension
+                                .before_tool_with_host(
+                                    &invocation.call.name,
+                                    &args,
+                                    &context,
+                                    states.get(extension.id()),
+                                    host.clone(),
+                                )
+                                .await
+                        }
+                        None => {
+                            extension
+                                .before_tool(
+                                    &invocation.call.name,
+                                    &args,
+                                    &context,
+                                    states.get(extension.id()),
+                                )
+                                .await
+                        }
+                    },
                 )?;
                 if decision != Decision::Allow {
                     return Err(pending());
@@ -147,6 +164,7 @@ impl Agent<'_> {
         normalized: TurnNormalized,
         states: &ExtensionStates,
         cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<TurnPreparation> {
         let (tool, mut args) = match normalized {
             TurnNormalized::Ready { tool, args } => (tool, args),
@@ -162,7 +180,7 @@ impl Agent<'_> {
         let decision = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states)) =>
+            decision = tokio::time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states, host)) =>
                 decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         };
         Ok(match decision {
@@ -195,6 +213,7 @@ impl Agent<'_> {
             normalized,
             states,
             cancel,
+            None,
         )
         .await
     }
@@ -205,13 +224,29 @@ impl Agent<'_> {
         args: &mut serde_json::Value,
         context: &ToolContext,
         states: &ExtensionStates,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<Decision> {
         for extension in &registry.extensions {
             let decision = hook(
                 extension.as_ref(),
-                extension
-                    .tool_call(name, args, context, states.get(extension.id()))
-                    .await,
+                match &host {
+                    Some(host) => {
+                        extension
+                            .tool_call_with_host(
+                                name,
+                                args,
+                                context,
+                                states.get(extension.id()),
+                                host.clone(),
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .tool_call(name, args, context, states.get(extension.id()))
+                            .await
+                    }
+                },
             )?;
             if decision != Decision::Allow {
                 return Ok(decision);
@@ -270,6 +305,7 @@ impl Agent<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn turn_transform(
         registry: &Registry,
         tool_timeout: Duration,
@@ -278,6 +314,7 @@ impl Agent<'_> {
         states: &ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        host: Option<Arc<dyn ToolHost>>,
     ) {
         if matches!(
             reply.outcome,
@@ -298,9 +335,12 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(tool_timeout, extension.tool_result_update(
-                    &invocation.call, &reply.outcome, &context, states.get(extension.id()),
-                )) => result,
+                result = tokio::time::timeout(tool_timeout, async {
+                    match &host {
+                        Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.for_extension(extension.id()).unwrap_or_else(|| host.clone())).await,
+                        None => extension.tool_result_update(&invocation.call, &reply.outcome, &context, states.get(extension.id())).await,
+                    }
+                }) => result,
             };
             let error = match result {
                 Ok(Ok(Some(outcome)))
@@ -524,6 +564,11 @@ impl Agent<'_> {
                 && extension.handles_tool_execution_updates()
         });
         let (progress_output, mut progress) = mpsc::channel::<TurnProgress>(32);
+        let (lifecycle_sender, mut lifecycle_messages) = mpsc::channel(32);
+        let lifecycle_host = Arc::new(LifecycleMessageHost {
+            sender: lifecycle_sender.clone(),
+            idle: false,
+        });
         let mut futures = FuturesUnordered::<TurnFuture>::new();
         let mut calls = Vec::<TurnCall>::new();
         let mut positions = HashMap::<Uuid, usize>::new();
@@ -701,6 +746,7 @@ impl Agent<'_> {
                     let cancel = calls[index].cancellation.clone();
                     let model_timeout = self.limits.model_timeout;
                     let tool_timeout = self.limits.tool_timeout;
+                    let hook_host = lifecycle_host.clone();
                     futures.push(async move {
                         let mut errors = Vec::new();
                         if observe_tools {
@@ -710,7 +756,7 @@ impl Agent<'_> {
                                 parent_tool_call_id: parent,
                             };
                             let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
-                            tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &state_snapshot, model_timeout, &mut collect) => {} }
+                            tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &state_snapshot, model_timeout, &mut collect, hook_host) => {} }
                         }
                         let result = Self::turn_normalize(&registry, tool_timeout, &invocation, &advertised, &cancel).await;
                         TurnEvent::Normalized(index, result, errors)
@@ -863,6 +909,12 @@ impl Agent<'_> {
                 let invocation = calls[index].invocation.clone();
                 let cancel = calls[index].cancellation.clone();
                 let timeout = self.limits.tool_timeout;
+                let hook_host = callback_root_host(
+                    session,
+                    lifecycle_sender.clone(),
+                    invocation.operation_id,
+                    "recovered_tool_result",
+                );
                 let future = async move {
                     let mut errors = Vec::new();
                     let mut collect = |event: Notification<'_>| {
@@ -883,12 +935,14 @@ impl Agent<'_> {
                         &snapshot,
                         &cancel,
                         &mut collect,
+                        Some(hook_host),
                     )
                     .await;
                     TurnEvent::Transformed(index, reply, duration, errors)
                 }
                 .boxed();
-                futures.push(start_turn_future(future).await);
+                let started = start_turn_future(future).await;
+                futures.push(started);
             }
             if lanes.values().all(|lane| lane.calls.is_empty()) {
                 break;
@@ -928,11 +982,13 @@ impl Agent<'_> {
                             Ok(normalized) => {
                                 let registry = self.registry.clone(); let snapshot = states.clone();
                                 let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let future = async move {
-                                    let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel).await;
+                                    let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Prepared(index, result, Vec::new())
                                 }.boxed();
-                                futures.push(start_turn_future(future).await);
+                                let started = start_turn_future(future).await;
+                                futures.push(started);
                             }
                         }
                     }
@@ -968,6 +1024,7 @@ impl Agent<'_> {
                                 let progress_cancel = calls[index].cancellation.clone();
                                 let progress_states = states.clone();
                                 let progress_timeout = self.limits.model_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let progress_worker = tokio::spawn(async move {
                                     let mut errors = Vec::new();
                                     let mut closing = false;
@@ -985,9 +1042,10 @@ impl Agent<'_> {
                                                             errors.push((extension.to_owned(), event, message.to_owned()));
                                                         }
                                                     };
-                                                    tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify(&progress_registry, *event, &progress_states, progress_timeout, &mut collect) => {} }
+                                                    tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&progress_registry, *event, &progress_states, progress_timeout, &mut collect, hook_host.clone()) => {} }
                                                 }
                                             }
+                                            TurnProgress::Custom(input, reply) => { let _ = progress_output.send(TurnProgress::Custom(input, reply)).await; }
                                             TurnProgress::Flush(reply) => { let _ = progress_output.send(TurnProgress::Flush(reply)).await; }
                                         }
                                     }
@@ -1015,6 +1073,7 @@ impl Agent<'_> {
                             let timeout = self.limits.tool_timeout; let model_timeout = self.limits.model_timeout; let reference = reference.clone();
                             let parent = calls[index].parent.clone();
                             let pending_outcome = outcome.clone();
+                            let hook_host = lifecycle_host.clone();
                             calls[index].phase = TurnPhase::Polling;
                             calls[index].polled = true;
                             let future = async move {
@@ -1022,12 +1081,13 @@ impl Agent<'_> {
                                 if observe_tools {
                                     let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(), result: pending_outcome, is_error: false, duration_ms: duration, parent_tool_call_id: parent };
                                     let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
-                                    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &snapshot, model_timeout, &mut collect) => {} }
+                                    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &snapshot, model_timeout, &mut collect, hook_host) => {} }
                                 }
                                 let result = Self::turn_poll_normalize(&registry, timeout, &invocation, &cancel).await;
                                 TurnEvent::PollPrepared(index, result, reference, duration, errors)
                             }.boxed();
-                            futures.push(start_turn_future(future).await);
+                            let started = start_turn_future(future).await;
+                            futures.push(started);
                             continue;
                         }
                         if let Err(error) = finished { record_turn_error(&mut first_error, &mut error_origin, index, error); }
@@ -1035,13 +1095,14 @@ impl Agent<'_> {
                         let registry = self.registry.clone(); let snapshot = states.clone(); let timeout = self.limits.model_timeout;
                         let invocation = calls[index].invocation.clone(); let parent = calls[index].parent.clone();
                         let notify_end = observe_tools && !calls[index].polled;
+                        let hook_host = lifecycle_host.clone();
                         futures.push(async move {
                             let mut errors = Vec::new();
                             if notify_end {
                                 let is_error = outcome.is_error();
                                 let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id, tool_name: invocation.call.name, result: outcome.clone(), is_error, duration_ms: duration, parent_tool_call_id: parent };
                                 let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(),event,message.to_owned())); };
-                                crate::lifecycle::notify(&registry,event,&snapshot,timeout,&mut collect).await;
+                                crate::lifecycle::notify_with_host(&registry,event,&snapshot,timeout,&mut collect,hook_host).await;
                             }
                             TurnEvent::Notified(index,outcome,errors)
                         }.boxed());
@@ -1061,11 +1122,13 @@ impl Agent<'_> {
                             Ok((tool, args)) => {
                                 let registry = self.registry.clone(); let snapshot = states.clone();
                                 let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let future = async move {
-                                    let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel).await;
+                                    let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Polled(index, result, reference, duration, Vec::new())
                                 }.boxed();
-                                futures.push(start_turn_future(future).await);
+                                let started = start_turn_future(future).await;
+                                futures.push(started);
                             }
                             Err(error) => { futures.push(futures_util::future::ready(TurnEvent::Polled(index, Err(error), reference, duration, Vec::new())).boxed()); }
                         }
@@ -1082,7 +1145,11 @@ impl Agent<'_> {
                         }
                     },
                 },
-                Some(message) = progress.recv() => match message { TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)), TurnProgress::Flush(reply) => { let _ = reply.send(()); } },
+                Some(message) = progress.recv() => match message { TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)), TurnProgress::Custom(input, reply) => { let result = queue_custom_message(session, input, observer).map_err(|error| error.to_string()); let _ = reply.send(result); }, TurnProgress::Flush(reply) => { let _ = reply.send(()); } },
+                Some((message, reply)) = lifecycle_messages.recv() => {
+                    let result = queue_custom_message(session, message, observer).map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                },
                 Some(input) = receive_input(&mut inputs) => queue_input(session,input.into(),observer)?,
                 else => return Err(Error::Config("turn scheduler lost its active work".into())),
             }
@@ -1091,6 +1158,11 @@ impl Agent<'_> {
         while let Some(message) = progress.recv().await {
             match message {
                 TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)),
+                TurnProgress::Custom(input, reply) => {
+                    let result = queue_custom_message(session, input, observer)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
                 TurnProgress::Flush(reply) => {
                     let _ = reply.send(());
                 }

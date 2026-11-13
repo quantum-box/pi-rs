@@ -56,7 +56,7 @@ impl Runtime {
     pub async fn discover_resources(
         &mut self,
         args: &Cli,
-        session: &Session,
+        session: &mut Session,
         reason: pi_rs::ResourceDiscoveryReason,
     ) -> Result<pi_rs::DiscoveredResources> {
         if !self.registry.has_resource_discovery_hooks() {
@@ -69,15 +69,30 @@ impl Runtime {
                 .unwrap_or_else(|_| args.workspace.clone()),
             reason,
         };
-        let results = self
-            .registry
-            .discover_resources(
-                &event,
-                &session.extension_states(),
-                args.tool_timeout(),
-                |extension, error| eprintln!("Extension {extension} (resources_discover): {error}"),
-            )
-            .await;
+        let results = if session.host_binding().is_some() {
+            self.registry
+                .discover_resources(
+                    &event,
+                    &session.extension_states(),
+                    args.tool_timeout(),
+                    |extension, error| {
+                        eprintln!("Extension {extension} (resources_discover): {error}")
+                    },
+                )
+                .await
+        } else {
+            self.registry
+                .discover_resources_in_session(
+                    &event,
+                    session,
+                    args.tool_timeout(),
+                    &mut |event| super::observe(event, args.trace),
+                    |extension, error| {
+                        eprintln!("Extension {extension} (resources_discover): {error}")
+                    },
+                )
+                .await?
+        };
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {
@@ -227,7 +242,48 @@ impl Runtime {
         json!({"commands":commands})
     }
 
-    pub fn agent<'a>(&'a self, args: &'a Cli, session_id: uuid::Uuid) -> Agent<'a> {
+    pub fn agent<'a>(&'a self, args: &'a Cli, session: &Session) -> Agent<'a> {
+        let session_id = session.session_id();
+        self.registry.remove_session_branch_models(session_id);
+        // Resolve every recorded identity through its own configured provider.
+        // The journal id scopes the cache so credentials cannot cross sessions.
+        for record in session.records() {
+            let pi_rs::Event::ModelSelected {
+                provider: Some(provider),
+                model,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            let Some(selected) = args.model_profiles.provider(provider) else {
+                continue;
+            };
+            let mut branch_args = args.clone();
+            if branch_args
+                .activate_provider(selected, Some(model))
+                .is_err()
+            {
+                continue;
+            }
+            branch_args.model = model.clone();
+            if let Ok(client) = model_client(
+                &branch_args,
+                super::thinking::reported(&branch_args).is_some(),
+                true,
+            ) {
+                let _ = self.registry.register_session_provider_model_with_limits(
+                    session_id,
+                    provider,
+                    model,
+                    Arc::new(client),
+                    Some(Limits {
+                        compaction_tokens: Some(args.settings.compaction_tokens(provider, model)),
+                        ..effective_limits(&branch_args)
+                    }),
+                );
+            }
+        }
         self.shell.set_context(ShellContext {
             id: session_id,
             path: (!args.no_session && !args.ephemeral_worker_session)
@@ -245,14 +301,7 @@ impl Runtime {
             model_name: &args.model,
             registry: &self.registry,
             system_prompt: &self.system_prompt,
-            limits: Limits {
-                model_requests: args.max_requests,
-                output_tokens_per_request: args.effective_max_output_tokens(),
-                output_tokens_per_run: args.output_budget,
-                model_timeout: Duration::from_secs(args.model_timeout_secs),
-                tool_timeout: args.tool_timeout(),
-                context_window: args.effective_context_window(),
-            },
+            limits: effective_limits(args),
         }
     }
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
@@ -705,6 +754,18 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         }
     }
     result
+}
+
+fn effective_limits(args: &Cli) -> Limits {
+    Limits {
+        model_requests: args.max_requests,
+        output_tokens_per_request: args.effective_max_output_tokens(),
+        output_tokens_per_run: args.output_budget,
+        model_timeout: Duration::from_secs(args.model_timeout_secs),
+        tool_timeout: args.tool_timeout(),
+        context_window: args.effective_context_window(),
+        compaction_tokens: None,
+    }
 }
 
 pub(super) fn model_client(

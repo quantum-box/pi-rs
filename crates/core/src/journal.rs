@@ -11,7 +11,8 @@ use crate::{
     Usage, UsageReport,
 };
 
-const FORMAT_VERSION: u32 = 2;
+pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = TURN_END_JOURNAL_VERSION;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +140,23 @@ impl CompactedSystemPrompt {
 // Keep the public journal event shape stable as optional provider metadata grows.
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Identity of one request-hook invocation, retained across interrupted runs.
+    RequestCallbackStarted {
+        id: Uuid,
+        purpose: String,
+    },
+    /// A prepared request was discarded before model execution.
+    RequestCallbackAbandoned {
+        id: Uuid,
+    },
+    /// The turn-end extension callbacks completed for this assistant entry.
+    TurnEndCallbacksCompleted {
+        assistant_record: u64,
+    },
+    /// Deferred context for the completed turn was applied.
+    TurnEndBoundaryApplied {
+        assistant_record: u64,
+    },
     /// Original external entry retained during an explicit session import.
     SourceEntry {
         format: String,
@@ -183,6 +201,24 @@ pub enum Event {
     /// Extension message included in model context; display is a UI preference.
     CustomMessage {
         #[serde(flatten)]
+        message: crate::CustomMessage,
+    },
+    /// Durable pending extension message, excluded from context until delivered.
+    CustomMessageQueued {
+        input: crate::QueuedCustomMessage,
+    },
+    /// Session-wide queue entry produced before switching branches.
+    TreeMessageQueued {
+        input: crate::QueuedCustomMessage,
+    },
+    /// Persist the selected branch while an interrupted tree trigger resumes elsewhere.
+    TreeTriggerHandoff {
+        run_id: Uuid,
+        return_to: u64,
+    },
+    /// Atomically consumes a queued message and adds it to model context.
+    CustomMessageDelivered {
+        id: Uuid,
         message: crate::CustomMessage,
     },
     ModelSelected {
@@ -476,7 +512,11 @@ impl Session {
 
     /// Hold an exclusive OS lock for the lifetime of the session.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::with_store(FileStore::open(path.as_ref())?)
+        let mut session = Self::with_store(FileStore::open(path.as_ref())?)?;
+        if session.host_binding().is_none() {
+            session.recover_tree_trigger_handoff()?;
+        }
+        Ok(session)
     }
 
     /// Read a stable, complete-record prefix without locking or repairing the source.
@@ -518,6 +558,10 @@ impl Session {
 
     pub(crate) fn set_run_id(&mut self, run_id: Option<Uuid>) {
         self.run_id = run_id;
+    }
+
+    pub(crate) fn current_run_id(&self) -> Option<Uuid> {
+        self.run_id
     }
 
     /// Bind an otherwise empty session to a host security scope. Reopening
@@ -1211,6 +1255,148 @@ impl Session {
         Ok(())
     }
 
+    pub fn queued_custom_messages(&self) -> Vec<(u64, crate::QueuedCustomMessage)> {
+        let branch = self.branch();
+        let mut consumed = std::collections::HashSet::new();
+        let mut globally_consumed = std::collections::HashSet::new();
+        for record in &self.records {
+            match &record.event {
+                Event::CustomMessageDelivered { id, .. } => {
+                    globally_consumed.insert(*id);
+                }
+                Event::InputQueueCleared { ids } => globally_consumed.extend(ids.iter().copied()),
+                _ => {}
+            }
+        }
+        for record in &branch {
+            match &record.event {
+                Event::CustomMessageDelivered { id, .. } => {
+                    consumed.insert(*id);
+                }
+                Event::InputQueueCleared { ids } => consumed.extend(ids.iter().copied()),
+                _ => {}
+            }
+        }
+        let mut queued: Vec<_> = branch
+            .into_iter()
+            .filter_map(|record| match &record.event {
+                Event::CustomMessageQueued { input } if !consumed.contains(&input.id) => {
+                    Some((record.id, input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        queued.extend(
+            self.records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    Event::TreeMessageQueued { input }
+                        if !globally_consumed.contains(&input.id) =>
+                    {
+                        Some((record.id, input.clone()))
+                    }
+                    _ => None,
+                }),
+        );
+        queued.sort_by_key(|(id, _)| *id);
+        queued
+    }
+
+    /// Find a callback-triggered run that has not started or was interrupted.
+    pub fn pending_custom_trigger(&self) -> Option<Uuid> {
+        let branch = self.branch();
+        let branch_ids: std::collections::HashSet<_> =
+            branch.iter().map(|record| record.id).collect();
+        self.records.iter().find_map(|record| {
+            let (input, global) = match &record.event {
+                Event::CustomMessageQueued { input } if branch_ids.contains(&record.id) => (input, false),
+                Event::TreeMessageQueued { input } => (input, true),
+                _ => return None,
+            };
+            if input.delivery != crate::CustomMessageDelivery::TriggerTurn {
+                return None;
+            }
+            let entries: Vec<_> = if global { self.records.iter().collect() } else { branch.clone() };
+            let last_state = entries.iter().rev().find_map(|entry| match entry.event {
+                Event::Run { state, .. } if entry.run_id == Some(input.id) => Some(state),
+                _ => None,
+            });
+            let delivered = entries.iter().any(|entry| matches!(entry.event, Event::CustomMessageDelivered { id, .. } if id == input.id));
+            match last_state {
+                None | Some(RunState::Running | RunState::WaitingForOperation | RunState::WaitingForReconciliation) => Some(input.id),
+                Some(RunState::Cancelled) if !delivered => Some(input.id),
+                _ => None,
+            }
+        })
+    }
+
+    /// Restore the branch that owns an interrupted session-wide tree trigger.
+    /// The current branch must be settled; the destination may contain the
+    /// pending operation that recovery is about to reconcile.
+    pub(crate) fn begin_tree_trigger_handoff(
+        &mut self,
+        run_id: Uuid,
+    ) -> Result<Option<(u64, Vec<Record>)>> {
+        let is_tree_trigger = self.records.iter().any(|record| matches!(&record.event,
+            Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn));
+        if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
+            return Ok(None);
+        }
+        let Some(target) = self
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
+            })
+            .map(|record| record.id)
+        else {
+            return Ok(None);
+        };
+        if self.head == target {
+            return Ok(None);
+        }
+        ensure_settled(self.operations())?;
+        let return_to = self.head;
+        let marker = self
+            .append(Event::TreeTriggerHandoff { run_id, return_to })?
+            .clone();
+        let checkout = self.append(Event::Checkout { target })?.clone();
+        Ok(Some((return_to, vec![marker, checkout])))
+    }
+
+    /// Restore the selected branch without abandoning the recoverable operation
+    /// on the temporary branch. The saved target was settled when handoff began.
+    pub(crate) fn finish_tree_trigger_handoff(&mut self, return_to: u64) -> Result<&Record> {
+        if return_to == 0
+            || return_to > self.records.len() as u64
+            || matches!(
+                self.records[(return_to - 1) as usize].event,
+                Event::Checkout { .. }
+            )
+        {
+            return Err(Error::Session("invalid tree trigger handoff target".into()));
+        }
+        self.append(Event::Checkout { target: return_to })
+    }
+
+    pub(crate) fn recover_tree_trigger_handoff(&mut self) -> Result<Option<&Record>> {
+        let pending = self.records.iter().rev().find_map(|record| {
+            let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
+                return None;
+            };
+            let returned = self.records[record.id as usize..].iter().any(|later| {
+                matches!(later.event,
+                Event::Checkout { target } if target == return_to)
+            });
+            (!returned).then_some(return_to)
+        });
+        match pending {
+            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -1266,10 +1452,21 @@ impl Session {
     }
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<crate::QueuedMessage>> {
         let pending = self.queued_inputs();
-        if !pending.is_empty() {
-            self.append(Event::InputQueueCleared {
-                ids: pending.iter().map(|input| input.input.id).collect(),
-            })?;
+        let mut ids: Vec<_> = pending.iter().map(|input| input.input.id).collect();
+        ids.extend(
+            self.queued_custom_messages()
+                .into_iter()
+                .filter_map(|(_, input)| {
+                    matches!(
+                        input.delivery,
+                        crate::CustomMessageDelivery::Steer
+                            | crate::CustomMessageDelivery::FollowUp
+                    )
+                    .then_some(input.id)
+                }),
+        );
+        if !ids.is_empty() {
+            self.append(Event::InputQueueCleared { ids })?;
         }
         Ok(pending)
     }
@@ -1376,6 +1573,7 @@ impl Session {
                     | Event::ContextEdited { .. }
                     | Event::BashExecution { .. }
                     | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
                     | Event::User { .. }
                     | Event::UserWithImages { .. }
                     | Event::UserImages { .. } => Some(false),
@@ -1525,6 +1723,17 @@ impl Session {
             .enumerate()
             .map(|(index, record)| (record.id, index as u64 + 1))
             .collect();
+        // Tree messages are consumed session-wide, even when their delivery is
+        // on a branch that is absent from the fork's ancestry.
+        let globally_consumed: std::collections::HashSet<Uuid> = self
+            .records
+            .iter()
+            .flat_map(|record| match &record.event {
+                Event::CustomMessageDelivered { id, .. } => vec![*id],
+                Event::InputQueueCleared { ids } => ids.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
         let mut records = Vec::new();
         for record in branch {
             let summary_metadata = record
@@ -1533,6 +1742,13 @@ impl Session {
             let mut record = record.clone();
             record.id = ids[&record.id];
             record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
+            if matches!(&record.event, Event::TreeMessageQueued { input } if globally_consumed.contains(&input.id))
+            {
+                record.event = Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                };
+            }
             match &mut record.event {
                 Event::Created { session_id } => {
                     *session_id = Uuid::new_v4();
@@ -1541,7 +1757,14 @@ impl Session {
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
                 }
-                Event::TurnFinished { assistant_record } => {
+                Event::TreeTriggerHandoff { return_to, .. } => {
+                    *return_to = *ids
+                        .get(return_to)
+                        .ok_or_else(|| Error::Session("missing tree handoff branch".into()))?;
+                }
+                Event::TurnFinished { assistant_record }
+                | Event::TurnEndCallbacksCompleted { assistant_record }
+                | Event::TurnEndBoundaryApplied { assistant_record } => {
                     *assistant_record = *ids
                         .get(assistant_record)
                         .ok_or_else(|| Error::Session("missing fork response".into()))?;
@@ -1577,6 +1800,26 @@ impl Session {
                 _ => {}
             }
             records.push(record);
+        }
+        // Tree callback queues are session-wide and may live on the branch left
+        // behind. Preserve still-pending entries when exporting another branch.
+        for (source, input) in self.queued_custom_messages() {
+            if !ids.contains_key(&source)
+                && matches!(
+                    self.records[(source - 1) as usize].event,
+                    Event::TreeMessageQueued { .. }
+                )
+            {
+                let id = records.len() as u64 + 1;
+                records.push(Record {
+                    timestamp: Some(record_timestamp()),
+                    run_id: None,
+                    version: FORMAT_VERSION,
+                    id,
+                    parent: Some(id - 1),
+                    event: Event::TreeMessageQueued { input },
+                });
+            }
         }
         validated_head(&records)?;
         Ok(records)
@@ -1669,7 +1912,7 @@ impl Session {
         }
         // A native message branching directly from a legacy Pi source needs a
         // distinct parent, even if its content is identical to the old message.
-        if matches!(&event, Event::CustomMessage { .. })
+        if matches!(&event, Event::CustomMessage { .. } | Event::CustomMessageDelivered { .. })
             && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
                 matches!(&record.event, Event::SourceEntry { format, entry }
                     if format == "pi" && entry["type"] == "message"
@@ -1791,6 +2034,7 @@ fn validate_context_edit(
             record.event,
             Event::User { .. }
                 | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
@@ -1864,6 +2108,11 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             }
             _ => (head != 0).then_some(head),
         };
+        if let Event::TreeTriggerHandoff { return_to, .. } = record.event
+            && !is_prior_position(return_to)
+        {
+            return Err(Error::Session("invalid tree trigger handoff target".into()));
+        }
         if !(version..=FORMAT_VERSION).contains(&record.version)
             || record.id != id
             || record.parent != expected_parent
@@ -2393,7 +2642,7 @@ fn conversation_entries_since_inner(
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
-            Event::CustomMessage { message } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
             Event::User { content, .. } => messages.push((
                 record.id,
                 Message::User {
@@ -2698,6 +2947,188 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn fork_does_not_resurrect_tree_message_consumed_on_another_branch() {
+        for delivery in [
+            crate::CustomMessageDelivery::TriggerTurn,
+            crate::CustomMessageDelivery::NextTurn,
+        ] {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "tree".into(),
+                content: crate::ContextContent::Text("once".into()),
+                display: false,
+                details: None,
+            };
+            session
+                .append(Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id,
+                        message: message.clone(),
+                        delivery,
+                    },
+                })
+                .unwrap();
+            let source = session.head();
+            session.checkout(1).unwrap();
+            session
+                .append(Event::CustomMessageDelivered { id, message })
+                .unwrap();
+            session.checkout(source).unwrap();
+            assert!(session.queued_custom_messages().is_empty());
+            let fork = Session::from_records(session.fork_records(source).unwrap()).unwrap();
+            assert!(fork.queued_custom_messages().is_empty());
+            assert_eq!(fork.pending_custom_trigger(), None);
+        }
+    }
+
+    #[test]
+    fn tree_trigger_restore_rejects_an_unsettled_current_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let trigger = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(trigger));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(1).unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "tool".into(),
+                        name: "tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.append(Event::ToolStarted { operation_id }).unwrap();
+        let head = session.head();
+        assert!(
+            matches!(session.begin_tree_trigger_handoff(trigger), Err(Error::Reconciliation(id)) if id == operation_id)
+        );
+        assert_eq!(session.head(), head);
+        assert_eq!(session.pending_custom_trigger(), Some(trigger));
+    }
+
+    #[test]
+    fn tree_trigger_handoff_can_checkout_a_different_named_provider() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("provider-a"), "model-a", None)
+            .unwrap();
+        let trigger = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(trigger));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(1).unwrap();
+        session
+            .select_provider_model(Some("provider-b"), "model-b", None)
+            .unwrap();
+        let before = session.head();
+        let (return_to, _) = session
+            .begin_tree_trigger_handoff(trigger)
+            .unwrap()
+            .unwrap();
+        assert_eq!(return_to, before);
+        assert_eq!(session.model_provider(), Some("provider-a"));
+        session.finish_tree_trigger_handoff(return_to).unwrap();
+        assert_eq!(session.model_provider(), Some("provider-b"));
+        assert_eq!(session.pending_custom_trigger(), Some(trigger));
+    }
+
+    #[test]
+    fn opening_a_host_bound_journal_does_not_repair_its_handoff_without_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-handoff.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.bind_host("tenant").unwrap();
+        session
+            .append_user_with_images("A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "tree".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(2).unwrap();
+        session
+            .append_user_with_images("B".into(), vec![], None)
+            .unwrap();
+        let branch_b = session.head();
+        session.begin_tree_trigger_handoff(run_id).unwrap().unwrap();
+        let temporary_head = session.head();
+        let count = session.records().len();
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.head(), temporary_head);
+        assert_eq!(reopened.records().len(), count);
+        reopened.recover_tree_trigger_handoff().unwrap().unwrap();
+        assert_eq!(reopened.head(), branch_b);
+    }
 
     #[test]
     fn dropping_the_store_unlocks_duplicated_file_descriptors() {

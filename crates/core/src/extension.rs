@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -10,6 +10,10 @@ use crate::{
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
+type BranchModels = BTreeMap<
+    (Option<Uuid>, Option<String>, String),
+    (Arc<dyn crate::Model>, Option<crate::Limits>),
+>;
 
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
@@ -116,6 +120,27 @@ pub struct CustomMessage {
         deserialize_with = "deserialize_present_json"
     )]
     pub details: Option<Value>,
+}
+
+/// Delivery boundary for an extension message sent during an active run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CustomMessageDelivery {
+    #[default]
+    Steer,
+    FollowUp,
+    NextTurn,
+    /// Start a new turn when idle; while active, deliver as steering.
+    TriggerTurn,
+    /// Append after the current assistant turn without starting another turn.
+    AfterTurn,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct QueuedCustomMessage {
+    pub id: uuid::Uuid,
+    pub delivery: CustomMessageDelivery,
+    pub message: CustomMessage,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -240,6 +265,11 @@ pub enum ToolExecution {
 /// Mediates nested tool calls through the same journal and policies as model calls.
 #[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
+    /// Opaque owner identity for callback-scoped session hosts.
+    #[doc(hidden)]
+    fn callback_scope_owner(&self) -> Option<uuid::Uuid> {
+        None
+    }
     fn tools(&self) -> Vec<ToolSpec>;
     fn supports_progress(&self) -> bool {
         false
@@ -253,6 +283,35 @@ pub trait ToolHost: Send + Sync {
     }
     async fn ui(&self, _request: crate::UiRequest) -> ExtensionResult<crate::UiResponse> {
         Err("interactive extension UI is unavailable".into())
+    }
+    /// Whether this host can journal custom-message delivery requests.
+    fn supports_custom_messages(&self) -> bool {
+        false
+    }
+    /// Queue custom context through the active session owner.
+    async fn send_message(
+        &self,
+        _message: CustomMessage,
+        _delivery: CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        Err("custom message delivery is unavailable".into())
+    }
+    /// Whether stable, extension-supplied message keys are supported here.
+    fn supports_keyed_messages(&self) -> bool {
+        false
+    }
+    /// Send with a stable key unique to this extension and callback phase within a run.
+    async fn send_message_with_key(
+        &self,
+        _message: CustomMessage,
+        _delivery: CustomMessageDelivery,
+        _key: &str,
+    ) -> ExtensionResult<()> {
+        Err("keyed custom messages are unavailable".into())
+    }
+    /// Scope a callback host to the extension being invoked.
+    fn for_extension(&self, _extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        None
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
     /// Submit an ordered group together so compatible reads can overlap.
@@ -765,6 +824,15 @@ pub trait Extension: Send + Sync {
         Ok(InputAction::Continue)
     }
 
+    async fn input_with_host(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<InputAction> {
+        self.input(event, state).await
+    }
+
     fn handles_user_bash(&self) -> bool {
         false
     }
@@ -776,6 +844,15 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<UserBashResult>> {
         Ok(None)
+    }
+
+    async fn user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<UserBashResult>> {
+        self.user_bash(event, state).await
     }
 
     /// Opt in to selecting a custom streaming implementation of user shell execution.
@@ -792,6 +869,15 @@ pub trait Extension: Send + Sync {
         Ok(false)
     }
 
+    async fn user_bash_operations_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        self.user_bash_operations(event, state).await
+    }
+
     /// Execute the command, sending combined output bytes as they become available.
     async fn execute_user_bash(
         &self,
@@ -802,6 +888,19 @@ pub trait Extension: Send + Sync {
         _output: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> ExtensionResult<Option<i32>> {
         Err("user shell operations unavailable".into())
+    }
+
+    async fn execute_user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<std::time::Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<i32>> {
+        self.execute_user_bash(event, state, timeout, cancel, output)
+            .await
     }
 
     fn handles_lifecycle(&self) -> bool {
@@ -836,6 +935,15 @@ pub trait Extension: Send + Sync {
         Ok(DiscoveredResources::default())
     }
 
+    async fn discover_resources_with_host(
+        &self,
+        event: &ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<DiscoveredResources> {
+        self.discover_resources(event, state).await
+    }
+
     /// Opt in to session start and shutdown events in addition to run and turn events.
     fn handles_session_lifecycle(&self) -> bool {
         false
@@ -848,6 +956,17 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
         Ok(())
+    }
+
+    /// Observe an active-run lifecycle event with access to its message host.
+    /// Existing extensions continue to use `lifecycle` by default.
+    async fn lifecycle_with_host(
+        &self,
+        event: &crate::LifecycleEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle(event, state).await
     }
 
     fn handles_cache_warming(&self) -> bool {
@@ -871,6 +990,15 @@ pub trait Extension: Send + Sync {
         Ok(false)
     }
 
+    async fn before_session_transition_with_host(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        self.before_session_transition(event, state).await
+    }
+
     async fn before_tree(
         &self,
         _preparation: &crate::TreePreparation,
@@ -878,6 +1006,16 @@ pub trait Extension: Send + Sync {
         _cancel: &crate::CancellationToken,
     ) -> ExtensionResult<Option<crate::TreeDecision>> {
         Ok(None)
+    }
+
+    async fn before_tree_with_host(
+        &self,
+        preparation: &crate::TreePreparation,
+        state: Option<&ExtensionState>,
+        cancel: &crate::CancellationToken,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<crate::TreeDecision>> {
+        self.before_tree(preparation, state, cancel).await
     }
 
     async fn cache_warming_decision(
@@ -918,6 +1056,16 @@ pub trait Extension: Send + Sync {
         self.context(request, state)
     }
 
+    async fn before_request_with_host(
+        &self,
+        request: &mut ContextRequest<'_>,
+        purpose: RequestPurpose,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<ContextChange> {
+        self.before_request(request, purpose, state).await
+    }
+
     /// Opt in to transforming the complete message list after context hooks.
     fn handles_context_with_system(&self) -> bool {
         false
@@ -932,6 +1080,15 @@ pub trait Extension: Send + Sync {
         Ok(ContextChange::Unchanged)
     }
 
+    async fn context_with_system_with_host(
+        &self,
+        messages: &mut ContextMessages<'_>,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<ContextChange> {
+        self.context_with_system(messages, state).await
+    }
+
     async fn before_tool(
         &self,
         _name: &str,
@@ -940,6 +1097,22 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Decision> {
         Ok(Decision::Allow)
+    }
+
+    /// Opt in to host-aware legacy policy dispatch instead of `tool_call`.
+    fn handles_before_tool_host(&self) -> bool {
+        false
+    }
+
+    async fn before_tool_with_host(
+        &self,
+        name: &str,
+        args: &Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        self.before_tool(name, args, context, state).await
     }
 
     /// Opt in to modifying validated tool arguments before execution.
@@ -956,6 +1129,22 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Decision> {
         self.before_tool(name, args, context, state).await
+    }
+
+    async fn tool_call_with_host(
+        &self,
+        name: &str,
+        args: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if self.handles_before_tool_host() {
+            self.before_tool_with_host(name, args, context, state, host)
+                .await
+        } else {
+            self.tool_call(name, args, context, state).await
+        }
     }
 
     /// Opt in to transforming completed tool results before they enter the journal.
@@ -1023,6 +1212,17 @@ pub trait Extension: Send + Sync {
         }
     }
 
+    async fn tool_result_update_with_host(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        self.tool_result_update(call, outcome, context, state).await
+    }
+
     fn after_tool(
         &self,
         _name: &str,
@@ -1040,12 +1240,30 @@ pub trait Extension: Send + Sync {
         Ok(Decision::Allow)
     }
 
+    async fn before_compaction_with_host(
+        &self,
+        compaction: &mut Compaction,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        self.before_compaction(compaction, state)
+    }
+
     fn after_compaction(
         &self,
         _compaction: &Compaction,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
         Ok(None)
+    }
+
+    async fn after_compaction_with_host(
+        &self,
+        compaction: &Compaction,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<ExtensionState>> {
+        self.after_compaction(compaction, state)
     }
 }
 
@@ -1084,9 +1302,111 @@ pub struct Registry {
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
+    branch_models: Arc<RwLock<BranchModels>>,
 }
 
 impl Registry {
+    /// Register a model instance for recovery on a branch that selected it.
+    pub fn register_branch_model(
+        &self,
+        name: impl Into<String>,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .insert((None, None, name), (model, None));
+        Ok(())
+    }
+
+    pub(crate) fn register_session_branch_model(
+        &self,
+        session_id: Uuid,
+        name: String,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .insert((Some(session_id), None, name), (model, None));
+        Ok(())
+    }
+    /// Register an exact provider/model identity for a single journal.
+    pub fn register_session_provider_model(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        self.register_session_provider_model_with_limits(session_id, provider, name, model, None)
+    }
+    /// Register a session-specific provider client and its effective run limits.
+    pub fn register_session_provider_model_with_limits(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        limits: Option<crate::Limits>,
+    ) -> Result<()> {
+        if provider.trim().is_empty() || name.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        self.branch_models.write().expect("branch models").insert(
+            (Some(session_id), Some(provider.to_owned()), name.to_owned()),
+            (model, limits),
+        );
+        Ok(())
+    }
+    pub(crate) fn provider_branch_config(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+    ) -> Option<(Arc<dyn crate::Model>, Option<crate::Limits>)> {
+        self.branch_models
+            .read()
+            .expect("branch models")
+            .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+            .cloned()
+    }
+    pub(crate) fn branch_model(
+        &self,
+        session_id: Uuid,
+        name: &str,
+    ) -> Option<Arc<dyn crate::Model>> {
+        let models = self.branch_models.read().expect("branch models");
+        models
+            .get(&(Some(session_id), None, name.to_owned()))
+            .or_else(|| models.get(&(None, None, name.to_owned())))
+            .map(|(model, _)| model.clone())
+    }
+    pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
+        let mut models = self.branch_models.write().expect("branch models");
+        let copies: Vec<_> = models
+            .iter()
+            .filter(|((owner, _, _), _)| *owner == Some(source))
+            .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
+            .collect();
+        for (provider, name, model) in copies {
+            models.insert((Some(destination), provider, name), model);
+        }
+    }
+    /// Remove recovery clients for a session before rebuilding its host configuration.
+    pub fn remove_session_branch_models(&self, session_id: Uuid) {
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .retain(|(owner, _, _), _| *owner != Some(session_id));
+    }
     /// Allow tools that opt out to run without the host's default timeout.
     /// Explicitly configured host timeouts should leave this disabled.
     pub fn omit_default_tool_timeout(&mut self, omit: bool) {
@@ -1130,6 +1450,57 @@ impl Registry {
         }
         result
     }
+    /// Discover resources while journaling custom messages sent by callbacks.
+    pub async fn discover_resources_in_session(
+        &self,
+        event: &ResourceDiscoveryEvent,
+        session: &mut crate::Session,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        mut on_error: impl FnMut(&str, &str),
+    ) -> Result<Vec<ExtensionResources>> {
+        let states = session.extension_states();
+        let mut result = Vec::new();
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|item| item.handles_resource_discovery())
+        {
+            let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+            let outcome = {
+                let future = tokio::time::timeout(
+                    timeout,
+                    extension.discover_resources_with_host(event, states.get(extension.id()), host),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, reply)) = incoming.recv() => {
+                            let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
+                                crate::agent::queue_custom_message(session, input, observer)
+                            } else {
+                                session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
+                            };
+                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        result = &mut future => break result,
+                    }
+                }
+            };
+            match outcome {
+                Ok(Ok(resources)) => result.push(ExtensionResources {
+                    extension_id: extension.id().into(),
+                    source: extension.command_source().map(std::path::Path::to_path_buf),
+                    resources,
+                }),
+                Ok(Err(error)) => on_error(extension.id(), &error),
+                Err(_) => on_error(extension.id(), "resource discovery timed out"),
+            }
+        }
+        Ok(result)
+    }
     pub fn has_session_transition_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -1143,6 +1514,30 @@ impl Registry {
         timeout: std::time::Duration,
         observer: &mut crate::Observer<'_>,
     ) -> bool {
+        self.session_transition_cancelled_inner(event, states, timeout, observer, None)
+            .await
+    }
+
+    pub(crate) async fn session_transition_cancelled_with_host(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        host: Arc<dyn ToolHost>,
+    ) -> bool {
+        self.session_transition_cancelled_inner(event, states, timeout, observer, Some(host))
+            .await
+    }
+
+    async fn session_transition_cancelled_inner(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> bool {
         let deadline =
             tokio::time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
         for extension in self
@@ -1150,10 +1545,24 @@ impl Registry {
             .iter()
             .filter(|extension| extension.handles_session_transitions())
         {
-            let error = match tokio::time::timeout_at(
-                deadline,
-                extension.before_session_transition(event, states.get(extension.id())),
-            )
+            let error = match tokio::time::timeout_at(deadline, async {
+                match &host {
+                    Some(host) => {
+                        extension
+                            .before_session_transition_with_host(
+                                event,
+                                states.get(extension.id()),
+                                host.clone(),
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .before_session_transition(event, states.get(extension.id()))
+                            .await
+                    }
+                }
+            })
             .await
             {
                 Ok(Ok(true)) => return true,
@@ -1168,6 +1577,61 @@ impl Registry {
             });
         }
         false
+    }
+    /// Check a transition while the session owner journals callback messages.
+    pub async fn session_transition_cancelled_in_session(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        session: &mut crate::Session,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+    ) -> Result<bool> {
+        let states = session.extension_states();
+        let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+        let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let mut errors = Vec::new();
+        let mut collect = |event: crate::Notification<'_>| {
+            if let crate::Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        let cancelled = {
+            let future = self.session_transition_cancelled_with_host(
+                event,
+                &states,
+                timeout,
+                &mut collect,
+                host,
+            );
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((input, reply)) = incoming.recv() => {
+                        let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
+                            crate::agent::queue_custom_message(session, input, observer)
+                        } else {
+                            session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
+                        };
+                        match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                    }
+                    result = &mut future => break result,
+                }
+            }
+        };
+        for (extension, event, message) in &errors {
+            observer(crate::Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(cancelled)
     }
     pub fn has_session_lifecycle_hooks(&self) -> bool {
         self.extensions
@@ -1231,13 +1695,35 @@ impl Registry {
         states: &ExtensionStates,
         cancel: &CancellationToken,
     ) -> Result<Option<UserBashReplacement>> {
+        self.prepare_user_bash_inner(event, states, cancel, None)
+            .await
+    }
+
+    pub async fn prepare_user_bash_with_host(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<UserBashReplacement>> {
+        self.prepare_user_bash_inner(event, states, cancel, Some(host))
+            .await
+    }
+
+    async fn prepare_user_bash_inner(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Result<Option<UserBashReplacement>> {
         for extension in &self.extensions {
             let state = states.get(extension.id());
             if extension.handles_user_bash() {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = extension.user_bash(event, state) => result,
+                    result = async { match &host { Some(host) => extension.user_bash_with_host(event, state, host.clone()).await, None => extension.user_bash(event, state).await } } => result,
                 };
                 if let Some(result) = hook(extension.as_ref(), result)? {
                     return Ok(Some(UserBashReplacement::Result(result)));
@@ -1247,7 +1733,7 @@ impl Registry {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = extension.user_bash_operations(event, state) => result,
+                    result = async { match &host { Some(host) => extension.user_bash_operations_with_host(event, state, host.clone()).await, None => extension.user_bash_operations(event, state).await } } => result,
                 };
                 if hook(extension.as_ref(), result)? {
                     return Ok(Some(UserBashReplacement::Operations {
@@ -1292,6 +1778,15 @@ impl Registry {
         states: &ExtensionStates,
     ) -> Result<Option<InputEvent>> {
         prepare_input(&self.extensions, event, states).await
+    }
+
+    pub(crate) async fn prepare_input_with_host(
+        &self,
+        event: InputEvent,
+        states: &ExtensionStates,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<InputEvent>> {
+        prepare_input_inner(&self.extensions, event, states, Some(host)).await
     }
 
     pub fn set_refresher(&mut self, refresher: Arc<dyn RegistryRefresher>) {
@@ -1451,6 +1946,7 @@ impl Registry {
             ui: self.ui.clone(),
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
+            branch_models: self.branch_models.clone(),
         })
     }
 
@@ -1543,14 +2039,48 @@ impl Registry {
 
 pub(crate) async fn prepare_input(
     extensions: &[Arc<dyn Extension>],
+    event: InputEvent,
+    states: &ExtensionStates,
+) -> Result<Option<InputEvent>> {
+    prepare_input_inner(extensions, event, states, None).await
+}
+
+pub(crate) async fn prepare_input_with_host(
+    extensions: &[Arc<dyn Extension>],
+    event: InputEvent,
+    states: &ExtensionStates,
+    host: Arc<dyn ToolHost>,
+) -> Result<Option<InputEvent>> {
+    prepare_input_inner(extensions, event, states, Some(host)).await
+}
+
+async fn prepare_input_inner(
+    extensions: &[Arc<dyn Extension>],
     mut event: InputEvent,
     states: &ExtensionStates,
+    host: Option<Arc<dyn ToolHost>>,
 ) -> Result<Option<InputEvent>> {
     for extension in extensions
         .iter()
         .filter(|extension| extension.handles_input())
     {
-        let action = match extension.input(&event, states.get(extension.id())).await {
+        let owner = host.as_ref().and_then(|host| host.callback_scope_owner());
+        let response = crate::sdk::scope_extension_callback(owner, async {
+            match &host {
+                Some(host) => {
+                    extension
+                        .input_with_host(
+                            &event,
+                            states.get(extension.id()),
+                            crate::sdk::scope_callback_host(host.clone()),
+                        )
+                        .await
+                }
+                None => extension.input(&event, states.get(extension.id())).await,
+            }
+        })
+        .await;
+        let action = match response {
             Ok(action) => action,
             Err(error) => {
                 eprintln!("Extension {} (input): {error}", extension.id());
@@ -1820,6 +2350,70 @@ mod replacement_tests {
             result[0].resources.prompt_paths,
             [std::path::PathBuf::from("relative.md")]
         );
+    }
+
+    struct ResourceMessageHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceMessageHook {
+        fn id(&self) -> &str {
+            "resource-message"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            host.send_message(
+                CustomMessage {
+                    custom_type: "resource".into(),
+                    content: crate::ContextContent::Text("discovery".into()),
+                    display: false,
+                    details: Some(json!({"id":1})),
+                },
+                CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources {
+                prompt_paths: vec!["fixture.md".into()],
+                ..Default::default()
+            })
+        }
+    }
+    #[tokio::test]
+    async fn resource_discovery_journals_trigger_before_acknowledging_callback() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceMessageHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(1),
+                &mut |_| {},
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result[0].resources.prompt_paths,
+            [std::path::PathBuf::from("fixture.md")]
+        );
+        let restored = crate::Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.details,
+            Some(json!({"id":1}))
+        );
+        assert!(restored.pending_custom_trigger().is_some());
     }
 
     struct TestExtension(&'static str, &'static str);

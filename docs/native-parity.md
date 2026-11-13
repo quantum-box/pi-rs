@@ -83,7 +83,7 @@ without `defaultProvider` are still accepted.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection | OAuth and refresh for other model providers; ChatGPT live acceptance |
-| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, user-shell result replacement and streaming operations, in-process shell spawn hooks, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, turn triggering and steering for custom messages, custom message renderers, shell tool factory and remote execution APIs, resource provenance in other surfaces and general component render callbacks |
+| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, active-run custom messages from native tools, user-shell result replacement and streaming operations, in-process shell spawn hooks, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, shell tool factory and remote execution APIs, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
@@ -2807,6 +2807,141 @@ cancellation remains independent of input preparation.
 The SDK tests cover handled and transformed queued input, image
 attachments, fork and checkout state, delivery mode during a run and
 clearing the resulting queue.
+
+### Active-run native custom messages
+
+A native tool or supported extension callback can call `ToolHost::send_message`
+with `Steer`, `FollowUp`, `NextTurn`, `TriggerTurn`, or `AfterTurn`. These
+correspond to Pi's default steering, `deliverAs: "followUp"`,
+`deliverAs: "nextTurn"`, `triggerTurn: true`, and `triggerTurn: false`,
+respectively. `TriggerTurn` queues steering during an active run. The last mode adds context after the
+current assistant turn and its tool results without itself starting another
+model request. `SessionControl` exposes the same active-run delivery modes;
+`AgentSession::queue_custom_message_next_turn` also works while idle.
+
+Messages are journaled before the host acknowledges them. Their type, content,
+visibility and details survive reopening, and a single delivery record both
+consumes the pending item and adds it to context. Steering and follow-ups share
+FIFO order and queue modes with user input. Clearing the queue removes those
+two modes but retains next-turn messages. Executable extensions negotiate the
+host-call capability and report it unavailable with older hosts.
+
+The SDK supplies a message host to initial input hooks and to `SessionControl`
+input hooks while idle or during a run. Idle host sends are acknowledged after
+journaling, and trigger messages start a run through the shared session owner.
+Directly awaited control calls from an idle input callback use a bounded
+callback-scoped child lane. To await a control call in a spawned task, capture
+`SessionControl::scoped()` inside the callback and move the returned control
+into that task. Scoped controls and message hosts expire when their individual
+extension callback finishes, including initial-prompt input hooks. Host scopes
+are bound to their session owner, so nested sessions cannot write to the
+caller’s journal. Ordinary control clones used by independently spawned tasks
+enter the normal FIFO queue.
+Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
+Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
+and ordinary and truncated-tool execution events; settled `agent_end` and
+`agent_settled`; and SDK-owned session and model-selection notifications,
+including active control rename, pre-navigation `session_before_tree` and
+post-navigation `session_tree` notifications. SDK and workbench transition
+checks, workbench resource discovery, and user-bash replacement, operation
+selection, and streamed execution hooks also service messages through the
+session owner. Streamed output and message calls share the negotiated process
+channel. A workbench discovery or shell callback can schedule a triggered run
+before the next user operation. Idle callbacks append messages without starting
+a model turn, except `NextTurn`, which is queued, and
+`TriggerTurn`, which starts a separate run. A trigger's queued message UUID is
+also its run ID. Reopening a session resumes an interrupted triggered run with
+that same ID and does not redeliver its message or repeat a recorded answer.
+Reentrant sends are serviced by the journal owner while the callback waits.
+Separately built extensions negotiate the individual callback capabilities.
+Messages queued by `session_before_tree` are session-wide: they survive a
+checkout, reopening, and an exported fork, and are consumed once across branch
+switches. If a tree-triggered run was started on another branch, recovery uses
+a journaled temporary handoff to resume there, then restores the selected branch
+on success, failure, or cancellation. Reopening repairs an interrupted handoff.
+The current branch's operations must be settled before the handoff. Branch
+extension state is refreshed at both boundaries. If the originating branch
+selected a different model, the host must register its model instance with
+`SessionBuilder::branch_model`, `AgentSession::register_branch_model`, or
+`Registry::register_branch_model`; otherwise recovery reports an error without
+running the wrong model. The workbench resolves recorded provider/model selections
+from its current configuration and registers them per session for recovery,
+including each model's effective output and context limits and per-model
+compaction tokens. Hosts that register provider models can supply their limits
+and compaction tokens alongside the client; otherwise the current agent limits
+and live session compaction settings apply. Handoff-specific tokens do not alter
+the selected branch's live compaction settings. Cross-provider recovery requires an exact provider/model registration; absent
+credentials or configuration leave the trigger pending with an error. Journals
+do not distinguish two runtime instances with the same provider and model name. Immediate idle messages remain on the branch where
+they were sent.
+
+Focused tests cover queue and tool-result ordering, callback reentrancy,
+initial and streaming input, provider-request delivery, session start and
+settled boundaries, process protocol metadata, and reopening before the next
+prompt. Tests also cover multiple triggers, idle and active delivery, waiting and
+undelivered cancelled runs, replayed `agent_start` callbacks, separate SDK run
+brackets, and restarts before run creation, before and after message delivery,
+and after the answer was recorded. During a run, `agent_start`, `turn_start`,
+`turn_end`, `before_request`, and `context_with_system` callbacks can call
+`send_message_with_key`. Keys are scoped by run, extension, callback phase and
+turn; request hooks use a journaled invocation ID and distinguish abandoned
+preparations and completed attempts. Recovered
+live and recovered tool-result hooks scope keys by operation and extension. The extension
+must supply a stable key unique for each logical send within that callback.
+Identical keyed replays reuse the journal entry even when callback order
+changes; reusing a key with different content fails the run instead of retrying
+indefinitely. Executable extensions negotiate keyed-message support.
+The journal records completion of turn-end callbacks and application of deferred
+context. Recovery reruns an unfinished callback before returning an existing
+answer or advancing the tool turn, then applies deferred context once. Journal
+version 3 identifies turns that use these boundaries. An older assistant record
+without a completion marker is treated as already observed: older journals
+cannot distinguish a completed callback from one interrupted before completion.
+Before a new run starts, unfinished earlier turn boundaries are resolved and
+their deferred messages are applied; legacy deferred messages are applied
+before the next request without replaying the legacy callback.
+
+Exactly-once recovery is not possible for unkeyed callback sends when a process
+stops between sends or the callback takes a different path. Ordinary Pi-style
+unkeyed sends remain accepted on recovery; re-executing a callback can append a
+message again. Extensions that can supply stable keys may use them for
+recovery-safe delivery and must not switch an interrupted run's sends from
+unkeyed to keyed: older journals do not contain enough information to match
+those identities. Journals produced by earlier versions of this draft did not
+scope keyed sends by request invocation, turn, or recovered tool operation; interrupted runs from
+those versions cannot be migrated without potentially duplicating a send.
+Automatic trigger
+runs retain their own SDK run events and do not replace the initiating run's
+result.
+
+The pinned Pi [`_prepareRun` implementation](https://github.com/badlogic/pi-mono/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/agent-session.ts#L1941-L1982)
+places the starting user or custom message before pending `nextTurn` messages,
+even when the latter were queued earlier. The native scheduler follows that
+order; it is covered for both user and custom starting messages. Host-aware
+`before_tool` policies can opt in with
+`handles_before_tool_host`; separately built extensions negotiate this support.
+Model-generated summary compaction, synchronous SDK `compact()`, and the
+asynchronous `compact_with_hooks()` SDK alternative run host-aware before/after
+hooks. Synchronous SDK `compact()` blocks its caller while a separate runtime
+services those hooks and triggered turns; callbacks that need work scheduled on
+the caller's blocked executor should use `compact_with_hooks()` instead. Legacy
+synchronous compaction hooks keep their signatures but execute on that worker
+thread when called through SDK `compact()`. Cooperative asynchronous hooks are
+bounded by the tool timeout; a legacy hook that blocks its worker thread cannot
+be preempted. Tasks spawned on the private runtime do not outlive the call;
+extensions needing longer-lived tasks should use the async API. Queue controls
+submitted reentrantly during compaction hooks are serviced by the session owner.
+Async `session_compact` and
+`session_compact_failed` notifications can send through the session owner.
+For host-bound workbench sessions, resource discovery
+uses the state-only API and session transitions require the owning host. The
+state-only `Registry::discover_resources` and `session_transition_cancelled`
+APIs do not have a session owner; hosts that need message delivery use their
+session-owned counterparts.
+A trigger requested by a session shutdown callback remains queued for the next
+session start because the closing session cannot start another run.
+Command effects retain their existing return-value mechanism; custom message
+renderers are unsupported.
 
 ### Rust extension lifecycle observation
 

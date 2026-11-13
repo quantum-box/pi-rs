@@ -262,6 +262,8 @@ fn selected(provider: &Value, model: &Value, thinking: Option<String>) -> Branch
 }
 impl Importer {
     fn append(&mut self, branch: &mut Branch, event: Event) -> u64 {
+        // Imported Pi history predates native turn-end callback markers. Keep
+        // it at journal version 2; new native appends upgrade it to version 3.
         let current_head = self
             .records
             .last()
@@ -422,6 +424,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 event,
                 Event::User { .. }
                     | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
                     | Event::Assistant { .. }
                     | Event::ToolFinished { .. }
                     | Event::ToolReconciled { .. }
@@ -1038,6 +1041,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn imported_history_keeps_legacy_version_and_accepts_native_appends() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"imported"}}),
+        ]).unwrap();
+        assert!(session.records().iter().all(|record| record.version == 2));
+        session
+            .append_user_with_images("native".into(), vec![], None)
+            .unwrap();
+        let current = Session::with_store(pi_rs::MemoryStore::default())
+            .unwrap()
+            .records()[0]
+            .version;
+        assert_eq!(session.records().last().unwrap().version, current);
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            restored.conversation_at(restored.head()).unwrap(),
+            session.conversation_at(session.head()).unwrap()
+        );
+    }
+
+    #[test]
     fn imported_assistant_total_tokens_survive_projection_and_edits() {
         let entries = vec![
             json!({"type":"session","version":3}),
@@ -1290,10 +1315,11 @@ mod tests {
             },
         ] {
             let parent = records.last().unwrap().id;
+            let version = records.last().unwrap().version;
             records.push(Record {
                 id: parent + 1,
                 parent: Some(parent),
-                version: 2,
+                version,
                 timestamp: None,
                 run_id: None,
                 event,
@@ -1377,10 +1403,11 @@ mod tests {
             },
         ] {
             let parent = records.last().unwrap().id;
+            let version = records.last().unwrap().version;
             records.push(Record {
                 id: parent + 1,
                 parent: Some(parent),
-                version: 2,
+                version,
                 timestamp: None,
                 run_id: None,
                 event,
@@ -1621,9 +1648,10 @@ mod tests {
             json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
         ]).unwrap();
         let mut records = session.records().to_vec();
+        let version = records.last().unwrap().version;
         records.push(Record {
             id: records.len() as u64 + 1,
-            version: 2,
+            version,
             parent: Some(session.head()),
             timestamp: None,
             run_id: None,
@@ -1931,10 +1959,11 @@ mod tests {
                     },
                 ] {
                     let parent = records.last().unwrap().id;
+                    let version = records.last().unwrap().version;
                     records.push(Record {
                         id: parent + 1,
                         parent: Some(parent),
-                        version: 2,
+                        version,
                         timestamp: None,
                         run_id: None,
                         event,
@@ -2501,7 +2530,8 @@ mod tests {
             .records()
             .iter()
             .filter_map(|record| match &record.event {
-                Event::CustomMessage { message } => Some(message),
+                Event::CustomMessage { message }
+                | Event::CustomMessageDelivered { message, .. } => Some(message),
                 _ => None,
             })
             .collect();

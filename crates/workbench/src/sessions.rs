@@ -341,7 +341,7 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage { message } => {
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
                 // Older unmarked journals are ambiguous when a native message
                 // exactly matches the legacy source. Prefer hiding that content.
                 let legacy = {

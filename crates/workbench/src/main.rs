@@ -2096,8 +2096,9 @@ async fn execute(
         )
         .await;
     runtime
-        .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+        .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
+    run_pending_custom_trigger(&args, &runtime, &mut session).await?;
     let result = async {
         if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
             if let Some(run_id) = args.run_id
@@ -2105,7 +2106,7 @@ async fn execute(
             {
                 return Err(Error::DuplicateRun(run_id));
             }
-            let trigger = runtime.agent(&args, session.session_id()).extension_command_with_trigger(
+            let trigger = runtime.agent(&args, &session).extension_command_with_trigger(
                 &mut session, extension_id, extension_command, arguments,
                 &mut |event| observe(event, args.trace),
             )?;
@@ -2121,12 +2122,13 @@ async fn execute(
                 runtime = runtime::configure(&args, false).await?;
                 session.set_auto_compaction_control(runtime.auto_compaction.clone());
                 session.set_retry_control(runtime.retry.clone());
-                runtime.discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                runtime.discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                run_pending_custom_trigger(&args, &runtime, &mut session).await?;
             }
             command = Command::Resume;
         }
         let registry = &runtime.registry;
-        let agent = runtime.agent(&args, session.session_id());
+        let agent = runtime.agent(&args, &session);
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
@@ -2191,17 +2193,19 @@ async fn execute(
             keep_turns,
             ..
         } => {
-            return match keep_turns {
-                Some(keep_turns) => agent.compact(
-                    &mut session, Compaction { summary, keep_turns }, &mut observer,
-                ),
-                None => agent.compact_configured(&mut session, summary, &mut observer),
+            let compacted = match keep_turns {
+                Some(keep_turns) => agent.compact_with_host(
+                    &mut session, Compaction { summary, keep_turns }, &cancel, &mut observer,
+                ).await,
+                None => agent.compact_configured_with_host(&mut session, summary, &cancel, &mut observer).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Compact {
             summary: None, keep_turns, instructions,
         } => {
-            return match keep_turns {
+            let compacted = match keep_turns {
                 Some(keep_turns) => agent.summarize_with_instructions::<pi_rs::AgentInput>(
                     &mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
@@ -2209,6 +2213,8 @@ async fn execute(
                     &mut session, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Run { prompt } => Some(prompt),
         Command::Resume => None,
@@ -2399,6 +2405,33 @@ fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) 
     }
 }
 
+async fn run_pending_custom_trigger(
+    args: &Cli,
+    runtime: &runtime::Runtime,
+    session: &mut Session,
+) -> Result<()> {
+    let Some(run_id) = session.pending_custom_trigger() else {
+        return Ok(());
+    };
+    if args.run_id == Some(run_id) {
+        return Ok(());
+    }
+    let agent = runtime.agent(args, session);
+    let (_sender, mut inputs) = mpsc::channel::<pi_rs::AgentInput>(32);
+    let answer = agent
+        .run_correlated(
+            session,
+            run_id,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| observe(event, args.trace),
+        )
+        .await?;
+    output(json!({"type":"answer", "content":answer}));
+    Ok(())
+}
+
 fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -2447,6 +2480,18 @@ fn output(event: Value) {
 
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
+        Event::RequestCallbackStarted { id, purpose } => {
+            json!({"event":"request_callback_started","invocation_id":id,"purpose":purpose})
+        }
+        Event::RequestCallbackAbandoned { id } => {
+            json!({"event":"request_callback_abandoned","invocation_id":id})
+        }
+        Event::TurnEndCallbacksCompleted { assistant_record } => {
+            json!({"event":"turn_end_callbacks_completed","assistant_record":assistant_record})
+        }
+        Event::TurnEndBoundaryApplied { assistant_record } => {
+            json!({"event":"turn_end_boundary_applied","assistant_record":assistant_record})
+        }
         Event::InputQueueCleared { ids } => json!({"event":"input_queue_cleared","ids":ids}),
         Event::QueueModeSelected { kind, mode } => {
             json!({"event":"queue_mode_selected","kind":kind,"mode":mode})
@@ -2454,10 +2499,16 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::BashExecution { execution } => {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }
+        Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input } => {
+            json!({"event":"custom_message_queued","id":input.id,"delivery":input.delivery})
+        }
+        Event::TreeTriggerHandoff { run_id, return_to } => {
+            json!({"event":"tree_trigger_handoff","run_id":run_id,"return_to":return_to})
+        }
         Event::CustomEntry { entry } => {
             json!({"event":"custom_entry","customType":entry.custom_type})
         }
-        Event::CustomMessage { message } => {
+        Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
             json!({"event":"custom_message","customType":message.custom_type,"display":message.display})
         }
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),

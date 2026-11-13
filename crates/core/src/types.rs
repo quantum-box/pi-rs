@@ -84,6 +84,10 @@ pub enum AgentInput {
         message: QueuedMessage,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    EnqueueCustom {
+        message: crate::QueuedCustomMessage,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     ClearQueue {
         reply: tokio::sync::oneshot::Sender<Result<Vec<QueuedMessage>>>,
     },

@@ -4492,6 +4492,313 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn supplied_compaction_hooks_trigger_durable_turns_in_print_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("compact-hooks.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); request=frame['request']; kind=request['type']
+    assert kind in ('before_compaction','after_compaction')
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'compact-hook','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    result=[request['summary'],request['keep_turns'],{'allow':True,'reason':None}] if kind=='before_compaction' else None
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'compact-hook','dependencies':[],'commands':[],'tools':[],'compaction_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.path().join("session.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("old".into(), vec![], None)
+        .unwrap();
+    drop(session);
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["compact", "--summary", "summary", "--keep-turns", "0"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(path).unwrap();
+    assert!(session.pending_custom_trigger().is_none());
+    assert_eq!(session.records().iter().filter(|record| matches!(&record.event,
+        pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_discovery_trigger_runs_before_print_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("resources.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'resources','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'resources_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let branch = session.branch();
+    let custom = branch.iter().position(|r| matches!(&r.event, pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "resources")).unwrap();
+    let user = branch
+        .iter()
+        .position(
+            |r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "same input"),
+        )
+        .unwrap();
+    assert!(custom < user);
+    assert!(session.pending_custom_trigger().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_shell_hook_journals_custom_message_before_reply() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-message.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='user_bash'
+    print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'shell','content':'queued from shell','display':False,'details':{'source':'shell'}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'output':'intercepted','exitCode':0}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-message','dependencies':[],'commands':[],'tools':[],'user_bash_hook':True,'user_bash_hook_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("shell callback timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    let pending = session.queued_custom_messages();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1.message.custom_type, "shell");
+    assert_eq!(
+        pending[0].1.message.details,
+        Some(json!({"source":"shell"}))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_streamed_shell_operation_can_send_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-stream.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); kind=frame['request']['type']
+    if kind=='user_bash_operations': result=True
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'before')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'stream-shell','content':'queued','display':False}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'after')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-stream','dependencies':[],'commands':[],'tools':[],'user_bash_operations_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("streamed shell timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            assert_eq!(event["data"]["output"], "beforeafter");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    assert_eq!(session.queued_custom_messages().len(), 1);
+    assert_eq!(
+        session.queued_custom_messages()[0].1.message.custom_type,
+        "stream-shell"
+    );
+}
+
 fn read_kimi_fixture_request(stream: TcpStream) -> std::io::Result<(TcpStream, String, Vec<u8>)> {
     // Accepted sockets can inherit nonblocking mode on Windows and macOS.
     stream.set_nonblocking(false)?;
@@ -5418,4 +5725,175 @@ fn cancelled_mcp_logout_does_not_wait_for_held_refresh_lock() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read(credentials).unwrap(), b"unchanged");
+}
+
+#[test]
+fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
+    use pi_rs::{
+        ContextContent, CustomMessage, CustomMessageDelivery, Event, QueuedCustomMessage, Record,
+        RunState,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let selected = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint_a = format!("http://{}/v1", origin.local_addr().unwrap());
+    let endpoint_b = format!("http://{}/v1", selected.local_addr().unwrap());
+    std::fs::write(home.join("models.json"), json!({"providers":{
+        "relay-a":{"api":"openai-completions","baseUrl":endpoint_a,"apiKey":"key-a","models":[{"id":"shared","maxTokens":64,"contextWindow":12000}]},
+        "relay-b":{"api":"openai-completions","baseUrl":endpoint_b,"apiKey":"key-b","models":[{"id":"shared","maxTokens":128,"contextWindow":24000}]}
+    }}).to_string()).unwrap();
+    let trigger = uuid::Uuid::new_v4();
+    let message = CustomMessage {
+        custom_type: "tree".into(),
+        content: ContextContent::Text("trigger from A".into()),
+        display: false,
+        details: None,
+    };
+    let events = vec![
+        (
+            None,
+            None,
+            Event::Created {
+                session_id: uuid::Uuid::new_v4(),
+            },
+        ),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-a".into()),
+            },
+        ),
+        (
+            Some(2),
+            None,
+            Event::TreeMessageQueued {
+                input: QueuedCustomMessage {
+                    id: trigger,
+                    delivery: CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+            },
+        ),
+        (
+            Some(3),
+            Some(trigger),
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+        ),
+        (
+            Some(4),
+            Some(trigger),
+            Event::CustomMessageDelivered {
+                id: trigger,
+                message,
+            },
+        ),
+        (Some(5), None, Event::Checkout { target: 1 }),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-b".into()),
+            },
+        ),
+        (
+            Some(7),
+            None,
+            Event::User {
+                content: "selected branch B".into(),
+                input_id: None,
+            },
+        ),
+    ];
+    let records: Vec<Record> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, (parent, run_id, event))| Record {
+            id: index as u64 + 1,
+            parent,
+            run_id,
+            event,
+            version: 3,
+            timestamp: None,
+        })
+        .collect();
+    let path = root.path().join("session.jsonl");
+    Session::from_records(records)
+        .unwrap()
+        .export_jsonl(&path)
+        .unwrap();
+    let serve = |listener: TcpListener, expected: &'static str, max_tokens: u64| {
+        std::thread::spawn(move || {
+            let (mut socket, mut reader, request) = accept_proxy_request(listener);
+            assert!(request.starts_with("POST "), "{request}");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line.to_ascii_lowercase());
+            }
+            assert!(
+                headers.contains(&format!("authorization: bearer {expected}")),
+                "{headers}"
+            );
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "shared");
+            assert_eq!(body["max_tokens"], max_tokens);
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        })
+    };
+    let a = serve(origin, "key-a", 64);
+    let b = serve(selected, "key-b", 128);
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "relay-b",
+            "--model",
+            "shared",
+            "--print",
+            "new prompt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    a.join().unwrap();
+    b.join().unwrap();
+    let session = Session::open(&path).unwrap();
+    assert_eq!(session.model_provider(), Some("relay-b"));
+    assert!(session.branch().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "selected branch B")));
+    assert_eq!(session.pending_custom_trigger(), None);
 }

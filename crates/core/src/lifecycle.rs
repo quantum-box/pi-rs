@@ -324,6 +324,88 @@ pub async fn notify(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) {
+    notify_inner(registry, event, states, timeout, observer, None).await;
+}
+
+pub(crate) async fn notify_with_host(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: std::sync::Arc<dyn crate::ToolHost>,
+) {
+    notify_inner(registry, event, states, timeout, observer, Some(host)).await;
+}
+
+pub(crate) async fn notify_idle_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> crate::Result<()> {
+    notify_session_with_host(registry, session, event, timeout, observer, true).await
+}
+
+pub(crate) async fn notify_session_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    idle: bool,
+) -> crate::Result<()> {
+    let states = session.extension_states();
+    let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+    let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
+    let mut errors = Vec::new();
+    let mut collect = |event: Notification<'_>| {
+        if let Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        } = event
+        {
+            errors.push((extension.to_owned(), event, message.to_owned()));
+        }
+    };
+    {
+        let future = notify_with_host(registry, event, &states, timeout, &mut collect, host);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                Some((input, reply)) = incoming.recv() => {
+                    let result = if !idle || matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                        crate::agent::queue_custom_message(session, input, observer)
+                    } else {
+                        session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                    };
+                    match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                }
+                _ = &mut future => break,
+            }
+        }
+    }
+    for (extension, event, message) in &errors {
+        observer(Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        });
+    }
+    Ok(())
+}
+
+async fn notify_inner(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+) {
     let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
@@ -352,7 +434,30 @@ pub async fn notify(
     }) {
         let error = match tokio::time::timeout_at(
             deadline,
-            extension.lifecycle(&event, states.get(extension.id())),
+            crate::sdk::scope_extension_callback(
+                host.as_ref().and_then(|host| host.callback_scope_owner()),
+                async {
+                    match &host {
+                        Some(host) => {
+                            extension
+                                .lifecycle_with_host(
+                                    &event,
+                                    states.get(extension.id()),
+                                    crate::sdk::scope_callback_host(
+                                        host.for_extension(extension.id())
+                                            .unwrap_or_else(|| host.clone()),
+                                    ),
+                                )
+                                .await
+                        }
+                        None => {
+                            extension
+                                .lifecycle(&event, states.get(extension.id()))
+                                .await
+                        }
+                    }
+                },
+            ),
         )
         .await
         {

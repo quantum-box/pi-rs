@@ -164,6 +164,11 @@ enum ProtocolRequest {
         event: pi_rs_core::UserBashEvent,
         state: Option<ExtensionState>,
     },
+    ExecuteUserBash {
+        event: pi_rs_core::UserBashEvent,
+        state: Option<ExtensionState>,
+        timeout_secs: Option<f64>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -312,6 +317,30 @@ struct Description {
     user_bash_operations_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    lifecycle_host_calls: bool,
+    #[serde(default)]
+    tool_hook_host_calls: bool,
+    #[serde(default)]
+    before_tool_host_calls: bool,
+    #[serde(default)]
+    request_hook_host_calls: bool,
+    #[serde(default)]
+    input_hook_host_calls: bool,
+    #[serde(default)]
+    context_hook_host_calls: bool,
+    #[serde(default)]
+    transition_hook_host_calls: bool,
+    #[serde(default)]
+    tree_hook_host_calls: bool,
+    #[serde(default)]
+    compaction_hook_host_calls: bool,
+    #[serde(default)]
+    resources_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_stream_host_calls: bool,
     #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
@@ -736,6 +765,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn input_with_host(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<InputAction> {
+        if !self.description.input_hook_host_calls {
+            return self.input(event, state).await;
+        }
+        let request = ProtocolRequest::Input {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn handles_user_bash(&self) -> bool {
         self.description.user_bash_hook
     }
@@ -750,6 +800,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash(event, state).await;
+        }
+        let request = ProtocolRequest::UserBash {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn handles_user_bash_operations(&self) -> bool {
         self.description.user_bash_operations_hook
     }
@@ -763,6 +834,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn user_bash_operations_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash_operations(event, state).await;
+        }
+        let request = ProtocolRequest::UserBashOperations {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     async fn execute_user_bash(
         &self,
@@ -785,6 +877,37 @@ impl Extension for ExecutableExtension {
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+    async fn execute_user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<i32>> {
+        if !self.description.user_bash_stream_host_calls {
+            return self
+                .execute_user_bash(event, state, timeout, cancel, output)
+                .await;
+        }
+        let request = ProtocolRequest::ExecuteUserBash {
+            event: event.clone(),
+            state: state.cloned(),
+            timeout_secs: timeout.map(|duration| duration.as_secs_f64()),
+        };
+        let host = Arc::new(ShellProgressHost {
+            inner: host,
+            output,
+        });
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(cancel.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
@@ -811,6 +934,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn discover_resources_with_host(
+        &self,
+        event: &pi_rs_core::ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::DiscoveredResources> {
+        if !self.description.resources_hook_host_calls {
+            return self.discover_resources(event, state).await;
+        }
+        let request = ProtocolRequest::DiscoverResources {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
@@ -852,6 +996,29 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.lifecycle_host_calls {
+            return self.lifecycle(event, state).await;
+        }
+        let request = ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn handles_cache_warming(&self) -> bool {
         self.description.cache_warming_hook
     }
@@ -883,6 +1050,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn before_session_transition_with_host(
+        &self,
+        event: &pi_rs_core::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.transition_hook_host_calls {
+            return self.before_session_transition(event, state).await;
+        }
+        let request = ProtocolRequest::BeforeSessionTransition {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     async fn before_tree(
         &self,
         preparation: &TreePreparation,
@@ -894,6 +1082,28 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn before_tree_with_host(
+        &self,
+        preparation: &TreePreparation,
+        state: Option<&ExtensionState>,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<TreeDecision>> {
+        if !self.description.tree_hook_host_calls {
+            return self.before_tree(preparation, state, cancel).await;
+        }
+        let request = ProtocolRequest::BeforeTree {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn migrate(
         &self,
@@ -997,6 +1207,74 @@ impl Extension for ExecutableExtension {
         **request = updated;
         Ok(pi_rs_core::ContextChange::Changed)
     }
+    async fn before_request_with_host(
+        &self,
+        request: &mut pi_rs_core::ContextRequest<'_>,
+        purpose: RequestPurpose,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        if !self.description.request_hook_host_calls {
+            return self.before_request(request, purpose, state).await;
+        }
+        let payload = if self.description.context_provenance_v1 {
+            if self.description.context_safe_patch_v1 {
+                ProtocolRequest::BeforeRequestV3 {
+                    request: extension_context(request),
+                    summary: purpose == RequestPurpose::Summary,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::BeforeRequestV2 {
+                    request: extension_context(request),
+                    summary: purpose == RequestPurpose::Summary,
+                    state: state.cloned(),
+                }
+            }
+        } else {
+            ProtocolRequest::BeforeRequest {
+                request: extension_context(request),
+                summary: purpose == RequestPurpose::Summary,
+                state: state.cloned(),
+            }
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut updated: ModelRequest = if self.description.context_provenance_v1 {
+            let response: ContextResponse<ModelRequest> = tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            match response {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??
+        };
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **request = updated;
+        Ok(pi_rs_core::ContextChange::Changed)
+    }
     fn handles_context_with_system(&self) -> bool {
         self.description.context_with_system_hook
     }
@@ -1056,6 +1334,81 @@ impl Extension for ExecutableExtension {
         **messages = updated.messages;
         Ok(pi_rs_core::ContextChange::Changed)
     }
+    async fn context_with_system_with_host(
+        &self,
+        messages: &mut pi_rs_core::ContextMessages<'_>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        if !self.description.context_hook_host_calls {
+            return self.context_with_system(messages, state).await;
+        }
+        let original = ModelRequest {
+            model: String::new(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            max_output_tokens: 0,
+        };
+        let payload = if self.description.context_provenance_v1 {
+            if self.description.context_safe_patch_v1 {
+                ProtocolRequest::ContextWithSystemV3 {
+                    messages: extension_context(&original).messages,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::ContextWithSystemV2 {
+                    messages: extension_context(&original).messages,
+                    state: state.cloned(),
+                }
+            }
+        } else {
+            ProtocolRequest::ContextWithSystem {
+                messages: extension_context(&original).messages,
+                state: state.cloned(),
+            }
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let updated: Vec<Message> = if self.description.context_provenance_v1 {
+            let response: ContextResponse<Vec<Message>> = tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            match response {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_messages_patch(messages, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??
+        };
+        let mut updated = ModelRequest {
+            messages: updated,
+            ..original.clone()
+        };
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **messages = updated.messages;
+        Ok(pi_rs_core::ContextChange::Changed)
+    }
+
     fn command(
         &self,
         name: &str,
@@ -1141,6 +1494,34 @@ impl Extension for ExecutableExtension {
                 .map_err(|error| error.to_string())??;
         Ok(result.into())
     }
+    async fn before_tool_with_host(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.before_tool_host_calls {
+            return self.before_tool(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::BeforeTool {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result: DecisionValue = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(result.into())
+    }
     fn handles_tool_call(&self) -> bool {
         self.description.tool_call_hook
     }
@@ -1167,6 +1548,40 @@ impl Extension for ExecutableExtension {
             tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
                 .await
                 .map_err(|error| error.to_string())??;
+        *arguments = updated;
+        Ok(decision.into())
+    }
+    async fn tool_call_with_host(
+        &self,
+        name: &str,
+        arguments: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.tool_call_hook {
+            return self
+                .before_tool_with_host(name, arguments, context, state, host)
+                .await;
+        }
+        if !self.description.tool_hook_host_calls {
+            return self.tool_call(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::ToolCall {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (updated, decision): (Value, DecisionValue) = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         *arguments = updated;
         Ok(decision.into())
     }
@@ -1228,6 +1643,35 @@ impl Extension for ExecutableExtension {
         Ok(updated)
     }
 
+    async fn tool_result_update_with_host(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        if !self.description.tool_hook_host_calls || !self.endpoint.text_result_v2 {
+            return self
+                .tool_result_update(call_data, outcome, context, state)
+                .await;
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: outcome.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     fn after_tool(
         &self,
         name: &str,
@@ -1259,6 +1703,34 @@ impl Extension for ExecutableExtension {
         compaction.keep_turns = keep_turns;
         Ok(decision.into())
     }
+    async fn before_compaction_with_host(
+        &self,
+        compaction: &mut Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.compaction_hook_host_calls {
+            return self.before_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::BeforeCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (summary, keep_turns, decision): (String, usize, DecisionValue) =
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+        compaction.summary = summary;
+        compaction.keep_turns = keep_turns;
+        Ok(decision.into())
+    }
     fn after_compaction(
         &self,
         compaction: &Compaction,
@@ -1269,6 +1741,28 @@ impl Extension for ExecutableExtension {
             keep_turns: compaction.keep_turns,
             state: state.cloned(),
         })
+    }
+    async fn after_compaction_with_host(
+        &self,
+        compaction: &Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<ExtensionState>> {
+        if !self.description.compaction_hook_host_calls {
+            return self.after_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::AfterCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
 }
 
@@ -1427,6 +1921,59 @@ impl Tool for ExecutableTool {
             .flatten()
     }
 }
+struct ShellProgressHost {
+    inner: Arc<dyn ToolHost>,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+#[async_trait::async_trait]
+impl ToolHost for ShellProgressHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.inner.tools()
+    }
+    fn supports_progress(&self) -> bool {
+        true
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.inner.supports_keyed_messages()
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        self.inner
+            .send_message_with_key(message, delivery, key)
+            .await
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.inner.send_message(message, delivery).await
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.inner.call(name, arguments).await
+    }
+    async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+        let data: Vec<u8> = serde_json::from_value(
+            value
+                .get("shellOutput")
+                .cloned()
+                .ok_or_else(|| "invalid shell progress".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        self.output
+            .send(data)
+            .await
+            .map_err(|_| "shell output consumer closed".to_owned())
+    }
+}
+
 struct DetachedHost;
 #[async_trait::async_trait]
 impl ToolHost for DetachedHost {
@@ -1446,10 +1993,20 @@ struct DuplexRequest {
     has_ui: bool,
     #[serde(default)]
     has_progress: bool,
+    #[serde(default)]
+    has_custom_messages: bool,
+    #[serde(default)]
+    has_keyed_messages: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    SendMessage {
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     Progress {
         partial_result: Value,
     },
@@ -1593,13 +2150,13 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
     })
 }
 
-fn call_duplex(
+fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
-) -> ExtensionResult<ToolReply> {
+) -> ExtensionResult<T> {
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -1622,6 +2179,7 @@ fn call_duplex(
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
+                    | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
@@ -1637,6 +2195,8 @@ fn call_duplex(
                 tools: host.tools(),
                 has_ui: host.has_ui(),
                 has_progress: host.supports_progress(),
+                has_custom_messages: host.supports_custom_messages(),
+                has_keyed_messages: host.supports_keyed_messages(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -1651,6 +2211,22 @@ fn call_duplex(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::SendMessage {
+                message,
+                delivery,
+                key,
+            })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during message delivery".to_owned()),
+                        result = async { match key { Some(key) => host.send_message_with_key(message, delivery, &key).await, None => host.send_message(message, delivery).await } } => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::Progress { partial_result })) => {
                 let response = runtime.block_on(host.report_progress(partial_result));
                 writer
@@ -1711,6 +2287,8 @@ struct RemoteHost {
     tools: Vec<ToolSpec>,
     has_ui: bool,
     has_progress: bool,
+    has_custom_messages: bool,
+    has_keyed_messages: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
 }
 #[async_trait::async_trait]
@@ -1755,6 +2333,66 @@ impl ToolHost for RemoteHost {
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
     }
+    fn supports_custom_messages(&self) -> bool {
+        self.has_custom_messages
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        if !self.has_custom_messages {
+            return Err("custom message delivery is unavailable".into());
+        }
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: None,
+                },
+            )?;
+            read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.has_keyed_messages
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        if !self.has_keyed_messages {
+            return Err("keyed custom messages are unavailable".into());
+        }
+        let io = self.io.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: Some(key),
+                },
+            )?;
+            read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
             .await
@@ -1787,6 +2425,8 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         tools: request.tools,
         has_ui: request.has_ui,
         has_progress: request.has_progress,
+        has_custom_messages: request.has_custom_messages,
+        has_keyed_messages: request.has_keyed_messages,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2130,6 +2770,18 @@ async fn dispatch_with_host(
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
+            lifecycle_host_calls: true,
+            tool_hook_host_calls: true,
+            before_tool_host_calls: true,
+            request_hook_host_calls: true,
+            input_hook_host_calls: true,
+            context_hook_host_calls: true,
+            transition_hook_host_calls: true,
+            tree_hook_host_calls: true,
+            compaction_hook_host_calls: true,
+            resources_hook_host_calls: true,
+            user_bash_hook_host_calls: true,
+            user_bash_stream_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -2201,35 +2853,127 @@ async fn dispatch_with_host(
             }))
         }
         ProtocolRequest::Input { event, state } => {
-            encode(extension.input(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .input_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.input(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBash { event, state } => {
-            encode(extension.user_bash(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBashOperations { event, state } => {
-            encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_operations_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            }
+        }
+        ProtocolRequest::ExecuteUserBash {
+            event,
+            state,
+            timeout_secs,
+        } => {
+            let timeout = timeout_secs
+                .map(Duration::try_from_secs_f64)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let result = extension.execute_user_bash_with_host(
+                &event,
+                state.as_ref(),
+                timeout,
+                CancellationToken::new(),
+                sender,
+                host.clone(),
+            );
+            tokio::pin!(result);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    data = receiver.recv(), if open => match data { Some(data) => host.report_progress(serde_json::json!({"shellOutput":data})).await?, None => open = false },
+                    response = &mut result => {
+                        while let Ok(data) = receiver.try_recv() { host.report_progress(serde_json::json!({"shellOutput":data})).await?; }
+                        break encode(response);
+                    }
+                }
+            }
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            encode(extension.lifecycle(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .lifecycle_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.lifecycle(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::DiscoverResources { event, state } => {
-            encode(extension.discover_resources(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .discover_resources_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.discover_resources(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::CacheWarmingDecision { event, state } => encode(
             extension
                 .cache_warming_decision(&event, state.as_ref())
                 .await,
         ),
-        ProtocolRequest::BeforeTree { preparation, state } => encode(
-            extension
-                .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
-                .await,
-        ),
-        ProtocolRequest::BeforeSessionTransition { event, state } => encode(
-            extension
-                .before_session_transition(&event, state.as_ref())
-                .await,
-        ),
+        ProtocolRequest::BeforeTree { preparation, state } => {
+            let cancel = CancellationToken::new();
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .before_tree_with_host(&preparation, state.as_ref(), &cancel, host)
+                        .await,
+                )
+            } else {
+                encode(
+                    extension
+                        .before_tree(&preparation, state.as_ref(), &cancel)
+                        .await,
+                )
+            }
+        }
+        ProtocolRequest::BeforeSessionTransition { event, state } => {
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .before_session_transition_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(
+                    extension
+                        .before_session_transition(&event, state.as_ref())
+                        .await,
+                )
+            }
+        }
         ProtocolRequest::BeforeRequest {
             mut request,
             summary,
@@ -2240,25 +2984,32 @@ async fn dispatch_with_host(
             } else {
                 RequestPurpose::Turn
             };
-            extension
-                .before_request(
-                    &mut pi_rs_core::ContextRequest::new(&mut request),
-                    purpose,
-                    state.as_ref(),
-                )
-                .await?;
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
             encode(Ok(request))
         }
         ProtocolRequest::ContextWithSystem {
             mut messages,
             state,
         } => {
-            extension
-                .context_with_system(
-                    &mut pi_rs_core::ContextMessages::new(&mut messages),
-                    state.as_ref(),
-                )
-                .await?;
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
             encode(Ok(messages))
         }
         ProtocolRequest::BeforeRequestV2 {
@@ -2274,9 +3025,15 @@ async fn dispatch_with_host(
             let original = request.clone();
             let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
             let access = guarded.access();
-            extension
-                .before_request(&mut guarded, purpose, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && request == original {
                 ContextResponse::Unchanged
@@ -2297,9 +3054,15 @@ async fn dispatch_with_host(
             let original = request.clone();
             let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
             let access = guarded.access();
-            extension
-                .before_request(&mut guarded, purpose, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && request == original {
                 ContextResponse::Unchanged
@@ -2318,9 +3081,15 @@ async fn dispatch_with_host(
             let original = messages.clone();
             let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
             let access = guarded.access();
-            extension
-                .context_with_system(&mut guarded, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && messages == original {
                 ContextResponse::Unchanged
@@ -2335,9 +3104,15 @@ async fn dispatch_with_host(
             let original = messages.clone();
             let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
             let access = guarded.access();
-            extension
-                .context_with_system(&mut guarded, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && messages == original {
                 ContextResponse::Unchanged
@@ -2386,9 +3161,15 @@ async fn dispatch_with_host(
             state,
         } => {
             let context = context(&operation_id)?;
-            let decision = extension
-                .tool_call(&name, &mut arguments, &context, state.as_ref())
-                .await?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .tool_call_with_host(&name, &mut arguments, &context, state.as_ref(), host)
+                    .await?
+            } else {
+                extension
+                    .tool_call(&name, &mut arguments, &context, state.as_ref())
+                    .await?
+            };
             encode(Ok((arguments, DecisionValue::from(decision))))
         }
         ProtocolRequest::BeforeTool {
@@ -2398,12 +3179,16 @@ async fn dispatch_with_host(
             state,
         } => {
             let context = context(&operation_id)?;
-            encode(
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_tool_with_host(&name, &arguments, &context, state.as_ref(), host)
+                    .await
+            } else {
                 extension
                     .before_tool(&name, &arguments, &context, state.as_ref())
                     .await
-                    .map(DecisionValue::from),
-            )
+            };
+            encode(decision.map(DecisionValue::from))
         }
         ProtocolRequest::Invoke {
             name,
@@ -2457,18 +3242,25 @@ async fn dispatch_with_host(
             operation_id,
             state,
             text_result_v2,
-        } => encode(
-            extension
-                .tool_result_update(&call, &outcome, &context(&operation_id)?, state.as_ref())
-                .await
-                .map(|result| {
-                    if text_result_v2 {
-                        result
-                    } else {
-                        result.map(|outcome| outcome.legacy_text_result())
-                    }
-                }),
-        ),
+        } => {
+            let context = context(&operation_id)?;
+            let result = if host.supports_custom_messages() {
+                extension
+                    .tool_result_update_with_host(&call, &outcome, &context, state.as_ref(), host)
+                    .await
+            } else {
+                extension
+                    .tool_result_update(&call, &outcome, &context, state.as_ref())
+                    .await
+            };
+            encode(result.map(|result| {
+                if text_result_v2 {
+                    result
+                } else {
+                    result.map(|outcome| outcome.legacy_text_result())
+                }
+            }))
+        }
         ProtocolRequest::BeforeCompaction {
             summary,
             keep_turns,
@@ -2478,7 +3270,13 @@ async fn dispatch_with_host(
                 summary,
                 keep_turns,
             };
-            let decision = extension.before_compaction(&mut compaction, state.as_ref())?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_compaction_with_host(&mut compaction, state.as_ref(), host)
+                    .await?
+            } else {
+                extension.before_compaction(&mut compaction, state.as_ref())?
+            };
             encode(Ok((
                 compaction.summary,
                 compaction.keep_turns,
@@ -2489,13 +3287,21 @@ async fn dispatch_with_host(
             summary,
             keep_turns,
             state,
-        } => encode(extension.after_compaction(
-            &Compaction {
+        } => {
+            let compaction = Compaction {
                 summary,
                 keep_turns,
-            },
-            state.as_ref(),
-        )),
+            };
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .after_compaction_with_host(&compaction, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.after_compaction(&compaction, state.as_ref()))
+            }
+        }
     }
 }
 fn context(operation_id: &str) -> ExtensionResult<ToolContext> {
@@ -2632,6 +3438,20 @@ mod tests {
         }))
         .unwrap();
         assert!(!request.has_progress);
+        assert!(!request.has_keyed_messages);
+        let legacy: DuplexFrame = serde_json::from_value(serde_json::json!({"type":"send_message","message":{"customType":"test","content":"hello","display":false},"delivery":"steer"})).unwrap();
+        assert!(matches!(legacy, DuplexFrame::SendMessage { key: None, .. }));
+        let keyed = DuplexFrame::SendMessage {
+            message: pi_rs_core::CustomMessage {
+                custom_type: "test".into(),
+                content: pi_rs_core::ContextContent::Text("hello".into()),
+                display: false,
+                details: None,
+            },
+            delivery: pi_rs_core::CustomMessageDelivery::Steer,
+            key: Some("stable".into()),
+        };
+        assert_eq!(serde_json::to_value(keyed).unwrap()["key"], "stable");
         let frame = DuplexFrame::Progress {
             partial_result: serde_json::json!({"text":"halfway"}),
         };
@@ -3607,6 +4427,540 @@ else:
                 "{name}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_custom_message_host_call_preserves_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::FollowUp);
+                assert_eq!(message.custom_type, "notice");
+                assert!(!message.display);
+                assert_eq!(message.details, Some(serde_json::json!({"key": 3})));
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'message-test','dependencies':[],'commands':[],'host_calls':True,'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['has_custom_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'followUp','message':{'customType':'notice','content':'hello','display':False,'details':{'key':3}}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        assert_eq!(
+            tool.invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await,
+            Outcome::Succeeded("done".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_lifecycle_callback_uses_negotiated_message_host() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            fn supports_keyed_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message_with_key(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+                key: &str,
+            ) -> ExtensionResult<()> {
+                assert_eq!(key, "stable");
+                assert_eq!(message.custom_type, "from-hook");
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::TriggerTurn);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'hook-test','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'pi_lifecycle_fields':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True and r['has_keyed_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','key':'stable','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        extension
+            .lifecycle_with_host(
+                &LifecycleEvent::AgentSettled { aborted: false },
+                None,
+                Arc::new(Host),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_host_context_preserves_tracked_safe_edits_and_hides_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    print(json.dumps({'version':1,'response':{'Ok':{'id':'tracked-host','dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_provenance_v1':True,'context_safe_patch_v1':True}}}))
+else:
+    frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
+    assert kind in ('before_request_v3','context_with_system_v3'),kind
+    payload=r.get('request',r.get('messages')); messages=payload['messages'] if isinstance(payload,dict) else payload
+    assert 'private-secret' not in json.dumps(messages)
+    print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'tracked','content':'host','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    patch={'user_edits':[{'op':'insert','index':0,'message':{'role':'user','content':'injected'}}]}
+    print(json.dumps({'type':'complete','response':{'Ok':{'change':'safe_patch','patch':patch}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracked-host");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut request = ModelRequest {
+            model: "m".into(),
+            tools: vec![],
+            max_output_tokens: 10,
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                    identity: pi_rs_core::ResolvedModelIdentity {
+                        provider: "p".into(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![serde_json::json!({"private":"private-secret"})],
+                })),
+            }],
+        };
+        let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        extension
+            .before_request_with_host(&mut guarded, RequestPurpose::Turn, None, Arc::new(Host))
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(matches!(
+            &request.messages[1],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+        let mut guarded = pi_rs_core::ContextMessages::new(&mut request.messages);
+        let access = guarded.access();
+        extension
+            .context_with_system_with_host(&mut guarded, None, Arc::new(Host))
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(matches!(
+            &request.messages[2],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_input_request_and_tool_hooks_use_message_channel() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
+    assert frame['has_custom_messages']
+    print(json.dumps({'type':'send_message','delivery':'steer','message':{'customType':kind,'content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    if kind=='input': result={'action':'continue'}
+    elif kind=='before_request': result=r['request']
+    elif kind=='context_with_system': result=r['messages']
+    elif kind=='user_bash': result=None
+    elif kind=='user_bash_operations': result=False
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':[111,107]}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
+    elif kind=='before_session_transition': result=False
+    elif kind=='before_tree': result=None
+    elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
+    elif kind=='after_compaction': result=None
+    elif kind=='before_tool': result={'allow':True,'reason':None}
+    elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
+    elif kind=='tool_result': result=None
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let host = Arc::new(Host(std::sync::atomic::AtomicUsize::new(0)));
+        let event = InputEvent {
+            text: "input".into(),
+            images: vec![],
+            source: pi_rs_core::InputSource::Interactive,
+            streaming_behavior: None,
+        };
+        assert!(matches!(
+            extension
+                .input_with_host(&event, None, host.clone())
+                .await
+                .unwrap(),
+            InputAction::Continue
+        ));
+        let mut request = ModelRequest {
+            model: "model".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        extension
+            .before_request_with_host(
+                &mut pi_rs_core::ContextRequest::new(&mut request),
+                RequestPurpose::Turn,
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        extension
+            .context_with_system_with_host(
+                &mut pi_rs_core::ContextMessages::new(&mut request.messages),
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        let bash = pi_rs_core::UserBashEvent {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/workspace".into(),
+        };
+        assert!(
+            extension
+                .user_bash_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !extension
+                .user_bash_operations_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            extension
+                .before_tree_with_host(
+                    &TreePreparation {
+                        target_id: 3,
+                        old_leaf_id: 5,
+                        common_ancestor_id: Some(2),
+                        entries_to_summarize: Vec::new(),
+                        user_wants_summary: false,
+                        custom_instructions: None,
+                        replace_instructions: false,
+                        label: None,
+                    },
+                    None,
+                    &CancellationToken::new(),
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (output, mut received) = tokio::sync::mpsc::channel(4);
+        assert_eq!(
+            extension
+                .execute_user_bash_with_host(
+                    &bash,
+                    None,
+                    None,
+                    CancellationToken::new(),
+                    output,
+                    host.clone()
+                )
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(received.recv().await.unwrap(), b"ok");
+        let discovered = extension
+            .discover_resources_with_host(
+                &pi_rs_core::ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: pi_rs_core::ResourceDiscoveryReason::Startup,
+                },
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered.prompt_paths,
+            [std::path::PathBuf::from("fixture.md")]
+        );
+        assert!(
+            !extension
+                .before_session_transition_with_host(
+                    &pi_rs_core::BeforeSessionTransition::Fork {
+                        entry_id: 1,
+                        position: pi_rs_core::ForkPosition::At
+                    },
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+        );
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut args = serde_json::json!({});
+        assert_eq!(
+            extension
+                .before_tool_with_host("tool", &args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert_eq!(
+            extension
+                .tool_call_with_host("tool", &mut args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            extension
+                .tool_result_update_with_host(
+                    &call,
+                    &Outcome::Succeeded("ok".into()),
+                    &context,
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut compaction = Compaction {
+            summary: "summary".into(),
+            keep_turns: 1,
+        };
+        assert_eq!(
+            extension
+                .before_compaction_with_host(&mut compaction, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert!(
+            extension
+                .after_compaction_with_host(&compaction, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 14);
+    }
+
+    #[tokio::test]
+    async fn streamed_shell_dispatch_forwards_output_and_message_host_calls() {
+        struct Host(std::sync::Mutex<Vec<u8>>, std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                self.0.lock().unwrap().extend(
+                    serde_json::from_value::<Vec<u8>>(value["shellOutput"].clone()).unwrap(),
+                );
+                Ok(())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct Shell;
+        #[async_trait::async_trait]
+        impl Extension for Shell {
+            fn id(&self) -> &str {
+                "shell"
+            }
+            async fn execute_user_bash_with_host(
+                &self,
+                _: &pi_rs_core::UserBashEvent,
+                _: Option<&ExtensionState>,
+                _: Option<Duration>,
+                _: CancellationToken,
+                output: tokio::sync::mpsc::Sender<Vec<u8>>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<Option<i32>> {
+                output.send(b"before".to_vec()).await.unwrap();
+                host.send_message(
+                    pi_rs_core::CustomMessage {
+                        custom_type: "shell".into(),
+                        content: pi_rs_core::ContextContent::Text("message".into()),
+                        display: false,
+                        details: None,
+                    },
+                    pi_rs_core::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+                output.send(b"after".to_vec()).await.unwrap();
+                Ok(Some(0))
+            }
+        }
+        let host = Arc::new(Host(
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let result = dispatch_with_host(
+            Arc::new(Shell),
+            ProtocolRequest::ExecuteUserBash {
+                event: pi_rs_core::UserBashEvent {
+                    command: "echo".into(),
+                    exclude_from_context: false,
+                    cwd: "/".into(),
+                },
+                state: None,
+                timeout_secs: None,
+            },
+            host.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!(0));
+        assert_eq!(&*host.0.lock().unwrap(), b"beforeafter");
+        assert_eq!(host.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
