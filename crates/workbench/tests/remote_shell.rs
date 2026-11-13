@@ -573,3 +573,51 @@ async fn bash_injection_does_not_replace_powershell() {
     assert!(matches!(result, Outcome::Succeeded(text) if text.contains("powershell-only")));
     assert!(remote.calls.lock().unwrap().is_empty());
 }
+
+struct HugeChunk;
+#[async_trait::async_trait]
+impl BashOperations for HugeChunk {
+    async fn exec(
+        &self,
+        _: ShellSpawnContext,
+        _: Option<Duration>,
+        _: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        let mut chunk = vec![b'x'; 8 * 1024 * 1024];
+        chunk.extend_from_slice(b"\nremote tail\n");
+        output.send(chunk).await.map_err(|_| Error::Cancelled)?;
+        Ok(Some(0))
+    }
+}
+
+#[tokio::test]
+async fn injected_shell_large_single_chunk_keeps_display_and_full_transcript() {
+    let tool = create_bash_tool(
+        std::env::temp_dir().as_path(),
+        ShellConfig::default(),
+        Arc::new(HugeChunk),
+    )
+    .unwrap();
+    let context = ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    let result = tool.invoke(json!({"command":"fixture"}), context).await;
+    let (text, details) = match result {
+        Outcome::SucceededWithDetails { output, details } => (output, details),
+        other => panic!("unexpected shell result: {other:?}"),
+    };
+    assert!(text.starts_with("remote tail\n"));
+    assert_eq!(details["truncation"]["truncatedBy"], "bytes");
+    let path = PathBuf::from(details["fullOutputPath"].as_str().unwrap());
+    let transcript = std::fs::read(&path).unwrap();
+    assert_eq!(transcript.len(), 8 * 1024 * 1024 + b"\nremote tail\n".len());
+    assert!(
+        transcript[..8 * 1024 * 1024]
+            .iter()
+            .all(|&byte| byte == b'x')
+    );
+    assert!(transcript.ends_with(b"\nremote tail\n"));
+    std::fs::remove_file(path).unwrap();
+}

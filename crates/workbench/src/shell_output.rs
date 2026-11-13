@@ -60,9 +60,22 @@ impl Accumulator {
         let head_remaining = SCRIPT_BYTES.saturating_sub(self.head.len());
         self.head
             .extend_from_slice(&bytes[..bytes.len().min(head_remaining)]);
-        self.tail.extend_from_slice(bytes);
-        if self.tail.len() > SCRIPT_BYTES {
-            self.tail.drain(..self.tail.len() - SCRIPT_BYTES);
+        // Backends may send a single chunk much larger than the retained tail.
+        // Discard the excess before appending so allocation stays bounded too.
+        if bytes.len() >= SCRIPT_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - SCRIPT_BYTES..]);
+        } else {
+            let discard = self
+                .tail
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(SCRIPT_BYTES);
+            if discard != 0 {
+                self.tail.drain(..discard);
+            }
+            self.tail.extend_from_slice(bytes);
         }
         Ok(())
     }
@@ -341,6 +354,32 @@ mod tests {
         assert!(!output.script_truncated);
         assert!(output.path.is_none());
     }
+    #[test]
+    fn oversized_backend_chunk_keeps_only_bounded_tail_and_complete_output() {
+        let mut accumulator = Accumulator::default();
+        let first = vec![b'a'; SCRIPT_BYTES / 2];
+        let mut large = vec![b'b'; 8 * SCRIPT_BYTES];
+        large.extend_from_slice(b"\nlast line\n");
+        accumulator.append(&first).unwrap();
+        accumulator.append(&large).unwrap();
+        assert_eq!(accumulator.tail.len(), SCRIPT_BYTES);
+        assert!(accumulator.tail.capacity() <= 2 * SCRIPT_BYTES);
+        let output = accumulator.finish().unwrap();
+        assert!(output.script.starts_with(&"a".repeat(20)));
+        assert!(output.script.ends_with("\nlast line\n"));
+        assert!(output.display_without_notice.ends_with("last line"));
+        assert!(output.script_truncated);
+        assert_eq!(
+            output.details.as_ref().unwrap()["truncation"]["truncated"],
+            true
+        );
+        let path = output.path.unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(&saved[..first.len()], first);
+        assert_eq!(&saved[first.len()..], large);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn line_limit_keeps_tail_and_publishes_complete_file() {
         let input = (1..=2100)
