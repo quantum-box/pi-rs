@@ -1144,28 +1144,17 @@ impl Model for Bedrock {
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         use tracing::instrument::WithSubscriber;
         let has_secrets = !secrets.is_empty();
-        let request = command
-            .customize()
-            .map_request(move |request| {
-                let mut request = request.try_into_http1x()?;
-                for (name, value) in &headers {
-                    let mut value =
-                        http::HeaderValue::from_str(value).expect("validated header value");
-                    value.set_sensitive(true);
-                    request.headers_mut().insert(
-                        http::HeaderName::from_bytes(name.as_bytes())
-                            .expect("validated header name"),
-                        value,
-                    );
-                }
-                aws_smithy_runtime_api::http::Request::try_from(request)
-            })
-            .send();
-        let response = if has_secrets {
+        let mut request = command.customize();
+        if !headers.is_empty() {
+            request = request.mutate_request(move |request| headers::apply(request, &headers));
+        }
+        let request = request.send();
+        let guarded_dispatch = has_secrets.then(|| {
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            request
-                .with_subscriber(headers::SigningTraceGuard(dispatch))
-                .await
+            tracing::Dispatch::new(headers::SigningTraceGuard(dispatch))
+        });
+        let response = if let Some(dispatch) = &guarded_dispatch {
+            request.with_subscriber(dispatch.clone()).await
         } else {
             request.await
         };
@@ -1178,7 +1167,14 @@ impl Model for Bedrock {
             let mut text_blocks: BTreeMap<i32, String> = BTreeMap::new();
             let mut reasoning: BTreeMap<i32, ReasoningBlock> = BTreeMap::new();
             let mut stopped_blocks = BTreeSet::new();
-            while let Some(event)=response.stream.recv().await.map_err(|e| {
+            loop {
+                let receive = response.stream.recv();
+                let next = if let Some(dispatch) = &guarded_dispatch {
+                    receive.with_subscriber(dispatch.clone()).await
+                } else {
+                    receive.await
+                };
+                let Some(event) = next.map_err(|e| {
                 if let Some(service) = e.as_service_error() {
                     let mut message=diagnostic(service.meta(), request_id.as_deref(), &secrets);
                     if service.meta().code().is_none() {
@@ -1187,7 +1183,7 @@ impl Model for Bedrock {
                     }
                     if service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception() { Error::RetryableModel(message) } else { Error::Model(message) }
                 } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
-            })? {
+            })? else { break };
                 match event {
                     ConverseStreamOutput::ContentBlockStart(event) => if let Some(ContentBlockStart::ToolUse(tool))=event.start {
                         let index=event.content_block_index;

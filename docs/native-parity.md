@@ -3615,9 +3615,10 @@ Configured provider and model request headers are applied before SigV4 signing;
 `authorization`, `host`, and `x-amz-*` cannot override SDK authentication or
 routing. Library callers can set custom headers on `Bedrock`. Effective custom
 headers are included in the protected prepared-request identity. Custom values
-are marked sensitive in SDK traces and redacted from service diagnostics;
-SigV4 canonical-request trace events are suppressed while signing requests with
-custom values because those events do not preserve header sensitivity.
+are marked sensitive in SDK traces and redacted from service diagnostics.
+During requests and stream reads with custom values, SDK and HTTP transport
+events are suppressed because signing and error traces can contain unredacted
+headers or echoed response frames; application tracing remains enabled.
 
 Not yet supported: Pi's interactive AWS profile login/storage, non-image
 multimodal inputs, workbench-specific thinking display controls, tool

@@ -16,9 +16,40 @@ pub(crate) fn filtered(headers: http::HeaderMap) -> pi_rs_core::Result<BTreeMap<
     Ok(result)
 }
 
-// SigV4 traces include the canonical request as a plain string, bypassing
-// HTTP header sensitivity flags. Forward the caller's subscriber while
-// filtering only those trace events during this request's signing future.
+/// Replace only the SDK header map, retaining request extensions of either HTTP version.
+pub(crate) fn apply(
+    request: &mut aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+    headers: &BTreeMap<String, String>,
+) {
+    if headers.is_empty() {
+        return;
+    }
+    let mut map = http::HeaderMap::new();
+    // The Smithy iterator does not expose existing sensitivity flags, so mark
+    // every retained value sensitive when rebuilding the map.
+    for (name, value) in request.headers().iter() {
+        let mut value = http::HeaderValue::from_str(value).expect("SDK header value");
+        value.set_sensitive(true);
+        map.append(
+            http::HeaderName::from_bytes(name.as_bytes()).expect("SDK header name"),
+            value,
+        );
+    }
+    for (name, value) in headers {
+        let mut value = http::HeaderValue::from_str(value).expect("validated header value");
+        value.set_sensitive(true);
+        map.insert(
+            http::HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
+            value,
+        );
+    }
+    *request.headers_mut() =
+        aws_smithy_runtime_api::http::Headers::try_from(map).expect("validated headers");
+}
+
+// SDK signers, deserializers and event-stream decoders can log secrets in
+// plain strings or raw frames. Filter SDK and HTTP transport events only for
+// this request and stream while forwarding application events.
 pub(crate) struct SigningTraceGuard(pub tracing::Dispatch);
 impl tracing::Subscriber for SigningTraceGuard {
     fn register_callsite(
@@ -28,9 +59,14 @@ impl tracing::Subscriber for SigningTraceGuard {
         tracing::subscriber::Interest::sometimes()
     }
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        let target = metadata.target();
         !(metadata.is_event()
-            && metadata.target().starts_with("aws_sigv4::")
-            && *metadata.level() == tracing::Level::TRACE)
+            && (target.starts_with("aws_")
+                || target == "hyper"
+                || target.starts_with("hyper::")
+                || target.starts_with("hyper_util::")
+                || target == "h2"
+                || target.starts_with("h2::")))
             && self.0.enabled(metadata)
     }
     fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -61,5 +97,59 @@ impl tracing::Subscriber for SigningTraceGuard {
     }
     fn current_span(&self) -> tracing_core::span::Current {
         self.0.current_span()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserves_http02_extensions_with_and_without_custom_headers() {
+        for custom in [false, true] {
+            let mut original = http02::Request::new(aws_smithy_types::body::SdkBody::empty());
+            original
+                .extensions_mut()
+                .insert(String::from("retained-02"));
+            original
+                .headers_mut()
+                .append("x-existing", http02::HeaderValue::from_static("one"));
+            original
+                .headers_mut()
+                .append("x-existing", http02::HeaderValue::from_static("two"));
+            let mut request = aws_smithy_runtime_api::http::Request::try_from(original).unwrap();
+            let headers = if custom {
+                [("x-custom".into(), "private".into())]
+                    .into_iter()
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            apply(&mut request, &headers);
+            let result = request.try_into_http02x().unwrap();
+            assert_eq!(
+                result.extensions().get::<String>().map(String::as_str),
+                Some("retained-02")
+            );
+            assert_eq!(result.headers().get_all("x-existing").iter().count(), 2);
+            assert_eq!(result.headers().get("x-custom").is_some(), custom);
+        }
+    }
+    #[test]
+    fn preserves_http1_extensions_with_custom_headers() {
+        let mut original = http::Request::new(aws_smithy_types::body::SdkBody::empty());
+        original.extensions_mut().insert(String::from("retained-1"));
+        let mut request = aws_smithy_runtime_api::http::Request::try_from(original).unwrap();
+        apply(
+            &mut request,
+            &[("x-custom".into(), "private".into())]
+                .into_iter()
+                .collect(),
+        );
+        let result = request.try_into_http1x().unwrap();
+        assert_eq!(
+            result.extensions().get::<String>().map(String::as_str),
+            Some("retained-1")
+        );
+        assert!(result.headers()["x-custom"].is_sensitive());
     }
 }

@@ -2795,6 +2795,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "http 0.2.12",
  "http 1.5.0",
  "pi-rs-core",
  "serde_json",
