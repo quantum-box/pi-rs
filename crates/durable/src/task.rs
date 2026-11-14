@@ -1,0 +1,276 @@
+//! Standalone, deterministic task transitions. The host must atomically persist
+//! each transition and ensure only one executor acts on a committed task.
+//! This module does not execute tasks or implement wake-up, scheduler, or hook semantics.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+/// Ownership is an immutable identity edge, not an executor lease.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskOwner {
+    Conversation(Uuid),
+    Task(Uuid),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub phase: String,
+    pub data: Value,
+}
+
+/// Waiting conditions are opaque to this state machine and interpreted by the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaitFor {
+    DeadlineMillis(i64),
+    Signal(String),
+    Tasks(Vec<Uuid>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskState {
+    Ready,
+    Running,
+    Waiting(WaitFor),
+    Succeeded(Value),
+    Failed(String),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    id: Uuid,
+    owner: TaskOwner,
+    checkpoint: Checkpoint,
+    state: TaskState,
+    /// Consecutive recoveries since the last changed checkpoint.
+    restarts: u32,
+    restart_limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionError {
+    InvalidState,
+    RestartLimit,
+    UnchangedCheckpoint,
+    SelfOwned,
+}
+
+impl Task {
+    pub fn new(
+        id: Uuid,
+        owner: TaskOwner,
+        checkpoint: Checkpoint,
+        restart_limit: u32,
+    ) -> Result<Self, TransitionError> {
+        if owner == TaskOwner::Task(id) {
+            return Err(TransitionError::SelfOwned);
+        }
+        Ok(Self {
+            id,
+            owner,
+            checkpoint,
+            state: TaskState::Ready,
+            restarts: 0,
+            restart_limit,
+        })
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+    pub fn owner(&self) -> &TaskOwner {
+        &self.owner
+    }
+    pub fn state(&self) -> &TaskState {
+        &self.state
+    }
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.checkpoint
+    }
+    pub fn restarts(&self) -> u32 {
+        self.restarts
+    }
+    pub fn restart_limit(&self) -> u32 {
+        self.restart_limit
+    }
+
+    /// Reserve only ready work. Recovery at the limit stays ready but cannot run.
+    pub fn start(&mut self) -> Result<(), TransitionError> {
+        if self.state != TaskState::Ready {
+            return Err(TransitionError::InvalidState);
+        }
+        if self.restarts > 0 && self.restarts >= self.restart_limit {
+            return Err(TransitionError::RestartLimit);
+        }
+        self.state = TaskState::Running;
+        Ok(())
+    }
+
+    /// Explicitly recover a persisted running task after the host establishes
+    /// that its prior executor is gone. No effects are replayed by this method.
+    pub fn recover(&mut self) -> Result<(), TransitionError> {
+        self.require_running()?;
+        self.restarts = self.restarts.saturating_add(1);
+        self.state = TaskState::Ready;
+        Ok(())
+    }
+
+    /// A changed checkpoint is durable progress and resets the restart count.
+    pub fn advance(&mut self, checkpoint: Checkpoint) -> Result<(), TransitionError> {
+        self.require_running()?;
+        if self.checkpoint == checkpoint {
+            return Err(TransitionError::UnchangedCheckpoint);
+        }
+        self.checkpoint = checkpoint;
+        self.restarts = 0;
+        Ok(())
+    }
+
+    pub fn wait(&mut self, condition: WaitFor) -> Result<(), TransitionError> {
+        self.require_running()?;
+        self.state = TaskState::Waiting(condition);
+        Ok(())
+    }
+
+    /// The host is responsible for establishing that the wait was satisfied.
+    pub fn wake(&mut self) -> Result<(), TransitionError> {
+        if !matches!(self.state, TaskState::Waiting(_)) {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Ready;
+        Ok(())
+    }
+
+    pub fn succeed(&mut self, result: Value) -> Result<(), TransitionError> {
+        self.require_running()?;
+        self.state = TaskState::Succeeded(result);
+        Ok(())
+    }
+
+    pub fn fail(&mut self, reason: String) -> Result<(), TransitionError> {
+        self.require_running()?;
+        self.state = TaskState::Failed(reason);
+        Ok(())
+    }
+
+    /// Cancellation is permitted for any nonterminal state, including blocked work.
+    pub fn cancel(&mut self) -> Result<(), TransitionError> {
+        if matches!(
+            self.state,
+            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
+        ) {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Cancelled;
+        Ok(())
+    }
+
+    fn require_running(&self) -> Result<(), TransitionError> {
+        if self.state == TaskState::Running {
+            Ok(())
+        } else {
+            Err(TransitionError::InvalidState)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn task(limit: u32) -> Task {
+        Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            checkpoint("first", 0),
+            limit,
+        )
+        .unwrap()
+    }
+    fn checkpoint(phase: &str, data: u32) -> Checkpoint {
+        Checkpoint {
+            phase: phase.into(),
+            data: json!(data),
+        }
+    }
+
+    #[test]
+    fn roundtrip_recovery_preserves_checkpoint_owner_and_enforces_limit() {
+        let mut t = task(2);
+        t.start().unwrap();
+        let mut t: Task = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(t.start(), Err(TransitionError::InvalidState));
+        t.recover().unwrap();
+        assert_eq!(t.checkpoint(), &checkpoint("first", 0));
+        assert_eq!(t.owner(), &TaskOwner::Conversation(Uuid::from_u128(2)));
+        t.start().unwrap();
+        t.recover().unwrap();
+        let before = t.clone();
+        assert_eq!(t.start(), Err(TransitionError::RestartLimit));
+        assert_eq!(t, before);
+        t.cancel().unwrap();
+    }
+
+    #[test]
+    fn progress_resets_restarts_but_unchanged_checkpoint_does_not() {
+        let mut t = task(2);
+        t.start().unwrap();
+        t.recover().unwrap();
+        t.start().unwrap();
+        assert_eq!(
+            t.advance(checkpoint("first", 0)),
+            Err(TransitionError::UnchangedCheckpoint)
+        );
+        assert_eq!(t.restarts(), 1);
+        t.advance(checkpoint("second", 1)).unwrap();
+        assert_eq!(t.restarts(), 0);
+        t.recover().unwrap();
+        t.start().unwrap();
+    }
+
+    #[test]
+    fn waiting_and_terminal_states_cannot_execute() {
+        let mut t = task(3);
+        t.start().unwrap();
+        t.wait(WaitFor::Signal("approval".into())).unwrap();
+        let before = t.clone();
+        assert_eq!(t.start(), Err(TransitionError::InvalidState));
+        assert_eq!(t.recover(), Err(TransitionError::InvalidState));
+        assert_eq!(t.succeed(json!(1)), Err(TransitionError::InvalidState));
+        assert_eq!(t, before);
+        t.wake().unwrap();
+        t.start().unwrap();
+        t.succeed(json!({"ok": true})).unwrap();
+        let before = t.clone();
+        assert_eq!(t.start(), Err(TransitionError::InvalidState));
+        assert_eq!(t.wake(), Err(TransitionError::InvalidState));
+        assert_eq!(t.cancel(), Err(TransitionError::InvalidState));
+        assert_eq!(t, before);
+    }
+
+    #[test]
+    fn ownership_and_failure_are_explicit() {
+        assert_eq!(
+            Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Task(Uuid::from_u128(1)),
+                checkpoint("x", 0),
+                1
+            ),
+            Err(TransitionError::SelfOwned)
+        );
+        let mut t = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Task(Uuid::from_u128(2)),
+            checkpoint("x", 0),
+            0,
+        )
+        .unwrap();
+        t.start().unwrap(); // Zero permits the initial invocation, but no restart.
+        t.fail("failed".into()).unwrap();
+        assert_eq!(t.start(), Err(TransitionError::InvalidState));
+        assert_eq!(t.recover(), Err(TransitionError::InvalidState));
+    }
+}
