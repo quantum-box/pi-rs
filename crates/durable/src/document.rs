@@ -34,6 +34,8 @@ pub enum Error {
     DuplicateTask,
     #[error("application entries require a valid active task ancestry and a nonempty non-pi. kind")]
     InvalidApplicationEntry,
+    #[error("application entry head does not match the expected ID")]
+    ApplicationEntryHeadMismatch,
 }
 
 /// An application-defined address. Components are encoded unambiguously;
@@ -657,6 +659,28 @@ impl<'a> TaskDocuments<'a> {
     /// The root conversation and every task ancestor must exist and not be aborting. The returned ID is
     /// provisional until the step commits and can change on replay.
     pub fn append_entry(&mut self, kind: &str, data: Value) -> Result<uuid::Uuid, Error> {
+        self.append_entry_inner(None, kind, data)
+    }
+
+    /// Append only if the application log's last entry matches `expected`.
+    /// `None` expects an empty log. Earlier entries staged in this invocation
+    /// are included. The check is fenced by the log version at commit; IDs are
+    /// provisional and may change when a replay-safe handler is retried.
+    pub fn append_entry_if_head(
+        &mut self,
+        expected: Option<uuid::Uuid>,
+        kind: &str,
+        data: Value,
+    ) -> Result<uuid::Uuid, Error> {
+        self.append_entry_inner(Some(expected), kind, data)
+    }
+
+    fn append_entry_inner(
+        &mut self,
+        expected: Option<Option<uuid::Uuid>>,
+        kind: &str,
+        data: Value,
+    ) -> Result<uuid::Uuid, Error> {
         if kind.is_empty() || kind.starts_with("pi.") {
             return Err(Error::InvalidApplicationEntry);
         }
@@ -712,7 +736,15 @@ impl<'a> TaskDocuments<'a> {
                 .map(|r| serde_json::from_slice(&r.value))
                 .transpose()?
                 .unwrap_or_default();
+            let entries: Vec<crate::application_entry::ApplicationEntry> = entries;
+            if expected.is_some_and(|head| entries.last().map(|entry| entry.id) != head) {
+                return Err(Error::ApplicationEntryHeadMismatch);
+            }
             self.entries = Some((conversation, version, entries, checks));
+        } else if expected.is_some_and(|head| {
+            self.entries.as_ref().unwrap().2.last().map(|entry| entry.id) != head
+        }) {
+            return Err(Error::ApplicationEntryHeadMismatch);
         }
         let id = uuid::Uuid::new_v4();
         let conversation = self.entries.as_ref().unwrap().0;
@@ -975,6 +1007,77 @@ mod nested_entry_tests {
             }],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn application_entry_expected_head_is_atomic_and_includes_staged_entries() {
+        for sqlite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("entries.sqlite");
+            let db = if sqlite {
+                Store::open(&path).unwrap()
+            } else {
+                Store::memory().unwrap()
+            };
+            let id = Uuid::from_u128(123);
+            conversation(&db, id);
+            let author = task(1, TaskOwner::Conversation(id));
+            let mut first = TaskDocuments::new(&db, &author).unwrap();
+            let mut stale = TaskDocuments::new(&db, &author).unwrap();
+            let addr = Address {
+                scope: "test".into(),
+                name: "atomic".into(),
+                key: "".into(),
+            };
+            stale.get(&addr).unwrap();
+            stale
+                .put(&addr, json!({"stale": true}).as_object().unwrap().clone())
+                .unwrap();
+            stale
+                .append_entry_if_head(None, "app.stale", json!(0))
+                .unwrap();
+            let first_id = first
+                .append_entry_if_head(None, "app.first", json!(1))
+                .unwrap();
+            assert!(matches!(
+                first.append_entry_if_head(None, "app.invalid", json!(0)),
+                Err(Error::ApplicationEntryHeadMismatch)
+            ));
+            let second_id = first
+                .append_entry_if_head(Some(first_id), "app.second", json!(2))
+                .unwrap();
+            let batch = first.into_batch().unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let batch = stale.into_batch().unwrap();
+            assert!(matches!(
+                db.commit(&batch.checks, &batch.mutations),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(Documents::new(&db).get(&addr).unwrap().is_none());
+            let mut mismatch = TaskDocuments::new(&db, &author).unwrap();
+            assert!(matches!(
+                mismatch.append_entry_if_head(Some(first_id), "app.invalid", json!(0)),
+                Err(Error::ApplicationEntryHeadMismatch)
+            ));
+            let empty = mismatch.into_batch().unwrap();
+            assert!(empty.mutations.is_empty());
+            let mut next = TaskDocuments::new(&db, &author).unwrap();
+            let third_id = next
+                .append_entry_if_head(Some(second_id), "app.third", json!(3))
+                .unwrap();
+            let batch = next.into_batch().unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let expected = vec![first_id, second_id, third_id];
+            if sqlite {
+                drop(db);
+                let reopened = Store::open(&path).unwrap();
+                let entries = crate::application_entry::list(&reopened, id).unwrap();
+                assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), expected);
+            } else {
+                let entries = crate::application_entry::list(&db, id).unwrap();
+                assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), expected);
+            }
+        }
     }
 
     #[test]
