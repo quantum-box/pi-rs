@@ -1354,6 +1354,24 @@ impl Harness {
                 };
             }
             Phase::Blocked { .. } => (),
+            Phase::ToolFinished {
+                calls,
+                index,
+                content,
+                ..
+            } => {
+                // The effect already committed; retain its result even if an
+                // after-tool hook was interrupted by the abort.
+                append_tool(&mut c, &calls, index, content)?;
+                for i in index + 1..calls.len() {
+                    append_tool(
+                        &mut c,
+                        &calls,
+                        i,
+                        Outcome::Skipped("aborted before dispatch".into()).tool_content(),
+                    )?;
+                }
+            }
             Phase::Tools { calls, index, .. } => {
                 for i in index..calls.len() {
                     append_tool(
@@ -1626,7 +1644,13 @@ impl Harness {
                             snapshot: &snapshot,
                             memo: &memo,
                         };
-                        let (sections, reports) = selected.prompt(&context, None).await;
+                        let (sections, reports) = fenced_poll(
+                            selected.prompt(&context, None),
+                            self.execution_gate.as_ref(),
+                            cancel,
+                        )
+                        .await
+                        .ok_or(Error::Interrupted)?;
                         // A callback may swallow a memo error. Never dispatch after
                         // an indeterminate store failure, even in that case.
                         self.subagent_store()?;
@@ -1663,13 +1687,17 @@ impl Harness {
                             memo: &memo,
                         };
                         let value = serde_json::json!({"messages": request.messages});
-                        let (value, _, _, reports) = selected
-                            .generation(
+                        let (value, _, _, reports) = fenced_poll(
+                            selected.generation(
                                 crate::extension::GenerationEvent::BeforeRequest,
                                 value,
                                 &context,
-                            )
-                            .await;
+                            ),
+                            self.execution_gate.as_ref(),
+                            cancel,
+                        )
+                        .await
+                        .ok_or(Error::Interrupted)?;
                         self.subagent_store()?;
                         if cancel.is_cancelled() {
                             self.failed = true;
@@ -1856,13 +1884,17 @@ impl Harness {
                             snapshot: &snapshot,
                             memo: &memo,
                         };
-                        let (_, _, _, _reports) = selected
-                            .generation(
+                        let (_, _, _, _reports) = fenced_poll(
+                            selected.generation(
                                 crate::extension::GenerationEvent::AfterResponse,
                                 serde_json::to_value(&*response)?,
                                 &context,
-                            )
-                            .await;
+                            ),
+                            self.execution_gate.as_ref(),
+                            cancel,
+                        )
+                        .await
+                        .ok_or(Error::Interrupted)?;
                         self.subagent_store()?;
                         if cancel.is_cancelled() {
                             self.failed = true;
@@ -2144,8 +2176,13 @@ impl Harness {
                         name: call.name.clone(),
                         arguments: prepared.arguments().clone(),
                     };
-                    let (rewritten, decision, reports) =
-                        selected.before_tool(hook_call, &context).await;
+                    let (rewritten, decision, reports) = fenced_poll(
+                        selected.before_tool(hook_call, &context),
+                        self.execution_gate.as_ref(),
+                        cancel,
+                    )
+                    .await
+                    .ok_or(Error::Interrupted)?;
                     self.subagent_store()?;
                     if cancel.is_cancelled() {
                         self.failed = true;
@@ -2355,13 +2392,17 @@ impl Harness {
                         name: call.name.clone(),
                         arguments,
                     };
-                    let (result, _reports) = selected
-                        .after_tool(
+                    let (result, _reports) = fenced_poll(
+                        selected.after_tool(
                             &hook_call,
                             serde_json::Value::String(content.clone()),
                             &context,
-                        )
-                        .await;
+                        ),
+                        self.execution_gate.as_ref(),
+                        cancel,
+                    )
+                    .await
+                    .ok_or(Error::Interrupted)?;
                     self.subagent_store()?;
                     if cancel.is_cancelled() {
                         self.failed = true;
@@ -2998,14 +3039,16 @@ async fn fenced_poll<F: std::future::Future>(
     cancel: &CancellationToken,
 ) -> Option<F::Output> {
     let mut future = std::pin::pin!(future);
-    std::future::poll_fn(|cx| {
-        let _guard = gate.map(|gate| gate.lock().expect("conversation gate poisoned"));
-        if cancel.is_cancelled() {
-            return std::task::Poll::Ready(None);
-        }
-        future.as_mut().poll(cx).map(Some)
-    })
-    .await
+    tokio::select! {
+        _ = cancel.cancelled() => None,
+        result = std::future::poll_fn(|cx| {
+            let _guard = gate.map(|gate| gate.lock().expect("conversation gate poisoned"));
+            if cancel.is_cancelled() {
+                return std::task::Poll::Ready(None);
+            }
+            future.as_mut().poll(cx).map(Some)
+        }) => result,
+    }
 }
 
 fn unix_ms() -> u64 {

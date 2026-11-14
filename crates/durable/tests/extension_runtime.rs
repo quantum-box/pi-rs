@@ -433,6 +433,48 @@ fn forks_preserve_historical_extension_selection() {
 }
 
 struct ResultHook;
+struct ParkAfterTool(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl Hook for ParkAfterTool {
+    async fn after_tool(
+        &self,
+        _: &HookCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        self.0.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn abort_during_after_tool_retains_committed_result() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler =
+        Scheduler::open(dir.path().join("db"), options(model, tool.clone())).unwrap();
+    scheduler
+        .install_extension(ext("park", "p", Arc::new(ParkAfterTool(entered.clone()))))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["park".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("ok"));
+    assert_eq!(tool.0.lock().unwrap().len(), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
 #[async_trait]
 impl Hook for ResultHook {
     async fn after_tool(
