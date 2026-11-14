@@ -303,13 +303,14 @@ impl<'a> Observer<'a> {
             if !page.records.is_empty() {
                 return Ok(WaitOutcome::Records(page));
             }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Ok(WaitOutcome::TimedOut { cursor: after });
             }
-            tokio::time::sleep(
-                poll.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-            )
-            .await;
+            // Use an absolute timer: a relative sleep can start late if this
+            // task is descheduled between calculating the delay and sleeping.
+            let wake = now.checked_add(poll).unwrap_or(deadline).min(deadline);
+            tokio::time::sleep_until(wake).await;
         }
     }
 }
@@ -579,7 +580,12 @@ mod tests {
             append(&observer, json!(1));
             append(&observer, json!(2));
             let WaitOutcome::Records(first) = observer
-                .watch_for(Cursor(0), limit(1), Duration::from_millis(1), Duration::ZERO)
+                .watch_for(
+                    Cursor(0),
+                    limit(1),
+                    Duration::from_millis(1),
+                    Duration::ZERO,
+                )
                 .await
                 .unwrap()
             else {
@@ -600,14 +606,26 @@ mod tests {
         assert_eq!(second.records[0].value, json!(2));
         assert_eq!(
             observer
-                .watch_for(second.next, limit(1), Duration::from_secs(1), Duration::from_millis(5))
+                .watch_for(
+                    second.next,
+                    limit(1),
+                    Duration::from_secs(1),
+                    Duration::from_millis(5)
+                )
                 .await
                 .unwrap(),
-            WaitOutcome::TimedOut { cursor: second.next }
+            WaitOutcome::TimedOut {
+                cursor: second.next
+            }
         );
         append(&observer, json!(3));
         let WaitOutcome::Records(third) = observer
-            .watch_for(second.next, limit(1), Duration::from_millis(1), Duration::ZERO)
+            .watch_for(
+                second.next,
+                limit(1),
+                Duration::from_millis(1),
+                Duration::ZERO,
+            )
             .await
             .unwrap()
         else {
@@ -615,11 +633,20 @@ mod tests {
         };
         assert_eq!(third.records[0].value, json!(3));
         assert!(matches!(
-            observer.watch_for(Cursor(4), limit(1), Duration::from_millis(1), Duration::ZERO).await,
+            observer
+                .watch_for(
+                    Cursor(4),
+                    limit(1),
+                    Duration::from_millis(1),
+                    Duration::ZERO
+                )
+                .await,
             Err(Error::FutureCursor)
         ));
         assert!(matches!(
-            observer.watch_for(third.next, limit(1), Duration::ZERO, Duration::ZERO).await,
+            observer
+                .watch_for(third.next, limit(1), Duration::ZERO, Duration::ZERO)
+                .await,
             Err(Error::ZeroPollInterval)
         ));
     }
@@ -634,7 +661,12 @@ mod tests {
         });
         let observer = Observer::new(&db, Uuid::nil());
         let outcome = observer
-            .watch_for(Cursor(0), limit(1), Duration::from_millis(2), Duration::from_secs(2))
+            .watch_for(
+                Cursor(0),
+                limit(1),
+                Duration::from_millis(2),
+                Duration::from_secs(2),
+            )
             .await
             .unwrap();
         task.await.unwrap();
@@ -643,6 +675,96 @@ mod tests {
         };
         assert_eq!(page.next, Cursor(1));
         assert_eq!(page.records[0].value, json!("new"));
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_final_poll_wins_and_cancellation_does_not_consume() {
+        let db = Store::memory().unwrap();
+        let observer = Observer::new(&db, Uuid::nil());
+        let mut wait = Box::pin(observer.watch_for(
+            Cursor(0),
+            limit(1),
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+        ));
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        std::thread::sleep(Duration::from_millis(250));
+        append(&observer, json!("boundary"));
+        let WaitOutcome::Records(page) = wait.await.unwrap() else {
+            panic!("final poll must see the committed record")
+        };
+        assert_eq!(page.next, Cursor(1));
+
+        let mut cancelled = Box::pin(observer.watch_for(
+            page.next,
+            limit(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        append(&observer, json!("after cancellation"));
+        let WaitOutcome::Records(replayed) = observer
+            .watch_for(page.next, limit(1), Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("cancelled wait must not consume records")
+        };
+        assert_eq!(replayed.records[0].value, json!("after cancellation"));
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_rejects_overflow_and_observes_only_committed_batches() {
+        let db = Store::memory().unwrap();
+        let observer = Observer::new(&db, Uuid::nil());
+        assert!(matches!(
+            observer
+                .watch_for(Cursor(0), limit(1), Duration::from_secs(1), Duration::MAX,)
+                .await,
+            Err(Error::WaitTooLong)
+        ));
+        let mut long_poll = Box::pin(observer.watch_for(
+            Cursor(0),
+            limit(1),
+            Duration::MAX,
+            Duration::from_secs(5),
+        ));
+        assert!(futures_util::poll!(long_poll.as_mut()).is_pending());
+        drop(long_poll);
+        let mut batch = observer.prepare_append(&json!("committed")).unwrap();
+        batch.checks.push(Check {
+            key: b"host".to_vec(),
+            expected: Expected::Missing,
+        });
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: b"host".to_vec(),
+                value: vec![1],
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert_eq!(
+            observer
+                .watch_for(Cursor(0), limit(1), Duration::MAX, Duration::ZERO)
+                .await
+                .unwrap(),
+            WaitOutcome::TimedOut { cursor: Cursor(0) }
+        );
+        append(&observer, json!("committed"));
+        let WaitOutcome::Records(page) = observer
+            .watch_for(Cursor(0), limit(1), Duration::MAX, Duration::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("expected committed record")
+        };
+        assert_eq!(page.records[0].value, json!("committed"));
     }
 
     #[test]
