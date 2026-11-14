@@ -760,6 +760,11 @@ impl Profiles {
             let mut ids = std::collections::BTreeSet::new();
             let mut model_endpoints = BTreeMap::new();
             for model in &mut profile.models {
+                // Pi defaults definitions to text; overrides remain partial.
+                model
+                    .metadata
+                    .input
+                    .get_or_insert_with(|| vec![Modality::Text]);
                 let adapter = match model.api.as_deref() {
                     None if builtin.is_none() && profile.api.is_none() => {
                         return Err(Error::Config(format!(

@@ -85,6 +85,10 @@ struct Cli {
     #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
+    rpc_model_images: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<(String, String, String), bool>>,
+    >,
+    #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
     #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,

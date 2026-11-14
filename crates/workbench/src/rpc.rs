@@ -951,6 +951,12 @@ fn command_cancellable(
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
+                    remember_model_images(
+                        &current,
+                        &catalog.provider,
+                        &candidate,
+                        details.get(&candidate),
+                    );
                     Ok(Some(model_with_input_details(
                         model_value(&current, &catalog.provider, &candidate),
                         details.get(&candidate),
@@ -1170,7 +1176,7 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
         .unwrap_or(model);
     let adapter = args.model_profiles.model_adapter(provider, model);
     let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
-    if let Some(configured) = configured {
+    let value = if let Some(configured) = configured {
         configured.apply_catalog_metadata(&mut value);
         if let Some(input) = configured.input_modalities() {
             value["input"] = json!(input);
@@ -1180,6 +1186,46 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
         super::model_listing::with_details(value, Some(&details))
     } else {
         value
+    };
+    if value.get("input").is_some() {
+        return value;
+    }
+    let key = model_cache_key(args, provider, model);
+    let images = args.rpc_model_images.lock().unwrap().get(&key).copied();
+    model_with_input_details(
+        value,
+        images
+            .map(|images| pi_rs::ollama::ModelDetails {
+                images: Some(images),
+                ..Default::default()
+            })
+            .as_ref(),
+    )
+}
+
+fn model_cache_key(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+) -> (String, String, String) {
+    (
+        provider.id().to_owned(),
+        args.model_endpoint_for(provider, Some(model)).to_owned(),
+        model.to_owned(),
+    )
+}
+
+fn remember_model_images(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    details: Option<&pi_rs::ollama::ModelDetails>,
+) {
+    if let Some(images) = details.and_then(|details| details.images) {
+        args.rpc_model_images
+            .lock()
+            .unwrap()
+            .insert(model_cache_key(args, provider, model), images);
     }
 }
 
@@ -1212,6 +1258,7 @@ fn available_models(
             };
             for model in catalog.models {
                 if include_details {
+                    remember_model_images(&args, &catalog.provider, &model, details.get(&model));
                     rows.push(model_with_input_details(
                         model_value(&args, &catalog.provider, &model),
                         details.get(&model),
@@ -1619,6 +1666,172 @@ mod tests {
             .unwrap();
         assert_eq!(state["model"]["id"], "text");
         assert_eq!(state["model"]["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn rpc_configured_default_input_and_partial_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {
+                "models": [{"id":"default"}, {"id":"vision", "input":["text", "image"]}],
+                "modelOverrides": {"vision":{"name":"renamed"}}
+            }}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        assert_eq!(
+            model_value(&args, &provider, "default")["input"],
+            json!(["text"])
+        );
+        assert_eq!(
+            model_value(&args, &provider, "vision")["input"],
+            json!(["text", "image"])
+        );
+        let models = available_models(&args, true).unwrap().1;
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "default" && m["input"] == json!(["text"]))
+        );
+        args.provider = provider;
+        let result = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"default"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn rpc_dynamic_discovery_selection_state_and_cycle_keep_capabilities() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.clone();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                let body = if path.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"},{"id":"other"}]}"#
+                } else if path.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if path.starts_with("POST /api/show ") {
+                    if String::from_utf8_lossy(&request_body).contains("dynamic") {
+                        r#"{"capabilities":["vision"]}"#
+                    } else {
+                        r#"{}"#
+                    }
+                } else {
+                    panic!("unexpected request: {path}")
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut args =
+            Cli::try_parse_from(["pi", "--offline", "--no-session", "--endpoint", &endpoint])
+                .unwrap();
+        args.workspace = directory.path().to_path_buf();
+        args.session = directory.path().join("session.jsonl");
+        args.model = "other".into();
+        let models = command(
+            &json!({"type":"get_available_models"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+        );
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "other" && m.get("input").is_none())
+        );
+        args.rpc_model_images.lock().unwrap().clear();
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"dynamic"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text", "image"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text", "image"]));
+        args.model = "other".into();
+        args.model_scope = ["other", "dynamic"]
+            .into_iter()
+            .map(|model| super::super::model_selection::ScopedChoice {
+                provider: args.provider.clone(),
+                model: model.into(),
+                thinking: None,
+            })
+            .collect();
+        let cycled = command(&json!({"type":"cycle_model"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycled["model"]["input"], json!(["text", "image"]));
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
     }
 
     #[test]

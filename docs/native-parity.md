@@ -307,9 +307,11 @@ requests are bounded and retain their individual response IDs.
 RPC model values expose Pi's `input` modality list for configured models in
 state, selection, cycling, and discovery responses. Discovery and selection
 responses for dynamic models derive the list from a reported image capability.
-When capability data is unavailable, including an uncached dynamic model in a
-state response, the list is omitted rather than guessed. The native `images`
-field remains available for existing clients.
+Known dynamic capabilities are retained for subsequent state and cycling
+responses in the same RPC session. When capability data is unavailable, the
+list is omitted rather than guessed. Configured model definitions default to
+text input, while partial overrides inherit the existing model's modalities.
+The native `images` field remains available for existing clients.
 
 `set_model` checks the exact model ID against the selected provider's
 configured or discovered catalog before saving the selection. A missing
