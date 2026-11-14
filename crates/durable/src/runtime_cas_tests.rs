@@ -3133,3 +3133,90 @@ async fn stale_reporter_retires_on_reopen_and_later_requests_work() {
     );
     assert_eq!(h.pending_reporters().unwrap().len(), 1);
 }
+
+struct LegacyHandoffTool;
+#[async_trait::async_trait]
+impl crate::keyed_tool::KeyedTool for LegacyHandoffTool {
+    fn spec(&self) -> pi_rs_core::ToolSpec {
+        pi_rs_core::ToolSpec {
+            name: "legacy-handoff".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn invoke(
+        &self,
+        _: serde_json::Value,
+        _: pi_rs_core::ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: crate::keyed_tool::KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        unreachable!()
+    }
+    async fn invoke_controlled(
+        &self,
+        _: serde_json::Value,
+        _: pi_rs_core::ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: crate::keyed_tool::KeyedHost,
+    ) -> (pi_rs_core::ToolReply, crate::reset::ToolControl) {
+        (
+            pi_rs_core::Outcome::Succeeded("ok".into()).into(),
+            crate::reset::ToolControl {
+                handoff: Some("new context".into()),
+                terminate: true,
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn resumed_legacy_round_records_handoff_without_termination_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = Arc::new(crate::keyed_tool::KeyedToolAdapter::new(LegacyHandoffTool));
+    let opts = || Options {
+        tools: vec![tool.register(ReplayPolicy::Safe)],
+        ..options()
+    };
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        h.submit(id, None, "old".into()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let calls = vec![ToolCall {
+            id: "call".into(),
+            name: "legacy-handoff".into(),
+            arguments: "{}".into(),
+        }];
+        c.messages.push(Message::Assistant {
+            content: "answer".into(),
+            calls: calls.clone(),
+            replay: None,
+        });
+        c.phase = Phase::Tools {
+            turns: 1,
+            calls,
+            index: 0,
+        };
+        // These are the serde defaults for a round saved before either field existed.
+        c.round_terminates.clear();
+        c.round_handoffs.clear();
+        h.save(&c, Expected::Version(version)).unwrap();
+    }
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.resets.len(), 1);
+    assert_eq!(c.resets[0].handoff.as_deref(), Some("new context"));
+    assert!(matches!(&c.submissions[0].status, Status::Done { answer } if answer == "answer"));
+}

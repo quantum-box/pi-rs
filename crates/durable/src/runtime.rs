@@ -5352,15 +5352,12 @@ impl Harness {
                             }
                         }
                         other => {
-                            // Older persisted rounds predate handoff slots.
+                            // Older persisted rounds may predate either control vector.
+                            c.round_terminates.resize(calls.len(), false);
                             c.round_handoffs.resize(calls.len(), None);
-                            if let Some(slot) = c.round_terminates.get_mut(index) {
-                                let control = control.lock().expect("control mutex poisoned");
-                                *slot = control.terminate;
-                                if let Some(handoff) = c.round_handoffs.get_mut(index) {
-                                    *handoff = control.handoff.clone();
-                                }
-                            }
+                            let control = control.lock().expect("control mutex poisoned");
+                            c.round_terminates[index] = control.terminate;
+                            c.round_handoffs[index] = control.handoff.clone();
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
