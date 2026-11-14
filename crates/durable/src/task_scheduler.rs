@@ -10,7 +10,7 @@
 //! and reopening it; never assume an unsuccessful commit did not happen.
 //!
 //! This scheduler supports direct-child all, any and fail-fast waits. It has no
-//! background tasks, abort handlers, combined waits, or conversation integration.
+//! background tasks, combined waits, or conversation integration.
 //! Cancellation changes durable state only and cannot undo external effects or
 //! interrupt a synchronous handler. Direct TaskStore writers must be fenced.
 //! Terminal success still requires all owned work to be finished.
@@ -54,6 +54,7 @@ pub enum Step {
 struct Registration {
     replay_safe: bool,
     handler: Arc<dyn Handler>,
+    abort: Option<Arc<dyn Handler>>,
 }
 #[derive(Default)]
 pub struct Registry {
@@ -72,11 +73,28 @@ impl Registry {
                 v.insert(Registration {
                     replay_safe,
                     handler: Arc::new(handler),
+                    abort: None,
                 });
                 true
             }
             Entry::Occupied(_) => false,
         }
+    }
+    /// Register a separate cleanup invocation. Abort handlers must be replay-safe:
+    /// their external effects require idempotency across a crash before commit.
+    pub fn register_with_abort(
+        &mut self,
+        kind: impl Into<String>,
+        replay_safe: bool,
+        handler: impl Handler + 'static,
+        abort: impl Handler + 'static,
+    ) -> bool {
+        let kind = kind.into();
+        if !self.register(kind.clone(), replay_safe, handler) {
+            return false;
+        }
+        self.entries.get_mut(&kind).unwrap().abort = Some(Arc::new(abort));
+        true
     }
 }
 
@@ -195,6 +213,15 @@ impl Scheduler {
             if item.task.state() != &TaskState::Running {
                 continue;
             }
+            if item.task.abort_requested() {
+                if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
+                    self.ts()
+                        .update(&item, |task| task.fail("abort restart limit".into()))?;
+                } else {
+                    self.ts().update(&item, |task| task.recover())?;
+                }
+                continue;
+            }
             if !item.task.replay_safe() {
                 self.finish_failed(
                     &item,
@@ -259,12 +286,16 @@ impl Scheduler {
         self.check()?;
         let mut progress = false;
         for snapshot in self.ts().list()? {
-            if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state() {
+            if !snapshot.task.abort_requested()
+                && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state()
+            {
                 self.poisoned = true;
                 self.cancel_failed_siblings(&snapshot, ids)?;
                 self.poisoned = false;
             }
-            if matches!(snapshot.task.state(), TaskState::Waiting(_)) {
+            if !snapshot.task.abort_requested()
+                && matches!(snapshot.task.state(), TaskState::Waiting(_))
+            {
                 match self.ts().poll_wait(&snapshot, now_millis) {
                     Ok(WakeResult::Woken { .. }) => progress = true,
                     Ok(WakeResult::Pending) => (),
@@ -278,10 +309,48 @@ impl Scheduler {
             }
         }
         let tasks = self.ts().list()?;
+        // Children settle before their owner, including when definitions are missing.
+        if let Some(snapshot) = tasks.iter().find(|s| {
+            s.task.abort_requested()
+                && s.task.state() == &TaskState::Ready
+                && !tasks.iter().any(|child| {
+                    child.task.owner() == &TaskOwner::Task(s.task.id()) && !child.task.is_terminal()
+                })
+        }) {
+            self.poisoned = true;
+            let abort = self
+                .registered(&snapshot.task)
+                .ok()
+                .and_then(|r| r.abort.clone());
+            if let Some(abort) = abort {
+                self.ts().reserve(snapshot)?;
+                let running = self
+                    .ts()
+                    .load(snapshot.task.id())?
+                    .ok_or(Error::Ownership)?;
+                match abort.run(&running.task).map_err(Error::Handler)? {
+                    Step::Succeed(_) => self.ts().update(&running, |t| t.cancel())?,
+                    Step::Fail(reason) => self.ts().update(&running, |t| t.fail(reason))?,
+                    _ => {
+                        return Err(Error::Handler(
+                            "abort handler must return Succeed or Fail".into(),
+                        ));
+                    }
+                }
+            } else {
+                self.ts().update(snapshot, |t| {
+                    t.start()?;
+                    t.fail("orphaned: missing abort handler or task definition".into())
+                })?;
+            }
+            self.poisoned = false;
+            return Ok(true);
+        }
         let Some(snapshot) = tasks
             .iter()
             .find(|s| {
                 s.task.state() == &TaskState::Ready
+                    && !s.task.abort_requested()
                     && self.registered(&s.task).is_ok()
                     && self.ancestors_available(&s.task, &tasks)
             })
@@ -373,7 +442,8 @@ impl Scheduler {
             let Some(parent) = tasks.iter().find(|entry| entry.task.id() == *id) else {
                 return false;
             };
-            if parent.task.is_terminal()
+            if parent.task.abort_requested()
+                || parent.task.is_terminal()
                 || parent.task.state() == &TaskState::Running
                 || self.registered(&parent.task).is_err()
             {
@@ -383,6 +453,52 @@ impl Scheduler {
         }
         true
     }
+    /// Persist abort intent for the live subtree. The synchronous scheduler can
+    /// accept this only between invocations; subsequent ticks drain children first.
+    pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
+        self.check()?;
+        let records = self.ts().list()?;
+        let root = records
+            .iter()
+            .find(|s| s.task.id() == id)
+            .ok_or(Error::Ownership)?;
+        if root.task.is_terminal() {
+            return Err(Error::Transition(TransitionError::InvalidState));
+        }
+        let mut ids = HashSet::from([id]);
+        loop {
+            let before = ids.len();
+            for record in &records {
+                if let TaskOwner::Task(parent) = record.task.owner()
+                    && ids.contains(parent)
+                {
+                    ids.insert(record.task.id());
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        let mut updates = Vec::new();
+        for record in &records {
+            if ids.contains(&record.task.id())
+                && !record.task.is_terminal()
+                && !record.task.abort_requested()
+            {
+                let mut next = record.clone();
+                next.task.request_abort().map_err(Error::Transition)?;
+                updates.push(next);
+            }
+        }
+        if !updates.is_empty() {
+            self.poisoned = true;
+            self.ts()
+                .save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+            self.poisoned = false;
+        }
+        Ok(())
+    }
+
     /// Cancel a task and all of its owned descendants in one transaction.
     /// This requires exclusive scheduler ownership and cannot interrupt `tick`.
     pub fn cancel(&mut self, id: Uuid) -> Result<(), Error> {
@@ -504,6 +620,151 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn abort_mark_survives_reopen_and_drains_children_once() {
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let make_registry = || {
+            let mut registry = Registry::default();
+            let calls = calls.clone();
+            registry.register_with_abort(
+                "tree",
+                true,
+                |t: &Task| {
+                    if t.id() == Uuid::from_u128(1) {
+                        Ok(Step::Wait {
+                            checkpoint: cp("waiting"),
+                            condition: WaitFor::Tasks(vec![Uuid::from_u128(2)]),
+                            children: vec![task(2, TaskOwner::Task(t.id()), "tree", true, 5)],
+                        })
+                    } else {
+                        Ok(Step::Succeed(json!(null)))
+                    }
+                },
+                move |t: &Task| {
+                    calls.lock().unwrap().push(t.id());
+                    Ok(Step::Succeed(json!(null)))
+                },
+            );
+            registry
+        };
+        {
+            let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "tree",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            scheduler.tick(0).unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+        }
+        {
+            let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+            assert!(
+                scheduler
+                    .get(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            assert!(scheduler.tick(0).unwrap());
+            assert!(scheduler.tick(0).unwrap());
+            assert!(!scheduler.tick(0).unwrap());
+        }
+        let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+        assert!(!scheduler.tick(0).unwrap());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![Uuid::from_u128(2), Uuid::from_u128(1)]
+        );
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+    }
+
+    #[test]
+    fn interrupted_abort_reservation_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "tree",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        {
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "tree",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+            let snapshot = scheduler.ts().load(Uuid::from_u128(1)).unwrap().unwrap();
+            scheduler.ts().reserve(&snapshot).unwrap(); // crash after reservation
+        }
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "tree",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(
+            scheduler
+                .get(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .restarts(),
+            1
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+    }
+
+    #[test]
+    fn missing_abort_definition_settles_with_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register("tree", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        {
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "tree",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+        }
+        let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            matches!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("orphaned"))
+        );
+    }
+
     #[test]
     fn missing_task_definition_does_not_block_other_ready_tasks() {
         let dir = tempfile::tempdir().unwrap();

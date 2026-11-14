@@ -15,6 +15,9 @@ P0 means recovery/effect safety or fundamental execution semantics; P1 means cor
 
 **Abort and reporter checkpoint:** `Scheduler::abort` persists conversation aborts, withdraws queued inputs and fences both ordinary and reporter-driven dispatch; `abort_and_wait` waits for local workers. A dispatched uncertain effect requires reconciliation even if replay-safe. Background reporter children remain independent: parent abort does not propagate through an ownership tree. See [abort tests](../crates/durable/tests/abort.rs) and [reporter tests](../crates/durable/tests/reporter_pending.rs).
 
+**Generic task abort checkpoint:** The separate generic scheduler can persist subtree abort intent and run registered cleanup handlers child-first, including after reopening. A handler interrupted before its outcome is committed may run again; external cleanup must be idempotent. Missing handlers become failed records with an orphan diagnostic, not upstream's `orphaned` outcome. This synchronous scheduler cannot mark or signal an active invocation until it returns, has no abort context, migrations, background boundaries, conversation-owned descendant traversal, or integration with conversation abort. Legacy `cancel` and fail-fast cancellation still terminalize directly. Restart exhaustion uses a failed record without upstream's fault reporting or cleanup hooks.
+
+
 **Admission policy checkpoint:** `Harness`, `Scheduler`, and the state-backed
 conversation helper now support optional busy and idle rejection for input,
 with request-ID deduplication before the policy check and version-checked

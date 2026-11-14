@@ -67,6 +67,9 @@ pub struct Task {
     /// Only explicitly replay-safe tasks may run again after an interrupted invocation.
     #[serde(default)]
     replay_safe: bool,
+    /// Durable cancellation intent; retained on terminal records.
+    #[serde(default)]
+    abort_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +101,7 @@ impl Task {
             delivered_signal: None,
             kind: None,
             replay_safe: false,
+            abort_requested: false,
         })
     }
 
@@ -113,6 +117,24 @@ impl Task {
     }
     pub fn replay_safe(&self) -> bool {
         self.replay_safe
+    }
+
+    pub fn abort_requested(&self) -> bool {
+        self.abort_requested
+    }
+
+    pub(crate) fn request_abort(&mut self) -> Result<(), TransitionError> {
+        if self.is_terminal() {
+            return Err(TransitionError::InvalidState);
+        }
+        if !self.abort_requested {
+            self.abort_requested = true;
+            self.restarts = 0;
+        }
+        if matches!(self.state, TaskState::Waiting(_)) {
+            self.state = TaskState::Ready;
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> Uuid {

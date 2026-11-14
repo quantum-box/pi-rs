@@ -136,6 +136,18 @@ impl Driver {
         self.shared.wake.notify_one();
         Ok(())
     }
+    /// Wait for the current synchronous invocation to finish, then persist
+    /// abort intent. Cleanup proceeds asynchronously on the driver thread.
+    pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
+        let _state = self.check()?;
+        self.shared
+            .scheduler
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .request_abort(id)?;
+        self.shared.wake.notify_one();
+        Ok(())
+    }
     pub fn signal(&self, signal: &Signal) -> Result<(), Error> {
         let _state = self.check()?;
         TaskStore::new(self.shared.owner.store())

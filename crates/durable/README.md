@@ -74,10 +74,13 @@ Current limits and differences from upstream Pi Durable:
   text for aborted display but not all upstream live view/metadata semantics.
   The subagent link primitive does not provide an automatic conversation/task ownership tree.
 - Generic task waits support deadlines, signals, deadline-or-signal sleeps, and direct-child
-  all/any/fail-fast joins. Task abort handlers are not yet
-  implemented. Local cancellation propagates through descendants, but cannot
-  cancel an already running external effect. Handler steps run synchronously
-  and shutdown waits for an in-flight step.
+  all/any/fail-fast joins. `register_with_abort` and `request_abort` provide
+  persisted, child-first cleanup for generic task-owned subtrees. Cleanup must
+  tolerate replay after a crash; a missing handler produces a failed record.
+  Handler steps run synchronously, so an abort request waits for the active step
+  and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
+  cleanup. Conversation abort does not propagate to these generic tasks.
+  Shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.
