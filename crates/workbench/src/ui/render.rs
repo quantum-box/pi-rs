@@ -1112,7 +1112,14 @@ fn protect_bare_links(text: &str, options: Options) -> String {
             }
             Event::Start(Tag::TableCell) => segments.push((range, true)),
             Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
-                let marker = if matches!(tag, Tag::Emphasis) { 1 } else { 2 };
+                let marker = if matches!(tag, Tag::Emphasis)
+                    || matches!(tag, Tag::Strikethrough)
+                        && text.as_bytes().get(range.start + 1) != Some(&b'~')
+                {
+                    1
+                } else {
+                    2
+                };
                 formatting.push(range.end.saturating_sub(marker));
             }
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
@@ -1282,7 +1289,7 @@ fn markdown_at_depth(
     let mut events = Parser::new_ext(&protected_text, options)
         .into_offset_iter()
         .peekable();
-    while let Some((event, mut range)) = events.next() {
+    while let Some((mut event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
                 Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
@@ -1290,6 +1297,21 @@ fn markdown_at_depth(
                 _ => {}
             }
             continue;
+        }
+        // Pi's Marked tokenizer only accepts paired double tildes. Pulldown
+        // also parses a single tilde pair; retain its delimiters as text while
+        // still rendering any formatting nested inside the pair.
+        if matches!(
+            event,
+            Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough)
+        ) && text.as_bytes().get(range.start + 1) != Some(&b'~')
+        {
+            if matches!(event, Event::Start(_)) {
+                range.end = range.start + 1;
+            } else {
+                range.start = range.end - 1;
+            }
+            event = Event::Text("~".into());
         }
         let is_text = matches!(&event, Event::Text(_));
         match event {
@@ -1768,6 +1790,91 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_requires_double_tildes_for_strikethrough() {
+        let theme = Theme::system();
+        for source in [
+            "~one~",
+            "before ~one~ after",
+            "~**bold**~",
+            "~~a ~b~ c~~",
+            "~~x~~~",
+        ] {
+            let lines = markdown(source, &theme, 80);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let rendered: String = spans.iter().map(|span| span.text.as_str()).collect();
+            let expected = match source {
+                "~**bold**~" => "~bold~",
+                "~~a ~b~ c~~" => "a ~b~ c",
+                _ => source,
+            };
+            assert_eq!(rendered, expected, "{source}");
+            if source == "~~a ~b~ c~~" {
+                assert!(spans.iter().all(|span| span.strikethrough));
+            } else {
+                assert!(spans.iter().all(|span| !span.strikethrough));
+            }
+            if source == "~**bold**~" {
+                assert!(spans.iter().any(|span| span.text == "bold" && span.bold));
+            }
+        }
+        let lines = markdown("~~deleted~~ and ~literal~", &theme, 80);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "deleted" && span.strikethrough)
+        );
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.text.contains('~'))
+                .all(|span| !span.strikethrough)
+        );
+        let lines = markdown_at_depth(
+            "~[label](https://example.com)~ `~code~`",
+            &theme,
+            80,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "~label~ ~code~"
+        );
+        assert!(
+            spans.iter().any(|span| span.text == "label"
+                && span.hyperlink.as_deref() == Some("https://example.com"))
+        );
+        let lines = markdown_at_depth(
+            "~https://example.com~",
+            &theme,
+            80,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "~https://example.com~"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com"))
+        );
+    }
     #[test]
     fn empty_fenced_code_has_one_indented_content_row() {
         for language in ["", "rust", "unknown-language"] {

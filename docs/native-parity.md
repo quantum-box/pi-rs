@@ -814,7 +814,9 @@ validate component ranges, and gamut-map OKLCH colors.
 
 Markdown tables now calculate Unicode-aware column widths, preserve alignment,
 wrap cells, and use a stacked layout when a terminal cannot fit the columns.
-Link destinations and strikethrough formatting are rendered. Table tests cover
+Link destinations and strikethrough formatting are rendered. Like Pi's strict
+strikethrough tokenizer, single-tilde pairs remain literal while double-tilde
+pairs apply strikethrough, including around nested formatting. Table tests cover
 Japanese text and narrow terminal widths.
 
 The core Session and owned SDK also support no-overwrite JSONL export and
