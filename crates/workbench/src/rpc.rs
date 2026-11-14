@@ -737,7 +737,7 @@ fn read_rpc_line(input: &mut impl BufRead) -> std::io::Result<Option<String>> {
 
 #[cfg(test)]
 mod jsonl_framing_tests {
-    use super::read_rpc_line;
+    use super::{parse_request, read_rpc_line};
     use std::io::BufReader;
 
     #[test]
@@ -760,6 +760,35 @@ mod jsonl_framing_tests {
         );
         assert!(read_rpc_line(&mut input).unwrap().is_none());
     }
+    #[test]
+    fn truncated_json_reports_pi_eof_diagnostics() {
+        for (input, expected) in [
+            ("[", "Unexpected end of JSON input"),
+            ("[1,", "Unexpected end of JSON input"),
+            (
+                "[1",
+                "Expected ',' or ']' after array element in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "{",
+                "Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                "\"😺",
+                "Unterminated string in JSON at position 3 (line 1 column 4)",
+            ),
+            (
+                "[\n1",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 2)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
 }
 
 fn parse_request(line: &str) -> Result<Value> {
@@ -768,7 +797,57 @@ fn parse_request(line: &str) -> Result<Value> {
         Ok(_) => Err(Error::Config(
             "Failed to parse command: expected a JSON object".into(),
         )),
-        Err(error) => Err(Error::Config(format!("Failed to parse command: {error}"))),
+        Err(error) => Err(Error::Config(format!(
+            "Failed to parse command: {}",
+            rpc_json_error(line, &error)
+        ))),
+    }
+}
+
+// Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
+// syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
+fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
+    if !error.is_eof() || line.contains('\r') {
+        return error.to_string();
+    }
+    let message = error.to_string();
+    let tail = line.trim_end_matches([' ', '\t', '\n']);
+    let reason = if message.starts_with("EOF while parsing a string") && !line.contains('\\') {
+        Some("Unterminated string in JSON")
+    } else if message.starts_with("EOF while parsing a list") {
+        if tail.ends_with('[') {
+            return "Unexpected end of JSON input".into();
+        }
+        Some("Expected ',' or ']' after array element in JSON")
+    } else if message.starts_with("EOF while parsing an object") && tail.ends_with('{') {
+        Some("Expected property name or '}' in JSON")
+    } else if message.starts_with("EOF while parsing a value")
+        && (tail.is_empty()
+            || tail.ends_with(':')
+            || tail.ends_with('[')
+            || tail.ends_with(',') && tail.starts_with('[') && !tail.contains('{')
+            || ["t", "tr", "tru", "f", "fa", "fal", "fals", "n", "nu", "nul"]
+                .iter()
+                .any(|word| tail.ends_with(word)))
+    {
+        return "Unexpected end of JSON input".into();
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => {
+            let position = line.encode_utf16().count();
+            let row = line.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = line
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .encode_utf16()
+                .count()
+                + 1;
+            format!("{reason} at position {position} (line {row} column {column})")
+        }
+        None => message,
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::time as platform_time;
 use futures_util::{FutureExt, stream::FuturesUnordered};
 
 pub(super) enum TurnPreparation {
@@ -39,7 +40,7 @@ impl Agent<'_> {
         let args = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(timeout, tool.tool.prepare_arguments(args)) => result.ok().and_then(std::result::Result::ok).ok_or_else(pending)?,
+            result = platform_time::timeout(timeout, tool.tool.prepare_arguments(args)) => result.ok().and_then(std::result::Result::ok).ok_or_else(pending)?,
         };
         if args.to_string().len() > 16 * 1024 * 1024 || !tool.validator.is_valid(&args) {
             return Err(pending());
@@ -103,12 +104,12 @@ impl Agent<'_> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(timeout, authorize) => result.map_err(|_| pending())??,
+            result = platform_time::timeout(timeout, authorize) => result.map_err(|_| pending())??,
         }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout(timeout, tool.tool.poll(reference, context)) => result.ok().flatten().ok_or_else(pending),
+            result = platform_time::timeout(timeout, tool.tool.poll(reference, context)) => result.ok().flatten().ok_or_else(pending),
         }
     }
 
@@ -142,7 +143,7 @@ impl Agent<'_> {
         let args = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
+            result = platform_time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
                 Ok(Ok(_)) => return Ok(TurnNormalized::Skipped("prepared arguments exceed size limit".into())),
                 Ok(Err(error)) => return Ok(TurnNormalized::Skipped(format!("argument preparation failed: {error}"))),
@@ -180,7 +181,7 @@ impl Agent<'_> {
         let decision = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states, host)) =>
+            decision = platform_time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states, host)) =>
                 decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         };
         Ok(match decision {
@@ -297,7 +298,7 @@ impl Agent<'_> {
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
             result = async {
                 match timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, invocation).await
+                    Some(timeout) => platform_time::timeout(timeout, invocation).await
                         .unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
                     None => invocation.await,
                 }
@@ -335,7 +336,7 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(tool_timeout, async {
+                result = platform_time::timeout(tool_timeout, async {
                     match &host {
                         Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.for_extension(extension.id()).unwrap_or_else(|| host.clone())).await,
                         None => extension.tool_result_update(&invocation.call, &reply.outcome, &context, states.get(extension.id())).await,
@@ -1081,7 +1082,7 @@ impl Agent<'_> {
                                 let omit = self.registry.omit_default_tool_timeout; let timeout = self.limits.tool_timeout;
                                 calls[index].phase = TurnPhase::Running;
                                 let flush = updates.clone();
-                                futures.push(async move { let start = std::time::Instant::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); let errors = progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]); TurnEvent::Ran(index, reply, duration, errors) }.boxed());
+                                futures.push(async move { let start = crate::runtime::Monotonic::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); let errors = progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]); TurnEvent::Ran(index, reply, duration, errors) }.boxed());
                     }
                     TurnEvent::Ran(index, reply, duration, errors) => { for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); } calls[index].phase = TurnPhase::Done(Box::new(reply), duration); }
                     TurnEvent::Transformed(index, reply, duration, errors) => {
