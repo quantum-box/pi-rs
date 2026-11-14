@@ -603,6 +603,7 @@ struct RemoteTask {
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
     _cancel: tokio::sync::oneshot::Sender<()>,
     logout_control: Option<super::chatgpt_auth::LogoutControl>,
+    meta_login_control: Option<super::meta_auth::LoginControl>,
 }
 
 impl RemoteTask {
@@ -643,6 +644,7 @@ impl RemoteTask {
             receiver,
             _cancel: cancel,
             logout_control: None,
+            meta_login_control: None,
         }
     }
 
@@ -650,6 +652,10 @@ impl RemoteTask {
         self.logout_control
             .as_ref()
             .is_none_or(|control| control.cancel_before_commit())
+            && self
+                .meta_login_control
+                .as_ref()
+                .is_none_or(|control| control.cancel_before_commit())
     }
 }
 
@@ -5590,18 +5596,22 @@ fn start_kimi_logout(view: &mut View) {
 
 fn start_meta_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
-    view.remote_task = Some(RemoteTask::start(
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
         "Signing in to Meta",
         "Meta login cancelled",
         move |sender| async move {
-            super::meta_auth::login(&settings, |url, code| {
+            super::meta_auth::login(&settings, task_control, |url, code| {
                 let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
             })
             .await?;
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             Ok(vec!["Signed in to Meta".into()])
         },
-    ));
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
 }
 
 fn start_kimi_login(view: &mut View, settings: &crate::config::Settings) {
@@ -5709,7 +5719,11 @@ fn interrupt_remote_task(view: &mut View) {
         clear_openrouter_editor(view);
         view.append(message);
     } else {
-        view.append("ChatGPT sign-out is completing; waiting for the result");
+        if task.meta_login_control.is_some() {
+            view.append("Meta sign-in is completing; waiting for the result");
+        } else {
+            view.append("ChatGPT sign-out is completing; waiting for the result");
+        }
     }
 }
 
@@ -7342,6 +7356,73 @@ mod tests {
             serde_json::json!({"client":credential}).to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn blocked_meta_login_commit_remains_observed_after_escape() {
+        use super::super::meta_auth::{Credential, LoginControl};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let control = LoginControl::default();
+        let worker_control = control.clone();
+        let worker_path = path.clone();
+        let mut task = super::RemoteTask::start(
+            "Signing in to Meta",
+            "Meta login cancelled",
+            move |_| async move {
+                super::super::meta_auth::save_login(
+                    &worker_path,
+                    None,
+                    Credential {
+                        kind: "oauth".into(),
+                        access: "key".into(),
+                        refresh: "identity".into(),
+                        expires: 1,
+                    },
+                    worker_control,
+                )
+                .await?;
+                Ok(vec!["Signed in to Meta".into()])
+            },
+        );
+        task.meta_login_control = Some(control.clone());
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !control.is_committing() {
+            assert!(std::time::Instant::now() < deadline, "commit never started");
+            std::thread::yield_now();
+        }
+        super::interrupt_remote_task(&mut view);
+        let task = view
+            .remote_task
+            .take()
+            .expect("commit must remain observed");
+        assert!(
+            task.receiver.try_recv().is_err(),
+            "save must still be blocked"
+        );
+        lock.unlock().unwrap();
+        assert!(matches!(
+            task.receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            super::RemoteEvent::Finished(Ok(_))
+        ));
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(auth["meta"]["access"], "key");
     }
 
     #[test]

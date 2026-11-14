@@ -210,13 +210,7 @@ impl DeviceService {
                         .as_str()
                         .filter(|s| super::model_auth::valid_key(s))
                 {
-                    let access = self.mint.mint(identity).await?;
-                    return Ok(Credential {
-                        kind: "oauth".into(),
-                        access,
-                        refresh: identity.into(),
-                        expires: now().saturating_add(KEY_LIFETIME_MS),
-                    });
+                    return Ok(identity.to_owned());
                 }
                 match json["error"].as_str() {
                     Some("authorization_pending") => {}
@@ -235,12 +229,19 @@ impl DeviceService {
                 }
             }
         };
-        match expires {
+        let identity = match expires {
             Some(deadline) => tokio::time::timeout(deadline, poll)
                 .await
                 .map_err(|_| error("device authorization expired; restart login"))?,
             None => poll.await,
-        }
+        }?;
+        let access = self.mint.mint(&identity).await?;
+        Ok(Credential {
+            kind: "oauth".into(),
+            access,
+            refresh: identity,
+            expires: now().saturating_add(KEY_LIFETIME_MS),
+        })
     }
 }
 fn poll_duration(value: Option<f64>, default: f64) -> Duration {
@@ -261,8 +262,59 @@ fn verification_url(value: &str) -> Option<reqwest::Url> {
     .then_some(url)
 }
 
+#[derive(Clone, Default)]
+pub(super) struct LoginControl(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl LoginControl {
+    // Only one of cancellation and the start of the synchronous commit wins.
+    pub(super) fn cancel_before_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+    #[cfg(test)]
+    pub(super) fn is_committing(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == 1
+    }
+    fn begin_commit(&self) -> Result<()> {
+        self.0
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|_| error("login cancelled"))
+    }
+}
+
+pub(super) async fn save_login(
+    path: &std::path::Path,
+    previous: Option<Value>,
+    credential: Credential,
+    control: LoginControl,
+) -> Result<()> {
+    let guard = super::auth_lock::acquire_async(path).await?;
+    // update_object_locked can block on the independent file lock. Once it
+    // starts, the UI must retain the task and observe its actual result.
+    control.begin_commit()?;
+    super::config::update_object_locked(path, Some(&guard), |data| {
+        if data.get("meta") != previous.as_ref() {
+            return Err(error("credentials changed during login"));
+        }
+        data.insert("meta".into(), serde_json::to_value(&credential)?);
+        Ok(())
+    })
+}
+
 pub(super) async fn login(
     settings: &super::config::Settings,
+    control: LoginControl,
     announce: impl Fn(&reqwest::Url, &str),
 ) -> Result<()> {
     let path = super::config::agent_dir().join("auth.json");
@@ -275,14 +327,7 @@ pub(super) async fn login(
         value
     };
     let credential = DeviceService::new(settings)?.login(announce).await?;
-    let guard = super::auth_lock::acquire_async(&path).await?;
-    super::config::update_object_locked(&path, Some(&guard), |data| {
-        if data.get("meta") != previous.as_ref() {
-            return Err(error("credentials changed during login"));
-        }
-        data.insert("meta".into(), serde_json::to_value(&credential)?);
-        Ok(())
-    })
+    save_login(&path, previous, credential, control).await
 }
 
 async fn access_at(
@@ -424,14 +469,14 @@ mod tests {
             let responses = [
                 (
                     "200 OK",
-                    r#"{"device_code":"device-secret","user_code":"CODE","verification_uri":"https://auth.meta.com/device","verification_uri_complete":"https://auth.meta.com/device?code=CODE","interval":0.01,"expires_in":10}"#,
+                    r#"{"device_code":"device-secret","user_code":"CODE","verification_uri":"https://auth.meta.com/device","verification_uri_complete":"https://auth.meta.com/device?code=CODE","interval":0.01,"expires_in":4}"#,
                 ),
                 ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
                 ("200 OK", r#"{"access_token":"identity-secret"}"#),
                 ("200 OK", r#"{"api_key":"inference-key"}"#),
             ];
             let mut requests = Vec::new();
-            for (status, body) in responses {
+            for (index, (status, body)) in responses.into_iter().enumerate() {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -456,6 +501,10 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
+                // The identity arrives before device expiry, but mint finishes after it.
+                if index == 3 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
                 socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
             requests
@@ -499,6 +548,82 @@ mod tests {
         );
         assert!(requests[3].ends_with("{}"));
     }
+    #[test]
+    fn blocked_file_lock_keeps_commit_observable_after_escape() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let control = LoginControl::default();
+        let worker_control = control.clone();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(save_login(
+                &worker_path,
+                None,
+                Credential {
+                    kind: "oauth".into(),
+                    access: "key".into(),
+                    refresh: "identity".into(),
+                    expires: 1,
+                },
+                worker_control,
+            ))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control.0.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "commit never started");
+            std::thread::yield_now();
+        }
+        assert!(
+            !control.cancel_before_commit(),
+            "Escape must retain the committing task"
+        );
+        assert!(
+            !worker.is_finished(),
+            "the file lock must still block the write"
+        );
+        lock.unlock().unwrap();
+        worker.join().unwrap().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["meta"]["access"], "key");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_commit_never_writes_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let control = LoginControl::default();
+        assert!(control.cancel_before_commit());
+        let result = save_login(
+            &path,
+            None,
+            Credential {
+                kind: "oauth".into(),
+                access: "key".into(),
+                refresh: "identity".into(),
+                expires: 1,
+            },
+            control,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+    }
+
     #[test]
     fn verification_urls_do_not_accept_unsafe_schemes_or_credentials() {
         assert!(verification_url("javascript:alert(1)").is_none());
