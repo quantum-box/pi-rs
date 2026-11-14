@@ -2038,8 +2038,11 @@ mod share_context_tests {
         let (sender, mut ready) = tokio::sync::watch::channel(false);
         let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
         assert!(result.to_string().contains("timed out"));
+        let waiter = tokio::spawn(async move { wait_for_share_readiness(&mut ready).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
         sender.send_replace(true);
-        wait_for_share_readiness(&mut ready).await.unwrap();
+        waiter.await.unwrap().unwrap();
         let (sender, mut ready) = tokio::sync::watch::channel(false);
         drop(sender);
         let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
