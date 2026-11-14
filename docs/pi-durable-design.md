@@ -6,6 +6,24 @@ comparison below was checked against upstream Pi commit
 [`827383a15262905f82e418483825a49dbb1adbf5`](https://github.com/earendil-works/pi/tree/827383a15262905f82e418483825a49dbb1adbf5/packages/durable)
 and pi-rs commit `a642cef`. Recheck upstream before implementing each phase.
 
+## Implementation checkpoint
+
+The experimental `pi-rs-durable::runtime::Harness` now provides a sequential
+local scheduler, durable input admission, model and tool calls, and recovery on
+open. Interrupted model requests are settled unconfirmed before retry. Tool
+replay requires both recorded and current safe policies; unsafe tools use the
+upstream-compatible interruption result by default, with opt-in blocking
+reconciliation. Model responses, tool intents, and tool results are saved
+before the next effect. Cancellation or a dropped scheduling future poisons
+the open harness until it is reopened.
+
+This is a subset of the design below, not complete upstream parity. In
+particular, scheduling is sequential and explicitly driven after admission,
+task-store is not wired into the runtime, and there is no live progress
+checkpoint, background scheduler, task graph, nested tool execution, fork,
+watch, or built-in polling. Runtime state still stores a whole conversation as
+one JSON value. See `crates/durable/README.md` for operational limits.
+
 ## Scope and compatibility
 
 Upstream `packages/durable` is a harness for durable conversations, submissions,

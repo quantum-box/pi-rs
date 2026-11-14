@@ -1,26 +1,44 @@
-# pi-rs-durable (experimental foundation)
+# pi-rs-durable (experimental)
 
-This crate is a separate, unfinished Rust foundation for a Pi Durable-style
-runtime. It does not yet provide `Harness`, a scheduler, model or tool
-dispatch, task recovery, conversation forks, watch APIs, or automatic resume.
-Do not use the state transitions as a crash-safe agent runner.
+An independent, local durable agent runtime for pi-rs. The existing CLI and
+session journal do not use this runtime and their format is unchanged.
 
-It currently contains:
+`runtime::Harness::open` obtains an exclusive local scheduler owner lock,
+recovers unfinished work, and drives it to completion or a blocked state.
+`create_conversation` stores model settings; `submit_and_run` durably admits a
+request and executes it. A repeated request ID returns the existing submission.
+`submit` only admits work; call `resume` to execute it. `open_paused` acquires
+ownership and recovers the stored phases without executing them, for inspection.
 
-- SQLite-backed atomic conversation transitions, plus ephemeral memory storage.
-- Request-ID deduplication within a conversation, persistent queued inputs,
-  explicit placement and settlement, and a small model stream adapter.
-- Pure recovery-policy decisions; nothing executes or reconciles tools yet.
-- A standalone serializable task state machine; it is not yet wired into storage.
+Completed model responses, request IDs and tool intents are committed before
+further work. On restart interrupted model requests are charged as unconfirmed
+and retried with a fresh ID. A tool is replayed only when its recorded and
+current policies are both `Safe`; unsafe interrupted tools return an interrupted
+result by default. `RequireReconciliation` instead blocks until a host supplies
+a known outcome via `reconcile`. An explicit `Unknown` or `Pending` tool outcome
+also blocks. Tool result and its optional state update commit together. A
+cancelled or dropped execution future poisons its harness; close and reopen it
+before running more work. Remote effect idempotency remains the tool's and the
+destination's responsibility.
 
-The conversation state is currently stored as one JSON value. It grows with
-history and does not provide the paginated storage or task-level atomic commits
-needed for long-lived workloads. SQLite synchronizes commits, but there is no
-exclusive lifetime scheduler lock in `Conversations`. An `OwnedStore` guard is
-available separately on Unix, but is not yet wired into this API. Multiple storage connections can use CAS;
-this alone does not make concurrent model or tool dispatch safe. Transient model
-progress is not persisted. The model adapter has a 1 MiB text and 64 tool-call
-limit; these are initial local limits, not claims of upstream parity.
+This initial runtime is deliberately bounded and not full Pi Durable parity:
 
-`docs/pi-durable-design.md` describes the proposed end state. Existing pi-rs
-sessions and CLI continue to use their existing engine and journal format.
+- Conversations are scheduled sequentially; no background worker, steering
+  while a run is in progress, concurrent conversation execution, or task graph.
+- A failed model request returns an error and leaves recovery for the next open;
+  one failure can stop the current scheduling pass. `open_paused` permits
+  inspection if automatic open encounters an error; `resume_conversation`
+  drives one selected conversation. `continue_queued` releases work retained
+  behind a failed run. No retry backoff yet.
+- There is no partial-output checkpoint, watch, fork, compaction, signals,
+  timers, subagent or nested-tool execution. Polling pending remote jobs is
+  currently host-owned through `reconcile`.
+- Conversation history is one JSON value and grows with the transcript; it is
+  not intended for arbitrarily long-lived production workloads yet. `task_store`
+  exposes separate durable task primitives but is not wired to the harness.
+- Scheduler ownership uses a cooperating lock protocol and currently supports
+  Unix local filesystems. Other processes must not bypass it or replace files.
+  The model adapter applies 1 MiB text and 64 tool-call limits.
+
+The design and planned parity work are in `docs/pi-durable-design.md`. Upstream
+reference: `earendil-works/pi` commit `827383a15262905f82e418483825a49dbb1adbf5`.

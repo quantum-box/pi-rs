@@ -2249,6 +2249,7 @@ dependencies = [
  "async-trait",
  "durable-store",
  "futures-util",
+ "jsonschema",
  "pi-rs-core",
  "serde",
  "serde_json",
