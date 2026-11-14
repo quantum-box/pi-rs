@@ -299,15 +299,18 @@ impl Driver {
     }
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.stop();
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| Error::Stopped("worker panicked".into()))?;
-        }
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup
-                .join()
-                .map_err(|_| Error::Stopped("cleanup worker panicked".into()))?;
+        let worker_panicked = self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        let cleanup_panicked = self
+            .cleanup
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if worker_panicked || cleanup_panicked {
+            return Err(Error::Stopped(format!(
+                "worker panicked: {worker_panicked}; cleanup worker panicked: {cleanup_panicked}"
+            )));
         }
         let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
         if let Some(error) = &state.failure {

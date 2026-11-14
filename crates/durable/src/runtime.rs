@@ -5218,6 +5218,17 @@ impl Scheduler {
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
+        Self::open_configured_with_tasks(path, options, registry, management, adapter, None)
+            .map(|(scheduler, _)| scheduler)
+    }
+    fn open_configured_with_tasks(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        management: Option<(Uuid, Config, Option<Vec<String>>)>,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+        tasks: Option<crate::task_scheduler::Registry>,
+    ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
         let mut harness = Harness::open_paused(path, options)?;
@@ -5246,11 +5257,15 @@ impl Scheduler {
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         };
+        // Attach and publish the task driver before any recovered worker is spawned.
+        let driver = tasks
+            .map(|registry| scheduler.start_tasks(registry))
+            .transpose()?;
         for id in ids {
             scheduler.schedule(id);
         }
         scheduler.start_reporter();
-        Ok(scheduler)
+        Ok((scheduler, driver))
     }
     /// Read the same durable extension error log exposed by the harness.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
@@ -5658,13 +5673,13 @@ impl Scheduler {
     pub async fn shutdown(mut self) -> Result<(), Error> {
         self.cancel.cancel();
         self.reporter_cancel.cancel();
+        let mut error = None;
         if let Some(reporter) = self.reporter.take() {
-            reporter
-                .await
-                .map_err(|e| Error::Invalid(format!("reporter task failed: {e}")))?;
+            if let Err(e) = reporter.await {
+                error = Some(Error::Invalid(format!("reporter task failed: {e}")));
+            }
         }
         let tasks = std::mem::take(&mut self.tasks);
-        let mut error = None;
         for task in tasks.into_values().flatten() {
             match task.await {
                 Ok(Ok(())) | Ok(Err(Error::Interrupted)) => (),
@@ -5677,6 +5692,74 @@ impl Scheduler {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+}
+
+/// Owns the conversation scheduler and generic task driver together.
+///
+/// Open inside a Tokio runtime. Extensions and task handlers must be registered
+/// before opening so recovered work sees them. This constructor does not install
+/// a provider adapter or parent-bound subagent management; hosts needing those
+/// configurations must use the existing lower-level APIs. Dropping without
+/// awaiting `shutdown` requests driver stop but does not wait for either worker.
+/// A synchronous task handler must eventually return for shutdown to finish.
+pub struct RuntimeOwner {
+    scheduler: Scheduler,
+    driver: crate::task_driver::Driver,
+}
+
+impl RuntimeOwner {
+    pub fn open(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+    ) -> Result<Self, Error> {
+        let (scheduler, driver) = Scheduler::open_configured_with_tasks(
+            path,
+            options,
+            extensions,
+            None,
+            None,
+            Some(tasks),
+        )?;
+        Ok(Self {
+            scheduler,
+            driver: driver.expect("task registry supplied"),
+        })
+    }
+
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.scheduler
+    }
+    pub fn scheduler_mut(&mut self) -> &mut Scheduler {
+        &mut self.scheduler
+    }
+    pub fn tasks(&self) -> &crate::task_driver::Driver {
+        &self.driver
+    }
+
+    /// Cancel and join conversations while their task driver remains available,
+    /// then stop and join the driver even if conversation shutdown failed.
+    /// Await this future to completion for deterministic release of ownership.
+    pub async fn shutdown(self) -> Result<(), Error> {
+        let Self { scheduler, driver } = self;
+        let conversations = scheduler.shutdown().await;
+        let tasks = tokio::task::spawn_blocking(move || driver.shutdown()).await;
+        match (conversations, tasks) {
+            (Ok(()), Ok(Ok(()))) => Ok(()),
+            (conversations, tasks) => Err(Error::Invalid(format!(
+                "shutdown failed: conversations: {}; tasks: {}",
+                conversations
+                    .err()
+                    .map_or_else(|| "ok".into(), |e| e.to_string()),
+                match tasks {
+                    Ok(Ok(())) => "ok".into(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                }
+            ))),
+        }
     }
 }
 

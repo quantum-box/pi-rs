@@ -2147,3 +2147,228 @@ async fn failed_hook_children_are_reported_and_run_continues() {
         driver.shutdown().unwrap();
     }
 }
+
+#[tokio::test]
+async fn runtime_owner_recovers_waiting_hook_task_and_conversation() {
+    use pi_rs_durable::{
+        extension::{GenerationEvent, Registry as Extensions},
+        runtime::RuntimeOwner,
+        task::{Checkpoint, Task, TaskState, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_store::Signal,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let handler: Arc<dyn Handler> = Arc::new(|task: &Task| {
+        if task.delivered_signal().is_some() {
+            Ok(Step::Succeed(json!(null)))
+        } else {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "waiting".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::Signal("go".into()),
+                children: vec![],
+            })
+        }
+    });
+    let extension = || Extension {
+        name: "lifecycle".into(),
+        hooks: vec![Arc::new(LifecycleHook {
+            events: Arc::default(),
+            task_event: Some(GenerationEvent::AfterTools),
+            park_event: None,
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        })],
+        tasks: vec![("job".into(), handler.clone())],
+        ..Default::default()
+    };
+    let registry = || {
+        let mut r = Registry::default();
+        assert!(r.register_shared("job", true, handler.clone()));
+        r
+    };
+    let opts = || {
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        )
+    };
+    let (id, child);
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_extension(extension()).unwrap();
+        let driver = h.start_tasks(registry()).unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+        child = state["phase"]["HookTasksWaiting"]["children"][0]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    driver.get(child).unwrap().unwrap().state(),
+                    TaskState::Waiting(_)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        driver.shutdown().unwrap();
+    }
+    let mut extensions = Extensions::default();
+    extensions.install(extension()).unwrap();
+    let mut owner = RuntimeOwner::open(&path, opts(), extensions, registry()).unwrap();
+    owner
+        .tasks()
+        .signal(&Signal::new(
+            uuid::Uuid::new_v4(),
+            child,
+            "go".into(),
+            json!(null),
+        ))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            owner.scheduler_mut().wait(id).await.unwrap();
+            if matches!(
+                owner.scheduler().conversation(id).unwrap().submissions[0].status,
+                Status::Done { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(owner.tasks().get(child).unwrap().unwrap().is_terminal());
+    owner.shutdown().await.unwrap();
+    RuntimeOwner::open(&path, opts(), Extensions::default(), Registry::default())
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_owner_stops_conversations_before_joining_task_driver() {
+    use pi_rs_durable::{
+        extension::{GenerationEvent, Registry as Extensions},
+        runtime::RuntimeOwner,
+        task::{Checkpoint, Task, TaskOwner},
+        task_scheduler::{Registry, Step},
+    };
+    struct OnDrop(Arc<tokio::sync::Semaphore>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+    struct Held {
+        entered: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait]
+    impl Hook for Held {
+        async fn generation(
+            &self,
+            event: GenerationEvent,
+            _: &Value,
+            _: &Context<'_>,
+        ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+            if event == GenerationEvent::BeforeRequest {
+                let _guard = OnDrop(self.dropped.clone());
+                self.entered.add_permits(1);
+                std::future::pending::<()>().await;
+            }
+            Ok(pi_rs_durable::extension::GenerationDecision::Pass)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let dropped = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut extensions = Extensions::default();
+    extensions
+        .install(Extension {
+            name: "held".into(),
+            hooks: vec![Arc::new(Held {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            })],
+            ..Default::default()
+        })
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let mut tasks = Registry::default();
+    tasks.register("held-task", true, move |_: &Task| {
+        started_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!(null)))
+    });
+    let opts = || {
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        )
+    };
+    let mut owner = RuntimeOwner::open(&path, opts(), extensions, tasks).unwrap();
+    let id = owner.scheduler_mut().create_conversation(config()).unwrap();
+    owner
+        .scheduler_mut()
+        .select_extensions(id, vec!["held".into()])
+        .unwrap();
+    owner.scheduler_mut().submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let task = Task::new(
+        uuid::Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("held-task".into(), true);
+    owner.tasks().submit(&task).unwrap();
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let shutdown = tokio::spawn(owner.shutdown());
+    tokio::time::timeout(std::time::Duration::from_secs(5), dropped.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(!shutdown.is_finished());
+    assert!(Harness::open_paused(&path, opts()).is_err());
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    Harness::open_paused(&path, opts()).unwrap();
+}
