@@ -8282,6 +8282,109 @@ mod tests {
     }
 
     #[test]
+    fn shell_ansi_is_removed_only_from_themed_display() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let raw_imported = "\u{1b}[31mIMPORTED\u{1b}[0m\r\nend";
+        let raw_extension = "\u{1b}]8;;https://example.invalid\u{7}EXTENSION\u{1b}]8;;\u{7}";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":raw_imported,"exitCode":0,"cancelled":false,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: raw_extension.into(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let spans: Vec<_> = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans)
+            .collect();
+        let text = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("IMPORTED") && text.contains("EXTENSION") && text.contains("end"));
+        assert!(
+            !text.contains("[31m") && !text.contains("]8;") && !text.contains("example.invalid")
+        );
+        for word in ["IMPORTED", "EXTENSION"] {
+            assert!(spans.iter().any(|span| span.text.contains(word) && span.color == theme.color("toolOutput")));
+        }
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            executions
+                .iter()
+                .map(|e| e.output.as_str())
+                .collect::<Vec<_>>(),
+            [raw_imported, raw_extension]
+        );
+        assert!(executions[0].context_text().contains(raw_imported));
+        assert!(executions[1].context_text().contains(raw_extension));
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"stream","command":"stream"}),
+        );
+        view.receive(
+            &json!({"type":"bash_execution_update","executionId":"stream","output":"\u{1b}[3"}),
+        );
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(
+            !rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("[3"))
+        );
+        view.receive(&json!({"type":"bash_execution_update","executionId":"stream","output":"1mSTREAM\u{1b}[0m"}));
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(rendered.iter().flat_map(|line| &line.spans).any(|span| span.text.contains("STREAM") && span.color == theme.color("toolOutput")));
+    }
+
+    #[test]
     fn clear_requires_two_presses_within_500_ms_even_when_empty() {
         let mut view = super::View::default();
         let mut last = None;

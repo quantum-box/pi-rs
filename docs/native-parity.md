@@ -4202,3 +4202,6 @@ exit status and truncation paths are included in the display output; the native
 excluded-from-context label is retained. Model context and journal data retain
 their existing framing and values. The terminal continues to use its generic
 tool styling and preview limits, so a long output may hide its status until expanded.
+Shell transcript rendering strips terminal escape sequences and normalizes line
+endings, including for imported and extension-provided output; journal and
+model-context text retain the original bytes.
