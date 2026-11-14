@@ -931,8 +931,13 @@ fn share_journal_mac(session: &Session, key: &[u8; 32]) -> Result<ShareJournalMa
     use hmac::Mac;
     let mut mac = ShareJournalMac::new_from_slice(key).expect("HMAC accepts 32 bytes");
     mac.update(b"pi-rs-live-share-journal-v1\0");
-    // Avoid allocating another complete JSON copy of a large journal.
-    serde_json::to_writer(ShareJournalWriter(&mut mac), session.records())?;
+    // Avoid allocating another complete JSON copy of a large journal while
+    // batching the serializer's small writes into efficient MAC updates.
+    {
+        let mut writer = std::io::BufWriter::new(ShareJournalWriter(&mut mac));
+        serde_json::to_writer(&mut writer, session.records())?;
+        writer.flush()?;
+    }
     Ok(mac)
 }
 
