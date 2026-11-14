@@ -1510,7 +1510,15 @@ impl Session {
     }
 
     pub(crate) fn recover_tree_trigger_handoff(&mut self) -> Result<Option<&Record>> {
-        let pending = self.records.iter().rev().find_map(|record| {
+        let pending = self.pending_tree_trigger_handoff().map(|(_, return_to)| return_to);
+        match pending {
+            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
+        self.records.iter().rev().find_map(|record| {
             let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
                 return None;
             };
@@ -1518,12 +1526,37 @@ impl Session {
                 matches!(later.event,
                 Event::Checkout { target } if target == return_to)
             });
-            (!returned).then_some(return_to)
-        });
-        match pending {
-            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
-            None => Ok(None),
+            (!returned).then_some((record.id, return_to))
+        })
+    }
+
+    /// Resolve a transient handoff target before extracting a fork ancestry.
+    /// The marker can live on the other branch and must be inspected in the
+    /// complete source journal, not in the already-filtered fork records.
+    pub(crate) fn fork_records_after_handoff(&self, requested: u64) -> Result<Vec<Record>> {
+        self.validate_checkout(requested)?;
+        let mut target = requested;
+        if let Some((marker, return_to)) = self.pending_tree_trigger_handoff() {
+            let checkout = self.records[marker as usize..].iter().find_map(|record| match record.event {
+                Event::Checkout { target } => Some((record.id, target)),
+                _ => None,
+            });
+            let temporary_descendant = checkout.is_some_and(|(checkout_id, temporary)| {
+                requested > checkout_id && self.path(requested).iter().any(|record| record.id == temporary)
+            });
+            if requested == marker || requested == self.head || temporary_descendant {
+                target = return_to;
+            }
         }
+        let mut records = self.fork_records(target)?;
+        // A handoff belongs to the source session. Once a fork's final target
+        // is chosen it must not replay a source handoff on reopen.
+        for record in &mut records {
+            if matches!(record.event, Event::TreeTriggerHandoff { .. }) {
+                record.event = Event::SessionInfo { name: None, cwd: None };
+            }
+        }
+        Ok(records)
     }
 
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
