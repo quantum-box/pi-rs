@@ -566,6 +566,14 @@ fn clean_for_search(text: &str) -> String {
         .replace('\t', "    ")
 }
 
+pub(super) fn search_display_width(grapheme: &str) -> usize {
+    if grapheme.contains('\u{85}') {
+        UnicodeWidthStr::width(clean(grapheme).as_str())
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    }
+}
+
 pub(crate) fn strip_shell_ansi(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut result = String::with_capacity(text.len());
@@ -626,7 +634,7 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
         fragment.text.clear();
         fragment.search_text = span.search_text.as_ref().map(|_| String::new());
         for grapheme in span.searchable().graphemes(true) {
-            let size = UnicodeWidthStr::width(grapheme);
+            let size = search_display_width(grapheme);
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
                 fragment.text.clear();

@@ -88,7 +88,7 @@ impl Search {
         let mut cursor = 0;
         let mut offset = cursor_prefix.len();
         for (start, glyph) in cursor_prefix.grapheme_indices(true).rev() {
-            let size = glyph.width();
+            let size = super::render::search_display_width(glyph);
             if cursor + size >= input_width {
                 break;
             }
@@ -531,6 +531,35 @@ mod tests {
         search.paste("\u{85}");
         assert!(search.update(&lines, 0).is_some());
         assert_eq!(search.result(), "1/1");
+    }
+
+    #[test]
+    fn invisible_control_does_not_consume_wrap_or_cursor_columns() {
+        let theme = Theme::system();
+        let lines = super::super::render::wrap(&[Span::new("a\u{85}b", Color::Reset)], 2);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "ab"
+        );
+        let mut search = Search::default();
+        search.paste("a\u{85}b");
+        assert_eq!(search.update(&lines, 0), Some(0..1));
+        assert_eq!(search.result(), "1/1");
+        let (overlay, row, column) = search.overlay(&theme, &Keys::default(), 8);
+        assert_eq!((row, column), (1, 3));
+        let (narrow, row, column) = search.overlay(&theme, &Keys::default(), 4);
+        assert_eq!((row, column), (1, 2));
+        assert!(narrow[1].spans.iter().any(|span| span.text == "b"));
+        let mut output = Vec::new();
+        for line in lines.iter().chain(&overlay).chain(&narrow) {
+            line.draw(&mut output, 8).unwrap();
+        }
+        assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
     }
 
     #[test]
