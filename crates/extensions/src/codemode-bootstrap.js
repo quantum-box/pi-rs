@@ -110,8 +110,10 @@
     const modelOperation = async (action, model, context) => {
         if (!record(model) || typeof model.provider !== "string" || typeof model.id !== "string")
             throw new Error(`models.${action}() expects a model with provider and id strings`);
-        validateContext(action, context);
         const { provider, id } = model;
+        const resolved = JSON.parse(await callModel(JSON.stringify({ action: "resolve", type: action === "classify" ? "classifier" : "image", provider, id })));
+        if (!resolved.ok) throw new Error(resolved.error);
+        validateContext(action, context);
         const reply = JSON.parse(await callModel(JSON.stringify({ action, provider, id, context })));
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;

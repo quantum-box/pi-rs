@@ -679,7 +679,7 @@ impl Tool for Operations {
                 "Private native model catalogue and classifier or image invocation for codemode"
                     .into(),
             parameters: json!({"type":"object","properties":{
-                "action":{"enum":["list","classify","generateImages"]},
+                "action":{"enum":["list","resolve","classify","generateImages"]},
                 "type":{"enum":["chat","classifier","image"]},
                 "provider":{"type":"string"},"id":{"type":"string"},
                 "available":{"type":"boolean"},"context":{"type":"object"}
@@ -692,12 +692,28 @@ impl Tool for Operations {
     }
 
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let catalogue = self.args.model_profiles.operations();
+        let provider = args["provider"].as_str();
+        if args["action"] == "resolve" {
+            let kind = serde_json::from_value::<Kind>(args["type"].clone()).ok();
+            let found = catalogue.0.iter().any(|model| {
+                Some(model.api.kind()) == kind
+                    && Some(model.provider.as_str()) == provider
+                    && Some(model.model.id.as_str()) == args["id"].as_str()
+            });
+            return if found {
+                Outcome::Structured {
+                    data: json!(true),
+                    attachments: vec![],
+                }
+            } else {
+                Outcome::Failed("unknown model for this operation".into())
+            };
+        }
         let keys = match Keys::load_async().await {
             Ok(keys) => keys,
             Err(error) => return Outcome::Failed(error.to_string()),
         };
-        let catalogue = self.args.model_profiles.operations();
-        let provider = args["provider"].as_str();
         if args["action"] == "list" {
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
             let entries = if kind == Kind::Chat {
@@ -942,6 +958,45 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolve_uses_catalogue_without_provider_request() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[
+            {"type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]}
+        ]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::new(),
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: Default::default(),
+        };
+        let resolve =
+            |kind, id| json!({"action":"resolve", "type":kind, "provider":"relay", "id":id});
+        assert!(matches!(
+            operation
+                .invoke(resolve("image", "fixture"), context())
+                .await,
+            Outcome::Structured { .. }
+        ));
+        assert!(matches!(
+            operation
+                .invoke(resolve("classifier", "fixture"), context())
+                .await,
+            Outcome::Failed(_)
+        ));
+        assert!(matches!(
+            operation
+                .invoke(resolve("image", "missing"), context())
+                .await,
+            Outcome::Failed(_)
+        ));
+    }
 
     #[tokio::test]
     async fn openrouter_image_empty_choice_preserves_result_and_usage() {

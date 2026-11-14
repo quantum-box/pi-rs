@@ -1335,10 +1335,15 @@ mod tests {
                 }]
             }
             async fn call(&self, _: &str, args: Value) -> Outcome {
-                self.0.fetch_add(1, Ordering::SeqCst);
                 if args["id"] == "missing" {
                     Outcome::Failed("unknown model".into())
+                } else if args["action"] == "resolve" {
+                    Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    }
                 } else {
+                    self.0.fetch_add(1, Ordering::SeqCst);
                     Outcome::Structured {
                         data: json!({"stopReason":"error","errorMessage":"provider failed","answers":{}}),
                         attachments: vec![],
@@ -1365,6 +1370,20 @@ mod tests {
                 try { await call(); } catch (_) { rejected = true; }
                 if (!rejected) throw new Error('invalid call succeeded');
             }
+            for (const call of [
+                () => models.classify({provider:'fixture', id:'missing'}, null),
+                () => models.generateImages({provider:'fixture', id:'missing'}, {input:[]}),
+            ]) {
+                try { await call(); throw new Error('missing model succeeded'); }
+                catch (error) { if (!String(error).includes('unknown model')) throw error; }
+            }
+            for (const [call, message] of [
+                [() => models.classify(model, null), 'expects a context object'],
+                [() => models.generateImages(model, {input:[]}), 'context.input'],
+            ]) {
+                try { await call(); throw new Error('invalid context succeeded'); }
+                catch (error) { if (!String(error).includes(message)) throw error; }
+            }
             try { await models.classify({provider:'fixture', id:'missing'}, {state:{}, questions:q}); throw new Error('missing model succeeded'); }
             catch (error) { if (!String(error).includes('unknown model')) throw error; }
             const result = await models.classify(model, {state:{}, questions:q});
@@ -1389,7 +1408,7 @@ mod tests {
         };
         assert_eq!(data["isError"], false);
         assert!(data["content"].to_string().contains("ok"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[async_trait::async_trait]
     impl ToolHost for Host {

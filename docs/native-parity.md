@@ -3158,6 +3158,8 @@ Codemode validates classifier and image model arguments before dispatch: invalid
 model references and malformed contexts reject the script promise, while an
 actual provider failure remains a structured model result. Classifier state
 must be an object, and native request validation enforces that independently.
+The configured model is resolved before context validation, without loading
+credentials or making a provider request for the lookup.
 Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
