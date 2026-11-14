@@ -861,8 +861,23 @@ using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
-arrive. Color requests are serialized and coalesced. A device-attributes reply starts
-the next request, with a two-second fallback when the terminal does not reply.
+arrive. Requeries retain the last complete palette until a complete replacement
+arrives, including after an appearance notification or incomplete reply. Color
+requests are serialized and coalesced. An incomplete query holds the next
+request until its device-attributes (DA1) marker or all 18 targets reply;
+timeout alone cannot identify late OSC replies. A terminal that sends neither
+all replies nor DA1 can leave later queries pending, retaining the last complete
+palette. Completed queries allow a new request without DA1; late markers are
+counted separately. Because replies and markers have no request IDs, a missing
+old marker can be confused with a new one, and duplicate or reordered old color
+replies after completion cannot be attributed reliably. Pi also relies on ordered
+DA1 replies, but uses a shorter timeout and accepts late replies.
+On an appearance notification, native invalidates the previous foreground and
+background so configured light/dark pairs switch immediately even when the
+requery is incomplete. Pi instead continues to prefer a previously reported
+background until fresh colors arrive. The active system theme immediately
+returns to indexed colors while the background is unknown; the last complete
+palette is retained for a fresh background report.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom
