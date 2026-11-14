@@ -168,23 +168,47 @@ impl Query {
     }
 }
 // JavaScript's non-Unicode regular expressions use ASCII for these classes.
-// Leave patterns with bracket expressions untouched: nested or negated class
-// expressions require a full JavaScript regex parser.
+// Translate single-shorthand bracket expressions too. More complex bracket
+// expressions remain untouched; their union and negation need a JS parser.
 fn ascii_regex_classes(pattern: &str) -> String {
-    let mut escaped = false;
-    for character in pattern.chars() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '[' {
-            return pattern.to_owned();
-        }
-    }
     let mut result = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
+    let mut chars = pattern.chars().peekable();
     while let Some(character) = chars.next() {
-        if character == '\\' {
+        if character == '[' {
+            let mut probe = chars.clone();
+            let negated = probe.peek() == Some(&'^');
+            if negated {
+                probe.next();
+            }
+            let shorthand = match (probe.next(), probe.next(), probe.next()) {
+                (Some('\\'), Some(kind @ ('d' | 'D' | 'w' | 'W')), Some(']')) => Some(kind),
+                _ => None,
+            };
+            if let Some(kind) = shorthand {
+                let positive = matches!(kind, 'd' | 'w') != negated;
+                let word = matches!(kind, 'w' | 'W');
+                result.push_str(match (word, positive) {
+                    (false, true) => "(?-i:[0-9])",
+                    (false, false) => "(?-i:[^0-9])",
+                    (true, true) => "(?-i:[A-Za-z0-9_])",
+                    (true, false) => "(?-i:[^A-Za-z0-9_])",
+                });
+                chars = probe;
+            } else {
+                result.push('[');
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    result.push(next);
+                    if escaped {
+                        escaped = false;
+                    } else if next == '\\' {
+                        escaped = true;
+                    } else if next == ']' {
+                        break;
+                    }
+                }
+            }
+        } else if character == '\\' {
             let Some(next) = chars.next() else {
                 result.push(character);
                 break;
@@ -327,7 +351,42 @@ mod tests {
             );
         }
         assert!(Query::new(r"re:^\\d$").score(&doc(r"\d")).is_some());
-        assert_eq!(ascii_regex_classes(r"[\d]"), r"[\d]");
+        assert_eq!(ascii_regex_classes(r"[\d]"), r"(?-i:[0-9])");
+    }
+
+    #[test]
+    fn regex_single_shorthand_brackets_use_javascript_ascii_classes() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, yes, no) in [
+            (r"re:^[\d]+$", "123", "١٢٣"),
+            (r"re:^[^\d]+$", "١٢٣", "123"),
+            (r"re:^[\D]+$", "١٢٣", "123"),
+            (r"re:^[^\D]+$", "123", "١٢٣"),
+            (r"re:^[\w]+$", "A_2", "K"),
+            (r"re:^[^\w]+$", "K", "A"),
+            (r"re:^[\W]+$", "K", "A"),
+            (r"re:^[^\W]+$", "A_2", "K"),
+            (r"re:^[a-z]+\d$", "abc1", "abc١"),
+        ] {
+            assert!(
+                Query::new(pattern).score(&doc(yes)).is_some(),
+                "{pattern} {yes}"
+            );
+            assert!(
+                Query::new(pattern).score(&doc(no)).is_none(),
+                "{pattern} {no}"
+            );
+        }
+        assert_eq!(ascii_regex_classes(r"[a\d]"), r"[a\d]");
+        assert_eq!(ascii_regex_classes(r"\[\d\]"), r"\[(?-i:[0-9])\]");
     }
 
     #[test]
@@ -380,7 +439,7 @@ mod tests {
             );
         }
         assert!(Query::new(r"re:^\\b$").score(&doc(r"\b")).is_some());
-        assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b]\w");
+        assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b](?-i:[A-Za-z0-9_])");
     }
 
     #[test]
