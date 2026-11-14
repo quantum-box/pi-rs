@@ -60,6 +60,15 @@ fn malformed_project_override_never_starts_disabled_server() {
         assert!(!output.status.success());
         assert!(!sentinel.exists());
     }
+    std::fs::write(
+        home.join("mcp.json"),
+        serde_json::json!({"mcpServers":{"fixture":{"command":script,"enabled":false,"exposure":null}}}).to_string(),
+    ).unwrap();
+    std::fs::write(&project, r#"{"mcpServers":{"fixture":{"enabled":true}}}"#).unwrap();
+    let inherited = run("--trust");
+    assert!(!inherited.status.success());
+    assert!(String::from_utf8_lossy(&inherited.stderr).contains("exposure"));
+    assert!(!sentinel.exists());
     let untrusted = run("--no-trust");
     assert!(
         untrusted.status.success(),

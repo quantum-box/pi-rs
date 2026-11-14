@@ -520,7 +520,9 @@ invalid values before applying any part of that override, so a typo or
 Pi ignores invalid overrides and reports a diagnostic; native fails the
 configuration load. Native additionally permits `oauth` in an override for its
 existing OAuth controls, alongside Pi's `enabled`, `exposure`, and
-`toolExposure`. Project `auth.provider` remains forbidden.
+`toolExposure`. Explicit project OAuth nulls are rejected; inherited global
+optional OAuth nulls retain native's existing absent-value behavior, while
+non-null settings are validated. Project `auth.provider` remains forbidden.
 
 Resource and template listings omit MCP App `ui://` entries and entries whose
 MIME profile starts with `mcp-app`, along with listing icons and `_meta`, matching
