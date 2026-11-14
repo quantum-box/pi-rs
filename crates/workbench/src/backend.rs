@@ -2030,8 +2030,51 @@ mod share_context_tests {
             .err()
             .expect("worker owns generation");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            invalidate_existing_share_generation(Some(&store), &path),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
         drop(lease);
         assert_eq!(store.read(&path, &binding).unwrap(), None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalidating_switch_target_does_not_release_previous_generation() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let first_path = directory.path().join("first.jsonl");
+        let second_path = directory.path().join("second.jsonl");
+        let first = Session::open(&first_path).unwrap();
+        let second = Session::open(&second_path).unwrap();
+        let first_binding = store.binding_for_session(&first, &()).unwrap();
+        let second_binding = store.binding_for_session(&second, &()).unwrap();
+        drop(first);
+        drop(second);
+        let first_lease = invalidate_existing_share_generation(Some(&store), &first_path)
+            .unwrap()
+            .unwrap();
+        let second_lease = invalidate_existing_share_generation(Some(&store), &second_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .try_begin(&first_path, first_binding)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store
+                .try_begin(&second_path, second_binding)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop((first_lease, second_lease));
     }
 
     #[test]
