@@ -74,16 +74,8 @@ fn accept_model_request(listener: TcpListener) -> (std::net::TcpStream, Value) {
 
 #[test]
 fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
-    for (missing_model_credentials, pending_trust, checkpoint) in [
-        (false, false, false),
-        (false, false, true),
-        (true, false, false),
-        (false, true, false),
-    ] {
+    for checkpoint in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        if pending_trust {
-            std::fs::create_dir_all(root.path().join(".agents/skills/example")).unwrap();
-        }
         let path = root.path().join("session.jsonl");
         let prompt = root.path().join("system.txt");
         std::fs::write(&prompt, "Unique standalone share prompt").unwrap();
@@ -164,14 +156,11 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
             .arg(&prompt)
             .arg("--session")
             .arg(&path);
-        if !pending_trust {
-            command.arg("--no-trust");
-        }
-        if missing_model_credentials {
-            command.args(["--provider", "google", "--model", "gemini-2.5-flash"]);
-        } else {
-            command.args(["--endpoint", "http://127.0.0.1:1/v1/chat/completions"]);
-        }
+        command.args([
+            "--no-trust",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+        ]);
         let mut child = command
             .arg("share")
             .stdout(Stdio::piped())
@@ -203,35 +192,185 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
         let metadata = entries
             .iter()
             .find(|entry| entry["customType"] == "pi.share");
-        if missing_model_credentials || pending_trust {
-            assert!(metadata.is_none());
-        } else {
-            let metadata = metadata.unwrap();
-            assert_eq!(entries.last(), Some(metadata));
-            assert_eq!(metadata["parentId"], entries[entries.len() - 2]["id"]);
-            assert!(
-                metadata["data"]["systemPrompt"]
-                    .as_str()
-                    .unwrap()
-                    .contains(if checkpoint {
-                        "Checkpoint prompt"
-                    } else {
-                        "Unique standalone share prompt"
-                    })
-            );
-            assert!(
-                metadata["data"]["tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
-            );
-            if checkpoint {
-                assert_eq!(metadata["data"]["tools"].as_array().unwrap().len(), 1);
-            }
+        let metadata = metadata.unwrap();
+        assert_eq!(entries.last(), Some(metadata));
+        assert_eq!(metadata["parentId"], entries[entries.len() - 2]["id"]);
+        assert!(
+            metadata["data"]["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .contains(if checkpoint {
+                    "Checkpoint prompt"
+                } else {
+                    "Unique standalone share prompt"
+                })
+        );
+        assert!(
+            metadata["data"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
+        );
+        if checkpoint {
+            assert_eq!(metadata["data"]["tools"].as_array().unwrap().len(), 1);
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
+}
+
+#[test]
+fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
+    for pending_trust in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        if pending_trust {
+            std::fs::create_dir_all(root.path().join(".agents/skills/example")).unwrap();
+        }
+        let path = root.path().join("session.jsonl");
+        drop(pi_rs::Session::open(&path).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+            ])
+            .arg("--session")
+            .arg(&path);
+        if pending_trust {
+            command.args(["--endpoint", "http://127.0.0.1:1/v1/chat/completions"]);
+        } else {
+            command.args([
+                "--no-trust",
+                "--provider",
+                "google",
+                "--model",
+                "gemini-2.5-flash",
+            ]);
+        }
+        let mut child = command
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("standalone share did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "unavailable context was shared");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = if pending_trust {
+            "project trust is pending"
+        } else {
+            "API key"
+        };
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Radius was contacted"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_share_does_not_upload_after_extension_breaks_context_reconstruction() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    let prompt = root.path().join("prompt.txt");
+    let marker = root.path().join("hook-ran");
+    let extension = root.path().join("break-resources.py");
+    std::fs::write(&prompt, "original prompt").unwrap();
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+r = json.load(sys.stdin)
+if r['type'] == 'describe':
+    response = {'Ok': {'id':'break-resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}}
+elif r['type'] == 'discover_resources':
+    with open(os.environ['SHARE_PROMPT'], 'w') as f: f.write('x' * (64 * 1024 + 1))
+    with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
+    response = {'Ok': {'skillPaths':[],'promptPaths':[],'themePaths':[]}}
+else:
+    response = {'Ok': None}
+print(json.dumps({'version':1,'response':response}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session = pi_rs::Session::open(&path).unwrap();
+    drop(session);
+    let before = std::fs::read(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env("SHARE_PROMPT", &prompt)
+        .env("SHARE_MARKER", &marker)
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+            "--system-prompt",
+        ])
+        .arg(&prompt)
+        .arg("--extension")
+        .arg(&extension)
+        .arg("--session")
+        .arg(&path)
+        .arg("share")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("standalone share did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        marker.exists(),
+        "resource discovery hook did not run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "failed reconstruction was shared");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Radius was contacted"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 #[test]

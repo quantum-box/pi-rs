@@ -4320,9 +4320,9 @@ the calling task and waits for configuration and discovery to finish; it has no
 metadata deadline, and synchronous filesystem operations cannot be interrupted
 until they return. This avoids abandoning a preparation worker after a timeout.
 An already-started credential refresh may finish to preserve rotated credentials.
-When runtime metadata is unavailable, including missing model credentials, startup
-failure or pending project trust, Radius uploads
-continue without metadata rather than reconstructing it from stale settings.
+Standalone Radius sharing reports preparation errors before upload, including
+missing model credentials and pending project trust. Interactive Radius sharing
+can still upload when runtime metadata is unavailable.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
 locks and validates the captured version before publication. Transient streaming
