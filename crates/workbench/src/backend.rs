@@ -657,12 +657,12 @@ async fn run_worker(
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
-    // Publish before configuration can launch any extension or MCP process.
+    let mut runtime = runtime::configure(&args, true).await?;
+    // Publish before lifecycle and request context hooks can run.
     if std::env::var_os(super::process::REFRESH_BARRIER_ENV).is_some() {
         super::process::SHARE_CONTEXT_STARTED.store(true, Ordering::SeqCst);
         super::output(json!({"type":"share_context_initializing"}));
     }
-    let mut runtime = runtime::configure(&args, true).await?;
     if args.mode == Some(super::OutputMode::Rpc) {
         super::output(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
