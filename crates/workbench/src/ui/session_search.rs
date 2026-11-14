@@ -62,7 +62,7 @@ impl Query {
             }
             return fancy_regex::RegexBuilder::new(&format!(
                 "(?i){}",
-                pattern.trim_matches(is_whitespace)
+                ascii_regex_classes(pattern.trim_matches(is_whitespace))
             ))
             .backtrack_limit(100_000)
             .build()
@@ -148,6 +148,47 @@ impl Query {
             }
         }
     }
+}
+// JavaScript's non-Unicode regular expressions use ASCII for these classes.
+// Leave patterns with bracket expressions untouched: nested or negated class
+// expressions require a full JavaScript regex parser.
+fn ascii_regex_classes(pattern: &str) -> String {
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '[' {
+            return pattern.to_owned();
+        }
+    }
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            let Some(next) = chars.next() else {
+                result.push(character);
+                break;
+            };
+            let replacement = match next {
+                'd' => Some("(?-i:[0-9])"),
+                'D' => Some("(?-i:[^0-9])"),
+                'w' => Some("(?-i:[A-Za-z0-9_])"),
+                'W' => Some("(?-i:[^A-Za-z0-9_])"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                result.push_str(replacement);
+            } else {
+                result.push(character);
+                result.push(next);
+            }
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 fn is_whitespace(character: char) -> bool {
     matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
@@ -238,6 +279,36 @@ fn position_score(text: &[u16], positions: &[usize]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_shorthand_classes_match_javascript_ascii_rules() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, yes, no) in [
+            (r"re:^\d+$", "123", "١٢٣"),
+            (r"re:^\D+$", "١٢٣", "123"),
+            (r"re:^\w+$", "A_2", "K"),
+            (r"re:^\W+$", "K", "A_2"),
+        ] {
+            assert!(
+                Query::new(pattern).score(&doc(yes)).is_some(),
+                "{pattern} {yes}"
+            );
+            assert!(
+                Query::new(pattern).score(&doc(no)).is_none(),
+                "{pattern} {no}"
+            );
+        }
+        assert!(Query::new(r"re:^\\d$").score(&doc(r"\d")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\d]"), r"[\d]");
+    }
 
     #[test]
     fn imported_external_identity_is_searchable_after_reopen_and_fork_changes_it() {

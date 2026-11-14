@@ -2738,7 +2738,10 @@ user/assistant text across saved branches. Space-separated tokens must all
 match. Quoted phrases normalize whitespace. `re:` queries use a case-insensitive
 native regular-expression engine with a bounded backtracking limit, including
 lookaround support. Invalid expressions produce no matches. Remaining JavaScript
-regular-expression edge compatibility has not been declared complete.
+regular-expression edge compatibility has not been declared complete. In
+patterns without bracket expressions, `\d`, `\D`, `\w`, and `\W` use
+JavaScript's ASCII character classes; patterns containing brackets and other
+Unicode case folding differences remain open.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
