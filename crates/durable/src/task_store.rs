@@ -1330,6 +1330,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_commit_of_independently_prepared_batches_can_create_a_cycle() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let a = owned(1, 2);
+        let b = owned(2, 1);
+        let first = ts.prepare_save(&[Save::Create(&a)]).unwrap();
+        let second = ts.prepare_save(&[Save::Create(&b)]).unwrap();
+        let checks = [first.checks, second.checks].concat();
+        let mutations = [first.mutations, second.mutations].concat();
+        // Raw commits evaluate both missing-owner checks before either write.
+        db.commit(&checks, &mutations).unwrap();
+        assert_eq!(ts.load(a.id()).unwrap().unwrap().task.owner(), &TaskOwner::Task(b.id()));
+        assert_eq!(ts.load(b.id()).unwrap().unwrap().task.owner(), &TaskOwner::Task(a.id()));
+        assert!(matches!(ts.save(&[Save::Create(&owned(3, 1))]), Err(Error::InvalidOwnership)));
+    }
+
+    #[test]
+    fn jointly_prepared_parent_and_child_can_be_committed_together() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let parent = owned(1, 9);
+        let child = owned(2, 1);
+        let batch = ts.prepare_save(&[Save::Create(&parent), Save::Create(&child)]).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        assert_eq!(ts.list().unwrap().len(), 2);
+    }
+
+    #[test]
     fn task_creation_rejects_cycle_through_background_conversation_edge() {
         use crate::ownership_edge::{Edge, Mode, edge_key};
         let db = Store::memory().unwrap();

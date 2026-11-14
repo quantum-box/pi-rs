@@ -232,7 +232,15 @@ cleanup. Missing owners remain supported but are fenced against concurrent creat
 Prepared task batches and edges must not be combined with separately prepared
 ownership changes in one transaction. Prepared edges must be committed one at a time without other
 ownership changes; raw store writes must preserve immutable ownership. Existing
-corrupt cycles are rejected on traversal, not repaired. Background remains an
+corrupt cycles are rejected on traversal, not repaired. In particular, `Store::commit`
+evaluates every check against the state before any mutation: concatenating two
+independently prepared batches can therefore commit a cycle even when both missing-owner
+checks pass. The raw store cannot identify preparation boundaries from flattened
+checks and mutations. `document::Transaction::append` rejects cross-component
+missing-owner check/write overlaps, but raw commits do not apply that protection;
+this conservative document check can also reject an acyclic composition. Prepare
+related task creations together with `prepare_save`, which validates their staged
+graph, or commit separately and re-prepare after conflicts. Background remains an
 abort/idle boundary, not a break in ownership identity.
 Current limits and differences from upstream Pi Durable:
 
