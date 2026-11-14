@@ -2224,18 +2224,8 @@ impl Session {
 
     /// Create and open an independent, persistent branch with fresh session identity.
     pub fn fork_to(&self, target: u64, destination: impl AsRef<Path>) -> Result<Self> {
-        let records = self.fork_records(target)?;
-        let metadata = self
-            .path(target)
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| {
-                self.record_metadata
-                    .get(&record.id)
-                    .map(|value| (index as u64 + 1, value.clone()))
-            })
-            .collect();
-        publish_snapshot(&records, &metadata, destination.as_ref())?;
+        let fork = self.fork_session(target)?;
+        publish_snapshot(&fork.records, &fork.record_metadata, destination.as_ref())?;
         Self::open(destination)
     }
 
