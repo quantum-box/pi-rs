@@ -521,11 +521,11 @@ impl Shared {
             .lock()
             .map_err(|_| "task scheduler lock poisoned".to_string())?;
         let result = scheduler.tick(now).map_err(|e| e.to_string());
-        if let Err(error) = &result {
-            if let Ok(mut state) = self.state.lock() {
-                state.failure = Some(error.clone());
-                state.stop = true;
-            }
+        if let Err(error) = &result
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.failure = Some(error.clone());
+            state.stop = true;
         }
         result
     }
