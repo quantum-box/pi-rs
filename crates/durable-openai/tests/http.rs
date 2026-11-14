@@ -115,7 +115,7 @@ async fn exact_body_fragmented_events_and_replay() {
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"猫\"}\r\n\r\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\"}}\r\n\r\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{}\"}\r\n\r\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\r\n\r\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\"},{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\r\n\r\n"
     );
     let (url, rx, thread) = server_with_options(http(events), false, true, false);
     let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
@@ -349,6 +349,75 @@ async fn output_limit_marks_partial_tool_calls_as_truncated() {
     assert!(result.is_truncated());
     assert!(result.metadata.replay.is_none());
     assert_eq!(result.calls[0].arguments, "{");
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn completed_tool_items_must_be_complete_and_at_the_streamed_index() {
+    for (index, status) in [(0, "incomplete"), (1, "completed")] {
+        let events = format!(
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":{index},\"item\":{{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\"}}}}\n\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":{index},\"delta\":\"{{}}\"}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{{\"type\":\"function_call\",\"status\":\"{status}\",\"call_id\":\"c\",\"name\":\"read\",\"arguments\":\"{{}}\"}}]}}}}\n\n"
+        );
+        let (url, rx, thread) = server(http(&events), false);
+        let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
+        let a = attempt();
+        let r = request();
+        let body = adapter.prepare(&a, &r).await.unwrap();
+        assert!(
+            collect_generation(
+                adapter.dispatch(&a, &r, body),
+                &CancellationToken::new(),
+                |_| {}
+            )
+            .await
+            .is_err()
+        );
+        rx.recv().unwrap();
+        thread.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn server_controlled_incomplete_reason_is_not_exposed() {
+    let events = "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"fixture-secret\"},\"output\":[]}}\n\n";
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let error = collect_generation(
+        adapter.dispatch(&a, &r, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("fixture-secret"));
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn completed_tool_call_with_empty_arguments_is_rejected() {
+    let events = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"read\",\"arguments\":\"\"}]}}\n\n"
+    );
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    assert!(
+        collect_generation(
+            adapter.dispatch(&a, &r, body),
+            &CancellationToken::new(),
+            |_| {}
+        )
+        .await
+        .is_err()
+    );
     rx.recv().unwrap();
     thread.join().unwrap();
 }

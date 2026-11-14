@@ -264,16 +264,18 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                         let finish_reason = match (event["type"].as_str(), response["status"].as_str(), response["incomplete_details"]["reason"].as_str()) {
                             (Some("response.completed"), Some("completed"), _) => "stop",
                             (Some("response.incomplete"), Some("incomplete"), Some("max_output_tokens")) => "length",
-                            (Some("response.incomplete"), Some("incomplete"), reason) => {
-                                Err(Error::Model(reason.map_or_else(|| "OpenAI response incomplete without a reason".to_owned(), |reason| format!("OpenAI response incomplete: {reason}"))))?
+                            (Some("response.incomplete"), Some("incomplete"), _) => {
+                                Err(Error::Model("OpenAI response incomplete".into()))?
                             }
                             _ => Err(Error::Model("invalid OpenAI completion status".into()))?,
                         };
                         let output = response["output"].as_array().ok_or_else(|| Error::Model("OpenAI completion missing output".into()))?;
                         let reported_calls: Vec<_> = output.iter().filter(|item| item["type"] == "function_call").collect();
                         if reported_calls.len() != calls.len() { Err(Error::Model("incomplete OpenAI tool stream".into()))?; }
-                        for (call, item) in calls.values().zip(reported_calls) {
-                            if item["call_id"] != call.id || item["name"] != call.name || item["arguments"] != call.arguments || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                        for (index, call) in &calls {
+                            let item = output.get(*index as usize).ok_or_else(|| Error::Model("incomplete OpenAI tool stream".into()))?;
+                            if item["type"] != "function_call" || item["call_id"] != call.id || item["name"] != call.name || item["arguments"] != call.arguments || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                            if finish_reason != "length" && (call.arguments.trim().is_empty() || item.get("status").is_some_and(|status| status != "completed")) { Err(Error::Model("incomplete OpenAI tool call".into()))?; }
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
