@@ -3381,7 +3381,7 @@ fn load_resolved_theme(
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
-    let resources = super::resources::Resources::load(args)?;
+    let resources = super::resources::Resources::load_for_startup(args)?;
     Ok(load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
         &resources.themes,
@@ -7849,15 +7849,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_picker_skips_unprepared_package_and_uses_it_after_preparation() {
+    fn resume_picker_loads_unprepared_local_package_without_installing() {
         const CHILD: &str = "PI_RS_TEST_RESUME_PACKAGE_THEME_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let home = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "interactive::tests::resume_picker_skips_unprepared_package_and_uses_it_after_preparation", "--nocapture"])
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::resume_picker_loads_unprepared_local_package_without_installing", "--nocapture"])
                 .env("PI_RS_HOME", home.path())
+                .env("CARGO_NET_OFFLINE", "true")
                 .env(CHILD, "1")
-                .output().unwrap();
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("package preparation blocked past the deadline");
+            }
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "{}\n{}",
@@ -7894,8 +7907,103 @@ mod tests {
         args.settings = super::super::config::Settings::default();
         args.use_theme = Some("package-theme".into());
         let index = home.join("packages/index.json");
-        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
         assert!(!index.exists(), "picker must not prepare packages");
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":["cargo:never-install-this-package"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            !index.exists(),
+            "missing remote packages must not be installed"
+        );
+
+        // A directly selected local package remains explicit with auto-discovery off.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        args.no_themes = true;
+        args.extensions.push(source.to_string_lossy().into_owned());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.extensions.clear();
+        args.no_themes = false;
+
+        // Global declarations work without project trust, but package filters
+        // still apply before any local theme enters the picker.
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        std::fs::write(home.join("settings.json"), serde_json::json!({"packages":[{"source":source,"autoload":false,"themes":["+themes/theme.json"]},"cargo:never-install-this-package"]}).to_string()).unwrap();
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        assert!(!index.exists());
+
+        // A project package is visible only after project trust is granted.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        let project = args.workspace.join(".pi");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        args.trusted = true;
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.trusted = false;
+
+        // Cargo metadata is parsed as data: even a build script is never run.
+        let cargo_source = home.join("cargo-package");
+        std::fs::create_dir_all(cargo_source.join("palette")).unwrap();
+        std::fs::write(cargo_source.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        let sentinel = home.join("build-ran");
+        std::fs::write(
+            cargo_source.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                sentinel
+            ),
+        )
+        .unwrap();
+        selected["name"] = serde_json::json!("cargo-theme");
+        std::fs::write(
+            cargo_source.join("palette/theme.json"),
+            selected.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[cargo_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("cargo-theme".into());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "cargo-theme"
+        );
+        assert!(!sentinel.exists());
+        assert!(!index.exists());
+
+        args.use_theme = Some("package-theme".into());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7914,6 +8022,630 @@ mod tests {
             super::startup_picker_theme(&args).unwrap().name,
             "package-theme"
         );
+
+        // Pi package.json manifests work before and after normal preparation,
+        // including a BOM; scripts are data and are never executed.
+        let pi_source = home.join("pi-package");
+        std::fs::create_dir_all(pi_source.join("assets")).unwrap();
+        selected["name"] = serde_json::json!("pi-theme");
+        std::fs::write(pi_source.join("assets/visual.json"), selected.to_string()).unwrap();
+        std::fs::create_dir_all(pi_source.join("extensions")).unwrap();
+        let extension = pi_source.join("extensions/unexpected");
+        std::fs::write(
+            &extension,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pi_manifest = serde_json::json!({"version":"1.0.0", "pi":{"themes":["assets/visual.json"]},
+            "scripts":{"prepare":"must-not-run"}});
+        std::fs::write(
+            pi_source.join("package.json"),
+            format!("\u{feff}{pi_manifest}"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("pi-theme".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(
+            !sentinel.exists(),
+            "picker must not execute package extensions"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(
+            !sentinel.exists(),
+            "preparation must not execute undeclared extensions"
+        );
+        let index_text = std::fs::read_to_string(&index).unwrap();
+        assert!(
+            index_text.contains("pi-package"),
+            "package must actually be prepared"
+        );
+
+        // Simulate an index written before package.json themes were supported.
+        // It may also contain native resources that the Pi manifest excludes.
+        let mut old_index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+        let cached = old_index
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .find(|entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|source| std::fs::canonicalize(source).ok())
+                    == std::fs::canonicalize(&pi_source).ok()
+            })
+            .unwrap();
+        cached["resources"]["themes"] = serde_json::json!([]);
+        let canonical_source = pi_source.canonicalize().unwrap();
+        cached["resources"]["extensions"] =
+            serde_json::json!([canonical_source.join("extensions/unexpected")]);
+        cached["resources"]["skills"] =
+            serde_json::json!([canonical_source.join("skills/old/SKILL.md")]);
+        cached["resources"]["prompts"] =
+            serde_json::json!([canonical_source.join("prompts/old.md")]);
+        let old_index = old_index.to_string();
+        std::fs::write(&index, &old_index).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert_eq!(
+            resources.themes,
+            vec![pi_source.join("assets/visual.json").canonicalize().unwrap()]
+        );
+        assert!(resources.extensions.is_empty());
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(!sentinel.exists());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":pi_source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            super::super::packages::resources(&args)
+                .unwrap()
+                .themes
+                .is_empty()
+        );
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+
+        // The higher-priority Pi manifest must not hide an unusable Cargo file.
+        std::fs::write(
+            pi_source.join("pi-package.json"),
+            r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(pi_source.join("Cargo.toml"), "[invalid").unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert!(resources.themes.is_empty() && resources.extensions.is_empty());
+        assert!(!sentinel.exists());
+        std::fs::remove_file(pi_source.join("Cargo.toml")).unwrap();
+        std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+
+        // A cached pre-upgrade package must obey each current manifest format.
+        // Force preparation through a transient declaration as well as checking
+        // the cached resolution path used by normal startup.
+        std::fs::create_dir_all(pi_source.join("src")).unwrap();
+        std::fs::write(pi_source.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        for format in ["pi-package", "cargo", "package"] {
+            std::fs::write(&index, &old_index).unwrap();
+            match format {
+                "pi-package" => std::fs::write(pi_source.join("pi-package.json"), r#"{"pi":{"themes":["assets/visual.json"]}}"#).unwrap(),
+                "cargo" => std::fs::write(pi_source.join("Cargo.toml"), "[package]\nname='upgrade-fixture'\nversion='0.1.0'\nedition='2021'\n[package.metadata.pi]\nthemes=['assets/visual.json']\n").unwrap(),
+                _ => {}
+            }
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "pi-theme",
+                "{format}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert_eq!(resources.themes.len(), 1, "{format}");
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty(),
+                "{format}"
+            );
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert_ne!(
+                std::fs::read_to_string(&index).unwrap(),
+                old_index,
+                "{format} was not prepared"
+            );
+            let prepared = super::super::packages::transient_resources(&args).unwrap();
+            assert!(
+                prepared.extensions.is_empty()
+                    && prepared.skills.is_empty()
+                    && prepared.prompts.is_empty(),
+                "{format}"
+            );
+            assert!(
+                !sentinel.exists(),
+                "{format} executed an undeclared extension"
+            );
+            args.extensions.clear();
+            if format == "pi-package" {
+                std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+            }
+            if format == "cargo" {
+                std::fs::remove_file(pi_source.join("Cargo.toml")).unwrap();
+            }
+        }
+
+        // Still-declared cached resources remain available after filtering.
+        std::fs::create_dir_all(pi_source.join("skills/old")).unwrap();
+        std::fs::create_dir_all(pi_source.join("prompts")).unwrap();
+        std::fs::write(
+            pi_source.join("skills/old/SKILL.md"),
+            "---\nname: old\n---\n",
+        )
+        .unwrap();
+        std::fs::write(pi_source.join("prompts/old.md"), "prompt").unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        std::fs::write(pi_source.join("pi-package.json"), r#"{"pi":{"extensions":["extensions/unexpected"],"skills":["skills/old"],"prompts":["prompts/old.md"],"themes":["assets/visual.json"]}}"#).unwrap();
+        let declared = super::super::packages::resources(&args).unwrap();
+        assert_eq!(declared.extensions.len(), 1);
+        assert_eq!(declared.skills.len(), 1);
+        assert_eq!(declared.prompts.len(), 1);
+        assert!(!sentinel.exists());
+        std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+
+        // Old indexes for local, Git and registry packages all carry a package
+        // root. Revalidate that root and apply exclusions to the whole list.
+        use sha2::Digest;
+        let manifest_path = pi_source.join("pi-package.json");
+        let manifest_with_exclusion = r#"{"pi":{"extensions":["extensions","!extensions/unexpected"],"themes":["assets/visual.json"]}}"#;
+        for source in [
+            pi_source
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "git:https://example.invalid/example/pkg".into(),
+            "cargo:example-pkg@1.0.0".into(),
+        ] {
+            std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+            let mut entries: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            let old_key = entries
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, entry)| {
+                    entry["source"]
+                        .as_str()
+                        .and_then(|s| std::fs::canonicalize(s).ok())
+                        == Some(canonical_source.clone())
+                })
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            let mut cached = entries.as_object_mut().unwrap().remove(&old_key).unwrap();
+            cached["source"] = serde_json::json!(source);
+            let key = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+            entries.as_object_mut().unwrap().insert(key, cached);
+            std::fs::write(&index, entries.to_string()).unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[source]}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "pi-theme",
+                "{source}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty(),
+                "{source}"
+            );
+            assert_eq!(resources.themes.len(), 1, "{source}");
+            std::fs::write(&manifest_path, r#"{"pi":null}"#).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{source}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{source}"
+            );
+            assert!(!sentinel.exists(), "{source} executed a cached extension");
+        }
+        // Fresh local preparation must not launch the excluded executable.
+        std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(
+            super::super::packages::transient_resources(&args)
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "preparation executed an excluded extension"
+        );
+        args.extensions.clear();
+        std::fs::remove_file(&manifest_path).unwrap();
+
+        // Cargo without Pi metadata must honor package.json during both
+        // cached resolution and a fresh preparation of the package.
+        let cargo_manifest = pi_source.join("Cargo.toml");
+        let package_manifest = pi_source.join("package.json");
+        let cargo_plain =
+            "[package]\nname='mixed-upgrade-fixture'\nversion='0.1.0'\nedition='2021'\n";
+        std::fs::write(&cargo_manifest, cargo_plain).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let cached = super::super::packages::resources(&args).unwrap();
+        assert_eq!(cached.themes.len(), 1);
+        assert!(
+            cached.extensions.is_empty() && cached.skills.is_empty() && cached.prompts.is_empty()
+        );
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&index).unwrap(),
+            old_index,
+            "mixed package not prepared"
+        );
+        let prepared = super::super::packages::transient_resources(&args).unwrap();
+        assert_eq!(prepared.themes.len(), 1);
+        assert!(
+            prepared.extensions.is_empty()
+                && prepared.skills.is_empty()
+                && prepared.prompts.is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "mixed package executed undeclared extension"
+        );
+        args.extensions.clear();
+
+        // Even when Cargo or pi-package.json has higher precedence, a present
+        // malformed package.json must fail before Cargo runs its build script.
+        for higher in ["none", "cargo", "native"] {
+            let cargo = if higher == "cargo" {
+                format!("{cargo_plain}[package.metadata.pi]\nthemes=['assets/visual.json']\n")
+            } else {
+                cargo_plain.to_owned()
+            };
+            std::fs::write(&cargo_manifest, cargo).unwrap();
+            if higher == "native" {
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+                )
+                .unwrap();
+            }
+            std::fs::write(&package_manifest, r#"{"pi":{"extensions":42}}"#).unwrap();
+            std::fs::write(
+                pi_source.join("build.rs"),
+                format!(
+                    "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                    sentinel
+                ),
+            )
+            .unwrap();
+            std::fs::write(&index, &old_index).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{higher}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{higher}"
+            );
+            let mut empty_index: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            empty_index.as_object_mut().unwrap().retain(|_, entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|s| std::fs::canonicalize(s).ok())
+                    != Some(canonical_source.clone())
+            });
+            let empty_index = empty_index.to_string();
+            std::fs::write(&index, &empty_index).unwrap();
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            assert!(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(super::super::packages::prepare(&args))
+                    .is_err(),
+                "{higher}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&index).unwrap(),
+                empty_index,
+                "{higher}"
+            );
+            assert!(!sentinel.exists(), "{higher} ran build script or extension");
+            args.extensions.clear();
+            std::fs::remove_file(pi_source.join("build.rs")).unwrap();
+            if higher == "native" {
+                std::fs::remove_file(&manifest_path).unwrap();
+            }
+        }
+        std::fs::remove_file(&cargo_manifest).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+
+        // Invalid resource fields and invalid pi values must be rejected both
+        // for cached startup and before preparation can run any build script.
+        for case in [
+            "native-null",
+            "native-string",
+            "native-array",
+            "native-extensions",
+            "cargo-scalar",
+            "cargo-extensions",
+            "package-extensions",
+            "package-skills",
+            "package-prompts",
+            "package-themes",
+        ] {
+            std::fs::write(&index, &old_index).unwrap();
+            let (name, body) = match case {
+                "native-null" => ("pi-package.json", r#"{"pi":null}"#.to_owned()),
+                "native-string" => ("pi-package.json", r#"{"pi":"bad"}"#.to_owned()),
+                "native-array" => ("pi-package.json", r#"{"pi":[]}"#.to_owned()),
+                "native-extensions" => ("pi-package.json", r#"{"pi":{"extensions":42}}"#.to_owned()),
+                "cargo-scalar" => ("Cargo.toml", "[package]\nname='invalid-fixture'\nversion='0.1.0'\n[package.metadata]\npi=42\n".to_owned()),
+                "cargo-extensions" => ("Cargo.toml", "[package]\nname='invalid-fixture'\nversion='0.1.0'\n[package.metadata.pi]\nextensions=42\n".to_owned()),
+                _ => ("package.json", format!(r#"{{"pi":{{"{}":42,"themes":[]}}}}"#, case.strip_prefix("package-").unwrap())),
+            };
+            // Avoid duplicate JSON keys for the invalid themes case.
+            let body = if case == "package-themes" {
+                r#"{"pi":{"themes":42}}"#.to_owned()
+            } else {
+                body
+            };
+            std::fs::write(pi_source.join(name), body).unwrap();
+            if case.starts_with("cargo-") {
+                std::fs::write(
+                    pi_source.join("build.rs"),
+                    format!(
+                        "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                        sentinel
+                    ),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{case}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty()
+                    && resources.themes.is_empty(),
+                "{case}"
+            );
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&index).unwrap(),
+                old_index,
+                "{case}"
+            );
+            assert!(!sentinel.exists(), "{case} executed an extension");
+            args.extensions.clear();
+            if name != "package.json" {
+                std::fs::remove_file(pi_source.join(name)).unwrap();
+            }
+            if case.starts_with("cargo-") {
+                std::fs::remove_file(pi_source.join("build.rs")).unwrap();
+            }
+            std::fs::write(
+                pi_source.join("package.json"),
+                format!("\u{feff}{pi_manifest}"),
+            )
+            .unwrap();
+        }
+
+        // Present but malformed or unreadable manifests must never be treated
+        // as absent and trigger conventional executable discovery.
+        for case in ["malformed", "unreadable", "invalid-pi", "invalid-root"] {
+            let invalid_source = home.join(format!("invalid-{case}"));
+            std::fs::create_dir_all(invalid_source.join("extensions")).unwrap();
+            let unexpected = invalid_source.join("extensions/unexpected");
+            std::fs::write(
+                &unexpected,
+                format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            match case {
+                "malformed" => {
+                    std::fs::write(invalid_source.join("package.json"), "{not valid JSON").unwrap()
+                }
+                "invalid-pi" => {
+                    std::fs::write(invalid_source.join("package.json"), r#"{"pi":"invalid"}"#)
+                        .unwrap()
+                }
+                "invalid-root" => {
+                    std::fs::write(invalid_source.join("package.json"), "[]").unwrap()
+                }
+                _ => {
+                    // Reading a directory as a file fails on all supported platforms.
+                    std::fs::create_dir(invalid_source.join("package.json")).unwrap();
+                }
+            }
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[invalid_source]}).to_string(),
+            )
+            .unwrap();
+            let before = std::fs::read(&index).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert!(!sentinel.exists(), "{case} manifest executed an extension");
+            assert_eq!(
+                std::fs::read(&index).unwrap(),
+                before,
+                "{case} package was indexed"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            for name in ["pi-package.json", "Cargo.toml"] {
+                for kind in ["fifo", "broken-link"] {
+                    let invalid = home.join(format!("invalid-{name}-{kind}"));
+                    std::fs::create_dir_all(invalid.join("extensions")).unwrap();
+                    let unexpected = invalid.join("extensions/unexpected");
+                    std::fs::write(
+                        &unexpected,
+                        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let path = invalid.join(name);
+                    if kind == "fifo" {
+                        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    } else {
+                        symlink(invalid.join("missing"), &path).unwrap();
+                    }
+                    std::fs::write(
+                        home.join("settings.json"),
+                        serde_json::json!({"packages":[invalid]}).to_string(),
+                    )
+                    .unwrap();
+                    let before = std::fs::read(&index).unwrap();
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(super::super::packages::prepare(&args))
+                        .unwrap();
+                    assert!(!sentinel.exists(), "{name} {kind} executed an extension");
+                    assert_eq!(
+                        std::fs::read(&index).unwrap(),
+                        before,
+                        "{name} {kind} was indexed"
+                    );
+                }
+            }
+        }
+
+        // A regular Cargo manifest still follows the normal offline build path.
+        let valid_cargo = home.join("valid-cargo");
+        std::fs::create_dir_all(valid_cargo.join("src")).unwrap();
+        std::fs::create_dir_all(valid_cargo.join("palette")).unwrap();
+        std::fs::write(valid_cargo.join("Cargo.toml"), "[package]\nname='local-theme-fixture'\nversion='0.1.0'\nedition='2021'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        std::fs::write(valid_cargo.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        selected["name"] = serde_json::json!("prepared-cargo-theme");
+        std::fs::write(valid_cargo.join("palette/theme.json"), selected.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[valid_cargo]}).to_string(),
+        )
+        .unwrap();
+        args.offline = true;
+        args.use_theme = Some("prepared-cargo-theme".into());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&index)
+                .unwrap()
+                .contains("valid-cargo")
+        );
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "prepared-cargo-theme"
+        );
+        assert!(!sentinel.exists());
     }
 
     #[test]

@@ -54,7 +54,7 @@ impl Resources {
         args: &Cli,
         discovered: &pi_rs::DiscoveredResources,
     ) -> Result<Self> {
-        let mut resources = Self::load_inner(args)?;
+        let mut resources = Self::load_inner(args, false)?;
         if discovered.skill_paths.is_empty()
             && discovered.prompt_paths.is_empty()
             && discovered.theme_paths.is_empty()
@@ -76,7 +76,7 @@ impl Resources {
             .collect();
         augmented.prompt_template = discovered.prompt_paths.clone();
         augmented.themes = discovered.theme_paths.clone();
-        let additions = match Self::load_inner(&augmented) {
+        let additions = match Self::load_inner(&augmented, false) {
             Ok(additional) => vec![additional],
             Err(_) => {
                 // A resource can disappear or become unreadable between the
@@ -99,7 +99,7 @@ impl Resources {
                             1 => one.prompt_template.push(path.clone()),
                             _ => one.themes.push(path.clone()),
                         }
-                        match Self::load_inner(&one) {
+                        match Self::load_inner(&one, false) {
                             Ok(additional) => loaded.push(additional),
                             Err(error) => resources.warnings.push(format!(
                                 "Could not load discovered resource {}: {error}",
@@ -159,7 +159,13 @@ impl Resources {
     }
 
     pub fn load(args: &Cli) -> Result<Self> {
-        let mut resources = Self::load_inner(args)?;
+        let mut resources = Self::load_inner(args, false)?;
+        resources.finish_collisions();
+        Ok(resources)
+    }
+
+    pub(super) fn load_for_startup(args: &Cli) -> Result<Self> {
+        let mut resources = Self::load_inner(args, true)?;
         resources.finish_collisions();
         Ok(resources)
     }
@@ -197,11 +203,14 @@ impl Resources {
         }
     }
 
-    fn load_inner(args: &Cli) -> Result<Self> {
+    fn load_inner(args: &Cli, startup: bool) -> Result<Self> {
         let mut resources = Self {
             packages: super::packages::resources(args)?,
             ..Self::default()
         };
+        if startup {
+            resources.packages.themes = super::packages::startup_themes(args, false)?;
+        }
         let agent = crate::config::agent_dir();
         let workspace = args.workspace.canonicalize()?;
         if !args.no_context_files {
@@ -238,7 +247,10 @@ impl Resources {
             .iter()
             .filter_map(|path| resource_paths::skill_path(args, path))
             .collect();
-        let transient = super::packages::transient_resources(args)?;
+        let mut transient = super::packages::transient_resources(args)?;
+        if startup {
+            transient.themes = super::packages::startup_themes(args, true)?;
+        }
         let explicit_skills: Vec<_> = explicit_skills
             .into_iter()
             .chain(transient.skills)

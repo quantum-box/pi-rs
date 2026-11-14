@@ -701,6 +701,11 @@ before settings change. User and trusted-project declarations support resource
 filters. Packaged extensions, skills, prompts and themes load through the
 normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
 outside the requested native Rust equivalence.
+Local package theme manifests are read again when resources are resolved, so
+packages indexed by older versions gain their declared themes without a build.
+An explicit Pi `package.json` resource list contributes themes only and prevents
+previously cached native resources from being loaded. Unreadable local manifests
+are skipped instead of falling back to cached resources.
 
 ### System prompt checkpoint
 
@@ -1519,7 +1524,16 @@ sources.
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
 only metadata retains automatic directory and native executable discovery.
-This prevents undeclared package resources from being enabled accidentally.
+Cached local, Git and Cargo package resources are filtered against the current
+cached-root manifest before loading. A present `pi` value must be an object, and
+every resource field must be a string array. Local and Git manifests are checked
+before their Cargo build. A Cargo manifest without Pi metadata falls back to
+`package.json` resource declarations; competing present manifests are validated.
+Registry packages are different: `cargo install` builds
+the crate (including build scripts) before pi-rs obtains and validates its source
+manifest. Installing a registry package therefore requires trusting its build;
+validating before that build needs a separate source acquisition and resolution
+design that preserves Cargo's selected version, registry and integrity checks.
 
 ### MCP form elicitation checkpoint
 

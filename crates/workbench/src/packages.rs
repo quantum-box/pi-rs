@@ -207,6 +207,9 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
             continue;
         };
         let package: Installed = serde_json::from_value(package.clone())?;
+        let Some(package) = revalidate_cached_package(package) else {
+            continue;
+        };
         for (name, paths, target) in [
             (
                 "extensions",
@@ -235,6 +238,339 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     }
     Ok(result)
 }
+
+fn revalidate_cached_package(mut package: Installed) -> Option<Installed> {
+    if !package.root.is_dir() || (!remote(&package.source) && !Path::new(&package.source).exists())
+    {
+        return None;
+    }
+    let (manifest, pi_package) = local_startup_manifest(&package.root).ok()?;
+    let pi = manifest_pi(&manifest).ok()?;
+    package.resources.themes = collect_package_themes(&package.root, pi).ok()?;
+    if has_resource_fields(pi) {
+        if pi_package {
+            package.resources.extensions.clear();
+            package.resources.skills.clear();
+            package.resources.prompts.clear();
+        } else {
+            let extensions = resource_patterns(pi, "extensions").ok()?;
+            package
+                .resources
+                .extensions
+                .retain(|path| extension_selected(path, &package.root, &extensions));
+            let skills = resource_patterns(pi, "skills").ok()?;
+            package
+                .resources
+                .skills
+                .retain(|path| manifest_selected(path, &package.root, &skills));
+            let prompts = resource_patterns(pi, "prompts").ok()?;
+            let selected = collect_package_prompts(&package.root, &prompts);
+            package
+                .resources
+                .prompts
+                .retain(|path| selected.contains(path));
+        }
+    }
+    Some(package)
+}
+/// Resolve themes for the startup picker without preparing packages or executing
+/// their extensions. Unindexed local sources can be inspected directly; missing
+/// remote packages remain unavailable until normal package preparation.
+pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>> {
+    let installed = index()?;
+    let mut themes = Vec::new();
+    for declaration in declarations(args)?
+        .into_iter()
+        .filter(|entry| entry.transient == transient)
+    {
+        let package = if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
+            let root = PathBuf::from(&declaration.source);
+            if !root.is_dir() {
+                continue;
+            }
+            let manifest = match local_startup_manifest(&root) {
+                Ok((manifest, _)) => manifest,
+                Err(_) => continue,
+            };
+            let Ok(pi) = manifest_pi(&manifest) else {
+                continue;
+            };
+            let themes = match collect_package_themes(&root, pi) {
+                Ok(themes) => themes,
+                Err(_) => continue,
+            };
+            let resources = PackageResources {
+                themes,
+                ..PackageResources::default()
+            };
+            Installed {
+                source: declaration.source.clone(),
+                root,
+                version: None,
+                resources,
+            }
+        } else if let Some(value) = installed.get(&key(&declaration.source)) {
+            let package = serde_json::from_value::<Installed>(value.clone())?;
+            let Some(package) = revalidate_cached_package(package) else {
+                continue;
+            };
+            package
+        } else {
+            continue;
+        };
+        let filter = ResourceFilter::new(&declaration.value, "themes")?;
+        let inherited = declaration
+            .inherited
+            .as_ref()
+            .map(|value| ResourceFilter::new(value, "themes"))
+            .transpose()?;
+        for path in package.resources.themes {
+            let inherited_enabled = inherited
+                .as_ref()
+                .is_some_and(|filter| filter.includes(&path, &package.root, false));
+            if filter.includes(&path, &package.root, inherited_enabled) && !themes.contains(&path) {
+                themes.push(path);
+            }
+        }
+    }
+    Ok(themes)
+}
+
+fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
+    let explicit = ["extensions", "skills", "prompts", "themes"]
+        .iter()
+        .any(|name| pi.get(name).is_some());
+    let patterns = pi
+        .get("themes")
+        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+        .transpose()?
+        .unwrap_or_else(|| {
+            if explicit {
+                Vec::new()
+            } else {
+                vec!["themes".into()]
+            }
+        });
+    validate_patterns(&patterns)?;
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut themes = Vec::new();
+    // Explicit files are authoritative: ignore files and symlink traversal
+    // rules for directory scans must not hide a named manifest entry.
+    for pattern in &patterns {
+        let candidate = pattern.strip_prefix('+').unwrap_or(pattern);
+        if pattern.starts_with(['!', '-']) || candidate.contains(['*', '?', '[', '{']) {
+            continue;
+        }
+        let path = root.join(candidate.replace('\\', "/"));
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "json")
+            && manifest_selected(&path, root, &patterns)
+        {
+            themes.push(path);
+        }
+    }
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            )
+        })
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && entry.file_name().to_string_lossy().ends_with(".json")
+            && manifest_selected(entry.path(), root, &patterns)
+        {
+            themes.push(entry.into_path());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    themes.retain(|path| seen.insert(dunce::simplified(path).to_path_buf()));
+    Ok(themes)
+}
+
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+// Open nonblocking before checking the opened descriptor, so a FIFO or device
+// substituted between path inspection and open cannot hang the startup UI.
+fn read_optional_manifest(root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    read_optional_manifest_after_probe(root, name, || {})
+}
+
+fn read_optional_manifest_after_probe(
+    root: &Path,
+    name: &str,
+    after_probe: impl FnOnce(),
+) -> Result<Option<Vec<u8>>> {
+    let path = root.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Config(format!("{}: {error}", path.display()))),
+    }
+    after_probe();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(Error::Config(format!(
+            "{} exceeds the package manifest size limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_PACKAGE_MANIFEST_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    if bytes.len() as u64 > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(Error::Config(format!(
+            "{} exceeds the package manifest size limit",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+// Mirror installation precedence without running Cargo or loading executables.
+fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
+    let pi_bytes = read_optional_manifest(root, "pi-package.json")?;
+    let cargo_bytes = read_optional_manifest(root, "Cargo.toml")?;
+    let cargo_manifest = if let Some(bytes) = cargo_bytes {
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        let manifest: toml::Value = toml::from_str(text)
+            .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        let metadata = manifest
+            .get("package")
+            .and_then(|v| v.get("metadata"))
+            .and_then(|v| v.get("pi"));
+        if let Some(metadata) = metadata {
+            validate_pi(&serde_json::to_value(metadata)?)?;
+        }
+        Some(manifest)
+    } else {
+        None
+    };
+    // Validate a competing Pi package manifest even when a higher-priority
+    // native or Cargo manifest supplies the selected resources.
+    let package_manifest = read_optional_pi_package_json(root)?;
+    if let Some(bytes) = pi_bytes {
+        let manifest = parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?;
+        manifest_pi(&manifest)?;
+        return Ok((manifest, false));
+    }
+    if let Some(metadata) = cargo_manifest.as_ref().and_then(|manifest| {
+        manifest
+            .get("package")
+            .and_then(|value| value.get("metadata"))
+            .and_then(|value| value.get("pi"))
+    }) {
+        return Ok((json!({"pi": metadata}), false));
+    }
+    let pi_package = package_manifest.is_some();
+    Ok((package_manifest.unwrap_or_else(|| json!({})), pi_package))
+}
+
+// A present manifest is authoritative, including broken links or devices.
+fn read_optional_pi_package_json(root: &Path) -> Result<Option<Value>> {
+    read_optional_manifest(root, "package.json")?
+        .map(|bytes| parse_pi_package_json(&root.join("package.json"), &bytes))
+        .transpose()
+}
+
+fn parse_manifest_object(path: &Path, bytes: &[u8], strip_bom: bool) -> Result<Value> {
+    let input = if strip_bom {
+        bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)
+    } else {
+        bytes
+    };
+    let value: Value = serde_json::from_slice(input)
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    if !value.is_object() {
+        return Err(Error::Config(format!(
+            "{} must contain an object",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
+fn has_resource_fields(pi: &Value) -> bool {
+    ["extensions", "skills", "prompts", "themes"]
+        .iter()
+        .any(|name| pi.get(name).is_some())
+}
+
+fn resource_patterns(pi: &Value, name: &str) -> Result<Vec<String>> {
+    let patterns = pi
+        .get(name)
+        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    validate_patterns(&patterns)?;
+    Ok(patterns)
+}
+
+fn validate_pi(pi: &Value) -> Result<()> {
+    if !pi.is_object() {
+        return Err(Error::Config("pi must contain an object".into()));
+    }
+    for name in ["extensions", "skills", "prompts", "themes"] {
+        resource_patterns(pi, name)?;
+    }
+    Ok(())
+}
+
+fn manifest_pi(manifest: &Value) -> Result<&Value> {
+    let pi = manifest.get("pi").unwrap_or(manifest);
+    validate_pi(pi)?;
+    Ok(pi)
+}
+
+// Pi packages describe resources in package.json's `pi` object. Never run
+// package scripts while reading it, and accept Pi's UTF-8 BOM handling.
+fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
+    let value = parse_manifest_object(path, bytes, true)?;
+    let pi = value.get("pi");
+    if let Some(pi) = pi {
+        validate_pi(pi)?;
+    }
+    let explicit = pi.is_some_and(has_resource_fields);
+    let theme_only = if explicit {
+        json!({"extensions": [], "skills": [], "prompts": [],
+            "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
+    } else {
+        json!({})
+    };
+    // Treat an explicit Pi resource manifest as authoritative before scanning
+    // native executables; only theme entries are supported from this format.
+    Ok(json!({"pi": theme_only, "version": value.get("version")}))
+}
+
 struct ResourceFilter {
     patterns: Option<Vec<String>>,
     autoload: bool,
@@ -306,6 +642,17 @@ fn manifest_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource(path, root, filters, true)
 }
 fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots: bool) -> bool {
+    select_resource_with(filters, |pattern, exact| {
+        resource_matches(path, root, pattern, exact, directory_roots)
+    })
+}
+fn extension_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
+    select_resource_with(filters, |pattern, exact| {
+        resource_matches(path, root, pattern, exact, true)
+            || path.file_stem().is_some_and(|stem| stem == pattern)
+    })
+}
+fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool) -> bool {
     if filters.is_empty() {
         return false;
     }
@@ -313,28 +660,25 @@ fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots
         .iter()
         .filter(|filter| !filter.starts_with(['!', '+', '-']))
         .collect();
-    let mut included = plain.is_empty()
-        || plain
-            .iter()
-            .any(|pattern| resource_matches(path, root, pattern, false, directory_roots));
+    let mut included = plain.is_empty() || plain.iter().any(|pattern| matches(pattern, false));
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('!'))
-        .any(|pattern| resource_matches(path, root, pattern, false, directory_roots))
+        .any(|pattern| matches(pattern, false))
     {
         included = false;
     }
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('+'))
-        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+        .any(|pattern| matches(pattern, true))
     {
         included = true;
     }
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('-'))
-        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+        .any(|pattern| matches(pattern, true))
     {
         included = false;
     }
@@ -761,16 +1105,21 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         installed_binaries.push(root.clone());
         root = root.parent().unwrap_or(Path::new(".")).into();
     }
-    let mut manifest = if root.join("pi-package.json").is_file() {
-        config::read_object(&root.join("pi-package.json"))?
-    } else {
-        json!({})
-    };
+    // Check both files before executable discovery or local/Git Cargo builds.
+    // Registry `cargo install` above has already built the crate in order to
+    // locate its source; it cannot be prevalidated through this path.
+    let pi_bytes = read_optional_manifest(&root, "pi-package.json")?;
+    let cargo_bytes = read_optional_manifest(&root, "Cargo.toml")?;
+    // Validate relevant manifests before the local/Git build below.
+    let (mut manifest, _) = local_startup_manifest(&root)?;
+    let has_pi_manifest = pi_bytes.is_some();
+    let has_cargo_manifest = cargo_bytes.is_some();
+    manifest_pi(&manifest)?;
     let mut version = manifest
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if root.join("Cargo.toml").is_file() {
+    if has_cargo_manifest {
         let mut metadata = tokio::process::Command::new("cargo");
         metadata
             .args([
@@ -792,8 +1141,13 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 })
             })
         }) {
-            if !root.join("pi-package.json").is_file() {
-                manifest = json!({"pi":package["metadata"]["pi"]});
+            if !has_pi_manifest
+                && let Some(pi) = package
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("pi"))
+            {
+                manifest = json!({"pi":pi});
+                manifest_pi(&manifest)?;
             }
             version = package["version"].as_str().map(str::to_owned);
         }
@@ -834,10 +1188,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         root = snapshot_registry_source(&root, &directory)?;
     }
 
-    let pi = manifest
-        .get("pi")
-        .filter(|value| value.is_object())
-        .unwrap_or(&manifest);
+    let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
@@ -884,12 +1235,7 @@ fn collect_package_resources(
         }
         installed_binaries
             .into_iter()
-            .filter(|path| {
-                names.iter().any(|name| {
-                    path.file_stem().is_some_and(|file| file == name.as_str())
-                        || manifest_selected(path, root, std::slice::from_ref(name))
-                })
-            })
+            .filter(|path| extension_selected(path, root, &names))
             .collect()
     } else if explicit {
         Vec::new()
@@ -919,6 +1265,10 @@ fn collect_package_resources(
                 }
             });
         validate_patterns(&patterns)?;
+        if name == "themes" {
+            *target = collect_package_themes(root, pi)?;
+            continue;
+        }
         if name == "prompts" {
             *target = collect_package_prompts(root, &patterns);
             continue;
@@ -1524,6 +1874,219 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extension_manifest_applies_includes_and_exclusions_together() {
+        let root = Path::new("/package");
+        let excluded = root.join("extensions/unexpected");
+        let allowed = root.join("extensions/allowed");
+        let filters = vec!["extensions".into(), "!extensions/unexpected".into()];
+        assert!(!extension_selected(&excluded, root, &filters));
+        assert!(extension_selected(&allowed, root, &filters));
+        let outside_binary = Path::new("/cache/bin/demo.exe");
+        assert!(extension_selected(outside_binary, root, &["demo".into()]));
+        assert!(!extension_selected(
+            outside_binary,
+            root,
+            &["demo".into(), "!demo".into()]
+        ));
+        assert!(extension_selected(
+            &excluded,
+            root,
+            &[
+                "extensions".into(),
+                "!extensions/unexpected".into(),
+                "+extensions/unexpected".into()
+            ]
+        ));
+        assert!(!extension_selected(
+            &excluded,
+            root,
+            &["extensions".into(), "-extensions/unexpected".into()]
+        ));
+    }
+    #[test]
+    fn absent_manifest_keeps_default_discovery_and_oversized_manifests_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("themes")).unwrap();
+        let theme = root.join("themes/default.json");
+        std::fs::write(&theme, "{}").unwrap();
+        assert!(read_optional_pi_package_json(root).unwrap().is_none());
+        assert_eq!(
+            collect_package_themes(root, &local_startup_manifest(root).unwrap().0).unwrap(),
+            [theme]
+        );
+        for name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let path = root.join(name);
+            std::fs::write(&path, vec![b'x'; MAX_PACKAGE_MANIFEST_BYTES as usize + 1]).unwrap();
+            let error = local_startup_manifest(root).unwrap_err().to_string();
+            assert!(error.contains("size limit"), "{name}: {error}");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_manifests_are_rejected_before_a_deadline() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        for name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let path = root.join(name);
+            let name_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name_bytes.as_ptr(), 0o600) }, 0);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = sender.send(local_startup_manifest(&root));
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            if result.is_err() {
+                // Release a regressed blocking FIFO open so the test fails cleanly.
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path);
+            }
+            let result = result.expect("manifest inspection blocked on FIFO");
+            assert!(result.is_err(), "FIFO {name} must be rejected");
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_replaced_with_fifo_after_probe_is_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        for manifest_name in ["package.json", "pi-package.json", "Cargo.toml"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let path = root.join(manifest_name);
+            std::fs::write(&path, "{}").unwrap();
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = read_optional_manifest_after_probe(&root, manifest_name, || {
+                    std::fs::remove_file(root.join(manifest_name)).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                });
+                let _ = sender.send(result);
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            if result.is_err() {
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path);
+            }
+            let error = result
+                .expect("replacement FIFO blocked manifest inspection")
+                .unwrap_err();
+            assert!(error.to_string().contains("regular file"), "{error}");
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_pi_manifest_symlink_is_not_treated_as_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            directory.path().join("missing"),
+            directory.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(read_optional_pi_package_json(directory.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_manifest_does_not_hide_unusable_cargo_manifest() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("pi-package.json"), r#"{"pi":{"themes":[]}}"#).unwrap();
+        let cargo = root.join("Cargo.toml");
+        std::os::unix::fs::symlink(root.join("missing"), &cargo).unwrap();
+        assert!(local_startup_manifest(root).is_err());
+        std::fs::remove_file(&cargo).unwrap();
+        let name = std::ffi::CString::new(cargo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let root = root.to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(local_startup_manifest(&root));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cargo);
+        }
+        assert!(
+            result
+                .expect("Cargo FIFO blocked manifest inspection")
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicitly_named_theme_file_bypasses_ignore_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let theme = root.join("assets/ignored.json");
+        std::fs::write(&theme, "{}").unwrap();
+        std::fs::write(root.join(".ignore"), "assets/\n").unwrap();
+        let manifest = json!({"themes":["assets/ignored.json"]});
+        assert_eq!(
+            collect_package_themes(root, &manifest).unwrap().as_slice(),
+            std::slice::from_ref(&theme)
+        );
+        assert_eq!(
+            collect_package_resources(root, &manifest, Vec::new())
+                .unwrap()
+                .themes,
+            [theme]
+        );
+        let excluded = json!({"themes":["assets/ignored.json", "!assets/ignored.json"]});
+        assert!(collect_package_themes(root, &excluded).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicitly_named_theme_files_follow_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("theme.json"), "{}").unwrap();
+        symlink(
+            external.join("theme.json"),
+            root.join("assets/file-link.json"),
+        )
+        .unwrap();
+        symlink(&external, root.join("assets/dir-link")).unwrap();
+        let files = vec![
+            root.join("assets/file-link.json"),
+            root.join("assets/dir-link/theme.json"),
+        ];
+        let manifest = json!({"themes":["assets/file-link.json", "assets/dir-link/theme.json"]});
+        assert_eq!(collect_package_themes(&root, &manifest).unwrap(), files);
+        assert_eq!(
+            collect_package_resources(&root, &manifest, Vec::new())
+                .unwrap()
+                .themes,
+            files
+        );
+    }
+
     #[test]
     fn local_package_sources_trim_surrounding_whitespace() {
         let directory = tempfile::tempdir().unwrap();
