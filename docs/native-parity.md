@@ -132,8 +132,15 @@ tool progress and completion-order notifications remain open.
 The `meta` provider includes Pi v1.5.0's six Muse models, including their
 thinking levels, image limits, token limits and prices. It uses the Responses
 adapter and `META_API_KEY` on the official endpoint. Saved and configured
-credentials retain precedence and remain bound to their endpoint. Subscription
-OAuth and live Meta account acceptance remain open.
+credentials retain precedence and remain bound to their endpoint. Existing
+Pi-compatible Meta subscription OAuth credentials can supply the inference key;
+when it expires or has less than five minutes remaining, the identity token is
+used only at Meta's fixed key-mint endpoint, and the new 24-hour key is stored
+under the auth lock. Concurrent refreshes recheck the stored expiry. OAuth
+credentials are accepted only for the official Meta Responses endpoint, and
+redirects are disabled for the mint request. pi-rs does not yet provide Meta's
+device login; sign in with Pi first. Live Meta account login, key minting and
+inference have not been verified.
 
 ### xAI Responses checkpoint
 

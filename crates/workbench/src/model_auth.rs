@@ -17,6 +17,7 @@ pub(super) enum Credential {
     Invalid,
     ChatGpt,
     Kimi,
+    Meta,
     BedrockProfile(String),
     BedrockChain,
 }
@@ -52,6 +53,7 @@ impl Credential {
             | Self::Invalid
             | Self::ChatGpt
             | Self::Kimi
+            | Self::Meta
             | Self::BedrockProfile(_)
             | Self::BedrockChain => None,
         }
@@ -71,6 +73,7 @@ impl Credential {
                 self,
                 Self::ChatGpt
                     | Self::Kimi
+                    | Self::Meta
                     | Self::Invalid
                     | Self::BedrockProfile(_)
                     | Self::BedrockChain
@@ -93,6 +96,10 @@ impl Credential {
             Self::Kimi => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::kimi_auth::access(&settings, None, false).await;
+            }
+            Self::Meta => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::meta_auth::access(&settings, None, false).await;
             }
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {
@@ -162,7 +169,8 @@ impl Keys {
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
-                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi)
+                let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
+                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi || meta)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
                     serde_json::from_value::<pi_rs::openai::oauth::Credential>(
@@ -177,6 +185,17 @@ impl Keys {
                         return None;
                     }
                     Some(Credential::Kimi)
+                } else if meta {
+                    let valid =
+                        serde_json::from_value::<super::meta_auth::Credential>(entry.clone())
+                            .is_ok_and(|credential| {
+                                valid_key(&credential.access) && valid_key(&credential.refresh)
+                            });
+                    Some(if valid {
+                        Credential::Meta
+                    } else {
+                        Credential::Invalid
+                    })
                 } else if oauth {
                     let access = entry["access"].as_str()?;
                     Some(valid_key(access).then(|| Credential::Literal(access.into()))?)
@@ -230,8 +249,14 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
-                    && super::builtin_chat::find(if kimi { "kimi-coding" } else { "openrouter" })
-                        .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
+                    && super::builtin_chat::find(if kimi {
+                        "kimi-coding"
+                    } else if meta {
+                        "meta"
+                    } else {
+                        "openrouter"
+                    })
+                    .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
                     return None;
                 }
@@ -452,7 +477,8 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
             .get(provider.id())
             .and_then(|value| value["type"].as_str());
         if kind == Some("api_key")
-            || (matches!(provider.id(), "openrouter" | "kimi-coding") && kind == Some("oauth"))
+            || (matches!(provider.id(), "openrouter" | "kimi-coding" | "meta")
+                && kind == Some("oauth"))
         {
             data.remove(provider.id());
             removed = true;
@@ -728,6 +754,43 @@ mod tests {
         assert!(
             invalid
                 .credential(&provider, provider.default_endpoint())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn meta_pi_oauth_is_endpoint_bound_and_malformed_entries_fail_closed() {
+        let provider = Provider::named("meta").unwrap();
+        let official = provider.default_endpoint();
+        let keys = Keys::parse(
+            &json!({"meta":{"type":"oauth","access":"minted","refresh":"identity","expires":123}}),
+        );
+        let credential = keys.credential(&provider, official).unwrap();
+        assert!(matches!(credential, Credential::Meta));
+        assert!(!credential.is_bearer());
+        assert!(credential.requires_resolution());
+        assert!(keys.oauth(&provider, official));
+        assert!(
+            keys.credential(&provider, "https://attacker.example/v1/responses")
+                .is_none()
+        );
+        assert!(
+            keys.credential(&provider, "https://api.meta.ai:444/v1/responses")
+                .is_none()
+        );
+        let malformed =
+            Keys::parse(&json!({"meta":{"type":"oauth","access":"minted","expires":123}}));
+        assert!(matches!(
+            malformed.credential(&provider, official),
+            Some(Credential::Invalid)
+        ));
+        let displaced = Keys::parse(
+            &json!({"meta":{"type":"oauth","access":"minted","refresh":"identity","expires":123,"endpoint":"https://attacker.example/v1/responses"}}),
+        );
+        assert!(displaced.credential(&provider, official).is_none());
+        assert!(
+            displaced
+                .credential(&provider, "https://attacker.example/v1/responses")
                 .is_none()
         );
     }
