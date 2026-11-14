@@ -275,3 +275,60 @@ fn snapshots_are_atomic_across_competing_multi_document_commits() {
     }
     writer.join().unwrap();
 }
+
+#[test]
+fn concurrent_document_commit_cannot_move_a_conversation_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let a = address("race-cut");
+    let key = a_key(&a);
+    let cut = b"runtime/fork/test/0001".to_vec();
+    let barrier = Arc::new(Barrier::new(2));
+    let db1 = Store::open(&path).unwrap();
+    let db2 = Store::open(&path).unwrap();
+    let barrier2 = barrier.clone();
+    let key2 = key.clone();
+    let writer = std::thread::spawn(move || {
+        barrier2.wait();
+        db2.commit(
+            &[],
+            &[Mutation::Put {
+                key: key2,
+                value: br#"{"n":2}"#.to_vec(),
+            }],
+        )
+        .unwrap();
+    });
+    barrier.wait();
+    db1.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: cut.clone(),
+                value: b"snapshot".to_vec(),
+            },
+            Mutation::Put {
+                key: key.clone(),
+                value: br#"{"n":1}"#.to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    writer.join().unwrap();
+    let revision = db1.document_cut(&cut).unwrap().unwrap();
+    let at_cut = db1.document_at(&key, revision).unwrap().unwrap();
+    assert_eq!(at_cut.value, br#"{"n":1}"#);
+    drop(db1);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.document_cut(&cut).unwrap(), Some(revision));
+    assert_eq!(
+        reopened.document_at(&key, revision).unwrap().unwrap().value,
+        br#"{"n":1}"#
+    );
+}
+
+fn a_key(a: &Address) -> Vec<u8> {
+    let mut key = b"durable/document/".to_vec();
+    key.extend(serde_json::to_vec(&[&a.scope, &a.name, &a.key]).unwrap());
+    key
+}

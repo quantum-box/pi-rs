@@ -97,6 +97,7 @@ impl Store {
         conn.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS durable_document_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
             CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS durable_document_cuts (key BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
             INSERT INTO durable_document_history(key, revision, value, version)
                 SELECT key, 0, value, version FROM durable_store_entries
                 WHERE substr(key, 1, 17)=CAST('durable/document/' AS BLOB)
@@ -221,6 +222,42 @@ impl Store {
         }
     }
 
+    /// Document revision recorded atomically with a conversation fork record.
+    pub fn document_cut(&self, key: &[u8]) -> Result<Option<u64>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_cuts WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Enumerate live document entries at an immutable revision.
+    pub fn documents_at(&self, revision: u64) -> Result<Vec<KeyedEntry>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
+        let rows = stmt.query_map([revision], |r| {
+            Ok((
+                r.get(0)?,
+                Entry {
+                    value: r.get(1)?,
+                    version: r.get(2)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
@@ -290,6 +327,15 @@ impl Store {
                 // Upsert accommodates raw batches that mutate the same key more
                 // than once: the snapshot represents the final committed state.
                 tx.execute("INSERT INTO durable_document_history(key,revision,value,version) VALUES(?1,?2,(SELECT value FROM durable_store_entries WHERE key=?1),(SELECT version FROM durable_store_entries WHERE key=?1)) ON CONFLICT(key,revision) DO UPDATE SET value=excluded.value,version=excluded.version", params![key, revision])?;
+            }
+        }
+        // Capture the post-mutation revision in the same transaction as every
+        // conversation snapshot, even when the document batch is appended later.
+        for mutation in mutations {
+            if let Mutation::Put { key, .. } = mutation {
+                if key.starts_with(b"runtime/fork/") {
+                    tx.execute("INSERT OR IGNORE INTO durable_document_cuts(key,revision) SELECT ?1,revision FROM durable_document_history_meta WHERE id=1", [key])?;
+                }
             }
         }
         tx.commit()?;

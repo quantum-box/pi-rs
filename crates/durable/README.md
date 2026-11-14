@@ -376,9 +376,26 @@ History is retained indefinitely. Older binaries writing the database after
 migration bypass history and are incompatible. Raw writes to the reserved
 namespace are recorded but still must obey document invariants.
 
-These snapshots are not yet associated atomically with conversation entries or
-fork cuts, and `get_at` requires a known address: this does not implement
-historical document inheritance, enumeration, or upstream Chord transactions.
+Each new conversation observation records the post-commit document revision in
+the same SQLite transaction, including document writes staged during admission.
+`Harness::document_at_cut` reads a known address at that boundary. `fork_at`,
+entry/position forks, and `fork` copy documents whose scope is exactly the
+parent conversation UUID string into the corresponding child UUID scope. Copies
+are independent documents with fresh CAS versions; all other scopes remain
+shared and are not copied. Historical forks use the selected cut; current forks
+use a revision captured during the call. Copies and child creation commit
+atomically. A fork of a fork follows the same rule.
+
+This scope convention is not enforced ownership or access control. Existing
+cuts from before this feature have no recorded boundary and historical document
+reads and forks fail closed. Interior message cuts additionally require equal
+document revisions across the surrounding commit; unrelated document writes
+can therefore conservatively prevent such a fork. Revision enumeration scans
+retained history and copying is proportional to the documents found. History is
+unbounded. This is a subset of upstream: there are no per-document current or
+initial fork policies, typed definitions, task ownership, deferred visibility,
+or general Chord transactions. Subagent history seeding is separate and does not
+copy application documents.
 
 `Harness::submit_with_documents` and `Scheduler::submit_with_documents` admit input, document changes, and optional tasks staged with `AdmissionDocuments::create_task` in
 the same durable commit as the conversation, transcript and observation updates.

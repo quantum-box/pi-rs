@@ -806,3 +806,157 @@ async fn before_compact_runs_for_automatic_threshold() {
         |m| matches!(m, Message::User { content } if content.contains("automatic hook summary"))
     ));
 }
+
+#[tokio::test]
+async fn document_forks_follow_committed_cuts_and_survive_reopen() {
+    use pi_rs_durable::{document::Address, runtime::AdmissionOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let (parent, old_child, new_child, shared);
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        parent = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        let a = Address {
+            scope: parent.to_string(),
+            name: "note".into(),
+            key: "x".into(),
+        };
+        shared = Address {
+            scope: "shared".into(),
+            name: "shared-only".into(),
+            key: "x".into(),
+        };
+        h.submit_with_documents(
+            parent,
+            None,
+            "first".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                docs.get(&a)?;
+                docs.get(&shared)?;
+                docs.put(&a, serde_json::json!({"n": 1}).as_object().unwrap().clone())?;
+                docs.put(
+                    &shared,
+                    serde_json::json!({"n": 9}).as_object().unwrap().clone(),
+                )
+            },
+        )
+        .unwrap();
+        let cut = h
+            .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .next;
+        h.submit_with_documents(
+            parent,
+            None,
+            "second".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                docs.get(&a)?;
+                docs.put(&a, serde_json::json!({"n": 2}).as_object().unwrap().clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.document_at_cut(parent, cut, &a).unwrap().unwrap().value["n"],
+            1
+        );
+        h.resume(&cancel).await.unwrap();
+        let current_child = h.fork(parent).unwrap();
+        assert_eq!(
+            h.document(&Address {
+                scope: current_child.to_string(),
+                ..a.clone()
+            })
+            .unwrap()
+            .unwrap()
+            .value["n"],
+            2
+        );
+        old_child = h.fork_at(parent, cut).unwrap();
+        let child_address = Address {
+            scope: old_child.to_string(),
+            ..a.clone()
+        };
+        assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 1);
+        let old_version = h.document(&child_address).unwrap().unwrap().version;
+        assert_ne!(old_version, h.document(&a).unwrap().unwrap().version);
+        h.submit_with_documents(
+            old_child,
+            None,
+            "child change".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                docs.get(&child_address)?;
+                docs.put(
+                    &child_address,
+                    serde_json::json!({"n": 7}).as_object().unwrap().clone(),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(h.document(&a).unwrap().unwrap().value["n"], 2);
+        h.submit_with_documents(
+            parent,
+            None,
+            "delete".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                docs.get(&a)?;
+                docs.delete(&a)
+            },
+        )
+        .unwrap();
+        let deleted_cut = h
+            .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .next;
+        new_child = h.fork_at(parent, deleted_cut).unwrap();
+        assert!(
+            h.document(&Address {
+                scope: new_child.to_string(),
+                ..a
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.document(&Address {
+            scope: old_child.to_string(),
+            name: "note".into(),
+            key: "x".into()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
+    assert!(
+        h.document(&Address {
+            scope: new_child.to_string(),
+            name: "note".into(),
+            key: "x".into()
+        })
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(h.document(&shared).unwrap().unwrap().value["n"], 9);
+    assert!(
+        h.document(&Address {
+            scope: old_child.to_string(),
+            name: "shared-only".into(),
+            key: "x".into()
+        })
+        .unwrap()
+        .is_none()
+    );
+}

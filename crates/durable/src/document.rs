@@ -62,6 +62,42 @@ impl<'a> Documents<'a> {
     pub fn snapshot(&self) -> Result<u64, Error> {
         Ok(self.store.document_snapshot()?)
     }
+    /// Prepare copies of one conversation scope at an immutable boundary.
+    pub(crate) fn fork_scope(
+        &self,
+        parent: uuid::Uuid,
+        child: uuid::Uuid,
+        revision: u64,
+    ) -> Result<OwnedBatch, Error> {
+        let mut batch = OwnedBatch {
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        };
+        for (key, entry) in self.store.documents_at(revision)? {
+            let parts: [String; 3] =
+                serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;
+            if parts[0] != parent.to_string() {
+                continue;
+            }
+            // Validate the document before copying; preserve JSON, allocate a new CAS version.
+            Self::decode(Some(entry.clone()))?;
+            let target = Address {
+                scope: child.to_string(),
+                name: parts[1].clone(),
+                key: parts[2].clone(),
+            }
+            .storage_key()?;
+            batch.checks.push(Check {
+                key: target.clone(),
+                expected: Expected::Missing,
+            });
+            batch.mutations.push(Mutation::Put {
+                key: target,
+                value: entry.value,
+            });
+        }
+        Ok(batch)
+    }
     /// Read one address at a previously captured document boundary.
     pub fn get_at(&self, address: &Address, snapshot: u64) -> Result<Option<Document>, Error> {
         Self::decode(self.store.document_at(&address.storage_key()?, snapshot)?)

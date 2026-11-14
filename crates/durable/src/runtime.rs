@@ -1694,7 +1694,10 @@ impl Harness {
         state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
-        self.save(&state, Expected::Missing)?;
+        let revision = self.owner.store().document_snapshot()?;
+        let batch = crate::document::Documents::new(self.owner.store())
+            .fork_scope(id, state.id, revision)?;
+        self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))?;
         Ok(state.id)
     }
     /// Fork a committed observation cut, including cuts during active work.
@@ -1718,6 +1721,21 @@ impl Harness {
             .store()
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
+        let revision = self
+            .owner
+            .store()
+            .document_cut(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if prefix.is_some() {
+            let previous = cursor
+                .0
+                .checked_sub(1)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let previous_key = format!("runtime/fork/{}/{:020}", id, previous);
+            if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision) {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+        }
         let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
         let transcript = value
             .get("_transcript")
@@ -1801,7 +1819,9 @@ impl Harness {
             abort_requested: false,
             phase: Phase::Idle,
         };
-        self.save(&state, Expected::Missing)?;
+        let batch = crate::document::Documents::new(self.owner.store())
+            .fork_scope(id, state.id, revision)?;
+        self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))?;
         Ok(state.id)
     }
     /// Fork at the commit that first exposed this complete message batch.
@@ -1960,6 +1980,29 @@ impl Harness {
         address: &crate::document::Address,
     ) -> Result<Option<crate::document::Document>, Error> {
         Ok(crate::document::Documents::new(self.subagent_store()?).get(address)?)
+    }
+    /// Read a known document address at a committed conversation observation.
+    /// Legacy cuts without a recorded document boundary fail closed.
+    pub fn document_at_cut(
+        &self,
+        id: Uuid,
+        cursor: crate::observer::Cursor,
+        address: &crate::document::Address,
+    ) -> Result<Option<crate::document::Document>, Error> {
+        self.subagent_store()?;
+        if cursor.0 == 0 {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let key = format!("runtime/fork/{}/{:020}", id, cursor.0);
+        if self.owner.store().get(key.as_bytes())?.is_none() {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let revision = self
+            .owner
+            .store()
+            .document_cut(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        Ok(crate::document::Documents::new(self.owner.store()).get_at(address, revision)?)
     }
     /// Capture current state and at most `limit` newest messages. The live
     /// checkpoint and conversation record are read consistently by retrying if
