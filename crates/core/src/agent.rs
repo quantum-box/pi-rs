@@ -1245,6 +1245,7 @@ impl Agent<'_> {
         let mut compacted =
             overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
         let mut retry_attempt = 0;
+        let mut recovery_marker_created_in_run = false;
         let lifecycle = crate::lifecycle::enabled(self.registry);
         let mut turn_index = completed_run_turns(session, run_id);
         let mut next_request_index = 0;
@@ -1283,6 +1284,18 @@ impl Agent<'_> {
                 if !session.auto_compaction_control().enabled() {
                     return Err(Error::Model(
                         "context overflow and automatic compaction is disabled".into(),
+                    ));
+                }
+                if recovery.started
+                    && !recovery.summary_started
+                    && !recovery_marker_created_in_run
+                    && !active.registry.extensions.is_empty()
+                {
+                    // The prior process may have entered a pre-summary hook
+                    // before crashing. Its external side effects cannot be
+                    // inferred from the marker, so never invoke it again.
+                    return Err(Error::Model(
+                        "interrupted overflow hook requires reconciliation".into(),
                     ));
                 }
                 if recovery.summary_started {
@@ -1716,6 +1729,7 @@ impl Agent<'_> {
                     },
                     observer,
                 )?;
+                recovery_marker_created_in_run = true;
                 continue;
             }
             let finished = reply.invocations.is_empty();
@@ -7322,6 +7336,70 @@ mod tree_tests {
             0,
             "must not resend a potentially billable request"
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_pre_summary_hook_is_not_invoked_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("interrupted-hook.jsonl");
+        let run_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let error = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted overflow hook requires reconciliation")
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
