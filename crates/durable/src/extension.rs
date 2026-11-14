@@ -1,0 +1,393 @@
+//! Independent extension resolution and hook execution. Nothing here schedules
+//! work or persists state; a host must commit memo writes before returning.
+use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
+
+use async_trait::async_trait;
+use futures_util::FutureExt;
+use pi_rs_core::Tool;
+use serde_json::Value;
+
+/// Host-provided task-scoped memo storage. `get_or_insert` must atomically
+/// persist the first value before returning it, including across process restarts.
+#[async_trait]
+pub trait Memo: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<Value>, String>;
+    async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String>;
+}
+
+/// Committed data and durable task-scoped memo access supplied by the host.
+pub struct Context<'a> {
+    pub snapshot: &'a Value,
+    pub memo: &'a dyn Memo,
+}
+
+#[async_trait]
+pub trait Section: Send + Sync {
+    fn key(&self) -> &str;
+    fn tagged(&self) -> bool {
+        true
+    }
+    async fn render(&self, context: &Context<'_>) -> Result<Option<String>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sleep {
+    pub signals: Vec<String>,
+    pub until_millis: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BeforeTool {
+    Pass,
+    Rewrite(Value),
+    Block(String),
+    Sleep(Sleep),
+}
+
+/// Generation events have separate chains. Values are host-defined JSON; the
+/// host validates their shape before using them or scheduling requested tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationEvent {
+    BeforeRequest,
+    BeforeProviderRequest,
+    AfterResponse,
+    OnYield,
+    AfterTools,
+    AfterRun,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenerationDecision {
+    Pass,
+    Replace(Value),
+    Continue(Value),
+    Tasks(Vec<HookTask>),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HookTask {
+    pub name: String,
+    pub input: Value,
+}
+
+#[async_trait]
+pub trait Hook: Send + Sync {
+    async fn before_tool(
+        &self,
+        _call: &ToolCall,
+        _ctx: &Context<'_>,
+    ) -> Result<BeforeTool, String> {
+        Ok(BeforeTool::Pass)
+    }
+    async fn after_tool(
+        &self,
+        _call: &ToolCall,
+        _result: &Value,
+        _ctx: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    async fn generation(
+        &self,
+        _event: GenerationEvent,
+        _value: &Value,
+        _ctx: &Context<'_>,
+    ) -> Result<GenerationDecision, String> {
+        Ok(GenerationDecision::Pass)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Extension {
+    pub name: String,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub sections: Vec<Arc<dyn Section>>,
+    pub hooks: Vec<Arc<dyn Hook>>,
+    /// Real scheduler handlers, keyed by their registered task kind.
+    pub tasks: Vec<(String, Arc<dyn crate::task_scheduler::Handler>)>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegistryError {
+    #[error("extension name must not be empty")]
+    EmptyName,
+    #[error("duplicate {kind} name {name} in extension {extension}")]
+    Duplicate {
+        kind: &'static str,
+        name: String,
+        extension: String,
+    },
+    #[error("invalid or reserved section key {0}")]
+    InvalidSection(String),
+    #[error("task name {0} is already installed or reserved")]
+    TaskConflict(String),
+}
+
+#[derive(Clone, Default)]
+pub struct Registry {
+    current: Snapshot,
+}
+#[derive(Clone, Default)]
+pub struct Snapshot {
+    extensions: Vec<Arc<Extension>>,
+}
+impl Registry {
+    pub fn snapshot(&self) -> Snapshot {
+        self.current.clone()
+    }
+    /// Validate the entire candidate before publishing; replacement keeps position.
+    pub fn install(&mut self, extension: Extension) -> Result<(), RegistryError> {
+        validate(&extension)?;
+        let mut next = self.current.extensions.clone();
+        if let Some(i) = next.iter().position(|x| x.name == extension.name) {
+            next[i] = Arc::new(extension);
+        } else {
+            next.push(Arc::new(extension));
+        }
+        let mut tasks = HashSet::new();
+        for ext in &next {
+            for (name, _) in &ext.tasks {
+                if name.is_empty()
+                    || matches!(name.as_str(), "pi.generation" | "pi.tool" | "pi.compaction")
+                    || !tasks.insert(name.clone())
+                {
+                    return Err(RegistryError::TaskConflict(name.clone()));
+                }
+            }
+        }
+        self.current = Snapshot { extensions: next };
+        Ok(())
+    }
+    pub fn uninstall(&mut self, name: &str) {
+        self.current.extensions.retain(|x| x.name != name);
+    }
+}
+fn validate(ext: &Extension) -> Result<(), RegistryError> {
+    if ext.name.trim().is_empty() {
+        return Err(RegistryError::EmptyName);
+    }
+    let mut tools = HashSet::new();
+    for t in &ext.tools {
+        let name = t.spec().name;
+        if name.is_empty() || !tools.insert(name.clone()) {
+            return Err(RegistryError::Duplicate {
+                kind: "tool",
+                name,
+                extension: ext.name.clone(),
+            });
+        }
+    }
+    let mut sections = HashSet::new();
+    for s in &ext.sections {
+        let key = s.key();
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some('a'..='z'))
+            || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            || key == "instructions"
+        {
+            return Err(RegistryError::InvalidSection(key.into()));
+        }
+        if !sections.insert(key.to_string()) {
+            return Err(RegistryError::Duplicate {
+                kind: "section",
+                name: key.into(),
+                extension: ext.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    pub extension: String,
+    pub operation: &'static str,
+    pub error: String,
+}
+fn failure(extension: &str, operation: &'static str, error: String) -> Report {
+    Report {
+        extension: extension.into(),
+        operation,
+        error,
+    }
+}
+async fn protect<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    match AssertUnwindSafe(f).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => Err("extension panicked".into()),
+    }
+}
+
+/// An immutable phase-local selection, in the requested order. Missing names are
+/// ignored and duplicate selections use their first occurrence.
+#[derive(Clone, Default)]
+pub struct Resolved {
+    extensions: Vec<Arc<Extension>>,
+}
+impl Snapshot {
+    pub fn names(&self) -> Vec<&str> {
+        self.extensions.iter().map(|x| x.name.as_str()).collect()
+    }
+    pub fn resolve(&self, names: Option<&[String]>) -> Resolved {
+        let extensions = match names {
+            None => self.extensions.clone(),
+            Some(names) => {
+                let mut seen = HashSet::new();
+                names
+                    .iter()
+                    .filter(|n| seen.insert((*n).clone()))
+                    .filter_map(|n| self.extensions.iter().find(|x| x.name == *n).cloned())
+                    .collect()
+            }
+        };
+        Resolved { extensions }
+    }
+}
+impl Resolved {
+    pub fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.extensions
+            .iter()
+            .rev()
+            .flat_map(|e| e.tools.iter().rev())
+            .find(|t| t.spec().name == name)
+            .cloned()
+    }
+    pub fn task(&self, name: &str) -> Option<Arc<dyn crate::task_scheduler::Handler>> {
+        self.extensions
+            .iter()
+            .flat_map(|e| e.tasks.iter())
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| h.clone())
+    }
+    /// Later sections replace by key without moving the key's original position.
+    pub async fn prompt(
+        &self,
+        ctx: &Context<'_>,
+        instructions: Option<&str>,
+    ) -> (String, Vec<Report>) {
+        let mut sections: Vec<(&str, &Arc<dyn Section>)> = Vec::new();
+        for e in &self.extensions {
+            for s in &e.sections {
+                if let Some(i) = sections.iter().position(|(_, old)| old.key() == s.key()) {
+                    sections[i] = (&e.name, s);
+                } else {
+                    sections.push((&e.name, s));
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        let mut reports = Vec::new();
+        for (owner, s) in sections {
+            match protect(s.render(ctx)).await {
+                Ok(Some(text)) => parts.push(if s.tagged() {
+                    format!("<{}>\n{}\n</{}>", s.key(), text, s.key())
+                } else {
+                    text
+                }),
+                Ok(None) => (),
+                Err(e) => reports.push(failure(owner, "section", e)),
+            }
+        }
+        if let Some(text) = instructions {
+            parts.push(format!("<instructions>\n{text}\n</instructions>"));
+        }
+        (parts.join("\n\n"), reports)
+    }
+    /// Any hook failure stops dispatch; a host must also validate a sleep and
+    /// re-run the complete chain on wake before dispatching.
+    pub async fn before_tool(
+        &self,
+        mut call: ToolCall,
+        ctx: &Context<'_>,
+    ) -> (ToolCall, BeforeTool, Vec<Report>) {
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(h.before_tool(&call, ctx)).await {
+                    Ok(BeforeTool::Pass) => (),
+                    Ok(BeforeTool::Rewrite(args)) => call.arguments = args,
+                    Ok(stop @ (BeforeTool::Block(_) | BeforeTool::Sleep(_))) => {
+                        return (call, stop, vec![]);
+                    }
+                    Err(err) => {
+                        let report = failure(&e.name, "before_tool", err);
+                        return (
+                            call,
+                            BeforeTool::Block("before-tool hook failed".into()),
+                            vec![report],
+                        );
+                    }
+                }
+            }
+        }
+        (call, BeforeTool::Pass, vec![])
+    }
+    pub async fn after_tool(
+        &self,
+        call: &ToolCall,
+        mut result: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Vec<Report>) {
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(h.after_tool(call, &result, ctx)).await {
+                    Ok(Some(value)) => result = value,
+                    Ok(None) => (),
+                    Err(err) => reports.push(failure(&e.name, "after_tool", err)),
+                }
+            }
+        }
+        (result, reports)
+    }
+    /// Request replacements pass down the chain; the first onYield decision wins.
+    /// Returned task requests are only collected, never scheduled here.
+    pub async fn generation(
+        &self,
+        event: GenerationEvent,
+        mut value: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        let mut tasks = vec![];
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(h.generation(event, &value, ctx)).await {
+                    Ok(GenerationDecision::Pass) => (),
+                    Ok(GenerationDecision::Replace(v))
+                        if matches!(
+                            event,
+                            GenerationEvent::BeforeRequest | GenerationEvent::BeforeProviderRequest
+                        ) =>
+                    {
+                        value = v
+                    }
+                    Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
+                        return (value, Some(v), tasks, reports);
+                    }
+                    Ok(GenerationDecision::Tasks(mut t))
+                        if matches!(
+                            event,
+                            GenerationEvent::OnYield
+                                | GenerationEvent::AfterTools
+                                | GenerationEvent::AfterRun
+                        ) =>
+                    {
+                        tasks.append(&mut t);
+                        if event == GenerationEvent::OnYield {
+                            return (value, None, tasks, reports);
+                        }
+                    }
+                    Ok(_) => reports.push(failure(
+                        &e.name,
+                        "generation",
+                        "decision is invalid for this event".into(),
+                    )),
+                    Err(err) => reports.push(failure(&e.name, "generation", err)),
+                }
+            }
+        }
+        (value, None, tasks, reports)
+    }
+}

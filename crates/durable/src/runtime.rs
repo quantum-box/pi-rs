@@ -373,7 +373,8 @@ impl Harness {
             });
             let terminal = match &state.phase {
                 Phase::Accounting { request_id, .. } => Some((*request_id, true)),
-                Phase::AbandonedModel { request_id, .. } => Some((*request_id, false)),
+                Phase::AbandonedModel { request_id, .. }
+                | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
                 _ => None,
             };
             if let Some((request_id, complete)) = terminal {
@@ -1113,6 +1114,20 @@ impl Harness {
                             if cancel.is_cancelled() || matches!(e, pi_rs_core::Error::Cancelled) {
                                 self.failed = true;
                                 return Err(Error::Interrupted);
+                            }
+                            let partial =
+                                crate::progress::Snapshot::load(self.owner.store(), request_id)?;
+                            if let crate::progress::State::Running(progress) = partial.state()
+                                && !progress.text.is_empty()
+                                && !c
+                                    .aborted_generations
+                                    .iter()
+                                    .any(|entry| entry.request_id == request_id)
+                            {
+                                c.aborted_generations.push(AbortedGeneration {
+                                    request_id,
+                                    text: progress.text.clone(),
+                                });
                             }
                             let decision =
                                 Failure::from_error(&e).map_or(Decision::Stop, |failure| {

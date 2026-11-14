@@ -5,6 +5,7 @@
 
 pub mod compact;
 pub mod conversation;
+pub mod extension;
 pub mod fork;
 pub mod model;
 pub mod nested;

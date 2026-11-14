@@ -157,9 +157,12 @@ async fn reopen_retries_model_interrupted_before_response() {
         .unwrap();
         id = h.create_conversation(config()).unwrap();
         assert!(
-            h.submit_and_run(id, Some("job".into()), "work".into(), &cancel)
-                .await
-                .is_err()
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                h.submit_and_run(id, Some("job".into()), "work".into(), &cancel)
+            )
+            .await
+            .is_err()
         );
     }
     let h = Harness::open(
@@ -478,9 +481,12 @@ async fn interrupted_model_is_settled_before_retry() {
         let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
         id = h.create_conversation(config()).unwrap();
         assert!(
-            h.submit_and_run(id, None, "work".into(), &cancel)
-                .await
-                .is_err()
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                h.submit_and_run(id, None, "work".into(), &cancel)
+            )
+            .await
+            .is_err()
         );
     }
     let h = Harness::open(&path, opts(), &cancel).await.unwrap();
@@ -577,7 +583,14 @@ async fn paused_owner_can_run_another_conversation_after_failure() {
         second = h.create_conversation(config()).unwrap();
         h.submit(first, None, "first".into()).unwrap();
         h.submit(second, None, "second".into()).unwrap();
-        assert!(h.resume_conversation(first, &cancel).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                h.resume_conversation(first, &cancel)
+            )
+            .await
+            .is_err()
+        );
     }
     let mut h = Harness::open_paused(&path, options(model, tool, ReplayPolicy::Unsafe)).unwrap();
     h.resume_conversation(second, &cancel).await.unwrap();
