@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: rustup toolchain install 1.89.0 --profile minimal --component clippy
+      - run: cargo +1.89.0 clippy --locked -p pi-rs-workbench --all-features --all-targets -- -D warnings
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs share_readiness_wait_is_bounded_and_reports_closed_worker
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_mint_caller_still_persists_new_key
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_
