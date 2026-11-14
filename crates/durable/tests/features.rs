@@ -203,6 +203,7 @@ async fn scheduler_runs_atomically_admitted_document_input() {
         s.conversation(id).unwrap().submissions[0].status,
         Status::Done { .. }
     ));
+    assert_eq!(s.document(&address).unwrap().unwrap().value["n"], 1);
     s.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     assert_eq!(

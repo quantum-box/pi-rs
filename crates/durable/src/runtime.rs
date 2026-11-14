@@ -1703,6 +1703,13 @@ impl Harness {
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
     }
+    /// Read the latest committed application document under this store owner.
+    pub fn document(
+        &self,
+        address: &crate::document::Address,
+    ) -> Result<Option<crate::document::Document>, Error> {
+        Ok(crate::document::Documents::new(self.subagent_store()?).get(address)?)
+    }
     /// Capture current state and at most `limit` newest messages. The live
     /// checkpoint and conversation record are read consistently by retrying if
     /// the latter changes while the checkpoint is read.
@@ -4663,6 +4670,12 @@ impl Scheduler {
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
+    }
+    pub fn document(
+        &self,
+        address: &crate::document::Address,
+    ) -> Result<Option<crate::document::Document>, Error> {
+        self.harness.document(address)
     }
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.harness.view(id, limit)
