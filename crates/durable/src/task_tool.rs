@@ -66,7 +66,8 @@ pub(crate) async fn scope<F: std::future::Future>(
     }
 }
 
-static ENTRIES: OnceLock<Mutex<Vec<(Weak<dyn Tool>, Weak<TaskTool>)>>> = OnceLock::new();
+type RegistryEntry = (Weak<dyn Tool>, Weak<TaskTool>);
+static ENTRIES: OnceLock<Mutex<Vec<RegistryEntry>>> = OnceLock::new();
 pub(crate) fn lookup(tool: &Arc<dyn Tool>) -> Option<Arc<TaskTool>> {
     let mut entries = ENTRIES.get_or_init(Default::default).lock().ok()?;
     entries.retain(|(tool, adapter)| tool.strong_count() > 0 && adapter.strong_count() > 0);
