@@ -10,6 +10,10 @@ use crate::{
 };
 use durable_store::{Check, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,10 +24,18 @@ pub(crate) enum Error {
     Task(#[from] crate::task_store::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Document(#[from] crate::document::Error),
     #[error("conversation or task attempt is stale, closed or unowned")]
     Stale,
     #[error("task attempt is already bound to a different conversation attempt")]
     Bound,
+    #[error("conversation executor is already held")]
+    Busy,
+    #[error("conversation execution epoch is cancelled")]
+    Cancelled,
+    #[error("execution fence poisoned")]
+    Poisoned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +44,93 @@ pub(crate) struct Binding {
     pub tool: ToolAttempt,
     pub task: Uuid,
     pub task_attempt: Uuid,
+}
+
+/// Exclusive among conversation workers that honor the shared control. The
+/// scheduler task executor is a separate lease and must be retired by the host
+/// before a future dispatch may use this capability. Never hold the task gate
+/// while acquiring this lease or await while holding either synchronous gate.
+pub(crate) struct ConversationLease {
+    owner: Arc<durable_store::owner::OwnedStore>,
+    control: durable_store::controls::Control,
+    binding: Binding,
+    _worker: tokio::sync::OwnedMutexGuard<()>,
+    failed: AtomicBool,
+    commit_lock: Mutex<()>,
+}
+
+impl ConversationLease {
+    pub(crate) fn acquire(
+        owner: Arc<durable_store::owner::OwnedStore>,
+        binding: Binding,
+    ) -> Result<Self, Error> {
+        let control = owner.conversation_controls().get(binding.conversation);
+        let worker = control
+            .worker
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Error::Busy)?;
+        let lease = Self {
+            owner,
+            control,
+            binding,
+            _worker: worker,
+            failed: AtomicBool::new(false),
+            commit_lock: Mutex::new(()),
+        };
+        lease.commit(crate::task_store::OwnedBatch {
+            checks: vec![],
+            mutations: vec![],
+        })?;
+        Ok(lease)
+    }
+
+    /// Commits a fully checked batch under both gates. The caller must stop on
+    /// any error and inspect after uncertain storage outcomes; no external
+    /// effects or asynchronous work may run inside these short-lived fences.
+    pub(crate) fn commit(&self, batch: crate::task_store::OwnedBatch) -> Result<(), Error> {
+        let _serial = self.commit_lock.lock().map_err(|_| Error::Poisoned)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        let result = self.commit_inner(batch);
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn commit_inner(&self, batch: crate::task_store::OwnedBatch) -> Result<(), Error> {
+        let _poll = self.control.gate.lock().map_err(|_| Error::Poisoned)?;
+        if self.control.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let _task = self.owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        if self.control.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let mut fences = checks(self.owner.store(), &self.binding)?;
+        // Preserve a timed signal's stronger deadline check when it overlaps a
+        // lease check, as in keyed child park/document composition.
+        for fence in &mut fences {
+            if let Expected::Version(version) = fence.expected
+                && let Some(stronger) = batch.checks.iter().find(|c| {
+                    c.key == fence.key
+                        && matches!(c.expected, Expected::VersionBefore(v, _) if v == version)
+                })
+            {
+                fence.expected = stronger.expected.clone();
+            }
+        }
+        let mut tx = crate::document::Transaction::new();
+        tx.append(crate::task_store::OwnedBatch {
+            checks: fences,
+            mutations: vec![],
+        })?;
+        tx.append(batch)?;
+        tx.commit(self.owner.store())?;
+        Ok(())
+    }
 }
 
 fn key(task: Uuid) -> Vec<u8> {
@@ -183,6 +282,206 @@ mod tests {
     fn commit_binding(db: &Store, b: &Binding) {
         let batch = prepare_binding(db, b).unwrap();
         db.commit(&batch.checks, &batch.mutations).unwrap();
+    }
+
+    fn effect_batch() -> crate::task_store::OwnedBatch {
+        let key = b"test/lease-effect".to_vec();
+        crate::task_store::OwnedBatch {
+            checks: vec![Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            mutations: vec![Mutation::Put {
+                key,
+                value: vec![1],
+            }],
+        }
+    }
+
+    #[test]
+    fn lease_excludes_other_conversation_workers_and_rechecks_abort() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let b = setup(owner.store());
+        commit_binding(owner.store(), &b);
+        let lease = ConversationLease::acquire(owner.clone(), b.clone()).unwrap();
+        assert!(matches!(
+            ConversationLease::acquire(owner.clone(), b.clone()),
+            Err(Error::Busy)
+        ));
+        assert!(
+            owner
+                .conversation_controls()
+                .get(b.conversation)
+                .worker
+                .try_lock_owned()
+                .is_err()
+        );
+        let tasks = TaskStore::new(owner.store());
+        let task = tasks.load(b.task).unwrap().unwrap();
+        tasks.update(&task, |t| t.request_abort()).unwrap();
+        assert!(matches!(lease.commit(effect_batch()), Err(Error::Stale)));
+        assert!(owner.store().get(b"test/lease-effect").unwrap().is_none());
+        drop(lease);
+        assert!(matches!(
+            ConversationLease::acquire(owner, b),
+            Err(Error::Stale)
+        ));
+    }
+
+    #[test]
+    fn lease_checks_epoch_and_replayed_task_before_committing() {
+        use durable_store::owner::OwnedStore;
+        for cancel_epoch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+            let b = setup(owner.store());
+            commit_binding(owner.store(), &b);
+            let lease = ConversationLease::acquire(owner.clone(), b.clone()).unwrap();
+            if cancel_epoch {
+                owner
+                    .conversation_controls()
+                    .fence(|| Ok::<_, ()>(vec![b.conversation]))
+                    .unwrap();
+                assert!(matches!(
+                    lease.commit(effect_batch()),
+                    Err(Error::Cancelled)
+                ));
+            } else {
+                let tasks = TaskStore::new(owner.store());
+                let running = tasks.load(b.task).unwrap().unwrap();
+                tasks.update(&running, |t| t.recover()).unwrap();
+                let ready = tasks.load(b.task).unwrap().unwrap();
+                tasks
+                    .update(&ready, |t| t.start_attempt(Uuid::from_u128(88)))
+                    .unwrap();
+                assert!(matches!(lease.commit(effect_batch()), Err(Error::Stale)));
+            }
+            assert!(owner.store().get(b"test/lease-effect").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn lease_commit_is_atomic_with_binding_fences() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let b = setup(owner.store());
+        commit_binding(owner.store(), &b);
+        let lease = ConversationLease::acquire(owner.clone(), b).unwrap();
+        lease.commit(effect_batch()).unwrap();
+        assert_eq!(
+            owner
+                .store()
+                .get(b"test/lease-effect")
+                .unwrap()
+                .unwrap()
+                .value,
+            vec![1]
+        );
+        assert!(matches!(
+            lease.commit(effect_batch()),
+            Err(Error::Document(crate::document::Error::Store(
+                durable_store::Error::Conflict { .. }
+            )))
+        ));
+        assert!(matches!(
+            lease.commit(crate::task_store::OwnedBatch {
+                checks: vec![],
+                mutations: vec![]
+            }),
+            Err(Error::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn lease_preserves_stronger_overlapping_deadline_check() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let b = setup(owner.store());
+        commit_binding(owner.store(), &b);
+        let lease = ConversationLease::acquire(owner.clone(), b.clone()).unwrap();
+        let task = TaskStore::new(owner.store()).load(b.task).unwrap().unwrap();
+        let mut batch = effect_batch();
+        batch.checks.push(Check {
+            key: crate::task_store::key(b.task),
+            expected: Expected::VersionBefore(task.version, std::time::Instant::now()),
+        });
+        assert!(matches!(
+            lease.commit(batch),
+            Err(Error::Document(crate::document::Error::Store(
+                durable_store::Error::Conflict { .. }
+            )))
+        ));
+        assert!(owner.store().get(b"test/lease-effect").unwrap().is_none());
+    }
+
+    #[test]
+    fn lease_crash_child() {
+        use durable_store::owner::OwnedStore;
+        let Ok(path) = std::env::var("PI_RS_LEASE_CRASH_DB") else {
+            return;
+        };
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let b = setup(owner.store());
+        commit_binding(owner.store(), &b);
+        let _lease = ConversationLease::acquire(owner, b).unwrap();
+        std::fs::write(format!("{path}.ready"), b"held").unwrap();
+        std::process::abort();
+    }
+
+    #[test]
+    fn lease_owner_is_released_after_process_death() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "executor_handoff::tests::lease_crash_child",
+                "--nocapture",
+            ])
+            .env("PI_RS_LEASE_CRASH_DB", &path)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read(format!("{}.ready", path.display())).unwrap(),
+            b"held"
+        );
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        // Recovery is explicit: process death releases locks but does not by
+        // itself revoke the old durable attempts.
+        let old = binding();
+        let tasks = TaskStore::new(owner.store());
+        let running = tasks.load(old.task).unwrap().unwrap();
+        tasks.update(&running, |t| t.recover()).unwrap();
+        let ready = tasks.load(old.task).unwrap().unwrap();
+        let mut next = old.clone();
+        next.task_attempt = Uuid::from_u128(101);
+        next.tool.attempt_id = Uuid::from_u128(102);
+        tasks
+            .update(&ready, |t| t.start_attempt(next.task_attempt))
+            .unwrap();
+        let conv = owner
+            .store()
+            .get(&Harness::key(old.conversation))
+            .unwrap()
+            .unwrap();
+        put_conversation(
+            owner.store(),
+            &conversation(&next),
+            Expected::Version(conv.version),
+        );
+        assert!(matches!(
+            ConversationLease::acquire(owner.clone(), old),
+            Err(Error::Stale)
+        ));
+        commit_binding(owner.store(), &next);
+        let lease = ConversationLease::acquire(owner.clone(), next).unwrap();
+        lease.commit(effect_batch()).unwrap();
     }
 
     #[test]
