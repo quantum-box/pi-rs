@@ -101,14 +101,17 @@ pub struct WakeSnapshot {
     pub blocked: Vec<BlockedTask>,
 }
 
+#[derive(Clone)]
 struct Registration {
+    identity: Arc<()>,
     version: u32,
     migrate: Option<Arc<Migration>>,
     replay_safe: bool,
     handler: Arc<dyn Handler>,
     abort: Option<Arc<dyn Handler>>,
 }
-#[derive(Default)]
+/// Clones preserve definition identity for migration retry decisions.
+#[derive(Clone, Default)]
 pub struct Registry {
     entries: HashMap<String, Registration>,
 }
@@ -123,6 +126,7 @@ impl Registry {
         match self.entries.entry(kind.into()) {
             Entry::Vacant(v) => {
                 v.insert(Registration {
+                    identity: Arc::new(()),
                     version: 1,
                     migrate: None,
                     replay_safe,
@@ -144,6 +148,7 @@ impl Registry {
         match self.entries.entry(kind.into()) {
             Entry::Vacant(v) => {
                 v.insert(Registration {
+                    identity: Arc::new(()),
                     version: 1,
                     migrate: None,
                     replay_safe,
@@ -178,6 +183,7 @@ impl Registry {
         let Some(entry) = self.entries.get_mut(kind) else {
             return false;
         };
+        entry.identity = Arc::new(());
         entry.abort = Some(Arc::new(abort));
         true
     }
@@ -260,7 +266,7 @@ pub struct Scheduler {
     attachment: Attachment,
     registry: Registry,
     poisoned: bool,
-    failed_migrations: HashMap<Uuid, String>,
+    failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
 }
 impl Scheduler {
     pub(crate) fn owner(&self) -> Arc<OwnedStore> {
@@ -324,11 +330,11 @@ impl Scheduler {
             .ok_or(Error::Registration)?;
         Ok(entry)
     }
-    /// Replace registrations after a clean scheduling boundary; blocked work is reconsidered.
+    /// Replace registrations after a clean scheduling boundary. Failed migrations
+    /// are retried only when their task definition changes.
     pub fn replace_registry(&mut self, registry: Registry) -> Result<(), Error> {
         self.check()?;
         self.registry = registry;
-        self.failed_migrations.clear();
         self.reconcile()
     }
     /// Inspect compatibility without executing migration code.
@@ -340,7 +346,9 @@ impl Scheduler {
             return Some(BlockedReason::TaskTooOld);
         }
         if task.definition_version() < reg.version {
-            if let Some(error) = self.failed_migrations.get(&task.id()) {
+            if let Some((identity, error)) = self.failed_migrations.get(&task.id())
+                && Arc::ptr_eq(identity, &reg.identity)
+            {
                 return Some(BlockedReason::MigrationFailed(error.clone()));
             }
             if reg.migrate.is_none() {
@@ -439,6 +447,7 @@ impl Scheduler {
         if snapshot.task.definition_version() < reg.version {
             let migration = reg.migrate.as_ref().unwrap().clone();
             let version = reg.version;
+            let identity = reg.identity.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 migration(
                     snapshot.task.input(),
@@ -450,7 +459,7 @@ impl Scheduler {
             match result {
                 Ok((input, checkpoint)) => next.task.migrate(version, input, checkpoint),
                 Err(error) => {
-                    self.failed_migrations.insert(snapshot.task.id(), error);
+                    self.failed_migrations.insert(snapshot.task.id(), (identity, error));
                     return Ok(false);
                 }
             }
@@ -1222,6 +1231,89 @@ mod tests {
         let finished = scheduler.get(task.id()).unwrap().unwrap();
         assert_eq!(finished.definition_version(), 2);
         assert!(matches!(finished.state(), TaskState::Succeeded(_)));
+    }
+
+    #[test]
+    fn migration_failure_survives_unrelated_registry_changes_and_retries_after_reopen() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut initial = Registry::default();
+        initial.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, initial).unwrap();
+        let task = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            "job",
+            true,
+            5,
+        );
+        scheduler.submit(&task).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut registry = Registry::default();
+        registry.register_versioned(
+            "job",
+            2,
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            Some(Arc::new(move |_, _, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                panic!("migration");
+            })),
+        );
+        scheduler.replace_registry(registry.clone()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        scheduler.replace_registry(registry.clone()).unwrap();
+        assert!(!scheduler.tick(0).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.get(task.id()).unwrap(), Some(task.clone()));
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(scheduler.get(task.id()).unwrap(), Some(task));
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn abort_with_panicking_migration_persists_orphan_without_running_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut initial = Registry::default();
+        initial.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, initial).unwrap();
+        let task = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            "job",
+            true,
+            5,
+        );
+        scheduler.submit(&task).unwrap();
+        let mut registry = Registry::default();
+        registry.register_versioned(
+            "job",
+            2,
+            true,
+            |_: &Task| panic!("run"),
+            Some(Arc::new(|_, _, _| panic!("migration"))),
+        );
+        registry.set_abort("job", |_: &Task| panic!("cleanup"));
+        scheduler.replace_registry(registry.clone()).unwrap();
+        scheduler.request_abort(task.id()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let result = scheduler.get(task.id()).unwrap().unwrap();
+        assert_eq!(result.definition_version(), 1);
+        assert_eq!(result.input(), task.input());
+        assert_eq!(result.checkpoint(), task.checkpoint());
+        assert!(matches!(
+            result.state(),
+            TaskState::Failed(reason) if reason == "orphaned: migration failed: migration panicked"
+        ));
+        drop(scheduler);
+        let scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(scheduler.get(task.id()).unwrap(), Some(result));
     }
 
     #[test]
