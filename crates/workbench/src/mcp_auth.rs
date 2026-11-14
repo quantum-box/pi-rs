@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
+    async fn oauth_manager_uses_proxy_for_registration_code_exchange_and_refresh() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let options = crate::mcp::HttpOptionsWithProxyHosts {
@@ -1585,6 +1585,7 @@ mod tests {
             for body in [
                 r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#,
                 r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#,
+                r#"{"access_token":"newer","token_type":"Bearer","refresh_token":"next2"}"#,
             ] {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
@@ -1646,15 +1647,175 @@ mod tests {
             .await
             .unwrap();
         manager.configure_client(config).unwrap();
-        let store = rmcp::transport::auth::InMemoryCredentialStore::new();
-        let creds: StoredCredentials = serde_json::from_value(serde_json::json!({"client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}})).unwrap();
-        store.save(creds).await.unwrap();
-        manager.set_credential_store(store);
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
         assert!(requests[0].0.starts_with("POST /register "));
         assert!(requests[1].0.starts_with("POST /token "));
-        assert!(requests[1].1.contains("refresh_token=old-refresh"));
+        assert!(requests[1].1.contains("grant_type=authorization_code"));
+        assert!(requests[1].1.contains("code=fixture-code"));
+        assert!(requests[2].0.starts_with("POST /token "));
+        assert!(requests[2].1.contains("refresh_token=next"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_routes_oauth_discovery_metadata_registration_code_exchange_and_refresh_directly()
+     {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", origin.local_addr().unwrap());
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!(
+                        "http://localhost:{}",
+                        proxy.local_addr().unwrap().port()
+                    ))
+                    .unwrap()
+                    .no_proxy(reqwest_mcp::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true),
+                ],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
+        };
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut token_requests = 0;
+            loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), origin.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut first = String::new();
+                socket.read_line(&mut first).await.unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    assert!(
+                        !line
+                            .to_ascii_lowercase()
+                            .starts_with("proxy-authorization:")
+                    );
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                requests.push((first.clone(), String::from_utf8(body).unwrap()));
+                let (status, response) = if first.starts_with("GET /metadata ") {
+                    ("200 OK", serde_json::json!({"issuer":server_base,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if first.starts_with("POST /register ") {
+                    (
+                        "200 OK",
+                        r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#
+                            .to_owned(),
+                    )
+                } else if first.starts_with("POST /token ") {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#
+                            .to_owned(),
+                    )
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                if first.starts_with("POST /token ") {
+                    token_requests += 1;
+                    if token_requests == 2 {
+                        return requests;
+                    }
+                }
+            }
+        });
+        let resource = format!("{base}/mcp");
+        let mut manager = oauth_manager(&resource, Some(&options)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), manager.resolve_metadata())
+            .await
+            .unwrap();
+        let metadata = configured_metadata(&format!("{base}/metadata"), &resource, Some(&options))
+            .await
+            .unwrap();
+        manager.set_metadata(metadata);
+        let config = manager
+            .register_client("fixture", "http://127.0.0.1/callback", &[])
+            .await
+            .unwrap();
+        manager.configure_client(config).unwrap();
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
+        manager.refresh_token().await.unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /.well-known/"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /metadata "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("POST /register "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("refresh_token=next"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("grant_type=authorization_code")
+                    && body.contains("code=fixture-code"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
