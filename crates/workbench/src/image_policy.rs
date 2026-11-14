@@ -89,9 +89,26 @@ impl Model for WorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
+        self.stream_in_session_with_identity(
+            _request_id,
+            session_id,
+            &session_id.to_string(),
+            request,
+        )
+        .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
         let mut headers = HeaderMap::new();
         if !self.session_affinity.is_empty() {
-            let value = HeaderValue::from_str(&session_id.to_string()).expect("UUID header value");
+            let value = HeaderValue::from_str(external_id)
+                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
             for &name in self.session_affinity {
                 headers.insert(name, value.clone());
             }
@@ -146,6 +163,17 @@ impl Model for PreparedWorkbenchModel {
     ) -> Result<ModelStream> {
         self.inner
             .stream_in_session(request_id, session_id, request)
+            .await
+    }
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
             .await
     }
     async fn stream_for_summary(
@@ -252,6 +280,66 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_identity_is_used_for_affinity_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut block = [0; 1024];
+                let count = socket.read(&mut block).unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&block[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let model = WorkbenchModel {
+            client: Client::Google(
+                pi_rs::google::Google::new(&format!("http://{address}"), "fixture-key")
+                    .unwrap()
+                    .with_context_probe(false),
+            ),
+            block_images: false,
+            supports_images: None,
+            session_affinity: &["x-session-id"],
+            price: None,
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let _ = model
+            .stream_in_session_with_identity(Uuid::new_v4(), Uuid::new_v4(), "custom-id.1", request)
+            .await;
+        let headers = server.join().unwrap().to_ascii_lowercase();
+        assert!(headers.contains("\r\nx-session-id: custom-id.1\r\n"));
+    }
 
     #[cfg(any(unix, windows))]
     #[test]
