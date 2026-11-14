@@ -5831,40 +5831,92 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.script.contains("日本語"));
-        let ready = root
-            .path()
-            .join("ready.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
-        let leaked = root
-            .path()
-            .join("leaked.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
+        use base64::Engine as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        struct ProcessHandle(HANDLE);
+        impl Drop for ProcessHandle {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns a successful OpenProcess handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+        let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+        let ready = root.path().join("ready.txt");
+        let pid_file = root.path().join("child.pid");
+        let leaked = root.path().join("leaked.txt");
         let script = format!(
-            "Set-Content -LiteralPath '{ready}' -Value ready; Start-Sleep -Seconds 10; Set-Content -LiteralPath '{leaked}' -Value leaked"
+            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 60; [IO.File]::WriteAllText('{}','leaked')",
+            quote(&pid_file),
+            quote(&ready),
+            quote(&leaked),
         );
+        let utf16 = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         let command = format!(
-            "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
+            "$ErrorActionPreference='Stop'; Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' | Out-Null; Start-Sleep -Seconds 60"
         );
-        assert!(
-            tool.shell(
-                &json!({"command":command,"timeout":5}),
-                &pi_rs::CancellationToken::new()
-            )
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let task_cancel = cancellation.clone();
+        let mut shell = tokio::spawn(async move {
+            tool.shell(&json!({"command":command,"timeout":20}), &task_cancel)
+                .await
+        });
+        let readiness = async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
             .await
-            .is_err()
-        );
+        };
+        tokio::select! {
+            result = &mut shell => panic!("shell ended before child readiness: {}", match result {
+                Ok(Ok(_)) => "unexpected success".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => error.to_string(),
+            }),
+            result = readiness => result.expect("child did not report readiness before deadline"),
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: requesting a synchronization-only handle for the reported child PID.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         assert!(
-            root.path().join("ready.txt").exists(),
-            "child process must have started"
+            !raw.is_null(),
+            "cannot open child process: {}",
+            std::io::Error::last_os_error()
         );
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        let child = ProcessHandle(raw);
+        // SAFETY: the guard holds a live process handle. A zero timeout only observes its state.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 0) },
+            WAIT_TIMEOUT,
+            "child must be running before timeout"
+        );
+        let result = shell.await.expect("shell task panicked");
         assert!(
-            !root.path().join("leaked.txt").exists(),
-            "timed-out descendants must be terminated"
+            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 20 seconds")),
+            "expected the configured timeout"
         );
+        // SAFETY: the process handle remains owned by the guard during the wait.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 5000) },
+            WAIT_OBJECT_0,
+            "timed-out descendant must terminate"
+        );
+        assert!(!leaked.exists(), "timed-out descendant must not continue");
     }
 }
