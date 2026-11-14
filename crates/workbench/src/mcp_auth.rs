@@ -709,6 +709,7 @@ pub async fn login_configured_with_http_options(
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
     let settings = settings.unwrap_or(&default);
+    validate_oauth_client_settings(settings)?;
     let client_secret = if let Some(secret) = &settings.client_secret {
         Some(crate::mcp::resolve_value(secret).await?)
     } else {
@@ -873,12 +874,12 @@ fn metadata_document(
     Ok(base)
 }
 
-async fn callback_listener(
+fn validate_callback(
     url: Option<&str>,
     port: Option<u16>,
-) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+) -> Result<(std::net::IpAddr, reqwest_mcp::Url, Option<u16>)> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let mut callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
+    let callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
     let address = match callback.host_str() {
         Some("127.0.0.1" | "localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
         Some("[::1]") => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -897,20 +898,104 @@ async fn callback_listener(
             "invalid MCP callbackUrl or callbackPort".into(),
         ));
     }
-    if let (Some(url_port), Some(port)) = (callback.port(), port)
+    // Url normalizes an explicit default :80 away. Inspect the original
+    // authority so it remains distinct from an unspecified callback port.
+    let explicit_port = if let Some(raw) = url {
+        let (_, rest) = raw
+            .trim()
+            .split_once("://")
+            .ok_or_else(|| Error::Config("invalid MCP callbackUrl".into()))?;
+        let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+        let suffix = if authority.starts_with('[') {
+            authority
+                .split_once(']')
+                .map(|(_, suffix)| suffix)
+                .ok_or_else(|| Error::Config("invalid MCP callbackUrl".into()))?
+        } else {
+            authority.find(':').map_or("", |index| &authority[index..])
+        };
+        if suffix.is_empty() {
+            None
+        } else {
+            let digits = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| Error::Config("invalid MCP callbackUrl port".into()))?;
+            let value = digits
+                .parse::<u16>()
+                .map_err(|_| Error::Config("invalid MCP callbackUrl port".into()))?;
+            if value == 0 {
+                return Err(Error::Config("invalid MCP callbackUrl port".into()));
+            }
+            Some(value)
+        }
+    } else {
+        None
+    };
+    if let (Some(url_port), Some(port)) = (explicit_port, port)
         && url_port != port
     {
         return Err(Error::Config(
             "MCP callbackUrl and callbackPort disagree".into(),
         ));
     }
+    Ok((address, callback, explicit_port))
+}
+
+async fn callback_listener(
+    url: Option<&str>,
+    port: Option<u16>,
+) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+    let (address, mut callback, explicit_port) = validate_callback(url, port)?;
     let listener =
-        tokio::net::TcpListener::bind((address, callback.port().or(port).unwrap_or_default()))
+        tokio::net::TcpListener::bind((address, explicit_port.or(port).unwrap_or_default()))
             .await?;
     callback
         .set_port(Some(listener.local_addr()?.port()))
         .map_err(|()| Error::Config("invalid MCP callback port".into()))?;
     Ok((listener, callback))
+}
+
+/// Validate configured OAuth client settings without network or filesystem effects.
+pub fn validate_oauth_client_settings(client: &OAuthClientSettings) -> Result<()> {
+    if client.client_secret.is_some() && client.client_id.is_none() {
+        return Err(Error::Config(
+            "OAuth client secret requires a client ID".into(),
+        ));
+    }
+    if client
+        .client_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+        || client
+            .client_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(Error::Config(
+            "OAuth client ID and name must be non-empty".into(),
+        ));
+    }
+    if client.client_registration == ClientRegistrationMode::Cimd
+        && (client.client_id.is_some() || client.client_name.is_some())
+    {
+        return Err(Error::Config(
+            "OAuth cimd registration requires a metadata document without clientId or clientName"
+                .into(),
+        ));
+    }
+    validate_callback(client.callback_url.as_deref(), client.callback_port)?;
+    if let Some(url) = client.client_metadata_url.as_deref()
+        && client.client_registration != ClientRegistrationMode::Dcr
+        && safe_http_url(url)?.scheme() != "https"
+    {
+        return Err(Error::Config(
+            "OAuth clientMetadataUrl requires HTTPS".into(),
+        ));
+    }
+    if let Some(url) = client.auth_server_metadata_url.as_deref() {
+        safe_http_url(url)?;
+    }
+    Ok(())
 }
 
 async fn configured_metadata(
@@ -1210,6 +1295,32 @@ pub(crate) async fn test_oauth_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_validation_preserves_explicit_default_port() {
+        for url in [
+            "http://127.0.0.1:80/callback",
+            "http://localhost:80/callback",
+            "http://[::1]:80/callback",
+        ] {
+            assert!(validate_callback(Some(url), Some(9001)).is_err());
+            assert_eq!(validate_callback(Some(url), Some(80)).unwrap().2, Some(80));
+            assert_eq!(validate_callback(Some(url), None).unwrap().2, Some(80));
+        }
+        assert_eq!(
+            validate_callback(Some("http://127.0.0.1/callback"), Some(9001))
+                .unwrap()
+                .2,
+            None
+        );
+        assert_eq!(
+            validate_callback(Some("http://127.0.0.1:9001/callback"), Some(9001))
+                .unwrap()
+                .2,
+            Some(9001)
+        );
+        assert!(validate_callback(Some("http://127.0.0.1:0/callback"), None).is_err());
+    }
 
     #[test]
     fn refresh_saves_token_and_only_dispatches_for_live_callers() {
