@@ -658,6 +658,11 @@ async fn run_worker(
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
     let mut runtime = runtime::configure(&args, true).await?;
+    // The parent must learn that this worker can run context hooks before it
+    // may ever fall back to an unauthenticated share after the worker exits.
+    if std::env::var_os(super::process::REFRESH_BARRIER_ENV).is_some() {
+        super::output(json!({"type":"share_context_initializing"}));
+    }
     if args.mode == Some(super::OutputMode::Rpc) {
         super::output(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),

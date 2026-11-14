@@ -335,10 +335,30 @@ fn share_context_tracks_idle_and_inflight_worker() {
 #[test]
 fn terminal_shares_idle_and_during_model_request() {
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
     let root = tempfile::tempdir().unwrap();
     let prompt = root.path().join("system.txt");
     std::fs::write(&prompt, "Terminal share prompt").unwrap();
+    let extension = root.path().join("context.py");
+    let marker = root.path().join("context-worker-pid");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+r = json.load(sys.stdin)
+if r['type'] == 'describe':
+    result = {'id':'share-context-fixture','dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True}
+elif r['type'] == 'context_with_system':
+    result = r['messages']
+    for message in result:
+        if message['role'] == 'system':
+            message['content'] += ' fixture-context-hook'
+    with open(os.environ['SHARE_FIXTURE_MARKER'], 'w') as marker:
+        marker.write(str(os.getppid()))
+else:
+    result = None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
     let model_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let model_endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -350,6 +370,7 @@ fn terminal_shares_idle_and_during_model_request() {
         share_listener.local_addr().unwrap()
     );
     let (share_tx, share_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
     let shares = std::thread::spawn(move || {
         for _ in 0..2 {
             let (mut socket, _) = share_listener.accept().unwrap();
@@ -380,6 +401,18 @@ fn terminal_shares_idle_and_during_model_request() {
                 .map(|line| serde_json::from_slice(line).unwrap())
                 .collect();
             share_tx.send(entries).unwrap();
+        }
+        share_listener.set_nonblocking(true).unwrap();
+        loop {
+            if !matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                break;
+            }
+            match share_listener.accept() {
+                Ok(_) => panic!("an unauthenticated third share reached Radius"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("share listener: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
     let (started_tx, started_rx) = mpsc::channel();
@@ -424,11 +457,11 @@ fn terminal_shares_idle_and_during_model_request() {
         .env("TERM", "xterm-256color")
         .env("RADIUS_API_KEY", "fixture")
         .env("PI_RS_RADIUS_SHARE_URL", &share_endpoint)
+        .env("SHARE_FIXTURE_MARKER", &marker)
         .args([
             "--offline",
             "--no-mcp",
             "--no-trust",
-            "--no-extensions",
             "--no-skills",
             "--no-context-files",
             "--tui-mode",
@@ -439,6 +472,8 @@ fn terminal_shares_idle_and_during_model_request() {
             "read",
             "--system-prompt",
         ])
+        .arg("--extension")
+        .arg(&extension)
         .arg(&prompt)
         .arg("--session")
         .arg(root.path().join("session.jsonl"))
@@ -517,9 +552,39 @@ fn terminal_shares_idle_and_during_model_request() {
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
     assert!(active.last().unwrap()["data"].get("journalKey").is_none());
     assert!(active.last().unwrap()["data"].get("journalTag").is_none());
-    assert_eq!(active.last().unwrap()["data"], idle_context["data"]);
+    assert!(
+        active.last().unwrap()["data"]["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .contains("fixture-context-hook")
+    );
     release_tx.send(()).unwrap();
     wait_output(&mut master, "done");
+    let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    struct Resume(libc::pid_t);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGCONT);
+            }
+        }
+    }
+    let _resume = Resume(pid);
+    let mut changed = pi_rs::Session::open(root.path().join("session.jsonl")).unwrap();
+    changed
+        .append_user_with_images("changed after hook".into(), Vec::new(), None)
+        .unwrap();
+    drop(changed);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    master.write_all(b"/share\r").unwrap();
+    wait_output(&mut master, "Live share context is unavailable");
+    master.write_all(b"/share\r").unwrap();
+    // The worker cannot read either request while stopped. Its termination
+    // exercises the exit fallback independently of the timeout above.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    wait_output(&mut master, "Live share context is unavailable");
+    stop_tx.send(()).unwrap();
     shares.join().unwrap();
     model.join().unwrap();
 }

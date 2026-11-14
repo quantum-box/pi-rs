@@ -760,6 +760,7 @@ struct View {
     model_list: Option<ModelDiscovery>,
     remote_task: Option<RemoteTask>,
     pending_share: Option<PendingShare>,
+    share_context_may_exist: bool,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
@@ -861,11 +862,8 @@ impl View {
         {
             return None;
         }
-        let mut pending = self.pending_share.take().expect("matching share");
+        let pending = self.pending_share.take().expect("matching share");
         if value["success"] != true {
-            // Existing fallback when a worker cannot provide context: upload
-            // without metadata rather than treating an old snapshot as valid.
-            pending.journal_key = None;
             return Some((pending, None));
         }
         let snapshot = serde_json::from_value(value["data"].clone()).ok();
@@ -2927,10 +2925,26 @@ fn slash(
         "/share" => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
             let id = if destination.is_radius() && !args.trust_pending {
-                worker.and_then(|worker| Worker::request_share_context(worker, args).ok())
+                if let Some(worker) = worker {
+                    let had_worker = worker.is_some();
+                    match Worker::request_share_context(worker, args) {
+                        Ok(request) => Some(request),
+                        Err(error) if had_worker || view.share_context_may_exist => {
+                            return Err(error);
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             };
+            if destination.is_radius() && id.is_none() && view.share_context_may_exist {
+                return Err(Error::Config(
+                    "Live share context is unavailable; try sharing again".into(),
+                ));
+            }
             let pending = PendingShare {
                 id: id.as_ref().map_or_else(uuid::Uuid::nil, |(id, _)| *id),
                 journal_key: id.as_ref().map(|(_, key)| *key),
@@ -3973,6 +3987,7 @@ pub(super) async fn run(
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.drain_events();
+            view.share_context_may_exist |= active.context_may_exist;
             for value in events {
                 if value["type"] == "response" && value["command"] == "get_share_context" {
                     if let Some((pending, snapshot)) = view.take_share_response(&value) {
@@ -4086,11 +4101,13 @@ pub(super) async fn run(
                     }
                     view.receive_worker(value, &mut args);
                 }
+                view.share_context_may_exist |= finished.context_may_exist;
                 if let Some(mut pending) = view.pending_share.take() {
-                    // A worker that exited before returning any context cannot
-                    // provide a tag. Preserve the existing safe no-context
-                    // fallback; a received malformed response remains an error.
-                    pending.journal_key = None;
+                    // Only a worker known to have failed before context setup
+                    // may use the legacy metadata-free fallback.
+                    if !view.share_context_may_exist {
+                        pending.journal_key = None;
+                    }
                     start_share_upload(&mut view, pending, None);
                 }
                 view.settle();
@@ -4118,8 +4135,7 @@ pub(super) async fn run(
                 .as_ref()
                 .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(15))
         {
-            let mut pending = view.pending_share.take().expect("timed out share");
-            pending.journal_key = None;
+            let pending = view.pending_share.take().expect("timed out share");
             start_share_upload(&mut view, pending, None);
             dirty = true;
         }
@@ -7890,7 +7906,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_live_share_response_preserves_no_context_fallback() {
+    fn failed_live_share_response_requires_authenticated_context() {
         let id = uuid::Uuid::new_v4();
         let mut view = super::View {
             pending_share: Some(super::PendingShare {
@@ -7908,7 +7924,7 @@ mod tests {
                 "type":"response", "command":"get_share_context", "id":id, "success":false
             }))
             .unwrap();
-        assert!(pending.journal_key.is_none());
+        assert_eq!(pending.journal_key, Some([3; 32]));
         assert!(snapshot.is_none());
     }
 

@@ -161,6 +161,7 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
+    pub(super) context_may_exist: bool,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
@@ -360,6 +361,7 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: Vec::new(),
+            context_may_exist: false,
             extension_sources: Default::default(),
             readers,
         })
@@ -450,6 +452,10 @@ impl Worker {
         events
             .into_iter()
             .filter_map(|mut event| {
+                if event["type"] == "share_context_initializing" {
+                    self.context_may_exist = true;
+                    return None;
+                }
                 if event["type"] == "worker_extension_sources" {
                     self.extension_sources = event["sources"]
                         .as_object()
@@ -563,7 +569,11 @@ impl Worker {
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
         {
-            slot.take();
+            // Replacing a worker here could discard its unread context marker.
+            // Refuse this share until the normal transition has completed.
+            return Err(Error::Config(
+                "The active worker configuration changed; try sharing again".into(),
+            ));
         }
         if slot.is_none() {
             *slot = Some(Self::start(args, &["serve"])?);
@@ -578,7 +588,9 @@ impl Worker {
         let mut key = [0; 32];
         key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session, "journal_key":key}))?;
+        // Even if stdin closed, wait for the exit and drain its final marker.
+        // Only that establishes whether unauthenticated fallback is safe.
+        let _ = worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session, "journal_key":key}));
         Ok((id, key))
     }
 
@@ -880,6 +892,7 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
+            context_may_exist: false,
             extension_sources: Default::default(),
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
