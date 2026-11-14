@@ -26,12 +26,15 @@ struct Envelope {
     version: u32,
     binding: Binding,
     context: Value,
+    tag: [u8; 32],
 }
 
 #[cfg(unix)]
 mod unix {
     use super::{Binding, Envelope, Value};
-    use sha2::{Digest, Sha256};
+    use hmac::{Hmac, Mac};
+    use serde::Serialize;
+    use sha2::Sha256;
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
@@ -45,6 +48,7 @@ mod unix {
     /// All operations remain relative to a verified private directory handle.
     pub struct Store {
         directory: File,
+        key: [u8; 32],
     }
 
     /// An exclusive generation invalidates any previous snapshot before the
@@ -168,14 +172,88 @@ mod unix {
         }
     }
 
-    fn name_for(session_path: &Path, id: uuid::Uuid, suffix: &str) -> io::Result<CString> {
-        let mut digest = Sha256::new();
-        digest.update(b"pi-rs-share-store-v1\0");
-        digest.update(session_path.as_os_str().as_bytes());
-        digest.update([0]);
-        digest.update(id.as_bytes());
-        CString::new(format!("{:x}.{suffix}", digest.finalize()))
+    fn keyed_digest<T: Serialize>(key: &[u8; 32], domain: &str, value: &T) -> io::Result<[u8; 32]> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(&serde_json::to_vec(value)?);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    fn name_for(
+        key: &[u8; 32],
+        session_path: &Path,
+        id: uuid::Uuid,
+        suffix: &str,
+    ) -> io::Result<CString> {
+        let path = session_path.as_os_str().as_bytes();
+        let digest = keyed_digest(key, "share-session-v1", &(path, id))?;
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        CString::new(format!("{hex}.{suffix}"))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cache name"))
+    }
+
+    fn read_key(directory: &File) -> io::Result<Option<[u8; 32]>> {
+        let name = CString::new("key-v1").unwrap();
+        let mut file = match open_at(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        secure_file(&file)?;
+        if file.metadata()?.len() != 32 {
+            return Err(invalid());
+        }
+        let mut key = [0; 32];
+        file.read_exact(&mut key)?;
+        Ok(Some(key))
+    }
+
+    fn load_or_create_key(directory: &File) -> io::Result<[u8; 32]> {
+        let lock_name = CString::new("key-v1.lock").unwrap();
+        let lock = open_at(
+            directory,
+            &lock_name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            0o600,
+        )?;
+        secure_file(&lock)?;
+        lock.lock()?;
+        if let Some(key) = read_key(directory)? {
+            return Ok(key);
+        }
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let temporary = CString::new(format!(".key-{}.tmp", uuid::Uuid::new_v4())).unwrap();
+        let target = CString::new("key-v1").unwrap();
+        let result = (|| {
+            let mut file = open_at(
+                directory,
+                &temporary,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?;
+            secure_file(&file)?;
+            file.write_all(&key)?;
+            file.sync_all()?;
+            // SAFETY: names and directory descriptor are valid.
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    target.as_ptr(),
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            directory.sync_all()?;
+            Ok(key)
+        })();
+        let _ = unlink_at(directory, &temporary);
+        result
     }
 
     impl Store {
@@ -223,11 +301,41 @@ mod unix {
             if created {
                 parent.sync_all()?;
             }
-            Ok(Some(Self { directory }))
+            let key = if create {
+                load_or_create_key(&directory)?
+            } else {
+                match read_key(&directory)? {
+                    Some(key) => key,
+                    None => return Ok(None),
+                }
+            };
+            Ok(Some(Self { directory, key }))
+        }
+
+        /// Keyed fingerprint for complete journal or provenance inputs. The
+        /// caller chooses and validates the inputs and a domain-specific label.
+        pub fn fingerprint<T: Serialize>(&self, domain: &str, value: &T) -> io::Result<[u8; 32]> {
+            keyed_digest(&self.key, domain, value)
+        }
+
+        /// Bind to the complete validated journal, not just the head number.
+        /// `provenance` must include every effective runtime input; this method
+        /// cannot establish freshness of remote or dynamically supplied tools.
+        pub fn binding_for_session<T: Serialize>(
+            &self,
+            session: &pi_rs::Session,
+            provenance: &T,
+        ) -> io::Result<Binding> {
+            Ok(Binding {
+                session_id: session.session_id(),
+                head: session.head(),
+                journal_digest: self.fingerprint("share-journal-v1", &session.records())?,
+                provenance_digest: self.fingerprint("share-provenance-v1", provenance)?,
+            })
         }
 
         fn lock(&self, path: &Path, binding: &Binding, create: bool) -> io::Result<File> {
-            let name = name_for(path, binding.session_id, "lock")?;
+            let name = name_for(&self.key, path, binding.session_id, "lock")?;
             let file = open_at(
                 &self.directory,
                 &name,
@@ -243,7 +351,7 @@ mod unix {
         pub fn begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
             let lock = self.lock(path, &binding, true)?;
             lock.lock()?;
-            let name = name_for(path, binding.session_id, "json")?;
+            let name = name_for(&self.key, path, binding.session_id, "json")?;
             unlink_at(&self.directory, &name)?;
             self.directory.sync_all()?;
             Ok(Generation {
@@ -267,7 +375,7 @@ mod unix {
                 Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
-            let name = name_for(path, binding.session_id, "json")?;
+            let name = name_for(&self.key, path, binding.session_id, "json")?;
             let file = match open_at(&self.directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -288,6 +396,17 @@ mod unix {
             if envelope.version != 1 || &envelope.binding != binding {
                 return Ok(None);
             }
+            let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts 32 bytes");
+            mac.update(b"share-envelope-v1\0");
+            mac.update(&serde_json::to_vec(&(
+                name.as_bytes(),
+                envelope.version,
+                &envelope.binding,
+                &envelope.context,
+            ))?);
+            if mac.verify_slice(&envelope.tag).is_err() {
+                return Ok(None);
+            }
             Ok(Some(envelope.context))
         }
     }
@@ -302,10 +421,16 @@ mod unix {
                     "session identity changed",
                 ));
             }
+            let tag = keyed_digest(
+                &self.store.key,
+                "share-envelope-v1",
+                &(self.name.as_bytes(), 1u32, &binding, &context),
+            )?;
             let envelope = Envelope {
                 version: 1,
                 binding,
                 context,
+                tag,
             };
             let bytes = serde_json::to_vec(&envelope)?;
             if bytes.len() as u64 > MAX_CACHE_BYTES {
@@ -399,11 +524,20 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let before = std::fs::read_dir(directory.path().join("share-context-v1"))
+            .unwrap()
+            .count();
+        assert!(
+            store
+                .read(Path::new("/legacy/session.jsonl"), &binding())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             std::fs::read_dir(directory.path().join("share-context-v1"))
                 .unwrap()
                 .count(),
-            0
+            before
         );
     }
 
@@ -441,6 +575,34 @@ mod tests {
         let generation = store.begin(path, original.clone()).unwrap();
         drop(generation); // crash or unsuccessful shutdown leaves no clean cache
         assert!(store.read(path, &original).unwrap().is_none());
+    }
+
+    #[test]
+    fn journal_binding_detects_equal_head_content_changes_and_provenance_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("first".into(), vec![], None)
+            .unwrap();
+        let provenance = serde_json::json!({"workspace":"/workspace","tools":["read"]});
+        let binding = store.binding_for_session(&session, &provenance).unwrap();
+        let mut changed_records = session.records().to_vec();
+        match &mut changed_records.last_mut().unwrap().event {
+            pi_rs::Event::User { content, .. } => *content = "different".into(),
+            _ => panic!("expected user record"),
+        }
+        let changed = pi_rs::Session::from_records(changed_records).unwrap();
+        let changed_binding = store.binding_for_session(&changed, &provenance).unwrap();
+        assert_eq!(binding.session_id, changed_binding.session_id);
+        assert_eq!(binding.head, changed_binding.head);
+        assert_ne!(binding.journal_digest, changed_binding.journal_digest);
+        let changed_provenance = serde_json::json!({"workspace":"/workspace","tools":["bash"]});
+        let changed_binding = store
+            .binding_for_session(&session, &changed_provenance)
+            .unwrap();
+        assert_eq!(binding.journal_digest, changed_binding.journal_digest);
+        assert_ne!(binding.provenance_digest, changed_binding.provenance_digest);
     }
 
     #[test]
@@ -585,6 +747,98 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&target, root.path().join("share-context-v1")).unwrap();
         assert!(Store::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn copying_a_valid_envelope_to_another_session_path_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let binding = binding();
+        let first = Path::new("/private/one.jsonl");
+        let second = Path::new("/private/two.jsonl");
+        store
+            .begin(first, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"first"}))
+            .unwrap();
+        drop(store.begin(second, binding.clone()).unwrap());
+        let directory = root.path().join("share-context-v1");
+        let entries: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .collect();
+        let source = entries
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let target = entries
+            .iter()
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "lock")
+                    && path.file_stem().is_some_and(|stem| stem.len() == 64)
+            })
+            .map(|path| path.with_extension("json"))
+            .find(|path| !path.exists())
+            .unwrap();
+        std::fs::copy(source, target).unwrap();
+        assert!(store.read(second, &binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn insecure_or_symlinked_key_is_rejected_without_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Store::open(root.path()).unwrap());
+        let key = root.path().join("share-context-v1/key-v1");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Store::open_existing(root.path()).is_err());
+        assert!(Store::open(root.path()).is_err());
+        std::fs::remove_file(&key).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, [3u8; 32]).unwrap();
+        symlink(&target, &key).unwrap();
+        assert!(Store::open_existing(root.path()).is_err());
+        assert!(Store::open(root.path()).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), [3u8; 32]);
+    }
+
+    #[test]
+    fn keyed_fingerprints_and_snapshot_authentication_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let other = Store::open(other_root.path()).unwrap();
+        let first = store.fingerprint("provenance", &"private input").unwrap();
+        assert_eq!(
+            first,
+            store.fingerprint("provenance", &"private input").unwrap()
+        );
+        assert_ne!(
+            first,
+            store.fingerprint("journal", &"private input").unwrap()
+        );
+        assert_ne!(
+            first,
+            other.fingerprint("provenance", &"private input").unwrap()
+        );
+        let path = Path::new("/private/authenticated.jsonl");
+        let binding = binding();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"original"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        let json = std::fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+        envelope["context"]["prompt"] = serde_json::json!("tampered");
+        std::fs::write(json, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
     }
 
     #[test]

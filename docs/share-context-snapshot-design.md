@@ -39,7 +39,11 @@ cannot by itself prove what a newly configured runtime would expose now.
    before creating its session snapshot, so invalidating only at the current
    snapshot initialization point would be too late. A crash, concurrent writer, unavailable
    private storage, or interrupted write leaves it dirty. Only a clean,
-   quiescent shutdown can publish a clean snapshot for that generation.
+   quiescent shutdown can publish a clean snapshot for that generation. If a
+   runtime can proceed after failing to invalidate a previously published cache
+   (for example a read-only or failing filesystem), a later reader can mistake
+   the old generation for current. Integration must resolve this explicitly;
+   ignoring invalidation errors is unsafe.
 2. Immediately before session shutdown, capture the idle share context under
    the existing revision/idle validation. Bind it to a format version, the
    canonical session identity, session ID, head, and a cryptographic digest of
@@ -89,13 +93,15 @@ cannot by itself prove what a newly configured runtime would expose now.
 An isolated storage prototype now exists in `private_share_store`: on Linux and
 macOS it uses an owner-only directory and files, no-follow directory-relative
 operations, generation locks, durable invalidation, atomic publication, exact
-binding checks, and read-only legacy misses. macOS extended ACLs are rejected;
+journal/provenance binding checks, keyed filenames and fingerprints,
+authenticated envelopes,
+and read-only legacy misses. macOS extended ACLs are rejected;
 unverified Unix ACL semantics fail closed. Tests include a killed process,
 concurrent generations, old format, symlink substitution, and access modes.
 
 The prototype is not connected to live sessions or standalone sharing. The
-caller must still provide and revalidate complete provenance, the storage key
-must be protected against disclosure, Windows storage is not implemented, and
+caller must still provide and revalidate complete provenance, Windows storage
+is not implemented, the protection must receive independent review, and
 a safe legacy reconstruction path remains unresolved. In particular, a
 session/head keyed sidecar would produce misleading or unsafe results.
 
