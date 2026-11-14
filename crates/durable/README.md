@@ -82,11 +82,12 @@ names are conversation-scoped single-value keys: a wake consumes its key, and a 
 
 `TaskStore::commit_owned_tasks` and `prepare_owned_tasks` also expose the
 lower-level atomic checkpoint and child creation primitive to other hosts.
-Conversation abort does **not** propagate to hook children: they may continue
-running after the parent aborts, including after restart. Do not use hook tasks
-whose effects require parent cancellation until child-first abort and execution
-fencing are integrated. Task handler external effects require their own
-idempotency and reconciliation.
+Conversation abort atomically marks owned task descendants and fences new
+admissions. Cleanup runs child-first after restart when a task driver or
+scheduler is attached. Synchronous handlers cannot be interrupted and cleanup
+can replay after a crash; external effects require idempotency and reconciliation.
+All conversation-owned generic tasks are currently included because upstream
+foreground/background ownership boundaries are not yet represented.
 Current limits and differences from upstream Pi Durable:
 
 - Historical fork currently accepts settled snapshots, not every upstream entry.
@@ -100,8 +101,8 @@ Current limits and differences from upstream Pi Durable:
   tolerate replay after a crash; a missing handler produces a failed record.
   Handler steps run synchronously, so an abort request waits for the active step
   and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
-  cleanup. Conversation abort does not propagate to these generic tasks.
-  Shutdown waits for an in-flight step.
+  cleanup. Conversation abort marks all conversation-owned generic descendants;
+  separate subagent conversations are not included. Shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.
