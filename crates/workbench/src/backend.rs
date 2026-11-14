@@ -2237,6 +2237,7 @@ mod share_context_tests {
     #[test]
     fn hard_link_alias_can_bypass_path_keyed_invalidation() {
         use pi_rs_workbench::private_share_store::Store;
+        use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path()).unwrap();
         let original = root.path().join("original.jsonl");
@@ -2250,11 +2251,17 @@ mod share_context_tests {
             .unwrap();
         drop(session);
         std::fs::hard_link(&original, &alias).unwrap();
+        let first = std::fs::metadata(&original).unwrap();
+        let second = std::fs::metadata(&alias).unwrap();
+        assert_eq!((first.dev(), first.ino()), (second.dev(), second.ino()));
         let generation = invalidate_existing_share_generation(Some(&store), &alias)
             .unwrap()
             .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 1);
         // Different path keys leave the original cache valid even though the
-        // worker is using the same journal inode through the alias.
+        // worker used the same inode through an alias that no longer exists.
+        // Checking the current link count alone cannot discover that history.
         assert_eq!(
             store.read(&original, &binding).unwrap(),
             Some(json!({"old": true}))
