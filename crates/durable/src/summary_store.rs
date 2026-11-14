@@ -281,8 +281,7 @@ impl<'a> SummaryStore<'a> {
         id: Uuid,
         session_id: Uuid,
         preparation: Preparation,
-        conversation_key: Vec<u8>,
-        version: u64,
+        (conversation_key, version): (Vec<u8>, u64),
         provider: ProviderIdentity,
         auto_place: bool,
     ) -> Result<(), Error> {

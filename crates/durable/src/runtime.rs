@@ -9253,8 +9253,7 @@ impl Scheduler {
                 id,
                 conversation,
                 preparation.bind_context(generation),
-                Harness::key(conversation),
-                version,
+                (Harness::key(conversation), version),
                 provider,
                 auto_place,
             )

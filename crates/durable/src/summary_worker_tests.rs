@@ -527,10 +527,11 @@ async fn public_retry_replays_settlement_then_places_once() {
         IndependentCompactionStatus::Applied
     );
     assert_eq!(model.calls.lock().unwrap().len(), 1);
-    let receipts = model.settlements.lock().unwrap();
-    assert_eq!(receipts.len(), 2);
-    assert_eq!(receipts[0], receipts[1]);
-    drop(receipts);
+    {
+        let receipts = model.settlements.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0], receipts[1]);
+    }
     scheduler.shutdown().await.unwrap();
 }
 
@@ -1348,8 +1349,7 @@ async fn creation_rejects_a_changed_conversation_version() {
             id,
             conversation,
             preparation,
-            Harness::key(conversation),
-            version,
+            (Harness::key(conversation), version),
             identity(),
             false,
         ),
