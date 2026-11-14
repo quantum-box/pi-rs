@@ -39,6 +39,10 @@ type ApplicationEntryCut = (
     Vec<crate::application_entry::ApplicationEntry>,
     Option<InheritedApplicationPrefix>,
 );
+type ResolvedOccurrences = (
+    Vec<(Message, Option<MessageHistory>)>,
+    std::collections::HashSet<Uuid>,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -3058,17 +3062,17 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
         }
-        if let Some((_, _, summary_index, occurrences)) = &compacted_metadata {
-            if count - 1 != *summary_index {
-                let (message, history) = occurrences
-                    .get(count - 1)
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                let history = history
-                    .as_ref()
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                let original = self.original_occurrence_position(history, message)?;
-                return self.fork_at_position(history.origin, original);
-            }
+        if let Some((_, _, summary_index, occurrences)) = &compacted_metadata
+            && count - 1 != *summary_index
+        {
+            let (message, history) = occurrences
+                .get(count - 1)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let history = history
+                .as_ref()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let original = self.original_occurrence_position(history, message)?;
+            return self.fork_at_position(history.origin, original);
         }
         if count == messages.len() {
             return self.fork_at(id, record.cursor);
@@ -3501,13 +3505,7 @@ impl Harness {
         &self,
         id: Uuid,
         mut cursor: crate::transcript::Cursor,
-    ) -> Result<
-        (
-            Vec<(Message, Option<MessageHistory>)>,
-            std::collections::HashSet<Uuid>,
-        ),
-        Error,
-    > {
+    ) -> Result<ResolvedOccurrences, Error> {
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let mut changes = Vec::new();
         loop {
