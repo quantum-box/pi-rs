@@ -12,7 +12,8 @@ use crate::{
 };
 
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
-const FORMAT_VERSION: u32 = TURN_END_JOURNAL_VERSION;
+const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = BRANCH_FALLBACK_JOURNAL_VERSION;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,6 +228,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Atomically switch branches and select a host-resolved fallback model.
+    BranchModelSelected {
+        target: u64,
+        provider: String,
+        model: String,
+    },
     HostBound {
         scope_digest: String,
     },
@@ -360,6 +367,8 @@ pub enum Event {
     BranchSummary {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_model: Option<BranchFallbackModel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         extension_summary: Option<crate::ExtensionTreeSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<u64>,
@@ -377,6 +386,12 @@ pub enum Event {
     ExtensionStates {
         states: ExtensionStates,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BranchFallbackModel {
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Default)]
@@ -863,6 +878,11 @@ impl Session {
                         | Event::Compacted { .. }
                         | Event::SystemCheckpoint { .. }
                         | Event::ModelSelected { .. }
+                        | Event::BranchModelSelected { .. }
+                        | Event::BranchSummary {
+                            fallback_model: Some(_),
+                            ..
+                        }
                 )
                 .then_some(record.id)
             })
@@ -1024,6 +1044,17 @@ impl Session {
                     thinking,
                     provider,
                 } => Some((provider.clone(), model.clone(), thinking.clone())),
+                Event::BranchModelSelected {
+                    provider, model, ..
+                } => Some((Some(provider.clone()), model.clone(), None)),
+                Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => Some((
+                    Some(selection.provider.clone()),
+                    selection.model.clone(),
+                    None,
+                )),
                 _ => None,
             })
             .or_else(|| {
@@ -1040,6 +1071,11 @@ impl Session {
             .rev()
             .find_map(|record| match &record.event {
                 Event::ModelSelected { provider, .. } => Some(provider.as_deref()),
+                Event::BranchModelSelected { provider, .. } => Some(Some(provider.as_str())),
+                Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => Some(Some(selection.provider.as_str())),
                 _ => None,
             })
             .flatten()
@@ -1101,12 +1137,45 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn checkout_provider_model_atomic(
+        &mut self,
+        target: u64,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.validate_checkout(target)?;
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(Error::Config(
+                "fallback provider or model name is empty".into(),
+            ));
+        }
+        self.append_inner(
+            Event::BranchModelSelected {
+                target,
+                provider: provider.into(),
+                model: model.into(),
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
     // Older journals may contain only a thinking marker and its synthetic
     // ModelSelected record. An explicit model choice must establish a model.
     fn has_only_thinking_selection(&self) -> bool {
         let branch = self.branch();
         let mut saw_thinking = false;
         for (index, record) in branch.iter().enumerate().rev() {
+            if matches!(
+                record.event,
+                Event::BranchModelSelected { .. }
+                    | Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+            ) {
+                return false;
+            }
             if matches!(record.event, Event::ModelSelected { .. }) {
                 let thinking_only = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
                     matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
@@ -1158,6 +1227,7 @@ impl Session {
                 || (entry["type"] == "message" && entry["message"]["role"] == "assistant"),
             Event::ModelSelected { .. } => !index.checked_sub(1).and_then(|i| branch.get(i))
                 .is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")),
+            Event::BranchModelSelected { .. } | Event::BranchSummary { fallback_model: Some(_), .. } => true,
             Event::Assistant { request_id: Some(_), .. } => true,
             _ => false,
         })
@@ -1194,6 +1264,11 @@ impl Session {
         let branch = self.branch();
         for (index, record) in branch.iter().enumerate().rev() {
             match &record.event {
+                Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                } => return false,
                 Event::SourceEntry { format, entry } if format == "pi" => {
                     if entry["type"] == "model_change" {
                         return false;
@@ -1435,7 +1510,17 @@ impl Session {
     }
 
     pub(crate) fn recover_tree_trigger_handoff(&mut self) -> Result<Option<&Record>> {
-        let pending = self.records.iter().rev().find_map(|record| {
+        let pending = self
+            .pending_tree_trigger_handoff()
+            .map(|(_, return_to)| return_to);
+        match pending {
+            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn pending_tree_trigger_handoff(&self) -> Option<(u64, u64)> {
+        self.records.iter().rev().find_map(|record| {
             let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
                 return None;
             };
@@ -1443,12 +1528,54 @@ impl Session {
                 matches!(later.event,
                 Event::Checkout { target } if target == return_to)
             });
-            (!returned).then_some(return_to)
-        });
-        match pending {
-            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
-            None => Ok(None),
+            (!returned).then_some((record.id, return_to))
+        })
+    }
+
+    /// Resolve a transient handoff target before extracting a fork ancestry.
+    /// The marker can live on the other branch and must be inspected in the
+    /// complete source journal, not in the already-filtered fork records.
+    pub(crate) fn fork_target_after_handoff(&self, requested: u64) -> Result<u64> {
+        if requested == 0 || requested > self.records.len() as u64 {
+            return Err(Error::Session("invalid fork entry".into()));
         }
+        let mut target = requested;
+        if let Some((marker, return_to)) = self.pending_tree_trigger_handoff() {
+            let checkout =
+                self.records[marker as usize..]
+                    .iter()
+                    .find_map(|record| match record.event {
+                        Event::Checkout { target } => Some((record.id, target)),
+                        _ => None,
+                    });
+            let temporary_descendant = checkout.is_some_and(|(checkout_id, temporary)| {
+                requested == checkout_id
+                    || (requested > checkout_id
+                        && self
+                            .path(requested)
+                            .iter()
+                            .any(|record| record.id == temporary))
+            });
+            if requested == marker || requested == self.head || temporary_descendant {
+                target = return_to;
+            }
+        }
+        Ok(target)
+    }
+
+    pub(crate) fn fork_records_after_handoff(&self, requested: u64) -> Result<Vec<Record>> {
+        let mut records = self.fork_records(self.fork_target_after_handoff(requested)?)?;
+        // A handoff belongs to the source session. Once a fork's final target
+        // is chosen it must not replay a source handoff on reopen.
+        for record in &mut records {
+            if matches!(record.event, Event::TreeTriggerHandoff { .. }) {
+                record.event = Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                };
+            }
+        }
+        Ok(records)
     }
 
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
@@ -1816,6 +1943,11 @@ impl Session {
                         .get(return_to)
                         .ok_or_else(|| Error::Session("missing tree handoff branch".into()))?;
                 }
+                Event::BranchModelSelected { target, .. } => {
+                    *target = *ids
+                        .get(target)
+                        .ok_or_else(|| Error::Session("missing branch model target".into()))?;
+                }
                 Event::TurnFinished { assistant_record }
                 | Event::TurnEndCallbacksCompleted { assistant_record }
                 | Event::TurnEndBoundaryApplied { assistant_record } => {
@@ -1868,7 +2000,9 @@ impl Session {
                 records.push(Record {
                     timestamp: Some(record_timestamp()),
                     run_id: None,
-                    version: FORMAT_VERSION,
+                    version: records.last().map_or(TURN_END_JOURNAL_VERSION, |record| {
+                        record.version.max(TURN_END_JOURNAL_VERSION)
+                    }),
                     id,
                     parent: Some(id - 1),
                     event: Event::TreeMessageQueued { input },
@@ -1887,6 +2021,66 @@ impl Session {
             ));
         }
         publish_snapshot(&self.records, destination.as_ref())
+    }
+
+    /// Publish an already validated in-memory fork and keep the same locked
+    /// file handle, avoiding a reopen/recovery window after publication.
+    pub(crate) fn publish_and_bind_snapshot(&mut self, destination: &Path) -> Result<()> {
+        if self.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be exported by their host".into(),
+            ));
+        }
+        validated_head(&self.records)?;
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        let parent_dir = File::open(parent)?;
+        #[cfg(windows)]
+        let lock_file = {
+            let mut lock_path = destination.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)?;
+            lock.try_lock()
+                .map_err(|error| Error::Session(format!("cannot lock journal: {error}")))?;
+            lock
+        };
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        for record in &self.records {
+            let mut line = serde_json::to_vec(record)?;
+            line.push(b'\n');
+            if line.len() > MAX_RECORD_BYTES {
+                return Err(Error::Session("journal record exceeds size limit".into()));
+            }
+            temporary.write_all(&line)?;
+        }
+        temporary.as_file().sync_all()?;
+        #[cfg(not(windows))]
+        temporary
+            .as_file()
+            .try_lock()
+            .map_err(|error| Error::Session(format!("cannot lock journal: {error}")))?;
+        let file = temporary
+            .persist_noclobber(destination)
+            .map_err(|error| Error::Io(error.error))?;
+        #[cfg(unix)]
+        parent_dir.sync_all()?;
+        self.store = Box::new(FileStore {
+            file,
+            #[cfg(windows)]
+            lock_file,
+            #[cfg(unix)]
+            parent: parent.into(),
+        });
+        Ok(())
     }
 
     /// Create and open an independent, persistent branch with fresh session identity.
@@ -2019,6 +2213,7 @@ impl Session {
             _ => id,
         };
         let parent = match &event {
+            Event::BranchModelSelected { target, .. } => Some(*target),
             Event::BranchSummary {
                 target: Some(target),
                 ..
@@ -2036,10 +2231,26 @@ impl Session {
         {
             timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         }
+        let version = if matches!(
+            &event,
+            Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        ) {
+            BRANCH_FALLBACK_JOURNAL_VERSION
+        } else {
+            self.records
+                .last()
+                .map_or(TURN_END_JOURNAL_VERSION, |record| {
+                    record.version.max(TURN_END_JOURNAL_VERSION)
+                })
+        };
         let record = Record {
             timestamp: Some(timestamp),
             run_id: self.run_id,
-            version: FORMAT_VERSION,
+            version,
             id,
             parent,
             event,
@@ -2185,9 +2396,30 @@ fn validated_head(records: &[Record]) -> Result<u64> {
                 && !matches!(records[target as usize - 1].event, Event::Checkout { .. })
         };
         let expected_parent = match &record.event {
-            Event::BranchSummary { target, from, .. } => {
+            Event::BranchModelSelected {
+                target,
+                provider,
+                model,
+            } => {
+                if !is_prior_position(*target)
+                    || provider.trim().is_empty()
+                    || model.trim().is_empty()
+                {
+                    return Err(Error::Session("invalid branch model selection".into()));
+                }
+                Some(*target)
+            }
+            Event::BranchSummary {
+                target,
+                from,
+                fallback_model,
+                ..
+            } => {
                 if target.is_some_and(|target| !is_prior_position(target))
                     || from.is_some_and(|from| !is_prior_position(from))
+                    || fallback_model.as_ref().is_some_and(|model| {
+                        model.provider.trim().is_empty() || model.model.trim().is_empty()
+                    })
                 {
                     return Err(Error::Session("invalid branch summary position".into()));
                 }
@@ -2206,6 +2438,20 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             || matches!(record.event, Event::Created { .. }) != (id == 1)
         {
             return Err(Error::Session(format!("invalid journal record {id}")));
+        }
+        if record.version < BRANCH_FALLBACK_JOURNAL_VERSION
+            && matches!(
+                &record.event,
+                Event::BranchModelSelected { .. }
+                    | Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+            )
+        {
+            return Err(Error::Session(format!(
+                "invalid branch fallback version in record {id}"
+            )));
         }
         if let Event::ContextEdited {
             target,
@@ -3341,6 +3587,7 @@ mod session_metadata_tests {
             .unwrap();
         session
             .append(Event::BranchSummary {
+                fallback_model: None,
                 summary: "decision from the old branch".into(),
                 extension_summary: None,
                 from: Some(3),
