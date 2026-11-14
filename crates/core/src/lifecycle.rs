@@ -1,6 +1,9 @@
 //! Observation hooks for sessions, agent runs, and completed model turns.
+use crate::runtime::time as platform_time;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -290,10 +293,17 @@ impl LifecycleEvent {
 }
 
 pub(crate) fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        js_sys::Date::now().max(0.0) as u64
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
 }
 
 pub(crate) fn messages(session: &Session, include: impl Fn(u64) -> bool) -> Vec<LifecycleMessage> {
@@ -416,7 +426,7 @@ async fn notify_inner(
     observer: &mut Observer<'_>,
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
 ) {
-    let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
             && match event {
@@ -442,7 +452,7 @@ async fn notify_inner(
                 _ => true,
             }
     }) {
-        let error = match tokio::time::timeout_at(
+        let error = match platform_time::timeout_at(
             deadline,
             crate::sdk::scope_extension_callback(
                 host.as_ref().and_then(|host| host.callback_scope_owner()),

@@ -1,4 +1,5 @@
 //! Owned session API for embedding the agent in long-lived native applications.
+use crate::runtime::time as platform_time;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1572,7 +1573,7 @@ impl AgentSession {
         };
         let window = match self.limits.context_window {
             Some(window) => Some(window),
-            None => tokio::time::timeout(self.limits.model_timeout, model.context_window(&name))
+            None => platform_time::timeout(self.limits.model_timeout, model.context_window(&name))
                 .await
                 .ok()
                 .flatten(),
@@ -3553,13 +3554,13 @@ mod tests {
         let waiting = session.journal_async();
         tokio::pin!(waiting);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+            platform_time::timeout(std::time::Duration::from_millis(10), &mut waiting)
                 .await
                 .is_err()
         );
         drop(guard);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            platform_time::timeout(std::time::Duration::from_secs(1), waiting)
                 .await
                 .is_ok()
         );
@@ -7095,7 +7096,7 @@ mod tests {
         };
         let mut journal = session.session.lock().await;
         let mut input_queue = session.input.lock().await;
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut journal,
@@ -7248,7 +7249,7 @@ mod tests {
         };
         let mut journal = session.session.lock().await;
         let mut input_queue = session.input.lock().await;
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut journal,
@@ -7640,7 +7641,7 @@ mod tests {
                 .build(journal)
                 .unwrap();
             let control = session.controls();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(session.start(), async {
                     if cancel_run {
                         model.entered.notified().await;
@@ -8183,7 +8184,7 @@ mod tests {
             .find(|record| matches!(record.event, crate::Event::User { .. }))
             .unwrap()
             .id;
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.navigate_tree(selected, crate::TreeNavigationOptions::default()),
         )
@@ -8583,7 +8584,7 @@ mod tests {
                 .open(&path)
                 .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
             .await
             .unwrap()
             .unwrap();
@@ -8625,7 +8626,7 @@ mod tests {
                 .in_memory()
                 .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.compact_with_hooks(Compaction {
                 summary: "supplied".into(),
@@ -8855,7 +8856,7 @@ mod tests {
             .open(&path)
             .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
             .await
             .unwrap()
             .unwrap();
@@ -8882,9 +8883,10 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
-            .await
-            .unwrap();
+        let result =
+            platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+                .await
+                .unwrap();
         assert!(
             result
                 .unwrap_err()
@@ -9230,7 +9232,7 @@ mod tests {
             };
             let submit_control = control.clone();
             let submit = tokio::spawn(async move { submit_control.follow_up("queued").await });
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            platform_time::timeout(std::time::Duration::from_secs(3), async {
                 if shutdown_before_registration {
                     while !control.input_order.state.lock().unwrap().busy {
                         tokio::task::yield_now().await;
@@ -9244,7 +9246,7 @@ mod tests {
             control.request_shutdown();
             drop(journal);
             hook.release.notify_one();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(3), submit)
+            let result = platform_time::timeout(std::time::Duration::from_secs(3), submit)
                 .await
                 .expect("idle submission did not settle")
                 .unwrap();
@@ -9817,7 +9819,7 @@ mod tests {
             .open(path)
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), session.resume())
+            platform_time::timeout(std::time::Duration::from_secs(3), session.resume())
                 .await
                 .unwrap()
                 .unwrap(),
@@ -10131,7 +10133,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .expect("lifecycle host call deadlocked")
             .unwrap();
@@ -10214,7 +10216,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -10273,7 +10275,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -10342,7 +10344,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
             .await
             .unwrap()
             .unwrap();
@@ -10374,7 +10376,7 @@ mod tests {
             control.steer("queued user").await.unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("prompt"), driver)
         })
         .await
@@ -10436,7 +10438,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -10512,7 +10514,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+            platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
                 .await
                 .unwrap()
                 .unwrap();
@@ -11023,7 +11025,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -11158,7 +11160,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -11271,7 +11273,7 @@ mod tests {
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
         let cancel = CancellationToken::new();
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -12078,7 +12080,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(32);
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -12318,7 +12320,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -12447,7 +12449,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -12761,7 +12763,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
             .await
             .unwrap()
             .unwrap();
@@ -12792,7 +12794,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.controls().follow_up("queued"),
         )
@@ -12880,7 +12882,7 @@ mod tests {
             .in_memory()
             .unwrap();
         let control = session.controls();
-        let (queued, prompted) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (queued, prompted) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(control.follow_up("control"), async {
                 entered.notified().await;
                 release.notify_one();
@@ -12934,7 +12936,7 @@ mod tests {
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
         session.start().await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             control.follow_up("queued"),
         )
@@ -12998,7 +13000,7 @@ mod tests {
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
         session.start().await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             control.follow_up("queued"),
         )
@@ -13028,7 +13030,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         let sender = control.clone();
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(sender.steer("input"), async {
                 notified.notified().await;
                 control.abort();
@@ -13066,7 +13068,7 @@ mod tests {
             .in_memory()
             .unwrap();
         let control = session.controls();
-        let (result, closed) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, closed) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(control.steer("input"), async {
                 notified.notified().await;
                 session.close().await
@@ -13136,7 +13138,7 @@ mod tests {
         *slot.lock().unwrap() = Some(control.clone());
         let parent = control.clone();
         let external = control.clone();
-        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, second) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(parent.steer("parent"), async {
                 entered.notified().await;
                 let task = tokio::spawn(async move { external.follow_up("external").await });
@@ -13219,7 +13221,7 @@ mod tests {
             let control = session.controls();
             *slot.lock().unwrap() = Some(control.clone());
             let parent = control.clone();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(parent.steer("parent"), async {
                     ready.notified().await;
                     control.abort();
@@ -13329,7 +13331,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+        platform_time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
             .await
             .expect("spawned child deadlocked")
             .unwrap();
@@ -13360,7 +13362,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+        platform_time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
             .await
             .expect("startup child deadlocked")
             .unwrap();
@@ -13390,7 +13392,7 @@ mod tests {
             .in_memory()
             .unwrap();
         *slot.lock().unwrap() = Some(session.controls());
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.start())
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
             .await
             .expect("explicit startup deadlocked")
             .unwrap();
@@ -13507,7 +13509,7 @@ mod tests {
             let driver = control.clone();
             let baseline_retry = control.retry.settings();
             let baseline_tokens = control.auto_compaction.token_settings();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(driver.steer("parent"), async {
                     entered.notified().await;
                     assert!(control.auto_compaction.enabled());
@@ -13633,7 +13635,7 @@ mod tests {
                 .in_memory()
                 .unwrap();
             let control = session.controls();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(control.steer("parent"), async {
                     entered.notified().await;
                     let stale = saved.lock().unwrap().clone().unwrap();
@@ -13711,7 +13713,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.controls().steer("outer"),
         )
@@ -13753,7 +13755,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("parent"), async {
                 entered.notified().await;
                 let stale = saved.lock().unwrap().clone().unwrap();
@@ -13840,7 +13842,7 @@ mod tests {
             source: crate::InputSource::Extension,
             streaming_behavior: None,
         };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let result = platform_time::timeout(std::time::Duration::from_secs(3), async {
             let mut observer = |_: Notification<'_>| {};
             tokio::join!(
                 prepare_idle_input_with_host(
@@ -13911,7 +13913,7 @@ mod tests {
             .unwrap();
         session.prompt("first").await.unwrap();
         let target = session.journal().unwrap().head();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
         )
@@ -13939,7 +13941,7 @@ mod tests {
             .unwrap();
         session.prompt("first").await.unwrap();
         let target = session.journal().unwrap().head();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
         )
@@ -14266,7 +14268,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(2),
             session.prompt("parallel"),
         )
@@ -14444,7 +14446,7 @@ mod tests {
         let mut events = session.subscribe();
         let driver = async {
             while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
-            let removed = tokio::time::timeout(
+            let removed = platform_time::timeout(
                 std::time::Duration::from_secs(1),
                 control.clear_queued_inputs(),
             )
@@ -14485,7 +14487,7 @@ mod tests {
         control.follow_up("after compaction").await.unwrap();
         let driver = async {
             while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
-            let removed = tokio::time::timeout(
+            let removed = platform_time::timeout(
                 std::time::Duration::from_secs(1),
                 control.clear_queued_inputs(),
             )
@@ -14556,7 +14558,7 @@ mod tests {
             started.notified().await;
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(2), async {
             tokio::join!(session.prompt("cancel metadata lookup"), driver)
         })
         .await
@@ -14619,7 +14621,7 @@ mod tests {
             control.set_session_name("new name").await.unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -14651,7 +14653,7 @@ mod tests {
                 .unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -14684,7 +14686,7 @@ mod tests {
             assert_eq!(queued[0].input.content, "follow-up:ACTIVE");
             controls.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -14722,7 +14724,7 @@ mod tests {
                 }
             }
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait for abort"), abort)
         })
         .await
