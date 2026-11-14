@@ -3554,9 +3554,12 @@ both display modes, as well as the correlated RPC responses.
 
 ### Radius share presentation metadata
 
-Terminal `/share` appends Pi's `pi.share` entry with the active system prompt
-and tool schemas to Radius uploads. Idle shares use the worker's current
-runtime and branch; shares during a model request use the actual request context.
+Terminal `/share` appends Pi's `pi.share` entry with the session's system prompt
+and active tool schemas to Radius uploads. Idle and in-flight shares use the
+worker's session state; request-only `context_with_system` transformations do
+not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
+exposes interactive `/share`; the standalone `pi share` command is a pi-rs
+extension.
 The snapshot is matched to the session and head before upload, and a changed
 session requires a retry. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
