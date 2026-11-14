@@ -1101,7 +1101,15 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        self.lines.push(Entry::Notice(clean(text)));
+        // Keep U+0085 for transcript search only. Span rendering strips it
+        // before terminal output, as it does for other control characters.
+        let text = text
+            .chars()
+            .filter(|character| {
+                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
+            })
+            .collect();
+        self.lines.push(Entry::Notice(text));
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
             self.lines.drain(..removed);

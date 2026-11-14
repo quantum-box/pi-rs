@@ -29,17 +29,21 @@ pub struct Search {
 impl Search {
     pub fn input(&mut self, key: KeyEvent, keys: &Keys) {
         let action = keys.action(key, false).unwrap_or("");
-        if action == "tui.input.newLine" || self.editor.action(action) {
+        if action == "tui.input.newLine" || self.editor.search_action(action) {
             return;
         }
         if let KeyCode::Char(character) = key.code
-            && !character.is_control()
+            && (!character.is_control() || character == '\u{85}')
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
             && self.editor.text.len() + character.len_utf8() <= 4096
         {
-            self.editor.type_character(character);
+            if character == '\u{85}' {
+                self.editor.insert_search("\u{85}");
+            } else {
+                self.editor.type_character(character);
+            }
         }
     }
 
@@ -56,7 +60,7 @@ impl Search {
                 if count < 4 {
                     break;
                 }
-            } else if character.is_control() {
+            } else if character.is_control() && character != '\u{85}' {
                 continue;
             } else if character.len_utf8() <= remaining.saturating_sub(sanitized.len()) {
                 sanitized.push(character);
@@ -64,7 +68,7 @@ impl Search {
                 break;
             }
         }
-        self.editor.insert(&sanitized);
+        self.editor.insert_search(&sanitized);
     }
 
     pub fn overlay(&self, theme: &Theme, keys: &Keys, width: usize) -> (Vec<Line>, usize, usize) {
@@ -158,7 +162,7 @@ impl Search {
         let source_changed = self.rows.len() != lines.len()
             || self.rows.iter().zip(lines).any(|(text, line)| {
                 text.bytes()
-                    .ne(line.spans.iter().flat_map(|span| span.text.bytes()))
+                    .ne(line.spans.iter().flat_map(|span| span.searchable().bytes()))
             });
         let previous = self.matches.get(self.selected);
         let anchor = previous.map_or(top, |found| found[0].row);
@@ -166,7 +170,7 @@ impl Search {
         if source_changed {
             self.rows = lines
                 .iter()
-                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .map(|line| line.spans.iter().map(|span| span.searchable()).collect())
                 .collect();
         }
         if source_changed || query_changed {
@@ -252,6 +256,14 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
     }
     let mut corpus = String::new();
     let mut source = Vec::new();
+    let controls: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| {
+            row.match_indices('\u{85}')
+                .map(|(offset, _)| offset)
+                .collect()
+        })
+        .collect();
     for (row, text) in rows.iter().enumerate() {
         let mut append = |offset: usize, word: &str| {
             if !corpus.is_empty() {
@@ -322,9 +334,16 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
                             .unwrap_or((first, glyph));
                         first..last.0 + last.1.len()
                     };
+                    // Search-only U+0085 contributes no bytes to the terminal
+                    // span. Empty ranges still identify a navigable row.
+                    let display_offset = |offset: usize| {
+                        offset
+                            - controls[part.row].partition_point(|position| *position < offset)
+                                * '\u{85}'.len_utf8()
+                    };
                     Segment {
                         row: part.row,
-                        bytes,
+                        bytes: display_offset(bytes.start)..display_offset(bytes.end),
                     }
                 })
                 .collect()
@@ -350,11 +369,10 @@ mod tests {
         assert!(matches[0].iter().all(|segment| segment.row == 1));
         let mut search = Search::default();
         search.paste("a\u{feff}b\u{85}c");
-        // Editor and terminal spans deliberately remove C1 controls before
-        // searching; test this public path instead of assuming U+0085 survives.
-        assert_eq!(search.editor.text, "a\u{feff}bc");
+        assert_eq!(search.editor.text, "a\u{feff}b\u{85}c");
         let rendered = Line::plain("a\u{85}b", Color::Reset);
         assert_eq!(rendered.spans[0].text, "ab");
+        assert_eq!(rendered.spans[0].searchable(), "a\u{85}b");
     }
 
     #[test]
@@ -367,6 +385,151 @@ mod tests {
         let lines = [Line::plain("a b", Color::Reset)];
         assert_eq!(search.update(&lines, 0), Some(0..1));
         assert_eq!(search.query, "a b");
+        assert_eq!(search.result(), "1/1");
+    }
+
+    #[test]
+    fn search_only_control_is_navigable_and_never_drawn() {
+        let mut lines = [
+            Line::plain("a\u{85}b", Color::Reset),
+            Line::plain("x\u{85}y", Color::Reset),
+        ];
+        let mut search = Search::default();
+        search.paste("\u{85}");
+        assert_eq!(search.update(&lines, 0), Some(0..1));
+        assert_eq!(search.result(), "1/2");
+        assert_eq!(search.matches[0][0].bytes, 1..1);
+        search.navigate(true);
+        assert_eq!(search.update(&lines, 0), Some(1..2));
+        assert_eq!(search.result(), "2/2");
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        search.highlight(&mut lines, 0..2, &theme);
+        let mut bytes = Vec::new();
+        for line in &lines {
+            line.draw(&mut bytes, 20).unwrap();
+        }
+        assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+        let (overlay, _, _) = search.overlay(&theme, &Keys::default(), 30);
+        let mut bytes = Vec::new();
+        for line in overlay {
+            line.draw(&mut bytes, 30).unwrap();
+        }
+        assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+    }
+
+    #[test]
+    fn typed_control_and_sanitized_tool_output_keep_search_identity() {
+        use super::super::render::{Entry, TranscriptOptions};
+        let theme = Theme::system();
+        let entry = Entry::Tool {
+            id: "test".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+            output: "\x1b[31ma\u{85}b\x1b[0m".into(),
+            failed: false,
+            finished: true,
+            parts: vec![],
+            numbered_diff: false,
+        };
+        let lines = entry.render(&theme, 80, true, true, TranscriptOptions::default());
+        let mut search = Search::default();
+        search.input(
+            KeyEvent::new(KeyCode::Char('\u{85}'), KeyModifiers::NONE),
+            &Keys::default(),
+        );
+        search.update(&lines, 0);
+        assert_eq!(search.result(), "1/1");
+        let mut joined = Search::default();
+        joined.paste("ab");
+        joined.update(&lines, 0);
+        assert_eq!(joined.result(), "No matches");
+        let mut bytes = Vec::new();
+        for line in lines {
+            line.draw(&mut bytes, 80).unwrap();
+        }
+        assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+    }
+
+    #[test]
+    fn search_cache_tracks_invisible_source_changes() {
+        let mut search = Search::default();
+        search.paste("\u{85}");
+        let first = [Line::plain("a\u{85}b", Color::Reset)];
+        assert_eq!(search.update(&first, 0), Some(0..1));
+        let second = [Line::plain("ab", Color::Reset)];
+        search.update(&second, 0);
+        assert_eq!(search.result(), "No matches");
+        search.update(&first, 0);
+        assert_eq!(search.result(), "1/1");
+    }
+
+    #[test]
+    fn search_kill_yank_and_undo_preserve_control() {
+        let mut search = Search::default();
+        search.paste("a\u{85}b");
+        assert!(search.editor.search_action("tui.editor.deleteToLineStart"));
+        assert_eq!(search.editor.text, "");
+        assert!(search.editor.search_action("tui.editor.yank"));
+        assert_eq!(search.editor.text, "a\u{85}b");
+        assert!(search.editor.search_action("tui.editor.undo"));
+        assert_eq!(search.editor.text, "");
+    }
+
+    #[test]
+    fn search_metadata_survives_highlight_splits_and_rerender() {
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        for source in ["\u{85}é\u{85}b\u{85}", "a\u{85}\u{85}b"] {
+            let mut lines = [Line::plain(source, Color::Reset)];
+            let mut search = Search::default();
+            search.paste(if source.starts_with('a') { "a" } else { "é" });
+            search.update(&lines, 0);
+            search.highlight(&mut lines, 0..1, &theme);
+            let raw: String = lines[0].spans.iter().map(Span::searchable).collect();
+            assert_eq!(raw, source);
+            let mut control_search = Search::default();
+            control_search.paste("\u{85}");
+            control_search.update(&lines, 0);
+            assert_eq!(
+                control_search.matches.len(),
+                source.matches('\u{85}').count()
+            );
+            let mut bytes = Vec::new();
+            lines[0].draw(&mut bytes, 20).unwrap();
+            assert!(!bytes.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+        }
+    }
+
+    #[test]
+    fn search_tracks_control_through_markdown_and_wrapping() {
+        use super::super::render::{Entry, TranscriptOptions};
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        for content in [
+            "**a\u{85}b**",
+            "`a\u{85}b`",
+            "[a\u{85}b](https://x.example)",
+            "```\na\u{85}b\n```",
+            "```rust\nlet a = \"a\u{85}b\";\n```",
+            "| a\u{85}b |\n| --- |\n| value |",
+        ] {
+            let entry = Entry::Assistant(content.into());
+            let mut lines = entry.render(&theme, 40, false, false, TranscriptOptions::default());
+            let mut search = Search::default();
+            search.paste("a\u{85}b");
+            assert!(search.update(&lines, 0).is_some(), "{content:?}");
+            assert_eq!(search.result(), "1/1", "{content:?}");
+            let len = lines.len();
+            search.highlight(&mut lines, 0..len, &theme);
+            let mut output = Vec::new();
+            for line in lines {
+                line.draw(&mut output, 40).unwrap();
+            }
+            assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+        }
+        let span = Span::new("a\u{85}b", Color::Reset);
+        let lines = super::super::render::wrap(&[span], 1);
+        let mut search = Search::default();
+        search.paste("\u{85}");
+        assert!(search.update(&lines, 0).is_some());
         assert_eq!(search.result(), "1/1");
     }
 

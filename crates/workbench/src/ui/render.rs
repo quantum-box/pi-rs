@@ -23,6 +23,8 @@ use super::theme::Theme;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub text: String,
+    // Search-only text may retain U+0085; `text` is always terminal-safe.
+    search_text: Option<String>,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -35,8 +37,11 @@ pub struct Span {
 }
 impl Span {
     pub(super) fn new(text: impl Into<String>, color: Color) -> Self {
+        let text = text.into();
+        let search_text = text.contains('\u{85}').then(|| clean_for_search(&text));
         Self {
-            text: clean(&text.into()),
+            text: clean(&text),
+            search_text,
             color,
             background: None,
             bold: false,
@@ -47,6 +52,33 @@ impl Span {
             strikethrough: false,
             hyperlink: None,
         }
+    }
+    pub(super) fn searchable(&self) -> &str {
+        self.search_text.as_deref().unwrap_or(&self.text)
+    }
+    fn set_source(&mut self, text: &str) {
+        self.text = clean(text);
+        self.search_text = text.contains('\u{85}').then(|| clean_for_search(text));
+    }
+    fn search_slice(&self, range: Range<usize>) -> Option<String> {
+        let raw = self.search_text.as_ref()?;
+        let boundary = |target: usize| {
+            if target == self.text.len() {
+                return raw.len();
+            }
+            let mut visible = 0;
+            for (offset, character) in raw.char_indices() {
+                if visible == target {
+                    return offset;
+                }
+                if character != '\u{85}' {
+                    visible += character.len_utf8();
+                }
+            }
+            raw.len()
+        };
+        let result = &raw[boundary(range.start)..boundary(range.end)];
+        result.contains('\u{85}').then(|| result.to_owned())
     }
     pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
         let mut span = Self::new(text, theme.color(role));
@@ -94,7 +126,8 @@ impl Line {
                 ] {
                     if !range.is_empty() {
                         let mut piece = Span {
-                            text: span.text[range].into(),
+                            text: span.text[range.clone()].into(),
+                            search_text: span.search_slice(range),
                             ..span.clone()
                         };
                         if matched {
@@ -526,6 +559,13 @@ pub fn clean(text: &str) -> String {
         .replace('\t', "    ")
 }
 
+fn clean_for_search(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\u{85}'))
+        .collect::<String>()
+        .replace('\t', "    ")
+}
+
 pub(crate) fn strip_shell_ansi(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut result = String::with_capacity(text.len());
@@ -584,11 +624,15 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     for span in spans {
         let mut fragment = span.clone();
         fragment.text.clear();
-        for grapheme in span.text.graphemes(true) {
+        fragment.search_text = span.search_text.as_ref().map(|_| String::new());
+        for grapheme in span.searchable().graphemes(true) {
             let size = UnicodeWidthStr::width(grapheme);
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
                 fragment.text.clear();
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.clear();
+                }
                 lines.push(Line::default());
                 used = 0;
                 if grapheme == "\n" {
@@ -596,7 +640,14 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
                 }
             }
             if size <= width {
-                fragment.text.push_str(grapheme);
+                if grapheme.contains('\u{85}') {
+                    fragment.text.push_str(&clean(grapheme));
+                } else {
+                    fragment.text.push_str(grapheme);
+                }
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.push_str(grapheme);
+                }
                 used += size;
             }
         }
@@ -1727,7 +1778,7 @@ fn markdown_at_depth(
                         for (link_range, url) in bare_links(displayed) {
                             let Some(mut url) = url else {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.end]);
+                                plain.set_source(&displayed[cursor..link_range.end]);
                                 spans.push(plain);
                                 cursor = link_range.end;
                                 continue;
@@ -1743,7 +1794,7 @@ fn markdown_at_depth(
                             }
                             if cursor < link_range.start {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.start]);
+                                plain.set_source(&displayed[cursor..link_range.start]);
                                 spans.push(plain);
                             }
                             let raw_label = &displayed[link_range.clone()];
@@ -1754,7 +1805,7 @@ fn markdown_at_depth(
                                 raw_label.to_owned()
                             };
                             let mut link = span.clone();
-                            link.text = clean(&label);
+                            link.set_source(&label);
                             link.color = theme.color("mdLink");
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
@@ -1770,7 +1821,7 @@ fn markdown_at_depth(
                             cursor = link_range.end;
                         }
                         if cursor < displayed.len() {
-                            span.text = clean(&displayed[cursor..]);
+                            span.set_source(&displayed[cursor..]);
                             spans.push(span);
                         }
                     } else {
