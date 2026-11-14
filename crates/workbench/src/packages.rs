@@ -968,29 +968,33 @@ fn matches_source(entry: &Value, source: &str, base: &Path) -> bool {
         .and_then(|entry| normalize(entry, base).ok())
         .is_some_and(|entry| source_identity(&entry) == source_identity(source))
 }
+fn git_path_start(source: &str) -> usize {
+    if let Some((scheme, rest)) = source.split_once("://") {
+        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
+    } else {
+        source.find(':').map_or(0, |index| index + 1)
+    }
+}
+fn ambiguous_git_reference(source: &str) -> bool {
+    !source.contains('#')
+        && source[git_path_start(source)..]
+            .bytes()
+            .filter(|byte| *byte == b'@')
+            .count()
+            > 1
+}
 fn git_reference(source: &str) -> (&str, &str) {
     if let Some(parts) = source.split_once('#') {
         return parts;
     }
-    let path_start = if let Some((scheme, rest)) = source.split_once("://") {
-        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
-    } else {
-        source.find(':').map_or(0, |index| index + 1)
-    };
-    // Pi splits at the first @ in the repository path, leaving subsequent
-    // @ characters as part of the ref. Do not split the URL's userinfo.
+    // Keep the established native interpretation for ambiguous sources.
+    // `#ref` disambiguates repositories and refs containing `@`.
     match source
-        .get(path_start..)
-        .and_then(|path| path.find('@'))
-        .map(|index| path_start + index)
+        .rfind('@')
+        .filter(|index| *index >= git_path_start(source))
     {
-        Some(index)
-            if !source[path_start..index].trim_matches('/').is_empty()
-                && index + 1 < source.len() =>
-        {
-            (&source[..index], &source[index + 1..])
-        }
-        _ => (source, "HEAD"),
+        Some(index) => (&source[..index], &source[index + 1..]),
+        None => (source, "HEAD"),
     }
 }
 fn key(source: &str) -> String {
@@ -1082,6 +1086,11 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
+        if ambiguous_git_reference(specification) {
+            eprintln!(
+                "Ambiguous Git package source: using the last @ as the ref separator for compatibility; use #ref to disambiguate"
+            );
+        }
         let (url, reference) = git_reference(specification);
         if let Ok(parsed) = reqwest::Url::parse(url)
             && ((parsed.scheme() != "ssh" && !parsed.username().is_empty())
@@ -2796,26 +2805,34 @@ mod tests {
             ("git@host:org/repo@v1", "git@host:org/repo", "v1"),
             (
                 "git@host:org/repo@feature@v2",
-                "git@host:org/repo",
-                "feature@v2",
+                "git@host:org/repo@feature",
+                "v2",
             ),
             (
-                "ssh://git@host/org/repo@feature@v2",
+                "ssh://git@host/org/repo#feature@v2",
                 "ssh://git@host/org/repo",
                 "feature@v2",
             ),
             (
-                "https://host/org/repo@feature@v2",
+                "https://host/org/repo#feature@v2",
                 "https://host/org/repo",
                 "feature@v2",
             ),
             (
-                "https://user:secret@host/org/repo@feature@v2",
+                "https://user:secret@host/org/repo#feature@v2",
                 "https://user:secret@host/org/repo",
                 "feature@v2",
             ),
-            ("https://host/org/repo@", "https://host/org/repo@", "HEAD"),
-            ("git@host:@branch", "git@host:@branch", "HEAD"),
+            (
+                "https://host/org@team/repo@stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
+            (
+                "https://host/org@team/repo#stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
             ("git@host:org/repo", "git@host:org/repo", "HEAD"),
             (
                 "https://user@host/repo#old",
@@ -2826,19 +2843,33 @@ mod tests {
             assert_eq!(git_reference(source), (url, reference));
         }
         assert_eq!(
-            source_identity("git:ssh://git@host/org/repo@feature@v2"),
+            source_identity("git:ssh://git@host/org/repo#feature@v2"),
             source_identity("git:https://host/org/repo@main")
         );
         assert!(matches_source(
-            &json!({"source":"git:https://host/org/repo@feature@v2", "prompts":["+prompts/keep.md"]}),
+            &json!({"source":"git:https://host/org/repo#feature@v2", "prompts":["+prompts/keep.md"]}),
             "git:ssh://git@host/org/repo@main",
             Path::new("."),
         ));
         assert!(!matches_source(
-            &json!({"source":"git:https://host/org/repo@feature@v2"}),
+            &json!({"source":"git:https://host/org/repo#feature@v2"}),
             "git:https://host/org/other@main",
             Path::new("."),
         ));
+        assert_eq!(
+            source_identity("git:https://host/org@team/repo@stable"),
+            source_identity("git:https://host/org@team/repo#stable")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org@team/repo@stable", "prompts":["+prompts/keep.md"]}),
+            "git:https://host/org@team/repo#stable",
+            Path::new(".")
+        ));
+        assert!(ambiguous_git_reference("https://host/org@team/repo@stable"));
+        assert!(!ambiguous_git_reference(
+            "https://host/org@team/repo#stable"
+        ));
+        assert!(!ambiguous_git_reference("ssh://git@host/org/repo@stable"));
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {

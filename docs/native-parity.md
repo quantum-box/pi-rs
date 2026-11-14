@@ -1734,10 +1734,14 @@ and repository path, including default ports and `.git` suffixes. Revision and
 transport changes preserve per-package resource filters and scope precedence.
 Explicit non-default ports and case-sensitive repository paths remain distinct.
 Regression tests cover transport aliases, ports, revisions and missing local
-sources. As in Pi, the first `@` after a nonempty Git repository path starts a
-nonempty ref, so refs containing additional `@` characters remain intact and resolve to the
-same package identity as other refs. URL userinfo is not treated as a ref;
-existing credential-helper requirements and native `#ref` support remain.
+sources. Pi treats the first `@` in a Git repository path as a ref separator.
+For compatibility with existing native declarations, pi-rs retains its prior
+last-`@` interpretation when several occur and warns during installation. Use
+the native `#ref` separator to disambiguate, for example
+`git:https://host/team/repo#feature@v2` or
+`git:https://host/org@team/repo#stable`. Both forms preserve repository identity
+and resource filters. URL userinfo is not treated as a ref, and credential-helper
+requirements remain unchanged.
 
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
