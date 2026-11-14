@@ -48,7 +48,8 @@ impl ToolResultPatch {
     }
 }
 
-/// Partial text result update with an independently adjustable error status.
+/// Partial result update with an independently adjustable error status.
+/// Metadata-only patches retain structured content and attachments.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultPatchV2 {
     pub output: Option<String>,
@@ -58,6 +59,43 @@ pub struct ToolResultPatchV2 {
 
 impl ToolResultPatchV2 {
     pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        if let Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } = outcome
+        {
+            let existing_details = match outcome {
+                Outcome::StructuredWithDetails { details, .. } => Some(details.clone()),
+                _ => None,
+            };
+            let details = self.details.or(existing_details);
+            let is_error = self.is_error.unwrap_or_else(|| outcome.is_error());
+            if let Some(output) = self.output {
+                return Ok(Outcome::TextResult {
+                    output,
+                    details,
+                    is_error,
+                });
+            }
+            let mut data = data.clone();
+            if is_error != outcome.is_error() {
+                let object = data
+                    .as_object_mut()
+                    .ok_or("cannot change error status of non-object structured result")?;
+                object.insert("isError".into(), Value::Bool(is_error));
+            }
+            return Ok(match details {
+                Some(details) => Outcome::StructuredWithDetails {
+                    data,
+                    attachments: attachments.clone(),
+                    details,
+                },
+                None => Outcome::Structured {
+                    data,
+                    attachments: attachments.clone(),
+                },
+            });
+        }
         let (output, details, is_error) = match outcome {
             Outcome::Succeeded(output) => (output.clone(), None, false),
             Outcome::SucceededWithDetails { output, details } => {
@@ -814,6 +852,39 @@ tokio::task_local! {
     pub(crate) static STRUCTURED_PATCH_PRESERVATION: std::cell::Cell<(Option<bool>, bool)>;
 }
 
+// Error status is metadata for structured outcomes. Compare all other data
+// and attachment references without cloning potentially large image payloads.
+fn same_tool_result_content(original: &Outcome, updated: &Outcome) -> bool {
+    fn parts(value: &Outcome) -> Option<(&Value, &[crate::AttachmentRef])> {
+        match value {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } => Some((data, attachments)),
+            _ => None,
+        }
+    }
+    if let (Some((a, aa)), Some((b, ba))) = (parts(original), parts(updated)) {
+        if aa != ba {
+            return false;
+        }
+        return match (a.as_object(), b.as_object()) {
+            (Some(a), Some(b)) => {
+                let left = a.iter().filter(|(key, _)| *key != "isError");
+                left.clone().count() == b.iter().filter(|(key, _)| *key != "isError").count()
+                    && left
+                        .into_iter()
+                        .all(|(key, value)| b.get(key) == Some(value))
+            }
+            _ => a == b,
+        };
+    }
+    if parts(original).is_some() || parts(updated).is_some() {
+        return false;
+    }
+    original.tool_content() == updated.tool_content()
+}
+
 /// Run a result hook while retaining trustworthy output-field presence.
 #[doc(hidden)]
 pub async fn track_tool_result_presence(
@@ -836,7 +907,7 @@ pub async fn track_tool_result_presence(
             let preserves = preserves
                 && result
                     .as_ref()
-                    .is_none_or(|updated| updated.tool_content() == outcome.tool_content());
+                    .is_none_or(|updated| same_tool_result_content(outcome, updated));
             Ok((result, Some(preserves)))
         })
         .await
@@ -1294,7 +1365,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text results while preserving fields omitted by the handler.
+    /// Patch result fields while preserving fields omitted by the handler.
     async fn tool_result_patch(
         &self,
         _call: &crate::ToolCall,
@@ -1305,7 +1376,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text, metadata and error status independently. The default delegates
+    /// Patch output, metadata and error status independently. The default delegates
     /// to the original partial-patch hook for source compatibility.
     async fn tool_result_patch_v2(
         &self,

@@ -717,8 +717,15 @@ that capability and forward the field-presence result across the process boundar
 A duplex host remains available for nested calls even if it cannot send custom
 messages. Single-shot and duplex presence responses allow only the fixed wrapper
 overhead; the underlying outcome and nonterminal frames still obey their original
-limits. Older executables
-and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
+limits. Older executables and opaque overrides remain conservative when field
+presence is unavailable. Image reads use the same transient event path to project
+Pi's image structured result with its MIME type, encoded data and displayed note;
+image omission results project the note as a string. Existing image and event
+size limits remain in force; attachment-reference results are not synthesized.
+Structured image outcomes accept metadata-only result patches without losing
+content or the transient structured value; explicit text replacement discards
+both. Changing the error status of a non-object structured payload remains
+unsupported.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
@@ -2288,6 +2295,26 @@ Tests cover trailing input, edits, compaction, model changes, checkout, reopenin
 zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
 Complete native prompt checkpointing remains open.
+
+### Tool argument token estimates
+
+Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
+after parsing them. Native estimates now count JavaScript binary64 number
+rounding and exponent formatting as well as UTF-16 string units, including in
+imported assistant messages. To retain the correct binary64 value when imported
+JSON is first read, the shared `serde_json` parser enables `float_roundtrip`.
+This also changes decimal floating-point parsing throughout binaries that use the
+core crate, including model configuration, provider responses, tool arguments,
+and reserialized provider requests. Pi likewise parses JSON decimals as
+JavaScript numbers. Native integer values retain their existing exact integer
+representation, even above 2^53, and other native consumers may observe more
+accurate decimal rounding. Previously persisted rounded values cannot recover
+their original decimal representation. Regressions cover exponent cutoffs,
+integers beyond 2^53, negative zero, nested values and escaped Unicode against
+Node 24, as well as tool execution and an Anthropic loopback request. Inputs
+that Rust's JSON parser rejects, such as non-finite numeric overflow, retain the
+existing raw-input fallback, so complete JavaScript JSON parsing and
+token-estimator parity remain open.
 
 ### Directory listing limits checkpoint
 
