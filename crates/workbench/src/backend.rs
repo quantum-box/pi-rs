@@ -145,6 +145,8 @@ enum Request {
         session: PathBuf,
         #[serde(default)]
         journal_key: Option<[u8; 32]>,
+        #[serde(default)]
+        include_journal: bool,
     },
     ReadSession {
         request: serde_json::Value,
@@ -352,6 +354,22 @@ fn snapshot_for_share_with_hook(
 struct ShareCaptureStamp {
     revision: u64,
     idle: bool,
+}
+
+struct ShareCaptureSize(usize);
+impl std::io::Write for ShareCaptureSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        const LIMIT: usize = 128 * 1024 * 1024 - 64;
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|size| *size <= LIMIT)
+            .ok_or_else(|| std::io::Error::other("share journal capture is too large"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // Keep the journal that produced the context alongside it. A future durable
@@ -1725,12 +1743,23 @@ fn read_requests(
                     id,
                     session,
                     journal_key,
+                    include_journal,
                 } => {
                     let mut ready = share_ready.clone();
                     let snapshot = snapshot.clone();
                     let active = active.clone();
                     let slots = share_slots.clone();
                     runtime.spawn(async move {
+                        if include_journal && journal_key.is_none() {
+                            control_response(
+                                "get_share_context",
+                                id,
+                                Err(Error::Config(
+                                    "Journal capture requires a per-request journal key".into(),
+                                )),
+                            );
+                            return;
+                        }
                         while !*ready.borrow_and_update() {
                             if ready.changed().await.is_err() {
                                 return;
@@ -1744,8 +1773,21 @@ fn read_requests(
                             move || Session::snapshot(session).ok(),
                         )
                         .await
-                        .and_then(|(snapshot, _journal)| {
-                            serde_json::to_value(snapshot).map_err(Into::into)
+                        .and_then(|(snapshot, journal)| {
+                            if include_journal {
+                                serde_json::to_writer(
+                                    &mut ShareCaptureSize(0),
+                                    &(&snapshot, journal.records()),
+                                )
+                                .map_err(|_| {
+                                    Error::Config(
+                                        "Share journal capture is too large or invalid".into(),
+                                    )
+                                })?;
+                                Ok(json!({"snapshot":snapshot, "records":journal.records()}))
+                            } else {
+                                serde_json::to_value(snapshot).map_err(Into::into)
+                            }
                         });
                         control_response("get_share_context", id, result);
                     });

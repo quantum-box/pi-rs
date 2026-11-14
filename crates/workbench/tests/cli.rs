@@ -243,6 +243,46 @@ fn worker_returns_keyed_share_journal_tag() {
     mac.update(b"pi-rs-live-share-context-v2\0");
     mac.update(&serde_json::to_vec(&(journal.records(), &context)).unwrap());
     assert!(mac.verify_slice(&tag).is_ok());
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"no-key", "type":"get_share_context", "session":path, "include_journal":true})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let denied = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "no-key" {
+            break event;
+        }
+    };
+    assert_eq!(denied["success"], false, "{denied}");
+    writeln!(input, "{}", json!({"id":"paired", "type":"get_share_context", "session":path, "journal_key":key, "include_journal":true})).unwrap();
+    input.flush().unwrap();
+    let paired = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "paired" {
+            break event;
+        }
+    };
+    assert_eq!(paired["success"], true, "{paired}");
+    let records: Vec<pi_rs::Record> =
+        serde_json::from_value(paired["data"]["records"].clone()).unwrap();
+    let captured = Session::from_records(records).unwrap();
+    assert_eq!(captured.session_id(), journal.session_id());
+    assert_eq!(captured.head(), journal.head());
+    let context: WireContext =
+        serde_json::from_value(paired["data"]["snapshot"]["context"].clone()).unwrap();
+    let tag: [u8; 32] =
+        serde_json::from_value(paired["data"]["snapshot"]["journalTag"].clone()).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    mac.update(b"pi-rs-live-share-context-v2\0");
+    mac.update(&serde_json::to_vec(&(captured.records(), &context)).unwrap());
+    assert!(mac.verify_slice(&tag).is_ok());
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);
     while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
