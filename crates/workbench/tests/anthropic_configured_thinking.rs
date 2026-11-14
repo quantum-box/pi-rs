@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 enum FixtureEvent {
     Accepted,
+    Reading,
     RequestLine,
+    BodyReading,
     Finished,
 }
 
@@ -45,6 +47,67 @@ fn fixture_discovery_write(result: std::io::Result<()>, stopping: &AtomicBool) -
     }
 }
 
+// Poll blocking sockets so shutdown is bounded even where shutdown on a
+// duplicated socket does not interrupt another thread's in-flight read.
+const SOCKET_POLL: Duration = Duration::from_millis(100);
+const REQUEST_WAIT: Duration = Duration::from_secs(10);
+
+fn retryable_read(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+fn fixture_line(reader: &mut BufReader<TcpStream>, stopping: &AtomicBool) -> Option<String> {
+    let deadline = Instant::now() + REQUEST_WAIT;
+    let mut bytes = Vec::new();
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut byte = [0];
+        match reader.read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => {
+                bytes.push(byte[0]);
+                assert!(bytes.len() <= 64 * 1024, "fixture request line too long");
+                if byte[0] == b'\n' {
+                    return Some(String::from_utf8(bytes).expect("request line must be UTF-8"));
+                }
+            }
+            Err(error) if disconnected(&error) => return None,
+            Err(error) if retryable_read(&error) && Instant::now() < deadline => {}
+            Err(error) if retryable_read(&error) => return None,
+            Err(error) => panic!("read fixture line: {error}"),
+        }
+    }
+}
+
+fn fixture_body(
+    reader: &mut BufReader<TcpStream>,
+    bytes: &mut [u8],
+    stopping: &AtomicBool,
+) -> bool {
+    let deadline = Instant::now() + REQUEST_WAIT;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        match reader.read(&mut bytes[offset..]) {
+            Ok(0) => return false,
+            Ok(count) => offset += count,
+            Err(error) if disconnected(&error) => return false,
+            Err(error) if retryable_read(&error) && Instant::now() < deadline => {}
+            Err(error) => panic!("read request body: {error}"),
+        }
+    }
+    true
+}
+
 // Handle each accepted connection independently so an idle connection cannot
 // prevent the actual HTTP request from reaching its assertions.
 fn serve_connection(
@@ -58,49 +121,25 @@ fn serve_connection(
     // Windows inherits the listener's nonblocking mode on accept.
     // The buffered HTTP reader below relies on blocking reads.
     socket.set_nonblocking(false).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    socket
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    socket.set_read_timeout(Some(SOCKET_POLL)).unwrap();
+    socket.set_write_timeout(Some(SOCKET_POLL)).unwrap();
     let mut reader = BufReader::new(socket.try_clone().unwrap());
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return false,
-        Ok(_) => {}
-        Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            return false;
-        }
-        Err(error) => panic!("read request line: {error}"),
+    if let Some(progress) = &progress {
+        let _ = progress.send(FixtureEvent::Reading);
     }
-    if !line.ends_with('\n') {
+    let Some(request) = fixture_line(&mut reader, stopping) else {
         return false;
-    }
-    if let Some(progress) = progress {
+    };
+    if let Some(progress) = &progress {
         let _ = progress.send(FixtureEvent::RequestLine);
     }
-    let request = line.clone();
     let mut length = 0;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return false,
-            Ok(_) => {}
-            Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
-            Err(error) => panic!("read request headers: {error}"),
-        }
+        let Some(line) = fixture_line(&mut reader, stopping) else {
+            return false;
+        };
         if line == "\r\n" {
             break;
-        }
-        if !line.ends_with('\n') {
-            return false;
         }
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -145,10 +184,11 @@ fn serve_connection(
     }
     assert!(request.starts_with("POST /v1/messages "), "{request}");
     let mut bytes = vec![0; length];
-    match reader.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
-        Err(error) => panic!("read request body: {error}"),
+    if let Some(progress) = &progress {
+        let _ = progress.send(FixtureEvent::BodyReading);
+    }
+    if !fixture_body(&mut reader, &mut bytes, stopping) {
+        return false;
     }
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     if discovery != 0 {
@@ -401,7 +441,25 @@ fn idle_connection_does_not_block_following_model_request() {
             .unwrap()
         {
             FixtureEvent::RequestLine => break,
-            FixtureEvent::Accepted | FixtureEvent::Finished => {}
+            FixtureEvent::Accepted
+            | FixtureEvent::Reading
+            | FixtureEvent::BodyReading
+            | FixtureEvent::Finished => {}
+        }
+    }
+    let mut incomplete_body = TcpStream::connect(address).unwrap();
+    incomplete_body.write_all(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"partial\":").unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            FixtureEvent::BodyReading => break,
+            FixtureEvent::Accepted
+            | FixtureEvent::Reading
+            | FixtureEvent::RequestLine
+            | FixtureEvent::Finished => {}
         }
     }
     let mut request = TcpStream::connect(address).unwrap();
@@ -420,7 +478,7 @@ fn idle_connection_does_not_block_following_model_request() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("message_stop"));
     server.join().unwrap();
-    drop((idle, partial, incomplete_headers));
+    drop((idle, partial, incomplete_headers, incomplete_body));
 }
 
 #[test]
@@ -437,12 +495,24 @@ fn fixture_limits_connections_and_finishes_at_deadline() {
             "budgeted",
             "high",
             Some(accepted),
-            Duration::from_secs(1),
+            Duration::from_secs(2),
             1,
         )
     });
     let idle = TcpStream::connect(address).unwrap();
-    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut accepted_seen = false;
+    let mut reading_seen = false;
+    while !accepted_seen || !reading_seen {
+        match received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            FixtureEvent::Accepted => accepted_seen = true,
+            FixtureEvent::Reading => reading_seen = true,
+            other => panic!("unexpected fixture event: {other:?}"),
+        }
+    }
     let _queued = TcpStream::connect(address).unwrap();
     assert!(
         server.join().is_err(),
@@ -454,7 +524,7 @@ fn fixture_limits_connections_and_finishes_at_deadline() {
             .all(|event| !matches!(event, FixtureEvent::Accepted)),
         "only one connection may be accepted"
     );
-    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(start.elapsed() < Duration::from_secs(8));
     drop(idle);
 }
 
@@ -519,7 +589,10 @@ fn early_header_disconnect_does_not_block_following_request() {
                 .unwrap()
             {
                 FixtureEvent::Finished => break,
-                FixtureEvent::Accepted | FixtureEvent::RequestLine => {}
+                FixtureEvent::Accepted
+                | FixtureEvent::Reading
+                | FixtureEvent::RequestLine
+                | FixtureEvent::BodyReading => {}
             }
         }
     }
@@ -597,7 +670,10 @@ fn disconnected_discovery_client_does_not_block_model_request() {
                 .unwrap()
             {
                 FixtureEvent::Finished => break,
-                FixtureEvent::Accepted | FixtureEvent::RequestLine => {}
+                FixtureEvent::Accepted
+                | FixtureEvent::Reading
+                | FixtureEvent::RequestLine
+                | FixtureEvent::BodyReading => {}
             }
         }
         let mut request = TcpStream::connect(address).unwrap();
@@ -617,4 +693,43 @@ fn disconnected_discovery_client_does_not_block_model_request() {
         assert!(response.contains("message_stop"));
         server.join().unwrap();
     }
+}
+
+#[test]
+fn fragmented_request_survives_read_poll_timeouts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            None,
+            Duration::from_secs(10),
+            4,
+        )
+    });
+    let mut request = TcpStream::connect(address).unwrap();
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    request.write_all(b"POST /v1/mes").unwrap();
+    std::thread::sleep(SOCKET_POLL * 3);
+    let body = r#"{"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+    write!(
+        request,
+        "sages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        &body[..10]
+    )
+    .unwrap();
+    std::thread::sleep(SOCKET_POLL * 3);
+    request.write_all(&body.as_bytes()[10..]).unwrap();
+    let mut response = String::new();
+    request.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("message_stop"));
+    server.join().unwrap();
 }
