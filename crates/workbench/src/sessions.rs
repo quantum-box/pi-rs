@@ -912,12 +912,36 @@ pub(super) struct ShareSnapshot {
     pub journal_tag: Option<[u8; 32]>,
 }
 
-pub(super) fn share_journal_tag(session: &Session, key: &[u8; 32]) -> Result<[u8; 32]> {
-    use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
+type ShareJournalMac = hmac::Hmac<sha2::Sha256>;
+
+struct ShareJournalWriter<'a>(&'a mut ShareJournalMac);
+impl std::io::Write for ShareJournalWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use hmac::Mac;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn share_journal_mac(session: &Session, key: &[u8; 32]) -> Result<ShareJournalMac> {
+    use hmac::Mac;
+    let mut mac = ShareJournalMac::new_from_slice(key).expect("HMAC accepts 32 bytes");
     mac.update(b"pi-rs-live-share-journal-v1\0");
-    mac.update(&serde_json::to_vec(session.records())?);
-    Ok(mac.finalize().into_bytes().into())
+    // Avoid allocating another complete JSON copy of a large journal.
+    serde_json::to_writer(ShareJournalWriter(&mut mac), session.records())?;
+    Ok(mac)
+}
+
+pub(super) fn share_journal_tag(session: &Session, key: &[u8; 32]) -> Result<[u8; 32]> {
+    use hmac::Mac;
+    Ok(share_journal_mac(session, key)?
+        .finalize()
+        .into_bytes()
+        .into())
 }
 
 pub(super) fn verify_share_journal(
@@ -925,11 +949,8 @@ pub(super) fn verify_share_journal(
     key: &[u8; 32],
     tag: &[u8; 32],
 ) -> Result<bool> {
-    use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
-    mac.update(b"pi-rs-live-share-journal-v1\0");
-    mac.update(&serde_json::to_vec(session.records())?);
-    Ok(mac.verify_slice(tag).is_ok())
+    use hmac::Mac;
+    Ok(share_journal_mac(session, key)?.verify_slice(tag).is_ok())
 }
 
 pub(super) fn validate_live_share_journal(
