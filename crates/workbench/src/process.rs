@@ -497,10 +497,7 @@ impl Worker {
         Ok(slot.as_mut())
     }
 
-    pub(super) fn share_snapshot(
-        slot: &mut Option<Self>,
-        args: &Cli,
-    ) -> Result<super::sessions::ShareSnapshot> {
+    pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
         if slot
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
@@ -516,44 +513,9 @@ impl Worker {
                 "The active worker belongs to another session".into(),
             ));
         }
-        let id = json!(uuid::Uuid::new_v4());
+        let id = uuid::Uuid::new_v4();
         worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session}))?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(Error::Cancelled);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Config(
-                    "Timed out reading the active share context".into(),
-                ));
-            }
-            let event = match worker
-                .events
-                .recv_timeout(remaining.min(Duration::from_millis(50)))
-            {
-                Ok(event) => event,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => return Err(Error::Config("The share worker stopped".into())),
-            };
-            if event["type"] == "response"
-                && event["command"] == "get_share_context"
-                && event["id"] == id
-            {
-                if event["success"] != true {
-                    return Err(Error::Config(
-                        event["error"]
-                            .as_str()
-                            .unwrap_or("Could not read the share context")
-                            .into(),
-                    ));
-                }
-                return serde_json::from_value(event["data"].clone())
-                    .map_err(|_| Error::Config("Invalid share context".into()));
-            }
-            worker.pending_events.push(event);
-        }
+        Ok(id)
     }
 
     pub(super) fn notify_session_name(

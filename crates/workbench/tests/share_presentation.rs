@@ -327,7 +327,26 @@ fn terminal_shares_idle_and_during_model_request() {
     };
     wait_output(&mut master, "Enter to send");
     master.write_all(b"/share\r").unwrap();
-    let idle = share_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let receive_share = |master: &mut std::fs::File| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            if let Ok(value) = share_rx.try_recv() {
+                return value;
+            }
+            if let Ok(n) = master.read(&mut buffer) {
+                output.extend_from_slice(&buffer[..n]);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "share timed out: {}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let idle = receive_share(&mut master);
     let idle_context = idle.last().unwrap();
     assert_eq!(idle_context["customType"], "pi.share");
     assert!(
@@ -347,10 +366,149 @@ fn terminal_shares_idle_and_during_model_request() {
     master.write_all(b"hello\r").unwrap();
     started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
     master.write_all(b"/share\r").unwrap();
-    let active = share_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
     assert_eq!(active.last().unwrap()["data"], idle_context["data"]);
     release_tx.send(()).unwrap();
     shares.join().unwrap();
     model.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_radius_share_succeeds_without_selected_model_credentials() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::time::Instant;
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut headers = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.is_empty() || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+            headers.push_str(&line.to_ascii_lowercase());
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let body = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        tx.send((headers, bytes)).unwrap();
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("TERM", "xterm-256color")
+        .env("RADIUS_API_KEY", "radius-fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-extensions",
+            "--no-skills",
+            "--tui-mode",
+            "regular",
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-flash",
+        ])
+        .arg("--session")
+        .arg(root.path().join("session.jsonl"))
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let _child = KillOnDrop(child);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        if let Ok(n) = master.read(&mut buffer) {
+            output.extend_from_slice(&buffer[..n]);
+        }
+        if String::from_utf8_lossy(&output).contains("Enter to send") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal startup: {}",
+            String::from_utf8_lossy(&output)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"/share\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (headers, bytes) = loop {
+        if let Ok(value) = rx.try_recv() {
+            break value;
+        }
+        if let Ok(n) = master.read(&mut buffer) {
+            output.extend_from_slice(&buffer[..n]);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "share timed out: {}",
+            String::from_utf8_lossy(&output)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(headers.contains("authorization: bearer radius-fixture"));
+    let entries: Vec<Value> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["customType"] == "pi.share")
+    );
+    server.join().unwrap();
 }
