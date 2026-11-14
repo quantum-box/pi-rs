@@ -43,6 +43,11 @@ try {
     await restored.close(); restored.free();
     document.body.textContent = 'PASS';
   } else {
+  const originalSetItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function() { throw new DOMException('quota', 'QuotaExceededError'); };
+  try { await reject(BrowserSession.open('quota', base + '/gateway', 'test-model', '', 1500), 'storage write failed'); }
+  finally { Storage.prototype.setItem = originalSetItem; }
+  const quota = await BrowserSession.open('quota', base + '/gateway', 'test-model', '', 1500); await quota.close(); quota.free();
   localStorage.setItem('pi-rs:session:bad', 'invalid');
   await reject(BrowserSession.open('bad', base + '/gateway', 'test-model', '', 1500), 'expected value');
   localStorage.removeItem('pi-rs:session:bad');
