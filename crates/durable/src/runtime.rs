@@ -7248,6 +7248,85 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn attempt_discovery_fences_competing_claims_and_lifecycle_saves() {
+        use crate::observer::{Cursor, Observer};
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (base, version) = h.load(id).unwrap();
+        let operation_id = Uuid::new_v4();
+        let claim = |attempt_id| {
+            let mut state = base.clone();
+            state.tool_attempt = Some(ToolAttempt {
+                operation_id,
+                attempt_id,
+            });
+            state.phase = Phase::ToolRunning {
+                turns: 0,
+                calls: vec![],
+                index: 0,
+                operation_id,
+                replay: ReplayPolicy::Safe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: false,
+            };
+            state
+        };
+        let first = claim(Uuid::new_v4());
+        let competing = claim(Uuid::new_v4());
+        let winner = h.prepare_save(&first, Expected::Version(version)).unwrap();
+        let loser = h
+            .prepare_save(&competing, Expected::Version(version))
+            .unwrap();
+        h.commit_conversation_save(winner).unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(loser),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        let limit = std::num::NonZeroUsize::new(10).unwrap();
+        let attempts = || h.tool_attempts(id, Cursor(0), limit).unwrap().records;
+        assert_eq!(attempts().len(), 1);
+        assert_eq!(
+            attempts()[0].value["attempt"],
+            serde_json::json!(first.tool_attempt())
+        );
+        assert!(
+            Observer::new(h.owner.store(), id)
+                .read(Cursor(0), limit)
+                .unwrap()
+                .records
+                .iter()
+                .all(|r| r.value.get("attempt").is_none())
+        );
+        assert!(
+            Observer::tool_progress(h.owner.store(), id)
+                .read(Cursor(0), limit)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        let (mut state, version) = h.load(id).unwrap();
+        state.abort_requested = true;
+        h.save(&state, Expected::Version(version)).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        state.phase = Phase::Idle;
+        h.save(&state, Expected::Version(version)).unwrap();
+        let page = h.tool_attempts(id, Cursor(0), limit).unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            page.records[0].value["attempt"],
+            serde_json::json!(first.tool_attempt())
+        );
+    }
+
+    #[test]
     fn legacy_running_attempt_is_not_backfilled_and_new_claim_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let model = Arc::new(GatedModel {
