@@ -686,8 +686,9 @@ explicitly replace output, including with the same text. Custom host hooks may
 opt in to reporting output-field presence; native executable extensions negotiate
 that capability and forward the field-presence result across the process boundary.
 A duplex host remains available for nested calls even if it cannot send custom
-messages. Single-shot presence responses allow only the fixed wrapper overhead;
-the underlying outcome still obeys the original response limit. Older executables
+messages. Single-shot and duplex presence responses allow only the fixed wrapper
+overhead; the underlying outcome and nonterminal frames still obey their original
+limits. Older executables
 and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
