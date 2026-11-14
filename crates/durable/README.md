@@ -239,8 +239,14 @@ the selection and take effect if later registered. The filter applies to model
 specs, model-issued and nested dispatch, and interrupted-tool recovery. It
 also applies to global and selected extension tools. Forks retain the captured
 selection; independently created named children start unrestricted, while
-history-seeded children inherit the parent snapshot. Set a child selection before
-submitting work. This limits tool dispatch, not other effects of trusted tools,
+history-seeded children inherit the parent snapshot unless explicitly restricted.
+Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
+initial child allowlist to the durable reservation before submission. For task-owned
+children, `ensure_task_owned_subagent_restricted` and
+`submit_task_owned_subagent_restricted` commit the selection with the child and,
+for submit, its initial input. The selection is part of the reservation identity:
+a retry with a different selection fails, even after reopening. Existing child
+selections may subsequently be changed using the settled-conversation API. This limits tool dispatch, not other effects of trusted tools,
 hooks, or host APIs.
 
 An embedding host can opt in to a parent-bound `subagent` extension with
@@ -249,6 +255,10 @@ Create the parent first with `Harness::open_paused`, then open the scheduler and
 select `subagent_management::extension_name(parent)` on that settled parent,
 preserving any other selected extensions. On reopen use the same constructor,
 parent and child configuration: the extension must be installed before recovery.
+For restricted children use `Scheduler::open_with_restricted_subagent_management`
+with an explicit child allowlist, including on reopen. `None` retains the existing
+unrestricted behavior; `Some(vec![])` disables all child tools. The bound selection
+is recorded per named child, and changing it for an existing name is rejected.
 The tool exposes `list` and `send` (optional `follow_up` or `steer` mode).
 A send creates the named child if needed and queues its answer as a parent
 follow-up. Calls with the same persisted operation ID reuse the first message,
@@ -269,9 +279,8 @@ agent definition, working directory, history inheritance, or recursion policy is
 provided. Named links are independent, not task-owned background anchors.
 
 This is not the complete upstream background-subagent extension. There is no
-automatic child-tool restriction or ownership tree for these named links.
-Tool selection is not an atomic child admission policy and the management
-tool submits children immediately; do not rely on it to create restricted children. Named links do not inherit parent extensions.
+default child-tool restriction or ownership tree for these named links. Explicit
+restrictions are opt-in. Named children do not inherit parent management extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.

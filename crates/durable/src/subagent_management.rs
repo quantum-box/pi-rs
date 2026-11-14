@@ -20,13 +20,19 @@ pub fn extension_name(parent: Uuid) -> String {
     format!("{EXTENSION_PREFIX}{parent}")
 }
 
-pub(crate) fn extension(harness: Harness, parent: Uuid, config: Config) -> Extension {
+pub(crate) fn extension(
+    harness: Harness,
+    parent: Uuid,
+    config: Config,
+    allowed_tools: Option<Vec<String>>,
+) -> Extension {
     Extension {
         name: extension_name(parent),
         tools: vec![Arc::new(Management {
             harness: Mutex::new(harness),
             parent,
             config,
+            allowed_tools,
         })],
         ..Extension::default()
     }
@@ -36,6 +42,7 @@ struct Management {
     harness: Mutex<Harness>,
     parent: Uuid,
     config: Config,
+    allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -121,11 +128,12 @@ impl Tool for Management {
                         _ => InputMode::FollowUp,
                     },
                 };
-                match harness.submit_subagent_reported(
+                match harness.submit_subagent_reported_restricted(
                     self.parent,
                     &name,
                     self.config.clone(),
                     input,
+                    self.allowed_tools.clone(),
                 ) {
                     Ok((link, submission)) => Outcome::Succeeded(format!(
                         "Sent to {name} (child {}, request {}). The answer will be reported asynchronously.",
@@ -197,6 +205,7 @@ mod tests {
             harness: Mutex::new(h),
             parent,
             config: config(),
+            allowed_tools: None,
         };
         let op = Uuid::new_v4();
         let args = json!({"action":"send","name":"worker","message":"hello"});
@@ -242,6 +251,7 @@ mod tests {
             harness: Mutex::new(h),
             parent,
             config: config(),
+            allowed_tools: None,
         };
         let after_restart = tool.invoke(args, context(op)).await;
         assert_eq!(format!("{first:?}"), format!("{after_restart:?}"));
@@ -285,6 +295,133 @@ mod tests {
         );
         scheduler.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn restricted_child_is_configured_before_first_dispatch_and_reopen() {
+        use crate::{recovery::ReplayPolicy, runtime::RegisteredTool};
+        struct Forbidden;
+        #[async_trait]
+        impl Tool for Forbidden {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "forbidden".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("forbidden tool executed")
+            }
+        }
+        struct Inspect;
+        #[async_trait]
+        impl Model for Inspect {
+            async fn stream(&self, req: ModelRequest) -> Result<ModelStream, Error> {
+                if req.messages.iter().any(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "hello"),
+                ) {
+                    assert!(
+                        req.tools.is_empty(),
+                        "child must be restricted on its first dispatch"
+                    );
+                }
+                Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                })])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = || {
+            let mut o = options();
+            o.model = Arc::new(Inspect);
+            o.tools.push(RegisteredTool {
+                tool: Arc::new(Forbidden),
+                replay: ReplayPolicy::Safe,
+            });
+            o
+        };
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        h.select_tools(parent, Some(vec!["forbidden".into()]))
+            .unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: Some(vec![]),
+        };
+        let op = Uuid::new_v4();
+        let args = json!({"action":"send","name":"worker","message":"hello"});
+        assert!(matches!(
+            tool.invoke(args.clone(), context(op)).await,
+            Outcome::Succeeded(_)
+        ));
+        let child = tool
+            .harness
+            .lock()
+            .unwrap()
+            .subagent(parent, "worker")
+            .unwrap()
+            .unwrap()
+            .child;
+        assert_eq!(
+            tool.harness
+                .lock()
+                .unwrap()
+                .conversation(parent)
+                .unwrap()
+                .allowed_tools,
+            Some(vec!["forbidden".into()])
+        );
+        drop(tool);
+        let scheduler = Scheduler::open_with_restricted_subagent_management(
+            &path,
+            opts(),
+            Default::default(),
+            parent,
+            config(),
+            Some(vec![]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    scheduler.conversation(child).unwrap().submissions[0].status,
+                    crate::runtime::Status::Done { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scheduler.conversation(child).unwrap().allowed_tools,
+            Some(vec![])
+        );
+        scheduler.shutdown().await.unwrap();
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        assert!(
+            h.ensure_subagent_restricted(
+                parent,
+                "worker",
+                config(),
+                false,
+                Some(vec!["forbidden".into()])
+            )
+            .is_err()
+        );
+        assert_eq!(
+            h.ensure_subagent_restricted(parent, "worker", config(), false, Some(vec![]))
+                .unwrap()
+                .child,
+            child
+        );
+    }
+
     struct CallingModel;
     #[async_trait]
     impl Model for CallingModel {

@@ -694,6 +694,19 @@ impl Drop for ResumeGuard {
         }
     }
 }
+pub(crate) fn validate_allowed_tools(names: &Option<Vec<String>>) -> Result<(), Error> {
+    if let Some(names) = names {
+        let mut seen = std::collections::HashSet::new();
+        if names
+            .iter()
+            .any(|name| name.is_empty() || !seen.insert(name))
+        {
+            return Err(Error::Invalid("empty or duplicate selected tool".into()));
+        }
+    }
+    Ok(())
+}
+
 impl Harness {
     /// Read committed extension error batches. Batches remain available after reopening.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
@@ -942,15 +955,7 @@ impl Harness {
                 "tool selection requires a settled conversation".into(),
             ));
         }
-        if let Some(names) = &names {
-            let mut seen = std::collections::HashSet::new();
-            if names
-                .iter()
-                .any(|name| name.is_empty() || !seen.insert(name))
-            {
-                return Err(Error::Invalid("empty or duplicate selected tool".into()));
-            }
-        }
+        validate_allowed_tools(&names)?;
         c.allowed_tools = names;
         self.save(&c, Expected::Version(version))
     }
@@ -1587,6 +1592,9 @@ impl Harness {
         }
         state.tool_attempt = None;
         state.id = child;
+        state
+            .extensions
+            .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
         state.config = config;
         state.submissions.clear();
         for write in &mut state.application_writes {
@@ -4788,13 +4796,37 @@ impl Scheduler {
         parent: Uuid,
         child_config: Config,
     ) -> Result<Self, Error> {
-        Self::open_configured(path, options, registry, Some((parent, child_config)), None)
+        Self::open_configured(
+            path,
+            options,
+            registry,
+            Some((parent, child_config, None)),
+            None,
+        )
+    }
+    /// Install management with an initial child allowlist before recovery.
+    pub fn open_with_restricted_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        validate_allowed_tools(&allowed_tools)?;
+        Self::open_configured(
+            path,
+            options,
+            registry,
+            Some((parent, child_config, allowed_tools)),
+            None,
+        )
     }
     fn open_configured(
         path: impl AsRef<Path>,
         options: Options,
         registry: crate::extension::Registry,
-        management: Option<(Uuid, Config)>,
+        management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
         tokio::runtime::Handle::try_current()
@@ -4804,13 +4836,16 @@ impl Scheduler {
             harness.install_provider_adapter(adapter)?;
         }
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
-        if let Some((parent, config)) = management {
+        if let Some((parent, config, allowed_tools)) = management {
             harness.conversation(parent)?;
             let mut worker = harness.worker();
             worker.extensions =
                 Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
             harness.install_extension(crate::subagent_management::extension(
-                worker, parent, config,
+                worker,
+                parent,
+                config,
+                allowed_tools,
             ))?;
         }
         let ids = harness.conversations()?;

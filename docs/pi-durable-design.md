@@ -23,7 +23,11 @@ of accepted external jobs are supported. Background workers repoll pending jobs,
 and nested calls are journaled with parent-owned identities. This is a subset of the design below,
 not complete upstream parity: tool-output progress is not automatically wired into the runtime,
 and entry-ID forks, full observer semantics, and distributed storage remain incomplete.
-The current capabilities and limits are documented in `crates/durable/README.md`.
+The current capabilities and limits are documented in `crates/durable/README.md`. Restricted task-owned children can atomically commit an initial tool
+allowlist with their first input. Named background children can opt into a
+reservation-bound initial allowlist before submission, including through the
+parent-bound management extension. These controls remain pi-rs host APIs, not
+the complete upstream task and subagent extension semantics.
 
 The experimental `tool_progress` API provides opt-in, bounded replacement
 partials and a scoped `ToolHost` adapter. Hosts must explicitly connect a sink,

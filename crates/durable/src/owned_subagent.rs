@@ -18,6 +18,9 @@ pub struct Admission {
     pub child: Uuid,
     pub config: Config,
     pub mode: Mode,
+    /// Initial tool selection, bound to this reservation.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
     /// Initial submission, if this reservation was created with input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<InitialSubmission>,
@@ -57,7 +60,7 @@ impl Harness {
         config: Config,
         mode: Mode,
     ) -> Result<Admission, Error> {
-        self.admit_task_owned_subagent(task, owner, name, config, mode, None)
+        self.admit_task_owned_subagent(task, owner, name, config, mode, None, None)
     }
 
     /// Atomically reserve a child and admit its first input. The key permanently
@@ -75,7 +78,44 @@ impl Harness {
         if content.trim().is_empty() {
             return Err(invalid());
         }
-        self.admit_task_owned_subagent(task, owner, name, config, mode, Some(content))
+        self.admit_task_owned_subagent(task, owner, name, config, mode, Some(content), None)
+    }
+
+    /// Atomically create an owned child with its initial tool selection.
+    pub fn ensure_task_owned_subagent_restricted(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Admission, Error> {
+        self.admit_task_owned_subagent(task, owner, name, config, mode, None, allowed_tools)
+    }
+    /// Atomically create a restricted child and queue its first input.
+    pub fn submit_task_owned_subagent_restricted(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        content: String,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Admission, Error> {
+        if content.trim().is_empty() {
+            return Err(invalid());
+        }
+        self.admit_task_owned_subagent(
+            task,
+            owner,
+            name,
+            config,
+            mode,
+            Some(content),
+            allowed_tools,
+        )
     }
 
     fn admit_task_owned_subagent(
@@ -86,7 +126,9 @@ impl Harness {
         config: Config,
         mode: Mode,
         content: Option<String>,
+        allowed_tools: Option<Vec<String>>,
     ) -> Result<Admission, Error> {
+        crate::runtime::validate_allowed_tools(&allowed_tools)?;
         if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
             return Err(invalid());
         }
@@ -100,6 +142,7 @@ impl Harness {
                     || a.key != name
                     || a.config != config
                     || a.mode != mode
+                    || a.allowed_tools != allowed_tools
                     || a.submission.as_ref().map(|s| &s.content) != content.as_ref()
                     || a.task_owner == TaskOwner::Conversation(a.child)
                 {
@@ -148,6 +191,7 @@ impl Harness {
                 child,
                 config: config.clone(),
                 mode,
+                allowed_tools: allowed_tools.clone(),
                 submission: content.as_ref().map(|content| InitialSubmission {
                     id: Uuid::new_v4(),
                     content: content.clone(),
@@ -161,6 +205,7 @@ impl Harness {
             };
             let ek = ownership_edge::edge_key(child);
             let mut child_state = Harness::empty_conversation(child, config.clone());
+            child_state.allowed_tools = allowed_tools.clone();
             if let Some(initial) = &a.submission {
                 child_state.admit_initial_input(initial.id, initial.content.clone());
             }
@@ -223,6 +268,44 @@ impl Scheduler {
             .submit_task_owned_subagent(task, owner, name, config, mode, content)?;
         self.schedule(admission.child);
         Ok(admission)
+    }
+
+    /// Commit a restricted child and initial input before scheduling it.
+    pub fn submit_task_owned_subagent_restricted(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        content: String,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Admission, Error> {
+        let admission = self
+            .subagent_harness()
+            .submit_task_owned_subagent_restricted(
+                task,
+                owner,
+                name,
+                config,
+                mode,
+                content,
+                allowed_tools,
+            )?;
+        self.schedule(admission.child);
+        Ok(admission)
+    }
+    pub fn ensure_task_owned_subagent_restricted(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Admission, Error> {
+        self.subagent_harness()
+            .ensure_task_owned_subagent_restricted(task, owner, name, config, mode, allowed_tools)
     }
 
     /// Reserve an owned child without scheduling it.
@@ -294,6 +377,100 @@ mod tests {
             .unwrap();
         (task.id(), owner)
     }
+    #[test]
+    fn restricted_admission_binds_selection_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let allowed = Some(vec!["read".to_string()]);
+        let a = h
+            .submit_task_owned_subagent_restricted(
+                task,
+                owner.clone(),
+                "restricted",
+                config(),
+                Mode::Foreground,
+                "work".into(),
+                allowed.clone(),
+            )
+            .unwrap();
+        assert_eq!(h.conversation(a.child).unwrap().allowed_tools, allowed);
+        assert_eq!(h.conversation(a.child).unwrap().submissions.len(), 1);
+        assert!(
+            h.submit_task_owned_subagent_restricted(
+                task,
+                owner.clone(),
+                "restricted",
+                config(),
+                Mode::Foreground,
+                "work".into(),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            h.ensure_task_owned_subagent_restricted(
+                task,
+                owner.clone(),
+                "bad",
+                config(),
+                Mode::Foreground,
+                Some(vec!["x".into(), "x".into()])
+            )
+            .is_err()
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.submit_task_owned_subagent_restricted(
+                task,
+                owner,
+                "restricted",
+                config(),
+                Mode::Foreground,
+                "work".into(),
+                allowed
+            )
+            .unwrap(),
+            a
+        );
+    }
+
+    #[test]
+    fn restricted_concurrent_admissions_share_one_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let mut worker = h.worker();
+                let owner = owner.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    worker
+                        .submit_task_owned_subagent_restricted(
+                            task,
+                            owner,
+                            "job",
+                            config(),
+                            Mode::Foreground,
+                            "work".into(),
+                            Some(vec!["read".into()]),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert!(results.iter().all(|a| a == &results[0]));
+        let child = h.conversation(results[0].child).unwrap();
+        assert_eq!(child.allowed_tools, Some(vec!["read".into()]));
+        assert_eq!(child.submissions.len(), 1);
+    }
+
     #[test]
     fn submitted_child_is_atomic_idempotent_and_fenced() {
         let dir = tempfile::tempdir().unwrap();

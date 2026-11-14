@@ -63,6 +63,8 @@ struct Reservation {
     #[serde(default)]
     history: bool,
     #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
     seed: Option<Conversation>,
 }
 /// The durable input and creation mode for a background report.
@@ -177,6 +179,19 @@ impl Harness {
         config: Config,
         history: bool,
     ) -> Result<Link, Error> {
+        self.ensure_subagent_restricted(parent, name, config, history, None)
+    }
+
+    /// Reserve a child with its initial tool selection before any input can be admitted.
+    pub fn ensure_subagent_restricted(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        config: Config,
+        history: bool,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Link, Error> {
+        crate::runtime::validate_allowed_tools(&allowed_tools)?;
         if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
             return Err(Error::Invalid(
                 "subagent key, model and output limit required".into(),
@@ -186,7 +201,10 @@ impl Harness {
         let k = key(parent, name);
         let reservation = loop {
             if let Some(reservation) = self.reservation(parent, name)? {
-                if reservation.link.config != config || reservation.history != history {
+                if reservation.link.config != config
+                    || reservation.history != history
+                    || reservation.allowed_tools != allowed_tools
+                {
                     return Err(Error::Invalid(
                         "subagent configuration or history mode changed".into(),
                     ));
@@ -200,13 +218,18 @@ impl Harness {
                 config: config.clone(),
             };
             let seed = if history {
-                Some(self.subagent_seed(parent, link.child, config.clone())?)
+                let mut seed = self.subagent_seed(parent, link.child, config.clone())?;
+                if allowed_tools.is_some() {
+                    seed.allowed_tools = allowed_tools.clone();
+                }
+                Some(seed)
             } else {
                 None
             };
             let reservation = Reservation {
                 link,
                 history,
+                allowed_tools: allowed_tools.clone(),
                 seed,
             };
             match self.subagent_store()?.commit(
@@ -240,9 +263,21 @@ impl Harness {
                     if seed.id != link.child || seed.config != link.config {
                         return Err(Error::Invalid("invalid subagent seed".into()));
                     }
-                    self.create_subagent_from_seed(&seed)?;
+                    match self.create_subagent_from_seed(&seed) {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                            self.conversation(link.child)?;
+                        }
+                        other => other?,
+                    };
                 } else {
-                    self.create_conversation_with_id(link.child, link.config.clone())?;
+                    let mut child = Harness::empty_conversation(link.child, link.config.clone());
+                    child.allowed_tools = reservation.allowed_tools;
+                    match self.create_subagent_from_seed(&child) {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                            self.conversation(link.child)?;
+                        }
+                        other => other?,
+                    };
                 }
             }
             Err(e) => return Err(e),
@@ -274,6 +309,17 @@ impl Harness {
         config: Config,
         input: ReportedInput,
     ) -> Result<(Link, Uuid), Error> {
+        self.submit_subagent_reported_restricted(parent, name, config, input, None)
+    }
+    /// Submit with the selection bound to the named reservation.
+    pub fn submit_subagent_reported_restricted(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        config: Config,
+        input: ReportedInput,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<(Link, Uuid), Error> {
         let ReportedInput {
             history,
             request_id,
@@ -288,7 +334,7 @@ impl Harness {
                 "valid subagent request ID and content required".into(),
             ));
         }
-        let link = self.ensure_subagent_with_history(parent, name, config, history)?;
+        let link = self.ensure_subagent_restricted(parent, name, config, history, allowed_tools)?;
         let k = reporter_key(link.child, &request_id);
         let reporter = loop {
             if let Some(entry) = self.subagent_store()?.get(&k)? {
@@ -351,11 +397,12 @@ impl Harness {
         if link.link != reporter.link {
             return Err(Error::Invalid("reporter link mismatch".into()));
         }
-        self.ensure_subagent_with_history(
+        self.ensure_subagent_restricted(
             reporter.link.parent,
             &reporter.link.key,
             reporter.link.config.clone(),
             link.history,
+            link.allowed_tools,
         )?;
         self.submit_with_mode(
             reporter.link.child,
@@ -456,6 +503,36 @@ impl Scheduler {
     ) -> Result<Link, Error> {
         self.subagent_harness()
             .ensure_subagent_with_history(parent, name, config, history)
+    }
+    pub fn ensure_subagent_restricted(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        config: Config,
+        history: bool,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Link, Error> {
+        self.subagent_harness().ensure_subagent_restricted(
+            parent,
+            name,
+            config,
+            history,
+            allowed_tools,
+        )
+    }
+    pub fn submit_subagent_reported_restricted(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        config: Config,
+        input: ReportedInput,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<(Link, Uuid), Error> {
+        let result = self
+            .subagent_harness()
+            .submit_subagent_reported_restricted(parent, name, config, input, allowed_tools)?;
+        self.schedule(result.0.child);
+        Ok(result)
     }
     pub fn submit_subagent(
         &mut self,
