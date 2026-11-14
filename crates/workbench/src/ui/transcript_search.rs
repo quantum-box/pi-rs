@@ -45,14 +45,26 @@ impl Search {
 
     pub fn paste(&mut self, text: &str) {
         let remaining = 4096usize.saturating_sub(self.editor.text.len());
-        let mut end = remaining.min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let text = &text[..end];
         // Match the single-line input's paste behavior; normalize the complete
-        // query during search so pasted boundary spaces are not discarded.
-        self.editor.insert(&text.replace(['\r', '\n'], ""));
+        // query during search so pasted boundary spaces are not discarded. Cap
+        // after sanitization and tab expansion, without splitting UTF-8.
+        let mut sanitized = String::with_capacity(remaining.min(text.len()));
+        for character in text.chars() {
+            if character == '\t' {
+                let count = 4.min(remaining.saturating_sub(sanitized.len()));
+                sanitized.extend(std::iter::repeat_n(' ', count));
+                if count < 4 {
+                    break;
+                }
+            } else if character.is_control() {
+                continue;
+            } else if character.len_utf8() <= remaining.saturating_sub(sanitized.len()) {
+                sanitized.push(character);
+            } else {
+                break;
+            }
+        }
+        self.editor.insert(&sanitized);
     }
 
     pub fn overlay(&self, theme: &Theme, keys: &Keys, width: usize) -> (Vec<Line>, usize, usize) {
@@ -356,6 +368,25 @@ mod tests {
         assert_eq!(search.update(&lines, 0), Some(0..1));
         assert_eq!(search.query, "a b");
         assert_eq!(search.result(), "1/1");
+    }
+
+    #[test]
+    fn pasted_tabs_and_utf8_respect_the_remaining_input_limit() {
+        let mut search = Search::default();
+        search.paste(&"\t".repeat(4096));
+        assert_eq!(search.editor.text.len(), 4096);
+        assert!(search.editor.text.bytes().all(|byte| byte == b' '));
+
+        let mut search = Search::default();
+        search.editor.replace("x".repeat(4094));
+        search.paste("\tmore");
+        assert_eq!(search.editor.text.len(), 4096);
+        assert!(search.editor.text.ends_with("  "));
+
+        let mut search = Search::default();
+        search.editor.replace("x".repeat(4095));
+        search.paste("éz");
+        assert_eq!(search.editor.text.len(), 4095);
     }
 
     #[test]
