@@ -453,6 +453,49 @@ pub struct Harness {
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
+/// A snapshot of all store changes for one or more conversation saves.
+/// Prepared checks can become stale; a conflict requires preparing the entire batch again.
+pub(crate) struct PreparedConversationSave {
+    owner: Arc<OwnedStore>,
+    checks: Vec<Check>,
+    mutations: Vec<Mutation>,
+}
+
+impl PreparedConversationSave {
+    /// Reject overlapping keys: store checks observe the pre-commit state, so
+    /// independently prepared writes to the same key cannot safely be combined.
+    pub(crate) fn extend(&mut self, other: Self) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.owner, &other.owner) {
+            return Err(Error::Invalid(
+                "prepared saves belong to different stores".into(),
+            ));
+        }
+        let keys: std::collections::HashSet<&[u8]> = self
+            .checks
+            .iter()
+            .map(|c| c.key.as_slice())
+            .chain(self.mutations.iter().map(|m| match m {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key.as_slice(),
+            }))
+            .collect();
+        if other
+            .checks
+            .iter()
+            .map(|c| c.key.as_slice())
+            .chain(other.mutations.iter().map(|m| match m {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key.as_slice(),
+            }))
+            .any(|key| keys.contains(key))
+        {
+            return Err(Error::Invalid(
+                "overlapping prepared conversation saves".into(),
+            ));
+        }
+        self.checks.extend(other.checks);
+        self.mutations.extend(other.mutations);
+        Ok(())
+    }
+}
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
     complete: bool,
@@ -769,181 +812,29 @@ impl Harness {
         let mut state = state.clone();
         let mut expected = expected;
         loop {
-            let base = self
-                .loaded
-                .lock()
-                .map_err(|_| Error::Failed)?
-                .get(&state.id)
-                .cloned();
-            let old = base
-                .as_ref()
-                .filter(|(v, _)| expected == Expected::Version(*v))
-                .map(|(_, s)| s);
-            let create = old.and_then(|s| s.transcript.as_ref()).is_none();
-            let change = match old {
-                Some(previous) if !create && state.messages == previous.messages => None,
-                Some(previous) if !create && state.messages.starts_with(&previous.messages) => {
-                    Some(TranscriptChange::Append(
-                        state.messages[previous.messages.len()..].to_vec(),
-                    ))
-                }
-                _ => Some(TranscriptChange::Replace(state.messages.clone())),
-            };
-            let prepared = if expected == Expected::Missing && state.transcript.is_some() {
-                let source = state.transcript.as_ref().unwrap();
-                if self.read_transcript(source.transcript_id(), source.clone())? != state.messages {
-                    return Err(Error::Invalid("fork transcript does not match seed".into()));
-                }
-                let (batch, cursor) =
-                    crate::transcript::Transcript::new(self.owner.store(), source.transcript_id())
-                        .prepare_fork_at(source, state.id)?;
-                state.transcript = Some(cursor);
-                Some(batch)
-            } else if let Some(change) = change {
-                let (batch, cursor) =
-                    crate::transcript::Transcript::new(self.owner.store(), state.id)
-                        .prepare_write(&serde_json::to_value(change)?, create)?;
-                state.transcript = Some(cursor);
-                Some(batch)
+            let mut prepared = if wake.is_none() && children.is_empty() && abort_tasks.is_empty() {
+                self.prepare_saves(&[(&state, expected.clone())])?
             } else {
-                state.transcript = old.and_then(|s| s.transcript.clone());
-                None
+                self.prepare_conversation_save(
+                    &state,
+                    expected.clone(),
+                    wake,
+                    children,
+                    abort_tasks,
+                )?
             };
-            let mut persisted = state.clone();
-            persisted.messages.clear();
-            let value = serde_json::to_vec(&persisted)?;
-            let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes});
-            let append = crate::observer::Observer::new(self.owner.store(), state.id)
-                .prepare_append(&event)?;
-            let fork_key =
-                format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
-            let fork_snapshot = crate::fork::Snapshot {
-                version: 1,
-                conversation_id: state.id,
-                config: state.config.clone(),
-                messages: vec![],
-                submissions: state.submissions.clone(),
-                tool_states: state.tool_states.clone(),
-                documents: HashMap::from([
-                    (
-                        "pi-rs/runtime/queue-modes".into(),
-                        serde_json::to_value(state.queue_modes)?,
-                    ),
-                    (
-                        "pi-rs/runtime/extensions".into(),
-                        serde_json::to_value(&state.extensions)?,
-                    ),
-                    (
-                        "pi-rs/runtime/resets".into(),
-                        serde_json::to_value(&state.resets)?,
-                    ),
-                    (
-                        "pi-rs/runtime/application-writes".into(),
-                        serde_json::to_value(&state.application_writes)?,
-                    ),
-                ]),
-                active: state.active,
-                pending_resets: state.pending_resets.clone(),
-                phase: serde_json::to_value(&state.phase)?,
-            };
-            let mut fork_value = serde_json::to_value(&fork_snapshot)?;
-            fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
-            let mut checks = vec![Check {
-                key: key.clone(),
-                expected: expected.clone(),
-            }];
-            let transcript_mutations = if let Some(batch) = prepared {
-                checks.extend(batch.checks);
-                batch.mutations
-            } else {
-                Vec::new()
-            };
-            checks.extend(append.checks);
-            checks.push(Check {
-                key: fork_key.clone(),
-                expected: Expected::Missing,
-            });
-            let mut mutations = vec![Mutation::Put {
-                key: key.clone(),
-                value,
-            }];
-            mutations.extend(transcript_mutations);
-            mutations.extend(append.mutations);
-            mutations.push(Mutation::Put {
-                key: fork_key,
-                value: serde_json::to_vec(&fork_value)?,
-            });
-            let terminal = if state.abort_requested {
-                match &state.phase {
-                    Phase::ModelRunning { request_id, .. }
-                    | Phase::AbandonedModel { request_id, .. }
-                    | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-            .or(match &state.phase {
-                Phase::Accounting { request_id, .. } => Some((*request_id, true)),
-                Phase::AbandonedModel { request_id, .. }
-                | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
-                _ => None,
-            });
-            if let Some((request_id, complete)) = terminal {
-                let snapshot = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
-                if snapshot.is_persisted()
-                    && matches!(snapshot.state(), crate::progress::State::Running(_))
-                {
-                    let prepared = if complete {
-                        snapshot.prepare_complete()?
-                    } else {
-                        snapshot.prepare_abort()?
-                    };
-                    checks.extend(prepared.checks);
-                    mutations.extend(prepared.mutations);
-                }
-            }
-            if !children.is_empty() {
-                let current = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
-                let current: Conversation = serde_json::from_slice(&current.value)?;
-                if current.abort_requested {
-                    return Err(Error::Invalid("conversation is aborting".into()));
-                }
-                let batch = crate::task_store::TaskStore::new(self.owner.store())
-                    .prepare_owned_tasks(
-                        &crate::task::TaskOwner::Conversation(state.id),
-                        &key,
-                        expected.clone(),
-                        &serde_json::to_vec(&persisted)?,
-                        children,
-                    )
-                    .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
-                // The conversation check and mutation are already part of this save.
-                checks.extend(batch.checks.into_iter().skip(1));
-                mutations.extend(batch.mutations.into_iter().skip(1));
-            }
-            for task in abort_tasks {
-                let key = crate::task_store::key(task.task.id());
-                checks.push(Check {
-                    key: key.clone(),
-                    expected: Expected::Version(task.version),
-                });
-                mutations.push(Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&task.task)?,
-                });
-            }
-            if let Some(wake) = wake {
-                checks.extend(wake.checks.clone());
-                mutations.extend(wake.mutations.clone());
-            }
             if let Some(batch) = documents {
-                checks.extend(batch.checks.clone());
-                mutations.extend(batch.mutations.clone());
+                prepared.extend(PreparedConversationSave {
+                    owner: self.owner.clone(),
+                    checks: batch.checks.clone(),
+                    mutations: batch.mutations.clone(),
+                })?;
             }
-            match self.owner.store().commit(&checks, &mutations) {
+            match self.commit_conversation_save(prepared) {
                 Ok(()) => break,
-                Err(durable_store::Error::Conflict { .. }) if self.merge_admissions => {
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+                    if self.merge_admissions =>
+                {
                     let entry = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
                     let mut latest: Conversation = serde_json::from_slice(&entry.value)?;
                     self.hydrate(&mut latest)?;
@@ -1024,15 +915,249 @@ impl Harness {
                         }),
                     );
                 }
-                Err(e @ durable_store::Error::Conflict { .. }) => return Err(e.into()),
-                Err(e) => {
-                    self.failed = true;
-                    self.storage_failed.store(true, Ordering::Release);
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
+    }
+    fn prepare_conversation_save(
+        &self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+    ) -> Result<PreparedConversationSave, Error> {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        let mut state = state.clone();
+        let key = Self::key(state.id);
+        let base = self
+            .loaded
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .get(&state.id)
+            .cloned();
+        let old = base
+            .as_ref()
+            .filter(|(v, _)| expected == Expected::Version(*v))
+            .map(|(_, s)| s);
+        let create = old.and_then(|s| s.transcript.as_ref()).is_none();
+        let change = match old {
+            Some(previous) if !create && state.messages == previous.messages => None,
+            Some(previous) if !create && state.messages.starts_with(&previous.messages) => Some(
+                TranscriptChange::Append(state.messages[previous.messages.len()..].to_vec()),
+            ),
+            _ => Some(TranscriptChange::Replace(state.messages.clone())),
+        };
+        let prepared = if expected == Expected::Missing && state.transcript.is_some() {
+            let source = state.transcript.as_ref().unwrap();
+            if self.read_transcript(source.transcript_id(), source.clone())? != state.messages {
+                return Err(Error::Invalid("fork transcript does not match seed".into()));
+            }
+            let (batch, cursor) =
+                crate::transcript::Transcript::new(self.owner.store(), source.transcript_id())
+                    .prepare_fork_at(source, state.id)?;
+            state.transcript = Some(cursor);
+            Some(batch)
+        } else if let Some(change) = change {
+            let (batch, cursor) = crate::transcript::Transcript::new(self.owner.store(), state.id)
+                .prepare_write(&serde_json::to_value(change)?, create)?;
+            state.transcript = Some(cursor);
+            Some(batch)
+        } else {
+            state.transcript = old.and_then(|s| s.transcript.clone());
+            None
+        };
+        let mut persisted = state.clone();
+        persisted.messages.clear();
+        let value = serde_json::to_vec(&persisted)?;
+        let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes});
+        let append =
+            crate::observer::Observer::new(self.owner.store(), state.id).prepare_append(&event)?;
+        let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
+        let fork_snapshot = crate::fork::Snapshot {
+            version: 1,
+            conversation_id: state.id,
+            config: state.config.clone(),
+            messages: vec![],
+            submissions: state.submissions.clone(),
+            tool_states: state.tool_states.clone(),
+            documents: HashMap::from([
+                (
+                    "pi-rs/runtime/queue-modes".into(),
+                    serde_json::to_value(state.queue_modes)?,
+                ),
+                (
+                    "pi-rs/runtime/extensions".into(),
+                    serde_json::to_value(&state.extensions)?,
+                ),
+                (
+                    "pi-rs/runtime/resets".into(),
+                    serde_json::to_value(&state.resets)?,
+                ),
+                (
+                    "pi-rs/runtime/application-writes".into(),
+                    serde_json::to_value(&state.application_writes)?,
+                ),
+            ]),
+            active: state.active,
+            pending_resets: state.pending_resets.clone(),
+            phase: serde_json::to_value(&state.phase)?,
+        };
+        let mut fork_value = serde_json::to_value(&fork_snapshot)?;
+        fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
+        let mut checks = vec![Check {
+            key: key.clone(),
+            expected: expected.clone(),
+        }];
+        let transcript_mutations = if let Some(batch) = prepared {
+            checks.extend(batch.checks);
+            batch.mutations
+        } else {
+            Vec::new()
+        };
+        checks.extend(append.checks);
+        checks.push(Check {
+            key: fork_key.clone(),
+            expected: Expected::Missing,
+        });
+        let mut mutations = vec![Mutation::Put {
+            key: key.clone(),
+            value,
+        }];
+        mutations.extend(transcript_mutations);
+        mutations.extend(append.mutations);
+        mutations.push(Mutation::Put {
+            key: fork_key,
+            value: serde_json::to_vec(&fork_value)?,
+        });
+        let terminal = if state.abort_requested {
+            match &state.phase {
+                Phase::ModelRunning { request_id, .. }
+                | Phase::AbandonedModel { request_id, .. }
+                | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+        .or(match &state.phase {
+            Phase::Accounting { request_id, .. } => Some((*request_id, true)),
+            Phase::AbandonedModel { request_id, .. } | Phase::FailedModel { request_id, .. } => {
+                Some((*request_id, false))
+            }
+            _ => None,
+        });
+        if let Some((request_id, complete)) = terminal {
+            let snapshot = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
+            if snapshot.is_persisted()
+                && matches!(snapshot.state(), crate::progress::State::Running(_))
+            {
+                let prepared = if complete {
+                    snapshot.prepare_complete()?
+                } else {
+                    snapshot.prepare_abort()?
+                };
+                checks.extend(prepared.checks);
+                mutations.extend(prepared.mutations);
+            }
+        }
+        if !children.is_empty() {
+            let current = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
+            let current: Conversation = serde_json::from_slice(&current.value)?;
+            if current.abort_requested {
+                return Err(Error::Invalid("conversation is aborting".into()));
+            }
+            let batch = crate::task_store::TaskStore::new(self.owner.store())
+                .prepare_owned_tasks(
+                    &crate::task::TaskOwner::Conversation(state.id),
+                    &key,
+                    expected.clone(),
+                    &serde_json::to_vec(&persisted)?,
+                    children,
+                )
+                .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
+            // The conversation check and mutation are already part of this save.
+            checks.extend(batch.checks.into_iter().skip(1));
+            mutations.extend(batch.mutations.into_iter().skip(1));
+        }
+        for task in abort_tasks {
+            let key = crate::task_store::key(task.task.id());
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(task.version),
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(&task.task)?,
+            });
+        }
+        if let Some(wake) = wake {
+            checks.extend(wake.checks.clone());
+            mutations.extend(wake.mutations.clone());
+        }
+        Ok(PreparedConversationSave {
+            owner: self.owner.clone(),
+            checks,
+            mutations,
+        })
+    }
+    /// Prepare a plain conversation save for composition. Callers must hold the
+    /// task gate when composing task ownership changes with these saves.
+    pub(crate) fn prepare_save(
+        &self,
+        state: &Conversation,
+        expected: Expected,
+    ) -> Result<PreparedConversationSave, Error> {
+        self.prepare_conversation_save(state, expected, None, &[], &[])
+    }
+
+    /// Prepare independent saves against one store snapshot. Any overlap is
+    /// rejected, and callers must discard the whole batch after a conflict.
+    pub(crate) fn prepare_saves(
+        &self,
+        saves: &[(&Conversation, Expected)],
+    ) -> Result<PreparedConversationSave, Error> {
+        let mut batch = PreparedConversationSave {
+            owner: self.owner.clone(),
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        };
+        for (state, expected) in saves {
+            batch.extend(self.prepare_save(state, expected.clone())?)?;
+        }
+        Ok(batch)
+    }
+
+    pub(crate) fn commit_conversation_save(
+        &mut self,
+        batch: PreparedConversationSave,
+    ) -> Result<(), Error> {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        if !Arc::ptr_eq(&self.owner, &batch.owner) {
+            return Err(Error::Invalid(
+                "prepared save belongs to a different store".into(),
+            ));
+        }
+        match self.owner.store().commit(&batch.checks, &batch.mutations) {
+            Ok(()) => Ok(()),
+            Err(e @ durable_store::Error::Conflict { .. }) => Err(e.into()),
+            Err(e) => {
+                self.failed = true;
+                self.storage_failed.store(true, Ordering::Release);
+                Err(e.into())
+            }
+        }
     }
     /// Persist delivery modes, including while a run is active. Each boundary reads the latest values.
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
@@ -4936,6 +5061,168 @@ mod scheduler_tests {
             event["messages"],
             serde_json::to_value(&state.messages).unwrap()
         );
+    }
+    #[test]
+    fn prepared_multiple_saves_are_atomic_and_migrate_legacy_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model.clone())).unwrap();
+        let first = h.create_conversation(config()).unwrap();
+        let second = h.create_conversation(config()).unwrap();
+        let mut legacy = h.conversation(first).unwrap();
+        legacy.transcript = None;
+        legacy.messages.push(Message::User {
+            content: "legacy".into(),
+        });
+        let mut head = b"durable/transcript/head/".to_vec();
+        head.extend_from_slice(first.as_bytes());
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[
+                    Mutation::Delete { key: head },
+                    Mutation::Put {
+                        key: Harness::key(first),
+                        value: serde_json::to_vec(&legacy).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let request = Uuid::new_v4();
+        let progress = crate::progress::Snapshot::load(h.owner.store(), request)
+            .unwrap()
+            .prepare_checkpoint()
+            .unwrap();
+        h.owner
+            .store()
+            .commit(&progress.checks, &progress.mutations)
+            .unwrap();
+        let (mut a, av) = h.load(first).unwrap();
+        let (mut b, bv) = h.load(second).unwrap();
+        a.messages.push(Message::User {
+            content: "migrated".into(),
+        });
+        b.messages.push(Message::User {
+            content: "second".into(),
+        });
+        b.phase = Phase::AbandonedModel {
+            turns: 0,
+            request_id: request,
+            restarts: 0,
+        };
+        let batch = h
+            .prepare_saves(&[(&a, Expected::Version(av)), (&b, Expected::Version(bv))])
+            .unwrap();
+        // A competing write invalidates just the second conversation's check.
+        let key = Harness::key(second);
+        let current = h.owner.store().get(&key).unwrap().unwrap();
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: current.value,
+                }],
+            )
+            .unwrap();
+        let snapshot = |h: &Harness| {
+            h.owner
+                .store()
+                .list(b"")
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| (k, v.value, v.version))
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot(&h);
+        assert!(matches!(
+            h.commit_conversation_save(batch),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(snapshot(&h), before);
+        assert_eq!(h.conversation(first).unwrap().messages, legacy.messages);
+        assert!(matches!(
+            crate::progress::Snapshot::load(h.owner.store(), request)
+                .unwrap()
+                .state(),
+            crate::progress::State::Running(_)
+        ));
+        let (mut a, av) = h.load(first).unwrap();
+        let (mut b, bv) = h.load(second).unwrap();
+        a.messages.push(Message::User {
+            content: "migrated".into(),
+        });
+        b.messages.push(Message::User {
+            content: "second".into(),
+        });
+        b.phase = Phase::AbandonedModel {
+            turns: 0,
+            request_id: request,
+            restarts: 0,
+        };
+        assert!(matches!(
+            h.prepare_saves(&[(&a, Expected::Version(av)), (&a, Expected::Version(av))]),
+            Err(Error::Invalid(_))
+        ));
+        let batch = h
+            .prepare_saves(&[(&a, Expected::Version(av)), (&b, Expected::Version(bv))])
+            .unwrap();
+        let progress = crate::progress::Snapshot::load(h.owner.store(), request)
+            .unwrap()
+            .prepare_checkpoint()
+            .unwrap();
+        h.owner
+            .store()
+            .commit(&progress.checks, &progress.mutations)
+            .unwrap();
+        let before = snapshot(&h);
+        assert!(matches!(
+            h.commit_conversation_save(batch),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(snapshot(&h), before);
+        let batch = h
+            .prepare_saves(&[(&a, Expected::Version(av)), (&b, Expected::Version(bv))])
+            .unwrap();
+        h.commit_conversation_save(batch).unwrap();
+        assert!(matches!(
+            crate::progress::Snapshot::load(h.owner.store(), request)
+                .unwrap()
+                .state(),
+            crate::progress::State::Aborted(_)
+        ));
+        for state in [&a, &b] {
+            let history = h
+                .history(
+                    state.id,
+                    crate::observer::Cursor(0),
+                    std::num::NonZeroUsize::new(100).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                history.records.last().unwrap().value["messages"],
+                serde_json::to_value(&state.messages).unwrap()
+            );
+            let fork_prefix = format!("runtime/fork/{}/", state.id);
+            assert_eq!(
+                h.owner.store().list(fork_prefix.as_bytes()).unwrap().len(),
+                2
+            );
+        }
+        let fork = h.fork(first).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().messages, a.messages);
+        drop(h);
+        let h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().messages, a.messages);
+        assert_eq!(h.conversation(first).unwrap().messages, a.messages);
+        assert_eq!(h.conversation(second).unwrap().messages, b.messages);
     }
     #[test]
     fn legacy_migration_is_atomic_and_snapshots_reopen() {
