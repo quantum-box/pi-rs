@@ -12,6 +12,8 @@ pub mod conversation_signal;
 pub mod document;
 pub mod extension;
 pub mod fork;
+#[allow(dead_code)] // Storage foundation; not wired into tool execution yet.
+mod keyed_child;
 pub mod keyed_tool;
 pub mod model;
 pub mod nested;
