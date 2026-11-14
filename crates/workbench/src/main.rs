@@ -63,6 +63,9 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
+type RpcModelImages =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, String, String), bool>>>;
+
 #[derive(Parser, Clone)]
 #[command(
     name = "pi-rs",
@@ -85,9 +88,7 @@ struct Cli {
     #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
-    rpc_model_images: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<(String, String, String), bool>>,
-    >,
+    rpc_model_images: RpcModelImages,
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
     #[arg(skip)]
