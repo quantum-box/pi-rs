@@ -1109,6 +1109,47 @@ impl Picker {
             items.len().saturating_sub(start).min(available),
             height,
         ));
+        let tree_scroll = if let (Some(tree), Some(layout)) = (&self.tree, &tree_layout) {
+            let viewport = width.saturating_sub(2);
+            let mut max_body = 0usize;
+            let mut selected_anchor = None;
+            for (index, item) in items.iter().enumerate().skip(start).take(available) {
+                let Selection::Checkout(id) = item.selection else {
+                    continue;
+                };
+                let Some(prefix) = layout.rows.get(&id) else {
+                    continue;
+                };
+                let marker = if tree.active_path.contains(&id) { 2 } else { 0 };
+                let timestamp = if tree.show_label_timestamps {
+                    tree.label_timestamps
+                        .get(&id)
+                        .map_or(0, |value| format_label_timestamp(value).width() + 1)
+                } else {
+                    0
+                };
+                let anchor = prefix.width().saturating_add(marker);
+                max_body = max_body.max(
+                    anchor
+                        .saturating_add(timestamp)
+                        .saturating_add(super::render::clean(&item.label).width()),
+                );
+                if index == self.selected {
+                    selected_anchor = Some(anchor);
+                }
+            }
+            let max_scroll = max_body.saturating_sub(viewport);
+            let min_content = (viewport / 3).clamp(4, 20);
+            selected_anchor
+                .filter(|&anchor| anchor > viewport.saturating_sub(min_content))
+                .map_or(0, |anchor| {
+                    anchor
+                        .saturating_sub((viewport / 4).clamp(2, 12))
+                        .min(max_scroll)
+                })
+        } else {
+            0
+        };
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             if let (Some(tree), Some(layout), Selection::Checkout(id)) =
                 (&self.tree, &tree_layout, &item.selection)
@@ -1123,33 +1164,39 @@ impl Picker {
                 } else {
                     String::new()
                 };
+                let prefix = &layout.rows[id];
+                let viewport = width.saturating_sub(2);
+                let prefix_text = prefix.slice(&layout.gutters, tree_scroll, viewport);
+                let suffix = [
+                    super::render::Span::themed(
+                        if tree.active_path.contains(id) {
+                            "• "
+                        } else {
+                            ""
+                        },
+                        theme,
+                        "accent",
+                    ),
+                    super::render::Span::themed(
+                        format!("{timestamp}{}", item.label),
+                        theme,
+                        "text",
+                    ),
+                ];
+                let mut spans = vec![super::render::Span::themed(
+                    if selected { "› " } else { "  " },
+                    theme,
+                    "accent",
+                )];
+                let prefix_columns = prefix_text.width();
+                spans.push(super::render::Span::themed(prefix_text, theme, "dim"));
+                spans.extend(slice_tree_spans(
+                    &suffix,
+                    tree_scroll.saturating_sub(prefix.width()),
+                    viewport.saturating_sub(prefix_columns),
+                ));
                 lines.push(Line {
-                    spans: vec![
-                        super::render::Span::themed(
-                            if selected { "› " } else { "  " },
-                            theme,
-                            "accent",
-                        ),
-                        super::render::Span::themed(
-                            layout.get(id).cloned().unwrap_or_default(),
-                            theme,
-                            "dim",
-                        ),
-                        super::render::Span::themed(
-                            if tree.active_path.contains(id) {
-                                "• "
-                            } else {
-                                ""
-                            },
-                            theme,
-                            "accent",
-                        ),
-                        super::render::Span::themed(
-                            format!("{timestamp}{}", item.label),
-                            theme,
-                            "text",
-                        ),
-                    ],
+                    spans,
                     background: selected.then(|| theme.color("selectedBg")),
                     image: None,
                 });
@@ -1385,6 +1432,114 @@ struct TreeState {
     visible: std::collections::BTreeSet<u64>,
     head: u64,
 }
+
+struct TreeGutter {
+    level: usize,
+    show: bool,
+    parent: Option<usize>,
+}
+
+struct TreePrefix {
+    indent: usize,
+    connector: Option<(bool, char)>,
+    folded_root: bool,
+    gutters: Option<usize>,
+}
+struct TreeLayout {
+    rows: std::collections::BTreeMap<u64, TreePrefix>,
+    gutters: Vec<TreeGutter>,
+}
+impl TreePrefix {
+    fn width(&self) -> usize {
+        self.indent
+            .saturating_mul(3)
+            .saturating_add(2 * usize::from(self.folded_root))
+    }
+    fn slice(&self, gutters: &[TreeGutter], start: usize, width: usize) -> String {
+        let end = start.saturating_add(width).min(self.width());
+        if start >= end {
+            return String::new();
+        }
+        let first = start / 3;
+        let last = end.min(self.indent * 3).div_ceil(3);
+        let mut visible = std::collections::BTreeMap::new();
+        let mut gutter = self.gutters;
+        while let Some(index) = gutter {
+            let item = &gutters[index];
+            if item.level >= first && item.level < last {
+                visible.entry(item.level).or_insert(item.show);
+            }
+            gutter = item.parent;
+        }
+        let mut text = String::new();
+        for position in start..end {
+            if position >= self.indent * 3 {
+                text.push(if position == self.indent * 3 {
+                    '⊞'
+                } else {
+                    ' '
+                });
+                continue;
+            }
+            let level = position / 3;
+            let offset = position % 3;
+            let ch = if let Some(show) = visible.get(&level) {
+                if offset == 0 && *show { '│' } else { ' ' }
+            } else if level + 1 == self.indent {
+                match (self.connector, offset) {
+                    (Some((last, _)), 0) => {
+                        if last {
+                            '└'
+                        } else {
+                            '├'
+                        }
+                    }
+                    (Some((_, marker)), 1) => marker,
+                    _ => ' ',
+                }
+            } else {
+                ' '
+            };
+            text.push(ch);
+        }
+        text
+    }
+}
+
+// Clip styled body spans by terminal columns without splitting graphemes.
+fn slice_tree_spans(
+    spans: &[super::render::Span],
+    start: usize,
+    width: usize,
+) -> Vec<super::render::Span> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let end = start.saturating_add(width);
+    let mut column = 0usize;
+    let mut result = Vec::new();
+    for span in spans {
+        let mut piece = span.clone();
+        piece.text.clear();
+        for grapheme in span.text.graphemes(true) {
+            let next = column.saturating_add(grapheme.width());
+            if column >= start && column < end && next <= end {
+                piece.text.push_str(grapheme);
+            }
+            column = next;
+            if column >= end {
+                break;
+            }
+        }
+        if !piece.text.is_empty() {
+            result.push(piece);
+        }
+        if column >= end {
+            break;
+        }
+    }
+    result
+}
 impl TreeState {
     fn new(
         entries: std::collections::BTreeMap<u64, (Option<u64>, TreeEntryKind)>,
@@ -1470,7 +1625,7 @@ impl TreeState {
 
     // Filtering can hide branch points. Rebuild the layout from visible
     // ancestors, as the navigation graph already does for branch jumps.
-    fn layout(&self, visible: &[u64]) -> std::collections::BTreeMap<u64, String> {
+    fn layout(&self, visible: &[u64]) -> TreeLayout {
         let (parents, children) = self.navigation_graph(visible);
         let roots: Vec<_> = visible
             .iter()
@@ -1490,53 +1645,53 @@ impl TreeState {
                     multiple_roots,
                     multiple_roots,
                     index + 1 == roots.len(),
-                    Vec::<(usize, bool)>::new(),
+                    None::<usize>,
                     multiple_roots,
                 )
             })
             .collect();
         let mut result = std::collections::BTreeMap::new();
+        let mut gutter_arena = Vec::new();
         while let Some((id, indent, branched, connector, last, gutters, virtual_root)) =
             pending.pop()
         {
-            // Keep deeply nested, imported sessions bounded like the previous
-            // picker, even when every ancestor is a branch point.
-            let display_indent = indent.saturating_sub(usize::from(multiple_roots)).min(12);
+            let display_indent = indent.saturating_sub(usize::from(multiple_roots));
             let show_connector = connector && !virtual_root;
             let connector_pos = display_indent.saturating_sub(1);
-            let mut prefix = String::new();
-            for level in 0..display_indent {
-                if let Some((_, show)) = gutters.iter().find(|(pos, _)| *pos == level) {
-                    prefix.push_str(if *show { "│  " } else { "   " });
-                } else if show_connector && level == connector_pos {
-                    let foldable = children.get(&id).is_some_and(|items| !items.is_empty())
-                        && parents[&id].is_none_or(|parent| {
-                            children.get(&parent).is_some_and(|items| items.len() > 1)
-                        });
-                    prefix.push(if last { '└' } else { '├' });
-                    prefix.push(if self.collapsed.contains(&id) {
-                        '⊞'
-                    } else if foldable {
-                        '⊟'
-                    } else {
-                        '─'
-                    });
-                    prefix.push(' ');
-                } else {
-                    prefix.push_str("   ");
-                }
-            }
-            if self.collapsed.contains(&id) && !show_connector {
-                prefix.push_str("⊞ ");
-            }
-            result.insert(id, prefix);
+            let foldable = children.get(&id).is_some_and(|items| !items.is_empty())
+                && parents[&id].is_none_or(|parent| {
+                    children.get(&parent).is_some_and(|items| items.len() > 1)
+                });
+            let marker = if self.collapsed.contains(&id) {
+                '⊞'
+            } else if foldable {
+                '⊟'
+            } else {
+                '─'
+            };
+            result.insert(
+                id,
+                TreePrefix {
+                    indent: display_indent,
+                    connector: show_connector.then_some((last, marker)),
+                    folded_root: self.collapsed.contains(&id) && !show_connector,
+                    gutters,
+                },
+            );
             let descendants = children.get(&id).map_or(&[][..], Vec::as_slice);
             let branches = descendants.len() > 1;
             let next_indent = indent + usize::from(branches || (branched && indent > 0));
-            let mut next_gutters = gutters;
-            if show_connector && !next_gutters.iter().any(|(pos, _)| *pos == connector_pos) {
-                next_gutters.push((connector_pos, !last));
-            }
+            let next_gutters = if show_connector {
+                let index = gutter_arena.len();
+                gutter_arena.push(TreeGutter {
+                    level: connector_pos,
+                    show: !last,
+                    parent: gutters,
+                });
+                Some(index)
+            } else {
+                gutters
+            };
             for (index, &child) in descendants.iter().enumerate().rev() {
                 pending.push((
                     child,
@@ -1544,12 +1699,15 @@ impl TreeState {
                     branches,
                     branches,
                     index + 1 == descendants.len(),
-                    next_gutters.clone(),
+                    next_gutters,
                     false,
                 ));
             }
         }
-        result
+        TreeLayout {
+            rows: result,
+            gutters: gutter_arena,
+        }
     }
 
     fn passes_filter(&self, id: u64) -> bool {
@@ -1871,14 +2029,17 @@ mod tests {
         let tree = picker.tree.as_ref().unwrap();
         assert_eq!(tree.order, [1, 4, 5, 2, 3]);
         let layout = tree.layout(&tree.order);
-        assert_eq!(layout[&1], "");
-        assert_eq!(layout[&4], "├⊟ ");
-        assert_eq!(layout[&5], "│     ");
-        assert_eq!(layout[&2], "└⊟ ");
-        assert_eq!(tree.layout(&[1, 5])[&5], "");
+        let text = |layout: &TreeLayout, id| {
+            layout.rows[&id].slice(&layout.gutters, 0, layout.rows[&id].width())
+        };
+        assert_eq!(text(&layout, 1), "");
+        assert_eq!(text(&layout, 4), "├⊟ ");
+        assert_eq!(text(&layout, 5), "│     ");
+        assert_eq!(text(&layout, 2), "└⊟ ");
+        assert_eq!(text(&tree.layout(&[1, 5]), 5), "");
         let layout = tree.layout(&[1, 5, 2, 3]);
-        assert_eq!(layout[&5], "├─ ");
-        assert_eq!(layout[&2], "└⊟ ");
+        assert_eq!(text(&layout, 5), "├─ ");
+        assert_eq!(text(&layout, 2), "└⊟ ");
         let lines = picker.render(&Theme::system(), 80, 20, &Keys::default());
         let text: Vec<String> = lines
             .iter()
@@ -1906,9 +2067,152 @@ mod tests {
         let tree = TreeState::new(entries, Default::default(), 4, TreeFilter::Default);
         assert_eq!(tree.order, [3, 4, 1, 2]);
         let layout = tree.layout(&tree.order);
-        assert_eq!(layout[&3], "");
-        assert_eq!(layout[&1], "");
-        assert_eq!(layout[&4], "   ");
+        assert_eq!(
+            layout.rows[&3].slice(&layout.gutters, 0, layout.rows[&3].width()),
+            ""
+        );
+        assert_eq!(
+            layout.rows[&1].slice(&layout.gutters, 0, layout.rows[&1].width()),
+            ""
+        );
+        assert_eq!(
+            layout.rows[&4].slice(&layout.gutters, 0, layout.rows[&4].width()),
+            "   "
+        );
+    }
+
+    #[test]
+    fn tree_viewport_tracks_deep_selection_and_branch_navigation() {
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(1, (None, TreeEntryKind::Message));
+        let mut parent = 1;
+        for depth in 1..=16 {
+            let child = depth * 2;
+            entries.insert(child, (Some(parent), TreeEntryKind::Message));
+            entries.insert(child + 1, (Some(parent), TreeEntryKind::Message));
+            parent = child;
+        }
+        let items = entries
+            .keys()
+            .map(|id| Item {
+                label: format!("node-{id}-日本語"),
+                selection: Selection::Checkout(*id),
+            })
+            .collect();
+        let mut picker = Picker::tree(
+            items,
+            entries,
+            Default::default(),
+            parent,
+            TreeFilter::Default,
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let rows = picker.render(&theme, 24, 50, &keys);
+        let selected = rows
+            .iter()
+            .find(|line| line.spans.first().is_some_and(|span| span.text == "› "))
+            .unwrap();
+        let text: String = selected
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(text.contains("node-32"), "{text:?}");
+        assert!(text.contains('├') || text.contains('└'), "{text:?}");
+        assert_eq!(selected.background, Some(theme.color("selectedBg")));
+        assert!(rows.iter().skip(1).take(33).all(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.width())
+                .sum::<usize>()
+                <= 24
+        }));
+        let tree = picker.tree.as_ref().unwrap();
+        assert!(tree.layout(&tree.order).rows[&parent].width() > 36);
+
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
+        assert_ne!(picker.selected, 0);
+        picker.focus_record(1);
+        let rows = picker.render(&theme, 24, 50, &keys);
+        let selected = rows
+            .iter()
+            .find(|line| line.spans.first().is_some_and(|span| span.text == "› "))
+            .unwrap();
+        let text: String = selected
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(text.starts_with("› • node-1"), "{text:?}");
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.matches().len(), 1);
+        picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.matches().len(), 33);
+        picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
+        assert!(matches!(
+            picker.matches()[picker.selected].selection,
+            Selection::Checkout(2)
+        ));
+        picker.focus_record(1);
+        picker.render(&theme, 8, 8, &keys);
+        let page = picker.page_size.get();
+        picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.selected, page);
+        let rows = picker.render(&theme, 8, 8, &keys);
+        let selected = rows
+            .iter()
+            .find(|line| line.spans.first().is_some_and(|span| span.text == "› "))
+            .unwrap();
+        assert!(
+            selected
+                .spans
+                .iter()
+                .map(|span| span.text.width())
+                .sum::<usize>()
+                <= 8
+        );
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn tree_viewport_clips_wide_graphemes_without_losing_style() {
+        let mut span =
+            super::super::render::Span::new("a日本e\u{301}z", crossterm::style::Color::Red);
+        span.bold = true;
+        let sliced = slice_tree_spans(&[span], 2, 4);
+        assert_eq!(
+            sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "本e\u{301}"
+        );
+        assert!(
+            sliced
+                .iter()
+                .all(|s| s.bold && s.color == crossterm::style::Color::Red)
+        );
+        assert!(slice_tree_spans(&sliced, 0, 0).is_empty());
+        let first = super::super::render::Span::new("日", crossterm::style::Color::Blue);
+        let mut second = super::super::render::Span::new("本abc", crossterm::style::Color::Green);
+        second.bold = true;
+        let sliced = slice_tree_spans(&[first, second], 1, 4);
+        assert_eq!(
+            sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "本a"
+        );
+        assert!(
+            sliced
+                .iter()
+                .all(|s| s.bold && s.color == crossterm::style::Color::Green)
+        );
+        let span = super::super::render::Span::new("a日b", crossterm::style::Color::Red);
+        assert_eq!(
+            slice_tree_spans(&[span], 0, 2)
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "a"
+        );
     }
 
     #[test]
