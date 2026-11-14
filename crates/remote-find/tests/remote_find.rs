@@ -285,3 +285,80 @@ async fn rejects_drive_relative_path_before_backend_calls() {
         Outcome::Failed(_)
     ));
 }
+
+#[tokio::test]
+async fn file_url_validation_precedes_remote_backend_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct Spy {
+        exists: AtomicUsize,
+        paths: Mutex<Vec<PathBuf>>,
+    }
+    #[async_trait::async_trait]
+    impl FindOperations for Spy {
+        async fn exists(&self, _: &Path) -> Result<bool> {
+            self.exists.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn glob(&self, _: &str, cwd: &Path, _: FindOptions) -> Result<Vec<PathBuf>> {
+            self.paths.lock().unwrap().push(cwd.to_owned());
+            Ok(vec![])
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Spy::default());
+    let tool = create_find_tool(root.path(), backend.clone()).unwrap();
+    let base = url::Url::from_directory_path(root.path())
+        .unwrap()
+        .to_string();
+    for (suffix, expected) in [
+        ("bad%2Fchild", "encoded"),
+        ("bad%2fchild", "encoded"),
+        ("bad%zz", "URI malformed"),
+        ("bad%ff", "URI malformed"),
+        ("bad%ed%a0%80", "URI malformed"),
+        ("bad%zz%2f", "encoded"),
+    ] {
+        let outcome = tool
+            .invoke(
+                json!({"pattern":"*", "path":format!("{base}{suffix}")}),
+                context(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Failed(ref message) if message.contains(expected)),
+            "{suffix}: {outcome:?}"
+        );
+    }
+    assert_eq!(backend.exists.load(Ordering::SeqCst), 0);
+    assert!(backend.paths.lock().unwrap().is_empty());
+    for suffix in ["with%20space", "plain?ignored=%2F#fragment"] {
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"*", "path":format!("{base}{suffix}")}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+    }
+    #[cfg(unix)]
+    assert!(matches!(
+        tool.invoke(
+            json!({"pattern":"*", "path":format!("{base}literal%5Cname")}),
+            context()
+        )
+        .await,
+        Outcome::Succeeded(_)
+    ));
+    #[cfg(windows)]
+    assert!(
+        matches!(tool.invoke(json!({"pattern":"*", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))
+    );
+    let paths = backend.paths.lock().unwrap();
+    assert_eq!(paths[0], root.path().join("with space"));
+    assert_eq!(paths[1], root.path().join("plain"));
+    #[cfg(unix)]
+    assert_eq!(paths[2], root.path().join("literal\\name"));
+    assert_eq!(paths.len(), if cfg!(unix) { 3 } else { 2 });
+}

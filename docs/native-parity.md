@@ -882,8 +882,12 @@ custom read operations because grep, find and ls still access the local filesyst
 To use all four tools on one remote workspace, `create_remote_read_only_tools`
 accepts one `Arc` whose backend implements read, grep, find, and ls operations.
 Its working directory and optional backend home are absolute paths in that
-backend's namespace. The backend enforces access controls and search semantics,
-including matching, ignore rules, and ordering. A set is an `Extension` and can
+backend's namespace. Injected `find` rejects malformed UTF-8 and percent escapes
+in file URL paths, as well as encoded path separators, before invoking the backend;
+query and fragment escapes are not treated as path escapes. On Unix encoded
+backslashes remain literal filename characters. Equivalent validation for
+injected `grep` and `ls` file URLs remains open. The backend enforces access
+controls and search semantics, including matching, ignore rules, and ordering. A set is an `Extension` and can
 be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
 ### Persistent runtime checkpoint
