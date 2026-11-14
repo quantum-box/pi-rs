@@ -927,21 +927,29 @@ impl std::io::Write for ShareJournalWriter<'_> {
     }
 }
 
-fn share_journal_mac(session: &Session, key: &[u8; 32]) -> Result<ShareJournalMac> {
+fn share_journal_mac(
+    session: &Session,
+    context: &ShareContext,
+    key: &[u8; 32],
+) -> Result<ShareJournalMac> {
     use hmac::Mac;
     let mut mac = ShareJournalMac::new_from_slice(key).expect("HMAC accepts 32 bytes");
-    mac.update(b"pi-rs-live-share-journal-v1\0");
+    mac.update(b"pi-rs-live-share-context-v2\0");
     // Avoid allocating another complete JSON copy of a large journal while
     // batching the serializer's small writes into efficient MAC updates.
     {
         let mut writer = std::io::BufWriter::new(ShareJournalWriter(&mut mac));
-        serde_json::to_writer(&mut writer, session.records())?;
+        serde_json::to_writer(&mut writer, &(session.records(), context))?;
         writer.flush()?;
     }
     Ok(mac)
 }
 
-pub(super) fn share_journal_tag(session: &Session, key: &[u8; 32]) -> Result<[u8; 32]> {
+pub(super) fn share_journal_tag(
+    session: &Session,
+    context: &ShareContext,
+    key: &[u8; 32],
+) -> Result<[u8; 32]> {
     use hmac::Mac;
     Ok(share_journal_mac(session, key)?
         .finalize()
@@ -951,11 +959,14 @@ pub(super) fn share_journal_tag(session: &Session, key: &[u8; 32]) -> Result<[u8
 
 pub(super) fn verify_share_journal(
     session: &Session,
+    context: &ShareContext,
     key: &[u8; 32],
     tag: &[u8; 32],
 ) -> Result<bool> {
     use hmac::Mac;
-    Ok(share_journal_mac(session, key)?.verify_slice(tag).is_ok())
+    Ok(share_journal_mac(session, context, key)?
+        .verify_slice(tag)
+        .is_ok())
 }
 
 pub(super) fn validate_live_share_journal(
@@ -970,7 +981,7 @@ pub(super) fn validate_live_share_journal(
     let (Some(key), Some(tag)) = (key, snapshot.journal_tag.as_ref()) else {
         return Err(changed());
     };
-    if !verify_share_journal(session, key, tag)? {
+    if !verify_share_journal(session, &snapshot.context, key, tag)? {
         return Err(changed());
     }
     Ok(())
@@ -1252,15 +1263,16 @@ mod tests {
             .append_user_with_images("original".into(), Vec::new(), None)
             .unwrap();
         let key = [42; 32];
-        let snapshot = ShareSnapshot {
+        let mut snapshot = ShareSnapshot {
             session_id: original.session_id(),
             head: original.head(),
             context: ShareContext {
                 system_prompt: "live".into(),
                 tools: vec![],
             },
-            journal_tag: Some(share_journal_tag(&original, &key).unwrap()),
+            journal_tag: None,
         };
+        snapshot.journal_tag = Some(share_journal_tag(&original, &snapshot.context, &key).unwrap());
         validate_live_share_journal(&original, &snapshot, Some(&key)).unwrap();
         let mut records = original.records().to_vec();
         match &mut records.last_mut().unwrap().event {
@@ -1273,6 +1285,16 @@ mod tests {
         assert!(validate_live_share_journal(&altered, &snapshot, Some(&key)).is_err());
         assert!(validate_live_share_journal(&original, &snapshot, Some(&[43; 32])).is_err());
         assert!(validate_live_share_journal(&original, &snapshot, None).is_err());
+        let mut changed_context = snapshot.clone();
+        changed_context.context.system_prompt.push_str(" tampered");
+        assert!(validate_live_share_journal(&original, &changed_context, Some(&key)).is_err());
+        let mut changed_tools = snapshot.clone();
+        changed_tools.context.tools.push(pi_rs::ToolSpec {
+            name: "extra".into(),
+            description: "tampered".into(),
+            parameters: serde_json::json!({}),
+        });
+        assert!(validate_live_share_journal(&original, &changed_tools, Some(&key)).is_err());
     }
 
     #[tokio::test]
@@ -1280,8 +1302,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = Session::open(root.path().join("session.jsonl")).unwrap();
         let key = [19; 32];
-        let snapshot = ShareSnapshot {
-            journal_tag: Some(share_journal_tag(&session, &key).unwrap()),
+        let mut snapshot = ShareSnapshot {
+            journal_tag: None,
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1293,6 +1315,7 @@ mod tests {
                 }],
             },
         };
+        snapshot.journal_tag = Some(share_journal_tag(&session, &snapshot.context, &key).unwrap());
         let (proxy, server) = super::super::http_proxy::test_proxy(
             r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
         )
@@ -1446,15 +1469,16 @@ mod tests {
             .append_user_with_images("original".into(), Vec::new(), None)
             .unwrap();
         let key = [23; 32];
-        let snapshot = ShareSnapshot {
+        let mut snapshot = ShareSnapshot {
             session_id: original.session_id(),
             head: original.head(),
             context: ShareContext {
                 system_prompt: "live".into(),
                 tools: vec![],
             },
-            journal_tag: Some(share_journal_tag(&original, &key).unwrap()),
+            journal_tag: None,
         };
+        snapshot.journal_tag = Some(share_journal_tag(&original, &snapshot.context, &key).unwrap());
         let mut records = original.records().to_vec();
         match &mut records.last_mut().unwrap().event {
             Event::User { content, .. } => *content = "changed".into(),

@@ -232,9 +232,16 @@ fn worker_returns_keyed_share_journal_tag() {
     assert!(response["data"].get("journalKey").is_none());
     let tag: [u8; 32] = serde_json::from_value(response["data"]["journalTag"].clone()).unwrap();
     let journal = Session::snapshot(&path).unwrap();
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireContext {
+        system_prompt: String,
+        tools: Vec<pi_rs::ToolSpec>,
+    }
+    let context: WireContext = serde_json::from_value(response["data"]["context"].clone()).unwrap();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
-    mac.update(b"pi-rs-live-share-journal-v1\0");
-    mac.update(&serde_json::to_vec(journal.records()).unwrap());
+    mac.update(b"pi-rs-live-share-context-v2\0");
+    mac.update(&serde_json::to_vec(&(journal.records(), &context)).unwrap());
     assert!(mac.verify_slice(&tag).is_ok());
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);

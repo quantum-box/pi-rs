@@ -861,10 +861,15 @@ impl View {
         {
             return None;
         }
-        let snapshot = (value["success"] == true)
-            .then(|| serde_json::from_value(value["data"].clone()).ok())
-            .flatten();
-        Some((self.pending_share.take().expect("matching share"), snapshot))
+        let mut pending = self.pending_share.take().expect("matching share");
+        if value["success"] != true {
+            // Existing fallback when a worker cannot provide context: upload
+            // without metadata rather than treating an old snapshot as valid.
+            pending.journal_key = None;
+            return Some((pending, None));
+        }
+        let snapshot = serde_json::from_value(value["data"].clone()).ok();
+        Some((pending, snapshot))
     }
 
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
@@ -4074,11 +4079,18 @@ pub(super) async fn run(
                 }
                 for value in finished.drain_events() {
                     if value["type"] == "response" && value["command"] == "get_share_context" {
+                        if let Some((pending, snapshot)) = view.take_share_response(&value) {
+                            start_share_upload(&mut view, pending, snapshot);
+                        }
                         continue;
                     }
                     view.receive_worker(value, &mut args);
                 }
-                if let Some(pending) = view.pending_share.take() {
+                if let Some(mut pending) = view.pending_share.take() {
+                    // A worker that exited before returning any context cannot
+                    // provide a tag. Preserve the existing safe no-context
+                    // fallback; a received malformed response remains an error.
+                    pending.journal_key = None;
                     start_share_upload(&mut view, pending, None);
                 }
                 view.settle();
@@ -4106,7 +4118,8 @@ pub(super) async fn run(
                 .as_ref()
                 .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(15))
         {
-            let pending = view.pending_share.take().expect("timed out share");
+            let mut pending = view.pending_share.take().expect("timed out share");
+            pending.journal_key = None;
             start_share_upload(&mut view, pending, None);
             dirty = true;
         }
@@ -7849,6 +7862,29 @@ mod tests {
             .unwrap();
         assert_eq!(pending.journal_key, Some(key));
         assert_eq!(received.unwrap().journal_tag, Some([9; 32]));
+    }
+
+    #[test]
+    fn failed_live_share_response_preserves_no_context_fallback() {
+        let id = uuid::Uuid::new_v4();
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id,
+                journal_key: Some([3; 32]),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let (pending, snapshot) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":id, "success":false
+            }))
+            .unwrap();
+        assert!(pending.journal_key.is_none());
+        assert!(snapshot.is_none());
     }
 
     #[test]

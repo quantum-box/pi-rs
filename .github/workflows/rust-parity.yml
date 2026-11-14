@@ -45,3 +45,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli standalone_radius_share_reconstructs_instead_of_using_old_cache
       - name: Test real terminal and standalone share flows
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation -- --test-threads=1
+      - name: Test live share fallback correlation
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs failed_live_share_response_preserves_no_context_fallback

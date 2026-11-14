@@ -464,7 +464,11 @@ fn finalize_share_capture(
     key: Option<[u8; 32]>,
 ) -> Result<(super::sessions::ShareSnapshot, Session)> {
     if let Some(key) = key {
-        share.journal_tag = Some(super::sessions::share_journal_tag(&journal, &key)?);
+        share.journal_tag = Some(super::sessions::share_journal_tag(
+            &journal,
+            &share.context,
+            &key,
+        )?);
     }
     let state = active.lock().expect("worker control");
     let snapshot = state_snapshot.lock().expect("session snapshot");
