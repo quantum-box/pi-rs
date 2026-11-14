@@ -548,11 +548,9 @@ fn invalidate_existing_share_generation<'a>(
     let Some(store) = store else { return Ok(None) };
     let session = match Session::snapshot(path) {
         Ok(session) => session,
-        // A worker for a new session still needs an identity before runtime
-        // initialization; create its journal under the normal session lock.
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Session::open(path)?
-        }
+        // Preserve the existing startup behavior: configuration failure must
+        // not create a new session journal. No cache entry can be served yet.
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let binding = store.binding_for_session(&session, &())?;
@@ -2086,21 +2084,17 @@ mod share_context_tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn new_session_gets_a_generation_before_runtime_initialization() {
+    fn new_session_is_not_created_during_optional_cache_setup() {
         use pi_rs_workbench::private_share_store::Store;
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let path = directory.path().join("new-session.jsonl");
-        let lease = invalidate_existing_share_generation(Some(&store), &path)
-            .unwrap()
-            .unwrap();
-        let session = Session::snapshot(&path).unwrap();
-        let binding = store.binding_for_session(&session, &()).unwrap();
-        assert_eq!(
-            store.try_begin(&path, binding).err().unwrap().kind(),
-            std::io::ErrorKind::WouldBlock
+        assert!(
+            invalidate_existing_share_generation(Some(&store), &path)
+                .unwrap()
+                .is_none()
         );
-        drop(lease);
+        assert!(!path.exists());
     }
 
     #[cfg(any(unix, windows))]

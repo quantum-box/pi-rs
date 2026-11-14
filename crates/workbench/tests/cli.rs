@@ -110,6 +110,10 @@ fn rpc_worker_starts_when_share_store_is_unavailable() {
     if child.0.try_wait().unwrap().is_none() {
         panic!("worker did not exit");
     }
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reader.is_finished(), "worker output did not close");
     reader.join().unwrap();
     assert_eq!(
         std::fs::read(home.join("share-context-v1")).unwrap(),
