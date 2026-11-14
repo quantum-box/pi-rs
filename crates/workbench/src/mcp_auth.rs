@@ -709,6 +709,7 @@ pub async fn login_configured_with_http_options(
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
     let settings = settings.unwrap_or(&default);
+    validate_oauth_client_settings(settings)?;
     let client_secret = if let Some(secret) = &settings.client_secret {
         Some(crate::mcp::resolve_value(secret).await?)
     } else {
@@ -873,12 +874,12 @@ fn metadata_document(
     Ok(base)
 }
 
-async fn callback_listener(
+fn validate_callback(
     url: Option<&str>,
     port: Option<u16>,
-) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+) -> Result<(std::net::IpAddr, reqwest_mcp::Url)> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let mut callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
+    let callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
     let address = match callback.host_str() {
         Some("127.0.0.1" | "localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
         Some("[::1]") => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -904,6 +905,14 @@ async fn callback_listener(
             "MCP callbackUrl and callbackPort disagree".into(),
         ));
     }
+    Ok((address, callback))
+}
+
+async fn callback_listener(
+    url: Option<&str>,
+    port: Option<u16>,
+) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+    let (address, mut callback) = validate_callback(url, port)?;
     let listener =
         tokio::net::TcpListener::bind((address, callback.port().or(port).unwrap_or_default()))
             .await?;
@@ -911,6 +920,49 @@ async fn callback_listener(
         .set_port(Some(listener.local_addr()?.port()))
         .map_err(|()| Error::Config("invalid MCP callback port".into()))?;
     Ok((listener, callback))
+}
+
+/// Validate configured OAuth client settings without network or filesystem effects.
+pub fn validate_oauth_client_settings(client: &OAuthClientSettings) -> Result<()> {
+    if client.client_secret.is_some() && client.client_id.is_none() {
+        return Err(Error::Config(
+            "OAuth client secret requires a client ID".into(),
+        ));
+    }
+    if client
+        .client_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+        || client
+            .client_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(Error::Config(
+            "OAuth client ID and name must be non-empty".into(),
+        ));
+    }
+    if client.client_registration == ClientRegistrationMode::Cimd
+        && (client.client_id.is_some() || client.client_name.is_some())
+    {
+        return Err(Error::Config(
+            "OAuth cimd registration requires a metadata document without clientId or clientName"
+                .into(),
+        ));
+    }
+    validate_callback(client.callback_url.as_deref(), client.callback_port)?;
+    if let Some(url) = client.client_metadata_url.as_deref()
+        && client.client_registration != ClientRegistrationMode::Dcr
+        && safe_http_url(url)?.scheme() != "https"
+    {
+        return Err(Error::Config(
+            "OAuth clientMetadataUrl requires HTTPS".into(),
+        ));
+    }
+    if let Some(url) = client.auth_server_metadata_url.as_deref() {
+        safe_http_url(url)?;
+    }
+    Ok(())
 }
 
 async fn configured_metadata(

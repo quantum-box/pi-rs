@@ -119,6 +119,22 @@ fn merge_project_servers(
                     )));
                 }
             }
+            let mut candidate = base.clone();
+            candidate.extend(overlay.clone());
+            let config: ServerConfig =
+                serde_json::from_value(Value::Object(candidate)).map_err(|_| {
+                    Error::Config(format!("project MCP server {name} override is invalid"))
+                })?;
+            if matches!(
+                config.oauth,
+                Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(_))
+                    | Some(pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(true))
+            ) && config.command.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} OAuth requires an HTTP server"
+                )));
+            }
             for (key, value) in overlay {
                 base.insert(key.clone(), value.clone());
             }
@@ -139,23 +155,11 @@ fn valid_exposure(value: &Value) -> bool {
 }
 
 fn valid_oauth(value: &Value) -> bool {
-    use pi_rs_workbench::mcp_auth::{ClientRegistrationMode, OAuthSetting};
+    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
 
     match serde_json::from_value::<OAuthSetting>(value.clone()) {
         Ok(OAuthSetting::Enabled(_)) => true,
-        Ok(OAuthSetting::Client(client)) => {
-            !(client.client_secret.is_some() && client.client_id.is_none())
-                && !client
-                    .client_id
-                    .as_deref()
-                    .is_some_and(|id| id.trim().is_empty())
-                && !client
-                    .client_name
-                    .as_deref()
-                    .is_some_and(|name| name.trim().is_empty())
-                && !(client.client_registration == ClientRegistrationMode::Cimd
-                    && (client.client_id.is_some() || client.client_name.is_some()))
-        }
+        Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
         Err(_) => false,
     }
 }
@@ -597,6 +601,10 @@ mod tests {
             json!({"enabled": true, "oauth": {"clientId": " "}}),
             json!({"enabled": true, "oauth": {"clientName": ""}}),
             json!({"enabled": true, "oauth": {"clientRegistration": "cimd", "clientId": "id"}}),
+            json!({"enabled": true, "oauth": {"callbackPort": 0}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://example.com/callback"}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://127.0.0.1:9000/callback", "callbackPort": 9001}}),
+            json!({"enabled": true, "oauth": {"clientMetadataUrl": "http://example.com/client.json"}}),
         ] {
             let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
             let mut servers = original.as_object().unwrap().clone();
@@ -604,5 +612,17 @@ mod tests {
             assert!(merge_project_servers(&mut servers, overlay.as_object().unwrap()).is_err());
             assert_eq!(Value::Object(servers), original);
         }
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let valid = json!({"service":{"enabled":true,"oauth":{"callbackUrl":"http://127.0.0.1:9000/callback","callbackPort":9000,"clientMetadataUrl":"https://example.com/client.json"}}});
+        merge_project_servers(&mut servers, valid.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        let original = json!({"service":{"command":"fixture","enabled":false}});
+        let mut servers = original.as_object().unwrap().clone();
+        let invalid = json!({"service":{"enabled":true,"oauth":true}});
+        assert!(merge_project_servers(&mut servers, invalid.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
     }
 }
