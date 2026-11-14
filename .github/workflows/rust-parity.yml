@@ -20,6 +20,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  vendored-reqwest:
+    name: Vendored reqwest integrity and RustSec
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify upstream archives and exact patches
+        run: python3 vendor/verify-reqwest.py
+      - name: Install cargo-audit
+        run: cargo +stable install cargo-audit --version 0.23.0 --locked
+      - name: Audit vendored registry versions
+        run: cargo +stable audit --file vendor/reqwest-audit.lock
+      - name: Verify known advisory detection
+        run: |
+          if cargo +stable audit --file vendor/audit-smoke.lock > "$RUNNER_TEMP/audit-smoke.log" 2>&1; then
+            echo "Expected known vulnerable fixture to fail"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/audit-smoke.log"
+          grep -q RUSTSEC-2020-0071 "$RUNNER_TEMP/audit-smoke.log"
+
+  reqwest-http3:
+    name: Vendored reqwest HTTP/3 feature checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check both HTTP/3 implementations
+        env:
+          RUSTFLAGS: --cfg reqwest_unstable
+        run: |
+          for version in 0.12.28 0.13.5; do
+            cp -R "vendor/reqwest-$version" "$RUNNER_TEMP/reqwest-$version"
+            cargo +stable check --manifest-path "$RUNNER_TEMP/reqwest-$version/Cargo.toml" --lib --features http3
+          done
+      - name: Test HTTP/3 proxy isolation on QUIC loopback
+        env:
+          RUSTFLAGS: --cfg reqwest_unstable
+        run: cargo +stable test --locked --manifest-path fixtures/reqwest-http3/Cargo.toml
+
   native:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

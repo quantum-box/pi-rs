@@ -2037,6 +2037,9 @@ mod tests {
     #[test]
     fn frozen_transport_is_released_during_panic_unwind() {
         let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // Install the cleanup guard before any fallible handshake so a failed
+        // assertion also releases the worker.
+        let release = ReleaseTestLatch(latch.clone());
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn({
@@ -2045,15 +2048,16 @@ mod tests {
                 let (lock, wake) = &*latch;
                 let held = lock.lock().unwrap();
                 waiting_tx.send(()).unwrap();
-                let (_guard, result) = wake
-                    .wait_timeout_while(held, Duration::from_secs(5), |released| !*released)
-                    .unwrap();
-                finished_tx.send(!result.timed_out()).unwrap();
+                let guard = wake.wait_while(held, |released| !*released).unwrap();
+                finished_tx.send(*guard).unwrap();
             }
         });
         waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let result = std::panic::catch_unwind(|| {
-            let _release = ReleaseTestLatch(latch);
+        let result = std::panic::catch_unwind(move || {
+            let _release = release;
+            // Reproduce slow work (such as a panic hook or delayed scheduling)
+            // before unwind without expiring the worker before it is released.
+            std::thread::sleep(Duration::from_millis(100));
             panic!("fixture early failure");
         });
         assert!(result.is_err());
@@ -2314,8 +2318,12 @@ mod tests {
     async fn http_proxy_is_preserved_when_transport_reconnects() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy =
-            reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy = reqwest_mcp::Proxy::all(format!(
+            "http://user:pass@{}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap()
+        .tunnel_http(true);
         let initialized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = initialized.clone();
         let server = tokio::spawn(async move {
@@ -2342,13 +2350,44 @@ mod tests {
                             length = value.trim().parse().unwrap();
                         }
                     }
+                    assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                    if socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    first.clear();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        assert!(
+                            !line
+                                .to_ascii_lowercase()
+                                .starts_with("proxy-authorization:")
+                        );
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
                     let mut body = vec![0; length];
                     if socket.read_exact(&mut body).await.is_err() {
                         return;
                     }
                     let request: Value = serde_json::from_slice(&body).unwrap_or_default();
                     let response = if request["method"] == "initialize" {
-                        assert!(first.starts_with("POST http://127.0.0.1:1/mcp "));
+                        assert!(first.starts_with("POST /mcp "));
                         count.fetch_add(1, Ordering::SeqCst);
                         Some(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
                     } else {
