@@ -458,7 +458,7 @@ fn signal_key(task_id: Uuid, id: Uuid) -> Vec<u8> {
     key
 }
 
-fn key(id: Uuid) -> Vec<u8> {
+pub(crate) fn key(id: Uuid) -> Vec<u8> {
     let mut key = PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
     key

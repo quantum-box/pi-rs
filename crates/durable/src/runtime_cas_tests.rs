@@ -528,3 +528,239 @@ fn writes_racing_abort_survive_and_stale_execution_cannot_clear_abort() {
             .any(|w| w.id == *id && w.placed)
     }));
 }
+
+#[tokio::test]
+async fn conversation_abort_marks_owned_tree_atomically_and_recovers_child_first() {
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use crate::task_scheduler::{Registry, Step};
+    use crate::task_store::{Save, TaskStore};
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abort-tree.db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let id = h.create_conversation(config.clone()).unwrap();
+    let other = h.create_conversation(config).unwrap();
+    let make = |id, owner| {
+        Task::new(
+            id,
+            owner,
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("tree".into(), true)
+    };
+    let root = make(Uuid::new_v4(), TaskOwner::Conversation(id));
+    let child = make(Uuid::new_v4(), TaskOwner::Task(root.id()));
+    let unrelated = make(Uuid::new_v4(), TaskOwner::Conversation(other));
+    let ts = TaskStore::new(h.owner.store());
+    ts.save(&[
+        Save::Create(&root),
+        Save::Create(&child),
+        Save::Create(&unrelated),
+    ])
+    .unwrap();
+    // A stale task version makes the entire composed transaction fail.
+    let mut stale = h.conversation_tasks(id).unwrap();
+    for record in &mut stale {
+        record.task.request_abort().unwrap();
+    }
+    let snapshot = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&snapshot, |t| t.start()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.abort_requested = true;
+    assert!(
+        h.save_composed_locked(&state, Expected::Version(version), None, &[], &stale)
+            .is_err()
+    );
+    assert!(!h.conversation(id).unwrap().abort_requested);
+    assert!(
+        !TaskStore::new(h.owner.store())
+            .load(child.id())
+            .unwrap()
+            .unwrap()
+            .task
+            .abort_requested()
+    );
+    h.request_abort(id).unwrap();
+    assert!(h.conversation(id).unwrap().abort_requested);
+    let ts = TaskStore::new(h.owner.store());
+    assert!(ts.load(root.id()).unwrap().unwrap().task.abort_requested());
+    assert!(ts.load(child.id()).unwrap().unwrap().task.abort_requested());
+    assert!(
+        !ts.load(unrelated.id())
+            .unwrap()
+            .unwrap()
+            .task
+            .abort_requested()
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    let log = calls.clone();
+    registry.register_with_abort(
+        "tree",
+        true,
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+        move |task: &Task| {
+            log.lock().unwrap().push(task.id());
+            Ok(Step::Succeed(json!(null)))
+        },
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    assert!(scheduler.tick(0).unwrap());
+    assert_eq!(*calls.lock().unwrap(), vec![child.id(), root.id()]);
+    assert_eq!(
+        scheduler.get(root.id()).unwrap().unwrap().state(),
+        &TaskState::Cancelled
+    );
+    drop(scheduler);
+    h.drive(id, &CancellationToken::new()).await.unwrap();
+    assert!(!h.conversation(id).unwrap().abort_requested);
+}
+
+#[test]
+fn abort_fences_root_and_stale_lifecycle_admissions() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::{Registry, Step};
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let make = || {
+        Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("tree".into(), true)
+    };
+    let mut registry = Registry::default();
+    registry.register("tree", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let scheduler = h.attach_tasks(registry).unwrap();
+    scheduler.submit(&make()).unwrap();
+    let mut worker = h.worker();
+    let (stale, version) = worker.load(id).unwrap();
+    h.request_abort(id).unwrap();
+    assert!(scheduler.submit(&make()).is_err());
+    let late = make();
+    assert!(
+        worker
+            .save_composed(
+                &stale,
+                Expected::Version(version),
+                None,
+                std::slice::from_ref(&late)
+            )
+            .is_err()
+    );
+    assert!(scheduler.get(late.id()).unwrap().is_none());
+}
+
+#[test]
+fn conversation_abort_fences_running_task_and_its_proposed_child() {
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
+    use crate::task_scheduler::{Registry, Step};
+    use serde_json::json;
+    use std::sync::mpsc;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let root = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        4,
+    )
+    .unwrap()
+    .registered("tree".into(), true);
+    let child_id = Uuid::new_v4();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let mut registry = Registry::default();
+    registry.register_with_abort(
+        "tree",
+        true,
+        move |task: &Task| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            let child = Task::new(
+                child_id,
+                TaskOwner::Task(task.id()),
+                task.checkpoint().clone(),
+                4,
+            )
+            .unwrap()
+            .registered("tree".into(), true);
+            Ok(Step::Wait {
+                checkpoint: task.checkpoint().clone(),
+                condition: WaitFor::Tasks(vec![child_id]),
+                children: vec![child],
+            })
+        },
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&root).unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    h.request_abort(id).unwrap();
+    assert!(driver.get(root.id()).unwrap().unwrap().abort_requested());
+    assert!(
+        driver
+            .submit(
+                &Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(id),
+                    root.checkpoint().clone(),
+                    4
+                )
+                .unwrap()
+                .registered("tree".into(), true)
+            )
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if driver.get(root.id()).unwrap().unwrap().state() == &TaskState::Cancelled {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(driver.get(child_id).unwrap().is_none());
+    driver.shutdown().unwrap();
+}

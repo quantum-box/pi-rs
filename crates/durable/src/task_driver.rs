@@ -123,15 +123,27 @@ impl Driver {
         {
             return Err(task_scheduler::Error::Ownership.into());
         }
+        let _gate = self
+            .shared
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
         if let TaskOwner::Conversation(id) = task.owner() {
             let key = format!("runtime/conversation/{id}");
-            if self
+            let entry = self
                 .shared
                 .owner
                 .store()
                 .get(key.as_bytes())
                 .map_err(|e| task_scheduler::Error::Store(e.into()))?
-                .is_none()
+                .ok_or(task_scheduler::Error::Ownership)?;
+            let value: serde_json::Value = serde_json::from_slice(&entry.value)
+                .map_err(|e| task_scheduler::Error::Store(e.into()))?;
+            if value
+                .get("abort_requested")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
             {
                 return Err(task_scheduler::Error::Ownership.into());
             }

@@ -285,6 +285,26 @@ impl Scheduler {
         {
             return Err(Error::Ownership);
         }
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        if let TaskOwner::Conversation(id) = task.owner() {
+            let key = format!("runtime/conversation/{id}");
+            if let Some(entry) = owner
+                .store()
+                .get(key.as_bytes())
+                .map_err(task_store::Error::from)?
+            {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&entry.value).map_err(task_store::Error::from)?;
+                if value
+                    .get("abort_requested")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return Err(Error::Ownership);
+                }
+            }
+        }
         self.ts().save(&[Save::Create(task)])?;
         Ok(())
     }

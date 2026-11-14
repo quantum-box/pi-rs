@@ -614,6 +614,22 @@ impl Harness {
         wake: Option<&crate::conversation_signal::PreparedWake>,
         children: &[crate::task::Task],
     ) -> Result<(), Error> {
+        let owner = self.owner.clone();
+        let _gate = if children.is_empty() {
+            None
+        } else {
+            Some(owner.task_gate().lock().map_err(|_| Error::Failed)?)
+        };
+        self.save_composed_locked(state, expected, wake, children, &[])
+    }
+    fn save_composed_locked(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+    ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -755,6 +771,11 @@ impl Harness {
                 }
             }
             if !children.is_empty() {
+                let current = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
+                let current: Conversation = serde_json::from_slice(&current.value)?;
+                if current.abort_requested {
+                    return Err(Error::Invalid("conversation is aborting".into()));
+                }
                 let batch = crate::task_store::TaskStore::new(self.owner.store())
                     .prepare_owned_tasks(
                         &crate::task::TaskOwner::Conversation(state.id),
@@ -767,6 +788,17 @@ impl Harness {
                 // The conversation check and mutation are already part of this save.
                 checks.extend(batch.checks.into_iter().skip(1));
                 mutations.extend(batch.mutations.into_iter().skip(1));
+            }
+            for task in abort_tasks {
+                let key = crate::task_store::key(task.task.id());
+                checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Version(task.version),
+                });
+                mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&task.task)?,
+                });
             }
             if let Some(wake) = wake {
                 checks.extend(wake.checks.clone());
@@ -1485,8 +1517,23 @@ impl Harness {
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
+        let owner = self.owner.clone();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
             let (mut c, version) = self.load(id)?;
+            let live = self.conversation_tasks(id)?;
+            let mut tasks = Vec::new();
+            for mut record in live
+                .iter()
+                .filter(|record| !record.task.abort_requested())
+                .cloned()
+            {
+                record
+                    .task
+                    .request_abort()
+                    .map_err(|e| Error::Invalid(format!("task abort: {e:?}")))?;
+                tasks.push(record);
+            }
             for submission in &mut c.submissions {
                 if submission.status == Status::Queued {
                     submission.status = Status::Unanswered {
@@ -1494,15 +1541,42 @@ impl Harness {
                     };
                 }
             }
-            if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            if !matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+                || c.active.is_some()
+                || !live.is_empty()
+            {
                 c.abort_requested = true;
             }
-            match self.save(&c, Expected::Version(version)) {
+            match self.save_composed_locked(&c, Expected::Version(version), None, &[], &tasks) {
                 Ok(()) => return Ok(()),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(error) => return Err(error),
             }
         }
+    }
+    fn conversation_tasks(&self, id: Uuid) -> Result<Vec<crate::task_store::StoredTask>, Error> {
+        use crate::task::TaskOwner;
+        let records = crate::task_store::TaskStore::new(self.owner.store())
+            .list()
+            .map_err(|e| Error::Invalid(format!("task list: {e}")))?;
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            let before = ids.len();
+            for record in &records {
+                if record.task.owner() == &TaskOwner::Conversation(id)
+                    || matches!(record.task.owner(), TaskOwner::Task(parent) if ids.contains(parent))
+                {
+                    ids.insert(record.task.id());
+                }
+            }
+            if before == ids.len() {
+                break;
+            }
+        }
+        Ok(records
+            .into_iter()
+            .filter(|record| ids.contains(&record.task.id()) && !record.task.is_terminal())
+            .collect())
     }
     /// Admit and run pending work immediately. Repeating a request ID returns
     /// the original submission, even when its answer was committed earlier.
@@ -1714,6 +1788,10 @@ impl Harness {
         version: u64,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
+        // Keep the conversation marked until all owned cleanup has finished.
+        if !self.conversation_tasks(c.id)?.is_empty() {
+            return Ok(false);
+        }
         // A blocked operation remains a barrier until an authoritative result arrives.
         if matches!(c.phase, Phase::Blocked { .. }) && c.active.is_none() {
             return Ok(false);
@@ -3820,25 +3898,30 @@ async fn drive_scheduled(
             };
         }
         let state = worker.conversation(id)?;
-        let should_poll = match &state.phase {
-            Phase::Pending { calls, index, .. } => calls
-                .get(*index)
-                .map(|call| {
-                    worker.resolved_tools(&state).map(|tools| {
-                        tools
-                            .get(&call.name)
-                            .is_some_and(|tool| tool.tool.can_poll())
+        let should_poll = if state.abort_requested && !matches!(state.phase, Phase::Blocked { .. })
+        {
+            true
+        } else {
+            match &state.phase {
+                Phase::Pending { calls, index, .. } => calls
+                    .get(*index)
+                    .map(|call| {
+                        worker.resolved_tools(&state).map(|tools| {
+                            tools
+                                .get(&call.name)
+                                .is_some_and(|tool| tool.tool.can_poll())
+                        })
                     })
-                })
-                .transpose()?
-                .unwrap_or(false),
-            Phase::ToolGateSleeping { .. }
-            | Phase::HookTasksWaiting { .. }
-            | Phase::YieldTasksWaiting { .. }
-            | Phase::OnYield { .. }
-            | Phase::AfterTools { .. }
-            | Phase::AfterRun { .. } => true,
-            _ => false,
+                    .transpose()?
+                    .unwrap_or(false),
+                Phase::ToolGateSleeping { .. }
+                | Phase::HookTasksWaiting { .. }
+                | Phase::YieldTasksWaiting { .. }
+                | Phase::OnYield { .. }
+                | Phase::AfterTools { .. }
+                | Phase::AfterRun { .. } => true,
+                _ => false,
+            }
         };
         if !should_poll {
             return Ok(());
