@@ -280,6 +280,11 @@ pub(super) async fn discover(
             && !args
                 .disable_extension
                 .contains(&format!("mcp-{extension_id}"));
+        // A disabled server cannot contribute to the reconstructed context;
+        // do not start it as a side effect of sharing.
+        if strict && !relevant {
+            continue;
+        }
         if !normalized.insert(name.replace('-', "_")) {
             discovery.failed |= relevant;
             if report {

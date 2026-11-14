@@ -206,12 +206,22 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
         drop(pi_rs::Session::open(&path).unwrap());
         let original = std::fs::read(&path).unwrap();
         let missing = root.path().join("missing-mcp-command");
+        let marker = root.path().join("disabled-mcp-started");
+        #[cfg(unix)]
+        let disabled = json!({"command":"sh", "args":["-c", "printf launched > \"$PI_RS_MCP_MARKER\""],
+            "env":{"PI_RS_MCP_MARKER":marker}});
+        #[cfg(windows)]
+        let disabled = json!({"command":"powershell.exe", "args":["-NoProfile", "-NonInteractive", "-Command", "[IO.File]::WriteAllText($env:PI_RS_MCP_MARKER,'launched')"],
+            "env":{"PI_RS_MCP_MARKER":marker}});
         let server = match case {
             "invalid-map" => json!({"mcpServers": []}),
             "invalid-server" => json!({"mcpServers": {"fixture": {"command": 42}}}),
             "disabled-config" => {
-                json!({"mcpServers": {"fixture": {"command": missing, "enabled": false}}})
+                let mut server = disabled.clone();
+                server["enabled"] = json!(false);
+                json!({"mcpServers": {"fixture":server}})
             }
+            "disabled-extension" => json!({"mcpServers": {"fixture":disabled}}),
             _ => json!({"mcpServers": {"fixture": {"command": missing}}}),
         };
         std::fs::write(home.join("mcp.json"), serde_json::to_vec(&server).unwrap()).unwrap();
@@ -301,6 +311,7 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
         assert_eq!(status.success(), disabled, "{case}: {stderr}");
         if disabled {
             let body = uploaded.expect("disabled server should not block sharing");
+            assert!(!marker.exists(), "disabled MCP server was started");
             assert!(
                 body.windows(b"pi.share".len())
                     .any(|part| part == b"pi.share")
