@@ -1803,3 +1803,417 @@ async fn reattachment_rechecks_current_parent_replay_policy_after_reopen() {
     assert_eq!(parent.calls.load(Ordering::SeqCst), 1);
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
 }
+
+struct ParallelJobs {
+    invocations: std::sync::Mutex<Vec<(String, uuid::Uuid)>>,
+    polls: std::sync::Mutex<Vec<(String, uuid::Uuid)>>,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    unknown: bool,
+}
+#[async_trait]
+impl Tool for ParallelJobs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, args: Value, ctx: ToolContext) -> Outcome {
+        let reference = format!("opaque/{}", args["job"].as_str().unwrap());
+        self.invocations
+            .lock()
+            .unwrap()
+            .push((reference.clone(), ctx.operation_id));
+        Outcome::Pending { reference }
+    }
+    async fn poll(&self, reference: &str, ctx: ToolContext) -> Option<Outcome> {
+        self.polls
+            .lock()
+            .unwrap()
+            .push((reference.into(), ctx.operation_id));
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Some(if self.unknown {
+            Outcome::Unknown("poll uncertain".into())
+        } else {
+            Outcome::Succeeded(reference.into())
+        })
+    }
+}
+struct ParallelParent;
+#[async_trait]
+impl pi_rs_durable::keyed_tool::KeyedTool for ParallelParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let outcomes = host
+            .call_keyed_batch(vec![
+                ("alpha".into(), "child".into(), json!({"job":"alpha"})),
+                ("beta".into(), "child".into(), json!({"job":"beta"})),
+            ])
+            .await;
+        Outcome::Succeeded(format!("{outcomes:?}")).into()
+    }
+}
+
+#[tokio::test]
+async fn keyed_pending_batch_polls_concurrently_and_reattaches_after_reopen() {
+    use pi_rs_durable::runtime::Scheduler;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let child = Arc::new(ParallelJobs {
+        invocations: std::sync::Mutex::new(vec![]),
+        polls: std::sync::Mutex::new(vec![]),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        unknown: false,
+    });
+    let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ParallelParent,
+    ));
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child.started.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(child.invocations.lock().unwrap().len(), 2);
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child.started.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    child.release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    let invocations = child.invocations.lock().unwrap().clone();
+    let polls = child.polls.lock().unwrap().clone();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(polls.len(), 4);
+    for (reference, operation) in &polls {
+        assert!(invocations.contains(&(reference.clone(), *operation)));
+    }
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keyed_pending_batch_abort_preserves_both_references_without_redispatch() {
+    use pi_rs_durable::runtime::Scheduler;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let child = Arc::new(ParallelJobs {
+        invocations: std::sync::Mutex::new(vec![]),
+        polls: std::sync::Mutex::new(vec![]),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        unknown: false,
+    });
+    let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ParallelParent,
+    ));
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child.started.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let (root, _) = scheduler.blocked(id).unwrap().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let jobs = h.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in jobs {
+        assert!(
+            child
+                .invocations
+                .lock()
+                .unwrap()
+                .contains(&(job.reference.clone(), job.operation_id))
+        );
+        h.cancel_nested_pending(
+            id,
+            root,
+            job.operation_id,
+            &job.reference,
+            "remote cancellation confirmed".into(),
+        )
+        .unwrap();
+    }
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert!(h.conversation(id).unwrap().abort_requested);
+    assert_eq!(child.invocations.lock().unwrap().len(), 2);
+    assert_eq!(child.polls.lock().unwrap().len(), 2);
+    h.reconcile(id, root, Outcome::Failed("parent cancelled".into()))
+        .unwrap();
+    assert!(!h.conversation(id).unwrap().abort_requested);
+}
+
+#[tokio::test]
+async fn keyed_batch_waits_for_every_confirmed_job_before_parent_reattaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let child = Arc::new(ParallelJobs {
+        invocations: std::sync::Mutex::new(vec![]),
+        polls: std::sync::Mutex::new(vec![]),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(2),
+        unknown: true,
+    });
+    let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ParallelParent,
+    ));
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let (root, _) = h.blocked(id).unwrap().unwrap();
+    let jobs = h.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 2);
+    h.reconcile_nested_pending(
+        id,
+        root,
+        jobs[0].operation_id,
+        &jobs[0].reference,
+        Outcome::Succeeded("first".into()),
+    )
+    .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    h.reconcile_nested_pending(
+        id,
+        root,
+        jobs[1].operation_id,
+        &jobs[1].reference,
+        Outcome::Succeeded("second".into()),
+    )
+    .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    assert_eq!(child.invocations.lock().unwrap().len(), 2);
+    assert_eq!(child.polls.lock().unwrap().len(), 2);
+}
+
+struct ProcessParallelJobs {
+    root: std::path::PathBuf,
+    hang: bool,
+}
+#[async_trait]
+impl Tool for ProcessParallelJobs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, args: Value, ctx: ToolContext) -> Outcome {
+        use std::io::Write;
+        let key = args["job"].as_str().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("batch-invocations"))
+            .unwrap();
+        writeln!(file, "{key} {}", ctx.operation_id).unwrap();
+        Outcome::Pending {
+            reference: format!("opaque/{key}"),
+        }
+    }
+    async fn poll(&self, reference: &str, ctx: ToolContext) -> Option<Outcome> {
+        let key = reference.strip_prefix("opaque/").unwrap();
+        std::fs::write(
+            self.root.join(format!("batch-poll-{key}")),
+            ctx.operation_id.to_string(),
+        )
+        .unwrap();
+        if self.hang {
+            std::future::pending().await
+        } else {
+            Some(Outcome::Succeeded(reference.into()))
+        }
+    }
+}
+fn process_batch_options(root: &std::path::Path, hang: bool) -> Options {
+    let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ParallelParent,
+    ));
+    Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(ProcessParallelJobs {
+                    root: root.into(),
+                    hang,
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn parallel_batch_crash_worker() {
+    let Some(root) = std::env::var_os("PI_PARALLEL_BATCH_WORKER") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(root.join("db"), process_batch_options(&root, true), &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(root.join("batch-id"), id.to_string()).unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn killed_parallel_batch_reattaches_without_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut worker = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "parallel_batch_crash_worker"])
+            .env("PI_PARALLEL_BATCH_WORKER", root)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !root.join("batch-poll-alpha").exists() || !root.join("batch-poll-beta").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both polls must start");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("batch-id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(root.join("db"), process_batch_options(root, false), &cancel)
+        .await
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    let log = std::fs::read_to_string(root.join("batch-invocations")).unwrap();
+    assert_eq!(log.lines().count(), 2);
+    for key in ["alpha", "beta"] {
+        let operation = std::fs::read_to_string(root.join(format!("batch-poll-{key}"))).unwrap();
+        assert!(log.lines().any(|line| line == format!("{key} {operation}")));
+    }
+}

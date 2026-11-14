@@ -1056,3 +1056,13 @@ intermediate calls and unsafe effects. This is narrower than upstream's
 scheduler-owned nested task settlement: it does not replay intermediate callers,
 legacy blocked records, extension-selected or stateful parent calls, or arbitrary
 interrupted nested calls without a persisted pending reference.
+
+`KeyedHost::call_keyed_batch` is a bounded pi-rs extension for at most eight
+distinct keyed calls. It admits calls in input order, durably records each
+accepted pending reference, and then polls those jobs concurrently. Results
+retain input order. Invalid, duplicate, or oversized batches fail before any
+dispatch; an uncertain admission stops later admissions. Reopen reuses each
+operation ID and reference, and abort stops local polling while retaining
+pending jobs for host reconciliation. The parent remains live while waiting;
+this is not upstream's independently scheduled child tasks or a parked parent.
+Ordinary nested calls and `call_batch` retain their existing serial behavior.

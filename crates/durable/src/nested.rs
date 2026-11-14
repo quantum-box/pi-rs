@@ -6,8 +6,8 @@
 //! Exactly one execution of a given root operation may be alive at a time,
 //! including detached tasks. The scheduler must cancel and join all old work
 //! before replay and keep `OwnedStore` ownership for the whole execution. Calls
-//! made concurrently on one host are rejected: only ordered calls, or the
-//! explicitly ordered `call_batch`, have stable replay identities.
+//! made concurrently on one host are rejected. The opt-in keyed batch admits
+//! calls in order and polls their persisted pending jobs concurrently.
 //!
 //! Tool argument preparation must be side-effect free. Nested tools that return
 //! extension state are unsupported: their result is treated as uncertain. The
@@ -321,11 +321,82 @@ impl NestedHost {
     /// Explicit keys follow upstream's path-segment rules. The same key may be
     /// reused only with the same tool and JSON arguments.
     pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
-        let positive_integer = !key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit());
-        if key.is_empty() || key.contains('/') || key == "__proto__" || positive_integer {
+        if !valid_key(key) {
             return self.fail("invalid nested call key");
         }
-        self.call_inner(Some(key), name, arguments).await
+        self.call_inner(Some(key), name, arguments, false, true).await
+    }
+    /// Admit up to eight distinct keyed calls in order, then poll their persisted
+    /// pending jobs concurrently. The parent remains active until all polls stop.
+    /// A failed admission stops later admissions; no job is redispatched to poll.
+    pub async fn call_keyed_batch(&self, calls: Vec<(String, String, Value)>) -> Vec<Outcome> {
+        const MAX_BATCH: usize = 8;
+        let mut keys = HashSet::new();
+        if calls.len() > MAX_BATCH
+            || calls
+                .iter()
+                .any(|(key, _, _)| !valid_key(key) || !keys.insert(key.clone()))
+        {
+            let error = self.fail("invalid or oversized keyed nested batch");
+            return vec![error; calls.len().max(1)];
+        }
+        let _active = match self.enter() {
+            Ok(active) => active,
+            Err(outcome) => return vec![outcome; calls.len()],
+        };
+        let _serial = match self.serial.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return vec![self.fail("concurrent nested calls have no stable order"); calls.len()];
+            }
+        };
+        let mut outcomes = Vec::with_capacity(calls.len());
+        for (key, name, arguments) in &calls {
+            let result = self
+                .call_inner(Some(key), name, arguments.clone(), true, false)
+                .await;
+            let stop = matches!(result, Outcome::Unknown(_));
+            outcomes.push(result);
+            if stop {
+                self.shared
+                    .non_pending_failure
+                    .store(true, Ordering::Release);
+                self.shared.failed.store(true, Ordering::Release);
+                outcomes.resize(
+                    calls.len(),
+                    Outcome::Skipped("earlier nested admission failed".into()),
+                );
+                return outcomes;
+            }
+        }
+        futures_util::future::join_all(calls.iter().zip(outcomes).map(
+            |((key, name, _), outcome)| async move {
+                if !matches!(outcome, Outcome::Pending { .. }) {
+                    return outcome;
+                }
+                let Some(reg) = self.shared.tools.get(name) else {
+                    return self.fail("nested tool unavailable");
+                };
+                if !reg.tool.can_poll() {
+                    return outcome;
+                }
+                let storage_key = self.explicit_key(self.parent, key);
+                let entry = match self.shared.owner.store().get(&storage_key) {
+                    Ok(Some(entry)) => entry,
+                    _ => return self.fail("nested pending record unavailable"),
+                };
+                let record: Record = match serde_json::from_slice(&entry.value) {
+                    Ok(record) => record,
+                    Err(_) => return self.fail("invalid nested pending record"),
+                };
+                if record.outcome != Some(outcome) {
+                    return self.fail("nested pending record changed");
+                }
+                self.poll_pending(&storage_key, record, entry.version, reg)
+                    .await
+            },
+        ))
+        .await
     }
     fn fail(&self, reason: impl Into<String>) -> Outcome {
         self.shared
@@ -455,14 +526,23 @@ impl NestedHost {
         }
         Ok(())
     }
-    async fn call_inner(&self, explicit: Option<&str>, name: &str, arguments: Value) -> Outcome {
+    async fn call_inner(
+        &self,
+        explicit: Option<&str>,
+        name: &str,
+        arguments: Value,
+        serial_held: bool,
+        poll: bool,
+    ) -> Outcome {
         let _active = match self.enter() {
             Ok(active) => active,
             Err(outcome) => return outcome,
         };
-        let _serial = match self.serial.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return self.fail("concurrent nested calls have no stable order"),
+        let _serial = if serial_held { None } else {
+            match self.serial.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => return self.fail("concurrent nested calls have no stable order"),
+            }
         };
         if self.depth >= self.shared.max_depth {
             return self.fail("nested depth limit exceeded");
@@ -503,7 +583,7 @@ impl NestedHost {
                 return self.fail("nested call identity, arguments, or replay policy changed");
             }
             if let Some(outcome) = &record.outcome {
-                if matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
+                if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
                     return self.poll_pending(&key, record, entry.version, reg).await;
                 }
                 return outcome.clone();
@@ -645,7 +725,7 @@ impl NestedHost {
         ) {
             return self.fail(format!("nested result commit: {e}"));
         }
-        if matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
+        if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
             let version = match store.get(&key) {
                 Ok(Some(entry)) => entry.version,
                 _ => return self.fail("nested pending record missing after commit"),
@@ -729,6 +809,11 @@ impl NestedHost {
         }
     }
 }
+fn valid_key(key: &str) -> bool {
+    let positive_integer = !key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit());
+    !key.is_empty() && !key.contains('/') && key != "__proto__" && !positive_integer
+}
+
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
     fn tools(&self) -> Vec<ToolSpec> {
@@ -737,12 +822,12 @@ impl ToolHost for NestedHost {
         tools
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
-        self.call_inner(None, name, arguments).await
+        self.call_inner(None, name, arguments, false, true).await
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
         let mut outcomes = Vec::with_capacity(calls.len());
         for (name, args) in calls {
-            outcomes.push(self.call_inner(None, &name, args).await);
+            outcomes.push(self.call_inner(None, &name, args, false, true).await);
         }
         outcomes
     }
@@ -1169,6 +1254,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn keyed_batch_rejects_duplicate_invalid_and_oversized_before_dispatch() {
+        let cases = vec![
+            vec![
+                ("same".to_string(), "fake".to_string(), json!({})),
+                ("same".to_string(), "fake".to_string(), json!({})),
+            ],
+            vec![
+                ("valid".to_string(), "fake".to_string(), json!({})),
+                ("1".to_string(), "fake".to_string(), json!({})),
+            ],
+            (0..9)
+                .map(|i| (format!("key-{i}"), "fake".to_string(), json!({})))
+                .collect(),
+        ];
+        for calls in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let h = host(
+                &dir.path().join("db"),
+                Uuid::new_v4(),
+                invoked.clone(),
+                ReplayPolicy::Unsafe,
+                false,
+                2,
+            );
+            let result = h.call_keyed_batch(calls).await;
+            assert!(
+                result
+                    .iter()
+                    .all(|item| matches!(item, Outcome::Unknown(_)))
+            );
+            assert_eq!(invoked.load(Ordering::SeqCst), 0);
+            assert!(h.seal_and_inspect().is_err());
+        }
+    }
     #[tokio::test]
     async fn depth_and_concurrent_calls_poison_inspection() {
         let dir = tempfile::tempdir().unwrap();

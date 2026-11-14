@@ -97,7 +97,8 @@ pub trait KeyedTool: Send + Sync {
 }
 
 /// The invocation's ordinary host plus its durable keyed-call capability.
-/// Calls remain subject to the same serialization, fencing and sealing checks.
+/// Calls remain subject to fencing and sealing checks. Ordinary keyed calls
+/// remain serialized; the bounded keyed batch polls accepted jobs concurrently.
 #[derive(Clone)]
 pub struct KeyedHost {
     ordinary: Arc<dyn ToolHost>,
@@ -110,6 +111,10 @@ impl KeyedHost {
     }
     pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
         self.nested.call_keyed(key, name, arguments).await
+    }
+    /// Admit distinct keyed calls in order and poll accepted jobs concurrently.
+    pub async fn call_keyed_batch(&self, calls: Vec<(String, String, Value)>) -> Vec<Outcome> {
+        self.nested.call_keyed_batch(calls).await
     }
 }
 

@@ -310,3 +310,8 @@ opaque reference. A replay-safe direct parent can reattach to the recorded resul
 when its replay identity and policy still match; other parents require separate
 authoritative reconciliation. Interrupted calls without pending references and
 unresolved intermediate callers remain outside this automatic path.
+
+The opt-in bounded keyed nested batch admits calls sequentially and polls their
+persisted pending jobs concurrently, preserving key and operation identity over
+reopen. It is not upstream's independent task admission or parked parent: the
+conversation worker remains active and abort requires local polling to stop.
