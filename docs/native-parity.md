@@ -172,6 +172,8 @@ recognizes interrupted compaction markers before a summary is complete, and
 recognizes a durable overflow or length stop before its marker is written. It
 restores the branch model before checking the interrupted request's identity;
 queued trigger turns do not overtake an unresolved compaction recovery.
+SDK recovery defers session-start callbacks until recovery succeeds; when
+extensions are registered it requires reconciliation before invoking them.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

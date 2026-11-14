@@ -1774,7 +1774,11 @@ impl AgentSession {
             None => None,
         };
         let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())), true)
+            .start_with_fallback(
+                Some((model.clone(), provider.clone(), name.clone())),
+                true,
+                false,
+            )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
@@ -2137,7 +2141,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None, true).await?;
+        let (_, error) = self.start_with_fallback(None, true, false).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2148,6 +2152,7 @@ impl AgentSession {
         &mut self,
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
         drain_triggers: bool,
+        defer_startup: bool,
     ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
@@ -2203,7 +2208,11 @@ impl AgentSession {
                 self.restore_branch_model(provider.as_deref(), name)?;
             }
         }
-        let startup = self.pending_start.lock().expect("session startup").take();
+        let startup = if defer_startup {
+            None
+        } else {
+            self.pending_start.lock().expect("session startup").take()
+        };
         let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
@@ -2647,19 +2656,17 @@ impl AgentSession {
         .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        let (_, startup_error) = self.start_with_fallback(None, false).await?;
-        if let Some(error) = startup_error {
-            return Err(error);
-        }
         let recovery = {
             let journal = self.journal_async().await;
             crate::agent::resumable_compaction_run(&journal)
         };
-        if recovery
-            .as_ref()
-            .is_some_and(|(_, _, completed)| *completed)
-            && !self.registry.extensions.is_empty()
-        {
+        let (_, startup_error) = self
+            .start_with_fallback(None, false, recovery.is_some())
+            .await?;
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
+        if recovery.is_some() && !self.registry.extensions.is_empty() {
             return Err(Error::Session(
                 "pending compaction recovery requires reconciliation after extensions changed"
                     .into(),
@@ -2678,15 +2685,20 @@ impl AgentSession {
         if run_id.is_none() {
             self.drain_idle_triggers().await?;
         }
-        self.run_input(
-            None,
-            None,
-            run_id.unwrap_or_else(Uuid::new_v4),
-            false,
-            true,
-            &mut |_| {},
-        )
-        .await
+        let result = self
+            .run_input(
+                None,
+                None,
+                run_id.unwrap_or_else(Uuid::new_v4),
+                false,
+                true,
+                &mut |_| {},
+            )
+            .await;
+        if result.is_ok() && run_id.is_some() {
+            self.start().await?;
+        }
+        result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -9271,6 +9283,37 @@ mod tests {
                 }),
                 ..Limits::default()
             };
+            // Startup would append immediate context; recovery must be
+            // classified before this callback can invalidate the summary.
+            let mut guarded = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reconciliation")
+            );
+            assert!(
+                !guarded
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::CustomMessage { message, .. } if message.custom_type == "lifecycle"))
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert!(model.attempts.lock().unwrap().is_empty());
+            guarded.close().await.unwrap();
+            drop(guarded);
             let mut session = SessionBuilder::new(model.clone(), "default")
                 .branch_model("fixture", model.clone())
                 .unwrap()
@@ -9568,7 +9611,11 @@ mod tests {
                 })
                 .unwrap();
             drop(journal);
-            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id: request_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
             let mut session = SessionBuilder::new(model.clone(), "fixture")
                 .limits(Limits {
                     context_window: Some(1000),
@@ -9582,9 +9629,19 @@ mod tests {
                 })
                 .open(&path)
                 .unwrap();
-            assert_eq!(session.resume().await.unwrap(), "answer 2");
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
             assert_eq!(
-                model.0.load(Ordering::SeqCst),
+                model.calls.load(Ordering::SeqCst),
                 2,
                 "only summary and retry may call the model"
             );

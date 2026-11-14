@@ -1289,6 +1289,28 @@ impl Agent<'_> {
                         "context overflow and automatic compaction is disabled".into(),
                     ));
                 }
+                if !recovery.started
+                    && let Some((usage, metadata)) =
+                        session
+                            .branch()
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.event {
+                                Event::ModelFinished {
+                                    request_id,
+                                    usage,
+                                    metadata,
+                                    ..
+                                } if *request_id == recovery.request_id => {
+                                    Some((usage.clone(), metadata.clone()))
+                                }
+                                _ => None,
+                            })
+                {
+                    active
+                        .settle_usage(recovery.request_id, &usage, &metadata)
+                        .await?;
+                }
                 if recovery.started
                     && !recovery.summary_started
                     && !recovery_marker_created_in_run
