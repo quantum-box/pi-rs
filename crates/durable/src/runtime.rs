@@ -44,6 +44,8 @@ pub enum Error {
     Observer(#[from] crate::observer::Error),
     #[error("generation progress: {0}")]
     Progress(#[from] crate::progress::Error),
+    #[error("tool progress: {0}")]
+    ToolProgress(#[from] crate::tool_progress::Error),
     #[error("transcript: {0}")]
     Transcript(#[from] crate::transcript::Error),
     #[error("conversation signal: {0}")]
@@ -389,6 +391,8 @@ impl Conversation {
 pub struct ConversationView {
     pub state: Conversation,
     pub live: Option<crate::progress::State>,
+    /// Latest committed partial for the current tool attempt.
+    pub tool_progress: Option<crate::tool_progress::State>,
     pub entries: Vec<Message>,
     pub older: Option<ViewCursor>,
 }
@@ -434,6 +438,7 @@ fn view_fingerprint(view: &ConversationView) -> Result<serde_json::Value, Error>
     Ok(serde_json::json!({
         "state": serde_json::to_value(&view.state)?,
         "live": serde_json::to_value(&view.live)?,
+        "tool_progress": serde_json::to_value(&view.tool_progress)?,
     }))
 }
 
@@ -472,6 +477,65 @@ pub struct ExtensionReportBatch {
     pub reports: Vec<crate::extension::Report>,
 }
 
+struct RuntimeToolProgress {
+    owner: Arc<OwnedStore>,
+    conversation: Uuid,
+    attempt: ToolAttempt,
+    storage_failed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl crate::tool_progress::Sink for RuntimeToolProgress {
+    async fn update(&self, partial: serde_json::Value) -> pi_rs_core::ExtensionResult<()> {
+        let store = self.owner.store();
+        loop {
+            let result = (|| -> Result<bool, Error> {
+                let key = Harness::key(self.conversation);
+                let Some(entry) = store.get(&key)? else {
+                    return Ok(true);
+                };
+                let state: Conversation = serde_json::from_slice(&entry.value)?;
+                if state.abort_requested
+                    || state.tool_attempt() != Some(self.attempt)
+                    || !matches!(
+                        state.phase,
+                        Phase::ToolRunning {
+                            replay_ready: false,
+                            ..
+                        }
+                    )
+                {
+                    return Ok(true);
+                }
+                let mut snapshot =
+                    crate::tool_progress::Snapshot::load(store, self.attempt.attempt_id)?;
+                if !matches!(snapshot.state(), crate::tool_progress::State::Running(_)) {
+                    return Ok(true);
+                }
+                snapshot.update(partial.clone())?;
+                let mut batch = snapshot.prepare_checkpoint()?;
+                batch.checks.push(Check {
+                    key,
+                    expected: Expected::Version(entry.version),
+                });
+                match store.commit(&batch.checks, &batch.mutations) {
+                    Ok(()) => Ok(true),
+                    Err(durable_store::Error::Conflict { .. }) => Ok(false),
+                    Err(error) => {
+                        self.storage_failed.store(true, Ordering::Release);
+                        Err(error.into())
+                    }
+                }
+            })();
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+}
+
 pub struct Harness {
     owner: Arc<OwnedStore>,
     options: Options,
@@ -480,6 +544,7 @@ pub struct Harness {
     failed: bool,
     dirty: Arc<AtomicBool>,
     merge_admissions: bool,
+    recovering: bool,
     storage_failed: Arc<AtomicBool>,
     /// Snapshots loaded by this worker, used to distinguish admission-only
     /// conflicts from changes to execution state.
@@ -628,6 +693,7 @@ impl Harness {
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: false,
+            recovering: false,
             storage_failed: Arc::new(AtomicBool::new(false)),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
@@ -646,6 +712,7 @@ impl Harness {
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: true,
+            recovering: false,
             storage_failed: self.storage_failed.clone(),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
@@ -867,6 +934,18 @@ impl Harness {
             }
             match self.commit_conversation_save(prepared) {
                 Ok(()) => break,
+                Err(Error::Storage(durable_store::Error::Conflict { key: conflict }))
+                    if conflict.starts_with(b"durable/tool-progress/")
+                        && self
+                            .owner
+                            .store()
+                            .get(&key)?
+                            .is_some_and(|entry| expected == Expected::Version(entry.version)) =>
+                {
+                    // A callback won the race with sealing. Reload its latest
+                    // partial and retry the whole atomic transition.
+                    continue;
+                }
                 Err(Error::Storage(durable_store::Error::Conflict { .. }))
                     if self.merge_admissions =>
                 {
@@ -1100,6 +1179,41 @@ impl Harness {
                 };
                 checks.extend(prepared.checks);
                 mutations.extend(prepared.mutations);
+            }
+        }
+        // Seal the invocation in the same transaction that leaves its running
+        // phase, requests abort, or prepares a replay. The attempt ID prevents
+        // callbacks from a previous invocation from affecting a replacement.
+        if let Some(previous) = old
+            && let Phase::ToolRunning {
+                replay_ready: false,
+                ..
+            } = &previous.phase
+            && let Some(attempt) = previous.tool_attempt()
+        {
+            let still_running = matches!(
+                &state.phase,
+                Phase::ToolRunning {
+                    replay_ready: false,
+                    ..
+                }
+            ) && state.tool_attempt() == Some(attempt)
+                && !state.abort_requested;
+            if !still_running {
+                let snapshot =
+                    crate::tool_progress::Snapshot::load(self.owner.store(), attempt.attempt_id)?;
+                if matches!(snapshot.state(), crate::tool_progress::State::Running(_)) {
+                    let complete = !self.recovering
+                        && !state.abort_requested
+                        && matches!(&state.phase, Phase::ToolFinished { .. });
+                    let prepared = if complete {
+                        snapshot.prepare_complete()?
+                    } else {
+                        snapshot.prepare_abort()?
+                    };
+                    checks.extend(prepared.checks);
+                    mutations.extend(prepared.mutations);
+                }
             }
         }
         if !children.is_empty() {
@@ -1476,7 +1590,7 @@ impl Harness {
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.subagent_store()?;
         let store = self.owner.store();
-        let (mut state, live) = loop {
+        let (mut state, live, tool_progress) = loop {
             let entry = store.get(&Self::key(id))?.ok_or(Error::NotFound)?;
             let state: Conversation = serde_json::from_slice(&entry.value)?;
             let request = match &state.phase {
@@ -1488,11 +1602,16 @@ impl Harness {
                 .map(|request| crate::progress::Snapshot::load(store, request))
                 .transpose()?
                 .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()));
+            let tool_progress = state
+                .tool_attempt()
+                .map(|attempt| crate::tool_progress::Snapshot::load(store, attempt.attempt_id))
+                .transpose()?
+                .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()));
             if store
                 .get(&Self::key(id))?
                 .is_some_and(|current| current.version == entry.version)
             {
-                break (state, live);
+                break (state, live, tool_progress);
             }
         };
         let cursor = state.transcript.clone().ok_or_else(|| {
@@ -1512,6 +1631,7 @@ impl Harness {
         Ok(ConversationView {
             state,
             live,
+            tool_progress,
             entries: page.entries,
             older: page.older,
         })
@@ -2430,7 +2550,10 @@ impl Harness {
                 }
                 _ => return Ok(()),
             }
-            self.save(&c, Expected::Version(version))?;
+            self.recovering = true;
+            let result = self.save(&c, Expected::Version(version));
+            self.recovering = false;
+            result?;
         }
         Ok(())
     }
@@ -3939,13 +4062,28 @@ impl Harness {
                                     8,
                                 ) {
                                     Ok(host) => {
+                                        let scope = c.tool_attempt().map(|attempt| {
+                                            crate::tool_progress::scoped_host(
+                                                host.clone(),
+                                                Arc::new(RuntimeToolProgress {
+                                                    owner: self.owner.clone(),
+                                                    conversation: id,
+                                                    attempt,
+                                                    storage_failed: self.storage_failed.clone(),
+                                                }),
+                                            )
+                                        });
+                                        let progress_host = scope
+                                            .as_ref()
+                                            .map(|(host, _)| host.clone())
+                                            .unwrap_or_else(|| host.clone());
                                         let reply = fenced_poll(
                                             std::panic::AssertUnwindSafe(crate::tool::execute(
                                                 reg.tool.as_ref(),
                                                 &invocation,
                                                 prepared,
                                                 c.tool_states.get(&call.name),
-                                                host.clone(),
+                                                progress_host,
                                                 cancel,
                                                 Duration::from_secs(120),
                                             ))
@@ -3954,6 +4092,7 @@ impl Harness {
                                             cancel,
                                         )
                                         .await;
+                                        drop(scope);
                                         match host.seal_and_wait().await {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,

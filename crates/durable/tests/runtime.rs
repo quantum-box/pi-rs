@@ -887,3 +887,162 @@ async fn continue_after_turn_limit_does_not_repeat_tool_effect() {
         }
     );
 }
+
+struct ProgressTool {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    host: std::sync::Mutex<Option<Arc<dyn pi_rs_core::ToolHost>>>,
+}
+#[async_trait]
+impl Tool for ProgressTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+    async fn invoke_with_host(
+        &self,
+        _: serde_json::Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: Arc<dyn pi_rs_core::ToolHost>,
+    ) -> Outcome {
+        host.report_progress(json!({"text":"working"}))
+            .await
+            .unwrap();
+        *self.host.lock().unwrap() = Some(host);
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Outcome::Succeeded("ok".into())
+    }
+}
+
+#[tokio::test]
+async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_reopen() {
+    use pi_rs_durable::{runtime::Scheduler, tool_progress::State};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = Arc::new(ProgressTool {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        host: std::sync::Mutex::new(None),
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![RegisteredTool {
+            tool: tool.clone(),
+            replay: ReplayPolicy::Safe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let limit = std::num::NonZeroUsize::new(1).unwrap();
+    assert_eq!(
+        scheduler.view(id, limit).unwrap().tool_progress,
+        Some(State::Running(Some(json!({"text":"working"}))))
+    );
+    scheduler.abort_and_wait(id).await.unwrap();
+    let host = tool.host.lock().unwrap().take().unwrap();
+    host.report_progress(json!("late")).await.unwrap();
+    drop(host);
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let snapshot =
+        pi_rs_durable::tool_progress::Snapshot::load(&store, attempt.attempt_id).unwrap();
+    assert_eq!(
+        snapshot.state(),
+        &State::Aborted(Some(json!({"text":"working"})))
+    );
+}
+
+#[tokio::test]
+async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
+    use pi_rs_durable::{
+        runtime::Scheduler,
+        tool_progress::{Snapshot, State},
+    };
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = Arc::new(ProgressTool {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        host: std::sync::Mutex::new(None),
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![RegisteredTool {
+            tool: tool.clone(),
+            replay: ReplayPolicy::Safe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let first = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    // Shutdown interrupts the invocation without recording an abort request.
+    scheduler.shutdown().await.unwrap();
+    let late = tool.host.lock().unwrap().take().unwrap();
+    late.report_progress(json!("late after shutdown"))
+        .await
+        .unwrap();
+    drop(late);
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_eq!(first.operation_id, second.operation_id);
+    tool.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let late = tool.host.lock().unwrap().take().unwrap();
+    late.report_progress(json!("late after completion"))
+        .await
+        .unwrap();
+    drop(late);
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        Snapshot::load(&store, first.attempt_id).unwrap().state(),
+        &State::Aborted(Some(json!({"text":"working"})))
+    );
+    assert_eq!(
+        Snapshot::load(&store, second.attempt_id).unwrap().state(),
+        &State::Completed
+    );
+}

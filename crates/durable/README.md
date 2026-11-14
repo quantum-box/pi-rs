@@ -55,7 +55,8 @@ again after reopening. `reset` preserves older observation records and can
 carry handoff text; busy resets are queued until a safe boundary.
 
 `Harness::view` and `Scheduler::view` capture conversation metadata, the
-committed running model/compaction progress checkpoint, and a newest-first
+committed running model/compaction progress checkpoint, the current tool attempt’s
+committed replacement partial, and a newest-first
 message page. Pass 50 for a window comparable to upstream's initial window.
 `view_page` follows `older` through the same immutable snapshot even after
 later commits or resets. Each call visits at most the requested number of
@@ -63,6 +64,13 @@ transcript records and returns at most that many messages; an empty page can
 still have an older cursor. Submission, abort and other persisted conversation
 fields remain visible. Legacy conversations without a transcript must first be
 saved by the runtime. Cursors are in-process handles, not a wire format.
+
+Tool progress is display-only: it is not a tool result or evidence that an effect
+is safe to replay. Each invocation uses a fresh attempt identity. Completion clears
+the partial; abort or an interrupted attempt retains the last committed partial.
+Callbacks are fenced by the conversation phase and attempt identity, and progress
+is sealed atomically with the corresponding transition. Legacy running attempts
+without an identity do not report durable progress until replay creates one.
 
 This pull API does not provide upstream's watch operations, `from`, automatic
 min/max window maintenance, or transcript entries for reset and compaction
@@ -75,7 +83,7 @@ paths still hydrate all messages. Store reads are synchronous and may block.
 
 `Harness::watch_view` and `Scheduler::watch_view` attach a pull watch with an
 initial `ConversationView`; `next().await` polls for the next changed bounded
-snapshot, including committed generation progress. The interval must be nonzero.
+snapshot, including committed generation and tool progress. The interval must be nonzero.
 Cancel a wait by dropping its future; close or drop the watch to release its store
 ownership. A watch retains the store owner even after the originating handle is
 dropped or the scheduler shuts down, so close it before reopening the database.
