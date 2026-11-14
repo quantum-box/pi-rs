@@ -469,6 +469,10 @@ pub struct Conversation {
     #[serde(default)]
     pub model_tools: Option<Vec<String>>,
     pub messages: Vec<Message>,
+    /// Identity of the active context since its last reset or compaction.
+    /// Older persisted conversations acquire one at the next compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_generation: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
@@ -2047,6 +2051,7 @@ impl Harness {
             allowed_tools: None,
             model_tools: None,
             messages: vec![],
+            context_generation: Some(Uuid::new_v4()),
             transcript: None,
             submissions: vec![],
             aborted_generations: vec![],
@@ -2090,6 +2095,7 @@ impl Harness {
         }
         state.tool_attempt = None;
         state.id = child;
+        state.context_generation = Some(Uuid::new_v4());
         state
             .extensions
             .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
@@ -2155,6 +2161,7 @@ impl Harness {
         }
         state.tool_attempt = None;
         state.id = Uuid::new_v4();
+        state.context_generation = Some(Uuid::new_v4());
         state.active = None;
         state.abort_requested = false;
         state.submissions.clear();
@@ -2272,6 +2279,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
+            context_generation: Some(Uuid::new_v4()),
             transcript: if prefix.is_some() { None } else { transcript },
             submissions: vec![],
             aborted_generations: vec![],
@@ -3099,8 +3107,9 @@ impl Harness {
         else {
             return Ok(false);
         };
+        let generation = *c.context_generation.get_or_insert_with(Uuid::new_v4);
         c.phase = Phase::CompactionHook {
-            preparation: Box::new(preparation),
+            preparation: Box::new(preparation.bind_context(generation)),
             operation_id: Uuid::new_v4(),
             reason: crate::extension::CompactionReason::Manual,
         };
@@ -4234,7 +4243,9 @@ impl Harness {
                                 usage: None,
                                 metadata: Default::default(),
                             })?;
-                            c.messages = result.apply(&c.messages)?;
+                            c.messages =
+                                result.apply_in_context(&c.messages, c.context_generation)?;
+                            c.context_generation = Some(Uuid::new_v4());
                             c.phase = c
                                 .compaction_return_turns
                                 .take()
@@ -4332,7 +4343,8 @@ impl Harness {
                             Err(_) => { self.failed = true; return Err(Error::Interrupted); }
                         }
                     }
-                    c.messages = result.apply(&c.messages)?;
+                    c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
+                    c.context_generation = Some(Uuid::new_v4());
                     c.phase = c
                         .compaction_return_turns
                         .take()
@@ -4394,9 +4406,13 @@ impl Harness {
                                         usize::try_from(keep.min(20_000)).unwrap_or(20_000),
                                         None,
                                     )? {
+                                        let generation =
+                                            *c.context_generation.get_or_insert_with(Uuid::new_v4);
                                         c.compaction_return_turns = Some(turns);
                                         c.phase = Phase::CompactionHook {
-                                            preparation: Box::new(preparation),
+                                            preparation: Box::new(
+                                                preparation.bind_context(generation),
+                                            ),
                                             operation_id: Uuid::new_v4(),
                                             reason: crate::extension::CompactionReason::Threshold,
                                         };
@@ -7159,9 +7175,10 @@ fn start_overflow_compaction(
         0,
         None,
     )? {
+        let generation = *c.context_generation.get_or_insert_with(Uuid::new_v4);
         c.compaction_return_turns = Some(turns);
         c.phase = Phase::CompactionHook {
-            preparation: Box::new(preparation),
+            preparation: Box::new(preparation.bind_context(generation)),
             operation_id: Uuid::new_v4(),
             reason: crate::extension::CompactionReason::Overflow,
         };
@@ -7283,6 +7300,7 @@ fn place_round_handoff(c: &mut Conversation) {
 }
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
+    c.context_generation = Some(Uuid::new_v4());
     c.messages.clear();
     if let Some(message) = marker.message() {
         c.messages.push(message);
@@ -7442,6 +7460,134 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+    #[test]
+    fn compact_context_identity_survives_reopen_and_rejects_reset_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let id;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.messages = vec![
+                Message::User {
+                    content: "old".into(),
+                },
+                Message::User {
+                    content: "new".into(),
+                },
+            ];
+            h.save(&c, Expected::Version(version)).unwrap();
+            assert!(h.request_compaction(id, 0).unwrap());
+        }
+        let (result, original, generation);
+        {
+            let h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            let c = h.conversation(id).unwrap();
+            generation = c.context_generation;
+            original = c.messages.clone();
+            let Phase::CompactionHook { preparation, .. } = c.phase else {
+                panic!("missing preparation")
+            };
+            result = preparation
+                .finish(CompletedGeneration {
+                    content: "summary".into(),
+                    calls: vec![],
+                    usage: None,
+                    metadata: Default::default(),
+                })
+                .unwrap();
+            assert!(result.apply_in_context(&original, generation).is_ok());
+        }
+        {
+            let mut h = Harness::open_paused(&path, options(model)).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            place_reset(&mut c, crate::reset::Reset::new(Uuid::new_v4(), None));
+            // Recreating identical text after the reset must not revive the cut.
+            c.messages = original.clone();
+            h.save(&c, Expected::Version(version)).unwrap();
+        }
+        let h = Harness::open_paused(
+            &path,
+            options(Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            })),
+        )
+        .unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_ne!(c.context_generation, generation);
+        assert_eq!(c.messages, original);
+        assert!(
+            result
+                .apply_in_context(&c.messages, c.context_generation)
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn applied_hook_compaction_rotates_context_identity_after_reopen() {
+        struct SummaryHook;
+        #[async_trait::async_trait]
+        impl crate::extension::Hook for SummaryHook {
+            async fn before_compact(
+                &self,
+                _: &crate::extension::CompactionInput,
+                _: &crate::extension::Context<'_>,
+            ) -> Result<crate::extension::BeforeCompact, String> {
+                Ok(crate::extension::BeforeCompact::Summary("summary".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let id;
+        let before;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            h.install_extension(crate::extension::Extension {
+                name: "summary".into(),
+                hooks: vec![Arc::new(SummaryHook)],
+                ..Default::default()
+            })
+            .unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["summary".into()]).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.messages = vec![
+                Message::User {
+                    content: "old".into(),
+                },
+                Message::User {
+                    content: "new".into(),
+                },
+            ];
+            before = c.context_generation;
+            h.save(&c, Expected::Version(version)).unwrap();
+            assert!(h.request_compaction(id, 0).unwrap());
+            h.resume(&CancellationToken::new()).await.unwrap();
+        }
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_ne!(c.context_generation, before);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content.contains("summary")))
+        );
     }
     struct GatedPanicModel {
         started: Arc<Semaphore>,
@@ -7946,6 +8092,7 @@ mod scheduler_tests {
             allowed_tools: None,
             model_tools: None,
             messages: vec![],
+            context_generation: Some(Uuid::new_v4()),
             transcript: None,
             submissions: vec![],
             aborted_generations: vec![],

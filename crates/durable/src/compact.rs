@@ -21,6 +21,10 @@ pub struct Preparation {
     request: ModelRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    // None is reserved for standalone and legacy preparations. Runtime-owned
+    // preparations bind to the context generation before being committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_generation: Option<Uuid>,
 }
 
 /// Result retains the exact preparation and usage/metadata for the host to commit.
@@ -143,7 +147,7 @@ pub fn prepare(
         transcript
     );
     Ok(Some(Preparation {
-        source: messages.to_vec(), system_end, first_kept, instructions: instructions.map(str::to_owned),
+        source: messages.to_vec(), system_end, first_kept, instructions: instructions.map(str::to_owned), context_generation: None,
         request: ModelRequest {
             model: model.into(), max_output_tokens, tools: vec![],
             messages: vec![Message::System { content: "You are a context summarization assistant. Do not continue the conversation; output only the summary.".into() }, Message::User { content: prompt }],
@@ -152,6 +156,10 @@ pub fn prepare(
 }
 
 impl Preparation {
+    pub(crate) fn bind_context(mut self, generation: Uuid) -> Self {
+        self.context_generation = Some(generation);
+        self
+    }
     pub(crate) fn hook_input(
         &self,
         reason: crate::extension::CompactionReason,
@@ -207,6 +215,20 @@ impl Preparation {
 }
 
 impl CompactionResult {
+    /// Check the durable context identity as well as the message snapshot.
+    /// Legacy in-flight preparations have no identity and retain old behavior.
+    pub(crate) fn apply_in_context(
+        &self,
+        current: &[Message],
+        generation: Option<Uuid>,
+    ) -> Result<Vec<Message>> {
+        if self.preparation.context_generation.is_some()
+            && self.preparation.context_generation != generation
+        {
+            return Err(invalid("stale compaction context generation"));
+        }
+        self.apply(current)
+    }
     /// Apply to the same snapshot or an append-only extension. The host must make
     /// this check and its durable commit atomic against concurrent mutations.
     pub fn apply(&self, current: &[Message]) -> Result<Vec<Message>> {
@@ -352,6 +374,35 @@ mod tests {
         let mut tools = completed("bad");
         tools.calls.push(call("x"));
         assert!(prep(&h).finish(tools).is_err());
+    }
+
+    #[test]
+    fn runtime_context_guard_survives_serialization_and_accepts_legacy_preparations() {
+        let history = history();
+        let generation = Uuid::new_v4();
+        let result = prep(&history)
+            .bind_context(generation)
+            .finish(completed("summary"))
+            .unwrap();
+        let mut value = serde_json::to_value(&result).unwrap();
+        let restored: CompactionResult = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            restored
+                .apply_in_context(&history, Some(generation))
+                .is_ok()
+        );
+        assert!(
+            restored
+                .apply_in_context(&history, Some(Uuid::new_v4()))
+                .is_err()
+        );
+        assert!(restored.apply_in_context(&history, None).is_err());
+        value["preparation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_generation");
+        let legacy: CompactionResult = serde_json::from_value(value).unwrap();
+        assert!(legacy.apply_in_context(&history, None).is_ok());
     }
 
     #[test]
