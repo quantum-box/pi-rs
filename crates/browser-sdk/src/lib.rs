@@ -308,6 +308,7 @@ impl BrowserSession {
                 SessionBuilder::new(Arc::new(Gateway { endpoint, bearer }), model.clone())
                     .limits(limits);
             if demo_tool {
+                builder = builder.system_prompt("You are a browser demo assistant. The only available tool adds two numbers. You cannot access files, a shell, or the network.");
                 builder = builder
                     .extension(Arc::new(BrowserTools))
                     .map_err(|e| js_error(&e.to_string()))?;

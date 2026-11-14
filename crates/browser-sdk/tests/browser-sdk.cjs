@@ -23,6 +23,7 @@ const { once } = require('node:events');
       if (last === 'test tool') { const tool = request.messages.find(m => m.role === 'tool'); res.end(JSON.stringify(tool ? {text:'result ' + tool.content} : {text:'',calls:[{id:'call-1',name:'add_numbers',arguments:'{\"a\":2,\"b\":3}'}]})); }
       else if (last === 'resume me' && ++resumeRequests === 1) { setTimeout(() => { if (!res.destroyed) res.end(JSON.stringify({text:'too late'})); }, 5000); }
       else if (last === 'resume me') { res.end(JSON.stringify({text:'resumed'})); }
+      else if (last === 'malformed') { res.end('{}'); }
       else if (last === 'fail me') { res.writeHead(403).end('private'); }
       else if (last === 'cancel me' || last === 'timeout me') {
         res.on('close', () => { if (!res.writableEnded) aborted = true; });
@@ -98,6 +99,7 @@ try {
   assert(await session.prompt('after cancel') === 'answer two', 'run after cancel');
   await reject(session.prompt('timeout me'), 'timed out');
   assert(await session.prompt('after timeout') === 'answer two', 'run after timeout');
+  await reject(session.prompt('malformed'), 'gateway response has no text or tool calls');
   await reject(session.prompt('fail me'), 'gateway request failed');
   assert(await session.prompt('after failure') === 'answer two', 'run after gateway failure');
   const doomed = session.prompt('cancel me');
