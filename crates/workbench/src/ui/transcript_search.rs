@@ -45,13 +45,26 @@ impl Search {
 
     pub fn paste(&mut self, text: &str) {
         let remaining = 4096usize.saturating_sub(self.editor.text.len());
-        let mut end = remaining.min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
+        // Match the single-line input's paste behavior; normalize the complete
+        // query during search so pasted boundary spaces are not discarded. Cap
+        // after sanitization and tab expansion, without splitting UTF-8.
+        let mut sanitized = String::with_capacity(remaining.min(text.len()));
+        for character in text.chars() {
+            if character == '\t' {
+                let count = 4.min(remaining.saturating_sub(sanitized.len()));
+                sanitized.extend(std::iter::repeat_n(' ', count));
+                if count < 4 {
+                    break;
+                }
+            } else if character.is_control() {
+                continue;
+            } else if character.len_utf8() <= remaining.saturating_sub(sanitized.len()) {
+                sanitized.push(character);
+            } else {
+                break;
+            }
         }
-        let text = &text[..end];
-        self.editor
-            .insert(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+        self.editor.insert(&sanitized);
     }
 
     pub fn overlay(&self, theme: &Theme, keys: &Keys, width: usize) -> (Vec<Line>, usize, usize) {
@@ -140,12 +153,7 @@ impl Search {
 
     /// Return the row to reveal after a query change or explicit navigation.
     pub fn update(&mut self, lines: &[Line], top: usize) -> Option<Range<usize>> {
-        let query = self
-            .editor
-            .text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let query = normalize_whitespace(&self.editor.text);
         let query_changed = query != self.query;
         let source_changed = self.rows.len() != lines.len()
             || self.rows.iter().zip(lines).any(|(text, line)| {
@@ -223,6 +231,21 @@ struct Source {
     offset: usize,
 }
 
+// ECMAScript's \s includes U+FEFF and excludes U+0085, unlike Rust's
+// Unicode White_Space predicate. Pi uses this rule for its search query and
+// for deciding whether a rendered grapheme separates corpus runs.
+fn is_js_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value
+        .split(is_js_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
     if query.is_empty() {
         return vec![];
@@ -230,9 +253,7 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
     let mut corpus = String::new();
     let mut source = Vec::new();
     for (row, text) in rows.iter().enumerate() {
-        let mut offset = 0;
-        for word in text.split_whitespace() {
-            offset += text[offset..].find(word).expect("word from source line");
+        let mut append = |offset: usize, word: &str| {
             if !corpus.is_empty() {
                 corpus.push(' ');
             }
@@ -243,7 +264,28 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
                 row,
                 offset,
             });
-            offset += word.len();
+        };
+        if text.is_ascii() {
+            let mut offset = 0;
+            for word in text.split(is_js_whitespace).filter(|word| !word.is_empty()) {
+                offset += text[offset..].find(word).expect("word from source line");
+                append(offset, word);
+                offset += word.len();
+            }
+        } else {
+            let mut start = None;
+            for (offset, glyph) in text.grapheme_indices(true) {
+                if glyph.chars().all(is_js_whitespace) {
+                    if let Some(start) = start.take() {
+                        append(start, &text[start..offset]);
+                    }
+                } else if start.is_none() {
+                    start = Some(offset);
+                }
+            }
+            if let Some(start) = start {
+                append(start, &text[start..]);
+            }
         }
     }
     let pattern = regex::RegexBuilder::new(&regex::escape(query))
@@ -294,6 +336,65 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
 mod tests {
     use super::*;
     use crossterm::style::Color;
+
+    #[test]
+    fn search_uses_ecmascript_whitespace_for_queries_and_corpus() {
+        assert_eq!(normalize_whitespace("  a\u{feff}b  "), "a b");
+        assert_eq!(normalize_whitespace("a\u{85}b"), "a\u{85}b");
+        let rows = vec!["a\u{feff}b".into(), "a\u{85}b".into()];
+        let matches = find_matches(&rows, &normalize_whitespace("a b"));
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].iter().all(|segment| segment.row == 0));
+        let matches = find_matches(&rows, &normalize_whitespace("a\u{85}b"));
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].iter().all(|segment| segment.row == 1));
+        let mut search = Search::default();
+        search.paste("a\u{feff}b\u{85}c");
+        // Editor and terminal spans deliberately remove C1 controls before
+        // searching; test this public path instead of assuming U+0085 survives.
+        assert_eq!(search.editor.text, "a\u{feff}bc");
+        let rendered = Line::plain("a\u{85}b", Color::Reset);
+        assert_eq!(rendered.spans[0].text, "ab");
+    }
+
+    #[test]
+    fn pasted_separator_is_preserved_between_existing_query_text() {
+        let mut search = Search::default();
+        search.editor.replace("ab".into());
+        search.editor.cursor = 1;
+        search.paste("\u{feff}");
+        assert_eq!(search.editor.text, "a\u{feff}b");
+        let lines = [Line::plain("a b", Color::Reset)];
+        assert_eq!(search.update(&lines, 0), Some(0..1));
+        assert_eq!(search.query, "a b");
+        assert_eq!(search.result(), "1/1");
+    }
+
+    #[test]
+    fn pasted_tabs_and_utf8_respect_the_remaining_input_limit() {
+        let mut search = Search::default();
+        search.paste(&"\t".repeat(4096));
+        assert_eq!(search.editor.text.len(), 4096);
+        assert!(search.editor.text.bytes().all(|byte| byte == b' '));
+
+        let mut search = Search::default();
+        search.editor.replace("x".repeat(4094));
+        search.paste("\tmore");
+        assert_eq!(search.editor.text.len(), 4096);
+        assert!(search.editor.text.ends_with("  "));
+
+        let mut search = Search::default();
+        search.editor.replace("x".repeat(4095));
+        search.paste("éz");
+        assert_eq!(search.editor.text.len(), 4095);
+    }
+
+    #[test]
+    fn whitespace_with_combining_mark_remains_part_of_a_grapheme() {
+        let rows = vec!["a \u{301}b".into()];
+        assert_eq!(find_matches(&rows, "a \u{301}b").len(), 1);
+        assert!(find_matches(&rows, "a b").is_empty());
+    }
 
     #[test]
     fn finds_a_literal_across_wraps_and_highlights_entire_graphemes() {
