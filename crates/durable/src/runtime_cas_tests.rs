@@ -1766,8 +1766,7 @@ async fn manual_target_rejects_forged_or_unrelated_source() {
     for field in ["source", "first_kept"] {
         let mut forged = encoded.clone();
         if field == "source" {
-            forged["preparation"]["source"][0]["content"] =
-                serde_json::json!("different source");
+            forged["preparation"]["source"][0]["content"] = serde_json::json!("different source");
         } else {
             forged["preparation"]["first_kept"] = serde_json::json!(0);
         }
