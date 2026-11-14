@@ -910,12 +910,22 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
             let mut closes = value.bytes().filter(|b| *b == b')').count();
             loop {
                 let value = &text[start..end];
+                if value.ends_with(';')
+                    && let Some(amp) = value.rfind('&')
+                    && value[amp + 1..value.len() - 1]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric())
+                    && amp + 2 < value.len()
+                {
+                    end = start + amp;
+                    continue;
+                }
                 let Some(last) = value.chars().last() else {
                     break;
                 };
                 let remove = matches!(
                     last,
-                    '?' | '!' | '.' | ',' | ':' | ';' | '*' | '_' | '\'' | '"' | '~' | '&'
+                    '?' | '!' | '.' | ',' | ':' | ';' | '*' | '_' | '\'' | '"' | '~'
                 ) || (last == ')' && closes > opens);
                 if !remove {
                     break;
@@ -943,6 +953,58 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
         offset = end.max(start + 1);
     }
     links
+}
+
+// Marked identifies bare links before parsing inline formatting. Protect the
+// ASCII delimiters within candidates so pulldown-cmark makes the same choice.
+// Byte lengths remain unchanged, allowing all parser offsets to index `text`.
+fn protect_bare_links(text: &str, options: Options) -> String {
+    let mut plain_ranges = Vec::new();
+    let mut protected = 0usize;
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link { .. } | Tag::Image { .. } | Tag::CodeBlock(_)) => {
+                protected += 1
+            }
+            Event::End(TagEnd::Link | TagEnd::Image | TagEnd::CodeBlock) => {
+                protected = protected.saturating_sub(1)
+            }
+            Event::Text(ref value)
+                if protected == 0 && text.get(range.clone()) == Some(value.as_ref()) =>
+            {
+                plain_ranges.push(range)
+            }
+            _ => {}
+        }
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    let mut eligible = 0;
+    for (range, _) in bare_links(text) {
+        while eligible < plain_ranges.len() && plain_ranges[eligible].end <= range.start {
+            eligible += 1;
+        }
+        if eligible == plain_ranges.len() || !plain_ranges[eligible].contains(&range.start) {
+            continue;
+        }
+        // Escaped constructs keep their source rendering and do not gain a link.
+        let preceding = text.as_bytes()[..range.start]
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'\\')
+            .count();
+        if preceding % 2 != 0 {
+            continue;
+        }
+        for byte in &mut bytes[range] {
+            if matches!(
+                *byte,
+                b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'\\' | b'&'
+            ) {
+                *byte = b'x';
+            }
+        }
+    }
+    String::from_utf8(bytes).expect("only ASCII markdown delimiters are replaced")
 }
 
 fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
@@ -1027,7 +1089,10 @@ fn markdown_at_depth(
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
-    let mut events = Parser::new_ext(text, options).into_offset_iter().peekable();
+    let protected_text = protect_bare_links(text, options);
+    let mut events = Parser::new_ext(&protected_text, options)
+        .into_offset_iter()
+        .peekable();
     while let Some((event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
@@ -1308,17 +1373,20 @@ fn markdown_at_depth(
                     let mut merged = content.into_string();
                     if is_text
                         && links.is_empty()
-                        && text.get(range.clone()) == Some(merged.as_str())
+                        && protected_text.get(range.clone()) == Some(merged.as_str())
                     {
                         while let Some((Event::Text(next), next_range)) = events.peek() {
                             if next_range.start != range.end
-                                || text.get(next_range.clone()) != Some(next.as_ref())
+                                || protected_text.get(next_range.clone()) != Some(next.as_ref())
                             {
                                 break;
                             }
                             merged.push_str(next);
                             range.end = next_range.end;
                             events.next();
+                        }
+                        if protected_text[range.clone()] != text[range.clone()] {
+                            merged = text[range.clone()].to_owned();
                         }
                     }
                     let preceding = text.as_bytes()[..range.start]
@@ -2139,6 +2207,83 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn bare_links_keep_ampersands_and_inline_markdown_delimiters() {
+        let theme = Theme::system();
+        let render = |source: &str, hyperlinks| {
+            markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                hyperlinks,
+                false,
+            )
+        };
+        for (source, href) in [
+            ("https://example.com/path&", "https://example.com/path&"),
+            (
+                "https://example.com/foo*bar*",
+                "https://example.com/foo*bar",
+            ),
+            (
+                "https://example.com/foo~~bar~~",
+                "https://example.com/foo~~bar",
+            ),
+            (
+                "https://example.com/?a=1&amp;b=2",
+                "https://example.com/?a=1&amp;b=2",
+            ),
+            ("https://example.com/path&amp;", "https://example.com/path"),
+        ] {
+            let lines = render(source, true);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.hyperlink.as_deref() == Some(href)),
+                "{source}: {spans:?}"
+            );
+            let fallback = render(source, false);
+            let fallback: Vec<_> = fallback.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                fallback
+                    .iter()
+                    .any(|span| span.underline && span.text == href),
+                "{source}: {fallback:?}"
+            );
+        }
+        let lines = render("**https://example.com/foo*bar***", true);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.bold
+                    && span.hyperlink.as_deref() == Some("https://example.com/foo*bar"))
+        );
+        let lines = render(
+            "`https://example.com/foo*bar*` [https://example.com/*foo*](https://other.example)",
+            true,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "https://example.com/foo*bar*" && s.hyperlink.is_none())
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://other.example"))
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|s| s.hyperlink.as_deref() != Some("https://example.com/*foo*"))
+        );
     }
 
     #[test]
