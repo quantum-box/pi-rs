@@ -3524,7 +3524,8 @@ expected savings. The worker checks the same session head and setting
 before dispatch, uses the original affinity and tool definitions, and
 stops on a changed context or the 30-minute limit. A completed cache miss
 retains its billed usage and schedules another decision on the normal cadence,
-as in Pi. Failed refreshes and local model timeouts stop warming without
+measured from the refresh request's start to protect the cache lifetime.
+Failed refreshes and local model timeouts stop warming without
 recording usage because the provider may still be processing the request. Pi
 waits for the refresh to settle and also retries errors.
 Refresh usage is journaled and projected as a Pi usage entry. Response

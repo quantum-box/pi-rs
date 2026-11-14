@@ -657,6 +657,7 @@ impl Candidate {
                 candidate: self,
                 usage,
                 metadata,
+                requested_at: now,
                 note: decision.overridden.then(|| "extension override".to_owned()),
                 decision,
             })
@@ -724,6 +725,7 @@ pub(super) struct Receipt {
     candidate: Candidate,
     usage: Usage,
     metadata: ModelMetadata,
+    requested_at: Instant,
     note: Option<String>,
     decision: status::Decision,
 }
@@ -770,7 +772,7 @@ impl Receipt {
         };
         self.candidate.context.lock().expect("cache context").scope = Scope::Idle(record.id);
         observe(record);
-        let next = Instant::now() + self.candidate.policy.delay;
+        let next = self.requested_at + self.candidate.policy.delay;
         controller.set(self.candidate.schedule(next));
     }
 
@@ -786,7 +788,7 @@ impl Receipt {
             metadata: Box::new(self.metadata),
             note: self.note,
         };
-        let next = Instant::now() + self.candidate.policy.delay;
+        let next = self.requested_at + self.candidate.policy.delay;
         controller.set(self.candidate.schedule(next));
         Some(input)
     }
@@ -978,12 +980,19 @@ mod tests {
                         .iter()
                         .any(|r| matches!(r.event, Event::CacheWarm { .. }))
                 );
+                // The provider completes after the refresh interval has elapsed.
+                tokio::time::sleep(Duration::from_millis(60)).await;
                 model.release_retry.notify_one();
             })
         })
         .await
         .unwrap();
-        receipt.unwrap().persist(&path, &controller, |_| {});
+        let receipt = receipt.unwrap();
+        let next_from_start = receipt.requested_at + receipt.candidate.policy.delay;
+        let context = receipt.candidate.context.clone();
+        assert!(Instant::now() >= next_from_start);
+        receipt.persist(&path, &controller, |_| {});
+        assert_eq!(context.lock().unwrap().next, next_from_start);
         let receipt = tokio::time::timeout(Duration::from_secs(2), controller.wait())
             .await
             .unwrap()
@@ -1061,6 +1070,7 @@ mod tests {
                 output_tokens: 1,
             },
             metadata: ModelMetadata::default(),
+            requested_at: now - Duration::from_secs(2),
             note: None,
             decision: status::Decision {
                 phase: CacheWarmingPhase::Streaming,
@@ -1072,10 +1082,13 @@ mod tests {
                 overridden: true,
             },
         };
+        let context = receipt.candidate.context.clone();
+        let expected_next = receipt.requested_at + receipt.candidate.policy.delay;
         let controller = Controller::default();
         assert!(
             matches!(receipt.account(&controller), Some(AgentInput::CacheWarm { request_id: id, .. }) if id == request_id)
         );
         assert!(controller.has_task());
+        assert_eq!(context.lock().unwrap().next, expected_next);
     }
 }
