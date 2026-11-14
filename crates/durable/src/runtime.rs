@@ -72,6 +72,24 @@ pub enum Error {
     Invalid(String),
 }
 
+// Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
+const FORK_DOCUMENT_ATTEMPTS: usize = 8;
+const FORK_DOCUMENT_FENCE: &[u8] = b"durable/document-fork-revision";
+
+fn retry_document_fork(mut attempt: impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
+    for remaining in (0..FORK_DOCUMENT_ATTEMPTS).rev() {
+        match attempt() {
+            Err(Error::Storage(durable_store::Error::Conflict { key }))
+                if key == FORK_DOCUMENT_FENCE && remaining > 0 =>
+            {
+                continue;
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Clone)]
 pub struct RegisteredTool {
     pub tool: Arc<dyn Tool>,
@@ -1262,7 +1280,7 @@ impl Harness {
                     continue;
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
-                    if key == b"durable/document-fork-revision" =>
+                    if key == FORK_DOCUMENT_FENCE =>
                 {
                     return Err(Error::Storage(durable_store::Error::Conflict { key }));
                 }
@@ -1917,22 +1935,11 @@ impl Harness {
         state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
-        loop {
+        retry_document_fork(|| {
             let batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
-            match self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
-            {
-                Err(Error::Storage(durable_store::Error::Conflict { key }))
-                    if key == b"durable/document-fork-revision" =>
-                {
-                    continue;
-                }
-                result => {
-                    result?;
-                    break;
-                }
-            }
-        }
+            self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
+        })?;
         Ok(state.id)
     }
     /// Fork a committed observation cut, including cuts during active work.
@@ -2060,22 +2067,11 @@ impl Harness {
             abort_requested: false,
             phase: Phase::Idle,
         };
-        loop {
+        retry_document_fork(|| {
             let batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
-            match self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
-            {
-                Err(Error::Storage(durable_store::Error::Conflict { key }))
-                    if key == b"durable/document-fork-revision" =>
-                {
-                    continue;
-                }
-                result => {
-                    result?;
-                    break;
-                }
-            }
-        }
+            self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
+        })?;
         Ok(state.id)
     }
     /// Fork at the commit that first exposed this complete message batch.
@@ -8044,5 +8040,78 @@ mod tool_allowlist_tests {
             Phase::ToolFinished { .. }
         ));
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod document_fork_retry_tests {
+    use super::*;
+    use crate::document::Documents;
+    use durable_store::Store;
+
+    #[test]
+    fn retries_only_revision_conflicts() {
+        let mut attempts = 0;
+        retry_document_fork(|| {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(durable_store::Error::Conflict {
+                    key: FORK_DOCUMENT_FENCE.to_vec(),
+                }
+                .into());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        attempts = 0;
+        let result = retry_document_fork(|| {
+            attempts += 1;
+            Err(durable_store::Error::Conflict {
+                key: b"other".to_vec(),
+            }
+            .into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn unrelated_writes_bound_retries_and_leave_no_partial_child() {
+        let store = Store::memory().unwrap();
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let docs = Documents::new(&store);
+        let cut = docs.snapshot().unwrap();
+        let target = b"test/fork-child".to_vec();
+        let mut attempts = 0;
+        let result = retry_document_fork(|| {
+            attempts += 1;
+            let mut batch = docs.fork_scope(parent, child, cut)?;
+            batch.mutations.push(Mutation::Put {
+                key: target.clone(),
+                value: vec![1],
+            });
+            store.commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"durable/application-entries/unrelated".to_vec(),
+                    value: vec![attempts as u8],
+                }],
+            )?;
+            store.commit(&batch.checks, &batch.mutations)?;
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(Error::Storage(durable_store::Error::Conflict { key })) if key == FORK_DOCUMENT_FENCE)
+        );
+        assert_eq!(attempts, FORK_DOCUMENT_ATTEMPTS);
+        assert!(store.get(&target).unwrap().is_none());
+        retry_document_fork(|| {
+            let batch = docs.fork_scope(parent, child, cut)?;
+            store.commit(&batch.checks, &batch.mutations)?;
+            Ok(())
+        })
+        .unwrap();
     }
 }

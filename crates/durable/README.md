@@ -549,8 +549,9 @@ document revisions across the surrounding commit; unrelated document writes
 can therefore conservatively prevent such a fork. Revision enumeration scans
 retained history and copying is proportional to the documents found. History is
 unbounded. A database-wide revision fence retries forks after any concurrent document,
-policy, or application-entry mutation, including unrelated scopes; sustained writes can
-starve a fork. Historical `Copy` and `Initial` retain their cut semantics even if
+policy, or application-entry mutation, including unrelated scopes. After eight failed
+attempts the fork returns a conflict and may be retried by the caller. Historical
+`Copy` and `Initial` retain their cut semantics even if
 the current policy changes. Unlike upstream, `Initial` eagerly copies a persisted
 object when the source exists, and mutable per-address policies do not model upstream
 document incarnations or duplicate-source rejection. This is a subset of upstream:
