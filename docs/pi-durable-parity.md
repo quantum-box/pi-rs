@@ -1,5 +1,7 @@
 # Pi Durable compatibility inventory
 
+**Current status:** The runtime supports durable model and tool execution, automatic recovery, task scheduling, transactional input/document admission, queue modes, continuation, extension gates and lifecycle tasks, local coding-tool adapters, snapshot views, and safe historical snapshot forks. These are subsets of upstream behavior. Principal open gaps include automatic worker cancellation and cleanup across task-to-conversation ownership edges; exact entry-ID forks and upstream Chord watch operations; tool-output progress integration; typed task-scoped signals; provider-body hooks; richer continuation inputs; and upstream storage and transaction surfaces. Hook callbacks and external effects still need idempotency. The dated checkpoints and original table below record incremental progress and must not be read as the current status in isolation.
+
 **Coding tools checkpoint:** The opt-in `coding-tools` feature registers the existing workbench local `read`, `write`, `edit`, and `bash` tools with unsafe replay policies. This is not a sandbox or an upstream environment adapter; schemas, structured results, streaming, diagnostics, image behavior, and file mutation serialization retain workbench behavior. Interrupted effects need interruption handling or reconciliation. Upstream reference: `packages/durable/src/tools` and `packages/durable/src/harness/tool.ts` at commit `3035f08d06c3054f99b6226ea1ad22353c49fc12`.
 
 This is an audit, not an implementation plan or a claim of complete compatibility.
