@@ -288,6 +288,54 @@ mod tests {
     }
 
     #[test]
+    fn deserialized_legacy_running_task_fails_closed() {
+        let db = Store::memory().unwrap();
+        let b = setup(&db);
+        let task_key = crate::task_store::key(b.task);
+        let entry = db.get(&task_key).unwrap().unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        legacy.as_object_mut().unwrap().remove("attempt_id");
+        db.commit(
+            &[Check {
+                key: task_key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key: task_key,
+                value: serde_json::to_vec(&legacy).unwrap(),
+            }],
+        )
+        .unwrap();
+        let task = TaskStore::new(&db).load(b.task).unwrap().unwrap().task;
+        assert_eq!(task.state(), &TaskState::Running);
+        assert_eq!(task.attempt_id(), None);
+        assert!(matches!(prepare_binding(&db, &b), Err(Error::Stale)));
+    }
+
+    #[test]
+    fn replay_ready_fences_prepared_and_committed_bindings() {
+        let db = Store::memory().unwrap();
+        let b = setup(&db);
+        commit_binding(&db, &b);
+        let stale = checks(&db, &b).unwrap();
+        let key = Harness::key(b.conversation);
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value = conversation(&b);
+        value["phase"]["ToolRunning"]["replay_ready"] = json!(true);
+        put_conversation(&db, &value, Expected::Version(entry.version));
+        assert!(matches!(checks(&db, &b), Err(Error::Stale)));
+        assert!(matches!(prepare_binding(&db, &b), Err(Error::Stale)));
+        assert!(matches!(
+            db.commit(&stale, &[Mutation::Put {
+                key: b"replayed-effect".to_vec(),
+                value: vec![1],
+            }]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(db.get(b"replayed-effect").unwrap().is_none());
+    }
+
+    #[test]
     fn scheduler_recovery_reserves_a_fresh_persisted_attempt() {
         use crate::task_scheduler::{Registry, Scheduler, Step};
         use std::sync::{Arc, Mutex};
@@ -321,5 +369,46 @@ mod tests {
         drop(scheduler);
         let db = Store::open(&path).unwrap();
         assert!(matches!(checks(&db, &old), Err(Error::Stale)));
+    }
+
+    #[test]
+    fn migration_reservation_fences_the_previous_attempt() {
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Store::open(&path).unwrap();
+        let old = setup(&db);
+        commit_binding(&db, &old);
+        let stale = checks(&db, &old).unwrap();
+        drop(db);
+        let reader_path = path.clone();
+        let mut registry = Registry::default();
+        registry.register_versioned(
+            "parent",
+            2,
+            true,
+            move |task: &Task| {
+                assert_eq!(task.definition_version(), 2);
+                assert_ne!(task.attempt_id(), Some(old.task_attempt));
+                assert!(task.attempt_id().is_some());
+                let db = Store::open(&reader_path).unwrap();
+                assert!(matches!(
+                    db.commit(&stale, &[Mutation::Put {
+                        key: b"old-effect".to_vec(),
+                        value: vec![1],
+                    }]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(db.get(b"old-effect").unwrap().is_none());
+                Ok(Step::Succeed(json!(null)))
+            },
+            Some(Arc::new(|_, checkpoint, _| {
+                Ok((json!({"migrated": true}), checkpoint.clone()))
+            })),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert!(scheduler.tick(0).unwrap());
     }
 }
