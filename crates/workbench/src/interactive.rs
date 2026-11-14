@@ -8154,6 +8154,8 @@ mod tests {
         use std::process::Stdio;
         const CHILD: &str = "PI_RS_FOREGROUND_EDITOR_TEST";
         if let Some(program) = std::env::var_os(CHILD) {
+            let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut baseline) }, 0);
             super::EXTERNAL_EDITOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
             super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new()))
                 .unwrap();
@@ -8170,6 +8172,12 @@ mod tests {
             let status = editor.child.wait().unwrap();
             assert!(!status.success());
             drop(editor);
+            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
+            assert_eq!(
+                restored.c_lflag & (libc::ECHO | libc::ICANON),
+                baseline.c_lflag & (libc::ECHO | libc::ICANON)
+            );
             println!("PARENT_SURVIVED");
             return;
         }
@@ -8177,7 +8185,7 @@ mod tests {
         let program = directory.path().join("editor");
         std::fs::write(
             &program,
-            "#!/bin/sh\ntrap 'exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nstty -echo -icanon\ntrap 'exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
