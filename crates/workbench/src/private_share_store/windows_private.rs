@@ -457,6 +457,29 @@ mod tests {
     }
 
     #[test]
+    fn private_directory_rejects_reparse_ancestor() {
+        let root = TestDirectory::new();
+        let parent = root.0.join("real-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let private = VerifiedDirectory::create(&parent.join("private")).unwrap();
+        let junction = root.0.join("parent-junction");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&parent)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create junction fixture");
+        assert!(VerifiedDirectory::open(&junction.join("private")).is_err());
+        std::fs::remove_dir(junction).unwrap();
+        drop(private);
+    }
+
+    #[test]
     fn private_directory_rejects_junction() {
         let root = TestDirectory::new();
         let private = root.0.join("private");
