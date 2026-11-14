@@ -986,7 +986,7 @@ impl Hook for LifecycleHook {
         use pi_rs_durable::extension::{GenerationDecision, GenerationEvent, HookTask};
         if !matches!(
             event,
-            GenerationEvent::AfterTools | GenerationEvent::AfterRun
+            GenerationEvent::AfterTools | GenerationEvent::OnYield | GenerationEvent::AfterRun
         ) {
             return Ok(GenerationDecision::Pass);
         }
@@ -1052,12 +1052,19 @@ async fn lifecycle_hooks_run_in_order() {
     h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(*events.lock().unwrap(), vec!["AfterTools", "AfterRun"]);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["AfterTools", "OnYield", "AfterRun"]
+    );
 }
 #[tokio::test]
 async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
     use pi_rs_durable::extension::GenerationEvent;
-    for event in [GenerationEvent::AfterTools, GenerationEvent::AfterRun] {
+    for event in [
+        GenerationEvent::AfterTools,
+        GenerationEvent::OnYield,
+        GenerationEvent::AfterRun,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let model = Arc::new(FakeModel::default());
@@ -1118,7 +1125,7 @@ async fn lifecycle_crash_child() {
 }
 #[tokio::test]
 async fn lifecycle_crash_recovers_stable_memo_without_replaying_tool() {
-    for phase in ["AfterTools", "AfterRun"] {
+    for phase in ["AfterTools", "OnYield", "AfterRun"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1164,7 +1171,11 @@ async fn lifecycle_crash_recovers_stable_memo_without_replaying_tool() {
 #[tokio::test]
 async fn abort_during_lifecycle_hook_stops_without_replaying_tool() {
     use pi_rs_durable::{extension::GenerationEvent, runtime::Scheduler};
-    for event in [GenerationEvent::AfterTools, GenerationEvent::AfterRun] {
+    for event in [
+        GenerationEvent::AfterTools,
+        GenerationEvent::OnYield,
+        GenerationEvent::AfterRun,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let tool = Arc::new(FakeTool::default());
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1221,6 +1232,144 @@ async fn abort_during_lifecycle_hook_stops_without_replaying_tool() {
             GenerationEvent::AfterRun => matches!(c.submissions[0].status, Status::Done { .. }),
             _ => matches!(c.submissions[0].status, Status::Unanswered { .. }),
         });
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+struct ContinueOnce;
+#[async_trait]
+impl Hook for ContinueOnce {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::OnYield
+            && !ctx.snapshot["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.to_string().contains("continue please"))
+        {
+            Ok(GenerationDecision::Continue(json!("continue please")))
+        } else {
+            Ok(GenerationDecision::Pass)
+        }
+    }
+}
+#[tokio::test]
+async fn yield_continuation_keeps_submission_open_and_runs_after_run_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut opts = options(model.clone(), Arc::new(FakeTool::default()));
+    opts.max_turns = 2;
+    let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+    h.install_extension(Extension {
+        name: "continue".into(),
+        hooks: vec![Arc::new(ContinueOnce)],
+        ..Default::default()
+    })
+    .unwrap();
+    lifecycle(&mut h, None, None, events.clone());
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["continue".into(), "lifecycle".into()])
+        .unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(c.submissions[0].status, Status::Done { .. }));
+    assert_eq!(model.0.lock().unwrap().len(), 3);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["AfterTools", "OnYield", "AfterRun"]
+    );
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "continue please"))
+    );
+}
+
+struct HeldYield {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Hook for HeldYield {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::OnYield
+            && self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            return Ok(GenerationDecision::Continue(json!("discard me")));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+#[tokio::test]
+async fn queued_steer_or_followup_supersedes_yield_continuation() {
+    use pi_rs_durable::{runtime::Scheduler, state::InputMode};
+    for mode in [InputMode::Steer, InputMode::FollowUp] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut scheduler = Scheduler::open(
+            dir.path().join("db"),
+            options(
+                Arc::new(FakeModel::default()),
+                Arc::new(FakeTool::default()),
+            ),
+        )
+        .unwrap();
+        scheduler
+            .install_extension(Extension {
+                name: "held".into(),
+                hooks: vec![Arc::new(HeldYield {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                    calls: Default::default(),
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler
+            .select_extensions(id, vec!["held".into()])
+            .unwrap();
+        scheduler.submit(id, None, "first".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        scheduler
+            .submit_with_mode(id, None, "queued".into(), mode)
+            .unwrap();
+        release.add_permits(1);
+        scheduler.wait(id).await.unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        assert!(
+            c.submissions
+                .iter()
+                .all(|s| matches!(s.status, Status::Done { .. }))
+        );
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "discard me"))
+        );
         scheduler.shutdown().await.unwrap();
     }
 }

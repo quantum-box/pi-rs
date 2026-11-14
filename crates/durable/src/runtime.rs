@@ -193,6 +193,11 @@ enum Phase {
         turns: u32,
         answer: Option<String>,
     },
+    OnYield {
+        turns: u32,
+        answer: String,
+        operation_id: Uuid,
+    },
     AfterTools {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -1827,9 +1832,9 @@ impl Harness {
         event: crate::extension::GenerationEvent,
         value: serde_json::Value,
         cancel: &CancellationToken,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<serde_json::Value>, Error> {
         if c.extensions.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let selected = self.selected_extensions(c)?;
         let snapshot = serde_json::to_value(c)?;
@@ -1838,7 +1843,7 @@ impl Harness {
             snapshot: &snapshot,
             memo: &memo,
         };
-        let (_, _, tasks, reports) = fenced_poll(
+        let (_, continuation, tasks, reports) = fenced_poll(
             selected.generation(event, value, &context),
             self.execution_gate.as_ref(),
             cancel,
@@ -1856,7 +1861,10 @@ impl Harness {
                 "{event:?} hook requested tasks; atomic scheduling is not supported"
             )));
         }
-        Ok(())
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
+        }
+        Ok(continuation)
     }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
@@ -2400,9 +2408,10 @@ impl Harness {
                     } else {
                         c.messages.push(response.assistant_message());
                         if response.calls.is_empty() {
-                            c.phase = Phase::Boundary {
+                            c.phase = Phase::OnYield {
                                 turns: turns + 1,
-                                answer: Some(response.content),
+                                answer: response.content,
+                                operation_id: Uuid::new_v4(),
                             };
                         } else {
                             c.phase = Phase::Tools {
@@ -2413,6 +2422,52 @@ impl Harness {
                         }
                     }
                     self.save(&c, Expected::Version(version))?;
+                }
+                Phase::OnYield {
+                    turns,
+                    answer,
+                    operation_id,
+                } => {
+                    let continuation = self
+                        .run_lifecycle_hook(
+                            &c,
+                            operation_id,
+                            crate::extension::GenerationEvent::OnYield,
+                            serde_json::json!({"answer": answer}),
+                            cancel,
+                        )
+                        .await?;
+                    let continuation = match continuation {
+                        Some(serde_json::Value::String(text)) => Some(text),
+                        Some(_) => {
+                            return Err(Error::Invalid(
+                                "OnYield continuation must be a string".into(),
+                            ));
+                        }
+                        None => None,
+                    };
+                    if let Some(text) = continuation.filter(|_| {
+                        c.pending_resets.is_empty()
+                            && !c.submissions.iter().any(|s| s.status == Status::Queued)
+                    }) {
+                        c.messages.push(Message::User { content: text });
+                        c.auto_compaction_attempted = false;
+                        c.phase = Phase::ModelReady { turns: 0 };
+                    } else {
+                        c.phase = Phase::Boundary {
+                            turns,
+                            answer: Some(answer),
+                        };
+                    }
+                    // The inbox must be checked atomically with the decision.
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let result = self.save(&c, Expected::Version(version));
+                    self.merge_admissions = merge;
+                    match result {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
                 }
                 Phase::Boundary { turns, answer } => {
                     if !c.pending_resets.is_empty()
