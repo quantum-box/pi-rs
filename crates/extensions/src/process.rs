@@ -1599,7 +1599,7 @@ impl Extension for ExecutableExtension {
         let sent = if legacy {
             outcome.legacy_text_result()
         } else {
-            outcome.clone()
+            outcome.protocol_text_result()
         };
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
@@ -1640,7 +1640,13 @@ impl Extension for ExecutableExtension {
                 }
             }));
         }
-        Ok(updated)
+        Ok(updated.map(|result| {
+            if result == sent {
+                outcome.clone()
+            } else {
+                outcome.restore_structured_text_result(result)
+            }
+        }))
     }
 
     async fn tool_result_update_with_host(
@@ -1658,7 +1664,7 @@ impl Extension for ExecutableExtension {
         }
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
-            outcome: outcome.clone(),
+            outcome: outcome.protocol_text_result(),
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: true,
@@ -1667,9 +1673,12 @@ impl Extension for ExecutableExtension {
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
-            .await
-            .map_err(|error| error.to_string())?
+        let updated: Option<Outcome> = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(updated.map(|result| outcome.restore_structured_text_result(result)))
     }
 
     fn after_tool(
@@ -1681,7 +1690,7 @@ impl Extension for ExecutableExtension {
         self.request(ProtocolRequest::AfterTool {
             name: name.into(),
             outcome: if self.endpoint.text_result_v2 {
-                outcome.clone()
+                outcome.protocol_text_result()
             } else {
                 outcome.legacy_text_result()
             },
@@ -2152,11 +2161,22 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
 
 fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
-    request: ProtocolRequest,
+    mut request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
 ) -> ExtensionResult<T> {
+    if let ProtocolRequest::Lifecycle {
+        event: LifecycleEvent::ToolExecutionEnd { result, .. },
+        ..
+    } = &mut request
+    {
+        *result = if endpoint.text_result_v2 {
+            result.protocol_text_result()
+        } else {
+            result.legacy_text_result()
+        };
+    }
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -2246,6 +2266,9 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 })?;
                 let results: Vec<_> = if endpoint.text_result_v2 {
                     results
+                        .into_iter()
+                        .map(|result| result.protocol_text_result())
+                        .collect()
                 } else {
                     results
                         .into_iter()
@@ -2529,14 +2552,15 @@ fn call<T: serde::de::DeserializeOwned>(
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
     let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
-    if !endpoint.text_result_v2
-        && wire["type"] == "lifecycle"
-        && wire["event"]["type"] == "tool_execution_end"
-    {
+    if wire["type"] == "lifecycle" && wire["event"]["type"] == "tool_execution_end" {
         let result = &mut wire["event"]["result"];
         if let Ok(outcome) = serde_json::from_value::<Outcome>(result.clone()) {
-            *result = serde_json::to_value(outcome.legacy_text_result())
-                .map_err(|error| error.to_string())?;
+            *result = serde_json::to_value(if endpoint.text_result_v2 {
+                outcome.protocol_text_result()
+            } else {
+                outcome.legacy_text_result()
+            })
+            .map_err(|error| error.to_string())?;
         }
     }
     let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;

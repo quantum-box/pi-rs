@@ -2073,6 +2073,17 @@ other local-tool output/error parity remain open.
 
 ### Shell partial-line notice checkpoint
 
+Completed local and injected remote model shell calls expose Pi's separate
+`structuredContent` in tool events: bounded full output, truncation state,
+exit code, rounded wall time and the full-output path when truncated. Text sent
+to the model remains the display result; nonzero exits retain their error flag
+and truncation details. Timeout and cancellation remain error results without
+structured content. A text-replacing extension patch drops the now-stale
+structured value; metadata-only in-process patches preserve it. Existing
+native executable protocols receive a compatible text result and retain
+structured data when the returned text is unchanged; those protocols cannot
+distinguish a same-text replacement from a metadata-only update.
+
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count
 to zero, while an unterminated line retains its UTF-8 byte count. The retained

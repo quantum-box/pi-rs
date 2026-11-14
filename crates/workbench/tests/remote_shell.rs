@@ -171,9 +171,10 @@ async fn paired_remote_read_can_page_only_its_shell_transcripts() {
     };
     let result = bash.invoke(json!({"command":"large"}), context()).await;
     let path = match result {
-        Outcome::SucceededWithDetails { details, .. } => {
-            details["fullOutputPath"].as_str().unwrap().to_owned()
-        }
+        Outcome::TextResultWithStructuredContent {
+            details: Some(details),
+            ..
+        } => details["fullOutputPath"].as_str().unwrap().to_owned(),
         other => panic!("unexpected result: {other:?}"),
     };
     let page = read
@@ -224,9 +225,10 @@ async fn coding_tools_share_transcripts_between_injected_backends() {
     };
     let result = bash.invoke(json!({"command":"large"}), context()).await;
     let path = match result {
-        Outcome::SucceededWithDetails { details, .. } => {
-            details["fullOutputPath"].as_str().unwrap().to_owned()
-        }
+        Outcome::TextResultWithStructuredContent {
+            details: Some(details),
+            ..
+        } => details["fullOutputPath"].as_str().unwrap().to_owned(),
         other => panic!("unexpected result: {other:?}"),
     };
     let page = read
@@ -460,10 +462,10 @@ async fn remote_shell_cancellation_timeout_exit_and_truncation() {
         cancellation: CancellationToken::new(),
     };
     assert!(
-        matches!(tool.invoke(json!({"command":"fail"}), context()).await, Outcome::Failed(text) if text.contains("firstsecond") && text.contains("code 7"))
+        matches!(tool.invoke(json!({"command":"fail"}), context()).await, Outcome::TextResultWithStructuredContent { output, is_error: true, structured_content, .. } if output.contains("firstsecond") && output.contains("code 7") && structured_content["exit_code"] == 7 && structured_content["output"] == "firstsecond")
     );
     assert!(
-        matches!(tool.invoke(json!({"command":"large"}), context()).await, Outcome::SucceededWithDetails { details, .. } if details["truncation"]["truncated"] == true)
+        matches!(tool.invoke(json!({"command":"large"}), context()).await, Outcome::TextResultWithStructuredContent { details: Some(details), is_error: false, .. } if details["truncation"]["truncated"] == true)
     );
     assert!(
         matches!(tool.invoke(json!({"command":"wait", "timeout":0.01}), context()).await, Outcome::Failed(text) if text.contains("first") && text.contains("timed out"))
@@ -508,7 +510,7 @@ async fn local_shell_operations_factory_streams_and_applies_exit_status() {
         )
         .await;
     assert!(
-        matches!(result, Outcome::Failed(text) if text.contains("ok") && text.contains("err") && text.contains("code 4"))
+        matches!(result, Outcome::TextResultWithStructuredContent { output, is_error: true, .. } if output.contains("ok") && output.contains("err") && output.contains("code 4"))
     );
 }
 
@@ -570,11 +572,54 @@ async fn bash_injection_does_not_replace_powershell() {
             },
         )
         .await;
-    assert!(matches!(result, Outcome::Succeeded(text) if text.contains("powershell-only")));
+    assert!(
+        matches!(result, Outcome::TextResultWithStructuredContent { output, is_error: false, .. } if output.contains("powershell-only"))
+    );
     assert!(remote.calls.lock().unwrap().is_empty());
 }
 
 struct HugeChunk;
+
+struct NoExitCode;
+#[async_trait::async_trait]
+impl BashOperations for NoExitCode {
+    async fn exec(
+        &self,
+        _: ShellSpawnContext,
+        _: Option<Duration>,
+        _: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        output
+            .send(b"partial".to_vec())
+            .await
+            .map_err(|_| Error::Cancelled)?;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn injected_shell_missing_exit_code_is_an_error() {
+    let tool = create_bash_tool(
+        std::env::temp_dir().as_path(),
+        ShellConfig::default(),
+        Arc::new(NoExitCode),
+    )
+    .unwrap();
+    let outcome = tool
+        .invoke(
+            json!({"command":"fixture"}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(outcome, Outcome::Failed(text) if text.contains("partial") && text.contains("Command terminated without an exit code"))
+    );
+}
+
 #[async_trait::async_trait]
 impl BashOperations for HugeChunk {
     async fn exec(
@@ -605,7 +650,11 @@ async fn injected_shell_large_single_chunk_keeps_display_and_full_transcript() {
     };
     let result = tool.invoke(json!({"command":"fixture"}), context).await;
     let (text, details) = match result {
-        Outcome::SucceededWithDetails { output, details } => (output, details),
+        Outcome::TextResultWithStructuredContent {
+            output,
+            details: Some(details),
+            ..
+        } => (output, details),
         other => panic!("unexpected shell result: {other:?}"),
     };
     assert!(text.starts_with("remote tail\n"));

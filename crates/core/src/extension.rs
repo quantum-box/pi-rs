@@ -53,15 +53,34 @@ impl ToolResultPatchV2 {
                 output,
                 details,
                 is_error,
+            }
+            | Outcome::TextResultWithStructuredContent {
+                output,
+                details,
+                is_error,
+                ..
             } => (output.clone(), details.clone(), *is_error),
             _ => return Err("text result patch requires a text outcome".into()),
         };
         if self.output.is_none() && self.details.is_none() && self.is_error.is_none() {
             return Ok(outcome.clone());
         }
+        let preserve_structured = self.output.is_none();
         let output = self.output.unwrap_or(output);
         let details = self.details.or(details);
         let is_error = self.is_error.unwrap_or(is_error);
+        if preserve_structured
+            && let Outcome::TextResultWithStructuredContent {
+                structured_content, ..
+            } = outcome
+        {
+            return Ok(Outcome::TextResultWithStructuredContent {
+                output,
+                details,
+                structured_content: structured_content.clone(),
+                is_error,
+            });
+        }
         if matches!(
             outcome,
             Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }

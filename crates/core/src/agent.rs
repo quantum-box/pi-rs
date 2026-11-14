@@ -2376,7 +2376,8 @@ impl Agent<'_> {
                     outcome
                 }
             }
-            outcome @ Outcome::TextResult { .. } => {
+            outcome @ (Outcome::TextResult { .. }
+            | Outcome::TextResultWithStructuredContent { .. }) => {
                 let size = serde_json::to_vec(&outcome)?.len();
                 if size > max_output_bytes {
                     Outcome::TextResult {
@@ -5292,6 +5293,33 @@ mod tree_tests {
         assert!(
             matches!(marked_error, Outcome::TextResult { details: Some(details), .. } if details["source"] == "tool")
         );
+        let shell = Outcome::TextResultWithStructuredContent {
+            output: "original".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"original"}),
+            is_error: false,
+        };
+        let patched = crate::ToolResultPatchV2 {
+            details: Some(serde_json::json!({"updated":true})),
+            ..Default::default()
+        }
+        .apply(&shell)
+        .unwrap();
+        assert!(
+            matches!(&patched, Outcome::TextResultWithStructuredContent { structured_content, .. } if structured_content["output"] == "original")
+        );
+        let replaced = crate::ToolResultPatchV2 {
+            output: Some("redacted".into()),
+            ..Default::default()
+        }
+        .apply(&shell)
+        .unwrap();
+        assert!(matches!(replaced, Outcome::TextResult { .. }));
+        let projected = shell.protocol_text_result();
+        assert_eq!(shell.restore_structured_text_result(projected), shell);
+        let round_trip: Outcome =
+            serde_json::from_slice(&serde_json::to_vec(&shell).unwrap()).unwrap();
+        assert_eq!(round_trip, shell);
     }
 
     #[tokio::test]

@@ -272,9 +272,10 @@ async fn remote_constructor_preserves_backend_cwd_home_and_shell_transcripts() {
         .invoke(json!({"command":"large"}), context())
         .await;
     let path = match result {
-        Outcome::SucceededWithDetails { details, .. } => {
-            details["fullOutputPath"].as_str().unwrap().to_owned()
-        }
+        Outcome::TextResultWithStructuredContent {
+            details: Some(details),
+            ..
+        } => details["fullOutputPath"].as_str().unwrap().to_owned(),
         other => panic!("unexpected shell result: {other:?}"),
     };
     let calls_before = backend.calls.lock().unwrap().len();
@@ -484,7 +485,7 @@ async fn fully_injected_file_tools_work_without_local_shell() {
             .find(|tool| tool.spec().name == "bash")
             .unwrap();
         assert!(
-            matches!(shell.invoke(json!({"command":"cat host-only"}), context()).await, Outcome::Succeeded(output) if output.contains("host shell fixture"))
+            matches!(shell.invoke(json!({"command":"cat host-only"}), context()).await, Outcome::TextResultWithStructuredContent { output, is_error: false, .. } if output.contains("host shell fixture"))
         );
     }
 }
@@ -512,7 +513,7 @@ async fn fully_injected_coding_set_uses_one_remote_backend() {
         matches!(tool("read").invoke(json!({"path":"file"}), context()).await, Outcome::Succeeded(text) if text.contains("remote content"))
     );
     assert!(
-        matches!(tool("bash").invoke(json!({"command":"remote-command"}), context()).await, Outcome::Succeeded(text) if text.contains("remote shell output"))
+        matches!(tool("bash").invoke(json!({"command":"remote-command"}), context()).await, Outcome::TextResultWithStructuredContent { output, is_error: false, .. } if output.contains("remote shell output"))
     );
     assert!(matches!(
         tool("write")

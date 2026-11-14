@@ -1622,7 +1622,7 @@ impl BashOperations for LocalBashOperations {
             task.abort();
         }
         process.finished = true;
-        Ok(Some(exit_code(status.expect("shell status observed"))))
+        Ok(status.expect("shell status observed").code())
     }
 }
 
@@ -1772,11 +1772,21 @@ impl RemoteShellTool {
                 "Command aborted",
             )));
         }
-        let code =
-            code.map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?;
+        let code = code
+            .map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?
+            .ok_or_else(|| {
+                Error::Config(shell_status(
+                    if output.display.is_empty() {
+                        "(no output)"
+                    } else {
+                        &output.display
+                    },
+                    "Command terminated without an exit code",
+                ))
+            })?;
         Ok(RemoteShellResult {
             output,
-            exit_code: code.unwrap_or(1),
+            exit_code: code,
             elapsed: started.elapsed().as_secs_f64(),
         })
     }
@@ -1795,7 +1805,7 @@ impl Tool for RemoteShellTool {
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         match self.run(&args, &context.cancellation, None).await {
-            Ok(result) => shell_outcome(result.output, result.exit_code),
+            Ok(result) => shell_outcome(result.output, result.exit_code, result.elapsed),
             Err(Error::Config(message)) => Outcome::Failed(message),
             Err(error) => Outcome::Failed(error.to_string()),
         }
@@ -1808,7 +1818,7 @@ impl Tool for RemoteShellTool {
         host: Arc<dyn ToolHost>,
     ) -> Outcome {
         match self.run(&args, &context.cancellation, Some(host)).await {
-            Ok(result) => shell_outcome(result.output, result.exit_code),
+            Ok(result) => shell_outcome(result.output, result.exit_code, result.elapsed),
             Err(Error::Config(message)) => Outcome::Failed(message),
             Err(error) => Outcome::Failed(error.to_string()),
         }
@@ -1837,24 +1847,27 @@ impl Tool for RemoteShellTool {
     }
 }
 
-fn shell_outcome(output: crate::shell_output::Output, code: i32) -> Outcome {
+fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
+    let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
+    if output.script_truncated
+        && let Some(path) = &output.path
+    {
+        structured_content["full_output_path"] = json!(path);
+    }
     let text = if output.display.is_empty() {
         "(no output)".into()
     } else {
         output.display
     };
-    match code {
-        0 => match output.details {
-            Some(details) => Outcome::SucceededWithDetails {
-                output: text,
-                details,
-            },
-            None => Outcome::Succeeded(text),
+    Outcome::TextResultWithStructuredContent {
+        output: if code == 0 {
+            text
+        } else {
+            shell_status(&text, &format!("Command exited with code {code}"))
         },
-        code => Outcome::Failed(shell_status(
-            &text,
-            &format!("Command exited with code {code}"),
-        )),
+        details: output.details,
+        structured_content,
+        is_error: code != 0,
     }
 }
 
@@ -1964,9 +1977,11 @@ impl Tool for CodingTool {
     }
 
     fn output_limit(&self) -> usize {
-        if self.unrestricted && matches!(self.kind, Kind::Read { .. }) {
-            // The reference permits inline images up to a 4.5 MiB base64
-            // payload; include room for the surrounding JSON and text.
+        if self.unrestricted
+            && matches!(self.kind, Kind::Read { .. } | Kind::Bash | Kind::PowerShell)
+        {
+            // Include room for inline images and JSON-escaped structured shell
+            // output in addition to the bounded model-facing display text.
             8 * 1024 * 1024
         } else {
             1024 * 1024
@@ -2778,7 +2793,7 @@ impl CodingTool {
                 Outcome::Failed(Error::Config(output).to_string())
             };
         }
-        shell_outcome(result.output, exit_code(result.status))
+        shell_outcome(result.output, exit_code(result.status), result.elapsed)
     }
 
     #[cfg(test)]
@@ -2812,6 +2827,17 @@ impl CodingTool {
             return Err(Error::Config(shell_status(
                 &result.output.display,
                 "Command aborted",
+            )));
+        }
+        if self.unrestricted && result.status.code().is_none() {
+            let text = if result.output.display.is_empty() {
+                "(no output)"
+            } else {
+                &result.output.display
+            };
+            return Err(Error::Config(shell_status(
+                text,
+                "Command terminated without an exit code",
             )));
         }
         Ok(result)
@@ -3388,6 +3414,81 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_structured_result_preserves_output_and_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = super::CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: super::ShellConfig::default(),
+            kind: super::Kind::Bash,
+        };
+        for (command, expected, code) in [
+            ("printf hello", "hello", 0),
+            ("printf bad; exit 7", "bad\n\nCommand exited with code 7", 7),
+        ] {
+            let outcome = tool
+                .bash(
+                    &serde_json::json!({"command":command}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(outcome.tool_content(), expected);
+            assert_eq!(outcome.is_error(), code != 0);
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                structured_content, ..
+            } = outcome
+            else {
+                panic!("missing structured result")
+            };
+            assert_eq!(
+                structured_content["output"],
+                if code == 0 { "hello" } else { "bad" }
+            );
+            assert_eq!(structured_content["exit_code"], code);
+            assert_eq!(structured_content["truncated"], false);
+            assert!(structured_content["wall_time_seconds"].as_f64().is_some());
+        }
+        let terminated = tool
+            .bash(
+                &serde_json::json!({"command":"kill -TERM $$"}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(terminated, pi_rs::Outcome::Failed(ref message) if message.contains("Command terminated without an exit code"))
+        );
+    }
+
+    #[test]
+    fn shell_structured_result_reports_bounded_full_output() {
+        let mut output = super::super::shell_output::Accumulator::default();
+        output.append(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let outcome = super::shell_outcome(output.finish().unwrap(), 0, 1.26);
+        let pi_rs::Outcome::TextResultWithStructuredContent {
+            structured_content,
+            details,
+            ..
+        } = outcome
+        else {
+            panic!("missing structured result")
+        };
+        let text = structured_content["output"].as_str().unwrap();
+        assert!(text.contains("\n\n[... 1 bytes omitted ...]\n\n"));
+        assert_eq!(
+            text.bytes().filter(|byte| *byte == b'x').count(),
+            1024 * 1024
+        );
+        assert_eq!(structured_content["truncated"], true);
+        assert_eq!(structured_content["wall_time_seconds"], 1.3);
+        assert!(
+            std::path::Path::new(structured_content["full_output_path"].as_str().unwrap())
+                .is_file()
+        );
+        assert!(details.is_some());
+        std::fs::remove_file(structured_content["full_output_path"].as_str().unwrap()).unwrap();
+    }
     use super::*;
 
     #[cfg(unix)]
@@ -3562,7 +3663,8 @@ mod tests {
                 host.clone(),
             )
             .await;
-        assert!(matches!(result, Outcome::Succeeded(ref text) if text == "firstsecond"));
+        assert_eq!(result.tool_content(), "firstsecond");
+        assert!(!result.is_error());
         let events = host.0.lock().unwrap();
         assert_eq!(events[0]["content"], json!([]));
         assert!(
@@ -5319,20 +5421,19 @@ mod tests {
             kind: Kind::Bash,
         };
         let cancellation = pi_rs::CancellationToken::new();
-        assert_eq!(
-            tool.bash(&json!({"command":"printf hello"}), &cancellation)
-                .await,
-            Outcome::Succeeded("hello".into())
-        );
-        assert_eq!(
-            tool.bash(&json!({"command":"true"}), &cancellation).await,
-            Outcome::Succeeded("(no output)".into())
-        );
-        assert_eq!(
-            tool.bash(&json!({"command":"printf hello; exit 7"}), &cancellation)
-                .await,
-            Outcome::Failed("hello\n\nCommand exited with code 7".into())
-        );
+        for (command, expected, error) in [
+            ("printf hello", "hello", false),
+            ("true", "(no output)", false),
+            (
+                "printf hello; exit 7",
+                "hello\n\nCommand exited with code 7",
+                true,
+            ),
+        ] {
+            let outcome = tool.bash(&json!({"command":command}), &cancellation).await;
+            assert_eq!(outcome.tool_content(), expected);
+            assert_eq!(outcome.is_error(), error);
+        }
     }
 
     #[cfg(windows)]

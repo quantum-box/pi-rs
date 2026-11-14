@@ -2657,7 +2657,8 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } => "succeeded",
         Outcome::Failed(_) => "failed",
-        Outcome::TextResult { is_error, .. } => {
+        Outcome::TextResult { is_error, .. }
+        | Outcome::TextResultWithStructuredContent { is_error, .. } => {
             if *is_error {
                 "failed"
             } else {
