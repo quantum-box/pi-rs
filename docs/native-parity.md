@@ -1520,6 +1520,10 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
+Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
+BOM when loaded or updated. Invalid JSON and invalid implemented settings remain
+errors; settings updates preserve unknown keys.
+
 `defaultTools` follows Pi's layered selection: project modifiers extend the
 user selection, while project plain-name lists replace it. Mixed plain names
 and ordered modifiers in settings resolve before CLI tool selection.
