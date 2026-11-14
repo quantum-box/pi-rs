@@ -27,7 +27,8 @@ macro_rules! h3_security {
         #[tokio::test]
         async fn $name() {
             let server = endpoint();
-            let url = format!("https://localhost:{}/", server.local_addr().unwrap().port());
+            let address = server.local_addr().unwrap();
+            let url = format!("https://localhost:{}/", address.port());
             let (finished, wait) = tokio::sync::oneshot::channel();
             let listener = tokio::spawn(async move {
                 let incoming = timeout(Duration::from_secs(10), server.accept())
@@ -52,6 +53,7 @@ macro_rules! h3_security {
             });
             let client = $client::Client::builder()
                 .no_proxy()
+                .resolve("localhost", address)
                 .http3_prior_knowledge()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -65,7 +67,7 @@ macro_rules! h3_security {
                     .send(),
             )
             .await
-            .unwrap()
+            .expect("direct HTTP/3 request timed out")
             .unwrap();
             assert!(response.status().is_success());
             let _ = finished.send(());
@@ -85,7 +87,7 @@ macro_rules! h3_security {
                 proxied.get(&url).version(http::Version::HTTP_3).send(),
             )
             .await
-            .unwrap()
+            .expect("proxied HTTP/3 request timed out")
             .unwrap_err();
             assert!(
                 format!("{err:?}").contains("HTTP/3 proxy routing is unsupported"),
