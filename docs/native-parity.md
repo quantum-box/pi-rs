@@ -41,7 +41,11 @@ sharing, OpenRouter OAuth, and MCP HTTP connections honor `httpProxy`, the
 HTTP(S) proxy environment variables, and `no_proxy`/`NO_PROXY` domain, wildcard,
 and port exclusions. MCP OAuth discovery, explicit metadata, dynamic registration,
 authorization-code exchange, refresh, login, scope upgrades, and reconnects use
-the same settings. To prevent proxy DNS exemptions from bypassing address checks,
+the same settings. A loopback CLI test exercises the actual workbench `httpProxy`
+adapter and `no_proxy` for discovery, explicit metadata and dynamic registration.
+Client-level loopback tests also cover code exchange and refresh through a CONNECT
+proxy and through a supplied `NoProxy` exclusion; no browser or live credentials
+are used. To prevent proxy DNS exemptions from bypassing address checks,
 OAuth requests and redirects to a configured proxy hostname are rejected, even
 when `NO_PROXY` selects a direct connection. Embedders using the original
 `HttpOptions` without proxy hostname information apply DNS filtering to proxy
@@ -1003,6 +1007,11 @@ description problem and any invalid name diagnostics; unreadable skill files
 also report their source path. Empty-description checks use ECMAScript whitespace
 semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
 reader gating and custom-prompt precedence.
+
+Skill and prompt-template files decode malformed UTF-8 with replacement, as Pi
+does, so an invalid byte does not hide an otherwise usable resource. The native
+64 KiB resource limit and existing resource trust rules remain in force; source
+files are not rewritten. Tests cover discovery, invocation and the size limit.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -3635,7 +3644,9 @@ and active tool schemas to Radius uploads. Idle and in-flight shares use the
 worker's session state; request-only `context_with_system` transformations do
 not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
 exposes interactive `/share`; the standalone `pi share` command is a pi-rs
-extension.
+extension. Standalone share keeps the journal lock without implicitly repairing
+or creating the journal. An incomplete journal or pending handoff recovery is
+reported before upload; an explicit `--name` still updates the session name.
 The snapshot is matched to the session and head before upload, and a changed
 session requires a retry. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
@@ -4371,7 +4382,9 @@ The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
 platform-default precedence, ignoring blank configured values and empty
 environment values. On successful return it decodes UTF-8 with replacement,
 strips one leading BOM and removes exactly one final LF. Failed editors leave
-the draft unchanged. Native shell-style command splitting remains supported.
+the draft unchanged. As in Pi, the temporary draft is closed before the editor
+launches, allowing editors that require exclusive file access. Native shell-style
+command splitting remains supported.
 
 ### Editor kill ring checkpoint
 

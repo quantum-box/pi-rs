@@ -1911,10 +1911,11 @@ async fn execute(
     if matches!(command, Command::Interactive) {
         return interactive::run(args, follow_up_prompts, ready).await;
     }
-    if let Some(parent) = args
-        .session
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+    if !matches!(&command, Command::Share)
+        && let Some(parent) = args
+            .session
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
@@ -1923,7 +1924,11 @@ async fn execute(
         output(json!({"type":"imported","path":args.session}));
         return Ok(());
     }
-    let mut session = Session::open(&args.session)?;
+    let mut session = if matches!(&command, Command::Share) {
+        Session::open_for_share(&args.session)?
+    } else {
+        Session::open(&args.session)?
+    };
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),

@@ -566,7 +566,7 @@ fn validate_skill(name: &str, skill: &Skill, warnings: &mut Vec<String>) {
 }
 
 fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String, Skill)>> {
-    let text = match read(path) {
+    let text = match read_resource(path) {
         Ok(text) => text,
         Err(error) => {
             warnings.push(format!("{}: {error}", path.display()));
@@ -599,7 +599,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter_with_trim(&read(path)?, true)?;
+    let (metadata, body) = frontmatter_with_trim(&read_resource(path)?, true)?;
     let mut fallback_surrogate = None;
     let description = metadata
         .description
@@ -751,6 +751,11 @@ fn read_without_bom(path: &Path) -> Result<String> {
     let bytes = read_bytes(path)?;
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+// Pi reads skill and prompt files as UTF-8 text, replacing malformed byte
+// sequences. Keep the BOM for the frontmatter parser to handle exactly once.
+fn read_resource(path: &Path) -> Result<String> {
+    Ok(String::from_utf8_lossy(&read_bytes(path)?).into_owned())
 }
 fn read(path: &Path) -> Result<String> {
     String::from_utf8(read_bytes(path)?)
@@ -1511,6 +1516,63 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("broken.md"))
+        );
+    }
+
+    #[test]
+    fn skill_and_prompt_resources_decode_malformed_utf8_without_changing_files() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let skill_path = directory.path().join("skills/fixture/SKILL.md");
+        let prompt_path = directory.path().join("review.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        let skill_bytes =
+            b"---\nname: fixture\ndescription: Skill \xff\n---\nSkill body \xe2\x82\n";
+        let prompt_bytes = b"---\ndescription: Review \xff\n---\nPrompt body \xe2\x82 $1\n";
+        std::fs::write(&skill_path, skill_bytes).unwrap();
+        std::fs::write(&prompt_path, prompt_bytes).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--skill",
+            skill_path.to_str().unwrap(),
+            "--prompt-template",
+            prompt_path.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["fixture"].description, "Skill �");
+        assert_eq!(resources.prompts["review"].description, "Review �");
+        assert_eq!(
+            resources.expand("/review test").as_deref(),
+            Some("Prompt body � test")
+        );
+        assert!(
+            resources
+                .expand("/skill:fixture")
+                .unwrap()
+                .contains("Skill body �")
+        );
+        assert_eq!(std::fs::read(&skill_path).unwrap(), skill_bytes);
+        assert_eq!(std::fs::read(&prompt_path).unwrap(), prompt_bytes);
+    }
+
+    #[test]
+    fn malformed_utf8_resources_still_obey_the_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_path = directory.path().join("SKILL.md");
+        let prompt_path = directory.path().join("review.md");
+        let bytes = vec![0xff; 64 * 1024 + 1];
+        std::fs::write(&skill_path, &bytes).unwrap();
+        std::fs::write(&prompt_path, &bytes).unwrap();
+        assert!(parse_prompt(&prompt_path).is_err());
+        let mut warnings = Vec::new();
+        assert!(parse_skill(&skill_path, &mut warnings).unwrap().is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("exceeds resource size limit"))
         );
     }
 

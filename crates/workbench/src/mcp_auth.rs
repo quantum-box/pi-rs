@@ -1296,6 +1296,127 @@ pub(crate) async fn test_oauth_client(
 mod tests {
     use super::*;
 
+    async fn fixture_headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<(String, Vec<String>, usize)> {
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(deadline, async {
+            let mut lines = Vec::new();
+            let mut bytes = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await? == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "incomplete fixture headers",
+                    ));
+                }
+                bytes += line.len();
+                if bytes > 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture headers too large",
+                    ));
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                lines.push(line);
+            }
+            if lines.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing fixture request line",
+                ));
+            }
+            let first = lines.remove(0);
+            let mut length = 0;
+            for line in &lines {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid fixture content length",
+                        )
+                    })?;
+                }
+            }
+            if length > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture body too large",
+                ));
+            }
+            Ok((first, lines, length))
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture headers timed out")
+        })?
+    }
+
+    async fn fixture_body<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        length: usize,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut body = vec![0; length];
+        tokio::time::timeout(deadline, reader.read_exact(&mut body))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture body timed out")
+            })??;
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn oauth_fixture_rejects_incomplete_headers_and_bounds_idle_reads() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n")
+            .await
+            .unwrap();
+        drop(sender);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender.write_all(b"x").await.unwrap();
+        drop(sender);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            1,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     #[test]
     fn callback_validation_preserves_explicit_default_port() {
         for url in [
@@ -1563,8 +1684,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    async fn oauth_manager_uses_proxy_for_registration_code_exchange_and_refresh() {
+        use tokio::io::{AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let options = crate::mcp::HttpOptionsWithProxyHosts {
             http: crate::mcp::HttpOptions {
@@ -1585,6 +1706,7 @@ mod tests {
             for body in [
                 r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#,
                 r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#,
+                r#"{"access_token":"newer","token_type":"Bearer","refresh_token":"next2"}"#,
             ] {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
@@ -1592,43 +1714,26 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 let mut socket = BufReader::new(socket);
-                let mut first = String::new();
-                socket.read_line(&mut first).await.unwrap();
-                let mut len = 0;
-                loop {
-                    let mut line = String::new();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = n.trim().parse().unwrap();
-                    }
-                }
+                let (first, _, _) = fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
                 socket
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await
                     .unwrap();
-                first.clear();
-                socket.read_line(&mut first).await.unwrap();
-                loop {
-                    let mut line = String::new();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    assert!(
-                        !line
-                            .to_ascii_lowercase()
-                            .starts_with("proxy-authorization:")
-                    );
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = n.trim().parse().unwrap();
-                    }
-                }
-                let mut data = vec![0; len];
-                socket.read_exact(&mut data).await.unwrap();
+                let (first, headers, length) =
+                    fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let data = fixture_body(&mut socket, length, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 requests.push((first, String::from_utf8(data).unwrap()));
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
@@ -1646,15 +1751,166 @@ mod tests {
             .await
             .unwrap();
         manager.configure_client(config).unwrap();
-        let store = rmcp::transport::auth::InMemoryCredentialStore::new();
-        let creds: StoredCredentials = serde_json::from_value(serde_json::json!({"client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}})).unwrap();
-        store.save(creds).await.unwrap();
-        manager.set_credential_store(store);
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
         assert!(requests[0].0.starts_with("POST /register "));
         assert!(requests[1].0.starts_with("POST /token "));
-        assert!(requests[1].1.contains("refresh_token=old-refresh"));
+        assert!(requests[1].1.contains("grant_type=authorization_code"));
+        assert!(requests[1].1.contains("code=fixture-code"));
+        assert!(requests[2].0.starts_with("POST /token "));
+        assert!(requests[2].1.contains("refresh_token=next"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_routes_oauth_discovery_metadata_registration_code_exchange_and_refresh_directly()
+     {
+        use std::time::Duration;
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", origin.local_addr().unwrap());
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!(
+                        "http://localhost:{}",
+                        proxy.local_addr().unwrap().port()
+                    ))
+                    .unwrap()
+                    .no_proxy(reqwest_mcp::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true),
+                ],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
+        };
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut token_requests = 0;
+            loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), origin.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let (first, headers, length) = fixture_headers(&mut socket, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let body = fixture_body(&mut socket, length, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                requests.push((first.clone(), String::from_utf8(body).unwrap()));
+                let (status, response) = if first.starts_with("GET /metadata ") {
+                    ("200 OK", serde_json::json!({"issuer":server_base,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if first.starts_with("POST /register ") {
+                    (
+                        "200 OK",
+                        r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#
+                            .to_owned(),
+                    )
+                } else if first.starts_with("POST /token ") {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#
+                            .to_owned(),
+                    )
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                if first.starts_with("POST /token ") {
+                    token_requests += 1;
+                    if token_requests == 2 {
+                        return requests;
+                    }
+                }
+            }
+        });
+        let resource = format!("{base}/mcp");
+        let mut manager = oauth_manager(&resource, Some(&options)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), manager.resolve_metadata())
+            .await
+            .unwrap();
+        let metadata = configured_metadata(&format!("{base}/metadata"), &resource, Some(&options))
+            .await
+            .unwrap();
+        manager.set_metadata(metadata);
+        let config = manager
+            .register_client("fixture", "http://127.0.0.1/callback", &[])
+            .await
+            .unwrap();
+        manager.configure_client(config).unwrap();
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
+        manager.refresh_token().await.unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /.well-known/"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /metadata "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("POST /register "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("refresh_token=next"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("grant_type=authorization_code")
+                    && body.contains("code=fixture-code"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -584,6 +584,18 @@ impl Session {
         Ok(session)
     }
 
+    /// Hold the journal lock while reading a complete session without repairing it.
+    /// This is intended for exports that must not modify the source journal.
+    pub fn open_for_share(path: impl AsRef<Path>) -> Result<Self> {
+        let session = Self::with_store(ShareFileStore(FileStore::open_existing(path.as_ref())?))?;
+        if session.host_binding().is_none() && session.pending_tree_trigger_handoff().is_some() {
+            return Err(Error::Session(
+                "journal requires handoff recovery before sharing".into(),
+            ));
+        }
+        Ok(session)
+    }
+
     /// Read a stable, complete-record prefix without locking or repairing the source.
     pub fn snapshot(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
@@ -2691,8 +2703,20 @@ struct FileStore {
 
 impl FileStore {
     fn open(path: &Path) -> Result<Self> {
+        Self::open_with_create(path, true)
+    }
+
+    fn open_existing(path: &Path) -> Result<Self> {
+        Self::open_with_create(path, false)
+    }
+
+    fn open_with_create(path: &Path, create: bool) -> Result<Self> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -2838,6 +2862,25 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
         line.clear();
     }
     Ok((records, metadata, offset, false))
+}
+
+// Keep the same exclusive lock as a normal session without recovery writes.
+struct ShareFileStore(FileStore);
+
+impl SessionStore for ShareFileStore {
+    fn load(&mut self) -> Result<Vec<Record>> {
+        let (records, _, incomplete) = read_complete_records(&mut self.0.file)?;
+        if incomplete || records.is_empty() {
+            return Err(Error::Session(
+                "journal is incomplete; reopen it before sharing".into(),
+            ));
+        }
+        Ok(records)
+    }
+
+    fn append(&mut self, record: &Record) -> Result<()> {
+        self.0.append(record)
+    }
 }
 
 impl SessionStore for FileStore {
@@ -3990,6 +4033,50 @@ mod session_metadata_tests {
     }
 
     #[test]
+    fn share_open_rejects_pending_handoff_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_user_with_images("A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(2).unwrap();
+        session
+            .append_user_with_images("B".into(), vec![], None)
+            .unwrap();
+        let original_head = session.head();
+        session.begin_tree_trigger_handoff(run_id).unwrap().unwrap();
+        drop(session);
+        let original = std::fs::read(&path).unwrap();
+        assert!(Session::open_for_share(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(Session::open(&path).unwrap().head(), original_head);
+    }
+
+    #[test]
     fn dropping_the_store_unlocks_duplicated_file_descriptors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
@@ -4652,6 +4739,39 @@ mod snapshot_tests {
             })
             .unwrap();
         assert_eq!(session.name(), Some("\u{0085}"));
+    }
+
+    #[test]
+    fn share_open_retains_lock_and_never_repairs_or_creates_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        assert!(Session::open_for_share(&path).is_err());
+        assert!(!path.exists());
+        drop(Session::open(&path).unwrap());
+        let original = std::fs::read(&path).unwrap();
+        let share = Session::open_for_share(&path).unwrap();
+        assert!(
+            Session::open(&path).is_err(),
+            "share must retain the journal lock"
+        );
+        drop(share);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut named = Session::open_for_share(&path).unwrap();
+        named.set_name("explicit name").unwrap();
+        drop(named);
+        assert_eq!(
+            Session::snapshot(&path).unwrap().name(),
+            Some("explicit name")
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"incomplete\":")
+            .unwrap();
+        let incomplete = std::fs::read(&path).unwrap();
+        assert!(Session::open_for_share(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), incomplete);
     }
 
     #[test]
