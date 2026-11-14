@@ -1016,6 +1016,6 @@ submission handle or durable task notification.
 
 ### Ordered transcript block storage
 
-The transcript storage API can append version 2 records with `prepare_append_with_blocks` and read them with `read_with_blocks`. Each block array is associated with a non-nil message occurrence ID; the host is responsible for binding that ID to the opaque record value. Ordering, metadata and empty arrays are preserved across append and store reopen. Existing version 1 records remain readable.
+The transcript storage API can append version 2 records with `prepare_append_with_blocks` and read them with `read_with_blocks`. Each block array must reference a unique user-message occurrence ID in the same versioned runtime transcript change; the binding is checked on write and read. Earlier experimental version 2 records without that binding are rejected as corrupt rather than interpreted as complete messages. Ordering, metadata and empty arrays are preserved across append and store reopen. Existing version 1 records remain readable.
 
 This is storage support only: the runtime does not yet write these records or accept additional `onYield` inputs. The legacy transcript reader rejects version 2 block-bearing records, so a runtime containing them cannot currently open, fork, compact, or otherwise run. Transcript-level forks also reject any captured history containing such records and scan the chain to enforce that restriction. No provider dispatch support is implied.

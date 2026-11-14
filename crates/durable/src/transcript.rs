@@ -69,8 +69,8 @@ struct Entry {
     content_blocks: Option<Vec<MessageContentBlocks>>,
 }
 
-/// Ordered content for one message occurrence. The host must bind `message_id`
-/// to the corresponding identity in the opaque record value.
+/// Ordered content for one user-message occurrence in a runtime transcript change.
+/// The message identity is validated against the corresponding record value.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageContentBlocks {
@@ -171,7 +171,10 @@ impl<'a> Transcript<'a> {
         blocks: Option<Vec<MessageContentBlocks>>,
         create: bool,
     ) -> Result<(Batch, Cursor), Error> {
-        if blocks.as_ref().is_some_and(|blocks| !valid_blocks(blocks)) {
+        if blocks
+            .as_ref()
+            .is_some_and(|blocks| !valid_block_bindings(value, blocks))
+        {
             return Err(Error::Corrupt);
         }
         let (head, expected) = if create {
@@ -378,7 +381,7 @@ impl<'a> Transcript<'a> {
         let entry: Entry = decode(&stored.value)?;
         if !match (entry.format, entry.content_blocks.as_ref()) {
             (1, None) => true,
-            (2, Some(blocks)) => valid_blocks(blocks),
+            (2, Some(blocks)) => valid_block_bindings(&entry.value, blocks),
             _ => false,
         } || entry.id != link.id
             || entry.sequence != link.sequence
@@ -394,12 +397,50 @@ impl<'a> Transcript<'a> {
         Ok(entry)
     }
 }
-fn valid_blocks(blocks: &[MessageContentBlocks]) -> bool {
-    let mut ids = std::collections::HashSet::new();
-    !blocks.is_empty()
-        && blocks
-            .iter()
-            .all(|block| !block.message_id.is_nil() && ids.insert(block.message_id))
+fn valid_block_bindings(value: &Value, blocks: &[MessageContentBlocks]) -> bool {
+    if blocks.is_empty() {
+        return false;
+    }
+    let Some(object) = value.as_object().filter(|object| object.len() == 1) else {
+        return false;
+    };
+    let Some((kind, data)) = object.iter().next() else {
+        return false;
+    };
+    if !matches!(
+        kind.as_str(),
+        "AppendV2" | "AppendV3" | "AppendV4" | "ReplaceV2"
+    ) {
+        return false;
+    }
+    let (Some(ids), Some(messages)) = (
+        data.get("ids").and_then(Value::as_array),
+        data.get("messages").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    if ids.len() != messages.len() {
+        return false;
+    }
+    let mut occurrences = std::collections::HashMap::new();
+    for (id, message) in ids.iter().zip(messages) {
+        let Some(id) = id.as_str().and_then(|id| Uuid::parse_str(id).ok()) else {
+            return false;
+        };
+        if id.is_nil() || occurrences.insert(id, message).is_some() {
+            return false;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    blocks.iter().all(|block| {
+        seen.insert(block.message_id)
+            && occurrences.get(&block.message_id).is_some_and(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("user" | "user_with_images")
+                )
+            })
+    })
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
@@ -473,7 +514,7 @@ mod tests {
         commit(
             &db,
             transcript
-                .prepare_append_with_blocks(&json!({"ids":[message_id]}), content.clone())
+                .prepare_append_with_blocks(&json!({"AppendV2":{"ids":[message_id],"messages":[{"role":"user","content":"placeholder"}]}}), content.clone())
                 .unwrap(),
         );
         let blocked_snapshot = transcript.snapshot().unwrap();
@@ -532,14 +573,15 @@ mod tests {
             message_id: Uuid::new_v4(),
             blocks: vec![],
         };
+        let change = json!({"AppendV2": {"ids": [empty.message_id], "messages": [{"role":"user","content":""}]}});
         assert!(matches!(
-            transcript.prepare_append_with_blocks(&json!(null), vec![empty.clone(), empty.clone()]),
+            transcript.prepare_append_with_blocks(&change, vec![empty.clone(), empty.clone()]),
             Err(Error::Corrupt)
         ));
         commit(
             &db,
             transcript
-                .prepare_append_with_blocks(&json!(null), vec![empty.clone()])
+                .prepare_append_with_blocks(&change, vec![empty.clone()])
                 .unwrap(),
         );
         let page = transcript
@@ -547,6 +589,54 @@ mod tests {
             .unwrap();
         assert_eq!(page.records[0].content_blocks, Some(vec![empty]));
     }
+    #[test]
+    fn blocks_must_bind_to_one_user_occurrence_on_write_and_read() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let transcript = Transcript::new(&db, id);
+        let message_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let content = vec![MessageContentBlocks {
+            message_id,
+            blocks: vec![],
+        }];
+        let good =
+            json!({"AppendV2": {"ids": [message_id], "messages": [{"role":"user","content":""}]}});
+        let wrong_id =
+            json!({"AppendV2": {"ids": [other_id], "messages": [{"role":"user","content":""}]}});
+        let wrong_role = json!({"AppendV2": {"ids": [message_id], "messages": [{"role":"assistant","content":""}]}});
+        let repeated = json!({"AppendV2": {"ids": [message_id, message_id], "messages": [{"role":"user"}, {"role":"user"}]}});
+        for value in [wrong_id, wrong_role, repeated, json!({"ids":[message_id]})] {
+            assert!(matches!(
+                transcript.prepare_append_with_blocks(&value, content.clone()),
+                Err(Error::Corrupt)
+            ));
+        }
+        commit(
+            &db,
+            transcript
+                .prepare_append_with_blocks(&good, content)
+                .unwrap(),
+        );
+        let cursor = transcript.snapshot().unwrap();
+        let link = cursor.next.unwrap();
+        let mut entry = transcript.load_entry(link).unwrap();
+        entry.value["AppendV2"]["ids"][0] = json!(other_id);
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: entry_key(link.id),
+                value: encode(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+    }
+
     #[test]
     fn record_version_and_content_must_agree() {
         let db = Store::memory().unwrap();
