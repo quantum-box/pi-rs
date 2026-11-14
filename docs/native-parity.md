@@ -133,13 +133,14 @@ the saved tool result retains the image for later use with a compatible model.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
-tool calls in a length-limited response are recorded as failed without executing
-their potentially incomplete arguments; the model receives those results and
-may request the tools again. Other incomplete reasons remain errors.
+tool calls in a length-limited response are never executed. When a recoverable
+length stop has an older prefix to compact, native omits the attempt and tries
+one compact-and-retry recovery; otherwise, it records failed tool results and
+the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
-Native extensions can opt into a pre-summary compaction hook for manual and
-threshold compaction. A supplied summary bypasses the summary model, carries
+Native extensions can opt into a pre-summary compaction hook for manual,
+threshold, and supported overflow compaction. A supplied summary bypasses the summary model, carries
 optional details and usage into the journal, and emits the normal lifecycle
 notification; cancellation leaves the branch unchanged. Executable extensions
 negotiate this hook before receiving the new request. Existing post-summary
@@ -151,8 +152,10 @@ least the prepared recent context and uses native numeric journal IDs; cuts that
 split a user message from its legacy image records or a tool call from its
 result are rejected. Later legacy hook changes can retain more history, but
 cannot move an extension-provided boundary forward. Native summary size and
-timeout limits still apply. Automatic overflow recovery and
-full Pi preparation payload compatibility remain separate gaps.
+timeout limits still apply. Overflow recovery remains partial: when an
+interrupted operation may have invoked an extension hook or sent an unconfirmed
+summary request, the host requires reconciliation rather than repeating it.
+Full Pi preparation payload and all provider overflow classifications remain gaps.
 
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
@@ -3519,8 +3522,9 @@ Manual preparation failures also emit `session_compact_failed`; its error
 message identifies manual versus automatic threshold compaction, and aborted
 events omit the error message. Native compaction retains its existing
 preflight, error types, and extension replacement behavior. Manual and threshold
-compaction accept extension-provided summaries before model generation; automatic
-overflow recovery remains a separate gap.
+compaction accept extension-provided summaries before model generation.
+Supported overflow recovery also invokes the hook; ambiguous interrupted
+requests or hooks are not automatically repeated.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
