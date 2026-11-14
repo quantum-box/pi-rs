@@ -299,6 +299,54 @@ mod tests {
     }
 
     #[test]
+    fn lease_commit_finishes_before_abort_fence_cancels_epoch() {
+        use durable_store::owner::OwnedStore;
+        use std::{sync::mpsc, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let b = setup(owner.store());
+        commit_binding(owner.store(), &b);
+        let lease = Arc::new(ConversationLease::acquire(owner.clone(), b.clone()).unwrap());
+        let control = owner.conversation_controls().get(b.conversation);
+        let task_guard = owner.task_gate().lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let committing = lease.clone();
+        let commit_thread = std::thread::spawn(move || {
+            let result = committing.commit(effect_batch());
+            tx.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control.gate.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit did not acquire poll gate"
+            );
+            std::thread::yield_now();
+        }
+        let (tx, fence_rx) = mpsc::channel();
+        let fencing_owner = owner.clone();
+        let id = b.conversation;
+        let fence_thread = std::thread::spawn(move || {
+            fencing_owner
+                .conversation_controls()
+                .fence(|| {
+                    tx.send(()).unwrap();
+                    Ok::<_, ()>(vec![id])
+                })
+                .unwrap();
+        });
+        assert!(fence_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(task_guard);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        fence_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        commit_thread.join().unwrap();
+        fence_thread.join().unwrap();
+        assert!(matches!(lease.commit(effect_batch()), Err(Error::Cancelled)));
+        assert!(matches!(lease.commit(effect_batch()), Err(Error::Poisoned)));
+    }
+
+    #[test]
     fn lease_excludes_other_conversation_workers_and_rechecks_abort() {
         use durable_store::owner::OwnedStore;
         let dir = tempfile::tempdir().unwrap();
