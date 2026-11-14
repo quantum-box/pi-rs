@@ -764,10 +764,6 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
-                let gateway = matches!(
-                    args.provider.id(),
-                    "fireworks" | "openrouter" | "vercel-ai-gateway"
-                );
                 let mut client = client
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
@@ -778,21 +774,35 @@ impl Client {
                     client =
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
                     let adaptive = metadata.adaptive_thinking();
-                    if metadata.reasoning == Some(true) && (gateway || adaptive.is_some()) {
+                    if metadata.reasoning == Some(true) {
+                        // Messages-compatible gateways need not implement Anthropic's
+                        // Models API. Keep their configured capabilities local.
+                        if args.provider.id() != "anthropic" {
+                            client = client.with_context_probe(false);
+                        }
                         let selected = thinking.unwrap_or("off");
                         let mapped = metadata.mapped_effort(selected);
                         if selected == "off" && mapped == Some(None) {
                             client = client.with_thinking(None);
                         } else {
-                            let effort = mapped
-                                .flatten()
-                                .filter(|_| selected != "off")
-                                .unwrap_or(selected);
-                            client = client.with_configured_thinking(
-                                effort,
-                                adaptive.unwrap_or(false),
-                                true,
-                            );
+                            let effort = if adaptive == Some(true) && selected != "off" {
+                                mapped.flatten().unwrap_or(if selected == "minimal" {
+                                    "low"
+                                } else {
+                                    selected
+                                })
+                            } else {
+                                selected
+                            };
+                            client = if adaptive.is_some() || metadata.has_thinking_level_map() {
+                                client.with_configured_thinking(
+                                    effort,
+                                    adaptive.unwrap_or(false),
+                                    true,
+                                )
+                            } else {
+                                client.with_fallback_thinking(effort, false, true)
+                            };
                             if matches!(args.provider.id(), "minimax" | "minimax-cn")
                                 && args.model == "MiniMax-M3"
                             {
@@ -943,7 +953,11 @@ impl Client {
                     .remove(model)?
                     .thinking_levels
             }
-            Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+            Self::Anthropic(client) => client
+                .model(model)
+                .await
+                .filter(|entry| entry.has_known_thinking())
+                .map(|entry| entry.thinking_levels),
             Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
             Self::PiMessages(client) => {
                 client
