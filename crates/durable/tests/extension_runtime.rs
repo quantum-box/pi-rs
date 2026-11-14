@@ -3440,6 +3440,7 @@ impl Hook for YieldDecisionHook {
         }
         match self.0 {
             "invalid" => Ok(D::Continue(json!({"bad": true}))),
+            "blank" => Ok(D::Continue(json!(" \n\t"))),
             "error" => Err("yield failed".into()),
             "tasks" => {
                 let operation = ctx.snapshot["phase"]["OnYield"]["operation_id"].clone();
@@ -3459,6 +3460,9 @@ impl Hook for YieldDecisionHook {
             {
                 Ok(D::Continue(json!("retry answer")))
             }
+            "later" if !ctx.snapshot["messages"].to_string().contains("retry answer") => {
+                Ok(D::Continue(json!("later answer")))
+            }
             _ => Ok(D::Pass),
         }
     }
@@ -3477,8 +3481,10 @@ async fn yield_invalid_and_failed_hooks_allow_later_continuation() {
         name: "yield".into(),
         hooks: vec![
             Arc::new(YieldDecisionHook("invalid")),
+            Arc::new(YieldDecisionHook("blank")),
             Arc::new(YieldDecisionHook("error")),
             Arc::new(YieldDecisionHook("continue")),
+            Arc::new(YieldDecisionHook("later")),
         ],
         ..Default::default()
     })
@@ -3498,17 +3504,27 @@ async fn yield_invalid_and_failed_hooks_allow_later_continuation() {
         1
     );
     assert_eq!(model.0.lock().unwrap().len(), 3);
+    assert!(
+        !c.messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "later answer"))
+    );
     let reports = h.extension_reports().unwrap();
     let yields: Vec<_> = reports.iter().filter(|r| r.phase == "OnYield").collect();
     assert_eq!(yields.len(), 2);
     for batch in yields {
-        assert_eq!(batch.reports.len(), 2);
+        assert_eq!(batch.reports.len(), 3);
         assert!(
             batch.reports[0]
                 .error
-                .contains("continuation must be a string")
+                .contains("continuation must be a nonempty string")
         );
-        assert_eq!(batch.reports[1].error, "yield failed");
+        assert!(
+            batch.reports[1]
+                .error
+                .contains("continuation must be a nonempty string")
+        );
+        assert_eq!(batch.reports[2].error, "yield failed");
     }
 }
 

@@ -582,13 +582,13 @@ impl Resolved {
                         }
                     }
                     Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
-                        if v.is_string() {
+                        if v.as_str().is_some_and(|text| !text.trim().is_empty()) {
                             return (value, Some(v), tasks, reports);
                         }
                         reports.push(failure(
                             &e.name,
                             "generation",
-                            "OnYield continuation must be a string".into(),
+                            "OnYield continuation must be a nonempty string".into(),
                         ));
                     }
                     Ok(GenerationDecision::Tasks(mut t))
