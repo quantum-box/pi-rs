@@ -3800,6 +3800,7 @@ fn configured_retention(
         return Ok(RetentionPlan::turns(session, fallback));
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let entries = conversation_entries(&branch, session.operations());
     let candidates: Vec<_> = entries
         .iter()
@@ -3818,9 +3819,7 @@ fn configured_retention(
     let mut cut = first;
     let mut accumulated = 0_u64;
     for (index, (source, message)) in entries.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(crate::tokens::estimate_source_tokens(
-            session, *source, message,
-        ));
+        accumulated = accumulated.saturating_add(token_index.estimate(*source, message));
         if accumulated >= target {
             cut = candidates
                 .iter()
@@ -3877,6 +3876,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         return Ok(1);
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let floor = retain_from(&branch, usize::MAX).unwrap_or(u64::MAX);
     let turns: Vec<_> = branch
         .iter()
@@ -3899,9 +3899,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         let middle = low + (high - low) / 2;
         let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
         let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                session, *source, message,
-            ))
+            tokens.saturating_add(token_index.estimate(*source, message))
         });
         if tokens >= target {
             low = middle + 1;
@@ -5031,6 +5029,50 @@ mod retention_estimate_tests {
     }
 
     #[test]
+    fn long_history_retention_and_usage_share_indexed_reasoning() {
+        const TURNS: usize = 2500;
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for _ in 0..TURNS {
+            session
+                .append(Event::User {
+                    content: "x".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        reasoning: Some("r".repeat(8)),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "ok".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.context_usage_estimate().tokens, (TURNS * 4) as u64);
+        let retention = configured_retention(&session, Some(u64::MAX), 1).unwrap();
+        assert_eq!(retention.keep_turns, TURNS);
+        assert!(!retention.split_turn);
+        assert_eq!(
+            retained_turn_count(&session, Some(u64::MAX)).unwrap(),
+            TURNS
+        );
+    }
+
+    #[test]
     fn recent_token_cut_counts_assistant_thinking() {
         let (session, completion) = session_with_reasoning(&"r".repeat(400));
         let retention = configured_retention(&session, Some(100), 1).unwrap();
@@ -5127,6 +5169,27 @@ mod retention_estimate_tests {
             .find(|r| matches!(r.event, Event::Assistant { .. }))
             .unwrap()
             .id;
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Thinking {
+                        thinking: "z".repeat(800),
+                        thinking_signature: None,
+                        redacted: false,
+                    },
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        assert!(
+            configured_retention(&session, Some(100), 1)
+                .unwrap()
+                .split_turn
+        );
         session
             .edit_context(
                 assistant,
