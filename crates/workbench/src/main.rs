@@ -1935,7 +1935,12 @@ async fn execute(
         output(json!({"type":"imported","path":args.session}));
         return Ok(());
     }
-    let mut session = Session::open(&args.session).map_err(|error| {
+    let mut session = if matches!(&command, Command::Share) {
+        Session::open_for_share(&args.session)
+    } else {
+        Session::open(&args.session)
+    }
+    .map_err(|error| {
         if matches!(&command, Command::Share) {
             Error::Config(format!(
                 "Cannot prepare share from the session; live context is unavailable: {error}"

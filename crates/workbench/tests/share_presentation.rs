@@ -256,6 +256,62 @@ fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
     }
 }
 
+#[test]
+fn standalone_share_rejects_incomplete_journal_without_repair_or_upload() {
+    use std::io::Write as _;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    drop(pi_rs::Session::open(&path).unwrap());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"incomplete\":")
+        .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .args([
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+        ])
+        .arg("--session")
+        .arg(&path)
+        .arg("share")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("standalone share did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "incomplete journal was shared");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("journal is incomplete"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Radius was contacted"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn standalone_share_does_not_upload_after_extension_hook_failure() {
