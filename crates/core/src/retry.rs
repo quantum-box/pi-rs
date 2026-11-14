@@ -110,11 +110,91 @@ fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
 // A header value can itself be an ordinary classifier word. Suppressing such
 // a value would also suppress a real provider error; fixed diagnostics keep
 // even these ambiguous values out of the user's output.
+// Representative Pi transient messages protect header fragments too. A complete
+// match is additionally checked against the actual Pi pattern below.
+const TRANSIENT_EXAMPLES: &[&str] = &[
+    "overloaded",
+    "server_busy",
+    "servers are currently busy",
+    "currently experiencing high demand",
+    "model is at capacity",
+    "rate limit",
+    "too many requests",
+    "service is temporarily unavailable",
+    "server error",
+    "internal error",
+    "provider returned an error",
+    "exceeded request buffer limit while retrying upstream",
+    "unable to forward upstream",
+    "upstream request failed",
+    "upstream_stream_read_error",
+    "stream was interrupted",
+    "http/2 stream failed",
+    "network error",
+    "connection error",
+    "connection refused",
+    "connection lost",
+    "other side closed",
+    "fetch failed",
+    "request to host failed, reason:",
+    "getaddrinfo",
+    "enotfound",
+    "eai_again",
+    "upstream connect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed out",
+    "timeout",
+    "terminated",
+    "websocket closed",
+    "websocket error",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "stream disconnected before completion",
+    "pending stream has been canceled",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "resourceexhausted",
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "520",
+    "524",
+];
+
 fn should_mask_provider_secret(secret: &str) -> bool {
     if secret.is_empty() {
         return false;
     }
     let lower = secret.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    // An exact retry expression is ambiguous with echoed credentials, so keep
+    // the upstream retry behavior; diagnostics never expose the response text.
+    if retryable_provider_error(&serde_json::Value::String(secret.to_owned()), &[])
+        || TRANSIENT_EXAMPLES.iter().any(|example| {
+            example.contains(&lower)
+                || (!compact.is_empty()
+                    && example
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>()
+                        .contains(&compact))
+        })
+    {
+        return false;
+    }
     ![
         "gousagelimiterror",
         "freeusagelimiterror",
@@ -685,6 +765,33 @@ mod quota_tests {
             let value = serde_json::json!({"error":{"message":format!("rate limit {secret}")}});
             assert!(!permanent_provider_error(&value, &secrets));
             assert!(retryable_provider_error(&value, &secrets));
+        }
+    }
+
+    #[test]
+    fn transient_messages_survive_header_collisions_and_secret_echoes() {
+        for message in TRANSIENT_EXAMPLES {
+            let value = serde_json::json!({"error":{"message":message}});
+            let baseline = retryable_provider_error(&value, &[]);
+            assert!(baseline, "fixture must be a Pi transient: {message}");
+            let secrets =
+                provider_error_secrets(Some("sk-provider-billing-secret"), [*message].into_iter());
+            assert!(
+                retryable_provider_error(&value, &secrets),
+                "header collision: {message}"
+            );
+            let echo = serde_json::json!({"error":{"message":format!("{message} sk-provider-billing-secret")}});
+            assert!(
+                retryable_provider_error(&echo, &secrets),
+                "credential echo: {message}"
+            );
+            assert!(
+                !permanent_provider_error(&echo, &secrets),
+                "credential echo: {message}"
+            );
+        }
+        for part in ["rate", "rate:", "limit", "service", "timeout", "server"] {
+            assert!(!should_mask_provider_secret(part), "{part}");
         }
     }
 

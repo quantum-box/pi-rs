@@ -670,6 +670,7 @@ mod tests {
                 true,
             ),
             ("rate---limit", false, false),
+            ("timeout sk-provider-billing-secret", false, true),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -692,6 +693,7 @@ mod tests {
                 headers.insert("x-tenant", "billing".parse().unwrap());
                 headers.insert("x-policy", "quota".parse().unwrap());
                 headers.insert("x-plan", "quota exceeded".parse().unwrap());
+                headers.insert("x-routing", "timeout".parse().unwrap());
                 headers
             });
             let request = ModelRequest {

@@ -1171,7 +1171,7 @@ mod content_tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded sk-provider-billing-secret"} else {"rate limit exceeded sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"}});
+            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded sk-provider-billing-secret"} else {"timeout sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -1183,7 +1183,12 @@ mod content_tests {
                 &format!("http://{address}"),
                 Some("sk-provider-billing-secret".into()),
             )
-            .unwrap();
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-routing", "timeout".parse().unwrap());
+                headers
+            });
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![],
