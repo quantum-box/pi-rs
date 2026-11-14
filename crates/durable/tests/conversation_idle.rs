@@ -275,3 +275,175 @@ async fn follows_terminal_task_anchor_to_recovered_child() {
     drop(wait);
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn conversation_abort_fences_nested_task_entry_and_document_transaction() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        application_entry,
+        document::{Address, Documents, TaskDocuments, Transaction},
+        task::{TaskState, WaitFor},
+        task_scheduler::Handler,
+        task_store::TaskStore,
+    };
+
+    struct Gated {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        address: Address,
+    }
+    impl Handler for Gated {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&self.address).unwrap().unwrap();
+            docs.put(
+                &self.address,
+                json!({"value": "after"}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            docs.append_entry("app.nested", json!("after")).unwrap();
+            self.started.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            Ok(Step::Continue(Checkpoint {
+                phase: "after".into(),
+                data: json!(null),
+            }))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let address = Address {
+        scope: "test".into(),
+        name: "race".into(),
+        key: "".into(),
+    };
+    {
+        let db = Store::open(&path).unwrap();
+        let mut tx = Transaction::new();
+        tx.put(
+            &address,
+            Expected::Missing,
+            json!({"value": "before"}).as_object().unwrap(),
+        )
+        .unwrap();
+        tx.commit(&db).unwrap();
+    }
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let conversation = scheduler.create_conversation(config()).unwrap();
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let checkpoint = Checkpoint {
+        phase: "before".into(),
+        data: json!(null),
+    };
+    let parent = Task::new(
+        parent_id,
+        TaskOwner::Conversation(conversation),
+        checkpoint.clone(),
+        3,
+    )
+    .unwrap()
+    .registered("parent".into(), true);
+    let child = Task::new(child_id, TaskOwner::Task(parent_id), checkpoint.clone(), 3)
+        .unwrap()
+        .registered("child".into(), true);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register_with_abort(
+        "parent",
+        true,
+        move |_: &Task| {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "waiting".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::Tasks(vec![child_id]),
+                children: vec![child.clone()],
+            })
+        },
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    registry.register_with_abort(
+        "child",
+        true,
+        Gated {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            address: address.clone(),
+        },
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    let driver = scheduler.start_tasks(registry).unwrap();
+    driver.submit(&parent).unwrap();
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    // Abort must finish while the handler is still held, before its staged output can commit.
+    let abort = tokio::task::spawn_blocking(move || {
+        let result = scheduler.abort(conversation);
+        (scheduler, result)
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), abort).await;
+    release_tx.send(()).unwrap();
+    let (scheduler, abort_result) = result
+        .expect("abort deadlocked behind nested handler")
+        .unwrap();
+    abort_result.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.wait_for_idle(conversation, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let shutdown = tokio::task::spawn_blocking(move || driver.shutdown());
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let db = Store::open(&path).unwrap();
+    assert!(
+        application_entry::list(&db, conversation)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        Documents::new(&db).get(&address).unwrap().unwrap().value["value"],
+        "before"
+    );
+    let tasks = TaskStore::new(&db);
+    let child = tasks.load(child_id).unwrap().unwrap().task;
+    assert_eq!(child.checkpoint(), &checkpoint);
+    assert_eq!(child.state(), &TaskState::Cancelled);
+    assert!(child.abort_requested());
+    let parent = tasks.load(parent_id).unwrap().unwrap().task;
+    assert_eq!(parent.checkpoint().phase, "waiting");
+    assert_eq!(parent.state(), &TaskState::Cancelled);
+    assert!(parent.abort_requested());
+    drop(db);
+    let reopened = Scheduler::open(&path, options()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reopened.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
