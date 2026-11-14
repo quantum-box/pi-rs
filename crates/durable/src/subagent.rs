@@ -341,6 +341,10 @@ impl Harness {
                 self.anchor_subagent(parent, name)?;
                 return Ok(link);
             }
+            // Abort snapshots the task graph under this gate. Hold it until
+            // the new anchor is committed so the snapshot cannot miss it.
+            let owner = self.owner.clone();
+            let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
             let store = self.subagent_store()?;
             let parent_key = format!("runtime/conversation/{parent}").into_bytes();
             let parent_entry = store.get(&parent_key)?.ok_or(Error::NotFound)?;
@@ -453,6 +457,10 @@ impl Harness {
         use crate::ownership_edge::{self, Edge, Mode};
         use crate::task::{Checkpoint, Task, TaskOwner};
         use crate::task_store::{self, TaskStore};
+        // Serialize anchor creation with abort's task graph snapshot, including
+        // upgrades of reservations created before managed admission.
+        let owner = self.owner.clone();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         let anchor_key = format!("runtime/subagent-anchor/{parent}/{name}").into_bytes();
         loop {
             let link = self.subagent(parent, name)?.ok_or(Error::NotFound)?;

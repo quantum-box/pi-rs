@@ -2927,6 +2927,65 @@ fn managed_anchor_races_background_abort_without_stranding_child() {
 }
 
 #[test]
+fn managed_anchor_creation_waits_for_abort_graph_gate() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let config = Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let parent = h.create_conversation(config.clone()).unwrap();
+        if existing {
+            h.ensure_subagent(parent, "worker", config.clone())
+                .unwrap();
+        }
+        let owner = h.owner.clone();
+        let gate = owner.task_gate().lock().unwrap();
+        let mut worker = h.worker();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = worker.ensure_managed_subagent(parent, "worker", config, None);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        // Model the parent mark committed while abort holds the gate. Admission
+        // must re-read it after acquiring the gate rather than create an anchor.
+        let (mut state, version) = h.load(parent).unwrap();
+        state.abort_requested = true;
+        h.save(&state, Expected::Version(version)).unwrap();
+        drop(gate);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        thread.join().unwrap();
+        assert!(
+            owner
+                .store()
+                .list(format!("runtime/subagent-anchor/{parent}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        if !existing {
+            assert!(h.subagent(parent, "worker").unwrap().is_none());
+        }
+    }
+}
+
+#[test]
 fn managed_anchor_kill_helper() {
     let Ok(path) = std::env::var("PI_RS_ANCHOR_KILL_DB") else {
         return;
