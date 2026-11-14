@@ -10,9 +10,9 @@ pub mod compact;
 pub mod conversation;
 pub mod conversation_signal;
 pub mod document;
-pub mod extension;
 #[allow(dead_code)] // Internal identity binding, not a dispatch API.
 mod executor_handoff;
+pub mod extension;
 pub mod fork;
 #[allow(dead_code)] // Storage foundation; not wired into tool execution yet.
 mod keyed_child;

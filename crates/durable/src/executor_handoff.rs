@@ -326,10 +326,13 @@ mod tests {
         assert!(matches!(checks(&db, &b), Err(Error::Stale)));
         assert!(matches!(prepare_binding(&db, &b), Err(Error::Stale)));
         assert!(matches!(
-            db.commit(&stale, &[Mutation::Put {
-                key: b"replayed-effect".to_vec(),
-                value: vec![1],
-            }]),
+            db.commit(
+                &stale,
+                &[Mutation::Put {
+                    key: b"replayed-effect".to_vec(),
+                    value: vec![1],
+                }]
+            ),
             Err(durable_store::Error::Conflict { .. })
         ));
         assert!(db.get(b"replayed-effect").unwrap().is_none());
@@ -395,10 +398,13 @@ mod tests {
                 assert!(task.attempt_id().is_some());
                 let db = Store::open(&reader_path).unwrap();
                 assert!(matches!(
-                    db.commit(&stale, &[Mutation::Put {
-                        key: b"old-effect".to_vec(),
-                        value: vec![1],
-                    }]),
+                    db.commit(
+                        &stale,
+                        &[Mutation::Put {
+                            key: b"old-effect".to_vec(),
+                            value: vec![1],
+                        }]
+                    ),
                     Err(durable_store::Error::Conflict { .. })
                 ));
                 assert!(db.get(b"old-effect").unwrap().is_none());
