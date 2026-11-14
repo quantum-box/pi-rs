@@ -161,15 +161,15 @@ async fn scheduler_executes_and_replays_lost_settlement_ack() {
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Completed { .. }));
     assert!(snap.operation.attempts()[0].settled);
-    let calls = model.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].1, session);
-    let settlements = model.settlements.lock().unwrap();
-    assert_eq!(settlements.len(), 2);
-    assert_eq!(settlements[0], settlements[1]);
-    assert!(matches!(settlements[0].1, UsageReport::Measured { .. }));
-    drop(settlements);
-    drop(calls);
+    {
+        let calls = model.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, session);
+        let settlements = model.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 2);
+        assert_eq!(settlements[0], settlements[1]);
+        assert!(matches!(settlements[0].1, UsageReport::Measured { .. }));
+    }
     scheduler.shutdown().await.unwrap();
 }
 
@@ -244,11 +244,12 @@ async fn abort_during_settlement_replays_measured_receipt() {
         state(&scheduler, id).operation.state(),
         State::Aborted
     ));
-    let reports = model.settlements.lock().unwrap();
-    assert_eq!(reports.len(), 2);
-    assert_eq!(reports[0], reports[1]);
-    assert!(matches!(reports[0].1, UsageReport::Measured { .. }));
-    drop(reports);
+    {
+        let reports = model.settlements.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0], reports[1]);
+        assert!(matches!(reports[0].1, UsageReport::Measured { .. }));
+    }
     scheduler.shutdown().await.unwrap();
 }
 
@@ -285,10 +286,11 @@ async fn interrupted_abort_cleanup_resumes_after_reopen() {
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Aborted));
     assert!(snap.operation.attempts()[0].settled);
-    let reports = model.settlements.lock().unwrap();
-    assert_eq!(reports.len(), 2);
-    assert_eq!(reports[0], reports[1]);
-    drop(reports);
+    {
+        let reports = model.settlements.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0], reports[1]);
+    }
     scheduler.shutdown().await.unwrap();
 }
 
