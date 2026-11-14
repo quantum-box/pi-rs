@@ -781,12 +781,40 @@ mod jsonl_framing_tests {
                 "[\n1",
                 "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 2)",
             ),
+            (
+                "\"😺\\ntext",
+                "Unterminated string in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                "\"a\\\\",
+                "Unterminated string in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "[\r\n1",
+                "Expected ',' or ']' after array element in JSON at position 4 (line 2 column 2)",
+            ),
+            (
+                "[\r1",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 2)",
+            ),
+            (
+                "[1\r",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 1)",
+            ),
         ] {
             let error = parse_request(input).unwrap_err().to_string();
             assert!(
                 error.contains(&format!("Failed to parse command: {expected}")),
                 "{input:?}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn unfinished_escapes_keep_native_diagnostic() {
+        for input in ["\"a\\", "\"a\\u12"] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(super::rpc_json_error(input, &error), error.to_string());
         }
     }
 }
@@ -807,12 +835,15 @@ fn parse_request(line: &str) -> Result<Value> {
 // Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
-    if !error.is_eof() || line.contains('\r') {
+    if !error.is_eof() {
         return error.to_string();
     }
     let message = error.to_string();
-    let tail = line.trim_end_matches([' ', '\t', '\n']);
-    let reason = if message.starts_with("EOF while parsing a string") && !line.contains('\\') {
+    let tail = line.trim_end_matches([' ', '\t', '\n', '\r']);
+    // Only map complete escapes: a dangling backslash or partial Unicode escape
+    // has a different V8 diagnostic and is left to serde for now.
+    let reason = if message.starts_with("EOF while parsing a string") && complete_json_escapes(line)
+    {
         Some("Unterminated string in JSON")
     } else if message.starts_with("EOF while parsing a list") {
         if tail.ends_with('[') {
@@ -837,9 +868,12 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     match reason {
         Some(reason) => {
             let position = line.encode_utf16().count();
-            let row = line.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let row = line.bytes().filter(|byte| *byte == b'\r').count()
+                + line.bytes().filter(|byte| *byte == b'\n').count()
+                - line.matches("\r\n").count()
+                + 1;
             let column = line
-                .rsplit('\n')
+                .rsplit(['\r', '\n'])
                 .next()
                 .unwrap_or_default()
                 .encode_utf16()
@@ -849,6 +883,29 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+fn complete_json_escapes(line: &str) -> bool {
+    let mut chars = line.chars();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => match chars.next() {
+                None => return false,
+                Some('u') => {
+                    for _ in 0..4 {
+                        if chars.next().is_none() {
+                            return false;
+                        }
+                    }
+                }
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    true
 }
 
 fn requires_idle(name: &str) -> bool {
