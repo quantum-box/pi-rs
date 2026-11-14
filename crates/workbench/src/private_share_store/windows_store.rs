@@ -491,4 +491,39 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn failed_invalidation_never_polls_initializer() {
+        use std::{
+            cell::Cell,
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let root = std::env::temp_dir().join(format!("pi-share-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let binding = Binding {
+            session_id: uuid::Uuid::new_v4(),
+            head: 1,
+            journal_digest: [7; 32],
+            provenance_digest: [8; 32],
+        };
+        let anchor = name_for(&store.key, &path, binding.session_id, "anchor").unwrap();
+        std::fs::create_dir(root.join("share-context-anchors-v1").join(anchor)).unwrap();
+        let initialized = Cell::new(false);
+        let mut future = Box::pin(store.begin_and_initialize(&path, binding, || async {
+            initialized.set(true);
+            Ok(())
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        drop(future);
+        assert!(!initialized.get());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
