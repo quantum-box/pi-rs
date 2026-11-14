@@ -1233,8 +1233,11 @@ explicit file arguments retain ripgrep's matching behavior. Directory results
 use Pi's slash-normalized relative paths and its basename fallback for paths
 starting with `..`; a single-file result retains the requested basename.
 The scoped native profile intentionally keeps its workspace-relative glob
-interpretation. Offline fixtures compare these cases with Pi's pinned ripgrep
-invocation, including filenames containing a literal backslash on Unix.
+interpretation. On Unix, scoped `grep` preserves literal backslashes in file
+names so its results can be passed to `read`; unrestricted Pi-compatible grep
+normalizes them as Pi does. Both profiles normalize Windows path separators.
+Offline fixtures compare these cases with Pi's pinned ripgrep invocation and
+exercise `grep`-to-`read` for a Unix filename containing a backslash.
 
 ### Published native package checkpoint
 

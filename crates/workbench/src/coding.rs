@@ -2738,8 +2738,10 @@ impl CodingTool {
                         let relative = relative.to_string_lossy();
                         if self.unrestricted && relative.starts_with("..") {
                             entry.file_name().to_string_lossy().into_owned().into()
-                        } else {
+                        } else if self.unrestricted || cfg!(windows) {
                             std::borrow::Cow::Owned(relative.replace('\\', "/"))
+                        } else {
+                            relative
                         }
                     },
                     std::borrow::Cow::from,
@@ -5373,7 +5375,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("name\\part.txt"), "needle\n").unwrap();
         let tool = CodingTool {
-            unrestricted: false,
+            unrestricted: true,
             shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Grep,

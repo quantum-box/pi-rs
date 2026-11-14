@@ -28,6 +28,30 @@ fn context() -> ToolContext {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_grep_path_with_literal_backslash_can_be_read() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("nested")).unwrap();
+    std::fs::write(directory.path().join("nested/name\\part.txt"), "needle\n").unwrap();
+    let scoped = CodingTools::new(directory.path()).unwrap();
+    let tools = read_only_tools_from(&scoped).unwrap().tools();
+    let grep = tools
+        .iter()
+        .find(|tool| tool.spec().name == "grep")
+        .unwrap();
+    let read = tools
+        .iter()
+        .find(|tool| tool.spec().name == "read")
+        .unwrap();
+    let result = grep.invoke(json!({"pattern":"needle"}), context()).await;
+    let output = result.tool_content();
+    assert_eq!(output, "nested/name\\part.txt:1: needle");
+    let path = output.strip_suffix(":1: needle").unwrap();
+    assert!(matches!(read.invoke(json!({"path":path}), context()).await,
+        Outcome::Succeeded(text) if text == "needle\n"));
+}
+
 #[test]
 fn factory_sets_match_pi_and_register_without_extra_tools() {
     let directory = tempfile::tempdir().unwrap();
