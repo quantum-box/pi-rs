@@ -31,10 +31,11 @@ request approaches it. Older committed snapshots remain in the observation
 log. `history` and `watch_history` read or poll from an exclusive cursor; slow
 consumers can reconnect. Snapshot records are stored atomically with state
 transitions. History produced before the observation log was introduced is not
-backfilled. The separate `task_store` exposes persisted task state, timers,
-signals and child waits to hosts, but those generic tasks are not scheduled by
-`runtime::Scheduler` yet. A separate, explicitly ticked generic task scheduler
-provides registered handlers, timers, signals, and direct-child waits.
+backfilled. `Scheduler::start_tasks` attaches a background generic task driver
+to the same owner; registered synchronous handlers, timers, signals, and
+direct-child waits use persistent task state. Hosts must register definitions
+again after reopening. `reset` preserves older observation records and can
+carry handoff text; it currently requires an idle conversation with no queue.
 
 Nested tool calls are journaled by parent operation and call order. A replayed
 parent reuses completed child results, while unsafe interrupted children block
@@ -47,7 +48,11 @@ Current limits and differences from upstream Pi Durable:
   Automatic compaction requires a known context window; provider overflow retry
   and concurrent compaction remain unsupported. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
-  There is no built-in subagent or integrated generic task graph.
+  There is no built-in subagent or automatic conversation/task ownership tree.
+- Generic task waits support one deadline, one signal, or all direct children;
+  any/fail-fast joins, combined waits, abort handlers and child cancellation
+  propagation are not yet implemented. Handler steps run synchronously and
+  shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model errors use a fixed retry delay. There is no flow control.
 - The scheduler retains scheduled join handles until `wait` or `shutdown`;

@@ -292,3 +292,42 @@ async fn automatic_compaction_scales_retention_to_small_context() {
             .any(|m| matches!(m,Message::User{content} if content.contains("short summary")))
     );
 }
+
+#[tokio::test]
+async fn idle_reset_preserves_observed_history_and_uses_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let path = dir.path().join("db");
+    let id;
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old task".into(), &cancel)
+            .await
+            .unwrap();
+        h.reset(id, Some("new handoff".into())).unwrap();
+    }
+    let h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.messages,
+        vec![Message::User {
+            content: "new handoff".into()
+        }]
+    );
+    assert_eq!(c.resets.len(), 1);
+    let page = h
+        .history(id, Cursor(0), NonZeroUsize::new(1000).unwrap())
+        .unwrap();
+    assert!(
+        page.records
+            .iter()
+            .any(|r| r.value.to_string().contains("old task"))
+    );
+}

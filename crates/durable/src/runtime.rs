@@ -44,6 +44,8 @@ pub enum Error {
     Progress(#[from] crate::progress::Error),
     #[error("fork: {0}")]
     Fork(#[from] crate::fork::Error),
+    #[error("task scheduler: {0}")]
+    TaskScheduler(#[from] crate::task_scheduler::Error),
     #[error("model: {0}")]
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
@@ -184,6 +186,8 @@ pub struct Conversation {
     #[serde(default)]
     pub aborted_generations: Vec<AbortedGeneration>,
     #[serde(default)]
+    pub resets: Vec<crate::reset::Reset>,
+    #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
     #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
@@ -309,7 +313,7 @@ impl Harness {
         let mut expected = expected;
         loop {
             let value = serde_json::to_vec(&state)?;
-            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations});
+            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets});
             let append = crate::observer::Observer::new(self.owner.store(), state.id)
                 .prepare_append(&event)?;
             let fork_key =
@@ -418,6 +422,7 @@ impl Harness {
             messages: vec![],
             submissions: vec![],
             aborted_generations: vec![],
+            resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
@@ -472,6 +477,7 @@ impl Harness {
             messages: point.messages,
             submissions: vec![],
             aborted_generations: vec![],
+            resets: vec![],
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
@@ -485,6 +491,31 @@ impl Harness {
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
     }
+    /// Attach one generic task scheduler to the same locked store. Its owner
+    /// guard survives this handle; callers explicitly drive its ticks.
+    pub fn attach_tasks(
+        &self,
+        registry: crate::task_scheduler::Registry,
+    ) -> Result<crate::task_scheduler::Scheduler, Error> {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        Ok(crate::task_scheduler::Scheduler::attach(
+            self.owner.clone(),
+            registry,
+        )?)
+    }
+    pub fn start_tasks(
+        &self,
+        registry: crate::task_scheduler::Registry,
+    ) -> Result<crate::task_driver::Driver, Error> {
+        Ok(crate::task_driver::Driver::start(
+            self.attach_tasks(registry)?,
+        ))
+    }
     /// Read committed snapshots after a cursor. Earlier cursors may be
     /// resumed; snapshots are retained independently of model context.
     pub fn history(
@@ -495,6 +526,28 @@ impl Harness {
     ) -> Result<crate::observer::Page, Error> {
         self.load(id)?;
         Ok(crate::observer::Observer::new(self.owner.store(), id).read(after, limit)?)
+    }
+    /// Reset model context without deleting prior committed snapshots. The
+    /// current implementation accepts resets only while no work is queued.
+    pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
+        let (mut state, version) = self.load(id)?;
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            || state.active.is_some()
+            || state.submissions.iter().any(|s| s.status == Status::Queued)
+        {
+            return Err(Error::Invalid(
+                "reset requires an idle conversation with no queued input".into(),
+            ));
+        }
+        let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
+        state.messages.clear();
+        if let Some(message) = marker.message() {
+            state.messages.push(message);
+        }
+        state.resets.push(marker.clone());
+        state.phase = Phase::Idle;
+        self.save(&state, Expected::Version(version))?;
+        Ok(marker.id)
     }
     pub async fn watch_history(
         &self,
@@ -1458,6 +1511,18 @@ impl Scheduler {
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
     }
+    pub fn attach_tasks(
+        &self,
+        registry: crate::task_scheduler::Registry,
+    ) -> Result<crate::task_scheduler::Scheduler, Error> {
+        self.harness.attach_tasks(registry)
+    }
+    pub fn start_tasks(
+        &self,
+        registry: crate::task_scheduler::Registry,
+    ) -> Result<crate::task_driver::Driver, Error> {
+        self.harness.start_tasks(registry)
+    }
     pub fn history(
         &self,
         id: Uuid,
@@ -1465,6 +1530,9 @@ impl Scheduler {
         limit: std::num::NonZeroUsize,
     ) -> Result<crate::observer::Page, Error> {
         self.harness.history(id, after, limit)
+    }
+    pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
+        self.harness.reset(id, handoff)
     }
     pub async fn watch_history(
         &self,
@@ -1746,6 +1814,7 @@ mod scheduler_tests {
             messages: vec![],
             submissions: vec![],
             aborted_generations: vec![],
+            resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
