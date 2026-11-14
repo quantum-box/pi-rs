@@ -69,6 +69,17 @@ direct-child waits use persistent task state. Hosts must register definitions
 again after reopening. `reset` preserves older observation records and can
 carry handoff text; busy resets are queued until a safe boundary.
 
+For a finite catch-up on the standalone `observer::Observer`, capture `head()`
+and page with `read_through(processed, head, limit)`, persisting both cursors
+after processing. The boundary remains fixed across later appends and reopening;
+when `has_more` is false, the existing `watch` can resume at `next` without a
+gap. Cursors are scoped to the same stream and store, and the observer namespace
+must remain append-only. Each record is returned whole, but record bytes and log
+retention are unbounded. This is a fixed range of explicitly logged records, not
+an atomic view attachment or a replacement for upstream's watch frames; progress
+and commits omitted from the observer log remain absent. The higher-level
+`history` and `watch_history` APIs are unchanged.
+
 `Harness::view` and `Scheduler::view` capture conversation metadata, the
 committed running model/compaction progress checkpoint, the current tool attempt’s
 committed replacement partial, and a newest-first

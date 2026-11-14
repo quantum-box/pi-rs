@@ -44,6 +44,14 @@ intermediate commits. Unlike upstream's [watch](https://github.com/earendil-work
 and does not end when its originating handle closes. See the durable README for
 ownership, cancellation, memory and persistence limitations.
 
+**Observer reconnect checkpoint:** The standalone observer can capture `head`
+and use `read_through` to replay complete logged records through that fixed
+cursor in bounded pages, then hand off to `watch` at the last processed cursor.
+Later appends do not extend the catch-up, and the boundary can be reused after
+reopening. This does not atomically attach a conversation or document view,
+produce Chord operations, or include changes absent from the observer log; record
+bytes and retained history are unbounded. Compare upstream's [watch contract](https://github.com/earendil-works/pi/blob/17d6ca759a070c377147f6d76b72dab9a3ba42a3/packages/durable/docs/spec.md).
+
 **Subsequent checkpoint:** Busy reset queues at safe boundaries, provider-overflow compaction and persisted bounded exponential retry were added. A host can attach a background generic task driver to the conversation store, with direct-child all/any/fail-fast waits and local descendant cancellation. A persistent subagent link can resume child admission. Task lifecycle/abort ownership is not yet integrated with conversation execution, reset ordering and tool handoff are incomplete, and subagent links do not yet supply automatic answer reporting or ownership-aware abort.
 
 **Latest checkpoint:** Subagent completion can now be reported automatically to its parent, and reporter-driven conversations continue polling pending tools. Named child status is available as a read-only Rust API, including reservations and queued work; it is not a model-facing management tool. Automatic child tool restriction and background anchor ownership for named links are still missing. Queued submissions can be withdrawn. Conversation extension selections, prompt sections, extension-provided tools, before/after-tool hooks and selected generation hooks are supported; the scheduler can preload an extension registry before automatic recovery. The remaining hooks and hook-created tasks are not yet integrated. Task sleeps can wait for a deadline or any named signal. Subagent cancellation is not yet an ownership-aware cascade. Later checkpoints and the table below supersede earlier statements where they differ.

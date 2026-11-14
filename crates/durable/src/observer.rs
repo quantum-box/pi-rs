@@ -37,7 +37,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("invalid or inconsistent observer history")]
     Corrupt,
-    #[error("cursor is beyond the current stream head")]
+    #[error("cursor is beyond the current stream head or replay boundary")]
     FutureCursor,
     #[error("observer sequence exhausted")]
     SequenceExhausted,
@@ -93,6 +93,55 @@ pub struct Observer<'a> {
 impl<'a> Observer<'a> {
     pub fn new(store: &'a Store, stream: Uuid) -> Self {
         Self { store, stream }
+    }
+
+    /// Capture the current committed head for a finite reconnect catch-up.
+    /// Persist this stream-scoped cursor together with the processing cursor if
+    /// the same catch-up must survive reopening.
+    pub fn head(&self) -> Result<Cursor, Error> {
+        Ok(Cursor(
+            self.store
+                .get(&head_key(self.stream))?
+                .map(|entry| decode_head(&entry.value))
+                .transpose()?
+                .unwrap_or(0),
+        ))
+    }
+
+    /// Read complete records after `after`, stopping at the captured `through`
+    /// cursor even if later records have been committed. `has_more` describes
+    /// this bounded range; once false, resume `watch` from `next`.
+    pub fn read_through(
+        &self,
+        after: Cursor,
+        through: Cursor,
+        limit: NonZeroUsize,
+    ) -> Result<Page, Error> {
+        if after.0 > through.0 {
+            return Err(Error::FutureCursor);
+        }
+        if through.0 > self.head()?.0 {
+            return Err(Error::FutureCursor);
+        }
+        // Never fetch records beyond the captured boundary, except read's
+        // single lookahead. This also avoids converting an unbounded u64 to usize.
+        let remaining = through.0 - after.0;
+        if remaining == 0 {
+            return Ok(Page {
+                records: Vec::new(),
+                next: after,
+                has_more: false,
+            });
+        }
+        let count = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(limit.get());
+        let mut page = self.read(
+            after,
+            NonZeroUsize::new(count).expect("remaining is nonzero"),
+        )?;
+        page.has_more = page.next.0 < through.0;
+        Ok(page)
     }
 
     /// Prepare one record. Commit these checks and mutations together, without
@@ -276,6 +325,65 @@ mod tests {
         assert!(o.read(p.next, limit(1)).unwrap().records.is_empty());
         assert!(matches!(
             o.read(Cursor(4), limit(1)),
+            Err(Error::FutureCursor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_replay_survives_reopen_and_hands_off_to_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.db");
+        let id = Uuid::from_u128(7);
+        let boundary;
+        let first;
+        {
+            let db = Store::open(&path).unwrap();
+            let o = Observer::new(&db, id);
+            assert_eq!(o.head().unwrap(), Cursor(0));
+            assert!(
+                !o.read_through(Cursor(0), Cursor(0), limit(1))
+                    .unwrap()
+                    .has_more
+            );
+            for n in 1..=3 {
+                append(&o, json!(n));
+            }
+            boundary = o.head().unwrap();
+            first = o.read_through(Cursor(0), boundary, limit(1)).unwrap();
+            assert_eq!(first.records[0].value, json!(1));
+            assert!(first.has_more);
+            append(&o, json!(4));
+        }
+        let db = Store::open(&path).unwrap();
+        let o = Observer::new(&db, id);
+        append(&o, json!(5));
+        let rest = o.read_through(first.next, boundary, limit(10)).unwrap();
+        assert_eq!(
+            rest.records
+                .iter()
+                .map(|r| r.value.clone())
+                .collect::<Vec<_>>(),
+            vec![json!(2), json!(3)]
+        );
+        assert_eq!(rest.next, boundary);
+        assert!(!rest.has_more);
+        let live = o
+            .watch(rest.next, limit(10), Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            live.records
+                .iter()
+                .map(|r| r.value.clone())
+                .collect::<Vec<_>>(),
+            vec![json!(4), json!(5)]
+        );
+        assert!(matches!(
+            o.read_through(Cursor(4), boundary, limit(1)),
+            Err(Error::FutureCursor)
+        ));
+        assert!(matches!(
+            o.read_through(Cursor(0), Cursor(6), limit(1)),
             Err(Error::FutureCursor)
         ));
     }
