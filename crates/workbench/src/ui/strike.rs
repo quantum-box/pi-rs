@@ -220,6 +220,7 @@ fn token_nodes(
     offsets: &[usize],
     whole: &str,
     run_start: usize,
+    cell_end: Option<usize>,
 ) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
@@ -256,7 +257,7 @@ fn token_nodes(
                 .iter()
                 .map(|offset| offsets.get(cursor + offset).copied())
                 .collect::<Option<Vec<_>>>()?;
-            token_nodes(children, text, &child_offsets, whole, run_start)
+            token_nodes(children, text, &child_offsets, whole, run_start, cell_end)
         };
         let group = match kind {
             "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
@@ -270,7 +271,7 @@ fn token_nodes(
                 if !raw.starts_with('[') && !raw.starts_with('<') {
                     let absolute_start = span.start;
                     let absolute_end = span.end;
-                    let tail = whole.get(absolute_end..)?;
+                    let tail = whole.get(absolute_end..cell_end.unwrap_or(whole.len()))?;
                     let extra = tail.char_indices().nth(2).map_or(tail.len(), |(i, _)| i);
                     let candidate = whole.get(absolute_start..absolute_end + extra)?;
                     let safe = super::render::bare_links(candidate)
@@ -338,7 +339,80 @@ fn token_nodes(
     (cursor == source.len()).then_some(result)
 }
 
-fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: bool) -> Vec<Node> {
+#[derive(Clone, Copy)]
+enum Container {
+    Quote,
+    Item(usize),
+}
+
+// Marked's block lexer removes container prefixes before inline lexing. Keep
+// byte boundaries into the original document for rendering and link guards.
+fn normalize_continuations(source: &str, containers: &[Container]) -> (String, Vec<usize>) {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        out.push(ch);
+        i += 1;
+        offsets.push(i);
+        if ch == b'\n' {
+            for container in containers {
+                match *container {
+                    Container::Quote => {
+                        let begin = i;
+                        while i < bytes.len() && i - begin < 3 && bytes[i] == b' ' {
+                            i += 1;
+                        }
+                        if bytes.get(i) == Some(&b'>') {
+                            i += 1;
+                            if bytes.get(i) == Some(&b' ') {
+                                i += 1;
+                            }
+                        } else {
+                            i = begin;
+                        }
+                    }
+                    Container::Item(indent) => {
+                        let begin = i;
+                        while i < bytes.len() && i - begin < indent && bytes[i] == b' ' {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            *offsets.last_mut().expect("newline boundary") = i;
+        }
+    }
+    (
+        String::from_utf8(out).expect("only ASCII prefixes removed"),
+        offsets,
+    )
+}
+
+fn item_indent(original: &str, start: usize) -> Option<usize> {
+    let line = original.get(start..)?.split('\n').next()?.as_bytes();
+    let marker = if matches!(line.first(), Some(b'-' | b'+' | b'*')) {
+        1
+    } else {
+        let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || !matches!(line.get(digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    };
+    let spaces = line[marker..].iter().take_while(|b| **b == b' ').count();
+    (spaces > 0).then_some(marker + spaces.min(4))
+}
+
+fn inline_run(
+    nodes: Vec<Node>,
+    original: &str,
+    refs: &RefDefs<'_>,
+    cell_end: Option<usize>,
+    containers: &[Container],
+) -> Vec<Node> {
     let Some(first) = nodes.first() else {
         return nodes;
     };
@@ -356,10 +430,12 @@ fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: 
     }
     // Marked's block table lexer removes a backslash before each pipe before
     // handing a cell to its inline lexer, including inside code spans.
-    let (source, offsets) = if table_cell {
-        unescape_with_offsets(source, b"|")
+    let (source, offsets) = normalize_continuations(source, containers);
+    let (source, offsets) = if cell_end.is_some() {
+        let (source, mapped) = unescape_with_offsets(&source, b"|");
+        (source, mapped.into_iter().map(|i| offsets[i]).collect())
     } else {
-        (source.to_owned(), (0..=source.len()).collect())
+        (source, offsets)
     };
     let offsets: Vec<usize> = offsets.into_iter().map(|offset| start + offset).collect();
     let tokens = LEXER.with(|lexer| {
@@ -369,10 +445,16 @@ fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: 
             .and_then(|lexer| lexer.tokens(&source, refs))
     });
     tokens
-        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start))
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end))
         .unwrap_or(nodes)
 }
-fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: bool) -> Vec<Node> {
+fn rewrite(
+    nodes: Vec<Node>,
+    original: &str,
+    refs: &RefDefs<'_>,
+    cell_end: Option<usize>,
+    containers: &[Container],
+) -> Vec<Node> {
     let mut result = Vec::new();
     let mut inline = Vec::new();
     for node in nodes {
@@ -383,7 +465,8 @@ fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: boo
                 std::mem::take(&mut inline),
                 original,
                 refs,
-                table_cell,
+                cell_end,
+                containers,
             ));
             let node = match node {
                 Node::Group {
@@ -391,11 +474,30 @@ fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: boo
                     children,
                     end,
                 } if !matches!(start.0, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)) => {
-                    let child_table_cell =
-                        table_cell || matches!(start.0, Event::Start(Tag::TableCell));
+                    let child_cell_end = if matches!(start.0, Event::Start(Tag::TableCell)) {
+                        Some(start.1.end)
+                    } else {
+                        cell_end
+                    };
+                    let mut child_containers = containers.to_vec();
+                    match start.0 {
+                        Event::Start(Tag::BlockQuote(_)) => child_containers.push(Container::Quote),
+                        Event::Start(Tag::Item) => {
+                            if let Some(indent) = item_indent(original, start.1.start) {
+                                child_containers.push(Container::Item(indent));
+                            }
+                        }
+                        _ => {}
+                    }
                     Node::Group {
                         start,
-                        children: rewrite(children, original, refs, child_table_cell),
+                        children: rewrite(
+                            children,
+                            original,
+                            refs,
+                            child_cell_end,
+                            &child_containers,
+                        ),
                         end,
                     }
                 }
@@ -404,7 +506,7 @@ fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: boo
             result.push(node);
         }
     }
-    result.extend(inline_run(inline, original, refs, table_cell));
+    result.extend(inline_run(inline, original, refs, cell_end, containers));
     result
 }
 
@@ -425,7 +527,8 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
         ),
         original,
         references.reference_definitions(),
-        false,
+        None,
+        &[],
     );
     let mut output = Vec::new();
     for node in nodes {

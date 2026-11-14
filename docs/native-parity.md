@@ -817,7 +817,8 @@ wrap cells, and use a stacked layout when a terminal cannot fit the columns.
 Link destinations and strikethrough formatting are rendered. Single-tilde
 pairs remain literal. Inline runs containing double tildes use the pinned Pi
 Marked lexer and its strict deletion tokenizer, including escaped delimiters,
-code-span crossings, and inline or reference link destinations. The lexer is
+code-span crossings, list continuation indentation, table cell boundaries, and
+inline or reference link destinations. The lexer is
 resource bounded across the entire terminal frame, including reference-definition
 preparation; oversized documents, runs or reference sets fall back without
 strikethrough.

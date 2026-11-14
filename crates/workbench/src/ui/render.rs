@@ -1781,6 +1781,53 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 mod tests {
     use super::*;
     #[test]
+    fn marked_strike_normalizes_list_and_quote_continuations() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("- ~~`a\n  b`~~", "a b"),
+            ("- ~~`a\n    b`~~", "a   b"),
+            ("> - ~~`a\n>   b`~~", "a b"),
+            ("1. ~~`a\n   b`~~", "a b"),
+            ("- outer\n  - ~~`a\n    b`~~", "a b"),
+        ] {
+            let lines = markdown(source, &theme, 120);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text == expected && span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_table_autolink_does_not_consume_next_cell() {
+        let theme = Theme::system();
+        for source in [
+            "| a | b |\n|---|---|\n|https://example.com|keep|\n| ~~x~~ | y |",
+            "| a | b |\n|---|---|\n|https://example.com ~~x~~|keep|",
+            "| a | b |\n|---|---|\n|~~https://example.com~~|keep|",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                120,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+    #[test]
     fn marked_strike_keeps_bare_and_angle_autolinks() {
         let theme = Theme::system();
         for source in [
