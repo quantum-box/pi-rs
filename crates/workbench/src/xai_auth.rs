@@ -564,6 +564,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostic_unread_request_after_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 2048];
+            assert!(socket.read(&mut bytes[..1]).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body =
+                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, serde_json::json!({"xai":{"type":"oauth","access":"old","refresh":"old-refresh","expires":1}}).to_string()).unwrap();
+        let service = Service {
+            host: Url::parse(&origin).unwrap(),
+            client: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        };
+        let task = tokio::spawn(access_at(path.clone(), service, None, false));
+        started_rx.await.unwrap();
+        task.abort();
+        reply_tx.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if saved["xai"]["refresh"] == "new-refresh" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_refresh_neither_retries_nor_changes_saved_credentials() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}/", listener.local_addr().unwrap());

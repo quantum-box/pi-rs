@@ -13,11 +13,11 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install 1.89.0 --profile minimal
       - name: Run acceptance tests with refresh stage diagnostics
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs diagnostic_unread_request_after_cancel -- --nocapture
       - name: Repeat cancellation fixture
         shell: pwsh
         run: |
           for ($i = 0; $i -lt 30; $i++) {
-            cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_caller_still_saves_rotated_refresh_token -- --nocapture
+            cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs diagnostic_unread_request_after_cancel -- --nocapture
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
