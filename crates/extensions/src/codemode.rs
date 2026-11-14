@@ -25,17 +25,103 @@ const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
 const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
 
-async fn acquire_worker<'a>(
-    workers: &'a tokio::sync::Semaphore,
+// Resizing never revokes a running worker. Excess permits are retired when
+// they become available, including when a running worker releases its slot.
+struct WorkerPool {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    admission: tokio::sync::Mutex<()>,
+    capacity: Mutex<usize>,
+    limit: Box<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl WorkerPool {
+    fn new(limit: impl Fn() -> usize + Send + Sync + 'static) -> Arc<Self> {
+        let capacity = limit();
+        Arc::new(Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            admission: tokio::sync::Mutex::new(()),
+            capacity: Mutex::new(capacity),
+            limit: Box::new(limit),
+        })
+    }
+
+    fn resize(&self) {
+        let mut capacity = self.capacity.lock().expect("worker capacity");
+        let limit = (self.limit)();
+        if limit > *capacity {
+            self.semaphore.add_permits(limit - *capacity);
+            *capacity = limit;
+        } else {
+            while *capacity > limit {
+                let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                    break;
+                };
+                permit.forget();
+                *capacity -= 1;
+            }
+        }
+    }
+}
+
+struct WorkerPermit {
+    pool: Arc<WorkerPool>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        let mut capacity = self.pool.capacity.lock().expect("worker capacity");
+        let limit = (self.pool.limit)();
+        if *capacity > limit {
+            self.permit.take().expect("worker permit").forget();
+            *capacity -= 1;
+        } else {
+            drop(self.permit.take());
+        }
+        drop(capacity);
+        self.pool.resize();
+    }
+}
+
+fn worker_limit() -> usize {
+    std::env::var("PI_CODEMODE_MAX_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0 && *value <= 1024)
+        .unwrap_or(2)
+}
+
+async fn acquire_worker(
+    workers: &Arc<WorkerPool>,
     cancellation: &pi_rs_core::CancellationToken,
     deadline: Option<Duration>,
     wait_limit: Duration,
-) -> Result<tokio::sync::SemaphorePermit<'a>, &'static str> {
+) -> Result<WorkerPermit, &'static str> {
+    workers.resize();
     let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
+    let acquire = async {
+        // Keep the first waiter in front even when it must retire an excess
+        // permit returned after a concurrent cancellation.
+        let _turn = workers.admission.lock().await;
+        loop {
+            let permit = workers.semaphore.clone().acquire_owned().await?;
+            let permit = WorkerPermit {
+                pool: workers.clone(),
+                permit: Some(permit),
+            };
+            // A cancelled waiter can return a granted semaphore permit after a
+            // shrink. Retire that excess before it starts another worker.
+            let excess = *workers.capacity.lock().expect("worker capacity") > (workers.limit)();
+            if !excess {
+                return Ok::<_, tokio::sync::AcquireError>(permit);
+            }
+            drop(permit);
+        }
+    };
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err("Script cancelled while waiting for a worker"),
-        result = tokio::time::timeout(wait, workers.acquire()) => match result {
+        result = tokio::time::timeout(wait, acquire) => match result {
             Ok(Ok(permit)) => Ok(permit),
             Ok(Err(_)) => Err("Codemode worker pool closed"),
             Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err("Script timed out while waiting for a codemode worker"),
@@ -177,15 +263,8 @@ impl Tool for ScriptTool {
         if previous.is_some_and(|state| state.version != 1 || !state.data.is_object()) {
             return Outcome::Failed("invalid codemode store state".into()).into();
         }
-        static WORKERS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-        let workers = WORKERS.get_or_init(|| {
-            let maximum = std::env::var("PI_CODEMODE_MAX_WORKERS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0 && *value <= 1024)
-                .unwrap_or(2);
-            tokio::sync::Semaphore::new(maximum)
-        });
+        static WORKERS: OnceLock<Arc<WorkerPool>> = OnceLock::new();
+        let workers = WORKERS.get_or_init(|| WorkerPool::new(worker_limit));
         let admission_deadline = match options.timeout {
             Some(timeout) => match timeout
                 .checked_sub(started.elapsed())
@@ -1225,8 +1304,8 @@ mod tests {
     #[tokio::test]
     async fn worker_admission_is_bounded_and_cancellable_without_leaking_permits() {
         assert_eq!(WORKER_WAIT_LIMIT, Duration::from_secs(60));
-        let workers = tokio::sync::Semaphore::new(1);
-        let held = workers.acquire().await.unwrap();
+        let workers = WorkerPool::new(|| 1);
+        let held = workers.semaphore.clone().acquire_owned().await.unwrap();
         let cancellation = pi_rs_core::CancellationToken::new();
         let short = Duration::from_millis(10);
         let overall = Duration::from_secs(5);
@@ -1253,13 +1332,85 @@ mod tests {
         let result = tokio::time::timeout(overall, waiting).await.unwrap();
         assert!(matches!(result, Err(error) if error.contains("cancelled")));
         drop(held);
-        assert_eq!(workers.available_permits(), 1);
+        assert_eq!(workers.semaphore.available_permits(), 1);
         let fresh = pi_rs_core::CancellationToken::new();
         assert!(
             acquire_worker(&workers, &fresh, None, overall)
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn worker_limit_changes_apply_without_revoking_running_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(1);
+        let first = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        limit.store(2, Ordering::SeqCst);
+        let second = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        limit.store(1, Ordering::SeqCst);
+        let third = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(second);
+        let third = third.await.unwrap();
+        drop(third);
+        assert_eq!(workers.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn resized_workers_preserve_waiter_order_and_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let cancelled = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(2);
+        let held = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        let first = acquire_worker(&workers, &cancelled, None, wait);
+        let second = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(first, second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second)
+                .await
+                .is_err()
+        );
+        cancelled.cancel();
+        assert!(first.await.is_err());
+        limit.store(2, Ordering::SeqCst);
+        // A later admission triggers resizing and must not overtake the queued waiter.
+        let third = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut third)
+                .await
+                .is_err()
+        );
+        let second = second.await.unwrap();
+        drop(held);
+        let third = third.await.unwrap();
+        drop((second, third));
+        assert_eq!(workers.semaphore.available_permits(), 2);
     }
 
     #[test]
