@@ -455,10 +455,10 @@ async fn quota_throttling_is_permanent_in_response_and_stream() {
                         ));
                     let mut bytes = Vec::new();
                     write_message_to(&frame, &mut bytes).unwrap();
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nx-amzn-requestid: billing-123\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
                     socket.write_all(&bytes).await.unwrap();
                 } else {
-                    socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nx-amzn-errortype: ThrottlingException\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nx-amzn-requestid: billing-123\r\nx-amzn-errortype: ThrottlingException\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
                 }
             });
             let config = aws_sdk_bedrockruntime::Config::builder()
@@ -499,6 +499,8 @@ async fn quota_throttling_is_permanent_in_response_and_stream() {
             );
             if permanent {
                 assert!(error.to_string().contains("quota or billing limit"));
+            } else {
+                assert!(error.to_string().contains("billing-123"));
             }
             assert!(!error.to_string().contains("sentinel-private"));
             server.await.unwrap();

@@ -4257,9 +4257,10 @@ available; model scope and picker selection retain their existing behavior.
 ### Bedrock quota retry classification
 
 Bedrock service and stream exceptions stop agent retries when their redacted
-diagnostics contain Pi's account quota or billing exhaustion markers, even if
+error message or code contains Pi's account quota or billing exhaustion markers, even if
 AWS categorizes the exception as transient throttling. The model receives a
-fixed limit message; ordinary throttling remains retryable. Classification uses
+fixed limit message; ordinary throttling remains retryable even if its request ID
+contains a marker. Classification uses
 the existing bounded diagnostic, so markers omitted by redaction or truncation
 retain the native retry behavior. AWS SDK retries before an exception reaches
 the agent remain governed by the configured SDK policy.

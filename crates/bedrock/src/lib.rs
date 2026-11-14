@@ -783,8 +783,30 @@ fn permanent_bedrock_limit(message: &str) -> bool {
     })
 }
 
-fn bedrock_service_error(message: String, retryable: bool) -> Error {
-    if retryable && permanent_bedrock_limit(&message) {
+fn bedrock_service_error(
+    message: String,
+    retryable: bool,
+    meta: &aws_smithy_types::error::metadata::ErrorMetadata,
+    secrets: &[String],
+) -> Error {
+    let permanent = [meta.message(), meta.code()]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let mut value = value.to_owned();
+            for secret in secrets {
+                if !secret.is_empty() {
+                    value = value.replace(secret, "[REDACTED]");
+                }
+            }
+            let bounded: String = value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(512)
+                .collect();
+            permanent_bedrock_limit(&bounded)
+        });
+    if retryable && permanent {
         Error::Model("Bedrock account quota or billing limit reached".into())
     } else if retryable {
         Error::RetryableModel(message)
@@ -805,7 +827,7 @@ fn request_error(
             || service.is_model_timeout_exception()
             || service.is_service_unavailable_exception()
             || service.is_internal_server_exception();
-        bedrock_service_error(message, retryable)
+        bedrock_service_error(message, retryable, service.meta(), secrets)
     } else {
         match &e {
                     aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
@@ -1279,7 +1301,7 @@ impl Model for Bedrock {
                         if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
                     }
                     let retryable = service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception();
-                    bedrock_service_error(message, retryable)
+                    bedrock_service_error(message, retryable, service.meta(), &secrets)
                 } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
             })? else { break };
                 match event {
@@ -1342,30 +1364,41 @@ mod tests {
     use super::*;
     #[test]
     fn quota_classification_keeps_transient_and_secret_safe() {
+        use aws_smithy_types::error::metadata::ErrorMetadata;
         for message in [
             "Insufficient_Quota",
             "Monthly usage limit reached",
             "Billing issue",
             r#"{"code":"1308"}"#,
         ] {
+            let meta = ErrorMetadata::builder().message(message).build();
             assert!(
-                matches!(bedrock_service_error(message.into(), true), Error::Model(text) if text == "Bedrock account quota or billing limit reached")
+                matches!(bedrock_service_error(message.into(), true, &meta, &[]), Error::Model(text) if text == "Bedrock account quota or billing limit reached")
             );
         }
         for message in ["rate limit reached", r#"{"code":13080}"#] {
+            let meta = ErrorMetadata::builder().message(message).build();
             assert!(matches!(
-                bedrock_service_error(message.into(), true),
+                bedrock_service_error(message.into(), true, &meta, &[]),
                 Error::RetryableModel(_)
             ));
         }
-        let metadata = aws_smithy_types::error::metadata::ErrorMetadata::builder()
+        let metadata = ErrorMetadata::builder()
             .message("quota exceeded secret-token")
             .build();
         let redacted = diagnostic(&metadata, None, &["secret-token".into()]);
-        let error = bedrock_service_error(redacted, true);
+        let error = bedrock_service_error(redacted, true, &metadata, &["secret-token".into()]);
         assert!(!error.to_string().contains("secret-token"));
+        let meta = ErrorMetadata::builder()
+            .message("temporary throttling")
+            .build();
+        let diagnostic = diagnostic(&meta, Some("billing-123"), &[]);
         assert!(matches!(
-            bedrock_service_error("validation failed".into(), false),
+            bedrock_service_error(diagnostic, true, &meta, &[]),
+            Error::RetryableModel(_)
+        ));
+        assert!(matches!(
+            bedrock_service_error("validation failed".into(), false, &meta, &[]),
             Error::Model(_)
         ));
     }
