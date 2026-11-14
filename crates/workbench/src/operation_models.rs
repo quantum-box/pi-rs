@@ -1113,7 +1113,9 @@ mod tests {
     #[tokio::test]
     async fn vercel_saved_key_enables_all_classifiers_without_network() {
         let catalogue = Catalogue::parse(&Map::new()).unwrap();
-        let keys = Keys::parse(&json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key"}}));
+        let keys = Keys::parse(
+            &json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key","endpoint":"https://ai-gateway.vercel.sh/v1/messages","literal":true}}),
+        );
         let available = catalogue
             .list(
                 Kind::Classifier,

@@ -342,10 +342,17 @@ impl Keys {
 
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
+        // The provider-key UI binds a Vercel key to its official chat route.
+        // Pi uses that same key for the gateway's separate classifier route.
+        let vercel_classifier = provider == "vercel-ai-gateway"
+            && official
+            && entry.endpoint.as_deref() == Some("https://ai-gateway.vercel.sh/v1/messages")
+            && endpoint == "https://ai-gateway.vercel.sh/typesafe/v1/systemone";
         (entry
             .endpoint
             .as_deref()
             .is_some_and(|saved| same_operation_endpoint(saved, endpoint))
+            || vercel_classifier
             || (official
                 && ((entry
                     .endpoint
@@ -386,13 +393,22 @@ fn same_operation_endpoint(left: &str, right: &str) -> bool {
 }
 
 pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
+    save_at(
+        &config::agent_dir().join("auth.json"),
+        provider,
+        endpoint,
+        key,
+    )
+}
+
+fn save_at(path: &std::path::Path, provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
     let key = key.trim();
     if !valid_key(key) {
         return Err(Error::Config(
             "API key must contain 1–4096 printable ASCII characters without spaces".into(),
         ));
     }
-    config::update_object(&config::agent_dir().join("auth.json"), |data| {
+    config::update_object(path, |data| {
         data.insert(
             provider.id().into(),
             json!({"type":"api_key","key":key,"endpoint":endpoint,"literal":true}),
@@ -468,6 +484,53 @@ pub(super) fn valid_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vercel_ui_saved_key_only_bridges_exact_official_classifier_route() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        let provider = Provider::named("vercel-ai-gateway").unwrap();
+        let chat = "https://ai-gateway.vercel.sh/v1/messages";
+        let classifier = "https://ai-gateway.vercel.sh/typesafe/v1/systemone";
+        assert_eq!(provider.default_endpoint(), chat);
+        save_at(&path, &provider, chat, "ui-fixture-key").unwrap();
+        let stored = config::read_object(&path).unwrap();
+        assert_eq!(stored[provider.id()]["endpoint"], chat);
+        assert_eq!(stored[provider.id()]["literal"], true);
+        let keys = Keys::load_path(&path).unwrap();
+        assert_eq!(
+            keys.operation_credential(provider.id(), classifier, true)
+                .unwrap()
+                .literal(),
+            Some("ui-fixture-key")
+        );
+        assert!(
+            keys.operation_credential(provider.id(), classifier, false)
+                .is_none()
+        );
+        for destination in [
+            "https://example.test/typesafe/v1/systemone",
+            "https://ai-gateway.vercel.sh:444/typesafe/v1/systemone",
+            "https://ai-gateway.vercel.sh/other/systemone",
+        ] {
+            assert!(
+                keys.operation_credential(provider.id(), destination, true)
+                    .is_none()
+            );
+        }
+        save_at(
+            &path,
+            &provider,
+            "https://example.test/v1/messages",
+            "custom-key",
+        )
+        .unwrap();
+        let keys = Keys::load_path(&path).unwrap();
+        assert!(
+            keys.operation_credential(provider.id(), classifier, true)
+                .is_none()
+        );
+    }
     #[test]
     fn bedrock_profile_and_chain_restore_in_pi_format() {
         use super::*;
