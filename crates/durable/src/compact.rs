@@ -216,15 +216,13 @@ impl Preparation {
 
 impl CompactionResult {
     /// Check the durable context identity as well as the message snapshot.
-    /// Legacy in-flight preparations have no identity and retain old behavior.
+    /// A legacy preparation is valid only while the context is also legacy.
     pub(crate) fn apply_in_context(
         &self,
         current: &[Message],
         generation: Option<Uuid>,
     ) -> Result<Vec<Message>> {
-        if self.preparation.context_generation.is_some()
-            && self.preparation.context_generation != generation
-        {
+        if self.preparation.context_generation != generation {
             return Err(invalid("stale compaction context generation"));
         }
         self.apply(current)
@@ -403,6 +401,7 @@ mod tests {
             .remove("context_generation");
         let legacy: CompactionResult = serde_json::from_value(value).unwrap();
         assert!(legacy.apply_in_context(&history, None).is_ok());
+        assert!(legacy.apply_in_context(&history, Some(generation)).is_err());
     }
 
     #[test]

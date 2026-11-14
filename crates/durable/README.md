@@ -545,8 +545,9 @@ optional manual instructions for the summary request and hook, including across
 recovery; `request_compaction` remains the instruction-free convenience API.
 Runtime-owned preparations also pin the context generation; a reset or another
 applied compaction invalidates the pinned generation even if message text later
-matches. Legacy in-flight preparations without a generation use their previous
-message-prefix check. This guard does not enable busy manual compaction or
+matches. Legacy in-flight preparations without a generation can finish while
+the conversation also has no generation; a reset, compaction, or fork fences
+them. This guard does not enable busy manual compaction or
 provide upstream's stale-submission settlement.
 Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook

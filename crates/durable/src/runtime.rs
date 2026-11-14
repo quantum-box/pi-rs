@@ -7533,6 +7533,51 @@ mod scheduler_tests {
                 .is_err()
         );
     }
+    #[test]
+    fn context_identity_fences_prepared_save_and_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut original, version) = h.load(id).unwrap();
+        original.messages = vec![Message::User {
+            content: "same".into(),
+        }];
+        h.save(&original, Expected::Version(version)).unwrap();
+        let child = h.fork(id).unwrap();
+        let forked = h.conversation(child).unwrap();
+        let (base, version) = h.load(id).unwrap();
+        assert_eq!(base.messages, forked.messages);
+        assert_ne!(base.context_generation, forked.context_generation);
+        let mut changed_identity = base.clone();
+        changed_identity.context_generation = forked.context_generation;
+        assert!(!admission_only(&base, &changed_identity).unwrap());
+
+        let mut stale = base.clone();
+        stale.messages.push(Message::User {
+            content: "stale".into(),
+        });
+        let prepared = h
+            .prepare_save(&stale, Expected::Version(version))
+            .unwrap();
+        let mut reset = base.clone();
+        place_reset(&mut reset, crate::reset::Reset::new(Uuid::new_v4(), None));
+        reset.messages = base.messages.clone();
+        assert!(!admission_only(&base, &reset).unwrap());
+        h.save(&reset, Expected::Version(version)).unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(prepared),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        let latest = h.conversation(id).unwrap();
+        assert_eq!(latest.messages, base.messages);
+        assert_eq!(latest.context_generation, reset.context_generation);
+    }
     #[tokio::test]
     async fn applied_hook_compaction_rotates_context_identity_after_reopen() {
         struct SummaryHook;
