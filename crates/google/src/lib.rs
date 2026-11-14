@@ -998,10 +998,15 @@ mod tests {
     #[tokio::test]
     async fn quota_stream_error_ignores_metadata_and_redacts() {
         use std::io::{Read, Write};
-        for permanent in [false, true] {
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+            ("sk-billing-timeout-secret", false, true),
+            ("sk-timeout-secret", false, true),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"error":{"code":503,"message":if permanent {"quota exceeded sk-provider-billing-secret"} else {"temporarily unavailable sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"}});
+            let event = json!({"error":{"code":503,"message":message,"request_id":"billing-sentinel-secret"}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -1009,9 +1014,15 @@ mod tests {
                 let body = format!("data: {event}\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = Google::new(&format!("http://{address}"), "sk-provider-billing-secret")
+            let model = Google::new(&format!("http://{address}"), "sk-billing-timeout-secret")
                 .unwrap()
-                .with_context_probe(false);
+                .with_context_probe(false)
+                .with_headers({
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert("x-routing", "timeout".parse().unwrap());
+                    headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                    headers
+                });
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![],
@@ -1033,8 +1044,10 @@ mod tests {
                 error.to_string().contains("quota or billing limit"),
                 permanent
             );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
             worker.join().unwrap();
         }
     }
@@ -1043,6 +1056,12 @@ mod tests {
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
             (
                 429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
@@ -1055,7 +1074,7 @@ mod tests {
             ),
             (
                 503,
-                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
                 true,
             ),
             (
@@ -1075,7 +1094,7 @@ mod tests {
             ),
             (
                 429,
-                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
                 false,
             ),
         ] {
@@ -1087,7 +1106,12 @@ mod tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = Google::new(&format!("http://{address}"), "sk-provider-billing-secret")
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model = Google::new(&format!("http://{address}"), credential)
                 .unwrap()
                 .with_context_probe(false);
             let result = model
@@ -1108,7 +1132,7 @@ mod tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
             worker.join().unwrap();
         }
     }

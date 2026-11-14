@@ -657,20 +657,18 @@ mod tests {
     async fn quota_stream_error_ignores_metadata_and_redacts() {
         use std::io::{Read, Write};
         for (message, permanent, retryable) in [
-            ("quota exceeded sk-provider-billing-secret", true, false),
+            ("quota exceeded sk-billing-timeout-secret", true, false),
             ("billing limit reached", true, false),
-            (
-                "rate limit exceeded sk-provider-billing-secret",
-                false,
-                true,
-            ),
+            ("rate limit exceeded sk-billing-timeout-secret", false, true),
             (
                 "request to https://example.invalid failed, reason: unexpected",
                 false,
                 true,
             ),
             ("rate---limit", false, false),
-            ("timeout sk-provider-billing-secret", false, true),
+            ("sk-billing-timeout-secret", false, false),
+            ("sk-timeout-secret", false, false),
+            ("timeout sk-billing-timeout-secret", false, true),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -684,7 +682,7 @@ mod tests {
             });
             let model = OpenAiResponses::new_api_provider(
                 &format!("http://{address}"),
-                "sk-provider-billing-secret".into(),
+                "sk-billing-timeout-secret".into(),
                 "fixture",
             )
             .unwrap()
@@ -694,6 +692,7 @@ mod tests {
                 headers.insert("x-policy", "quota".parse().unwrap());
                 headers.insert("x-plan", "quota exceeded".parse().unwrap());
                 headers.insert("x-routing", "timeout".parse().unwrap());
+                headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
                 headers
             });
             let request = ModelRequest {
@@ -719,7 +718,8 @@ mod tests {
             );
             assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
             worker.join().unwrap();
         }
     }
@@ -728,6 +728,12 @@ mod tests {
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
             (
                 503,
                 r#"{"error":{"message":"billing limit reached"}}"#,
@@ -745,7 +751,7 @@ mod tests {
             ),
             (
                 503,
-                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
                 true,
             ),
             (
@@ -765,7 +771,7 @@ mod tests {
             ),
             (
                 429,
-                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
                 false,
             ),
         ] {
@@ -777,9 +783,14 @@ mod tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
             let model = OpenAiResponses::new_api_provider(
                 &format!("http://{address}"),
-                "sk-provider-billing-secret".into(),
+                credential.into(),
                 "fixture",
             )
             .unwrap()
@@ -801,7 +812,7 @@ mod tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains(credential));
             worker.join().unwrap();
         }
     }

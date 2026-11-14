@@ -4312,11 +4312,11 @@ recognize permanent account, billing and quota exhaustion in structured error
 message, code and type fields for retryable HTTP statuses and stream errors.
 Recognized transient stream errors remain retryable after permanent-limit checks.
 JSON metadata such as request IDs does not affect classification. Known request
-credentials and configured header values are masked before classification when
-they can be distinguished from quota and transient terms. Values matching these
-error expressions remain classifiable because an echo cannot be distinguished
-from a real provider error;
-diagnostics remain fixed and do not include provider bodies. Transient stream
+credentials and Bearer tokens are masked before classification, including when
+they contain quota or transient terms. Other configured header values are masked
+when distinguishable from those terms; ambiguous header values remain
+classifiable because an echo cannot be distinguished from a provider error.
+Diagnostics remain fixed and do not include provider bodies. Transient stream
 matching follows the pinned Pi patterns. OpenAI subscription
 codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
 seconds. Complete error fields preceding a truncated later JSON field remain

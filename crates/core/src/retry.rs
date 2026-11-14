@@ -80,16 +80,21 @@ pub fn provider_error_secrets<'a>(
     headers: impl Iterator<Item = &'a str>,
 ) -> Vec<String> {
     let mut secrets = Vec::new();
-    for value in token.into_iter().chain(headers) {
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        secrets.push(token.to_owned());
+    }
+    for value in headers {
         if value.is_empty() {
             continue;
         }
-        secrets.push(value.to_owned());
         if let Some((scheme, credential)) = value.split_once(' ')
             && scheme.eq_ignore_ascii_case("bearer")
             && !credential.is_empty()
         {
+            secrets.push(value.to_owned());
             secrets.push(credential.to_owned());
+        } else if should_mask_provider_secret(value) {
+            secrets.push(value.to_owned());
         }
     }
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
@@ -100,7 +105,7 @@ pub fn provider_error_secrets<'a>(
 fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
     let mut masked = text.to_owned();
     for secret in secrets {
-        if should_mask_provider_secret(secret) {
+        if !secret.is_empty() {
             masked = masked.replace(secret, "\0\0");
         }
     }
@@ -182,17 +187,15 @@ fn should_mask_provider_secret(secret: &str) -> bool {
         .collect();
     // An exact retry expression is ambiguous with echoed credentials, so keep
     // the upstream retry behavior; diagnostics never expose the response text.
-    if retryable_provider_error(&serde_json::Value::String(secret.to_owned()), &[])
-        || TRANSIENT_EXAMPLES.iter().any(|example| {
-            example.contains(&lower)
-                || (!compact.is_empty()
-                    && example
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .collect::<String>()
-                        .contains(&compact))
-        })
-    {
+    if TRANSIENT_EXAMPLES.iter().any(|example| {
+        example.contains(&lower)
+            || (!compact.is_empty()
+                && example
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .contains(&compact))
+    }) {
         return false;
     }
     ![
@@ -420,7 +423,6 @@ fn permanent_limit_body(bytes: &[u8], complete: bool, secrets: &[String]) -> boo
                 // A bounded body can end in the middle of an echoed secret.
                 let suffix = secrets
                     .iter()
-                    .filter(|secret| should_mask_provider_secret(secret))
                     .flat_map(|secret| {
                         secret
                             .char_indices()
@@ -793,6 +795,36 @@ mod quota_tests {
         for part in ["rate", "rate:", "limit", "service", "timeout", "server"] {
             assert!(!should_mask_provider_secret(part), "{part}");
         }
+    }
+
+    #[test]
+    fn complete_credentials_are_masked_even_when_they_contain_retry_markers() {
+        for credential in ["sk-billing-timeout-secret", "sk-timeout-secret", "timeout"] {
+            let secrets = provider_error_secrets(Some(credential), ["timeout"].into_iter());
+            let echo = serde_json::json!({"error":{"message":credential}});
+            assert!(!permanent_provider_error(&echo, &secrets), "{credential}");
+            assert!(!retryable_provider_error(&echo, &secrets), "{credential}");
+            if credential != "timeout" {
+                let actual =
+                    serde_json::json!({"error":{"message":format!("timeout {credential}")}});
+                assert!(retryable_provider_error(&actual, &secrets));
+                assert!(!permanent_provider_error(&actual, &secrets));
+            }
+        }
+        let secrets =
+            provider_error_secrets(None, ["timeout", "sk-billing-timeout-secret"].into_iter());
+        assert!(retryable_provider_error(
+            &serde_json::json!("timeout"),
+            &secrets
+        ));
+        assert!(!permanent_provider_error(
+            &serde_json::json!("sk-billing-timeout-secret"),
+            &secrets
+        ));
+        assert!(!retryable_provider_error(
+            &serde_json::json!("sk-billing-timeout-secret"),
+            &secrets
+        ));
     }
 
     #[test]

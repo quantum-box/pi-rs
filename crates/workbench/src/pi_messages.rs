@@ -817,10 +817,15 @@ mod tool_status_tests {
     #[tokio::test]
     async fn quota_stream_error_ignores_metadata_and_redacts() {
         use std::io::{Read, Write};
-        for permanent in [false, true] {
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+            ("sk-billing-timeout-secret", false, false),
+            ("sk-timeout-secret", false, false),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded sk-provider-billing-secret"} else {"timeout sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"});
+            let event = json!({"type":"error","reason":"error","errorMessage":message,"request_id":"billing-sentinel-secret"});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -831,12 +836,13 @@ mod tool_status_tests {
             let model = PiMessages::new(
                 "fixture",
                 &format!("http://{address}/"),
-                "sk-provider-billing-secret".into(),
+                "sk-billing-timeout-secret".into(),
             )
             .unwrap()
             .with_headers({
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("x-routing", "timeout".parse().unwrap());
+                headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
                 headers
             });
             let request = ModelRequest {
@@ -860,9 +866,10 @@ mod tool_status_tests {
                 error.to_string().contains("quota or billing limit"),
                 permanent
             );
-            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
             worker.join().unwrap();
         }
     }
@@ -873,6 +880,12 @@ mod tool_status_tests {
     async fn quota_429_preserves_transient_retry_and_redacts_body() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
             (
                 429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
@@ -885,7 +898,7 @@ mod tool_status_tests {
             ),
             (
                 503,
-                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
                 true,
             ),
             (
@@ -905,7 +918,7 @@ mod tool_status_tests {
             ),
             (
                 429,
-                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
                 false,
             ),
         ] {
@@ -917,12 +930,14 @@ mod tool_status_tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = PiMessages::new(
-                "fixture",
-                &format!("http://{address}/"),
-                "sk-provider-billing-secret".into(),
-            )
-            .unwrap();
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model =
+                PiMessages::new("fixture", &format!("http://{address}/"), credential.into())
+                    .unwrap();
             let result = model
                 .stream(ModelRequest {
                     model: "m".into(),
@@ -941,7 +956,7 @@ mod tool_status_tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
-            assert!(!error.to_string().contains("sk-provider-billing-secret"));
+            assert!(!error.to_string().contains(credential));
             worker.join().unwrap();
         }
     }
