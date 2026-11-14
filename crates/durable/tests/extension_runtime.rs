@@ -1894,6 +1894,9 @@ impl Hook for YieldReviews {
             && !ctx.snapshot["messages"]
                 .to_string()
                 .contains("chosen review")
+            && !ctx.snapshot["messages"]
+                .to_string()
+                .contains("queued message")
         {
             Ok(GenerationDecision::Tasks(vec![
                 HookTask {
