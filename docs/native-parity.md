@@ -514,6 +514,13 @@ listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
 
+Trusted project overrides of a global MCP server reject unknown fields before
+applying any part of that override, so a typo cannot silently enable a server.
+Pi ignores invalid overrides and reports a diagnostic; native fails the
+configuration load. Native additionally permits `oauth` in an override for its
+existing OAuth controls, alongside Pi's `enabled`, `exposure`, and
+`toolExposure`. Project `auth.provider` remains forbidden.
+
 Resource and template listings omit MCP App `ui://` entries and entries whose
 MIME profile starts with `mcp-app`, along with listing icons and `_meta`, matching
 pinned Pi's prefix regex. This also hides non-App profiles such as

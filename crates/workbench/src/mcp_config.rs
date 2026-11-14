@@ -70,32 +70,47 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
-            for (name, entry) in entries {
-                if entry.get("auth").is_some() {
-                    return Err(Error::Config(format!(
-                        "project MCP server {name} cannot use auth.provider"
-                    )));
-                }
-                if !["command", "url", "type"]
-                    .iter()
-                    .any(|key| entry.get(*key).is_some())
-                    && let (Some(base), Some(overlay)) = (
-                        servers.get_mut(name).and_then(Value::as_object_mut),
-                        entry.as_object(),
-                    )
-                {
-                    for key in ["enabled", "exposure", "toolExposure", "oauth"] {
-                        if let Some(value) = overlay.get(key) {
-                            base.insert(key.into(), value.clone());
-                        }
-                    }
-                    continue;
-                }
-                servers.insert(name.clone(), entry.clone());
-            }
+            merge_project_servers(&mut servers, entries)?;
         }
     }
     Ok(servers.into_iter().collect())
+}
+
+fn merge_project_servers(
+    servers: &mut serde_json::Map<String, Value>,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    const OVERRIDE_KEYS: &[&str] = &["enabled", "exposure", "toolExposure", "oauth"];
+    for (name, entry) in entries {
+        if entry.get("auth").is_some() {
+            return Err(Error::Config(format!(
+                "project MCP server {name} cannot use auth.provider"
+            )));
+        }
+        if !["command", "url", "type"]
+            .iter()
+            .any(|key| entry.get(*key).is_some())
+            && let (Some(base), Some(overlay)) = (
+                servers.get_mut(name).and_then(Value::as_object_mut),
+                entry.as_object(),
+            )
+        {
+            if let Some(key) = overlay
+                .keys()
+                .find(|key| !OVERRIDE_KEYS.contains(&key.as_str()))
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} override has unsupported field {key}"
+                )));
+            }
+            for (key, value) in overlay {
+                base.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+        servers.insert(name.clone(), entry.clone());
+    }
+    Ok(())
 }
 
 pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
@@ -483,5 +498,41 @@ fn path(args: &Cli, local: bool) -> PathBuf {
         args.workspace.join(".pi/mcp.json")
     } else {
         config::agent_dir().join("mcp.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_override_rejects_unknown_fields_before_changing_global_server() {
+        for extra in ["headers", "args", "url_typo", "description"] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"headers":{"Authorization":"Bearer ${TOKEN}"}}});
+            let mut servers = original.as_object().unwrap().clone();
+            let mut overlay = json!({"service":{"enabled":true}});
+            overlay["service"][extra] = json!("unexpected");
+            let error =
+                merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(extra));
+            assert_eq!(Value::Object(servers), original);
+        }
+    }
+
+    #[test]
+    fn project_override_retains_native_oauth_and_global_credentials() {
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer ${TOKEN}"},"enabled":false}}).as_object().unwrap().clone();
+        let project = json!({"service":{"enabled":true,"exposure":"deferred","toolExposure":{"read":"hidden"},"oauth":false}});
+        merge_project_servers(&mut servers, project.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        assert_eq!(servers["service"]["oauth"], false);
+        assert_eq!(
+            servers["service"]["headers"]["Authorization"],
+            "Bearer ${TOKEN}"
+        );
+        let before = servers.clone();
+        let forbidden = json!({"service":{"enabled":true,"auth":{"provider":"openai"}}});
+        assert!(merge_project_servers(&mut servers, forbidden.as_object().unwrap()).is_err());
+        assert_eq!(servers, before);
     }
 }
