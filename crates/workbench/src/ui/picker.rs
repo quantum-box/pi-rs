@@ -616,10 +616,8 @@ impl Picker {
                     _ => item.label.to_lowercase(),
                 };
                 if self.title == "Settings" {
-                    crate::model_selection::fuzzy(
-                        &query,
-                        label.split(" · ").next().unwrap_or(&label),
-                    )
+                    settings_match_score(&query, label.split(" · ").next().unwrap_or(&label))
+                        .is_some()
                 } else if self.active_session.is_some()
                     || self.model_scope.is_some()
                     || self.title == "Thinking: select model"
@@ -645,6 +643,10 @@ impl Picker {
                     Selection::Completion { text, .. } => text.to_lowercase(),
                     _ => item.label.to_lowercase(),
                 };
+                if self.title == "Settings" {
+                    let name = label.split(" · ").next().unwrap_or(&label);
+                    return (settings_match_score(&query, name).unwrap_or(i64::MAX), 0);
+                }
                 (
                     label
                         .find(&query)
@@ -1830,6 +1832,15 @@ fn short_path(path: &std::path::Path) -> String {
     }
     path.display().to_string()
 }
+fn settings_match_score(query: &str, label: &str) -> Option<i64> {
+    query
+        .split(|ch| ch == '/' || super::session_search::is_whitespace(ch))
+        .filter(|token| !token.is_empty())
+        .try_fold(0_i64, |sum, token| {
+            super::session_search::fuzzy_score(token, label).map(|score| sum.saturating_add(score))
+        })
+}
+
 fn normalize_completion_description(text: &str) -> String {
     let mut result = String::new();
     let mut in_newline = false;
@@ -2114,6 +2125,44 @@ mod tests {
             matches!(&picker.matches()[picker.selected].selection, Selection::Setting(name, value) if name == "HTTP timeout" && *value == 30)
         );
         assert_eq!(picker.query, "ht to");
+    }
+
+    #[test]
+    fn settings_search_uses_pi_token_order_and_scores() {
+        let item = |name: &str| Item {
+            label: format!("{name} · value"),
+            selection: Selection::Setting(name.into(), serde_json::json!(true)),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            [
+                "HTTP timeout",
+                "Timeout HTTP",
+                "HTTP response timeout",
+                "Unrelated",
+            ]
+            .into_iter()
+            .map(item)
+            .collect(),
+        );
+        for query in ["timeout/http", "timeout http", "ht\u{feff}time"] {
+            picker.query = query.into();
+            let matches = picker.matches();
+            let names: Vec<_> = matches.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "Timeout HTTP · value",
+                    "HTTP timeout · value",
+                    "HTTP response timeout · value"
+                ],
+                "{query:?}"
+            );
+        }
+        picker.query = "http\u{85}timeout".into();
+        assert!(picker.matches().is_empty());
+        picker.query = "//".into();
+        assert_eq!(picker.matches().len(), 4);
     }
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {

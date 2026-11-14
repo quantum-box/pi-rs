@@ -210,7 +210,7 @@ fn ascii_regex_classes(pattern: &str) -> String {
     }
     result
 }
-fn is_whitespace(character: char) -> bool {
+pub(super) fn is_whitespace(character: char) -> bool {
     matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
 }
 fn normalize(value: &str) -> String {
@@ -221,7 +221,7 @@ fn normalize(value: &str) -> String {
         .join(" ")
 }
 
-fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
+pub(super) fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
     let query: Vec<_> = query.encode_utf16().collect();
     let text: Vec<_> = text.encode_utf16().collect();
     if let Some(score) = alignment_score(&query, &text) {
