@@ -354,3 +354,154 @@ fn concurrent_same_request_wins_before_busy_rejection() {
     assert!(ids.iter().all(|id| *id == ids[0]));
     assert_eq!(owner.conversation(id).unwrap().submissions.len(), 1);
 }
+
+#[test]
+fn concurrent_writes_deduplicate_and_merge_with_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let mut writer = owner.worker();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let shared = writer
+                    .submit_write(id, Some("same".into()), "app.shared".into(), None)
+                    .unwrap();
+                let unique = writer
+                    .submit_write(
+                        id,
+                        Some(format!("write-{i}")),
+                        "app.unique".into(),
+                        Some(serde_json::json!(i)),
+                    )
+                    .unwrap();
+                (shared, unique)
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(results.iter().all(|r| r.0 == results[0].0));
+    stale.phase = Phase::Boundary {
+        turns: 1,
+        answer: Some("answer".into()),
+    };
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    drop(worker);
+    drop(owner);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    let state = reopened.conversation(id).unwrap();
+    assert_eq!(state.application_writes.len(), 9);
+    assert!(state.application_writes.iter().all(|w| w.placed));
+    for (_, unique) in results {
+        assert!(state.application_writes.iter().any(|w| w.id == unique));
+    }
+}
+
+#[test]
+fn input_and_write_race_reserves_request_id_across_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut input = owner.worker();
+    let mut write = owner.worker();
+    let b = barrier.clone();
+    let a = std::thread::spawn(move || {
+        b.wait();
+        input.submit_with_options(
+            id,
+            Some("shared".into()),
+            "input".into(),
+            AdmissionOptions {
+                reject_when_busy: true,
+                ..Default::default()
+            },
+        )
+    });
+    let b = std::thread::spawn(move || {
+        barrier.wait();
+        write.submit_write(id, Some("shared".into()), "app.test".into(), None)
+    });
+    let (a, b) = (a.join().unwrap(), b.join().unwrap());
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert!(matches!(a, Err(Error::Invalid(_))) || matches!(b, Err(Error::Invalid(_))));
+    let state = owner.conversation(id).unwrap();
+    assert_eq!(state.submissions.len() + state.application_writes.len(), 1);
+}
+
+#[test]
+fn writes_racing_abort_survive_and_stale_execution_cannot_clear_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let mut stale_worker = owner.worker();
+    let (mut stale, version) = stale_worker.load(id).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+    for i in 0..8 {
+        let mut writer = owner.worker();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            writer
+                .submit_write(id, Some(format!("write-{i}")), "app.test".into(), None)
+                .unwrap()
+        }));
+    }
+    let mut aborter = owner.worker();
+    let b = barrier.clone();
+    let abort = std::thread::spawn(move || {
+        b.wait();
+        aborter.request_abort(id).unwrap();
+    });
+    let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    abort.join().unwrap();
+    stale.phase = Phase::Boundary {
+        turns: 1,
+        answer: Some("stale".into()),
+    };
+    assert!(
+        stale_worker
+            .save(&stale, Expected::Version(version))
+            .is_err()
+    );
+    drop(stale_worker);
+    drop(owner);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    let state = reopened.conversation(id).unwrap();
+    assert!(state.abort_requested);
+    assert_eq!(state.application_writes.len(), 8);
+    assert!(ids.iter().all(|id| {
+        state
+            .application_writes
+            .iter()
+            .any(|w| w.id == *id && w.placed)
+    }));
+}

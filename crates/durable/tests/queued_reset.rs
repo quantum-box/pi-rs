@@ -228,3 +228,77 @@ async fn reset_survives_restart_during_tool_round() {
     ));
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn application_writes_are_visible_while_busy_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let mut s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    let write = s
+        .submit_write(
+            id,
+            Some("key".into()),
+            "app.note".into(),
+            Some(serde_json::json!({"value": 1})),
+        )
+        .unwrap();
+    assert_eq!(
+        s.submit_write(id, Some("key".into()), "app.other".into(), None)
+            .unwrap(),
+        write
+    );
+    let c = s.conversation(id).unwrap();
+    assert!(c.application_writes[0].placed);
+    assert_eq!(
+        c.application_writes[0].data,
+        Some(serde_json::json!({"value":1}))
+    );
+    s.shutdown().await.unwrap();
+    let s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    let c = s.conversation(id).unwrap();
+    assert_eq!(c.application_writes.len(), 1);
+    assert_eq!(c.application_writes[0].id, write);
+    assert!(c.application_writes[0].placed);
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn writes_follow_queued_resets_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let mut s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    let first = s.reset(id, None).unwrap();
+    let a = s.submit_write(id, None, "app.a".into(), None).unwrap();
+    let second = s.reset(id, None).unwrap();
+    let b = s.submit_write(id, None, "app.b".into(), None).unwrap();
+    let c = s.conversation(id).unwrap();
+    assert!(c.application_writes.iter().all(|w| !w.placed));
+    assert_eq!(c.application_writes[0].after_reset, Some(first));
+    assert_eq!(c.application_writes[1].after_reset, Some(second));
+    s.shutdown().await.unwrap();
+    let mut s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    acquire(&model.started).await;
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let c = s.conversation(id).unwrap();
+    assert_eq!(
+        c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [first, second]
+    );
+    assert_eq!(
+        c.application_writes
+            .iter()
+            .map(|w| (w.id, w.placed, w.after_reset))
+            .collect::<Vec<_>>(),
+        [(a, true, Some(first)), (b, true, Some(second))]
+    );
+    s.shutdown().await.unwrap();
+}

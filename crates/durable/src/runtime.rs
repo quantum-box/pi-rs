@@ -99,6 +99,17 @@ pub struct Submission {
     pub content: String,
     pub status: Status,
 }
+/// A durable application entry. Queued entries wait for their preceding reset.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ApplicationWrite {
+    pub id: Uuid,
+    pub request_id: Option<String>,
+    pub kind: String,
+    pub data: Option<serde_json::Value>,
+    pub placed: bool,
+    /// The last reset preceding this write, if any.
+    pub after_reset: Option<Uuid>,
+}
 /// Result of attempting to withdraw a single input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithdrawResult {
@@ -243,6 +254,8 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
+    #[serde(default)]
+    pub application_writes: Vec<ApplicationWrite>,
     #[serde(default)]
     pub aborted_generations: Vec<AbortedGeneration>,
     #[serde(default)]
@@ -566,7 +579,7 @@ impl Harness {
             let mut persisted = state.clone();
             persisted.messages.clear();
             let value = serde_json::to_vec(&persisted)?;
-            let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested});
+            let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes});
             let append = crate::observer::Observer::new(self.owner.store(), state.id)
                 .prepare_append(&event)?;
             let fork_key =
@@ -672,6 +685,20 @@ impl Harness {
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
+                    for mut write in latest
+                        .application_writes
+                        .iter()
+                        .skip(base.application_writes.len())
+                        .cloned()
+                    {
+                        if write
+                            .after_reset
+                            .is_some_and(|id| state.resets.iter().any(|r| r.id == id))
+                        {
+                            write.placed = true;
+                        }
+                        state.application_writes.push(write);
+                    }
                     for submission in latest.submissions {
                         if let Some(existing) =
                             state.submissions.iter_mut().find(|s| s.id == submission.id)
@@ -744,6 +771,7 @@ impl Harness {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            application_writes: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
@@ -859,6 +887,7 @@ impl Harness {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            application_writes: vec![],
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
@@ -932,6 +961,65 @@ impl Harness {
             }
             match self.save(&state, Expected::Version(version)) {
                 Ok(()) => return Ok(marker.id),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    /// Persist a display-only application entry and return its submission ID.
+    /// It is immediately placed unless a reset is queued ahead of it.
+    pub fn submit_write(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<Uuid, Error> {
+        if kind.is_empty() || kind.starts_with("pi.") {
+            return Err(Error::Invalid(
+                "application entry kind must be nonempty and outside pi.".into(),
+            ));
+        }
+        loop {
+            let (mut c, version) = self.load(id)?;
+            if let Some(key) = request_id.as_ref() {
+                if c.submissions
+                    .iter()
+                    .any(|s| s.request_id.as_ref() == Some(key))
+                {
+                    return Err(Error::Invalid(
+                        "request ID identifies an input submission".into(),
+                    ));
+                }
+                if let Some(write) = c
+                    .application_writes
+                    .iter()
+                    .find(|w| w.request_id.as_ref() == Some(key))
+                {
+                    return Ok(write.id);
+                }
+            }
+            let after_reset = c
+                .pending_resets
+                .last()
+                .map(|r| r.id)
+                .or_else(|| c.resets.last().map(|r| r.id));
+            let write = ApplicationWrite {
+                id: Uuid::new_v4(),
+                request_id: request_id.clone(),
+                kind: kind.clone(),
+                data: data.clone(),
+                placed: c.pending_resets.is_empty(),
+                after_reset,
+            };
+            let write_id = write.id;
+            c.application_writes.push(write);
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&c, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Ok(()) => return Ok(write_id),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
             }
@@ -1058,6 +1146,15 @@ impl Harness {
         }
         loop {
             let (mut c, version) = self.load(id)?;
+            if request_id.as_ref().is_some_and(|key| {
+                c.application_writes
+                    .iter()
+                    .any(|w| w.request_id.as_ref() == Some(key))
+            }) {
+                return Err(Error::Invalid(
+                    "request ID identifies a write submission".into(),
+                ));
+            }
             if let Some(key) = request_id.as_ref()
                 && let Some(s) = c
                     .submissions
@@ -2854,6 +2951,17 @@ impl Scheduler {
         self.schedule(id);
         Ok(marker)
     }
+    pub fn submit_write(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<Uuid, Error> {
+        let write = self.harness.submit_write(id, request_id, kind, data)?;
+        self.schedule(id);
+        Ok(write)
+    }
     pub async fn watch_history(
         &self,
         id: Uuid,
@@ -3274,6 +3382,18 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         }
         _ => false,
     };
+    let old_writes = old
+        .as_object_mut()
+        .and_then(|v| v.remove("application_writes"));
+    let new_writes = new
+        .as_object_mut()
+        .and_then(|v| v.remove("application_writes"));
+    let writes_unchanged = match (old_writes, new_writes) {
+        (Some(serde_json::Value::Array(old)), Some(serde_json::Value::Array(new))) => {
+            new.starts_with(&old)
+        }
+        _ => false,
+    };
     let old_modes = old.as_object_mut().and_then(|v| v.remove("input_modes"));
     let new_modes = new.as_object_mut().and_then(|v| v.remove("input_modes"));
     let modes_unchanged = match (old_modes, new_modes) {
@@ -3290,6 +3410,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
     Ok(old == new
         && modes_unchanged
         && resets_unchanged
+        && writes_unchanged
         && new_submissions.len() >= old_submissions.len()
         && old_submissions.iter().zip(new_submissions).all(|(a, b)| {
             if a == b {
@@ -3309,6 +3430,11 @@ fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     c.messages.clear();
     if let Some(message) = marker.message() {
         c.messages.push(message);
+    }
+    for write in &mut c.application_writes {
+        if write.after_reset == Some(marker.id) {
+            write.placed = true;
+        }
     }
     c.resets.push(marker);
     c.auto_compaction_attempted = false;
@@ -3435,6 +3561,7 @@ mod scheduler_tests {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            application_writes: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
