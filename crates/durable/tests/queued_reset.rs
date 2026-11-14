@@ -622,3 +622,240 @@ async fn block_reset_places_queued_text_atomically_after_new_context() {
     );
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn queued_block_reset_places_handoff_blocks_and_steer_atomically() {
+    use pi_rs_durable::{extension::Registry, runtime::Harness};
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let tool_adapter = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        HandoffTool(tool.clone()),
+    ));
+    let mut options = opts(model.clone(), tool.clone());
+    options.tools = vec![tool_adapter.register(ReplayPolicy::Safe)];
+    let provider = Arc::new(BlockAdapter {
+        model: model.clone(),
+        requests: Mutex::new(vec![]),
+    });
+    let mut h = Harness::open_paused(&path, options.clone()).unwrap();
+    h.install_provider_adapter(provider.clone()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    let old = h
+        .append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+        .unwrap();
+    drop(h);
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options.clone(),
+        Registry::default(),
+        provider.clone(),
+    )
+    .unwrap();
+    s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    let first = vec![
+        json!({"type":"text","text":"one"}),
+        json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+        json!({"type":"text","text":"two","textSignature":"opaque"}),
+    ];
+    let (reset, ids) = s
+        .reset_with_blocks(id, Some("new handoff".into()), vec![first.clone(), vec![]])
+        .unwrap();
+    assert!(s.reset(id, None).is_err());
+    s.submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+        .unwrap();
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    let c = s.conversation(id).unwrap();
+    assert_eq!(
+        c.resets
+            .iter()
+            .map(|r| r.handoff.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("tool handoff"), Some("new handoff")]
+    );
+    assert_eq!(c.resets[1].id, reset);
+    assert_eq!(c.content_blocks[&1].message_id, ids[0]);
+    assert_eq!(c.content_blocks[&1].blocks, first);
+    assert_eq!(c.content_blocks[&2].message_id, ids[1]);
+    assert!(c.content_blocks[&2].blocks.is_empty());
+    assert_eq!(users(&c.messages), ["new handoff", "", "", "steer"]);
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[1].blocks[&2].message_id, ids[0]);
+        assert_eq!(requests[1].blocks[&3].message_id, ids[1]);
+    }
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let historical = s.fork_by_entry_id(id, old).unwrap();
+    assert_eq!(
+        s.conversation(historical).unwrap().content_blocks[&0].message_id,
+        old
+    );
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, options).unwrap();
+    let reopened = h.conversation(id).unwrap();
+    assert_eq!(reopened.content_blocks[&1].message_id, ids[0]);
+    assert_eq!(reopened.content_blocks[&2].message_id, ids[1]);
+}
+
+#[test]
+fn block_reset_crash_child() {
+    use pi_rs_durable::runtime::Harness;
+    use serde_json::json;
+    let Ok(path) = std::env::var("PI_BLOCK_RESET_CRASH_DB") else {
+        return;
+    };
+    let (model, tool) = setup();
+    let options = opts(model.clone(), tool);
+    let provider = Arc::new(BlockAdapter {
+        model,
+        requests: Mutex::new(vec![]),
+    });
+    let mut h = Harness::open_paused(&path, options).unwrap();
+    h.install_provider_adapter(provider).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    let old = h
+        .append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let (reset, ids) = h
+        .reset_with_blocks(
+            id,
+            Some("after crash".into()),
+            vec![vec![
+                json!({"type":"text","text":"kept"}),
+                json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            ]],
+        )
+        .unwrap();
+    std::fs::write(
+        format!("{path}.ids"),
+        format!("{id}\n{old}\n{reset}\n{}", ids[0]),
+    )
+    .unwrap();
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn queued_block_reset_survives_process_exit_and_abort() {
+    use pi_rs_durable::runtime::Harness;
+    use serde_json::json;
+    use uuid::Uuid;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "block_reset_crash_child", "--nocapture"])
+        .env("PI_BLOCK_RESET_CRASH_DB", &path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let data = std::fs::read_to_string(format!("{}.ids", path.display())).unwrap();
+    let ids: Vec<Uuid> = data.lines().map(|s| s.parse().unwrap()).collect();
+    let (model, tool) = setup();
+    let options = opts(model.clone(), tool);
+    let provider = Arc::new(BlockAdapter {
+        model,
+        requests: Mutex::new(vec![]),
+    });
+    let mut h = Harness::open_paused(&path, options.clone()).unwrap();
+    h.install_provider_adapter(provider).unwrap();
+    h.request_abort(ids[0]).unwrap();
+    h.resume(&pi_rs_core::CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(ids[0]).unwrap();
+    assert_eq!(c.resets.last().unwrap().id, ids[2]);
+    assert_eq!(users(&c.messages), ["after crash", ""]);
+    assert_eq!(c.content_blocks[&1].message_id, ids[3]);
+    assert_eq!(
+        c.content_blocks[&1].blocks,
+        vec![
+            json!({"type":"text","text":"kept"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"})
+        ]
+    );
+    let previous = h.fork_by_entry_id(ids[0], ids[1]).unwrap();
+    assert_eq!(
+        h.conversation(previous).unwrap().content_blocks[&0].message_id,
+        ids[1]
+    );
+    drop(h);
+    let h = Harness::open_paused(&path, options).unwrap();
+    assert_eq!(
+        h.conversation(ids[0]).unwrap().content_blocks[&1].message_id,
+        ids[3]
+    );
+}
+
+#[test]
+fn idle_block_reset_records_atomic_occurrences_and_history() {
+    use pi_rs_durable::runtime::Harness;
+    use serde_json::json;
+    for old_blocks in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (model, tool) = setup();
+        let options = opts(model, tool);
+        let (id, reset, ids, expected);
+        {
+            let mut h = Harness::open_paused(&path, options.clone()).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            if old_blocks {
+                h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+                    .unwrap();
+            }
+            let before = h.history_head(id).unwrap();
+            assert!(h.reset_with_blocks(id, None, vec![]).is_err());
+            assert!(
+                h.reset_with_blocks(id, None, vec![vec![json!({"type":"image"})]])
+                    .is_err()
+            );
+            assert_eq!(h.history_head(id).unwrap(), before);
+            expected = vec![
+                json!({"type":"text","text":"first","textSignature":"sig"}),
+                json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                json!({"type":"text","text":"last"}),
+            ];
+            (reset, ids) = h
+                .reset_with_blocks(id, Some("handoff".into()), vec![expected.clone(), vec![]])
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(c.resets.last().unwrap().id, reset);
+            assert_eq!(users(&c.messages), ["handoff", "", ""]);
+            assert_eq!(c.content_blocks[&1].message_id, ids[0]);
+            assert_eq!(c.content_blocks[&1].blocks, expected);
+            assert_eq!(c.content_blocks[&2].message_id, ids[1]);
+            let history = h
+                .history(id, before, std::num::NonZeroUsize::new(10).unwrap())
+                .unwrap();
+            assert_eq!(history.records.len(), 1);
+            assert_eq!(
+                history.records[0].value["resets"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["id"],
+                json!(reset)
+            );
+            assert_eq!(
+                history.records[0].value["content_blocks"]["1"]["message_id"],
+                json!(ids[0])
+            );
+            let fork = h.fork_by_entry_id(id, ids[1]).unwrap();
+            let child = h.conversation(fork).unwrap();
+            assert_eq!(child.content_blocks, c.content_blocks);
+        }
+        let h = Harness::open_paused(&path, options).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.resets.last().unwrap().id, reset);
+        assert_eq!(c.content_blocks[&1].blocks, expected);
+        assert_eq!(c.content_blocks[&2].message_id, ids[1]);
+    }
+}

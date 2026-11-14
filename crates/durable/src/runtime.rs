@@ -684,6 +684,9 @@ pub struct Conversation {
     pub resets: Vec<crate::reset::Reset>,
     #[serde(default)]
     pending_resets: Vec<crate::reset::Reset>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pending_reset_blocks:
+        std::collections::BTreeMap<Uuid, Vec<crate::transcript::MessageContentBlocks>>,
     #[serde(default)]
     pending_independent_summary: Option<PendingIndependentSummary>,
     #[serde(default)]
@@ -734,6 +737,8 @@ struct BlockResetProof {
     previous_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
     placed_resets: Vec<crate::reset::Reset>,
     messages: Vec<Message>,
+    blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    overwritten_blocks: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1859,6 +1864,7 @@ impl Harness {
             state.messages = messages;
             state.content_blocks = blocks;
         }
+        validate_pending_reset_blocks(state)?;
         Ok(())
     }
     fn read_transcript_blocks(
@@ -2161,6 +2167,16 @@ impl Harness {
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
+                    for (id, blocks) in &latest.pending_reset_blocks {
+                        if !base.pending_reset_blocks.contains_key(id)
+                            && state
+                                .pending_reset_blocks
+                                .insert(*id, blocks.clone())
+                                .is_some()
+                        {
+                            return Err(Error::Invalid("duplicate pending reset blocks".into()));
+                        }
+                    }
                     // A manual summary is admitted at this commit, not when
                     // its hook or usage callback began. Reset admissions merged
                     // into this commit therefore precede the summary.
@@ -2276,6 +2292,7 @@ impl Harness {
             return Err(Error::Failed);
         }
         let mut state = state.clone();
+        validate_pending_reset_blocks(&state)?;
         let key = Self::key(state.id);
         let base = self
             .loaded
@@ -2347,6 +2364,42 @@ impl Harness {
         } else {
             false
         };
+        let reset_proven = old.is_some_and(|previous| {
+            state.block_reset_proof.as_ref().is_some_and(|proof| {
+                proof.previous_context == previous.context_generation
+                    && proof.previous_resets == previous.resets
+                    && proof.previous_messages == previous.messages
+                    && proof.previous_blocks == previous.content_blocks
+                    && !proof.placed_resets.is_empty()
+                    && !proof.overwritten_blocks
+                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
+                    && state.resets.starts_with(&proof.previous_resets)
+                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
+                    && state.context_generation != previous.context_generation
+                    && state.content_blocks == proof.blocks
+                    && state.messages == proof.messages
+            })
+        });
+        if let Some(previous) = old {
+            for (id, expected_blocks) in &previous.pending_reset_blocks {
+                if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
+                    continue;
+                }
+                let placed = reset_proven
+                    && state.block_reset_proof.as_ref().is_some_and(|proof| {
+                        proof
+                            .placed_resets
+                            .last()
+                            .is_some_and(|reset| reset.id == *id)
+                            && state.content_blocks.values().eq(expected_blocks.iter())
+                    });
+                if !placed {
+                    return Err(Error::Invalid(
+                        "pending reset blocks changed or disappeared".into(),
+                    ));
+                }
+            }
+        }
         if let Some(previous) = old
             && !previous.content_blocks.is_empty()
         {
@@ -2357,21 +2410,35 @@ impl Harness {
                     .all(|(i, b)| state.content_blocks.get(i) == Some(b))
                 && previous.context_generation == state.context_generation
                 && state.resets == previous.resets;
-            let reset = state.block_reset_proof.as_ref().is_some_and(|proof| {
-                proof.previous_context == previous.context_generation
-                    && proof.previous_resets == previous.resets
-                    && proof.previous_messages == previous.messages
-                    && proof.previous_blocks == previous.content_blocks
-                    && !proof.placed_resets.is_empty()
-                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
-                    && state.resets.starts_with(&proof.previous_resets)
-                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
-                    && state.context_generation != previous.context_generation
-                    && state.content_blocks.is_empty()
-                    && state.messages == proof.messages
-            });
-            if !unchanged && !reset && !block_compaction {
+            if !unchanged && !reset_proven && !block_compaction {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+        }
+        if let Some(previous) = old
+            && state.resets != previous.resets
+            && !state.content_blocks.is_empty()
+            && !reset_proven
+        {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
+        if reset_proven && !state.content_blocks.is_empty() {
+            let previous = old.unwrap();
+            let source = previous
+                .transcript
+                .clone()
+                .ok_or(crate::transcript::Error::UnsupportedContentBlocks)?;
+            if !previous.occurrence_epoch_proven {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+            let (_, created) = self.resolved_occurrences_with_ids(state.id, source)?;
+            if state
+                .content_blocks
+                .values()
+                .any(|binding| created.contains(&binding.message_id))
+            {
+                return Err(Error::Invalid(
+                    "reset block occurrence identity collision".into(),
+                ));
             }
         }
         let old_len = old.map_or(0, |s| s.messages.len());
@@ -2388,6 +2455,7 @@ impl Harness {
                 )
                 .is_none()
                 || (!block_compaction
+                    && !reset_proven
                     && index < old_len
                     && old.and_then(|s| s.content_blocks.get(&index)) != Some(binding))
             {
@@ -2565,7 +2633,7 @@ impl Harness {
         let mut change = change;
         let new_blocks: Vec<_> = state
             .content_blocks
-            .range(old_len..)
+            .range(if reset_proven { 0 } else { old_len }..)
             .filter(|_| !block_compaction)
             .map(|(&index, binding)| (index, binding.clone()))
             .collect();
@@ -2576,7 +2644,9 @@ impl Harness {
                     | TranscriptChange::AppendV3 { ids, .. }
                     | TranscriptChange::AppendV4 { ids, .. },
                 ) => (ids, old_len),
-                Some(TranscriptChange::ReplaceV2 { ids, .. }) if old_len == 0 => (ids, 0),
+                Some(TranscriptChange::ReplaceV2 { ids, .. }) if old_len == 0 || reset_proven => {
+                    (ids, 0)
+                }
                 _ => return Err(crate::transcript::Error::UnsupportedContentBlocks.into()),
             };
             for (index, binding) in &new_blocks {
@@ -3031,6 +3101,7 @@ impl Harness {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            pending_reset_blocks: Default::default(),
             pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
@@ -3090,6 +3161,7 @@ impl Harness {
         state.aborted_generations.clear();
         state.resets.clear();
         state.pending_resets.clear();
+        state.pending_reset_blocks.clear();
         state.input_modes.clear();
         state.answer_ids.clear();
         state.auto_compaction_attempted = false;
@@ -3319,6 +3391,7 @@ impl Harness {
                     .clone(),
             )?,
             pending_resets: vec![],
+            pending_reset_blocks: Default::default(),
             pending_independent_summary: None,
             application_writes: point
                 .documents
@@ -4872,6 +4945,11 @@ impl Harness {
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
         loop {
             let (mut state, version) = self.load(id)?;
+            if !state.pending_reset_blocks.is_empty() {
+                return Err(Error::Invalid(
+                    "a block-bearing reset is already queued".into(),
+                ));
+            }
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && state.pending_resets.is_empty()
@@ -4887,10 +4965,98 @@ impl Harness {
             } else {
                 state.pending_resets.push(marker.clone());
             }
-            match self.save(&state, Expected::Version(version)) {
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let saved = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match saved {
                 Ok(()) => return Ok(marker.id),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
+            }
+        }
+    }
+    /// Admit a reset and ordered user block occurrences as one durable operation.
+    /// The handoff precedes the additions. While queued, other resets are rejected
+    /// until this marker is placed, so no intermediate block occurrence disappears.
+    pub fn reset_with_blocks(
+        &mut self,
+        id: Uuid,
+        handoff: Option<String>,
+        additions: Vec<Vec<serde_json::Value>>,
+    ) -> Result<(Uuid, Vec<Uuid>), Error> {
+        if additions.is_empty()
+            || additions.iter().any(|blocks| {
+                crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(blocks.clone()),
+                    false,
+                )
+                .is_none()
+            })
+        {
+            return Err(Error::Invalid("invalid reset block additions".into()));
+        }
+        let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
+        let bindings: Vec<_> = additions
+            .into_iter()
+            .map(|blocks| crate::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks,
+            })
+            .collect();
+        let ids: Vec<_> = bindings.iter().map(|binding| binding.message_id).collect();
+        loop {
+            let (mut state, version) = self.load(id)?;
+            if !state.pending_resets.is_empty() || !state.pending_reset_blocks.is_empty() {
+                return Err(Error::Invalid(
+                    "reset with blocks requires no queued reset".into(),
+                ));
+            }
+            let source = state
+                .transcript
+                .clone()
+                .ok_or(crate::transcript::Error::UnsupportedContentBlocks)?;
+            if !state.occurrence_epoch_proven {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+            let (_, created) = self.resolved_occurrences_with_ids(id, source)?;
+            let mut unique = std::collections::HashSet::new();
+            if ids
+                .iter()
+                .any(|id| id.is_nil() || !unique.insert(*id) || created.contains(id))
+                || state.resets.iter().any(|reset| reset.id == marker.id)
+            {
+                return Err(Error::Invalid("reset identity collision".into()));
+            }
+            state
+                .pending_reset_blocks
+                .insert(marker.id, bindings.clone());
+            if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+                && state.active.is_none()
+                && !state.abort_requested
+                && state.pending_independent_summary.is_none()
+                && !state
+                    .application_writes
+                    .iter()
+                    .any(|write| !write.placed && !write.withdrawn)
+                && !state
+                    .submissions
+                    .iter()
+                    .any(|submission| submission.status == Status::Queued)
+            {
+                place_reset(&mut state, marker.clone());
+                state.phase = Phase::Idle;
+            } else {
+                state.pending_resets.push(marker.clone());
+            }
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let saved = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match saved {
+                Ok(()) => return Ok((marker.id, ids)),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -9566,6 +9732,17 @@ impl Scheduler {
         self.schedule(id);
         Ok(marker)
     }
+    /// Admit a reset with ordered block occurrences and schedule placement.
+    pub fn reset_with_blocks(
+        &mut self,
+        id: Uuid,
+        handoff: Option<String>,
+        additions: Vec<Vec<serde_json::Value>>,
+    ) -> Result<(Uuid, Vec<Uuid>), Error> {
+        let admitted = self.harness.reset_with_blocks(id, handoff, additions)?;
+        self.schedule(id);
+        Ok(admitted)
+    }
     pub fn submit_write(
         &mut self,
         id: Uuid,
@@ -11091,6 +11268,22 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .as_object_mut()
         .and_then(|v| v.remove("pending_independent_summary"));
     let pending_ok = old_pending == new_pending || old_pending == Some(serde_json::Value::Null);
+    old.as_object_mut()
+        .and_then(|v| v.remove("pending_reset_blocks"));
+    new.as_object_mut()
+        .and_then(|v| v.remove("pending_reset_blocks"));
+    let reset_blocks_unchanged = base
+        .pending_reset_blocks
+        .iter()
+        .all(|(id, blocks)| latest.pending_reset_blocks.get(id) == Some(blocks))
+        && latest.pending_reset_blocks.iter().all(|(id, _)| {
+            base.pending_reset_blocks.contains_key(id)
+                || latest
+                    .pending_resets
+                    .iter()
+                    .skip(base.pending_resets.len())
+                    .any(|reset| reset.id == *id)
+        });
     let old_resets = old.as_object_mut().and_then(|v| v.remove("pending_resets"));
     let new_resets = new.as_object_mut().and_then(|v| v.remove("pending_resets"));
     let resets_unchanged = match (old_resets, new_resets) {
@@ -11141,6 +11334,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         && pending_ok
         && modes_unchanged
         && resets_unchanged
+        && reset_blocks_unchanged
         && writes_unchanged
         && new_submissions.len() >= old_submissions.len()
         && old_submissions.iter().zip(new_submissions).all(|(a, b)| {
@@ -11179,6 +11373,47 @@ fn place_round_handoff(c: &mut Conversation) {
     c.round_handoffs.clear();
 }
 
+fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
+    if c.pending_reset_blocks.is_empty() {
+        return Ok(());
+    }
+    if c.pending_reset_blocks.len() != 1
+        || c.pending_resets.len() != 1
+        || !c.pending_reset_blocks.contains_key(&c.pending_resets[0].id)
+        || c.pending_resets[0].id.is_nil()
+        || c.resets
+            .iter()
+            .any(|reset| reset.id == c.pending_resets[0].id)
+    {
+        return Err(Error::Invalid(
+            "invalid pending reset block ordering".into(),
+        ));
+    }
+    let mut ids: std::collections::HashSet<_> = c
+        .content_blocks
+        .values()
+        .map(|binding| binding.message_id)
+        .collect();
+    for blocks in c.pending_reset_blocks.values() {
+        if blocks.is_empty() {
+            return Err(Error::Invalid("empty reset block additions".into()));
+        }
+        for binding in blocks {
+            if binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+                || crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(binding.blocks.clone()),
+                    false,
+                )
+                .is_none()
+            {
+                return Err(Error::Invalid("invalid pending reset block binding".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     place_reset_before_writes(c, marker, usize::MAX);
 }
@@ -11188,7 +11423,11 @@ fn place_reset_before_writes(
     marker: crate::reset::Reset,
     write_limit: usize,
 ) {
-    if !c.content_blocks.is_empty() || c.block_reset_proof.is_some() {
+    let additions = c
+        .pending_reset_blocks
+        .remove(&marker.id)
+        .unwrap_or_default();
+    {
         let proof = c.block_reset_proof.get_or_insert_with(|| BlockResetProof {
             previous_context: c.context_generation,
             previous_resets: c.resets.clone(),
@@ -11196,9 +11435,11 @@ fn place_reset_before_writes(
             previous_blocks: c.content_blocks.clone(),
             placed_resets: Vec::new(),
             messages: Vec::new(),
+            blocks: Default::default(),
+            overwritten_blocks: false,
         });
+        proof.overwritten_blocks |= !proof.blocks.is_empty();
         proof.placed_resets.push(marker.clone());
-        proof.messages = marker.message().into_iter().collect();
     }
     c.content_blocks.clear();
     c.context_generation = Some(Uuid::new_v4());
@@ -11206,6 +11447,17 @@ fn place_reset_before_writes(
     c.messages.clear();
     if let Some(message) = marker.message() {
         c.messages.push(message);
+    }
+    for binding in additions {
+        let index = c.messages.len();
+        c.messages.push(Message::User {
+            content: String::new(),
+        });
+        c.content_blocks.insert(index, binding);
+    }
+    if let Some(proof) = &mut c.block_reset_proof {
+        proof.messages = c.messages.clone();
+        proof.blocks = c.content_blocks.clone();
     }
     for write in c.application_writes.iter_mut().take(write_limit) {
         if !write.withdrawn && write.after_reset == Some(marker.id) {
@@ -11723,6 +11975,86 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn reset_block_placement_conflicts_with_concurrent_append() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let original = h
+            .append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+            .unwrap();
+        let (mut planned, version) = h.load(id).unwrap();
+        let reset = crate::reset::Reset::new(Uuid::new_v4(), Some("handoff".into()));
+        let new_id = Uuid::new_v4();
+        planned.pending_reset_blocks.insert(
+            reset.id,
+            vec![crate::transcript::MessageContentBlocks {
+                message_id: new_id,
+                blocks: vec![json!({"type":"text","text":"staged"})],
+            }],
+        );
+        place_reset(&mut planned, reset.clone());
+        let staged = h
+            .prepare_save(&planned, Expected::Version(version))
+            .unwrap();
+        let winner = h
+            .append_user_blocks(id, vec![json!({"type":"text","text":"winner"})])
+            .unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(staged),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        let c = h.conversation(id).unwrap();
+        assert!(c.resets.iter().all(|marker| marker.id != reset.id));
+        assert_eq!(c.content_blocks[&0].message_id, original);
+        assert_eq!(c.content_blocks[&1].message_id, winner);
+        assert!(
+            c.content_blocks
+                .values()
+                .all(|binding| binding.message_id != new_id)
+        );
+    }
+
+    #[test]
+    fn queued_reset_blocks_cannot_be_mutated_dropped_or_overwritten() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.submit(id, None, "active".into()).unwrap();
+        let (reset, ids) = h
+            .reset_with_blocks(
+                id,
+                Some("handoff".into()),
+                vec![vec![json!({"type":"text","text":"original"})]],
+            )
+            .unwrap();
+        let (mut changed, version) = h.load(id).unwrap();
+        changed.pending_reset_blocks.get_mut(&reset).unwrap()[0].blocks =
+            vec![json!({"type":"text","text":"tampered"})];
+        assert!(h.save(&changed, Expected::Version(version)).is_err());
+        let (mut changed, version) = h.load(id).unwrap();
+        changed.pending_reset_blocks.clear();
+        assert!(h.save(&changed, Expected::Version(version)).is_err());
+        let (mut changed, version) = h.load(id).unwrap();
+        let marker = changed.pending_resets.remove(0);
+        place_reset(&mut changed, marker);
+        place_reset(&mut changed, crate::reset::Reset::new(Uuid::new_v4(), None));
+        assert!(h.save(&changed, Expected::Version(version)).is_err());
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.pending_reset_blocks[&reset][0].message_id, ids[0]);
+        assert_eq!(
+            c.pending_reset_blocks[&reset][0].blocks,
+            vec![json!({"type":"text","text":"original"})]
+        );
+    }
+
+    #[test]
     fn block_reset_rejects_unproven_replacements_and_extra_messages() {
         let dir = tempfile::tempdir().unwrap();
         let mut h =
@@ -11795,6 +12127,18 @@ mod scheduler_tests {
                 crate::transcript::Error::UnsupportedContentBlocks
             ))
         ));
+        let (mut state, version) = h.load(id).unwrap();
+        let marker = crate::reset::Reset::new(Uuid::new_v4(), None);
+        let old_id = state.content_blocks[&0].message_id;
+        state.pending_reset_blocks.insert(
+            marker.id,
+            vec![crate::transcript::MessageContentBlocks {
+                message_id: old_id,
+                blocks: vec![],
+            }],
+        );
+        place_reset(&mut state, marker);
+        assert!(h.save(&state, Expected::Version(version)).is_err());
         assert_eq!(h.conversation(id).unwrap().content_blocks.len(), 1);
     }
 
@@ -14417,6 +14761,7 @@ mod scheduler_tests {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            pending_reset_blocks: Default::default(),
             pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
