@@ -991,7 +991,11 @@ impl Session {
     }
 
     pub fn model_selection(&self) -> Option<(String, Option<String>)> {
-        let branch = self.branch();
+        self.model_selection_at(self.head())
+    }
+
+    pub(crate) fn model_selection_at(&self, target: u64) -> Option<(String, Option<String>)> {
+        let branch = self.path(target);
         branch
             .iter()
             .rev()

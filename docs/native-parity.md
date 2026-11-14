@@ -633,6 +633,18 @@ use the existing host API.
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
+Owned sessions restore the registered model client as well as the model name
+when reopening, navigating branches, or forking. Context-window queries and
+idle input hooks use that branch's client too. Register clients for historical
+model names with `SessionBuilder::branch_model` or
+`AgentSession::register_branch_model`; an unavailable client is reported
+instead of sending to a different one. Unlike Pi's automatic fallback on
+resume, a host can explicitly call `set_model` to select another client.
+Checkout and persistent fork validate
+the destination model before changing the journal or creating a file. Native
+SDK branch registrations are keyed by model name, so hosts must use distinct
+names for clients from different providers.
+
 Embedded hosts can use `coding_factories::create_coding_tools` and
 `create_read_only_tools` to register Pi's ordered coding or read-only tool sets
 without registering every built-in tool. The factories use the unrestricted
