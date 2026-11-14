@@ -644,8 +644,14 @@ mod tests {
             transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
             Err(Error::Corrupt)
         ));
-        assert!(matches!(transcript.prepare_fork(Uuid::new_v4()), Err(Error::Corrupt)));
-        assert!(matches!(transcript.prepare_fork_at(&cursor, Uuid::new_v4()), Err(Error::Corrupt)));
+        assert!(matches!(
+            transcript.prepare_fork(Uuid::new_v4()),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            transcript.prepare_fork_at(&cursor, Uuid::new_v4()),
+            Err(Error::Corrupt)
+        ));
     }
 
     #[test]

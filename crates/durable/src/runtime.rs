@@ -10244,7 +10244,10 @@ mod scheduler_tests {
         let child_history = h
             .resolved_occurrences(fork, reopened_fork.transcript.clone().unwrap())
             .unwrap();
-        assert_eq!(&child_history[..parent_history.len()], parent_history.as_slice());
+        assert_eq!(
+            &child_history[..parent_history.len()],
+            parent_history.as_slice()
+        );
         assert_eq!(
             h.conversation(first_fork).unwrap().content_blocks[&0].message_id,
             occurrence
