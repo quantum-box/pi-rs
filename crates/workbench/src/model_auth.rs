@@ -365,6 +365,25 @@ impl Keys {
             .as_ref()
     }
 
+    // A scoped credential may supply an account only when that account
+    // reconstructs its own official operation endpoint.
+    pub(super) fn cloudflare_operation_account(&self) -> Option<&str> {
+        let entry = self.entries.get("cloudflare-workers-ai")?;
+        let account = entry.env.as_ref()?.get("CLOUDFLARE_ACCOUNT_ID")?.as_str()?;
+        if entry.official_routes {
+            return Some(account);
+        }
+        if !super::operation_models::valid_cloudflare_account(account) {
+            return None;
+        }
+        let expected = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
+        entry
+            .endpoint
+            .as_deref()
+            .filter(|endpoint| same_operation_endpoint(endpoint, &expected))?;
+        Some(account)
+    }
+
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
         // The provider-key UI binds a Vercel key to its official chat route.

@@ -3293,9 +3293,18 @@ One classifiers with `models.classify` and OpenRouter image models with
 provider responses enter the same journal as other nested tool calls. Native
 `models.json` also accepts configured entries with `type: "classifier"` or
 `type: "image"` for supported endpoints.
-Configured Cloudflare Workers AI System One classifiers support the `/run`
-request and response envelopes. They require an explicit resolved endpoint and
-credential; automatic Cloudflare catalog and account discovery remain open.
+Cloudflare Workers AI System One classifiers include Pi's five pinned catalog
+entries and support the `/run` request and response envelopes. The official
+endpoint uses an explicit account ID from stored credential metadata or
+`CLOUDFLARE_ACCOUNT_ID`; Pi does not discover accounts over the network.
+Endpoint-scoped credentials supply a stored account only when it reconstructs
+their exact official classifier endpoint.
+Configured official URLs can include `{CLOUDFLARE_ACCOUNT_ID}` or a concrete
+account ID; placeholder expansion is restricted to the official account path.
+Custom endpoints retain endpoint-scoped credential and header rules.
+If a Cloudflare provider has no base URL and its configured models all name
+the same endpoint, provider credentials and headers bind to that endpoint;
+ambiguous model endpoints do not inherit them.
 Codemode validates classifier and image model arguments before dispatch: invalid
 model references and malformed contexts reject the script promise, while an
 actual provider failure remains a structured model result. Classifier state

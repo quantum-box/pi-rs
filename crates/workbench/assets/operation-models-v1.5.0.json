@@ -2165,5 +2165,109 @@
         "contextWindow": 32000
       }
     ]
+  },
+  "cloudflare-workers-ai": {
+    "models": [
+      {
+        "type": "classifier",
+        "id": "@cf/cloudflare/clef",
+        "name": "Clef",
+        "api": "cloudflare-workers-ai-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.24,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 65536,
+        "compat": {
+          "imageInput": "images"
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "@cf/cloudflare/clef-flash",
+        "name": "Clef Flash",
+        "api": "cloudflare-workers-ai-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.038,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 24576,
+        "compat": {
+          "imageInput": "images"
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "@cf/cloudflare/clef-omni",
+        "name": "Clef Omni",
+        "api": "cloudflare-workers-ai-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.15,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 64000,
+        "compat": {
+          "imageInput": "images"
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "typesafe/jev",
+        "name": "Jev",
+        "api": "cloudflare-workers-ai-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 32000,
+        "compat": {
+          "imageInput": "assets"
+        }
+      },
+      {
+        "type": "classifier",
+        "id": "typesafe/jev-1.14.0",
+        "name": "Jev 1.14",
+        "api": "cloudflare-workers-ai-system-one",
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.042,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 32000,
+        "compat": {
+          "imageInput": "assets"
+        }
+      }
+    ]
   }
 }
