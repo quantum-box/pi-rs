@@ -452,6 +452,11 @@ mod tests {
         let client = reqwest::Client::builder()
             .no_proxy()
             .proxy(proxy)
+            .proxy(
+                reqwest::Proxy::all("http://127.0.0.1:1")
+                    .unwrap()
+                    .basic_auth("later", "secret"),
+            )
             .build()
             .unwrap();
         let response = timeout(
@@ -574,6 +579,110 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("proxy-authorization: basic dxnlcjpwyxnz")
         );
+    }
+
+    #[tokio::test]
+    async fn https_tunnel_preserves_origin_tls_verification() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+        for valid_name in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = proxies(
+                Some(&format!(
+                    "http://user:pass@{}",
+                    listener.local_addr().unwrap()
+                )),
+                Some(&format!(
+                    "http://user:pass@{}",
+                    listener.local_addr().unwrap()
+                )),
+                "",
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert!(first.starts_with("CONNECT "));
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                drop(reader);
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let cert = rustls::pki_types::CertificateDer::from(
+                    include_bytes!("../tests/fixtures/bedrock-proxy-tls/server.der").to_vec(),
+                );
+                let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        include_bytes!("../tests/fixtures/bedrock-proxy-tls/server-key.der")
+                            .to_vec(),
+                    ),
+                );
+                let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+                let mut tls = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                    socket,
+                );
+                let mut request = [0u8; 4096];
+                let result = tls.read(&mut request);
+                if valid_name {
+                    let n = result.unwrap();
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    assert!(request.starts_with("GET /test HTTP/1.1"));
+                    assert!(
+                        !request
+                            .to_ascii_lowercase()
+                            .contains("proxy-authorization:")
+                    );
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                } else {
+                    assert!(result.is_err());
+                }
+            });
+            let cert = reqwest::Certificate::from_pem(include_bytes!(
+                "../tests/fixtures/bedrock-proxy-tls/ca.pem"
+            ))
+            .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(proxy)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(cert)
+                .build()
+                .unwrap();
+            let host = if valid_name { "127.0.0.1" } else { "localhost" };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(format!("https://{host}:8443/test")).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), valid_name);
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]

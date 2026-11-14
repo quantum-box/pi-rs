@@ -2673,6 +2673,14 @@ impl Client {
         }
 
         for proxy in self.inner.proxies.iter() {
+            // The connector uses the first matching proxy. Do not take forward
+            // credentials from a later proxy when this one tunnels the request.
+            if proxy
+                .intercept(dst)
+                .is_some_and(|matched| matched.tunnel_http())
+            {
+                break;
+            }
             if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
                 headers.insert(PROXY_AUTHORIZATION, header);
                 break;
@@ -2690,6 +2698,12 @@ impl Client {
         }
 
         for proxy in self.inner.proxies.iter() {
+            if proxy
+                .intercept(dst)
+                .is_some_and(|matched| matched.tunnel_http())
+            {
+                break;
+            }
             if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
                 iter.iter().for_each(|(key, value)| {
                     headers.insert(key, value.clone());
