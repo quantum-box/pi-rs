@@ -335,3 +335,32 @@ committed separately from the phase decision; a crash can rerun hooks and their
 external effects, which require memoization or destination-level idempotency. The
 first recorded batch may differ from a later retry's errors; callback delivery and
 exactly-once external effects are not guaranteed.
+
+### Generic task definition versions
+
+Generic `Task` records carry a positive definition version, JSON input, and a
+checkpoint. Older records without these fields read as version 1 with null input.
+Use `registered_versioned` and `Registry::register_versioned` to create tasks
+and register definitions; legacy registration remains version 1. A definition's
+migration receives the stored input, checkpoint, and version and returns both
+new values. Migration must be deterministic and free of external effects: it can
+be retried after a crash. The scheduler commits the migrated record and running
+reservation together before invoking the handler. Failed or missing migrations,
+missing definitions, and newer stored versions block ordinary execution without
+changing the record. `blocked_reason` inspects this state without running code;
+`replace_registry` reconsiders blocked work at a scheduling boundary, and reopen
+also retries failures. New submissions must match the registered version.
+
+Parity limitations: the standalone scheduler uses host-driven ticks and an
+explicit whole-registry replacement; the background driver cannot replace its
+registry or report blocked changes. Replacement clears all cached migration
+failures, even for unchanged definitions, and reopening retries them. Migration
+failures are exposed by `blocked_reason` rather than upstream report/graph/wake
+notifications. The synchronous callback uses Rust `Result` and a structured
+`Checkpoint` rather than upstream's JavaScript task types and JSON checkpoint;
+panics are not converted into migration failure reports. Blocked aborts use the
+existing generic failed/orphan message rather than upstream's typed orphaned
+outcome and reason. Existing replay-safety and interrupted-execution recovery
+policies remain pi-rs extensions and can differ from upstream, including leaving
+some interrupted tasks running until a missing definition returns. Generic tasks
+are not yet fully integrated into upstream's registry, task graph, or lifecycle.

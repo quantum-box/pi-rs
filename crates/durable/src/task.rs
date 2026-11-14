@@ -55,6 +55,10 @@ pub struct Task {
     id: Uuid,
     owner: TaskOwner,
     checkpoint: Checkpoint,
+    #[serde(default = "initial_version")]
+    definition_version: u32,
+    #[serde(default)]
+    input: Value,
     state: TaskState,
     /// Consecutive recoveries since the last changed checkpoint.
     restarts: u32,
@@ -85,6 +89,10 @@ pub enum TransitionError {
     BackgroundChild,
 }
 
+fn initial_version() -> u32 {
+    1
+}
+
 impl Task {
     pub fn new(
         id: Uuid,
@@ -99,6 +107,8 @@ impl Task {
             id,
             owner,
             checkpoint,
+            definition_version: 1,
+            input: Value::Null,
             state: TaskState::Ready,
             restarts: 0,
             restart_limit,
@@ -131,6 +141,35 @@ impl Task {
         self.kind = Some(kind);
         self.replay_safe = replay_safe;
         self
+    }
+
+    /// Bind a newly created task to a positive definition version and input.
+    pub fn registered_versioned(
+        mut self,
+        kind: String,
+        replay_safe: bool,
+        version: u32,
+        input: Value,
+    ) -> Result<Self, TransitionError> {
+        if version == 0 || self.state != TaskState::Ready {
+            return Err(TransitionError::InvalidState);
+        }
+        self.kind = Some(kind);
+        self.replay_safe = replay_safe;
+        self.definition_version = version;
+        self.input = input;
+        Ok(self)
+    }
+    pub fn definition_version(&self) -> u32 {
+        self.definition_version
+    }
+    pub fn input(&self) -> &Value {
+        &self.input
+    }
+    pub(crate) fn migrate(&mut self, version: u32, input: Value, checkpoint: Checkpoint) {
+        self.definition_version = version;
+        self.input = input;
+        self.checkpoint = checkpoint;
     }
 
     pub fn kind(&self) -> Option<&str> {

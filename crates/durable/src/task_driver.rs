@@ -27,7 +27,7 @@ pub enum Error {
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     owner: Arc<OwnedStore>,
-    policies: HashMap<String, bool>,
+    policies: HashMap<String, (bool, u32)>,
     definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
     state: Mutex<State>,
     wake: Condvar,
@@ -117,7 +117,7 @@ impl Driver {
             .kind()
             .and_then(|kind| self.shared.policies.get(kind))
             .copied();
-        if registered != Some(task.replay_safe())
+        if registered != Some((task.replay_safe(), task.definition_version()))
             || !matches!(task.owner(), TaskOwner::Conversation(_))
             || task.state() != &TaskState::Ready
         {
@@ -219,6 +219,9 @@ impl Shared {
             return None;
         }
         let (policy, registered) = self.definitions.get(name)?;
+        if self.policies.get(name)?.1 != 1 {
+            return None;
+        }
         Arc::ptr_eq(handler, registered).then_some(*policy)
     }
 }
