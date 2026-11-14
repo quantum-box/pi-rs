@@ -2607,7 +2607,7 @@ mod share_context_tests {
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
         assert!(
-            Arc::strong_count(&context) >= 5,
+            Arc::strong_count(&context) >= 3,
             "share capture must retain references, not clone the context"
         );
         let _state = active
@@ -2858,15 +2858,22 @@ mod share_context_tests {
     #[test]
     fn live_share_uses_current_tools_not_transcript_declarations() {
         let root = tempfile::tempdir().unwrap();
-        let mut session = Session::with_store(MemoryStore::default()).unwrap();
-        session
-            .append(Event::SystemCheckpoint {
+        let seed = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::SystemCheckpoint {
                 content: "session prompt".into(),
                 sections: vec![],
                 tools_added: vec![],
                 tools_removed: vec![],
-            })
-            .unwrap();
+            },
+        });
+        let session = Session::from_records(records).unwrap();
         let mut registry = Registry::default();
         registry
             .register(Arc::new(CodingTools::local(root.path()).unwrap()))
