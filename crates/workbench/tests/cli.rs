@@ -49,8 +49,10 @@ fn assert_rpc_worker_starts_with_unavailable_store(root: &std::path::Path, home:
     struct Reap(std::process::Child);
     impl Drop for Reap {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
     }
     let child = Command::new(env!("CARGO_BIN_EXE_pi"))
@@ -152,8 +154,10 @@ fn worker_returns_keyed_share_journal_tag() {
     struct Reap(std::process::Child);
     impl Drop for Reap {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
     }
     let root = tempfile::tempdir().unwrap();
