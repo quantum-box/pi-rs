@@ -1,56 +1,119 @@
 use pi_rs_core::{Error, Message, ModelRequest, ProviderReplay, Result, ToolCall};
 use serde_json::{Value, json};
 pub(crate) fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
+    encode_request_with_blocks(request, replay_scope, None)
+}
+pub(crate) fn encode_request_with_blocks(
+    request: ModelRequest,
+    replay_scope: &str,
+    durable: Option<&pi_rs_durable::model::DurableRequest>,
+) -> Result<Value> {
+    if let Some(durable) = durable {
+        let mut ids = std::collections::BTreeSet::new();
+        if durable.blocks.iter().any(|(index, binding)| {
+            *index >= request.messages.len()
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+        }) {
+            return Err(Error::Config("invalid durable content bindings".into()));
+        }
+    }
     let mut system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
-    for message in request.messages {
-        let (role, blocks) = match message {
-            Message::System { content } => {
-                system.push(content);
-                continue;
+    for (index, message) in request.messages.into_iter().enumerate() {
+        let (role, blocks) = if let Some(binding) = durable.and_then(|d| d.blocks.get(&index)) {
+            if !matches!(&message, Message::User { content } if content.is_empty()) {
+                return Err(Error::Config("durable block placeholder mismatch".into()));
             }
-            Message::User { content } => ("user", text_block(content).into_iter().collect()),
-            Message::UserWithImages { content, images } => {
-                let mut blocks: Vec<_> = text_block(content).into_iter().collect();
-                for image in images {
-                    image.validate()?;
-                    blocks.push(json!({"type":"image","source":{
-                        "type":"base64","media_type":image.mime_type,"data":image.data
-                    }}));
-                }
-                ("user", blocks)
-            }
-            Message::Assistant {
-                content,
-                calls,
-                replay,
-            } => {
-                let blocks = match replay {
-                    Some(replay)
-                        if replay_matches(
-                            &replay,
-                            replay_scope,
-                            &request.model,
-                            &content,
-                            &calls,
-                        ) =>
+            let mut blocks = Vec::new();
+            for block in &binding.blocks {
+                let object = block
+                    .as_object()
+                    .ok_or_else(|| Error::Config("invalid content block".into()))?;
+                match block["type"].as_str() {
+                    Some("text") if object.len() == 2 => {
+                        let text = block["text"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid text block".into()))?;
+                        blocks.push(json!({"type":"text", "text":text}));
+                    }
+                    Some("image")
+                        if object.len() == 3
+                            && object
+                                .keys()
+                                .all(|k| ["type", "data", "mimeType"].contains(&k.as_str())) =>
                     {
-                        replay.blocks
+                        let image = pi_rs_core::ImageContent {
+                            data: block["data"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                            mime_type: block["mimeType"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                        };
+                        image.validate()?;
+                        blocks.push(json!({"type":"image","source":{"type":"base64","media_type":image.mime_type,"data":image.data}}));
                     }
-                    _ => {
-                        let mut blocks: Vec<_> = text_block(content).into_iter().collect();
-                        blocks.extend(calls.into_iter().map(|call| tool_block(&call)));
-                        blocks
-                    }
-                };
-                ("assistant", blocks)
+                    _ => return Err(Error::Config("unsupported durable block metadata".into())),
+                }
             }
-            Message::Tool { call_id, content } => (
-                "user",
-                vec![json!({
-                    "type":"tool_result","tool_use_id":call_id,"content":content
-                })],
-            ),
+            if blocks.is_empty() {
+                return Err(Error::Config(
+                    "empty user block array unsupported by Anthropic".into(),
+                ));
+            }
+            ("user", blocks)
+        } else {
+            match message {
+                Message::System { content } => {
+                    system.push(content);
+                    continue;
+                }
+                Message::User { content } => ("user", text_block(content).into_iter().collect()),
+                Message::UserWithImages { content, images } => {
+                    let mut blocks: Vec<_> = text_block(content).into_iter().collect();
+                    for image in images {
+                        image.validate()?;
+                        blocks.push(json!({"type":"image","source":{
+                            "type":"base64","media_type":image.mime_type,"data":image.data
+                        }}));
+                    }
+                    ("user", blocks)
+                }
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay,
+                } => {
+                    let blocks = match replay {
+                        Some(replay)
+                            if replay_matches(
+                                &replay,
+                                replay_scope,
+                                &request.model,
+                                &content,
+                                &calls,
+                            ) =>
+                        {
+                            replay.blocks
+                        }
+                        _ => {
+                            let mut blocks: Vec<_> = text_block(content).into_iter().collect();
+                            blocks.extend(calls.into_iter().map(|call| tool_block(&call)));
+                            blocks
+                        }
+                    };
+                    ("assistant", blocks)
+                }
+                Message::Tool { call_id, content } => (
+                    "user",
+                    vec![json!({
+                        "type":"tool_result","tool_use_id":call_id,"content":content
+                    })],
+                ),
+            }
         };
         if blocks.is_empty() {
             continue;

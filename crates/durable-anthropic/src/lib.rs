@@ -7,7 +7,7 @@ use pi_rs_core::{
     Error, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
     ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -57,6 +57,36 @@ impl AnthropicAdapter {
 }
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_durable(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<Value> {
+        encode::encode_request_with_blocks(request.request.clone(), SCOPE, Some(request))
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request, body)?;
+        if !request.blocks.is_empty()
+            && body.get("messages")
+                != encode::encode_request_with_blocks(
+                    request.request.clone(),
+                    SCOPE,
+                    Some(request),
+                )?
+                .get("messages")
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn id(&self) -> &str {
         "anthropic-messages/v1"
     }
@@ -66,7 +96,13 @@ impl ProviderAdapter for AnthropicAdapter {
     fn validate(&self, _: &ProviderAttempt, request: &ModelRequest, body: &Value) -> Result<()> {
         let fail = || Error::Config("invalid or unauthorized Anthropic request body".into());
         let obj = body.as_object().ok_or_else(fail)?;
-        let expected = encode::encode_request(request.clone(), SCOPE)?;
+        let expected = encode::encode_request(request.clone(), SCOPE).or_else(|_| {
+            let mut augmented = request.clone();
+            augmented.messages.push(pi_rs_core::Message::User {
+                content: " ".into(),
+            });
+            encode::encode_request(augmented, SCOPE)
+        })?;
         if obj.keys().any(|k| {
             ![
                 "model",
