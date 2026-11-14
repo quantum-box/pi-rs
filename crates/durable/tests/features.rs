@@ -1020,13 +1020,17 @@ async fn task_entries_follow_proven_fork_cuts_and_descendants() {
             max_output_tokens: 128,
         })
         .unwrap();
+    drop(h);
     let first_author = append(&path, parent, 1);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
     h.reset(parent, None).unwrap();
     let cut = h
         .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
         .unwrap()
         .next;
+    drop(h);
     append(&path, parent, 2);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
     let old = h.fork_at(parent, cut).unwrap();
     let current = h.fork(parent).unwrap();
     let db = Store::open(&path).unwrap();
@@ -1035,7 +1039,9 @@ async fn task_entries_follow_proven_fork_cuts_and_descendants() {
     assert_eq!(original[0].author_task_id, first_author);
     assert_eq!(application_entry::list(&db, old).unwrap(), original[..1]);
     assert_eq!(application_entry::list(&db, current).unwrap(), original);
+    drop(h);
     append(&path, old, 3);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
     let descendant = h.fork(old).unwrap();
     let old_entries = application_entry::list(&db, old).unwrap();
     assert_eq!(old_entries.len(), 2);

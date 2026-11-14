@@ -509,6 +509,88 @@ mod document_history_tests {
     use super::*;
 
     #[test]
+    fn application_revisions_preserve_document_watches_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let reader = Store::open(&path).unwrap();
+        let writer = Store::open(&path).unwrap();
+        let doc = b"durable/document/example".to_vec();
+        let log = b"durable/application-entries/example".to_vec();
+        let cut = b"runtime/fork/example/1".to_vec();
+        let start = reader.document_snapshot().unwrap();
+        writer
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: log.clone(),
+                    value: b"one".to_vec(),
+                }],
+            )
+            .unwrap();
+        let gap = reader.document_snapshot().unwrap();
+        assert!(gap > start);
+        assert!(reader.document_commits(start, 1).unwrap().is_empty());
+        writer
+            .commit(
+                &[Check {
+                    key: doc.clone(),
+                    expected: Expected::DocumentUnchangedSince(start),
+                }],
+                &[
+                    Mutation::Put {
+                        key: cut.clone(),
+                        value: vec![],
+                    },
+                    Mutation::Put {
+                        key: log.clone(),
+                        value: b"two".to_vec(),
+                    },
+                    Mutation::Put {
+                        key: doc.clone(),
+                        value: b"document".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        let revision = reader.document_cut(&cut).unwrap().unwrap();
+        assert_eq!(
+            reader
+                .application_entries_at(&log, gap)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            reader
+                .application_entries_at(&log, revision)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"two"
+        );
+        assert_eq!(
+            reader.document_at(&doc, revision).unwrap().unwrap().value,
+            b"document"
+        );
+        let commits = reader.document_commits(start, 1).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].0, revision);
+        assert_eq!(commits[0].1.len(), 1);
+        assert_eq!(commits[0].1[0].0, doc);
+        assert!(matches!(
+            reader.commit(
+                &[Check {
+                    key: doc,
+                    expected: Expected::DocumentUnchangedSince(gap)
+                }],
+                &[]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+    }
+
+    #[test]
     fn migrates_existing_live_documents_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
