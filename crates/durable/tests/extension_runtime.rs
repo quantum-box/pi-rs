@@ -3053,6 +3053,20 @@ async fn handoff_waits_for_after_tools_and_survives_reopen() {
 
 #[derive(Default)]
 struct AddToolsModel(Mutex<Vec<Vec<String>>>);
+struct EarlyTool;
+#[async_trait]
+impl Tool for EarlyTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "aaa".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        Outcome::Succeeded("ok".into())
+    }
+}
 #[async_trait]
 impl Model for AddToolsModel {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
@@ -3097,8 +3111,8 @@ async fn added_tools_are_persisted_in_call_order_across_reopen() {
                     controls: [false, false],
                     handoffs: [None, None],
                     additions: [
-                        vec!["test".into(), "missing".into()],
-                        vec!["missing".into(), "later".into()],
+                        vec!["test".into(), "".into(), "missing".into()],
+                        vec!["missing".into(), "aaa".into(), "later".into()],
                     ],
                     calls: calls.clone(),
                     fail_second: false,
@@ -3107,6 +3121,10 @@ async fn added_tools_are_persisted_in_call_order_across_reopen() {
             .register(ReplayPolicy::Safe),
             RegisteredTool {
                 tool: Arc::new(FakeTool::default()),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: Arc::new(EarlyTool),
                 replay: ReplayPolicy::Safe,
             },
         ],
@@ -3145,14 +3163,15 @@ async fn added_tools_are_persisted_in_call_order_across_reopen() {
                 "controlled".into(),
                 "test".into(),
                 "missing".into(),
+                "aaa".into(),
                 "later".into()
             ])
         );
     }
     let h = Harness::open_paused(&path, options()).unwrap();
-    assert_eq!(h.conversation(id).unwrap().allowed_tools.unwrap().len(), 4);
+    assert_eq!(h.conversation(id).unwrap().allowed_tools.unwrap().len(), 5);
     assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
     let requests = model.0.lock().unwrap();
-    assert!(!requests[0].contains(&"test".into()));
-    assert!(requests[1].contains(&"test".into()));
+    assert_eq!(requests[0], vec!["controlled"]);
+    assert_eq!(requests[1], vec!["controlled", "test", "aaa"]);
 }

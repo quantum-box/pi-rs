@@ -1082,6 +1082,23 @@ impl Harness {
         }
         Ok(tools)
     }
+    fn ordered_tool_specs(&self, c: &Conversation) -> Result<Vec<ToolSpec>, Error> {
+        let mut tools = self.resolved_tools(c)?;
+        if let Some(allowed) = &c.allowed_tools {
+            Ok(allowed
+                .iter()
+                .filter_map(|name| tools.remove(name))
+                .map(|tool| tool.tool.spec())
+                .collect())
+        } else {
+            let mut specs: Vec<_> = tools
+                .into_values()
+                .map(|tool| tool.tool.spec())
+                .collect();
+            specs.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(specs)
+        }
+    }
     /// Install a host adapter before resuming any conversation that selected it.
     pub fn install_provider_adapter(
         &mut self,
@@ -4131,11 +4148,7 @@ impl Harness {
                                     content: c.config.system_prompt.clone(),
                                 }];
                                 messages.extend(c.messages.clone());
-                                let specs: Vec<_> = self
-                                    .resolved_tools(&c)?
-                                    .values()
-                                    .map(|tool| tool.tool.spec())
-                                    .collect();
+                                let specs = self.ordered_tool_specs(&c)?;
                                 let request = model_request(
                                     &c.config.model,
                                     messages,
@@ -4220,12 +4233,7 @@ impl Harness {
                         content: system_prompt,
                     }];
                     messages.extend(c.messages.clone());
-                    let mut specs: Vec<ToolSpec> = self
-                        .resolved_tools(&c)?
-                        .values()
-                        .map(|t| t.tool.spec())
-                        .collect();
-                    specs.sort_by(|a, b| a.name.cmp(&b.name));
+                    let specs = self.ordered_tool_specs(&c)?;
                     let mut request =
                         model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
                     if !c.extensions.is_empty() {
@@ -6923,7 +6931,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
 fn place_round_handoff(c: &mut Conversation) {
     if let Some(allowed) = &mut c.allowed_tools {
         for name in c.round_added_tools.iter().flatten() {
-            if !allowed.contains(name) {
+            if !name.is_empty() && !allowed.contains(name) {
                 allowed.push(name.clone());
             }
         }
