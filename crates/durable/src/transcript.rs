@@ -2,7 +2,7 @@
 //!
 //! Reserve `durable/transcript/` for this module. Entries are immutable and
 //! heads may only be changed with these operations. A fork shares its parent's
-//! captured head; neither forking nor appending copies history. Reads walk
+//! captured head; an interior runtime fork may copy a verified prefix projection. Reads walk
 //! newest-first from a captured head and perform at most `limit` entry reads.
 //! Each page is stable across subsequent appends and forks under this namespace
 //! contract. Storage and payload sizes are otherwise unbounded.
@@ -306,6 +306,81 @@ impl<'a> Transcript<'a> {
         ))
     }
 
+    /// Atomically fork an immutable source and append a validated projection.
+    pub(crate) fn prepare_fork_projection(
+        &self,
+        cursor: &Cursor,
+        child: Uuid,
+        value: &Value,
+        blocks: Vec<MessageContentBlocks>,
+    ) -> Result<(Batch, Cursor), Error> {
+        if cursor.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        if child == self.id {
+            return Err(Error::SelfFork);
+        }
+        if value.get("ForkCut").is_none()
+            || (!blocks.is_empty() && !valid_block_bindings(value, &blocks))
+        {
+            return Err(Error::Corrupt);
+        }
+        self.validate_chain(cursor.next)?;
+        let sequence = cursor
+            .next
+            .and_then(|tip| tip.sequence.checked_add(1))
+            .ok_or(Error::SequenceExhausted)?;
+        let tip = Link {
+            id: Uuid::new_v4(),
+            sequence,
+        };
+        let entry = Entry {
+            format: if blocks.is_empty() { 1 } else { 2 },
+            id: tip.id,
+            sequence,
+            previous: cursor.next,
+            value: value.clone(),
+            content_blocks: if blocks.is_empty() {
+                None
+            } else {
+                Some(blocks)
+            },
+        };
+        let head_key = head_key(child);
+        let entry_key = entry_key(tip.id);
+        Ok((
+            Batch {
+                checks: vec![
+                    Check {
+                        key: head_key.clone(),
+                        expected: Expected::Missing,
+                    },
+                    Check {
+                        key: entry_key.clone(),
+                        expected: Expected::Missing,
+                    },
+                ],
+                mutations: vec![
+                    Mutation::Put {
+                        key: entry_key,
+                        value: encode(&entry)?,
+                    },
+                    Mutation::Put {
+                        key: head_key,
+                        value: encode(&Head {
+                            format: 1,
+                            tip: Some(tip),
+                        })?,
+                    },
+                ],
+            },
+            Cursor {
+                transcript: child,
+                next: Some(tip),
+            },
+        ))
+    }
+
     /// Capture a stable position; later writes do not change this snapshot.
     pub fn snapshot(&self) -> Result<Cursor, Error> {
         let (head, _) = self.load_head()?;
@@ -403,23 +478,41 @@ fn valid_block_bindings(value: &Value, blocks: &[MessageContentBlocks]) -> bool 
     let Some((kind, data)) = object.iter().next() else {
         return false;
     };
-    if !matches!(
-        kind.as_str(),
-        "AppendV2" | "AppendV3" | "AppendV4" | "ReplaceV2"
-    ) {
-        return false;
-    }
-    let (Some(ids), Some(messages)) = (
-        data.get("ids").and_then(Value::as_array),
-        data.get("messages").and_then(Value::as_array),
-    ) else {
+    let Some(messages) = data.get("messages").and_then(Value::as_array) else {
         return false;
     };
-    if ids.len() != messages.len() {
-        return false;
-    }
+    let ids: Vec<&Value> = if kind == "ForkCut" {
+        let Some(histories) = data.get("histories").and_then(Value::as_array) else {
+            return false;
+        };
+        if histories.len() != messages.len() {
+            return false;
+        }
+        let Some(ids) = histories
+            .iter()
+            .map(|history| history.get("id"))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        ids
+    } else {
+        if !matches!(
+            kind.as_str(),
+            "AppendV2" | "AppendV3" | "AppendV4" | "ReplaceV2"
+        ) {
+            return false;
+        }
+        let Some(ids) = data.get("ids").and_then(Value::as_array) else {
+            return false;
+        };
+        if ids.len() != messages.len() {
+            return false;
+        }
+        ids.iter().collect()
+    };
     let mut occurrences = std::collections::HashMap::new();
-    for (id, message) in ids.iter().zip(messages) {
+    for (id, message) in ids.into_iter().zip(messages) {
         let Some(id) = id.as_str().and_then(|id| Uuid::parse_str(id).ok()) else {
             return false;
         };

@@ -378,9 +378,15 @@ async fn public_busy_block_summary_places_before_later_queued_input() {
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(c.content_blocks.len(), 1);
         if queued {
-            assert!(c.messages.iter().any(
-                |message| matches!(message, pi_rs_core::Message::User { content } if content == "queued")
-            ));
+            let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("<summary>"))).unwrap();
+            let later = c
+                .messages
+                .iter()
+                .position(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"),
+                )
+                .unwrap();
+            assert!(summary < later);
         }
         s.shutdown().await.unwrap();
     }

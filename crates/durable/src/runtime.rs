@@ -473,6 +473,12 @@ enum TranscriptChange {
     },
     /// A compaction projection of the immediately preceding active transcript.
     /// Retained provenance is derived from that link, never from message text.
+    ForkCut {
+        messages: Vec<Message>,
+        histories: Vec<Option<MessageHistory>>,
+        commit: u64,
+        origin: Uuid,
+    },
     ReplaceCompacted {
         messages: Vec<Message>,
         system_end: usize,
@@ -488,6 +494,24 @@ type TranscriptChangeParts = (Vec<Message>, bool, Option<(Vec<Uuid>, u64, Uuid)>
 
 impl TranscriptChange {
     fn compacted_histories(&self) -> Result<Option<&[Option<MessageHistory>]>, Error> {
+        if let Self::ForkCut {
+            messages,
+            histories,
+            ..
+        } = self
+        {
+            let mut seen = std::collections::HashSet::new();
+            if histories.len() != messages.len()
+                || histories.iter().any(|history| {
+                    history.as_ref().is_none_or(|h| {
+                        h.id.is_nil() || h.origin.is_nil() || h.commit == 0 || !seen.insert(h.id)
+                    })
+                })
+            {
+                return Err(Error::Invalid("invalid fork cut metadata".into()));
+            }
+            return Ok(Some(histories));
+        }
         let Self::ReplaceCompacted {
             messages,
             system_end,
@@ -557,7 +581,9 @@ impl TranscriptChange {
                 commit,
                 origin,
             } => (messages, true, Some((ids, commit, origin))),
-            Self::ReplaceCompacted { messages, .. } => (messages, true, None),
+            Self::ReplaceCompacted { messages, .. } | Self::ForkCut { messages, .. } => {
+                (messages, true, None)
+            }
         };
         if let Some((ids, commit, origin)) = &metadata {
             let unique: std::collections::HashSet<_> = ids.iter().collect();
@@ -628,6 +654,8 @@ pub struct Conversation {
     /// In-memory proof of a reset placed in the current transaction; never persisted.
     #[serde(skip)]
     block_reset_proof: Option<BlockResetProof>,
+    #[serde(skip)]
+    block_fork_cut: Option<usize>,
     /// Identity of the active context since its last reset or compaction.
     /// Older persisted conversations acquire one at the next compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1779,9 +1807,8 @@ impl Harness {
                 | TranscriptChange::AppendV3 { origin, commit, .. }
                 | TranscriptChange::AppendV4 { origin, commit, .. }
                 | TranscriptChange::ReplaceV2 { origin, commit, .. }
-                | TranscriptChange::ReplaceCompacted { origin, commit, .. } => {
-                    Some((*origin, *commit))
-                }
+                | TranscriptChange::ReplaceCompacted { origin, commit, .. }
+                | TranscriptChange::ForkCut { origin, commit, .. } => Some((*origin, *commit)),
                 _ => None,
             };
             if let Some((origin, commit)) = origin {
@@ -1849,8 +1876,10 @@ impl Harness {
                 .next()
                 .ok_or(crate::transcript::Error::Corrupt)?;
             let change: TranscriptChange = serde_json::from_value(record.value)?;
-            let base = !matches!(change, TranscriptChange::ReplaceCompacted { .. })
-                && change.clone().parts()?.1;
+            let base = !matches!(
+                change,
+                TranscriptChange::ReplaceCompacted { .. } | TranscriptChange::ForkCut { .. }
+            ) && change.clone().parts()?.1;
             parts.push((cursor.clone(), change, record.content_blocks));
             if base {
                 break;
@@ -1860,10 +1889,43 @@ impl Harness {
             }
             cursor = page.next;
         }
-        let mut messages = Vec::new();
-        let mut blocks = std::collections::BTreeMap::new();
+        let mut messages: Vec<Message> = Vec::new();
+        let mut blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks> =
+            std::collections::BTreeMap::new();
         for (position, change, bindings) in parts.into_iter().rev() {
-            if let TranscriptChange::ReplaceCompacted {
+            if let TranscriptChange::ForkCut {
+                messages: next,
+                histories,
+                ..
+            } = &change
+            {
+                let resolved = self.resolved_occurrences(id, position)?;
+                if resolved.iter().map(|(m, _)| m).ne(next.iter())
+                    || next.len() >= messages.len()
+                    || next.as_slice() != &messages[..next.len()]
+                    || histories.len() != next.len()
+                {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                blocks.retain(|index, _| *index < next.len());
+                let stored = bindings.unwrap_or_default();
+                let mut expected = Vec::new();
+                for (index, binding) in &blocks {
+                    if resolved
+                        .get(*index)
+                        .and_then(|(_, h)| h.as_ref())
+                        .map(|h| h.id)
+                        != Some(binding.message_id)
+                    {
+                        return Err(crate::transcript::Error::Corrupt.into());
+                    }
+                    expected.push(binding.clone());
+                }
+                if expected != stored {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                messages = next.clone();
+            } else if let TranscriptChange::ReplaceCompacted {
                 messages: next,
                 system_end,
                 first_kept,
@@ -2520,7 +2582,49 @@ impl Harness {
                 return Err(crate::transcript::Error::Corrupt.into());
             }
         }
-        let prepared = if expected == Expected::Missing && state.transcript.is_some() {
+        let prepared = if expected == Expected::Missing
+            && let Some(len) = state.block_fork_cut
+        {
+            let source = state
+                .transcript
+                .as_ref()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let (messages, blocks) =
+                self.read_transcript_blocks(source.transcript_id(), source.clone())?;
+            let occurrences = self.resolved_occurrences(source.transcript_id(), source.clone())?;
+            let expected_blocks: std::collections::BTreeMap<_, _> = blocks
+                .into_iter()
+                .filter(|(index, _)| *index < len)
+                .collect();
+            if !state.occurrence_epoch_proven
+                || len >= messages.len()
+                || messages.get(..len) != Some(state.messages.as_slice())
+                || expected_blocks != state.content_blocks
+                || occurrences.len() != messages.len()
+                || occurrences[..len].iter().any(|(_, h)| h.is_none())
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            let cut = TranscriptChange::ForkCut {
+                messages: state.messages.clone(),
+                histories: occurrences[..len]
+                    .iter()
+                    .map(|(_, history)| history.clone())
+                    .collect(),
+                commit,
+                origin: state.id,
+            };
+            let (batch, cursor) =
+                crate::transcript::Transcript::new(self.owner.store(), source.transcript_id())
+                    .prepare_fork_projection(
+                        source,
+                        state.id,
+                        &serde_json::to_value(cut)?,
+                        state.content_blocks.values().cloned().collect(),
+                    )?;
+            state.transcript = Some(cursor);
+            Some(batch)
+        } else if expected == Expected::Missing && state.transcript.is_some() {
             let source = state.transcript.as_ref().unwrap();
             let (messages, blocks) =
                 self.read_transcript_blocks(source.transcript_id(), source.clone())?;
@@ -2911,6 +3015,7 @@ impl Harness {
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
+            block_fork_cut: None,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
@@ -3117,7 +3222,7 @@ impl Harness {
             .map(serde_json::from_value)
             .transpose()?;
         self.expand_event(id, &mut value)?;
-        let blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks> =
+        let mut blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks> =
             value
                 .as_object_mut()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?
@@ -3125,11 +3230,7 @@ impl Harness {
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default();
-        // Interior cuts rebuild a transcript. Until their original occurrence
-        // provenance can be materialized exactly, do not rebuild block history.
-        if prefix.is_some() && !blocks.is_empty() {
-            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-        }
+        let block_fork_cut = prefix.filter(|_| !blocks.is_empty()).map(|(len, _)| len);
         if let Some((len, expected_len)) = prefix {
             let messages = value
                 .get_mut("messages")
@@ -3139,6 +3240,9 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
             messages.truncate(len);
+            if block_fork_cut.is_some() {
+                blocks.retain(|index, _| *index < len);
+            }
         }
         let record = crate::observer::Record { cursor, value };
         let point = crate::fork::extract_cut(id, &record)?;
@@ -3184,6 +3288,7 @@ impl Harness {
             messages: point.messages,
             content_blocks: blocks,
             block_reset_proof: None,
+            block_fork_cut,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: point
                 .documents
@@ -3191,7 +3296,11 @@ impl Harness {
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or(false),
-            transcript: if prefix.is_some() { None } else { transcript },
+            transcript: if prefix.is_some() && block_fork_cut.is_none() {
+                None
+            } else {
+                transcript
+            },
             submissions: vec![],
             manual_compactions: vec![],
             active_manual_compaction: None,
@@ -3540,6 +3649,24 @@ impl Harness {
             .first()
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        if matches!(&change, TranscriptChange::ForkCut { .. }) {
+            let count = position
+                .remaining
+                .ok_or(crate::fork::Error::InvalidCursor)?;
+            let occurrences = self.resolved_occurrences(id, position.cursor.clone())?;
+            let (message, history) = occurrences
+                .get(
+                    count
+                        .checked_sub(1)
+                        .ok_or(crate::fork::Error::InvalidCursor)?,
+                )
+                .ok_or(crate::fork::Error::InvalidCursor)?;
+            let history = history
+                .as_ref()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let original = self.original_occurrence_position(history, message)?;
+            return self.fork_at_position(history.origin, original);
+        }
         let compacted_metadata = match &change {
             TranscriptChange::ReplaceCompacted {
                 commit,
@@ -3828,7 +3955,10 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             };
             let change: TranscriptChange = serde_json::from_value(batch.value.clone())?;
-            if matches!(&change, TranscriptChange::ReplaceCompacted { .. }) {
+            if matches!(
+                &change,
+                TranscriptChange::ReplaceCompacted { .. } | TranscriptChange::ForkCut { .. }
+            ) {
                 let active = self.resolved_occurrences(id, position.clone())?;
                 if let Some((message, history)) = active
                     .iter()
@@ -4184,7 +4314,76 @@ impl Harness {
         let mut created = std::collections::HashSet::new();
         for (position, change) in changes {
             change.compacted_histories()?;
-            if let TranscriptChange::ReplaceCompacted {
+            if let TranscriptChange::ForkCut {
+                messages,
+                histories,
+                commit,
+                origin,
+            } = change
+            {
+                self.verify_occurrence_origin(id, &position, origin, commit)?;
+                let predecessor =
+                    transcript.read_with_blocks(&position, std::num::NonZeroUsize::MIN)?;
+                if !predecessor.has_more {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let source_page =
+                    transcript.read_with_blocks(&predecessor.next, std::num::NonZeroUsize::MIN)?;
+                let source: TranscriptChange = serde_json::from_value(
+                    source_page
+                        .records
+                        .first()
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?
+                        .value
+                        .clone(),
+                )?;
+                let (stable_prefix, source_commit, source_origin, batch_len) = match source {
+                    TranscriptChange::AppendV3 {
+                        stable_prefix,
+                        commit,
+                        origin,
+                        messages,
+                        ..
+                    }
+                    | TranscriptChange::AppendV4 {
+                        stable_prefix,
+                        commit,
+                        origin,
+                        messages,
+                        ..
+                    } => (stable_prefix, commit, origin, messages.len()),
+                    _ => return Err(crate::fork::Error::InvalidSnapshot.into()),
+                };
+                let current_key = format!("runtime/fork/{source_origin}/{source_commit:020}");
+                let previous = source_commit
+                    .checked_sub(1)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let previous_key = format!("runtime/fork/{source_origin}/{previous:020}");
+                let revision = self
+                    .owner
+                    .store()
+                    .document_cut(current_key.as_bytes())?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if self.owner.store().document_cut(previous_key.as_bytes())? != Some(revision)
+                    || stable_prefix.checked_add(batch_len) != Some(active.len())
+                    || messages.len() <= stable_prefix
+                    || messages.len() >= active.len()
+                    || histories.len() != messages.len()
+                    || histories.iter().any(Option::is_none)
+                    || messages
+                        .iter()
+                        .zip(&active)
+                        .any(|(message, (old, _))| message != old)
+                    || histories
+                        .iter()
+                        .zip(&active)
+                        .any(|(history, (_, old))| history != old)
+                    || crate::fork::validate_context(&messages).is_err()
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                active.truncate(messages.len());
+            } else if let TranscriptChange::ReplaceCompacted {
                 messages,
                 system_end,
                 first_kept,
@@ -4343,6 +4542,9 @@ impl Harness {
                 break;
             };
             let change: TranscriptChange = serde_json::from_value(record.value)?;
+            if matches!(&change, TranscriptChange::ForkCut { .. }) {
+                self.resolved_occurrences(id, position.cursor.clone())?;
+            }
             let histories = change
                 .compacted_histories()?
                 .map(|histories| histories.to_vec());
@@ -11578,43 +11780,261 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn interior_block_batch_cut_is_rejected_without_losing_occurrence_provenance() {
+    fn interior_block_batch_fork_preserves_provenance_across_reopen() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let (id, child, ids, expected);
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            ids = [Uuid::new_v4(), Uuid::new_v4()];
+            for (index, occurrence) in ids.iter().enumerate() {
+                c.messages.push(Message::User {
+                    content: String::new(),
+                });
+                c.content_blocks.insert(
+                    index,
+                    crate::transcript::MessageContentBlocks {
+                        message_id: *occurrence,
+                        blocks: vec![
+                            json!({"type":"text", "text":format!("{index}")}),
+                            json!({"type":"image", "data":"aGk=", "mimeType":"image/png"}),
+                            json!({"type":"text", "text":"tail", "textSignature":"opaque"}),
+                        ],
+                    },
+                );
+            }
+            h.save(&c, Expected::Version(version)).unwrap();
+            let source = h.conversation(id).unwrap();
+            expected = h
+                .resolved_occurrences(id, source.transcript.clone().unwrap())
+                .unwrap();
+            child = h
+                .fork_at_position(
+                    id,
+                    ViewCursor {
+                        cursor: source.transcript.unwrap(),
+                        remaining: Some(1),
+                    },
+                )
+                .unwrap();
+            let forked = h.conversation(child).unwrap();
+            assert_eq!(forked.messages.len(), 1);
+            assert_eq!(forked.content_blocks[&0], c.content_blocks[&0]);
+            assert_eq!(
+                h.resolved_occurrences(child, forked.transcript.unwrap())
+                    .unwrap(),
+                expected[..1]
+            );
+            let via_id = h.fork_by_entry_id(id, ids[0]).unwrap();
+            assert_eq!(
+                h.conversation(via_id).unwrap().content_blocks[&0],
+                c.content_blocks[&0]
+            );
+        }
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
+        let forked = h.conversation(child).unwrap();
+        let marker = forked.transcript.clone().unwrap();
+        assert_eq!(forked.content_blocks[&0].message_id, ids[0]);
+        assert_eq!(
+            h.resolved_occurrences(child, forked.transcript.unwrap())
+                .unwrap(),
+            expected[..1]
+        );
+        let descendant = h.fork_by_entry_id(child, ids[0]).unwrap();
+        assert_eq!(
+            h.conversation(descendant).unwrap().content_blocks[&0].message_id,
+            ids[0]
+        );
+        assert!(h.fork_by_entry_id(child, ids[1]).is_err());
+        let new_id = h
+            .append_user_blocks(child, vec![json!({"type":"text", "text":"new"})])
+            .unwrap();
+        let appended = h.conversation(child).unwrap();
+        assert_eq!(appended.content_blocks[&0].message_id, ids[0]);
+        assert_eq!(appended.content_blocks[&1].message_id, new_id);
+        assert_eq!(
+            h.resolved_occurrences(child, appended.transcript.unwrap())
+                .unwrap()[0],
+            expected[0]
+        );
+        // A valid-looking but altered block on the child projection must not
+        // override the immutable occurrence from its parent.
+        let cursor = serde_json::to_value(marker).unwrap();
+        let entry_id = Uuid::parse_str(cursor["next"]["id"].as_str().unwrap()).unwrap();
+        let mut key = b"durable/transcript/entry/".to_vec();
+        key.extend_from_slice(entry_id.as_bytes());
+        let record = h.owner.store().get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();
+        value["content_blocks"][0]["blocks"][0]["text"] = json!("tampered");
+        h.owner
+            .store()
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(record.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(h.conversation(child).is_err());
+        drop(h);
+        assert!(Harness::open_paused(&path, options(placement_model())).is_err());
+    }
+
+    #[test]
+    fn interior_fork_before_first_block_preserves_plain_occurrence() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let (child, original);
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.messages = vec![
+                Message::User {
+                    content: "plain".into(),
+                },
+                Message::User {
+                    content: String::new(),
+                },
+                Message::User {
+                    content: "later".into(),
+                },
+            ];
+            c.content_blocks.insert(
+                1,
+                crate::transcript::MessageContentBlocks {
+                    message_id: Uuid::new_v4(),
+                    blocks: vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+                },
+            );
+            h.save(&c, Expected::Version(version)).unwrap();
+            let source = h.conversation(id).unwrap();
+            let histories = h
+                .resolved_occurrences(id, source.transcript.clone().unwrap())
+                .unwrap();
+            original = histories[0].1.clone().unwrap();
+            child = h
+                .fork_at_position(
+                    id,
+                    ViewCursor {
+                        cursor: source.transcript.unwrap(),
+                        remaining: Some(1),
+                    },
+                )
+                .unwrap();
+            let forked = h.conversation(child).unwrap();
+            assert!(forked.content_blocks.is_empty());
+            assert_eq!(
+                forked.messages,
+                vec![Message::User {
+                    content: "plain".into()
+                }]
+            );
+            let page = h
+                .view_positioned(child, std::num::NonZeroUsize::new(10).unwrap())
+                .unwrap();
+            assert_eq!(page.entries[0].history, Some(original.clone()));
+            let nested = h
+                .fork_at_position(child, page.entries[0].position.clone())
+                .unwrap();
+            assert_eq!(h.conversation(nested).unwrap().messages, forked.messages);
+        }
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
+        let forked = h.conversation(child).unwrap();
+        assert_eq!(
+            h.resolved_occurrences(child, forked.transcript.unwrap())
+                .unwrap()[0]
+                .1,
+            Some(original.clone())
+        );
+        let descendant = h.fork_by_entry_id(child, original.id).unwrap();
+        assert_eq!(
+            h.conversation(descendant).unwrap().messages,
+            forked.messages
+        );
+    }
+
+    #[test]
+    fn interior_block_fork_rejects_unproven_and_incomplete_tool_cuts() {
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let mut h =
             Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
-        let id = h.create_conversation(config()).unwrap();
-        let (mut c, version) = h.load(id).unwrap();
-        let ids = [Uuid::new_v4(), Uuid::new_v4()];
-        for (index, occurrence) in ids.iter().enumerate() {
+        for unproven in [false, true] {
+            let id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
             c.messages.push(Message::User {
                 content: String::new(),
             });
+            let occurrence = Uuid::new_v4();
             c.content_blocks.insert(
-                index,
+                0,
                 crate::transcript::MessageContentBlocks {
-                    message_id: *occurrence,
-                    blocks: vec![json!({"type":"text", "text":format!("{index}")})],
+                    message_id: occurrence,
+                    blocks: vec![json!({"type":"text","text":"keep"})],
                 },
             );
+            if unproven {
+                c.allowed_tools = Some(vec![]);
+                c.messages.push(Message::User {
+                    content: "later".into(),
+                });
+            } else {
+                c.messages.push(Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "test".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: None,
+                });
+                c.messages.push(Message::Tool {
+                    call_id: "call".into(),
+                    content: "done".into(),
+                });
+                c.messages.push(Message::User {
+                    content: "later".into(),
+                });
+            }
+            h.save(&c, Expected::Version(version)).unwrap();
+            let cursor = h.conversation(id).unwrap().transcript.unwrap();
+            let count = if unproven { 1 } else { 2 };
+            assert!(
+                h.fork_at_position(
+                    id,
+                    ViewCursor {
+                        cursor: cursor.clone(),
+                        remaining: Some(count)
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                h.fork_at_position(
+                    id,
+                    ViewCursor {
+                        cursor,
+                        remaining: Some(0)
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(
+                h.conversation(id).unwrap().content_blocks[&0].message_id,
+                occurrence
+            );
         }
-        h.save(&c, Expected::Version(version)).unwrap();
-        let cursor = h.conversation(id).unwrap().transcript.unwrap();
-        let interior = ViewCursor {
-            cursor,
-            remaining: Some(1),
-        };
-        assert!(matches!(
-            h.fork_at_position(id, interior),
-            Err(Error::Transcript(
-                crate::transcript::Error::UnsupportedContentBlocks
-            ))
-        ));
-        assert!(h.fork_by_entry_id(id, ids[0]).is_err());
-        let boundary = h.fork_by_entry_id(id, ids[1]).unwrap();
-        let forked = h.conversation(boundary).unwrap();
-        assert_eq!(forked.content_blocks[&0].message_id, ids[0]);
-        assert_eq!(forked.content_blocks[&1].message_id, ids[1]);
     }
 
     #[test]
@@ -13968,6 +14388,7 @@ mod scheduler_tests {
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
+            block_fork_cut: None,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
