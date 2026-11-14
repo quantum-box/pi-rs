@@ -862,7 +862,55 @@ mod jsonl_framing_tests {
 
     #[test]
     fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
-        for input in ["[false,] \"x\\u1", "\"x\\q\\u1", "\"x\n\\u1"] {
+        for input in ["[false,] \"x\\u1", "\"x\n\\u1"] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_escapes_report_v8_diagnostics() {
+        for (input, expected) in [
+            (
+                "\"\\x\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\q\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\u12x4\"",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"\\u1\"",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "{\"x\":\"😺\\x\"}",
+                "Bad escaped character in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                "[\r\n\"\\u12z4\"]",
+                "Bad Unicode escape in JSON at position 8 (line 2 column 6)",
+            ),
+            (
+                "\"x\\q\\u1",
+                "Bad escaped character in JSON at position 3 (line 1 column 4)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+        for input in ["[false,] \"x\\q\"", "\"x\n\\q\"", "\"\\uDC00\\x\""] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
                 super::rpc_json_error(input, &error),
@@ -908,6 +956,25 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    if (message.starts_with("invalid escape")
+        || error.is_eof() && message.starts_with("EOF while parsing a string"))
+        && let Some((reason, offset)) = invalid_json_escape(line)
+    {
+        let prefix = &line[..offset];
+        let position = prefix.encode_utf16().count();
+        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
+            + prefix.bytes().filter(|byte| *byte == b'\n').count()
+            - prefix.matches("\r\n").count()
+            + 1;
+        let column = prefix
+            .rsplit(['\r', '\n'])
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count()
+            + 1;
+        return format!("{reason} at position {position} (line {row} column {column})");
+    }
     if error.is_eof() && message.starts_with("EOF while parsing a string") {
         match unfinished_json_escape(line) {
             Some(false) => return "Unexpected end of JSON input".into(),
@@ -982,6 +1049,38 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// Locate the first malformed escape without interpreting subsequent text.
+// The caller only uses this after serde reports an invalid escape or an
+// unfinished string, so preceding structural errors retain their diagnostics.
+fn invalid_json_escape(line: &str) -> Option<(&'static str, usize)> {
+    let mut chars = line.char_indices();
+    let mut in_string = false;
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => match chars.next() {
+                Some((_, 'u')) => {
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some((_, hex)) if hex.is_ascii_hexdigit() => {}
+                            Some((offset, _)) => {
+                                return Some(("Bad Unicode escape in JSON", offset));
+                            }
+                            None => return None,
+                        }
+                    }
+                }
+                Some((_, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) => {}
+                Some((offset, _)) => return Some(("Bad escaped character in JSON", offset)),
+                None => return None,
+            },
+            ch if in_string && ch < ' ' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 // Identify only an incomplete escape inside an open string. Earlier invalid
