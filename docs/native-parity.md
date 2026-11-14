@@ -3366,7 +3366,9 @@ Completed output retains source and a warning when that last line failed.
 The journal, print output, and model context retain the original Markdown.
 Partially accepted flowchart statements retain the source and report the first
 warning and the count of additional warnings after streaming; during streaming
-the readable portion remains visible.
+the readable portion remains visible. Like Pi v1.5.0’s
+`grok-mermaid` parser, a class name immediately followed by an undirected link
+without whitespace can consume part of that link and render an incomplete graph.
 
 ### Model session affinity checkpoint
 
