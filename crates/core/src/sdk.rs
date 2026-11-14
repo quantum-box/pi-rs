@@ -2433,9 +2433,14 @@ impl AgentSession {
             .iter()
             .find(|record| record.id == entry_id)
             .ok_or_else(|| Error::Session("invalid fork entry".into()))?;
-        let target = match position {
-            crate::ForkPosition::Before => record.parent.unwrap_or(1),
-            crate::ForkPosition::At => record.id,
+        let resolved_entry = journal.fork_target_after_handoff(record.id)?;
+        let target = if resolved_entry != record.id {
+            resolved_entry
+        } else {
+            match position {
+                crate::ForkPosition::Before => record.parent.unwrap_or(1),
+                crate::ForkPosition::At => record.id,
+            }
         };
         let target = journal.fork_target_after_handoff(target)?;
         let snapshot = Session::from_records(journal.fork_records_after_handoff(target)?)?;
@@ -5537,6 +5542,114 @@ mod tests {
         assert_eq!(hooked.prompt("hooked").await.unwrap(), "return");
         hooked.close().await.unwrap();
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fork_hook_positions_resolve_selected_handoff_entry() {
+        for (position, checkout_entry) in [
+            (crate::ForkPosition::Before, false),
+            (crate::ForkPosition::At, false),
+            (crate::ForkPosition::Before, true),
+            (crate::ForkPosition::At, true),
+        ] {
+            let mut session =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+                    .provider("return")
+                    .unwrap()
+                    .provider_branch_model(
+                        "temporary",
+                        "shared",
+                        Arc::new(ProviderBranchModel("temporary")),
+                    )
+                    .unwrap()
+                    .in_memory()
+                    .unwrap();
+            let selected = {
+                let mut journal = session.journal().unwrap();
+                journal
+                    .select_provider_model(Some("temporary"), "shared", None)
+                    .unwrap();
+                let temporary = journal.head();
+                journal.checkout(1).unwrap();
+                journal
+                    .select_provider_model(Some("return"), "shared", None)
+                    .unwrap();
+                let return_to = journal.head();
+                journal
+                    .append(crate::Event::TreeTriggerHandoff {
+                        run_id: Uuid::new_v4(),
+                        return_to,
+                    })
+                    .unwrap();
+                journal.checkout(temporary).unwrap();
+                let checkout = journal.records().last().unwrap().id;
+                journal
+                    .append_user_with_images("temporary".into(), vec![], None)
+                    .unwrap();
+                if checkout_entry {
+                    checkout
+                } else {
+                    journal.head()
+                }
+            };
+            let mut fork = session
+                .fork_with_hooks(selected, position, None)
+                .await
+                .unwrap();
+            assert_eq!(fork.prompt("test").await.unwrap(), "return");
+            fork.close().await.unwrap();
+            session.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn historical_fork_accepts_settled_target_when_source_is_unsettled() {
+        for handoff in [false, true] {
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .select_provider_model(Some("temporary"), "shared", None)
+                .unwrap();
+            let temporary = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("return"), "shared", None)
+                .unwrap();
+            let return_to = journal.head();
+            if handoff {
+                journal
+                    .append(crate::Event::TreeTriggerHandoff {
+                        run_id: Uuid::new_v4(),
+                        return_to,
+                    })
+                    .unwrap();
+            }
+            journal.checkout(temporary).unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![crate::Invocation {
+                        operation_id: Uuid::new_v4(),
+                        call: crate::ToolCall {
+                            id: "pending".into(),
+                            name: "tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let requested = if handoff { journal.head() } else { return_to };
+            let fork =
+                Session::from_records(journal.fork_records_after_handoff(requested).unwrap())
+                    .unwrap();
+            assert_eq!(fork.model_provider(), Some("return"));
+            assert!(journal.conversation_at(journal.head()).is_err());
+            assert!(journal.fork_records_after_handoff(0).is_err());
+            if !handoff {
+                assert!(journal.fork_records_after_handoff(journal.head()).is_err());
+            }
+        }
     }
 
     #[test]

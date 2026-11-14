@@ -1536,7 +1536,9 @@ impl Session {
     /// The marker can live on the other branch and must be inspected in the
     /// complete source journal, not in the already-filtered fork records.
     pub(crate) fn fork_target_after_handoff(&self, requested: u64) -> Result<u64> {
-        self.validate_checkout(requested)?;
+        if requested == 0 || requested > self.records.len() as u64 {
+            return Err(Error::Session("invalid fork entry".into()));
+        }
         let mut target = requested;
         if let Some((marker, return_to)) = self.pending_tree_trigger_handoff() {
             let checkout =
@@ -1547,11 +1549,12 @@ impl Session {
                         _ => None,
                     });
             let temporary_descendant = checkout.is_some_and(|(checkout_id, temporary)| {
-                requested > checkout_id
-                    && self
-                        .path(requested)
-                        .iter()
-                        .any(|record| record.id == temporary)
+                requested == checkout_id
+                    || (requested > checkout_id
+                        && self
+                            .path(requested)
+                            .iter()
+                            .any(|record| record.id == temporary))
             });
             if requested == marker || requested == self.head || temporary_descendant {
                 target = return_to;
