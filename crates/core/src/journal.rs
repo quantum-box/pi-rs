@@ -2006,6 +2006,8 @@ impl Session {
     }
 
     /// Export one settled branch with fresh session identity and remapped record references.
+    /// Auxiliary record metadata is not representable in this legacy return type;
+    /// use `fork_session` or `fork_to` when it must be preserved.
     pub fn fork_records(&self, target: u64) -> Result<Vec<Record>> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
@@ -2126,6 +2128,27 @@ impl Session {
         }
         validated_head(&records)?;
         Ok(records)
+    }
+
+    /// Fork a settled branch in memory, preserving auxiliary record metadata.
+    pub fn fork_session(&self, target: u64) -> Result<Self> {
+        let records = self.fork_records(target)?;
+        let metadata = self
+            .path(target)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, original)| {
+                let forked = records.get(index)?;
+                (std::mem::discriminant(&original.event) == std::mem::discriminant(&forked.event))
+                    .then(|| {
+                        self.record_metadata
+                            .get(&original.id)
+                            .map(|value| (forked.id, value.clone()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        Self::from_records_with_metadata(records, metadata)
     }
 
     /// Publish a complete local journal without replacing an existing file.
@@ -3519,6 +3542,8 @@ mod record_metadata_tests {
         assert_eq!(fork.record_metadata(id), Some(&metadata));
         let in_memory_fork = session.fork_session_after_handoff(id).unwrap();
         assert_eq!(in_memory_fork.record_metadata(id), Some(&metadata));
+        let public_fork = session.fork_session(id).unwrap();
+        assert_eq!(public_fork.record_metadata(id), Some(&metadata));
         drop(session);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));
