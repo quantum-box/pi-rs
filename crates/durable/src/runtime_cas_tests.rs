@@ -2941,8 +2941,7 @@ fn managed_anchor_creation_waits_for_abort_graph_gate() {
         };
         let parent = h.create_conversation(config.clone()).unwrap();
         if existing {
-            h.ensure_subagent(parent, "worker", config.clone())
-                .unwrap();
+            h.ensure_subagent(parent, "worker", config.clone()).unwrap();
         }
         let owner = h.owner.clone();
         let gate = owner.task_gate().lock().unwrap();
