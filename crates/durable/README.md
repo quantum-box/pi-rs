@@ -41,6 +41,14 @@ The explicitly driven Harness polls once per resume. Polling never redispatches
 the original operation. External effect
 idempotency remains the tool's and destination's responsibility.
 
+New transcript batches expose immutable per-occurrence message IDs and their
+originating atomic observation commit through positioned views. Only the last
+message of a batch corresponds to a separately captured state boundary; legacy
+batches have no entry metadata and fail closed for position forks. Reset and
+compaction replacement batches assign fresh IDs to their replacement occurrences.
+This is groundwork, not entry-ID lookup or arbitrary entry-ID forking. See the
+parity document for historical-state and storage limitations.
+
 The runtime can fork a settled conversation at its current state or a supported
 historical snapshot cursor, and performs explicit idle compaction. It also
 supports `fork_at_position` for a message at a complete batch boundary with

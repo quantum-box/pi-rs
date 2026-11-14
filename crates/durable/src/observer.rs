@@ -74,6 +74,17 @@ pub struct Append {
     pub cursor: Cursor,
 }
 
+impl Append {
+    /// Set the payload after preparing the sequence, before committing the batch.
+    pub(crate) fn set_value(&mut self, value: &Value) -> Result<(), Error> {
+        match self.mutations.first_mut() {
+            Some(Mutation::Put { value: stored, .. }) => *stored = serde_json::to_vec(value)?,
+            _ => return Err(Error::Corrupt),
+        }
+        Ok(())
+    }
+}
+
 pub struct Observer<'a> {
     store: &'a Store,
     stream: Uuid,

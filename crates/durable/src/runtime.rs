@@ -297,6 +297,51 @@ enum ModelFailureDecision {
 enum TranscriptChange {
     Append(Vec<Message>),
     Replace(Vec<Message>),
+    AppendV2 {
+        messages: Vec<Message>,
+        ids: Vec<Uuid>,
+        commit: u64,
+        origin: Uuid,
+    },
+    ReplaceV2 {
+        messages: Vec<Message>,
+        ids: Vec<Uuid>,
+        commit: u64,
+        origin: Uuid,
+    },
+}
+
+impl TranscriptChange {
+    fn parts(self) -> Result<(Vec<Message>, bool, Option<(Vec<Uuid>, u64, Uuid)>), Error> {
+        let (messages, base, metadata) = match self {
+            Self::Append(messages) => (messages, false, None),
+            Self::Replace(messages) => (messages, true, None),
+            Self::AppendV2 {
+                messages,
+                ids,
+                commit,
+                origin,
+            } => (messages, false, Some((ids, commit, origin))),
+            Self::ReplaceV2 {
+                messages,
+                ids,
+                commit,
+                origin,
+            } => (messages, true, Some((ids, commit, origin))),
+        };
+        if let Some((ids, commit, origin)) = &metadata {
+            let unique: std::collections::HashSet<_> = ids.iter().collect();
+            if ids.len() != messages.len()
+                || unique.len() != ids.len()
+                || ids.iter().any(Uuid::is_nil)
+                || *commit == 0
+                || origin.is_nil()
+            {
+                return Err(Error::Invalid("invalid transcript entry metadata".into()));
+            }
+        }
+        Ok((messages, base, metadata))
+    }
 }
 
 /// Delivery selection at durable conversation boundaries.
@@ -460,6 +505,18 @@ pub struct ViewPage {
 pub struct PositionedMessage {
     pub message: Message,
     pub position: ViewCursor,
+    /// Identity and atomic commit association, absent for legacy batches.
+    pub history: Option<MessageHistory>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageHistory {
+    pub id: Uuid,
+    pub commit: u64,
+    /// Conversation whose observation stream owns this commit.
+    pub origin: Uuid,
+    /// Only the final message in a batch has a state at its exact boundary.
+    pub commit_boundary: bool,
 }
 
 pub struct PositionedViewPage {
@@ -844,12 +901,10 @@ impl Harness {
             let page = transcript.read(&cursor, std::num::NonZeroUsize::new(128).unwrap())?;
             for record in page.records {
                 let change: TranscriptChange = serde_json::from_value(record.value)?;
-                match change {
-                    TranscriptChange::Append(messages) => parts.push(messages),
-                    TranscriptChange::Replace(messages) => {
-                        parts.push(messages);
-                        return Ok(parts.into_iter().rev().flatten().collect());
-                    }
+                let (messages, base, _) = change.parts()?;
+                parts.push(messages);
+                if base {
+                    return Ok(parts.into_iter().rev().flatten().collect());
                 }
             }
             if !page.has_more {
@@ -1060,6 +1115,9 @@ impl Harness {
             .as_ref()
             .filter(|(v, _)| expected == Expected::Version(*v))
             .map(|(_, s)| s);
+        let mut append = crate::observer::Observer::new(self.owner.store(), state.id)
+            .prepare_append(&serde_json::json!({}))?;
+        let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
         let change = match old {
             Some(previous) if !create && state.messages == previous.messages => None,
@@ -1068,6 +1126,28 @@ impl Harness {
             ),
             _ => Some(TranscriptChange::Replace(state.messages.clone())),
         };
+        // Inline legacy messages predate this commit; their original identities and
+        // state cannot be reconstructed. Keep the migration batch unannotated.
+        let change = change.map(|change| {
+            if create && old.is_some() {
+                return change;
+            }
+            match change {
+                TranscriptChange::Append(messages) => TranscriptChange::AppendV2 {
+                    ids: messages.iter().map(|_| Uuid::new_v4()).collect(),
+                    messages,
+                    commit,
+                    origin: state.id,
+                },
+                TranscriptChange::Replace(messages) => TranscriptChange::ReplaceV2 {
+                    ids: messages.iter().map(|_| Uuid::new_v4()).collect(),
+                    messages,
+                    commit,
+                    origin: state.id,
+                },
+                _ => unreachable!(),
+            }
+        });
         let prepared = if expected == Expected::Missing && state.transcript.is_some() {
             let source = state.transcript.as_ref().unwrap();
             if self.read_transcript(source.transcript_id(), source.clone())? != state.messages {
@@ -1091,8 +1171,7 @@ impl Harness {
         persisted.messages.clear();
         let value = serde_json::to_vec(&persisted)?;
         let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes});
-        let append =
-            crate::observer::Observer::new(self.owner.store(), state.id).prepare_append(&event)?;
+        append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
             version: 1,
@@ -1525,9 +1604,11 @@ impl Harness {
             .first()
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
-        let messages = match change {
-            TranscriptChange::Append(messages) | TranscriptChange::Replace(messages) => messages,
-        };
+        let (messages, _, metadata) = change.parts()?;
+        let (_, commit, origin) = metadata.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if origin != id {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         if messages.is_empty() || position.remaining != Some(messages.len()) {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
@@ -1541,6 +1622,9 @@ impl Harness {
                 let reference: Option<crate::transcript::Cursor> =
                     serde_json::from_value(reference)?;
                 if reference.as_ref() == Some(&position.cursor) {
+                    if record.cursor.0 != commit {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
                     let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
                     let entry = self
                         .owner
@@ -1727,10 +1811,8 @@ impl Harness {
                 break;
             };
             let change: TranscriptChange = serde_json::from_value(record.value)?;
-            let (messages, base) = match change {
-                TranscriptChange::Append(messages) => (messages, false),
-                TranscriptChange::Replace(messages) => (messages, true),
-            };
+            let (messages, base, metadata) = change.parts()?;
+            let batch_len = messages.len();
             let end = position.remaining.unwrap_or(messages.len());
             if end > messages.len() {
                 return Err(Error::Invalid("invalid view cursor".into()));
@@ -1749,6 +1831,14 @@ impl Harness {
                             cursor: position.cursor.clone(),
                             remaining: Some(index + 1),
                         },
+                        history: metadata
+                            .as_ref()
+                            .map(|(ids, commit, origin)| MessageHistory {
+                                id: ids[index],
+                                commit: *commit,
+                                origin: *origin,
+                                commit_boundary: index + 1 == batch_len,
+                            }),
                     }),
             );
             if start > 0 {

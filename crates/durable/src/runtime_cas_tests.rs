@@ -1137,3 +1137,177 @@ fn position_fork_rejects_missing_or_mismatched_historical_metadata() {
         .unwrap();
     assert!(h.fork_at_position(id, position).is_err());
 }
+
+#[test]
+fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "first".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "hello".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let user = h
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0);
+    let user_history = user.history.unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "second".into();
+    state.phase = Phase::Boundary {
+        turns: 1,
+        answer: None,
+    };
+    state.tool_states.insert(
+        "tool".into(),
+        ExtensionState {
+            version: 1,
+            data: serde_json::json!({"step": 1}),
+        },
+    );
+    state.messages.extend([
+        Message::Assistant {
+            content: "calling".into(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "call".into(),
+            content: "result".into(),
+        },
+    ]);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let page = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    let tool = page.entries[0].history.as_ref().unwrap();
+    let model = page.entries[1].history.as_ref().unwrap();
+    assert_ne!(tool.id, model.id);
+    assert_ne!(tool.id, user_history.id);
+    assert_eq!(tool.commit, model.commit);
+    assert!(tool.commit_boundary);
+    assert!(!model.commit_boundary);
+    assert_ne!(tool.commit, user_history.commit);
+    let snapshot = |history: &MessageHistory| -> serde_json::Value {
+        let key = format!("runtime/fork/{}/{:020}", history.origin, history.commit);
+        serde_json::from_slice(&h.owner.store().get(key.as_bytes()).unwrap().unwrap().value)
+            .unwrap()
+    };
+    assert_eq!(snapshot(&user_history)["config"]["model"], "first");
+    let historical = snapshot(tool);
+    assert_eq!(historical["config"]["model"], "second");
+    assert_eq!(historical["tool_states"]["tool"]["data"]["step"], 1);
+    assert!(historical["phase"].get("Boundary").is_some());
+    let saved = serde_json::to_value(tool).unwrap();
+    let position = page.entries[0].position.clone();
+    let (mut state, version) = h.load(id).unwrap();
+    state.phase = Phase::Idle;
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.reset(id, Some("replacement".into())).unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let old = h
+        .view_positioned_page(id, position, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(old.entries[0].history.as_ref().unwrap()).unwrap(),
+        saved
+    );
+}
+
+#[test]
+fn legacy_batches_are_readable_but_cannot_claim_entry_history_or_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, _) = h.load(id).unwrap();
+    let message = Message::User {
+        content: "legacy".into(),
+    };
+    let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+    let (batch, cursor) = transcript
+        .prepare_write(
+            &serde_json::to_value(TranscriptChange::Replace(vec![message])).unwrap(),
+            false,
+        )
+        .unwrap();
+    state.transcript = Some(cursor);
+    state.messages.clear();
+    let mut mutations = batch.mutations;
+    mutations.push(Mutation::Put {
+        key: Harness::key(id),
+        value: serde_json::to_vec(&state).unwrap(),
+    });
+    h.owner.store().commit(&batch.checks, &mutations).unwrap();
+    let old = h
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0);
+    assert!(old.history.is_none());
+    assert!(h.fork_at_position(id, old.position).is_err());
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "new".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let page = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    assert!(page.entries[0].history.is_some());
+    assert!(page.entries[1].history.is_none());
+}
+
+#[test]
+fn malformed_entry_metadata_fails_closed() {
+    let id = Uuid::new_v4();
+    let message = Message::User {
+        content: "x".into(),
+    };
+    for ids in [vec![], vec![Uuid::nil()], vec![id, id]] {
+        let messages = if ids.len() == 2 {
+            vec![message.clone(), message.clone()]
+        } else {
+            vec![message.clone()]
+        };
+        assert!(
+            TranscriptChange::AppendV2 {
+                messages,
+                ids,
+                commit: 1,
+                origin: Uuid::new_v4()
+            }
+            .parts()
+            .is_err()
+        );
+    }
+    assert!(
+        TranscriptChange::AppendV2 {
+            messages: vec![message],
+            ids: vec![id],
+            commit: 0,
+            origin: Uuid::new_v4()
+        }
+        .parts()
+        .is_err()
+    );
+}
