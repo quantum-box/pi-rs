@@ -707,8 +707,15 @@ that capability and forward the field-presence result across the process boundar
 A duplex host remains available for nested calls even if it cannot send custom
 messages. Single-shot and duplex presence responses allow only the fixed wrapper
 overhead; the underlying outcome and nonterminal frames still obey their original
-limits. Older executables
-and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
+limits. Older executables and opaque overrides remain conservative when field
+presence is unavailable. Image reads use the same transient event path to project
+Pi's image structured result with its MIME type, encoded data and displayed note;
+image omission results project the note as a string. Existing image and event
+size limits remain in force; attachment-reference results are not synthesized.
+Structured image outcomes accept metadata-only result patches without losing
+content or the transient structured value; explicit text replacement discards
+both. Changing the error status of a non-object structured payload remains
+unsupported.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
