@@ -25,8 +25,12 @@
 <main>
   <span class="badge">ブラウザで動作する Rust / WASM</span>
   <h1>pi-rs セッションプレビュー</h1>
-  <p class="hint">pi-rs の AgentSession がこのブラウザ内で動作します。回答はプレビュー用の<b>模擬応答</b>で、実際の AI モデルには接続しません。</p>
+  <p class="hint">pi-rs の AgentSession がブラウザ内で動き、Tachyon Model Gateway の <b>GPT-6 Luna</b> に接続します。</p>
   <div class="box">
+    <label for="token"><b>Tachyon アクセストークン</b></label>
+    <p class="hint">QuantumBox テナントにアクセスできるトークンを入力してください。トークンはこのページのメモリ内だけで使い、保存しません。API の利用料金はテナントに発生します。</p>
+    <div class="row"><input id="token" type="password" autocomplete="off" spellcheck="false" aria-label="Tachyon アクセストークン" placeholder="Tachyon アクセストークン"></div>
+    <p class="hint">macOS では <code>tachyon auth token --tenant-id quantumbox | pbcopy</code> でコピーできます。ページを再読み込みした場合は再入力してください。</p>
     <div id="log" aria-live="polite"></div>
     <p id="status" class="status">WASM を読み込み中…</p>
     <div class="row">
@@ -36,34 +40,22 @@
     </div>
     <div class="row" style="margin-top:12px">
       <button id="reopen" disabled>保存した会話を再オープン</button>
-      <button id="slow" disabled>待機する通信を開始</button>
     </div>
-    <p class="hint">会話はこのブラウザに保存されます。「待機する通信を開始」のあとに「キャンセル」を押すと中断を試せます。</p>
+    <p class="hint">会話はこのブラウザに保存されます。回答中は「キャンセル」で中断できます。</p>
   </div>
 </main>
 <script type="module">
 import init, { BrowserSession } from './pkg/pi_rs_browser_sdk.js';
-
-// Demo gateway: the SDK issues a POST, and this adapter fetches a static mock
-// response. It never sends the user's text to a model provider.
-const nativeFetch = window.fetch.bind(window);
-window.fetch = async function(request, options) {
-  if (request instanceof Request && new URL(request.url).pathname === '/demo-gateway') {
-    const body = await request.clone().json();
-    const last = body.messages.filter(m => m.role === 'user').at(-1)?.content;
-    const delay = last === 'キャンセルを試す' ? 10000 : 400;
-    await new Promise((resolve, reject) => {
-      if (request.signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
-      const timer = setTimeout(resolve, delay);
-      request.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
-    });
-    return nativeFetch('./mock-response.json', { signal: request.signal, cache: 'no-store' });
-  }
-  return nativeFetch(request, options);
-};
+import { createGatewayFetch } from './tachyon-gateway.mjs';
+let gatewayError = '';
+const token = document.querySelector('#token');
+token.value = '';
+window.addEventListener('pagehide', () => { token.value = ''; });
+window.addEventListener('pageshow', event => { if (event.persisted) token.value = ''; });
+window.fetch = createGatewayFetch({ fetchImpl: window.fetch.bind(window), getToken: () => token.value, onError: message => { gatewayError = message; }, origin: location.origin });
 const log = document.querySelector('#log'), status = document.querySelector('#status');
 const send = document.querySelector('#send'), cancel = document.querySelector('#cancel');
-const reopen = document.querySelector('#reopen'), slow = document.querySelector('#slow'), input = document.querySelector('#input');
+const reopen = document.querySelector('#reopen'), input = document.querySelector('#input');
 let session;
 function show(text, cls = 'status') { const item = document.createElement('div'); item.className = cls; item.textContent = text; log.append(item); log.scrollTop = log.scrollHeight; }
 function render() {
@@ -75,23 +67,23 @@ function render() {
   }
   if (!messages.length) show('まだ会話はありません。メッセージを送ってください。');
 }
-function ready() { send.disabled = false; reopen.disabled = false; slow.disabled = false; cancel.disabled = true; }
+function ready() { send.disabled = false; reopen.disabled = false; cancel.disabled = true; }
 async function run(text) {
-  send.disabled = reopen.disabled = slow.disabled = true; cancel.disabled = false; status.textContent = '通信中…';
+  if (!token.value.trim()) { status.textContent = 'Tachyon アクセストークンを入力してください。'; token.focus(); return; }
+  gatewayError = ''; send.disabled = reopen.disabled = true; cancel.disabled = false; status.textContent = 'GPT-6 Luna に問い合わせ中…';
   try { await session.prompt(text); render(); status.textContent = '完了（会話をブラウザに保存しました）'; }
-  catch (error) { render(); status.textContent = '中断またはエラー: ' + String(error); }
+  catch (error) { render(); status.textContent = gatewayError || ('中断またはエラー: ' + String(error)); }
   finally { ready(); }
 }
 send.onclick = () => run(input.value);
 input.onkeydown = event => { if (event.key === 'Enter' && !send.disabled) send.click(); };
-slow.onclick = () => run('キャンセルを試す');
 cancel.onclick = () => { session.cancel(); status.textContent = 'キャンセルを要求しました…'; };
 reopen.onclick = async () => {
-  send.disabled = reopen.disabled = slow.disabled = true;
-  try { await session.close(); session.free(); session = await BrowserSession.open('tachyon-preview', location.origin + '/demo-gateway', 'preview', '', 15000); render(); status.textContent = '保存した会話を復元しました'; ready(); }
+  send.disabled = reopen.disabled = true;
+  try { await session.close(); session.free(); session = await BrowserSession.open('tachyon-luna-v1', location.origin + '/demo-gateway', 'openai/gpt-6-luna', '', 120000); render(); status.textContent = '保存した会話を復元しました'; ready(); }
   catch (error) { status.textContent = '復元できません: ' + String(error); }
 };
-try { await init(); session = await BrowserSession.open('tachyon-preview', location.origin + '/demo-gateway', 'preview', '', 15000); render(); status.textContent = '準備完了'; ready(); }
+try { await init(); session = await BrowserSession.open('tachyon-luna-v1', location.origin + '/demo-gateway', 'openai/gpt-6-luna', '', 120000); render(); status.textContent = '準備完了'; ready(); }
 catch (error) { status.textContent = '起動できません: ' + String(error); }
 </script>
 </body>
