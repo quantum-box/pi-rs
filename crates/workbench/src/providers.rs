@@ -784,7 +784,13 @@ impl Client {
                 }
                 Self::Anthropic(client)
             }
-            Self::Google(client) => Self::Google(client.with_thinking(thinking)),
+            Self::Google(client) => Self::Google(
+                client
+                    .with_thinking(thinking)
+                    .with_thinking_budget_settings(
+                        args.settings.value().get("thinkingBudgets").cloned(),
+                    ),
+            ),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -1025,6 +1031,41 @@ mod contention_tests {
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn google_thinking_budget_settings_follow_model_options() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".pi")).unwrap();
+        std::fs::write(
+            workspace.path().join(".pi/settings.json"),
+            r#"{"thinkingBudgets":{"high":9000}}"#,
+        )
+        .unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        args.thinking = Some("high".into());
+        let base =
+            Client::Google(pi_rs::google::Google::new("https://example.com", "key").unwrap());
+        let configured = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("high"))
+                .with_thinking_budget_settings(
+                    args.settings.value().get("thinkingBudgets").cloned(),
+                ),
+        );
+        assert_eq!(configured.context_identity(), expected.context_identity());
+        args.settings = super::super::config::Settings::default();
+        let reset = configured.with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("high")),
+        );
+        assert_eq!(reset.context_identity(), expected.context_identity());
+    }
 
     #[cfg(any(unix, windows))]
     #[tokio::test]

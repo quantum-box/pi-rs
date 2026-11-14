@@ -2533,6 +2533,16 @@ clamping and worker transmission. A real PTY check with local Qwen verifies
 the available levels, selection persistence and terminal restoration.
 Workspace tests and all-target Clippy pass.
 
+### Google thinking budgets checkpoint
+
+Gemini 2.5 token-budget thinking uses Pi's model-specific defaults or the
+selected `thinkingBudgets` setting, independently of `maxOutputTokens`.
+Turning thinking off sends a zero budget. Gemini's discrete thinking-level
+models do not consume these token budgets. The configured budgets also enter
+the protected request identity, so changing them invalidates a prior context
+estimate. A loopback fixture checks the configured budget on the actual request;
+live Google service limits and acceptance have not been verified.
+
 ### Terminal session navigation checkpoint
 
 With an empty draft, two interrupts within 500 ms open the session tree by
