@@ -3745,6 +3745,7 @@ pub(super) async fn run(
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
+    let mut thinking_level_input = VecDeque::new();
     let mut interrupted = false;
     'interactive: loop {
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3997,6 +3998,7 @@ pub(super) async fn run(
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     state.levels = None;
+                    thinking_level_input.clear();
                     let mut picker = state.model_picker.take().expect("model picker");
                     picker.show_feedback(Err("Thinking level discovery stopped".into()));
                     view.picker = Some(picker);
@@ -4279,7 +4281,20 @@ pub(super) async fn run(
         } else {
             Duration::from_millis(40)
         };
-        let next_input = if let Some(event) = deferred_input.pop_front() {
+        let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
+        let loading = picker_title == Some("Loading thinking levels");
+        let ready = picker_title.is_some_and(|title| title.starts_with("Thinking level · "));
+        let blocked =
+            view.dialog().is_some() || view.local_editor.is_some() || view.share_blocks_input();
+        let pending = if view.pending_transition.is_some() {
+            thinking_level_input.clear();
+            None
+        } else {
+            next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
+        };
+        let next_input = if let Some(event) = pending {
+            Some(crate::ui::input::InputEvent::Event(event))
+        } else if let Some(event) = deferred_input.pop_front() {
             Some(event)
         } else {
             input.next(input_wait)?
@@ -4395,6 +4410,22 @@ pub(super) async fn run(
             }
             _ => continue,
         };
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+            && view.pending_transition.is_none()
+            && buffer_thinking_level_input(
+                &mut thinking_level_input,
+                &event,
+                matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && keys.matches("tui.select.cancel", *key)),
+            )
+        {
+            continue;
+        }
         if view.pending_transition.is_some() {
             match &event {
                 Event::Key(key) if key.code == KeyCode::Esc => {
@@ -7027,6 +7058,40 @@ fn select(
     Ok(())
 }
 
+// Keep typeahead in order until model-level discovery finishes. A configured
+// picker cancellation discards input intended for the abandoned picker.
+fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event, cancel: bool) -> bool {
+    match event {
+        Event::Key(_) if cancel => {
+            pending.clear();
+            false
+        }
+        Event::Key(_) | Event::Paste(_) => {
+            if pending.len() < 1024 {
+                pending.push_back(event.clone());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn next_thinking_level_input(
+    pending: &mut VecDeque<Event>,
+    loading: bool,
+    ready: bool,
+    blocked: bool,
+) -> Option<Event> {
+    if !loading && !ready {
+        pending.clear();
+    }
+    if ready && !blocked {
+        pending.pop_front()
+    } else {
+        None
+    }
+}
+
 // A bare Escape may need the input decoder's 25 ms disambiguation window.
 // Give already-arrived input priority over committing a prepared session.
 fn queued_transition_cancel(
@@ -7892,6 +7957,99 @@ mod tests {
         assert_eq!(pending.id, share_id);
         assert!(snapshot.is_none());
         assert!(view.pending_share.is_none());
+    }
+
+    #[test]
+    fn thinking_level_typeahead_waits_for_discovery_and_escape_discards_it() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let mut pending = VecDeque::new();
+        let typed = [
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
+            Event::Paste("lear".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        for event in &typed {
+            assert!(super::buffer_thinking_level_input(
+                &mut pending,
+                event,
+                false
+            ));
+        }
+        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, true, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, true),
+            None
+        );
+        for event in &typed {
+            assert_eq!(
+                super::next_thinking_level_input(&mut pending, false, true, false),
+                Some(event.clone())
+            );
+        }
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &escape,
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(super::Keys::default().matches("tui.select.cancel", ctrl_c));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Key(ctrl_c),
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Resize(80, 24),
+            false
+        ));
+    }
+
+    #[test]
+    fn thinking_typeahead_does_not_escape_an_abandoned_picker() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let extra = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([enter.clone(), extra.clone()]);
+        // Enter selects a level and closes the level picker.
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            Some(enter)
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert!(pending.is_empty());
+        // A new picker must never receive input left by a cancelled discovery.
+        pending.push_back(extra);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            None
+        );
     }
 
     #[test]
