@@ -1521,7 +1521,10 @@ fn markdown_at_depth(
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                let body = text[range]
+                // The range indexes the original document; normalize only the
+                // extracted quote before recursively parsing its local text.
+                let quote = text[range].replace("\r\n", "\n").replace('\r', "\n");
+                let body = quote
                     .lines()
                     .map(|line| {
                         let trimmed = line.trim_start_matches(' ');
@@ -1824,6 +1827,9 @@ mod tests {
             "~~`a\rb`~~",
             "- ~~`a\r\n  b`~~",
             "- ~~`a\r  b`~~",
+            "> ~~`a\r\n> b`~~",
+            "> ~~`a\r> b`~~",
+            "> - ~~`a\r>   b`~~",
         ] {
             let lines = markdown(source, &theme, 120);
             assert!(
@@ -1841,6 +1847,23 @@ mod tests {
                 "{source:?}: {lines:?}"
             );
         }
+        let source = "> ~~`a\r> b`~~\r> https://example.com";
+        let lines = markdown_at_depth(
+            source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+            "{lines:?}"
+        );
     }
 
     #[test]
