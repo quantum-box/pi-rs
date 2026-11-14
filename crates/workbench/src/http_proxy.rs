@@ -554,6 +554,115 @@ mod tests {
     concurrent_routes_loopback!(concurrent_proxy_credentials_are_isolated, reqwest);
     concurrent_routes_loopback!(mcp_concurrent_proxy_credentials_are_isolated, reqwest_mcp);
 
+    macro_rules! socks_routes_loopback {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{
+                    Arc,
+                    atomic::{AtomicUsize, Ordering},
+                };
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let counter = calls.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let password = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "one"
+                    } else {
+                        "two"
+                    };
+                    Some(format!("socks5h://user:{password}@{address}"))
+                });
+                let server = tokio::spawn(async move {
+                    let mut passwords = Vec::new();
+                    let mut open_sockets = Vec::new();
+                    for _ in 0..2 {
+                        let (mut socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let mut greeting = [0u8; 2];
+                        socket.read_exact(&mut greeting).await.unwrap();
+                        assert_eq!(greeting[0], 5);
+                        let mut methods = vec![0; greeting[1] as usize];
+                        socket.read_exact(&mut methods).await.unwrap();
+                        assert!(methods.contains(&2));
+                        socket.write_all(&[5, 2]).await.unwrap();
+                        let mut prefix = [0u8; 2];
+                        socket.read_exact(&mut prefix).await.unwrap();
+                        assert_eq!(prefix[0], 1);
+                        let mut user = vec![0; prefix[1] as usize];
+                        socket.read_exact(&mut user).await.unwrap();
+                        let mut size = [0];
+                        socket.read_exact(&mut size).await.unwrap();
+                        let mut password = vec![0; size[0] as usize];
+                        socket.read_exact(&mut password).await.unwrap();
+                        assert_eq!(user, b"user");
+                        passwords.push(password);
+                        socket.write_all(&[1, 0]).await.unwrap();
+                        let mut command = [0; 4];
+                        socket.read_exact(&mut command).await.unwrap();
+                        assert_eq!(command, [5, 1, 0, 3]);
+                        socket.read_exact(&mut size).await.unwrap();
+                        let mut destination = vec![0; size[0] as usize + 2];
+                        socket.read_exact(&mut destination).await.unwrap();
+                        socket
+                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                            .await
+                            .unwrap();
+                        let mut socket = BufReader::new(socket);
+                        let mut headers = String::new();
+                        loop {
+                            let mut line = String::new();
+                            socket.read_line(&mut line).await.unwrap();
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            headers.push_str(&line);
+                        }
+                        assert!(
+                            !headers
+                                .to_ascii_lowercase()
+                                .contains("proxy-authorization:")
+                        );
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        open_sockets.push(socket);
+                    }
+                    passwords
+                });
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(proxy)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let response = timeout(
+                        Duration::from_secs(5),
+                        client.get("http://origin.invalid/test").send(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(response.status().is_success());
+                }
+                assert_eq!(server.await.unwrap(), [b"one".to_vec(), b"two".to_vec()]);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        };
+    }
+    socks_routes_loopback!(socks_credentials_do_not_reuse_another_route, reqwest);
+    socks_routes_loopback!(
+        mcp_socks_credentials_do_not_reuse_another_route,
+        reqwest_mcp
+    );
+
     #[tokio::test]
     async fn nonmatching_custom_rule_keeps_authenticated_forward_proxy() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
