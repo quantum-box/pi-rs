@@ -106,12 +106,14 @@ including for model request affinity. Pi also permits non-UUID custom IDs;
 custom IDs are preserved across native export and reopen and used for
 model request and cache warming affinity. A separate internal UUID continues to
 identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
-external ID. RPC state and session statistics project the external ID; UI and
-share identity projection still uses the internal UUID.
-Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
+external ID. RPC state, session statistics, resume search, share headers and
+model-shell metadata project the external ID. Empty IDs omit affinity headers.
+Nonempty IDs use Fetch-compatible Latin-1
 header bytes and whitespace normalization. Unrepresentable or invalid values
 fail before dispatch when an affinity default is needed; explicit headers win
-without validating an unused default.
+without validating an unused default. An ID containing NUL is omitted from the
+child process environment. Internal UUIDs remain accepted for native session
+lookup.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
@@ -937,7 +939,14 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Declared `SKILL.md` files with missing descriptions report both the
+loading. Prompt templates accept Pi string `argument-hint` frontmatter; native multi-match
+completion displays the hint before the description and inserts only the command
+name. Built-in and skill candidates take precedence over same-named templates. Completion
+descriptions use Pi's single-line normalization, selected and muted theme roles,
+and narrow-width visibility. Native completion still opens on explicit Tab and
+inserts a sole match directly, rather than reproducing Pi's continuously displayed
+autocomplete.
+Declared `SKILL.md` files with missing descriptions report both the
 description problem and any invalid name diagnostics; unreadable skill files
 also report their source path. Empty-description checks use ECMAScript whitespace
 semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,

@@ -3263,9 +3263,8 @@ fn slash(
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        let mut document = super::ui::session_search::Document::new(
-                            session.name().unwrap_or_default().into(),
-                            session.session_id().to_string(),
+                        let mut document = super::ui::session_search::Document::from_session(
+                            &session,
                             cwd.into(),
                             messages,
                             local,
@@ -6843,7 +6842,7 @@ fn select(
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
         }
-        Selection::Completion { range, text } => insert_completion(view, range, &text),
+        Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
@@ -7286,6 +7285,12 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
 }
 
 fn complete_input(args: &Cli, view: &mut View) {
+    enum CompletionSource {
+        Builtin,
+        Skill,
+        Prompt(Option<String>),
+        Other,
+    }
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
         .char_indices()
@@ -7321,7 +7326,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         ]
         .into_iter()
         .filter(|name| name.starts_with(word))
-        .map(str::to_owned)
+        .map(|name| (name.to_owned(), CompletionSource::Builtin))
         .collect::<Vec<_>>()
     } else {
         let file_word = word.strip_prefix('@').unwrap_or(word);
@@ -7352,40 +7357,71 @@ fn complete_input(args: &Cli, view: &mut View) {
                 } else {
                     ""
                 };
-                Some(format!(
-                    "{}{}{suffix}",
-                    if word.starts_with('@') { "@" } else { "" },
-                    parent.join(file_name).display()
+                Some((
+                    format!(
+                        "{}{}{suffix}",
+                        if word.starts_with('@') { "@" } else { "" },
+                        parent.join(file_name).display()
+                    ),
+                    CompletionSource::Other,
                 ))
             })
             .take(100)
             .collect::<Vec<_>>()
     };
     if start == 0 && word.starts_with('/') {
-        candidates.extend(
-            view.resources
-                .prompts
-                .keys()
-                .map(|name| format!("/{name}"))
-                .filter(|name| name.starts_with(word)),
-        );
+        for (name, prompt) in &view.resources.prompts {
+            let text = format!("/{name}");
+            if text.starts_with(word) && !candidates.iter().any(|(candidate, _)| candidate == &text)
+            {
+                if name
+                    .strip_prefix("skill:")
+                    .is_some_and(|skill| view.resources.skills.contains_key(skill))
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                    continue;
+                }
+                let description = match (&prompt.argument_hint, prompt.description.is_empty()) {
+                    (Some(hint), false) => format!("{hint} — {}", prompt.description),
+                    (Some(hint), true) => hint.clone(),
+                    (None, _) => prompt.description.clone(),
+                };
+                candidates.push((
+                    text,
+                    CompletionSource::Prompt((!description.is_empty()).then_some(description)),
+                ));
+            }
+        }
         if args.settings.enable_skill_commands() {
-            candidates.extend(
-                view.resources
-                    .skills
-                    .keys()
-                    .map(|name| format!("/skill:{name}"))
-                    .filter(|name| name.starts_with(word)),
-            );
+            for name in view.resources.skills.keys() {
+                let text = format!("/skill:{name}");
+                if text.starts_with(word)
+                    && !candidates.iter().any(|(candidate, _)| candidate == &text)
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                }
+            }
         }
     }
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     let range = start..view.editor.cursor;
     match candidates.as_slice() {
-        [candidate] => insert_completion(view, range, candidate),
+        [(candidate, _)] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(text, source)| {
+                    let description = match source {
+                        CompletionSource::Prompt(description) => description,
+                        CompletionSource::Builtin
+                        | CompletionSource::Skill
+                        | CompletionSource::Other => None,
+                    };
+                    (text, description)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
@@ -8338,6 +8374,163 @@ mod tests {
         assert_eq!(args.model, "initial");
         assert_eq!(args.thinking.as_deref(), Some("high"));
     }
+    #[test]
+    fn prompt_completion_displays_argument_hint_without_inserting_it() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("audit.md"),
+            "---\ndescription: Inspect changes\nargument-hint: |-\n  <path>\n  [focus]\n---\nReview $1",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("author.md"), "Write text").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/au".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().expect("multiple matching commands");
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("<path> [focus] — Inspect changes"),
+            "{rendered}"
+        );
+        let input = picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, .. }) if text == "/audit")
+        );
+    }
+
+    #[test]
+    fn builtin_completion_never_uses_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("model.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nText",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("models.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/mo".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/model"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/model")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_completion_wins_over_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        let skill = directory.path().join("skills/review");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\n---\nSkill body",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("skill:review.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nWrong body",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("skill:reviewer.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--no-skills",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+            "--skill",
+            skill.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        assert!(
+            view.resources
+                .expand("/skill:review")
+                .unwrap()
+                .contains("Skill body")
+        );
+        view.editor.replace("/skill:rev".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/skill:review"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
     #[test]
     fn patched_results_render_status_and_details_from_record_events() {
         use super::*;
