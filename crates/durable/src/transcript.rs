@@ -165,7 +165,7 @@ impl<'a> Transcript<'a> {
             .map(|(batch, _)| batch)
     }
 
-    fn prepare_write_with_blocks(
+    pub(crate) fn prepare_write_with_blocks(
         &self,
         value: &Value,
         blocks: Option<Vec<MessageContentBlocks>>,

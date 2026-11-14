@@ -1689,3 +1689,63 @@ async fn interrupted_unsafe_stream_is_not_promoted_or_replayed() {
         Some("first")
     );
 }
+
+#[test]
+fn runtime_block_process_child() {
+    let Ok(path) = std::env::var("PI_RS_BLOCK_CRASH_DB") else {
+        return;
+    };
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let mut h = Harness::open_paused(&path, options(model, tool, ReplayPolicy::Unsafe)).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let occurrence = h
+        .append_user_blocks(
+            id,
+            vec![json!({"type":"text","text":"saved","textSignature":"opaque"})],
+        )
+        .unwrap();
+    std::fs::write(format!("{path}.ids"), format!("{id}\n{occurrence}")).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn runtime_block_commit_survives_process_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "runtime_block_process_child", "--nocapture"])
+        .env("PI_RS_BLOCK_CRASH_DB", &path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let ids = std::fs::read_to_string(format!("{}.ids", path.display())).unwrap();
+    let mut ids = ids.lines();
+    let id = ids.next().unwrap().parse().unwrap();
+    let occurrence = ids.next().unwrap();
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let mut h = Harness::open_paused(&path, options(model, tool, ReplayPolicy::Unsafe)).unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.content_blocks[&0].message_id.to_string(), occurrence);
+    assert_eq!(
+        c.content_blocks[&0].blocks,
+        vec![json!({"type":"text","text":"saved","textSignature":"opaque"})]
+    );
+    assert!(h.fork(id).is_err());
+    assert!(h.request_manual_compaction(id, 0, None).is_err());
+}

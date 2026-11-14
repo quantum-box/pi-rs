@@ -592,6 +592,10 @@ pub struct Conversation {
     #[serde(default)]
     pub model_tools: Option<Vec<String>>,
     pub messages: Vec<Message>,
+    /// Lossless block arrays indexed by their active message position.
+    /// Reconstructed from the transcript; never serialized in the snapshot.
+    #[serde(skip)]
+    pub content_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
     /// Identity of the active context since its last reset or compaction.
     /// Older persisted conversations acquire one at the next compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1586,9 +1590,72 @@ impl Harness {
     }
     fn hydrate(&self, state: &mut Conversation) -> Result<(), Error> {
         if let Some(cursor) = &state.transcript {
-            state.messages = self.read_transcript(state.id, cursor.clone())?;
+            let (messages, blocks) = self.read_transcript_blocks(state.id, cursor.clone())?;
+            state.messages = messages;
+            state.content_blocks = blocks;
         }
         Ok(())
+    }
+    fn read_transcript_blocks(
+        &self,
+        id: Uuid,
+        mut cursor: crate::transcript::Cursor,
+    ) -> Result<
+        (
+            Vec<Message>,
+            std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+        ),
+        Error,
+    > {
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut parts = Vec::new();
+        loop {
+            let page = transcript.read_with_blocks(&cursor, std::num::NonZeroUsize::MIN)?;
+            for record in page.records {
+                let change: TranscriptChange = serde_json::from_value(record.value)?;
+                let (messages, base, metadata) =
+                    if matches!(&change, TranscriptChange::ReplaceCompacted { .. }) {
+                        (
+                            self.resolved_occurrences(id, cursor.clone())?
+                                .into_iter()
+                                .map(|(m, _)| m)
+                                .collect(),
+                            true,
+                            None,
+                        )
+                    } else {
+                        change.parts()?
+                    };
+                let mut blocks = Vec::new();
+                if let Some(bindings) = record.content_blocks {
+                    let (ids, _, _) = metadata.ok_or(crate::transcript::Error::Corrupt)?;
+                    for binding in bindings {
+                        let index = ids
+                            .iter()
+                            .position(|id| *id == binding.message_id)
+                            .ok_or(crate::transcript::Error::Corrupt)?;
+                        blocks.push((index, binding));
+                    }
+                }
+                parts.push((messages, blocks));
+                if base {
+                    let mut messages = Vec::new();
+                    let mut blocks = std::collections::BTreeMap::new();
+                    for (part, bindings) in parts.into_iter().rev() {
+                        let offset = messages.len();
+                        messages.extend(part);
+                        for (index, binding) in bindings {
+                            blocks.insert(offset + index, binding);
+                        }
+                    }
+                    return Ok((messages, blocks));
+                }
+            }
+            if !page.has_more {
+                return Err(Error::Invalid("transcript has no base".into()));
+            }
+            cursor = page.next;
+        }
     }
     fn read_transcript(
         &self,
@@ -1904,6 +1971,37 @@ impl Harness {
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
+        if let Some(previous) = old {
+            if !previous.content_blocks.is_empty()
+                && (!state.messages.starts_with(&previous.messages)
+                    || previous
+                        .content_blocks
+                        .iter()
+                        .any(|(i, b)| state.content_blocks.get(i) != Some(b))
+                    || previous.context_generation != state.context_generation)
+            {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+        }
+        let old_len = old.map_or(0, |s| s.messages.len());
+        let mut block_ids = std::collections::HashSet::new();
+        for (&index, binding) in &state.content_blocks {
+            if !matches!(
+                state.messages.get(index),
+                Some(Message::User { .. } | Message::UserWithImages { .. })
+            ) || binding.message_id.is_nil()
+                || !block_ids.insert(binding.message_id)
+                || crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(binding.blocks.clone()),
+                    false,
+                )
+                .is_none()
+                || (index < old_len
+                    && old.and_then(|s| s.content_blocks.get(&index)) != Some(binding))
+            {
+                return Err(Error::Invalid("invalid transcript block binding".into()));
+            }
+        }
         let compacted = old
             .map(|previous| -> Result<Option<(usize, usize)>, Error> {
                 if create
@@ -2080,6 +2178,31 @@ impl Harness {
                 _ => unreachable!(),
             }
         });
+        let mut change = change;
+        let new_blocks: Vec<_> = state
+            .content_blocks
+            .range(old_len..)
+            .map(|(&index, binding)| (index, binding.clone()))
+            .collect();
+        if !new_blocks.is_empty() {
+            let (ids, offset) = match change.as_mut() {
+                Some(
+                    TranscriptChange::AppendV2 { ids, .. }
+                    | TranscriptChange::AppendV3 { ids, .. }
+                    | TranscriptChange::AppendV4 { ids, .. },
+                ) => (ids, old_len),
+                Some(TranscriptChange::ReplaceV2 { ids, .. }) if old_len == 0 => (ids, 0),
+                _ => return Err(crate::transcript::Error::UnsupportedContentBlocks.into()),
+            };
+            for (index, binding) in &new_blocks {
+                *ids.get_mut(index - offset)
+                    .ok_or(crate::transcript::Error::Corrupt)? = binding.message_id;
+            }
+            let mut unique = std::collections::HashSet::new();
+            if ids.iter().any(|id| !unique.insert(*id)) {
+                return Err(crate::transcript::Error::Corrupt.into());
+            }
+        }
         let prepared = if expected == Expected::Missing && state.transcript.is_some() {
             let source = state.transcript.as_ref().unwrap();
             if self.read_transcript(source.transcript_id(), source.clone())? != state.messages {
@@ -2092,7 +2215,15 @@ impl Harness {
             Some(batch)
         } else if let Some(change) = change {
             let (batch, cursor) = crate::transcript::Transcript::new(self.owner.store(), state.id)
-                .prepare_write(&serde_json::to_value(change)?, create)?;
+                .prepare_write_with_blocks(
+                    &serde_json::to_value(change)?,
+                    if new_blocks.is_empty() {
+                        None
+                    } else {
+                        Some(new_blocks.into_iter().map(|(_, b)| b).collect())
+                    },
+                    create,
+                )?;
             state.transcript = Some(cursor);
             Some(batch)
         } else {
@@ -2444,6 +2575,7 @@ impl Harness {
             allowed_tools: None,
             model_tools: None,
             messages: vec![],
+            content_blocks: Default::default(),
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
@@ -2477,6 +2609,9 @@ impl Harness {
         config: Config,
     ) -> Result<Conversation, Error> {
         let (mut state, _) = self.load(parent)?;
+        if !state.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
             || !state.pending_resets.is_empty()
@@ -2549,6 +2684,9 @@ impl Harness {
                 return Err(durable_store::Error::Conflict { key: Self::key(id) }.into());
             }
         };
+        if !state.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
             || !state.pending_resets.is_empty()
@@ -2605,7 +2743,9 @@ impl Harness {
         prefix: Option<(usize, usize)>,
         application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
     ) -> Result<Uuid, Error> {
-        self.load(id)?;
+        if !self.load(id)?.0.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if cursor.0 == 0 {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
@@ -2692,6 +2832,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
+            content_blocks: Default::default(),
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: point
                 .documents
@@ -2890,7 +3031,9 @@ impl Harness {
     /// prefix. Historical state comes from its owner, current-policy documents
     /// from the immediate parent. Unprovable histories fail closed.
     pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
-        self.load(id)?;
+        if !self.load(id)?.0.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if entry_id.is_nil() || self.owner.store().legacy_version_boundary()? != 0 {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
@@ -3038,7 +3181,9 @@ impl Harness {
     /// Interior positions require proof of unchanged fork state or a tool-free
     /// append changing only config; incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
-        self.load(id)?;
+        if !self.load(id)?.0.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let page = transcript.read(&position.cursor, std::num::NonZeroUsize::MIN)?;
         let record = page
@@ -3240,7 +3385,9 @@ impl Harness {
     /// be visible in the captured shared chain and have an origin snapshot.
     /// Local retained observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
-        self.load(id)?;
+        if !self.load(id)?.0.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if entry_id.is_nil() {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
@@ -4253,6 +4400,44 @@ impl Harness {
         }
         Ok(page)
     }
+    /// Append an ordered user block occurrence to an idle conversation.
+    /// Generation, forking and compaction of block-bearing history are not supported yet.
+    pub fn append_user_blocks(
+        &mut self,
+        id: Uuid,
+        blocks: Vec<serde_json::Value>,
+    ) -> Result<Uuid, Error> {
+        if crate::content::UserContent::from_yield(serde_json::Value::Array(blocks.clone()), false)
+            .is_none()
+        {
+            return Err(Error::Invalid("invalid user content blocks".into()));
+        }
+        let (mut state, version) = self.load(id)?;
+        if !matches!(state.phase, Phase::Idle)
+            || state.active.is_some()
+            || state.abort_requested
+            || !state.pending_resets.is_empty()
+            || state
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+        {
+            return Err(Error::Invalid(
+                "appending blocks requires an idle conversation".into(),
+            ));
+        }
+        let message_id = Uuid::new_v4();
+        let index = state.messages.len();
+        state.messages.push(Message::User {
+            content: String::new(),
+        });
+        state.content_blocks.insert(
+            index,
+            crate::transcript::MessageContentBlocks { message_id, blocks },
+        );
+        self.save(&state, Expected::Version(version))?;
+        Ok(message_id)
+    }
     /// Admission is durable before returning. Call `resume` to drive work now;
     /// opening the database also drives all work left by a previous process.
     /// Commit a summary intent while idle. Previous snapshots remain in history.
@@ -4284,6 +4469,9 @@ impl Harness {
         instructions: Option<&str>,
     ) -> Result<Option<Uuid>, Error> {
         let (mut c, version) = self.load(id)?;
+        if !c.content_blocks.is_empty() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if !matches!(c.phase, Phase::Idle) || c.active.is_some() || c.abort_requested {
             return Err(Error::Invalid(
                 "compaction requires an idle conversation".into(),
@@ -4450,6 +4638,9 @@ impl Harness {
                 None
             };
             let (mut c, version) = self.load(id)?;
+            if !c.content_blocks.is_empty() {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
             if request_id.as_ref().is_some_and(|key| {
                 c.application_writes
                     .iter()
@@ -4951,6 +5142,20 @@ impl Harness {
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
         {
             let (mut c, version) = self.load(id)?;
+            if !c.content_blocks.is_empty() {
+                if matches!(c.phase, Phase::Idle)
+                    && c.active.is_none()
+                    && !c.abort_requested
+                    && c.pending_resets.is_empty()
+                    && !c
+                        .submissions
+                        .iter()
+                        .any(|s| matches!(s.status, Status::Queued | Status::Running))
+                {
+                    return Ok(());
+                }
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 return Ok(());
@@ -5717,6 +5922,9 @@ impl Harness {
                     }
                 }
                 Phase::ModelReady { turns } => {
+                    if !c.content_blocks.is_empty() {
+                        return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                    }
                     if !matches!(
                         c.messages
                             .iter()
@@ -9053,112 +9261,163 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn block_records_reopen_losslessly_and_runtime_boundaries_fail_closed() {
-        use crate::transcript::{MessageContentBlocks, Transcript};
+    fn runtime_block_save_reopens_and_rejects_lossy_operations() {
         use serde_json::json;
-        use std::num::NonZeroUsize;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let model = placement_model();
-        let mut harness = Harness::open_paused(&path, options(model.clone())).unwrap();
-        let id = harness.create_conversation(config()).unwrap();
-        let message_id = Uuid::new_v4();
-        let content = vec![MessageContentBlocks {
-            message_id,
-            blocks: vec![json!({"type":"text","text":"signed","textSignature":"opaque"})],
-        }];
-        let store = harness.owner.store();
-        let transcript = Transcript::new(store, id);
-        let change = TranscriptChange::AppendV2 {
-            messages: vec![Message::User {
-                content: "placeholder".into(),
-            }],
-            ids: vec![message_id],
-            commit: 1,
-            origin: id,
-        };
-        let batch = transcript
-            .prepare_append_with_blocks(&serde_json::to_value(change).unwrap(), content.clone())
-            .unwrap();
-        store.commit(&batch.checks, &batch.mutations).unwrap();
-        let cursor = transcript.snapshot().unwrap();
-        let key = Harness::key(id);
-        let saved = store.get(&key).unwrap().unwrap();
-        let mut state: serde_json::Value = serde_json::from_slice(&saved.value).unwrap();
-        state["transcript"] = serde_json::to_value(&cursor).unwrap();
-        store
-            .commit(
-                &[Check {
-                    key: key.clone(),
-                    expected: Expected::Version(saved.version),
-                }],
-                &[Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&state).unwrap(),
-                }],
-            )
-            .unwrap();
-        let transcript = Transcript::new(harness.owner.store(), id);
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let blocks = vec![
+            json!({"type":"text","text":"a","textSignature":"opaque"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"b"}),
+        ];
+        let occurrence = h.append_user_blocks(id, blocks.clone()).unwrap();
+        let second = h.append_user_blocks(id, vec![]).unwrap();
+        let c = h.conversation(id).unwrap();
+        let binding = c.content_blocks.get(&0).unwrap();
+        assert_eq!(binding.message_id, occurrence);
+        assert_eq!(binding.blocks, blocks);
+        assert_eq!(c.content_blocks[&1].message_id, second);
+        let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
         let page = transcript
-            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
-            .unwrap();
-        assert_eq!(page.records[0].content_blocks, Some(content));
-        let blocked = |error| {
-            matches!(
-                error,
-                Error::Transcript(crate::transcript::Error::UnsupportedContentBlocks)
+            .read_with_blocks(
+                &transcript.snapshot().unwrap(),
+                std::num::NonZeroUsize::new(8).unwrap(),
             )
+            .unwrap();
+        for record in page.records.iter().filter(|r| r.content_blocks.is_some()) {
+            let binding = &record.content_blocks.as_ref().unwrap()[0];
+            let value = record.value.as_object().unwrap().values().next().unwrap();
+            assert!(
+                value["ids"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(binding.message_id))
+            );
+        }
+        let position = ViewCursor {
+            cursor: transcript.snapshot().unwrap(),
+            remaining: None,
         };
-        assert!(blocked(harness.conversation(id).unwrap_err()));
-        assert!(blocked(harness.fork(id).unwrap_err()));
-        assert!(blocked(
-            harness.fork_at(id, crate::observer::Cursor(1)).unwrap_err()
-        ));
-        assert!(blocked(
-            harness
-                .fork_at_position(
-                    id,
-                    ViewCursor {
-                        cursor,
-                        remaining: None
-                    }
-                )
-                .unwrap_err()
-        ));
-        assert!(blocked(
-            harness.fork_by_entry_id(id, message_id).unwrap_err()
-        ));
-        assert!(blocked(
-            harness
-                .fork_at_application_entry(id, message_id)
-                .unwrap_err()
-        ));
-        assert!(blocked(harness.request_compaction(id, 1).unwrap_err()));
-        assert!(blocked(
-            harness
-                .request_compaction_with_instructions(id, 1, None)
-                .unwrap_err()
-        ));
-        assert!(blocked(
-            harness.request_manual_compaction(id, 1, None).unwrap_err()
-        ));
-        drop(harness);
         assert!(matches!(
-            Harness::open_paused(&path, options(model)),
+            h.fork_at(id, crate::observer::Cursor(1)),
             Err(Error::Transcript(
                 crate::transcript::Error::UnsupportedContentBlocks
             ))
         ));
-        let store = durable_store::Store::open(&path).unwrap();
-        let transcript = Transcript::new(&store, id);
-        let page = transcript
-            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
-            .unwrap();
-        assert_eq!(
-            page.records[0].content_blocks.as_ref().unwrap()[0].message_id,
-            message_id
+        assert!(matches!(
+            h.fork_at_position(id, position),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert!(matches!(
+            h.fork_by_entry_id(id, occurrence),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert!(matches!(
+            h.fork_at_application_entry(id, occurrence),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert!(matches!(
+            h.fork(id),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert!(matches!(
+            h.request_manual_compaction(id, 0, None),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut changed, version) = h.load(id).unwrap();
+        changed.messages.clear();
+        assert!(matches!(
+            h.save(&changed, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.content_blocks[&0].message_id, occurrence);
+        assert_eq!(c.content_blocks[&0].blocks, blocks);
+        assert_eq!(c.content_blocks[&1].message_id, second);
+        assert!(c.content_blocks[&1].blocks.is_empty());
+    }
+
+    #[test]
+    fn staged_block_append_is_atomic_and_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        let occurrence = Uuid::new_v4();
+        state.messages.push(Message::User {
+            content: String::new(),
+        });
+        state.content_blocks.insert(
+            0,
+            crate::transcript::MessageContentBlocks {
+                message_id: occurrence,
+                blocks: vec![serde_json::json!({"type":"text","text":"replay"})],
+            },
         );
+        let staged = h
+            .prepare_conversation_save(&state, Expected::Version(version), None, &[], &[])
+            .unwrap();
+        drop(staged);
+        drop(h);
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        assert!(h.conversation(id).unwrap().content_blocks.is_empty());
+        let (_, version) = h.load(id).unwrap();
+        h.save(&state, Expected::Version(version)).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().content_blocks[&0].message_id,
+            occurrence
+        );
+    }
+
+    #[tokio::test]
+    async fn block_history_never_reaches_core_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.append_user_blocks(id, vec![]).unwrap();
+        assert!(matches!(
+            h.submit(id, None, "next".into()),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut state, version) = h.load(id).unwrap();
+        state.phase = Phase::ModelReady { turns: 0 };
+        h.save(&state, Expected::Version(version)).unwrap();
+        assert!(matches!(
+            h.resume_conversation(id, &CancellationToken::new()).await,
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert_eq!(model.maximum.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -10389,6 +10648,7 @@ mod scheduler_tests {
             allowed_tools: None,
             model_tools: None,
             messages: vec![],
+            content_blocks: Default::default(),
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
