@@ -3,7 +3,7 @@
 //! validate the child's registration before admission. Conflicts and uncertain
 //! commits require a fresh parent snapshot and inspection before retrying.
 
-use crate::task::{Task, TaskOwner, TaskState};
+use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
 use crate::task_store::{Error as TaskError, Save, StoredTask, TaskStore};
 use durable_store::{Check, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ pub(crate) enum Error {
     IdentityMismatch,
     #[error("stored child is missing or has a different owner")]
     InvalidStoredChild,
+    #[error("wait must contain distinct existing keyed children")]
+    InvalidWait,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +51,79 @@ struct Prepared {
     child: Uuid,
     checks: Vec<Check>,
     mutations: Vec<Mutation>,
+}
+
+/// Persist a checkpoint and an any-child wait in one checked transaction. The
+/// caller must fence the parent executor, hold the scheduler's task gate, and
+/// reload after admission or a conflict. This does not start or stop workers.
+pub(crate) fn park_any(
+    store: &Store,
+    parent: &StoredTask,
+    checkpoint: Checkpoint,
+    keys: &[&str],
+) -> Result<(), Error> {
+    let batch = prepare_park_any(store, parent, checkpoint, keys)?;
+    store.commit(&batch.checks, &batch.mutations)?;
+    Ok(())
+}
+
+fn prepare_park_any(
+    store: &Store,
+    parent: &StoredTask,
+    checkpoint: Checkpoint,
+    keys: &[&str],
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    let tasks = TaskStore::new(store);
+    let current = tasks.load(parent.task.id())?.ok_or(Error::ParentClosed)?;
+    if current != *parent
+        || current.task.state() != &TaskState::Running
+        || current.task.abort_requested()
+    {
+        return Err(Error::ParentClosed);
+    }
+    if keys.is_empty() {
+        return Err(Error::InvalidWait);
+    }
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_children = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(keys.len());
+    let mut checks = Vec::with_capacity(keys.len() * 2);
+    for key in keys {
+        if !seen_keys.insert(*key) {
+            return Err(Error::InvalidWait);
+        }
+        let key = record_key(parent.task.id(), key);
+        let entry = store.get(&key)?.ok_or(Error::InvalidWait)?;
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if !seen_children.insert(record.child) {
+            return Err(Error::InvalidWait);
+        }
+        let child = tasks.load(record.child)?.ok_or(Error::InvalidStoredChild)?;
+        if child.task.owner() != &TaskOwner::Task(parent.task.id()) {
+            return Err(Error::InvalidStoredChild);
+        }
+        ids.push(record.child);
+        checks.push(Check {
+            key,
+            expected: Expected::Version(entry.version),
+        });
+        checks.push(Check {
+            key: crate::task_store::key(record.child),
+            expected: Expected::Version(child.version),
+        });
+    }
+    let mut next = parent.clone();
+    if next.task.checkpoint() != &checkpoint {
+        next.task
+            .advance(checkpoint)
+            .map_err(TaskError::Transition)?;
+    }
+    next.task
+        .wait(WaitFor::TasksAny(ids))
+        .map_err(TaskError::Transition)?;
+    let mut batch = tasks.prepare_save(&[Save::Update(&next)])?;
+    batch.checks.extend(checks);
+    Ok(batch)
 }
 
 fn record_key(parent: Uuid, key: &str) -> Vec<u8> {
@@ -176,6 +251,10 @@ mod tests {
     use super::*;
     use crate::task::Checkpoint;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn parent(store: &Store) -> StoredTask {
         let mut task = Task::new(
@@ -207,6 +286,287 @@ mod tests {
         .unwrap()
         .registered_versioned("tool-task".into(), safe, 1, input)
         .unwrap()
+    }
+
+    fn registered_parent(store: &Store, safe: bool) -> StoredTask {
+        let mut task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(99)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent-task".into(), safe);
+        task.start().unwrap();
+        let tasks = TaskStore::new(store);
+        tasks.save(&[Save::Create(&task)]).unwrap();
+        tasks.load(task.id()).unwrap().unwrap()
+    }
+
+    fn cp(phase: &str) -> Checkpoint {
+        Checkpoint {
+            phase: phase.into(),
+            data: json!({"saved":true}),
+        }
+    }
+
+    fn admit_pair(store: &Store, p: &StoredTask) -> (StoredTask, Task, Task) {
+        let a = child(2, p.task.id(), true, json!({"n":1}));
+        let b = child(3, p.task.id(), true, json!({"n":2}));
+        admit(store, p, "a", "tool", &json!({"n":1}), &a).unwrap();
+        let p = TaskStore::new(store).load(p.task.id()).unwrap().unwrap();
+        admit(store, &p, "b", "tool", &json!({"n":2}), &b).unwrap();
+        let p = TaskStore::new(store).load(p.task.id()).unwrap().unwrap();
+        (p, a, b)
+    }
+
+    #[test]
+    fn scheduler_runs_children_and_resumes_unsafe_parked_parent_across_reopens() {
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let db = Store::open(&path).unwrap();
+        let p = registered_parent(&db, false);
+        let (p, a, b) = admit_pair(&db, &p);
+        park_any(&db, &p, cp("first"), &["a", "b"]).unwrap();
+        drop(db);
+        let parents = Arc::new(AtomicUsize::new(0));
+        let children = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        let parent_runs = parents.clone();
+        assert!(registry.register("parent-task", false, move |task: &Task| {
+            parent_runs.fetch_add(1, Ordering::SeqCst);
+            Ok(if task.checkpoint().phase == "first" {
+                Step::Wait {
+                    checkpoint: cp("second"),
+                    condition: WaitFor::TasksAny(vec![Uuid::from_u128(3)]),
+                    children: vec![],
+                }
+            } else {
+                Step::Succeed(json!("done"))
+            })
+        }));
+        let child_runs = children.clone();
+        assert!(registry.register("tool-task", true, move |task: &Task| {
+            child_runs.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(task.input().clone()))
+        }));
+        let mut scheduler = Scheduler::open(&path, registry.clone()).unwrap();
+        assert_eq!(
+            scheduler.get(p.task.id()).unwrap().unwrap().state(),
+            &TaskState::Waiting(WaitFor::TasksAny(vec![a.id(), b.id()]))
+        );
+        assert_eq!(parents.load(Ordering::SeqCst), 0);
+        assert!(scheduler.tick(0).unwrap()); // first child
+        assert!(scheduler.tick(0).unwrap()); // wake and repark parent
+        assert_eq!(parents.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.get(p.task.id()).unwrap().unwrap().checkpoint(),
+            &cp("second")
+        );
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(parents.load(Ordering::SeqCst), 1);
+        assert!(scheduler.tick(0).unwrap()); // second child
+        assert!(scheduler.tick(0).unwrap()); // wake and finish parent
+        assert_eq!(
+            scheduler.get(p.task.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+        assert_eq!(parents.load(Ordering::SeqCst), 2);
+        assert_eq!(children.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn interrupted_child_follows_its_replay_policy_while_parent_remains_parked() {
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        for safe in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.db");
+            let db = Store::open(&path).unwrap();
+            let p = registered_parent(&db, false);
+            let c = child(2, p.task.id(), safe, json!({}));
+            admit(&db, &p, "a", "tool", &json!({}), &c).unwrap();
+            let tasks = TaskStore::new(&db);
+            let p = tasks.load(p.task.id()).unwrap().unwrap();
+            park_any(&db, &p, cp("parked"), &["a"]).unwrap();
+            tasks
+                .reserve(&tasks.load(c.id()).unwrap().unwrap())
+                .unwrap();
+            drop(db);
+            let mut registry = Registry::default();
+            registry.register("parent-task", false, |_: &Task| {
+                Ok(Step::Succeed(json!(null)))
+            });
+            registry.register("tool-task", safe, |_: &Task| {
+                Ok(Step::Succeed(json!("replayed")))
+            });
+            let scheduler = Scheduler::open(&path, registry).unwrap();
+            assert!(matches!(
+                scheduler.get(p.task.id()).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            ));
+            let state = scheduler.get(c.id()).unwrap().unwrap();
+            if safe {
+                assert_eq!(state.state(), &TaskState::Ready);
+            } else {
+                assert!(matches!(state.state(), TaskState::Failed(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn parked_parent_abort_cascades_to_admitted_children_after_reopen() {
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let db = Store::open(&path).unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, b) = admit_pair(&db, &p);
+        park_any(&db, &p, cp("parked"), &["a", "b"]).unwrap();
+        drop(db);
+        let mut registry = Registry::default();
+        registry.register("parent-task", true, |_: &Task| {
+            Ok(Step::Succeed(json!(null)))
+        });
+        registry.register("tool-task", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, registry.clone()).unwrap();
+        scheduler.request_abort(p.task.id()).unwrap();
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        for _ in 0..8 {
+            if !scheduler.tick(0).unwrap() {
+                break;
+            }
+        }
+        for id in [p.task.id(), a.id(), b.id()] {
+            assert!(scheduler.get(id).unwrap().unwrap().is_terminal());
+            assert!(scheduler.get(id).unwrap().unwrap().abort_requested());
+        }
+    }
+
+    #[test]
+    fn park_fences_admission_abort_and_child_changes_without_partial_checkpoint() {
+        for race in 0..4 {
+            let db = Store::memory().unwrap();
+            let p = registered_parent(&db, true);
+            let (p, a, _) = admit_pair(&db, &p);
+            let pending = prepare_park_any(&db, &p, cp("parked"), &["a"]).unwrap();
+            let tasks = TaskStore::new(&db);
+            match race {
+                0 => {
+                    let c = child(4, p.task.id(), true, json!({}));
+                    admit(&db, &p, "c", "tool", &json!({}), &c).unwrap();
+                }
+                1 => {
+                    tasks.update(&p, |t| t.request_abort()).unwrap();
+                }
+                2 => {
+                    tasks.update(&p, |t| t.succeed(json!("settled"))).unwrap();
+                }
+                _ => {
+                    let c = tasks.load(a.id()).unwrap().unwrap();
+                    tasks.update(&c, |t| t.cancel()).unwrap();
+                }
+            }
+            assert!(matches!(
+                db.commit(&pending.checks, &pending.mutations),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            let after = tasks.load(p.task.id()).unwrap().unwrap();
+            assert_eq!(after.task.checkpoint(), p.task.checkpoint());
+            if race == 2 {
+                assert_eq!(after.task.state(), &TaskState::Succeeded(json!("settled")));
+            } else {
+                assert_eq!(after.task.state(), &TaskState::Running);
+            }
+        }
+    }
+
+    #[test]
+    fn park_rejects_missing_duplicate_and_foreign_keys() {
+        let db = Store::memory().unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, _) = admit_pair(&db, &p);
+        for keys in [vec![], vec!["missing"], vec!["a", "a"]] {
+            assert!(matches!(
+                park_any(&db, &p, cp("no"), &keys),
+                Err(Error::InvalidWait)
+            ));
+        }
+        let task_key = crate::task_store::key(a.id());
+        db.commit(&[], &[Mutation::Delete { key: task_key }])
+            .unwrap();
+        assert!(matches!(
+            park_any(&db, &p, cp("no"), &["a"]),
+            Err(Error::InvalidStoredChild)
+        ));
+        assert_eq!(TaskStore::new(&db).load(p.task.id()).unwrap().unwrap(), p);
+    }
+
+    #[test]
+    fn wake_reattaches_original_key_after_reopen_without_recreating_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let db = Store::open(&path).unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, _) = admit_pair(&db, &p);
+        park_any(&db, &p, cp("parked"), &["a", "b"]).unwrap();
+        let tasks = TaskStore::new(&db);
+        let c = tasks.load(a.id()).unwrap().unwrap();
+        tasks.update(&c, |t| t.cancel()).unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        let waiting = tasks.load(p.task.id()).unwrap().unwrap();
+        assert!(matches!(
+            tasks.poll_wait(&waiting, 0).unwrap(),
+            crate::task_store::WakeResult::Woken { .. }
+        ));
+        tasks
+            .reserve(&tasks.load(p.task.id()).unwrap().unwrap())
+            .unwrap();
+        let running = tasks.load(p.task.id()).unwrap().unwrap();
+        let candidate = child(4, p.task.id(), true, json!({"n":1}));
+        assert_eq!(
+            admit(&db, &running, "a", "tool", &json!({"n":1}), &candidate).unwrap(),
+            a.id()
+        );
+        assert_eq!(running.task.checkpoint(), &cp("parked"));
+        assert!(tasks.load(candidate.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn park_rejects_key_record_pointing_to_foreign_child() {
+        let db = Store::memory().unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, _) = admit_pair(&db, &p);
+        let foreign = child(9, Uuid::from_u128(77), true, json!({}));
+        TaskStore::new(&db).save(&[Save::Create(&foreign)]).unwrap();
+        let key = record_key(p.task.id(), "a");
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut record: Record = serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(record.child, a.id());
+        record.child = foreign.id();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            park_any(&db, &p, cp("no"), &["a"]),
+            Err(Error::InvalidStoredChild)
+        ));
+        assert_eq!(TaskStore::new(&db).load(p.task.id()).unwrap().unwrap(), p);
     }
 
     #[test]
