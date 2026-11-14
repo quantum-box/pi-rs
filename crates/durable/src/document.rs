@@ -20,7 +20,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Signal(#[from] crate::task_store::Error),
-    #[error("at most one signal to another task may be staged per invocation")]
+    #[error("self-delivery or a repeated typed signal key cannot be staged")]
     SignalComposition,
     #[error("stored document is not a JSON object")]
     InvalidDocument,
@@ -509,7 +509,8 @@ pub struct TaskDocuments<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     task: crate::task::Task,
     entries: Option<PendingEntries>,
-    signal: Option<OwnedBatch>,
+    signal: OwnedBatch,
+    signal_keys: HashSet<(uuid::Uuid, String, String)>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
@@ -517,7 +518,11 @@ impl<'a> TaskDocuments<'a> {
             store,
             task: task.clone(),
             entries: None,
-            signal: None,
+            signal: OwnedBatch {
+                checks: Vec::new(),
+                mutations: Vec::new(),
+            },
+            signal_keys: HashSet::new(),
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
             writes: HashMap::new(),
@@ -550,7 +555,7 @@ impl<'a> TaskDocuments<'a> {
         self.writes.insert(address.clone(), value);
         Ok(())
     }
-    /// Stage one typed delivery before document or entry writes. The returned
+    /// Stage distinct typed deliveries before document or entry writes. The returned
     /// outcome is provisional until this task's checkpoint commits. A conflict
     /// replays only registered replay-safe handlers. Supply a fresh clock value
     /// on replay; elapsed monotonic time is checked at the storage commit boundary.
@@ -566,7 +571,8 @@ impl<'a> TaskDocuments<'a> {
         if !self.writes.is_empty() || self.entries.is_some() {
             return Err(Error::ReadAfterWrite);
         }
-        if self.signal.is_some() || task_id == self.task.id() {
+        let identity = (task_id, token.name().to_owned(), key.to_owned());
+        if task_id == self.task.id() || self.signal_keys.contains(&identity) {
             return Err(Error::SignalComposition);
         }
         let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
@@ -576,7 +582,52 @@ impl<'a> TaskDocuments<'a> {
             value,
             || now_millis,
         )?;
-        self.signal = Some(batch);
+        // Only the target and its revision may be shared between deliveries.
+        // Other overlaps remain errors when the complete transaction is composed.
+        let shared = [
+            crate::task_store::key(task_id),
+            crate::task_store::signal_revision_key(task_id),
+        ];
+        for check in batch.checks {
+            if shared.contains(&check.key) {
+                if let Some(existing) = self.signal.checks.iter_mut().find(|c| c.key == check.key) {
+                    existing.expected = match (&existing.expected, &check.expected) {
+                        (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y))
+                            if a == b =>
+                        {
+                            Expected::VersionBefore(*a, (*x).min(*y))
+                        }
+                        (Expected::Version(a), Expected::VersionBefore(b, x))
+                        | (Expected::VersionBefore(b, x), Expected::Version(a))
+                            if a == b =>
+                        {
+                            Expected::VersionBefore(*a, *x)
+                        }
+                        (a, b) if a == b => a.clone(),
+                        // Observations disagreed during staging. Force a commit conflict
+                        // so the normal replay-safe retry policy handles the race.
+                        _ => Expected::VersionBefore(0, std::time::Instant::now()),
+                    };
+                    continue;
+                }
+            }
+            self.signal.checks.push(check);
+        }
+        for mutation in batch.mutations {
+            if let Mutation::Put { key, .. } = &mutation {
+                if *key == shared[1]
+                    && self
+                        .signal
+                        .mutations
+                        .iter()
+                        .any(|m| matches!(m, Mutation::Put { key: k, .. } if k == key))
+                {
+                    continue;
+                }
+            }
+            self.signal.mutations.push(mutation);
+        }
+        self.signal_keys.insert(identity);
         Ok(result)
     }
 
@@ -677,10 +728,8 @@ impl<'a> TaskDocuments<'a> {
                 });
             }
         }
-        if let Some(signal) = self.signal {
-            batch.checks.extend(signal.checks);
-            batch.mutations.extend(signal.mutations);
-        }
+        batch.checks.extend(self.signal.checks);
+        batch.mutations.extend(self.signal.mutations);
         if let Some((conversation, version, entries, checks)) = self.entries {
             batch.checks.extend(checks);
             let key = crate::application_entry::key(conversation);

@@ -267,8 +267,8 @@ Current limits and differences from upstream Pi Durable:
   recovery until checkpoint progress, another wait, or termination. A delivery
   to an expired key returns closed. `deliver_signal` uses wall time; deterministic
   hosts should use `deliver_signal_at` with the same clock as scheduler ticks.
-- Opt-in task handlers using `TaskDocuments::signal_at` can stage one typed
-  signal to a different existing or missing task before document/entry writes.
+- Opt-in task handlers using `TaskDocuments::signal_at` can stage multiple distinct typed
+  signals to different existing or missing tasks, including distinct keys on one task before document/entry writes.
   Its status is provisional: the target task version and signal revision are
   checked with the handler's checkpoint and documents, and a conflict rolls
   back all of them. Replay-safe handlers are retried; other handlers require
@@ -276,8 +276,9 @@ Current limits and differences from upstream Pi Durable:
   an empty key with a future deadline, monotonic elapsed time since staging is
   checked under the storage write lock; crossing the deadline conflicts and
   replay must sample a fresh timestamp. Clock jumps after staging are not observed.
-  Signal staging is limited to one call
-  per invocation, excludes self-delivery, and cannot overlap another batch
+  Repeating a typed key in the same invocation is rejected; upstream instead
+  returns duplicate for the repeated delivery. Self-delivery is excluded (upstream
+  permits it), and signal checks cannot overlap another batch
   participant's checked keys (for example an entry's task ancestor or a newly
   created child). It is not a general host transaction or upstream `tx.signal`.
   A running task driver continues scheduling after a successful step; external

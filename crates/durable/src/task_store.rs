@@ -1097,7 +1097,7 @@ fn signal_task_prefix(task_id: Uuid) -> Vec<u8> {
     key
 }
 
-fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
+pub(crate) fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());
     key

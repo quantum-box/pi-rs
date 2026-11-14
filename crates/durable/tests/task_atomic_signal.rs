@@ -123,7 +123,7 @@ fn setup(path: &std::path::Path, deadline: Option<i64>) {
 fn commit_reopen_and_wake() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    setup(&path, Some(100));
+    setup(&path, None);
     let results = Arc::new(Mutex::new(vec![]));
     let mut s = Scheduler::open(&path, registry(&path, 0, results.clone())).unwrap();
     s.submit(&task(1, "sender")).unwrap();
@@ -349,4 +349,284 @@ fn deadline_crossing_rolls_back_entire_attempt_and_replays_closed() {
             .unwrap(),
         SignalResult::Closed
     );
+}
+
+struct MultiSend {
+    path: std::path::PathBuf,
+    mode: u8,
+    attempts: Arc<Mutex<Vec<Vec<SignalResult>>>>,
+}
+impl Handler for MultiSend {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        let token = SignalToken::new("answer", 1).unwrap();
+        let attempt = self.attempts.lock().unwrap().len();
+        let now = if self.mode == 2 && attempt > 0 {
+            100
+        } else {
+            99
+        };
+        let mut results = Vec::new();
+        for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+            results.push(
+                docs.signal_at(Uuid::from_u128(id), &token, key, json!(key), now)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            docs.signal_at(Uuid::from_u128(2), &token, "a", json!(4), now),
+            Err(pi_rs_durable::document::Error::SignalComposition)
+        ));
+        self.attempts.lock().unwrap().push(results);
+        docs.get(&addr()).unwrap();
+        docs.put(&addr(), json!({"done":true}).as_object().unwrap().clone())
+            .unwrap();
+        if self.mode == 1 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            assert_eq!(
+                TaskStore::new(&db)
+                    .deliver_signal_at(Uuid::from_u128(2), &token, "b", json!("rival"), 99)
+                    .unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        if self.mode == 5 && attempt == 0 {
+            // Simulate an abort intent committed by the driver during the invocation.
+            let db = Store::open(&self.path).unwrap();
+            let mut task_key = b"durable/task/".to_vec();
+            task_key.extend_from_slice(Uuid::from_u128(1).as_bytes());
+            let record = db.get(&task_key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&record.value).unwrap();
+            value["abort_requested"] = json!(true);
+            db.commit(
+                &[durable_store::Check {
+                    key: task_key.clone(),
+                    expected: durable_store::Expected::Version(record.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: task_key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        if self.mode == 4 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            let ts = TaskStore::new(&db);
+            let sender = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+            ts.update(&sender, |task| task.cancel()).unwrap();
+        }
+        if self.mode == 2 && attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if self.mode == 3 {
+            return Ok(Step::Fail("abort staged writes".into()));
+        }
+        Ok(Step::Continue(cp("done")))
+    }
+}
+fn multi_setup(
+    path: &std::path::Path,
+    deadline: Option<i64>,
+    mode: u8,
+    attempts: Arc<Mutex<Vec<Vec<SignalResult>>>>,
+) -> Scheduler {
+    setup(path, deadline);
+    let db = Store::open(path).unwrap();
+    let target = task(3, "receiver");
+    let ts = TaskStore::new(&db);
+    ts.save(&[Save::Create(&target)]).unwrap();
+    ts.reserve(&ts.load(target.id()).unwrap().unwrap()).unwrap();
+    ts.update(&ts.load(target.id()).unwrap().unwrap(), |t| {
+        t.wait(WaitFor::TypedSleep {
+            until_millis: None,
+            signals: vec![SignalToken::new("answer", 1).unwrap().key("a").unwrap()],
+        })
+    })
+    .unwrap();
+    drop(db);
+    let mut registry = Registry::default();
+    registry.register(
+        "sender",
+        true,
+        MultiSend {
+            path: path.into(),
+            mode,
+            attempts,
+        },
+    );
+    registry.register("receiver", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let s = Scheduler::open(path, registry).unwrap();
+    s.submit(&task(1, "sender")).unwrap();
+    s
+}
+fn signal_value(path: &std::path::Path, id: u128, key: &str) -> Option<serde_json::Value> {
+    let db = Store::open(path).unwrap();
+    TaskStore::new(&db)
+        .read_typed_signal(
+            Uuid::from_u128(id),
+            &SignalToken::new("answer", 1).unwrap(),
+            key,
+        )
+        .unwrap()
+}
+#[test]
+fn multiple_targets_and_keys_commit_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(vec![]));
+    let mut s = multi_setup(&path, None, 0, attempts.clone());
+    s.tick(99).unwrap();
+    drop(s);
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![vec![SignalResult::Delivered; 3]]
+    );
+    for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+        assert_eq!(signal_value(&path, id, key), Some(json!(key)));
+    }
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_some());
+    assert_eq!(
+        TaskStore::new(&db)
+            .load(Uuid::from_u128(1))
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint()
+            .phase,
+        "done"
+    );
+    drop(db);
+    let mut registry = Registry::default();
+    registry.register("receiver", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let mut reopened = Scheduler::open(&path, registry).unwrap();
+    for _ in 0..8 {
+        reopened.tick(99).unwrap();
+        if [2, 3].iter().all(|id| {
+            matches!(
+                reopened.get(Uuid::from_u128(*id)).unwrap().unwrap().state(),
+                TaskState::Succeeded(_)
+            )
+        }) {
+            return;
+        }
+    }
+    panic!("both receivers should wake after reopen");
+}
+#[test]
+fn multi_signal_conflict_rolls_back_everything_then_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(vec![]));
+    let mut s = multi_setup(&path, None, 1, attempts.clone());
+    s.tick(99).unwrap();
+    assert_eq!(signal_value(&path, 2, "a"), None);
+    assert_eq!(signal_value(&path, 3, "a"), None);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&addr())
+            .unwrap()
+            .is_none()
+    );
+    s.tick(99).unwrap();
+    assert_eq!(
+        attempts.lock().unwrap()[1],
+        vec![
+            SignalResult::Delivered,
+            SignalResult::Duplicate,
+            SignalResult::Delivered
+        ]
+    );
+    assert_eq!(signal_value(&path, 2, "b"), Some(json!("rival")));
+    assert_eq!(signal_value(&path, 3, "a"), Some(json!("a")));
+}
+#[test]
+fn multi_signal_expiry_rolls_back_other_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(vec![]));
+    let mut s = multi_setup(&path, Some(100), 2, attempts.clone());
+    s.tick(99).unwrap();
+    assert_eq!(signal_value(&path, 2, "b"), None);
+    assert_eq!(signal_value(&path, 3, "a"), None);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&addr())
+            .unwrap()
+            .is_none()
+    );
+    s.tick(99).unwrap();
+    assert_eq!(
+        attempts.lock().unwrap()[1],
+        vec![
+            SignalResult::Closed,
+            SignalResult::Delivered,
+            SignalResult::Delivered
+        ]
+    );
+}
+#[test]
+fn failed_step_discards_all_staged_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut s = multi_setup(&path, None, 3, Arc::new(Mutex::new(vec![])));
+    s.tick(99).unwrap();
+    drop(s);
+    for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+        assert_eq!(signal_value(&path, id, key), None);
+    }
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&addr())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn concurrent_sender_cancellation_discards_all_staged_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut s = multi_setup(&path, None, 4, Arc::new(Mutex::new(vec![])));
+    assert!(s.tick(99).is_err());
+    drop(s);
+    for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+        assert_eq!(signal_value(&path, id, key), None);
+    }
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_none());
+    assert_ne!(
+        TaskStore::new(&db)
+            .load(Uuid::from_u128(1))
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint()
+            .phase,
+        "done"
+    );
+}
+
+#[test]
+fn concurrent_abort_intent_discards_all_staged_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut s = multi_setup(&path, None, 5, Arc::new(Mutex::new(vec![])));
+    s.tick(99).unwrap();
+    drop(s);
+    for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+        assert_eq!(signal_value(&path, id, key), None);
+    }
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_none());
+    let sender = TaskStore::new(&db)
+        .load(Uuid::from_u128(1))
+        .unwrap()
+        .unwrap()
+        .task;
+    assert!(sender.abort_requested());
+    assert_eq!(sender.checkpoint().phase, "start");
 }
