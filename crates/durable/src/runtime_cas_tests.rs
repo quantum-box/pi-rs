@@ -102,3 +102,47 @@ fn concurrent_duplicate_and_distinct_admissions_retry_cas() {
         assert!(state.submissions.iter().any(|s| s.id == unique));
     }
 }
+
+#[test]
+fn withdrawal_is_durable_and_merges_with_worker_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let sid = owner
+        .submit(id, Some("request".into()), "queued".into())
+        .unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    assert_eq!(
+        owner.withdraw_submission(id, sid).unwrap(),
+        WithdrawResult::Aborted
+    );
+    stale.phase = Phase::ModelReady { turns: 0 };
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    drop(worker);
+    drop(owner);
+    let mut reopened = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        reopened.conversation(id).unwrap().submissions[0].status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+    assert_eq!(
+        reopened
+            .submit(id, Some("request".into()), "duplicate".into())
+            .unwrap(),
+        sid
+    );
+    assert_eq!(
+        reopened.withdraw_submission(id, sid).unwrap(),
+        WithdrawResult::Settled
+    );
+}

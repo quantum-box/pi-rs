@@ -95,6 +95,14 @@ pub struct Submission {
     pub content: String,
     pub status: Status,
 }
+/// Result of attempting to withdraw a single input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithdrawResult {
+    Aborted,
+    AlreadyPlaced,
+    Settled,
+    NotFound,
+}
 /// A persisted interrupted partial, for display only; it is never sent to a model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AbortedGeneration {
@@ -438,7 +446,23 @@ impl Harness {
                         state.pending_resets.push(marker.clone());
                     }
                     for submission in latest.submissions {
-                        if !state.submissions.iter().any(|s| s.id == submission.id) {
+                        if let Some(existing) =
+                            state.submissions.iter_mut().find(|s| s.id == submission.id)
+                        {
+                            if existing.status == Status::Queued
+                                && matches!(&submission.status, Status::Unanswered { reason } if reason == "aborted")
+                            {
+                                existing.status = submission.status.clone();
+                            } else if let Some(original) =
+                                base.submissions.iter().find(|s| s.id == submission.id)
+                                && original.status != submission.status
+                            {
+                                return Err(Error::Invalid(
+                                    "queued input changed while being placed; retry execution"
+                                        .into(),
+                                ));
+                            }
+                        } else {
                             if let Some(mode) = latest.input_modes.get(&submission.id) {
                                 state.input_modes.insert(submission.id, *mode);
                             }
@@ -703,6 +727,33 @@ impl Harness {
                 Ok(()) => return Ok(sid),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
+            }
+        }
+    }
+    /// Withdraw an input only while it is still queued. Request IDs remain reserved.
+    pub fn withdraw_submission(
+        &mut self,
+        id: Uuid,
+        submission: Uuid,
+    ) -> Result<WithdrawResult, Error> {
+        loop {
+            let (mut c, version) = self.load(id)?;
+            let Some(item) = c.submissions.iter_mut().find(|item| item.id == submission) else {
+                return Ok(WithdrawResult::NotFound);
+            };
+            match item.status {
+                Status::Queued => {
+                    item.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    }
+                }
+                Status::Running => return Ok(WithdrawResult::AlreadyPlaced),
+                _ => return Ok(WithdrawResult::Settled),
+            }
+            match self.save(&c, Expected::Version(version)) {
+                Ok(()) => return Ok(WithdrawResult::Aborted),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1810,6 +1861,13 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    pub fn withdraw_submission(
+        &mut self,
+        id: Uuid,
+        submission: Uuid,
+    ) -> Result<WithdrawResult, Error> {
+        self.harness.withdraw_submission(id, submission)
+    }
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
     }
@@ -1966,7 +2024,19 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
     Ok(old == new
         && modes_unchanged
         && resets_unchanged
-        && new_submissions.starts_with(old_submissions))
+        && new_submissions.len() >= old_submissions.len()
+        && old_submissions.iter().zip(new_submissions).all(|(a, b)| {
+            if a == b {
+                return true;
+            }
+            let mut a = a.clone();
+            let mut b = b.clone();
+            let old_status = a.as_object_mut().and_then(|v| v.remove("status"));
+            let new_status = b.as_object_mut().and_then(|v| v.remove("status"));
+            a == b
+                && old_status == Some(serde_json::json!("Queued"))
+                && new_status == Some(serde_json::json!({"Unanswered": {"reason": "aborted"}}))
+        }))
 }
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
@@ -2144,6 +2214,46 @@ mod scheduler_tests {
         );
         assert_eq!(model.maximum.load(Ordering::SeqCst), 2);
         s.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn withdrawal_during_model_call_survives_worker_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler.submit(id, None, "first".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        let queued = scheduler
+            .submit(id, Some("queued".into()), "withdraw me".into())
+            .unwrap();
+        assert_eq!(
+            scheduler.withdraw_submission(id, queued).unwrap(),
+            WithdrawResult::Aborted
+        );
+        model.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = scheduler.conversation(id).unwrap();
+        assert_eq!(
+            conversation.submissions[1].status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+        assert!(
+            !conversation
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "withdraw me"))
+        );
+        scheduler.shutdown().await.unwrap();
     }
     struct FailingModel;
     #[async_trait::async_trait]
