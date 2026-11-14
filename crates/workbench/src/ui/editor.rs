@@ -15,7 +15,10 @@ fn word_segments(text: &str) -> Vec<(usize, usize, bool)> {
     let mut segments = Vec::new();
     for (end, kind) in segmenter.segment_str(text).iter_with_word_type() {
         if end > start {
-            let word = kind.is_word_like() || text[start..end].chars().any(char::is_alphanumeric);
+            // ICU4X can mark Hebrew letters as non-word, unlike Intl.Segmenter.
+            // Do not use is_alphanumeric: non-decimal numeric symbols such as
+            // superscript ² are non-word segments in the reference.
+            let word = kind.is_word_like() || text[start..end].chars().any(char::is_alphabetic);
             segments.push((start, end, word));
         }
         start = end;
@@ -503,6 +506,29 @@ mod tests {
         assert_eq!(&editor.text[editor.cursor..], "e\u{301}lan");
         editor.action("tui.editor.deleteWordBackward");
         assert_eq!(editor.text, "你好世界 e\u{301}lan");
+    }
+
+    #[test]
+    fn non_word_numeric_symbols_move_and_delete_with_adjacent_emoji() {
+        let mut editor = Editor::default();
+        editor.replace("😀²abc".into());
+        editor.cursor = 0;
+        editor.action("tui.editor.cursorWordRight");
+        assert_eq!(editor.cursor, "😀²".len());
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(editor.cursor, 0);
+        editor.action("tui.editor.deleteWordForward");
+        assert_eq!(editor.text, "abc");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "😀²abc");
+        editor.cursor = "😀²".len();
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "abc");
+
+        editor.replace("שלום test".into());
+        editor.cursor = 0;
+        editor.action("tui.editor.cursorWordRight");
+        assert_eq!(editor.cursor, "שלום".len());
     }
 
     #[test]
