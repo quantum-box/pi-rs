@@ -24,24 +24,17 @@ fn receive(receiver: &mpsc::Receiver<Value>, predicate: impl Fn(&Value) -> bool)
     }
 }
 
-#[test]
-fn share_context_tracks_idle_and_inflight_worker() {
-    let root = tempfile::tempdir().unwrap();
-    let prompt = root.path().join("system.txt");
-    std::fs::write(&prompt, "Unique active system prompt").unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!(
-        "http://{}/v1/chat/completions",
-        listener.local_addr().unwrap()
-    );
-    let (received, started) = mpsc::channel();
-    let (release, released) = mpsc::channel();
-    let server = std::thread::spawn(move || {
+// Native Ollama probing can precede the actual chat request. Reply to it
+// immediately so the in-flight share is synchronized with the model stream.
+fn accept_model_request(listener: TcpListener) -> (std::net::TcpStream, Value) {
+    for _ in 0..8 {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -57,9 +50,45 @@ fn share_context_tracks_idle_and_inflight_worker() {
         }
         let mut body = vec![0; length];
         reader.read_exact(&mut body).unwrap();
+        if request_line.starts_with("GET /api/ps ") || request_line.starts_with("POST /api/show ") {
+            let response = r#"{"models":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            continue;
+        }
+        assert!(
+            request_line.starts_with("POST /v1/chat/completions "),
+            "unexpected model request: {request_line:?}"
+        );
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stream"], true, "not a streaming chat request: {body}");
+        assert!(
+            body["messages"]
+                .as_array()
+                .is_some_and(|messages| !messages.is_empty()),
+            "missing model messages: {body}"
+        );
+        return (stream, body);
+    }
+    panic!("model chat request did not follow the probes");
+}
+
+#[test]
+fn share_context_tracks_idle_and_inflight_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let prompt = root.path().join("system.txt");
+    std::fs::write(&prompt, "Unique active system prompt").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (received, started) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _request) = accept_model_request(listener);
         received.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(20)).unwrap();
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     let child = Command::new(env!("CARGO_BIN_EXE_pi"))
@@ -163,10 +192,14 @@ fn share_context_tracks_idle_and_inflight_worker() {
         request["request"]["tools"]
     );
     release.send(()).unwrap();
-    receive(&rx, |event| event["type"] == "agent_settled");
+    let settled = receive(&rx, |event| {
+        assert_ne!(event["type"], "error", "model request error: {event}");
+        event["type"] == "agent_settled"
+    });
+    assert_eq!(settled["success"], true, "model request failed: {settled}");
+    server.join().unwrap();
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     input.flush().unwrap();
-    server.join().unwrap();
 }
 
 #[cfg(unix)]
@@ -223,29 +256,10 @@ fn terminal_shares_idle_and_during_model_request() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let model = std::thread::spawn(move || {
-        let (mut socket, _) = model_listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line.is_empty() || line == "\r\n" {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().unwrap();
-            }
-        }
-        let mut bytes = vec![0; length];
-        reader.read_exact(&mut bytes).unwrap();
+        let (mut socket, _request) = accept_model_request(model_listener);
         started_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     let mut master_fd = -1;
@@ -370,6 +384,7 @@ fn terminal_shares_idle_and_during_model_request() {
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
     assert_eq!(active.last().unwrap()["data"], idle_context["data"]);
     release_tx.send(()).unwrap();
+    wait_output(&mut master, "done");
     shares.join().unwrap();
     model.join().unwrap();
 }
