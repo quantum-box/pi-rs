@@ -2013,7 +2013,7 @@ mod tests {
             );
         let task = tokio::spawn(run(command, "test"));
         let _cleanup = AbortOnDrop(task.abort_handle());
-        let (mut parent, mut child, child_pid) =
+        let (mut parent, parent_pid, mut child, child_pid) =
             tokio::time::timeout(Duration::from_secs(45), async {
                 let mut parent = None;
                 let mut child = None;
@@ -2025,19 +2025,20 @@ mod tests {
                     let (role, pid) = line.split_once(' ').unwrap();
                     let pid: u32 = pid.trim().parse().unwrap();
                     match role {
-                        "parent" => parent = Some(reader.into_inner()),
+                        "parent" => parent = Some((reader.into_inner(), pid)),
                         "child" => child = Some((reader.into_inner(), pid)),
                         _ => panic!("unexpected fixture role"),
                     }
                 }
                 let (child, pid) = child.unwrap();
-                (parent.unwrap(), child, pid)
+                let (parent, parent_pid) = parent.unwrap();
+                (parent, parent_pid, child, pid)
             })
             .await
             .expect("package process tree did not become ready");
 
         #[cfg(windows)]
-        let child_handle = {
+        let (child_handle, parent_handle) = {
             use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
@@ -2066,7 +2067,17 @@ mod tests {
             let handle = Handle(handle);
             // SAFETY: handle remains owned until the end of this test.
             assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
-            handle
+            // SAFETY: parent reported its own PID while blocked on its connection.
+            let parent =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, parent_pid) };
+            assert!(
+                !parent.is_null(),
+                "cannot open parent: {}",
+                std::io::Error::last_os_error()
+            );
+            let parent = Handle(parent);
+            assert_eq!(unsafe { WaitForSingleObject(parent.0, 0) }, WAIT_TIMEOUT);
+            (handle, parent)
         };
         #[cfg(unix)]
         {
@@ -2076,12 +2087,71 @@ mod tests {
         if parent_exits {
             parent.write_all(&[1]).await.unwrap();
             let mut byte = [0];
-            tokio::time::timeout(Duration::from_secs(15), parent.read(&mut byte))
-                .await
-                .expect("parent did not exit")
-                .unwrap();
-            // Allow a concurrent wait implementation to observe and reap the parent.
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(15), parent.read(&mut byte))
+                    .await
+                    .expect("parent did not exit")
+                    .unwrap(),
+                0
+            );
+            #[cfg(unix)]
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    // WNOWAIT observes the original direct child without releasing its PID.
+                    // SAFETY: zeroed siginfo is valid for waitid and the pointer is writable.
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let result = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            parent_pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    assert_eq!(
+                        result,
+                        0,
+                        "parent was reaped while its descendant held a pipe: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    // SAFETY: waitid initialized siginfo; zero means the child has not exited yet.
+                    if unsafe { info.si_pid() } == parent_pid as libc::pid_t {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("parent process did not exit");
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+                use windows_sys::Win32::System::Threading::WaitForSingleObject;
+                // SAFETY: retained handle identifies the original parent process.
+                assert_eq!(
+                    unsafe { WaitForSingleObject(parent_handle.0, 15000) },
+                    WAIT_OBJECT_0,
+                    "original parent did not exit"
+                );
+            }
+            // Give an erroneously concurrent wait a chance to reap before cancellation.
             tokio::time::sleep(Duration::from_millis(250)).await;
+            #[cfg(unix)]
+            {
+                // SAFETY: observe the still-owned child without reaping it.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        parent_pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(result, 0, "parent ownership was lost before cancellation");
+                // SAFETY: successful waitid initialized siginfo.
+                assert_eq!(unsafe { info.si_pid() }, parent_pid as libc::pid_t);
+            }
         }
         task.abort();
         assert!(
