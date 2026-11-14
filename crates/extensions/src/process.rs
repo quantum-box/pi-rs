@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
+// A duplex tool-result request and its completion can each contain an 8 MiB
+// journaled outcome, including JSON-escaped structured shell output.
+const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
 // A lifecycle event can include an 8 MiB journaled tool result, whose JSON
 // representation may expand to six times its original size when escaped.
 const MAX_REQUEST: u64 = 64 * 1024 * 1024;
@@ -2036,24 +2039,77 @@ enum DuplexFrame {
 }
 
 fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 >= MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+    write_bounded_line(writer, value, MAX_MESSAGE)
+}
+fn duplex_write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
+    write_bounded_line(writer, value, MAX_DUPLEX_MESSAGE)
+}
+fn write_bounded_line(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    limit: u64,
+) -> ExtensionResult<()> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+        exceeded: bool,
     }
-    bytes.push(b'\n');
+    impl Write for Bounded {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data.len() > self.limit.saturating_sub(self.bytes.len()) {
+                self.exceeded = true;
+                return Err(std::io::Error::other("frame limit exceeded"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: Vec::new(),
+        limit: (limit - 1) as usize,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        return Err(if buffer.exceeded {
+            format!(
+                "native extension frame exceeds {} MiB",
+                limit / (1024 * 1024)
+            )
+        } else {
+            error.to_string()
+        });
+    }
+    buffer.bytes.push(b'\n');
     writer
-        .write_all(&bytes)
+        .write_all(&buffer.bytes)
         .and_then(|_| writer.flush())
         .map_err(|error| error.to_string())
 }
 fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_MESSAGE)
+}
+fn duplex_read_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_DUPLEX_MESSAGE)
+}
+fn read_bounded_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+    limit: u64,
+) -> ExtensionResult<T> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_MESSAGE + 1)
+        .take(limit + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "native extension frame exceeds {} MiB",
+            limit / (1024 * 1024)
+        ));
     }
     if bytes.is_empty() {
         return Err("native extension connection closed".into());
@@ -2186,7 +2242,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     let (errors, failed) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         for value in writes {
-            if let Err(error) = write_line(&mut input, &value) {
+            if let Err(error) = duplex_write_line(&mut input, &value) {
                 let _ = errors.send(error);
                 break;
             }
@@ -2196,7 +2252,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = read_line::<DuplexFrame>(&mut output);
+            let frame = duplex_read_line::<DuplexFrame>(&mut output);
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
@@ -2322,8 +2378,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2341,8 +2397,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Ui { request })?;
-            read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Ui { request })?;
+            duplex_read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2366,7 +2422,7 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(
+            duplex_write_line(
                 &mut io.1,
                 &DuplexFrame::SendMessage {
                     message,
@@ -2374,7 +2430,7 @@ impl ToolHost for RemoteHost {
                     key: None,
                 },
             )?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2397,7 +2453,7 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(
+            duplex_write_line(
                 &mut io.1,
                 &DuplexFrame::SendMessage {
                     message,
@@ -2405,7 +2461,7 @@ impl ToolHost for RemoteHost {
                     key: Some(key),
                 },
             )?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2422,8 +2478,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Call { calls })?;
-            let outcomes: Vec<Outcome> = read_line(&mut io.0)?;
+            duplex_write_line(&mut io.1, &DuplexFrame::Call { calls })?;
+            let outcomes: Vec<Outcome> = duplex_read_line(&mut io.0)?;
             if outcomes.len() != count {
                 return Err("native extension received an invalid batch size".into());
             }
@@ -2437,7 +2493,7 @@ impl ToolHost for RemoteHost {
 }
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
-    let request: DuplexRequest = read_line(&mut input).map_err(Error::Config)?;
+    let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
@@ -2454,7 +2510,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         .io
         .lock()
         .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
-    write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
+    duplex_write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -5199,6 +5255,89 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
                 ),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'tool_hook_host_calls':True, 'text_result_v2':True, 'structured_text_result':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())['request']
+    outcome=request['outcome']
+    assert len(outcome['detail']['structured_content']['output']) == 1024 * 1024
+    assert outcome['detail']['structured_content']['output'] == '\0' * (1024 * 1024)
+    print(json.dumps({'type':'complete','response':{'Ok':outcome}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update_with_host(&call, &outcome, &context, None, Arc::new(Host))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned, outcome);
+    }
+
+    #[test]
+    fn duplex_frame_limit_is_symmetric_and_bounded() {
+        let value = "\0".repeat(1024 * 1024);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &value).unwrap();
+        assert!(frame.len() > MAX_MESSAGE as usize);
+        assert_eq!(
+            duplex_read_line::<String>(&mut std::io::Cursor::new(&frame)).unwrap(),
+            value
+        );
+        assert!(read_line::<String>(&mut std::io::Cursor::new(&frame)).is_err());
+        let oversized = "x".repeat(MAX_DUPLEX_MESSAGE as usize);
+        assert!(
+            duplex_write_line(&mut Vec::new(), &oversized)
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+        let oversized_frame = vec![b'x'; MAX_DUPLEX_MESSAGE as usize + 1];
+        assert!(
+            duplex_read_line::<Value>(&mut std::io::Cursor::new(oversized_frame))
+                .unwrap_err()
+                .contains("16 MiB")
+        );
     }
 
     #[tokio::test]

@@ -2086,6 +2086,9 @@ protocols receive a compatible text result; any returned replacement drops
 the structured value because those protocols cannot distinguish a same-text
 replacement from a metadata-only update. Legacy failure replacements retain
 existing error details.
+Duplex native-extension frames have a symmetric 16 MiB bound so escaped
+structured shell output can cross the process boundary; oversized frames are
+rejected, and the separate shell-stream protocol retains its 4 MiB bound.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count
