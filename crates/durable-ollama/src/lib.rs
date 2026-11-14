@@ -82,6 +82,10 @@ impl ProviderAdapter for OllamaAdapter {
                 .as_u64()
                 .is_none_or(|n| n == 0 || n > u64::from(request.max_output_tokens))
             || obj.contains_key("max_completion_tokens")
+            || obj.contains_key("max_output_tokens")
+            || obj.contains_key("functions")
+            || obj.contains_key("function_call")
+            || obj.get("n").is_some_and(|n| n.as_u64() != Some(1))
             || serde_json::to_vec(body)?.len() > 4 * 1024 * 1024
         {
             return Err(fail());
@@ -147,6 +151,10 @@ impl ProviderAdapter for OllamaAdapter {
                 let event = event.map_err(|e| match e { eventsource_stream::EventStreamError::Transport(e) => e, _ => Error::RetryableModel("broken SSE stream".into()) })?;
                 if event.data == "[DONE]" {
                     match metadata.finish_reason.as_deref() { Some("stop" | "length") if calls.is_empty() => {}, Some("tool_calls") if !calls.is_empty() => {}, _ => Err(Error::Model("model response did not finish successfully".into()))? }
+                    let mut ids = std::collections::HashSet::new();
+                    if calls.values().any(|c| c.id.is_empty() || c.name.is_empty() || !c.has_arguments || !ids.insert(&c.id)) {
+                        Err(Error::Model("incomplete or duplicate tool call".into()))?;
+                    }
                     if !reasoning.is_empty() { metadata.reasoning = Some(reasoning); yield ModelEvent::Metadata(metadata); }
                     yield ModelEvent::Complete { calls: calls.into_values().map(|c| ToolCall { id:c.id, name:c.name, arguments:c.arguments }).collect(), usage };
                     return;
@@ -162,8 +170,9 @@ impl ProviderAdapter for OllamaAdapter {
                     if let Some(text) = choice.delta.content.filter(|s| !s.is_empty()) { yield ModelEvent::Text(text); }
                     for delta in choice.delta.tool_calls.unwrap_or_default() {
                         if delta.index >= 64 { Err(Error::Model("invalid tool call index".into()))?; }
-                        let (name, arguments) = delta.function.map(|f| (f.name.unwrap_or_default(), f.arguments.unwrap_or_default())).unwrap_or_default();
+                        let (name, arguments, has_arguments) = delta.function.map(|f| (f.name.unwrap_or_default(), f.arguments.clone().unwrap_or_default(), f.arguments.is_some())).unwrap_or_default();
                         let id = delta.id.unwrap_or_default(); let call = calls.entry(delta.index).or_default();
+                        call.has_arguments |= has_arguments;
                         call.id.push_str(&id); call.name.push_str(&name); call.arguments.push_str(&arguments);
                         yield ModelEvent::ToolCallDelta(ToolCallDelta { index: delta.index as u64, id, name, arguments });
                     }
@@ -236,9 +245,7 @@ struct Chunk {
 }
 #[derive(Deserialize)]
 struct WireUsage {
-    #[serde(default)]
     prompt_tokens: u64,
-    #[serde(default)]
     completion_tokens: u64,
 }
 #[derive(Deserialize)]
@@ -271,4 +278,5 @@ struct CallDelta {
     id: String,
     name: String,
     arguments: String,
+    has_arguments: bool,
 }

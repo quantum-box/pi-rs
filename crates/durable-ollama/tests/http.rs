@@ -33,6 +33,14 @@ fn server(
     response: &'static str,
     delay: bool,
 ) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    server_with_options(response, delay, false, false)
+}
+fn server_with_options(
+    response: &'static str,
+    delay: bool,
+    fragment: bool,
+    pause_after_headers: bool,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -73,9 +81,68 @@ fn server(
         if delay {
             std::thread::sleep(Duration::from_millis(300));
         }
-        let _ = socket.write_all(response.as_bytes());
+        if pause_after_headers {
+            let end = response.find("\r\n\r\n").unwrap() + 4;
+            let _ = socket.write_all(&response.as_bytes()[..end]);
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = socket.write_all(&response.as_bytes()[end..]);
+        } else if fragment {
+            for byte in response.as_bytes() {
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        } else {
+            let _ = socket.write_all(response.as_bytes());
+        }
     });
     (format!("http://{addr}"), rx, thread)
+}
+
+#[tokio::test]
+async fn fragmented_sse_and_late_usage_are_collected() {
+    let response = http(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"猫\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\r\n\r\ndata: [DONE]\r\n\r\n",
+    );
+    let (url, rx, thread) = server_with_options(response, false, true, false);
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let result = collect_generation(
+        adapter.dispatch(&a, &r, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.content, "猫");
+    assert_eq!(result.usage.unwrap().input_tokens, 7);
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_drops_pending_response_stream() {
+    let (url, rx, thread) = server_with_options(http("data: [DONE]\n\n"), false, false, true);
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let stream = adapter.dispatch(&a, &r, body).await.unwrap();
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        c.cancel();
+    });
+    assert!(matches!(
+        collect_generation(async { Ok(stream) }, &cancel, |_| {}).await,
+        Err(Error::Cancelled)
+    ));
+    rx.recv().unwrap();
+    thread.join().unwrap();
 }
 fn http(body: &str) -> &'static str {
     Box::leak(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).into_boxed_str())
@@ -115,6 +182,20 @@ async fn rejected_rewrites_and_bad_endpoints() {
     let mut body = adapter.prepare(&a, &r).await.unwrap();
     body["model"] = json!("other");
     assert!(adapter.dispatch(&a, &r, body).await.is_err());
+    for (key, value) in [
+        ("functions", json!([])),
+        ("function_call", json!("auto")),
+        ("max_output_tokens", json!(999)),
+        ("max_completion_tokens", json!(999)),
+        ("n", json!(2)),
+    ] {
+        let mut body = adapter.prepare(&a, &r).await.unwrap();
+        body[key] = value;
+        assert!(
+            adapter.dispatch(&a, &r, body).await.is_err(),
+            "accepted {key}"
+        );
+    }
     for url in [
         "http://example.com",
         "http://localhost:11434",
@@ -124,6 +205,71 @@ async fn rejected_rewrites_and_bad_endpoints() {
     ] {
         assert!(OllamaAdapter::new(url).is_err());
     }
+}
+
+#[tokio::test]
+async fn incomplete_calls_and_partial_usage_fail() {
+    for data in [
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read"}}]},"finish_reason":"tool_calls"}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3}}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"a","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ] {
+        let response = http(&format!("data: {data}\n\ndata: [DONE]\n\n"));
+        let (url, rx, thread) = server(response, false);
+        let adapter = OllamaAdapter::new(&url).unwrap();
+        let a = attempt();
+        let r = request();
+        let body = adapter.prepare(&a, &r).await.unwrap();
+        assert!(
+            collect_generation(
+                adapter.dispatch(&a, &r, body),
+                &CancellationToken::new(),
+                |_| {}
+            )
+            .await
+            .is_err()
+        );
+        rx.recv().unwrap();
+        thread.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn malformed_argument_json_is_retained_for_tool_error_handling() {
+    let response = http(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+    );
+    let (url, rx, thread) = server(response, false);
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let result = collect_generation(
+        adapter.dispatch(&a, &r, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.calls[0].arguments, "{");
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let response = Box::leak(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/stolen\r\nContent-Length: 0\r\n\r\n", target.local_addr().unwrap()).into_boxed_str());
+    let (url, rx, thread) = server(response, false);
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    assert!(adapter.dispatch(&a, &r, body).await.is_err());
+    rx.recv().unwrap();
+    thread.join().unwrap();
+    assert!(target.accept().is_err());
 }
 #[tokio::test]
 async fn malformed_and_incomplete_streams_fail() {
