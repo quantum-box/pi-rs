@@ -109,6 +109,17 @@ impl Store {
                 AND NOT EXISTS (SELECT 1 FROM durable_document_history_meta WHERE id=1);
             INSERT OR IGNORE INTO durable_document_history_meta(id, revision) VALUES(1, 0);
             COMMIT;")?;
+        // Establish a boundary after all legacy cuts. Legacy live logs are seeded
+        // here, but earlier states cannot be reconstructed.
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_application_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), first_revision INTEGER NOT NULL);
+            UPDATE durable_document_history_meta SET revision=revision+1 WHERE id=1 AND NOT EXISTS (SELECT 1 FROM durable_application_history_meta WHERE id=1);
+            INSERT INTO durable_document_history(key,revision,value,version)
+                SELECT key,(SELECT revision FROM durable_document_history_meta WHERE id=1),value,version FROM durable_store_entries
+                WHERE substr(key,1,28)=CAST('durable/application-entries/' AS BLOB)
+                  AND NOT EXISTS (SELECT 1 FROM durable_application_history_meta WHERE id=1);
+            INSERT OR IGNORE INTO durable_application_history_meta(id,first_revision) SELECT 1,revision FROM durable_document_history_meta WHERE id=1;
+            COMMIT;")?;
         Ok(Self {
             connection: Mutex::new(conn),
         })
@@ -283,7 +294,7 @@ impl Store {
         if after > current {
             return Err(Error::InvalidSnapshot);
         }
-        let mut stmt = conn.prepare("SELECT revision,key,value,version FROM durable_document_history WHERE revision IN (SELECT DISTINCT revision FROM durable_document_history WHERE revision>?1 ORDER BY revision LIMIT ?2) ORDER BY revision,key")?;
+        let mut stmt = conn.prepare("SELECT revision,key,value,version FROM durable_document_history WHERE substr(key,1,17)=CAST('durable/document/' AS BLOB) AND revision IN (SELECT DISTINCT revision FROM durable_document_history WHERE substr(key,1,17)=CAST('durable/document/' AS BLOB) AND revision>?1 ORDER BY revision LIMIT ?2) ORDER BY revision,key")?;
         let mut rows = stmt.query(params![after, limit as i64])?;
         let mut commits: Vec<DocumentCommit> = Vec::new();
         while let Some(row) = rows.next()? {
@@ -317,6 +328,41 @@ impl Store {
             .optional()?)
     }
 
+    /// Read an application log at a proven history boundary. Older cuts are
+    /// rejected because pre-migration log changes were not recorded.
+    pub fn application_entries_at(
+        &self,
+        key: &[u8],
+        revision: u64,
+    ) -> Result<Option<Entry>, Error> {
+        if !key.starts_with(b"durable/application-entries/") {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let first: u64 = conn.query_row(
+            "SELECT first_revision FROM durable_application_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision < first || revision > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let row: Option<(Option<Vec<u8>>, Option<u64>)> = conn.query_row(
+            "SELECT value,version FROM durable_document_history WHERE key=?1 AND revision<=?2 ORDER BY revision DESC LIMIT 1",
+            params![key, revision], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        match row {
+            Some((Some(value), Some(version))) => Ok(Some(Entry { value, version })),
+            Some((None, None)) | None => Ok(None),
+            _ => Err(Error::Storage(rusqlite::Error::InvalidQuery)),
+        }
+    }
+
     /// Enumerate live document entries at an immutable revision.
     pub fn documents_at(&self, revision: u64) -> Result<Vec<KeyedEntry>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -328,7 +374,7 @@ impl Store {
         if revision > current {
             return Err(Error::InvalidSnapshot);
         }
-        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
+        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE substr(h.key,1,17)=CAST('durable/document/' AS BLOB) AND h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
         let rows = stmt.query_map([revision], |r| {
             Ok((
                 r.get(0)?,
@@ -385,6 +431,7 @@ impl Store {
         let document_changed = mutations.iter().any(|mutation| match mutation {
             Mutation::Put { key, .. } | Mutation::Delete { key } => {
                 key.starts_with(b"durable/document/")
+                    || key.starts_with(b"durable/application-entries/")
             }
         });
         let revision = if document_changed {
@@ -424,7 +471,9 @@ impl Store {
             let key = match mutation {
                 Mutation::Put { key, .. } | Mutation::Delete { key } => key,
             };
-            if key.starts_with(b"durable/document/") {
+            if key.starts_with(b"durable/document/")
+                || key.starts_with(b"durable/application-entries/")
+            {
                 // Upsert accommodates raw batches that mutate the same key more
                 // than once: the snapshot represents the final committed state.
                 tx.execute("INSERT INTO durable_document_history(key,revision,value,version) VALUES(?1,?2,(SELECT value FROM durable_store_entries WHERE key=?1),(SELECT version FROM durable_store_entries WHERE key=?1)) ON CONFLICT(key,revision) DO UPDATE SET value=excluded.value,version=excluded.version", params![key, revision])?;
@@ -474,7 +523,7 @@ mod document_history_tests {
             .unwrap();
         }
         let db = Store::open(&path).unwrap();
-        assert_eq!(db.document_snapshot().unwrap(), 0);
+        assert_eq!(db.document_snapshot().unwrap(), 1);
         assert_eq!(db.document_at(key, 0).unwrap().unwrap().version, 7);
         db.commit(
             &[Check {
@@ -487,6 +536,36 @@ mod document_history_tests {
         drop(db);
         let db = Store::open(&path).unwrap();
         assert_eq!(db.document_at(key, 0).unwrap().unwrap().value, b"legacy");
-        assert!(db.document_at(key, 1).unwrap().is_none());
+        assert!(db.document_at(key, 2).unwrap().is_none());
+    }
+    #[test]
+    fn legacy_application_cuts_fail_closed_and_live_log_is_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let key = b"durable/application-entries/example";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES(1, 7); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID;").unwrap();
+            conn.execute(
+                "INSERT INTO durable_store_entries VALUES (?1, ?2, 7)",
+                params![key, b"legacy".as_slice()],
+            )
+            .unwrap();
+        }
+        let db = Store::open(&path).unwrap();
+        assert!(matches!(
+            db.application_entries_at(key, 0),
+            Err(Error::InvalidSnapshot)
+        ));
+        assert_eq!(
+            db.application_entries_at(key, 1).unwrap().unwrap().value,
+            b"legacy"
+        );
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert_eq!(
+            db.application_entries_at(key, 1).unwrap().unwrap().value,
+            b"legacy"
+        );
     }
 }

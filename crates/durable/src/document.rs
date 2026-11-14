@@ -216,6 +216,21 @@ impl<'a> Documents<'a> {
             checks: Vec::new(),
             mutations: Vec::new(),
         };
+        let source = crate::application_entry::key(parent);
+        if let Some(entry) = self.store.application_entries_at(&source, revision)? {
+            // Validate before copying; the original IDs and authors remain immutable.
+            let _: Vec<crate::application_entry::ApplicationEntry> =
+                serde_json::from_slice(&entry.value)?;
+            let target = crate::application_entry::key(child);
+            batch.checks.push(Check {
+                key: target.clone(),
+                expected: Expected::Missing,
+            });
+            batch.mutations.push(Mutation::Put {
+                key: target,
+                value: entry.value,
+            });
+        }
         for (key, entry) in self.store.documents_at(revision)? {
             let parts: [String; 3] =
                 serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;

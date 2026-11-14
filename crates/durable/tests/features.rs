@@ -960,3 +960,96 @@ async fn document_forks_follow_committed_cuts_and_survive_reopen() {
         .is_none()
     );
 }
+
+#[tokio::test]
+async fn task_entries_follow_proven_fork_cuts_and_descendants() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Scheduler as TaskScheduler, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Append;
+    impl Handler for Append {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            task: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.note", task.checkpoint().data.clone())
+                .unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    fn append(path: &std::path::Path, conversation: Uuid, value: i32) -> Uuid {
+        let id = Uuid::new_v4();
+        let task = Task::new(
+            id,
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(value),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("append".into(), true);
+        let mut registry = Registry::default();
+        registry.register("append", true, Append);
+        let mut scheduler = TaskScheduler::open(path, registry).unwrap();
+        scheduler.submit(&task).unwrap();
+        scheduler.tick(0).unwrap();
+        id
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let first_author = append(&path, parent, 1);
+    h.reset(parent, None).unwrap();
+    let cut = h
+        .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .next;
+    append(&path, parent, 2);
+    let old = h.fork_at(parent, cut).unwrap();
+    let current = h.fork(parent).unwrap();
+    let db = Store::open(&path).unwrap();
+    let original = application_entry::list(&db, parent).unwrap();
+    assert_eq!(original.len(), 2);
+    assert_eq!(original[0].author_task_id, first_author);
+    assert_eq!(application_entry::list(&db, old).unwrap(), original[..1]);
+    assert_eq!(application_entry::list(&db, current).unwrap(), original);
+    append(&path, old, 3);
+    let descendant = h.fork(old).unwrap();
+    let old_entries = application_entry::list(&db, old).unwrap();
+    assert_eq!(old_entries.len(), 2);
+    assert_eq!(old_entries[1].conversation_id, old);
+    assert_eq!(
+        application_entry::list(&db, descendant).unwrap(),
+        old_entries
+    );
+    assert_eq!(application_entry::list(&db, parent).unwrap(), original);
+    drop(db);
+    drop(h);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(
+        application_entry::list(&db, descendant).unwrap(),
+        old_entries
+    );
+}
