@@ -1796,6 +1796,14 @@ mod tests {
             ("- ~~`a\n \tb`~~", "a    b"),
             ("- ~~`a\n  \tb`~~", "a b"),
             ("- ~~`a\n b`~~", "a  b"),
+            (" - ~~`a\n   b`~~", "a b"),
+            ("  - ~~`a\n    b`~~", "a b"),
+            ("   - ~~`a\n     b`~~", "a b"),
+            ("  - ~~`a\n\tb`~~", "a b"),
+            ("  -\t~~`a\n\tb`~~", "a b"),
+            ("  1. ~~`a\n     b`~~", "a b"),
+            ("  - outer\n    - ~~`a\n      b`~~", "a b"),
+            (">   - ~~`a\n>     b`~~", "a b"),
         ] {
             let lines = markdown(source, &theme, 120);
             assert!(

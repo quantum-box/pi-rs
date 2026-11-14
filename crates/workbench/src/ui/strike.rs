@@ -432,14 +432,21 @@ fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(St
 
 fn item_indent(original: &str, start: usize) -> Option<usize> {
     let line = original.get(start..)?.split('\n').next()?.as_bytes();
-    let marker = if matches!(line.first(), Some(b'-' | b'+' | b'*')) {
-        1
+    let leading = line.iter().take_while(|byte| **byte == b' ').count();
+    if leading > 3 {
+        return None;
+    }
+    let marker = if matches!(line.get(leading), Some(b'-' | b'+' | b'*')) {
+        leading + 1
     } else {
-        let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits == 0 || !matches!(line.get(digits), Some(b'.' | b')')) {
+        let digits = line[leading..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || !matches!(line.get(leading + digits), Some(b'.' | b')')) {
             return None;
         }
-        digits + 1
+        leading + digits + 1
     };
     let mut column = marker;
     for byte in &line[marker..] {
