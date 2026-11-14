@@ -828,7 +828,6 @@ mod tests {
                 .select_provider_model(Some("old"), "shared", Some("high"))
                 .unwrap();
             let mut records = session.records().to_vec();
-            let version = records[0].version;
             let event = if summary {
                 Event::BranchSummary {
                     summary: "summary".into(),

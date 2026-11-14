@@ -2378,8 +2378,7 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let mut session = Session::from_records(self.journal()?.fork_records(record)?)?;
-        session.recover_tree_trigger_handoff()?;
+        let session = Session::from_records(self.journal()?.fork_records_after_handoff(record)?)?;
         let resolution = self.resolve_branch_model(&session, session.head())?;
         self.fork_snapshot(session, resolution)
     }
@@ -2397,9 +2396,8 @@ impl AgentSession {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
-        let records = journal.fork_records(record)?;
-        let mut snapshot = Session::from_records(records)?;
-        snapshot.recover_tree_trigger_handoff()?;
+        let records = journal.fork_records_after_handoff(record)?;
+        let snapshot = Session::from_records(records)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.fork_snapshot_to(snapshot, resolution, &destination)
@@ -2439,8 +2437,8 @@ impl AgentSession {
             crate::ForkPosition::Before => record.parent.unwrap_or(1),
             crate::ForkPosition::At => record.id,
         };
-        let mut snapshot = Session::from_records(journal.fork_records(target)?)?;
-        snapshot.recover_tree_trigger_handoff()?;
+        let target = journal.fork_target_after_handoff(target)?;
+        let snapshot = Session::from_records(journal.fork_records_after_handoff(target)?)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.start().await?;
@@ -2464,8 +2462,7 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
-        let mut snapshot = Session::from_records(self.journal()?.fork_records(target)?)?;
-        snapshot.recover_tree_trigger_handoff()?;
+        let snapshot = Session::from_records(self.journal()?.fork_records_after_handoff(target)?)?;
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -5451,6 +5448,94 @@ mod tests {
         let mut reopened = Session::open(&path).unwrap();
         assert!(reopened.recover_tree_trigger_handoff().unwrap().is_none());
         drop(reopened);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fork_resolves_handoff_before_selecting_temporary_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let hook_path = dir.path().join("hook-fork.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+            .provider("return")
+            .unwrap()
+            .provider_branch_model(
+                "temporary",
+                "shared",
+                Arc::new(ProviderBranchModel("temporary")),
+            )
+            .unwrap()
+            .provider_branch_model("other", "shared", Arc::new(ProviderBranchModel("other")))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let (temporary_record, unrelated) = {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("other"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("unrelated".into(), vec![], None)
+                .unwrap();
+            let unrelated = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("temporary"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("temporary before".into(), vec![], None)
+                .unwrap();
+            let temporary = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("return"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("selected context".into(), vec![], None)
+                .unwrap();
+            let return_to = journal.head();
+            journal
+                .append(crate::Event::TreeTriggerHandoff {
+                    run_id: Uuid::new_v4(),
+                    return_to,
+                })
+                .unwrap();
+            journal.checkout(temporary).unwrap();
+            journal
+                .append_user_with_images("temporary after marker".into(), vec![], None)
+                .unwrap();
+            (journal.head(), unrelated)
+        };
+        let mut fork = session.fork_at(temporary_record).unwrap();
+        let context = {
+            let journal = fork.journal().unwrap();
+            format!("{:?}", journal.conversation_at(journal.head()).unwrap())
+        };
+        assert!(context.contains("selected context"));
+        assert!(!context.contains("temporary after marker"));
+        assert_eq!(fork.prompt("fork").await.unwrap(), "return");
+        fork.close().await.unwrap();
+        let mut other = session.fork_at(unrelated).unwrap();
+        assert_eq!(other.prompt("other").await.unwrap(), "other");
+        other.close().await.unwrap();
+        let mut persistent = session.fork_to(temporary_record, &path).unwrap();
+        assert_eq!(persistent.prompt("persistent").await.unwrap(), "return");
+        persistent.close().await.unwrap();
+        drop(persistent);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+            .provider("return")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("reopened").await.unwrap(), "return");
+        reopened.close().await.unwrap();
+        assert_eq!(session.journal().unwrap().head(), temporary_record);
+        let mut hooked = session
+            .fork_with_hooks(temporary_record, crate::ForkPosition::At, Some(&hook_path))
+            .await
+            .unwrap();
+        assert_eq!(hooked.prompt("hooked").await.unwrap(), "return");
+        hooked.close().await.unwrap();
         session.close().await.unwrap();
     }
 

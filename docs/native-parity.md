@@ -751,7 +751,8 @@ fallback clears thinking and a competing registration cannot be overwritten.
 If a host revokes clients during a successful transition write, the SDK emits
 the committed record and reports the successful transition, while subsequent
 dispatch fails closed until an authorized client is registered. Persistent
-forks recover pending handoffs and validate their complete snapshot before
+forks resolve pending handoffs from the complete source journal before selecting
+their branch and validate their complete snapshot before
 publishing and retain the locked published file handle.
 Failures before publication remove the temporary snapshot and do not replace a
 destination. As with existing journal export, a directory-sync failure after
