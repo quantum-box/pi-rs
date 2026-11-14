@@ -96,6 +96,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0));
             INSERT OR IGNORE INTO durable_store_meta(id, version) VALUES(1, 0);
             CREATE TABLE IF NOT EXISTS durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;")?;
+        // The version boundary distinguishes pre-migration writes, whose commit
+        // grouping is unknowable, from all subsequently recorded puts.
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_commit_meta (id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL CHECK(sequence>=0), legacy_version INTEGER NOT NULL CHECK(legacy_version>=0));
+            INSERT OR IGNORE INTO durable_commit_meta SELECT 1,0,version FROM durable_store_meta WHERE id=1;
+            CREATE TABLE IF NOT EXISTS durable_commit_versions (key BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0), sequence INTEGER NOT NULL CHECK(sequence>0), PRIMARY KEY(key,version)) WITHOUT ROWID;
+            COMMIT;")?;
         // Seed existing live documents once. Earlier overwritten/deleted values cannot
         // be recovered. Both the seed and its marker are committed atomically.
         conn.execute_batch("BEGIN IMMEDIATE;
@@ -124,6 +131,41 @@ impl Store {
             connection: Mutex::new(conn),
         })
     }
+    /// Current store-wide sequence. Zero is the migration boundary; only
+    /// successful commits containing mutations advance it, once per batch.
+    pub fn commit_sequence(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Highest per-put version allocated before commit tracking was installed.
+    /// Its historical commit grouping cannot be reconstructed.
+    pub fn legacy_version_boundary(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Commit containing this put, including puts later overwritten or deleted.
+    /// None means the key/version is unknown or predates commit tracking.
+    pub fn commit_for_version(&self, key: &[u8], version: u64) -> Result<Option<u64>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT sequence FROM durable_commit_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Entry>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn
@@ -459,6 +501,21 @@ impl Store {
                 });
             }
         }
+        let sequence = if mutations.is_empty() {
+            None
+        } else {
+            let previous: i64 = tx.query_row(
+                "SELECT sequence FROM durable_commit_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let next = previous.checked_add(1).ok_or(Error::VersionExhausted)?;
+            tx.execute(
+                "UPDATE durable_commit_meta SET sequence=?1 WHERE id=1",
+                [next],
+            )?;
+            Some(next)
+        };
         let document_changed = mutations.iter().any(|mutation| match mutation {
             Mutation::Put { key, .. } | Mutation::Delete { key } => {
                 key.starts_with(b"durable/document/")
@@ -495,6 +552,7 @@ impl Store {
                         [version],
                     )?;
                     tx.execute("INSERT INTO durable_store_entries(key,value,version) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,version=excluded.version", params![key, value, version])?;
+                    tx.execute("INSERT INTO durable_commit_versions(key,version,sequence) VALUES(?1,?2,?3)", params![key, version, sequence])?;
                 }
                 Mutation::Delete { key } => {
                     tx.execute("DELETE FROM durable_store_entries WHERE key=?1", [key])?;

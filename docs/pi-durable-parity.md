@@ -1,3 +1,5 @@
+**Store commit sequence prerequisite:** The durable store records a monotonic sequence per successful nonempty mutation batch and maps each put key/version to its commit. Pre-migration versions have no reconstructible commit mapping; the store records their version boundary. This is a storage prerequisite for unified ordered conversation history, not an implementation of that history or upstream session parity.
+
 # Pi Durable compatibility inventory
 
 **Extension report subscription:** `Harness` and `Scheduler` expose a bounded,
