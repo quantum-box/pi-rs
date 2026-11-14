@@ -2677,9 +2677,9 @@ fn encode_record(record: &Record, metadata: Option<&serde_json::Value>) -> Resul
     }
 }
 
-fn read_complete_records(
-    reader: impl Read,
-) -> Result<(Vec<Record>, BTreeMap<u64, serde_json::Value>, u64, bool)> {
+type CompleteRecords = (Vec<Record>, BTreeMap<u64, serde_json::Value>, u64, bool);
+
+fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
     let mut records = Vec::new();
     let mut metadata = BTreeMap::new();
     let mut offset = 0;
