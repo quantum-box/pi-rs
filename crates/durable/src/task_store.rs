@@ -8,6 +8,7 @@ use crate::task::{Task, TaskOwner, TaskState, TransitionError, WaitFor};
 use durable_store::{Check, Entry, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/task/";
@@ -46,15 +47,47 @@ pub enum Error {
     OwnerChanged,
     #[error("signal name, version, or key is invalid")]
     InvalidSignalToken,
+    #[error("invalid signal schema: {0}")]
+    InvalidSignalSchema(String),
+    #[error("signal payload does not match its schema")]
+    InvalidSignalPayload,
+    #[error("signal version {stored} is newer than reader version {current}")]
+    NewerSignalVersion { stored: u32, current: u32 },
+    #[error("signal migration failed: {0}")]
+    SignalMigration(String),
 }
 
-/// Identity and value version of a signal kind. Payload schemas and migration
-/// are the caller's responsibility.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Identity and value version of a signal kind. `new` retains the legacy
+/// unconstrained JSON behavior; `with_schema` enables checked typed reads.
+#[derive(Clone)]
 pub struct SignalToken {
     name: String,
     version: u32,
+    schema: Option<Value>,
+    migrate: Option<Arc<SignalMigration>>,
 }
+
+type SignalMigration = dyn Fn(Value, u32) -> Result<Value, String> + Send + Sync;
+
+impl std::fmt::Debug for SignalToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalToken")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("schema", &self.schema)
+            .field("has_migration", &self.migrate.is_some())
+            .finish()
+    }
+}
+
+// A token's identity has always been its name and version. Definitions sharing
+// that identity are the caller's responsibility, as in upstream.
+impl PartialEq for SignalToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.version == other.version
+    }
+}
+impl Eq for SignalToken {}
 
 /// Upstream-shaped signal kind and wait key; versions do not affect matching.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +102,62 @@ impl SignalToken {
         if name.is_empty() || name.contains('/') || version == 0 {
             return Err(Error::InvalidSignalToken);
         }
-        Ok(Self { name, version })
+        Ok(Self {
+            name,
+            version,
+            schema: None,
+            migrate: None,
+        })
+    }
+
+    /// Define a JSON Schema for values read with this token.
+    pub fn with_schema(
+        name: impl Into<String>,
+        version: u32,
+        schema: Value,
+    ) -> Result<Self, Error> {
+        let mut token = Self::new(name, version)?;
+        jsonschema::validator_for(&schema)
+            .map_err(|e| Error::InvalidSignalSchema(e.to_string()))?;
+        token.schema = Some(schema);
+        Ok(token)
+    }
+
+    /// Register one migration from any supported older version to this version.
+    pub fn with_migration<F>(mut self, migration: F) -> Self
+    where
+        F: Fn(Value, u32) -> Result<Value, String> + Send + Sync + 'static,
+    {
+        self.migrate = Some(Arc::new(migration));
+        self
+    }
+
+    fn read_value(&self, value: Value, stored: u32) -> Result<Value, Error> {
+        if stored == 0 || stored > self.version {
+            return Err(Error::NewerSignalVersion {
+                stored,
+                current: self.version,
+            });
+        }
+        let value = if stored < self.version {
+            let migrate = self
+                .migrate
+                .as_ref()
+                .ok_or_else(|| Error::SignalMigration("missing migration".into()))?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| migrate(value, stored)))
+                .map_err(|_| Error::SignalMigration("migration panicked".into()))?
+                .map_err(Error::SignalMigration)?
+        } else {
+            value
+        };
+        if let Some(schema) = &self.schema {
+            let validator = jsonschema::validator_for(schema)
+                .map_err(|e| Error::InvalidSignalSchema(e.to_string()))?;
+            if !validator.is_valid(&value) {
+                return Err(Error::InvalidSignalPayload);
+            }
+        }
+        Ok(value)
     }
 
     pub fn name(&self) -> &str {
@@ -160,6 +248,7 @@ impl Signal {
         payload: Value,
     ) -> Result<Self, Error> {
         let key = token.key(key)?;
+        let payload = token.read_value(payload, token.version)?;
         Ok(Self {
             id,
             task_id,
@@ -459,6 +548,37 @@ impl<'a> TaskStore<'a> {
         self.store
             .get(&signal_key(task_id, id))?
             .map(|entry| serde_json::from_slice(&entry.value).map_err(Error::from))
+            .transpose()
+    }
+
+    /// Read the committed value for a typed key, including consumed values.
+    /// Migration is read-only: the original receipt remains unchanged.
+    pub fn read_typed_signal(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key: impl Into<String>,
+    ) -> Result<Option<Value>, Error> {
+        let key = token.key(key)?;
+        let mut found = None;
+        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+            let signal: Signal = serde_json::from_slice(&entry.value)?;
+            if signal.typed_key() == Some(&key) {
+                // Historical duplicate keys are ambiguous and must not silently
+                // select an arbitrary value.
+                if found.is_some() {
+                    return Err(Error::SignalKeyMismatch);
+                }
+                found = Some(signal);
+            }
+        }
+        found
+            .map(|signal| {
+                token.read_value(
+                    signal.payload,
+                    signal.typed.expect("typed key matched").version,
+                )
+            })
             .transpose()
     }
 

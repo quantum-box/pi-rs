@@ -209,9 +209,18 @@ Current limits and differences from upstream Pi Durable:
   A task/key holds one version and JSON value: identical retries, including with
   another receipt ID, succeed without creating another receipt; conflicting
   values or versions are rejected. Consumed keys reject later waits. Legacy
-  records and task-scoped UUID idempotency remain supported. Unlike upstream,
-  schema validation, migration, expiry, typed deadline-or-signal sleeps, and
-  upstream delivery result variants are not implemented. Upstream reports any
+  records and task-scoped UUID idempotency remain supported.
+  `SignalToken::with_schema` accepts a JSON Schema, validates newly constructed
+  typed signals, and checks values returned by `TaskStore::read_typed_signal`.
+  An optional `with_migration` callback converts any supported older version;
+  missing, failed, panicking, invalid, and newer-version reads return errors.
+  Reads do not rewrite receipts, so migrations must be deterministic and may run
+  again after reopening. Legacy `SignalToken::new` accepts any JSON, and raw
+  receipt reads and wake results bypass validation; hosts must use the typed
+  read to enforce it. Token definitions and migration callbacks are supplied by
+  the host after reopening. Duplicate historical typed keys fail typed reads.
+  Unlike upstream, expiry, typed deadline-or-signal sleeps, and upstream delivery
+  result variants are not implemented. Upstream reports any
   occupied key as duplicate regardless of value; this API rejects a different
   value or version. Same-ID retries remain successful after task termination,
   while a new ID is rejected for a terminal task. Existing stores with
