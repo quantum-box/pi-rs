@@ -715,6 +715,11 @@ the effective endpoint and credentials from trusted host configuration, and
 returns an exact client, a different provider/model client, or unavailable.
 For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
+rejects a fallback before committing if that provider/model already has a
+different client; an existing matching client must be the same `Arc`. A host
+revocation during the write prevents the resolved client from being installed.
+The durable selection can then exist without a client and requires a new
+authorized registration before dispatch. The SDK
 cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. This resolver runs on session
