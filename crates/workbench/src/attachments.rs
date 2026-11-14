@@ -1,5 +1,4 @@
 //! Explicit @file inputs for the initial CLI prompt.
-use std::io::Read;
 use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
@@ -27,25 +26,7 @@ pub fn expand(
         if metadata.is_file() && metadata.len() == 0 {
             continue;
         }
-        let (content, attached) = match tools.read_attachment(&path) {
-            Ok(result) => result,
-            // Node's readFile(path, "utf-8") replaces malformed sequences. The
-            // normal attachment reader rejects them, so retry text with the
-            // same aggregate bound enforced below.
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
-                let mut bytes = Vec::new();
-                std::fs::File::open(&path)?
-                    .take(8 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() > 8 * 1024 * 1024 {
-                    return Err(Error::Config(
-                        "attachments exceed the 8 MiB input limit".into(),
-                    ));
-                }
-                (String::from_utf8_lossy(&bytes).into_owned(), Vec::new())
-            }
-            Err(error) => return Err(error),
-        };
+        let (content, attached) = tools.read_attachment_lossy(&path)?;
         let name = path
             .to_string_lossy()
             .replace('&', "&amp;")
@@ -111,6 +92,20 @@ mod tests {
         .unwrap();
         assert!(images.is_empty());
         assert!(text.ends_with("broken.txt\">\nhello \u{fffd}world\u{fffd}\n</file>\nsummarize"));
+    }
+
+    #[test]
+    fn corrupt_detected_image_retains_image_omission() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.png"),
+            b"\x89PNG\r\n\x1a\ncorrupt",
+        )
+        .unwrap();
+        let (text, images) = expand(&["@broken.png".into()], directory.path(), true, None).unwrap();
+        assert!(images.is_empty());
+        assert!(text.contains("[Image omitted:"), "{text}");
+        assert!(!text.contains('\u{fffd}'));
     }
 
     #[test]

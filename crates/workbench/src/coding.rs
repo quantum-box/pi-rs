@@ -428,6 +428,19 @@ impl CodingTools {
 
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, false)
+    }
+
+    /// Read CLI text attachments using Pi's replacement decoding and input bound.
+    pub fn read_attachment_lossy(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, true)
+    }
+
+    fn read_attachment_inner(
+        &self,
+        path: &Path,
+        lossy: bool,
+    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
         let tool = CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
@@ -442,23 +455,51 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        if let Some(image) = tool.read_image(&path)? {
-            let blocks = image["content"].as_array().expect("image content");
-            let images = blocks
-                .iter()
-                .filter(|block| block["type"] == "image")
-                .cloned()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()?;
-            let hints = blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok((hints, images))
-        } else {
-            Ok((tool.text(&path)?, Vec::new()))
-        }
+        finish_attachment(tool.read_image(&path), || {
+            if !lossy {
+                return tool.text(&path);
+            }
+            use std::io::Read as _;
+            let metadata = path.metadata()?;
+            if !metadata.is_file() || (!tool.unrestricted && metadata.len() > MAX_FILE_BYTES) {
+                return Err(Error::Config(
+                    "expected a regular text file up to 4 MiB".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(Error::Config(
+                    "attachments exceed the 8 MiB input limit".into(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }
+}
+
+fn finish_attachment(
+    image: Result<Option<Value>>,
+    read_text: impl FnOnce() -> Result<String>,
+) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+    if let Some(image) = image? {
+        let blocks = image["content"].as_array().expect("image content");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()?;
+        let hints = blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok((hints, images))
+    } else {
+        Ok((read_text()?, Vec::new()))
     }
 }
 
@@ -3434,6 +3475,17 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_image_io_invalid_data_does_not_fall_back_to_text() {
+        let image_error = std::io::Error::new(std::io::ErrorKind::InvalidData, "image read failed");
+        let result = super::finish_attachment(Err(image_error.into()), || {
+            panic!("image errors must not invoke text decoding")
+        });
+        assert!(
+            matches!(result, Err(pi_rs::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_structured_result_preserves_output_and_exit_status() {
