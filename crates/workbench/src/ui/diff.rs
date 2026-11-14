@@ -80,11 +80,21 @@ fn rows(text: &str) -> Vec<Row> {
         })
         .collect()
 }
-fn changed_span(text: &str, row: &Row, theme: &Theme, changed: bool) -> Vec<Span> {
+fn changed_span(
+    text: &str,
+    row: &Row,
+    theme: &Theme,
+    changed: bool,
+    trim_leading: bool,
+) -> Vec<Span> {
     if !changed {
         return vec![Span::themed(text, theme, row.color())];
     }
-    let trimmed = text.trim_start();
+    let trimmed = if trim_leading {
+        text.trim_start()
+    } else {
+        text
+    };
     let mut spans = vec![Span::themed(
         &text[..text.len() - trimmed.len()],
         theme,
@@ -161,6 +171,8 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
             let added = &rows[index + 1];
             let mut removed_spans = vec![Span::themed(row.prefix(digits), theme, row.color())];
             let mut added_spans = vec![Span::themed(added.prefix(digits), theme, added.color())];
+            let mut first_removed = true;
+            let mut first_added = true;
             for change in TextDiff::configure()
                 .deadline(deadline)
                 .diff_words(&row.text, &added.text)
@@ -172,7 +184,11 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
                         row,
                         theme,
                         change.tag() == ChangeTag::Delete,
+                        first_removed,
                     ));
+                    if change.tag() == ChangeTag::Delete {
+                        first_removed = false;
+                    }
                 }
                 if change.tag() != ChangeTag::Delete {
                     added_spans.extend(changed_span(
@@ -180,7 +196,11 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
                         added,
                         theme,
                         change.tag() == ChangeTag::Insert,
+                        first_added,
                     ));
+                    if change.tag() == ChangeTag::Insert {
+                        first_added = false;
+                    }
                 }
             }
             lines.extend(wrap(&removed_spans, width));
@@ -227,6 +247,20 @@ mod tests {
                 .iter()
                 .any(|span| span.inverse && span.text == "new")
         );
+    }
+
+    #[test]
+    fn only_first_changed_fragment_drops_leading_whitespace_highlighting() {
+        let lines = render_numbered("-1 A x B y\n+1 A  c B  d", &Theme::system(), 80);
+        let added = &lines[1].spans;
+        let text: String = added.iter().map(|span| span.text.as_str()).collect();
+        assert_eq!(text, "+1 A  c B  d");
+        let inverse_spaces: Vec<_> = added
+            .iter()
+            .filter(|span| span.inverse && !span.text.is_empty() && span.text.trim().is_empty())
+            .collect();
+        assert_eq!(inverse_spaces.len(), 1, "{added:?}");
+        assert_eq!(inverse_spaces[0].text, "  ");
     }
 
     #[test]

@@ -1234,7 +1234,9 @@ terminal modes, heading decoration, code fences, nested quotes and clean exit.
 Edit tool panels retain unified hunk information, show original and updated line
 numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
-and word comparison has a shared 100 ms budget per render. Large comparisons
+and word comparison has a shared 100 ms budget per render. Only the first
+changed fragment on each side excludes leading whitespace from inverse styling.
+Large comparisons
 retain line-level highlighting when that budget is exhausted.
 
 A PTY fixture runs an actual file edit and verifies numbered output and inverse
