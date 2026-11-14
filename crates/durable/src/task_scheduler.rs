@@ -1857,6 +1857,132 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn child_wake_process_death_worker() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_CHILD_WAKE_TEST_DB") else {
+            return;
+        };
+        let safe = std::env::var("PI_CHILD_WAKE_TEST_SAFE").unwrap() == "yes";
+        let parent = Uuid::from_u128(1);
+        let child = Uuid::from_u128(2);
+        let mut registry = Registry::default();
+        registry.register("parent", safe, move |t: &Task| {
+            if t.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![child]),
+                    children: vec![task(2, TaskOwner::Task(parent), "child", true, 3)],
+                })
+            } else {
+                assert_eq!(t.ended_children(), Some(&[child][..]));
+                println!("CHILD_WAKE_RESERVED");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+        registry.register("child", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("done")))
+        });
+        let mut scheduler = Scheduler::open(path, registry).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                safe,
+                3,
+            ))
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        scheduler.tick(0).unwrap();
+        scheduler.tick(0).unwrap();
+        panic!("handler returned after reserved wake");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_wake_process_death_replays_only_safe_handler() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for safe in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "task_scheduler::tests::child_wake_process_death_worker",
+                    "--nocapture",
+                ])
+                .env("PI_CHILD_WAKE_TEST_DB", &path)
+                .env("PI_CHILD_WAKE_TEST_SAFE", if safe { "yes" } else { "no" })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut child = KillOnDrop(child);
+            let stdout = child.0.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if line.contains("CHILD_WAKE_RESERVED") {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .expect("handler did not reach reserved child wake");
+            child.0.kill().unwrap();
+            assert!(!child.0.wait().unwrap().success());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let mut registry = Registry::default();
+            registry.register("parent", safe, move |t: &Task| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(t.ended_children(), Some(&[Uuid::from_u128(2)][..]));
+                Ok(Step::Succeed(serde_json::json!("resumed")))
+            });
+            registry.register("child", true, |_: &Task| {
+                Ok(Step::Succeed(serde_json::json!("done")))
+            });
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            if safe {
+                assert_eq!(
+                    scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+                scheduler.tick(0).unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    &TaskState::Succeeded(serde_json::json!("resumed"))
+                );
+            } else {
+                assert!(matches!(
+                    scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    TaskState::Failed(_)
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
     #[test]
     fn child_wake_payload_survives_reservation_recovery_and_reaches_handler() {
         use std::sync::{Arc, Mutex};
