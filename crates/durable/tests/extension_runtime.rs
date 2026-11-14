@@ -1075,14 +1075,13 @@ async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
             lifecycle(&mut h, Some(event), None, Arc::default());
             id = h.create_conversation(config()).unwrap();
             h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+            let driver = h.start_tasks(Default::default()).unwrap();
             let err = h
                 .submit_and_run(id, None, "go".into(), &CancellationToken::new())
                 .await
                 .unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("atomic scheduling is not supported")
-            );
+            assert!(err.to_string().contains("unselected task registration"));
+            driver.shutdown().unwrap();
         }
         let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
         let c = h.conversation(id).unwrap();
@@ -1372,4 +1371,174 @@ async fn queued_steer_or_followup_supersedes_yield_continuation() {
         );
         scheduler.shutdown().await.unwrap();
     }
+}
+#[tokio::test]
+async fn lifecycle_children_resume_after_reopen() {
+    use pi_rs_durable::{
+        extension::GenerationEvent,
+        task::{Checkpoint, Task, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_store::Signal,
+    };
+    for event in [GenerationEvent::AfterTools, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let tool = Arc::new(FakeTool::default());
+        let handler: Arc<dyn Handler> = Arc::new(|task: &Task| {
+            if task.delivered_signal().is_some() {
+                Ok(Step::Succeed(json!(null)))
+            } else {
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "waiting".into(),
+                        data: task.checkpoint().data.clone(),
+                    },
+                    condition: WaitFor::Signal("go".into()),
+                    children: vec![],
+                })
+            }
+        });
+        let install = |h: &Harness| {
+            h.install_extension(Extension {
+                name: "lifecycle".into(),
+                hooks: vec![Arc::new(LifecycleHook {
+                    events: Arc::default(),
+                    task_event: Some(event),
+                    park_event: None,
+                    entered: Arc::new(tokio::sync::Semaphore::new(0)),
+                })],
+                tasks: vec![("job".into(), handler.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        let registry = || {
+            let mut r = Registry::default();
+            assert!(r.register_shared("job", true, handler.clone()));
+            r
+        };
+        let id;
+        let child;
+        {
+            let mut h =
+                Harness::open_paused(&path, options(Arc::new(FakeModel::default()), tool.clone()))
+                    .unwrap();
+            install(&h);
+            let driver = h.start_tasks(registry()).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            let phase = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+            child = phase["phase"]["HookTasksWaiting"]["children"][0]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(driver.get(child).unwrap().is_some());
+            driver.shutdown().unwrap();
+        }
+        {
+            let mut h =
+                Harness::open_paused(&path, options(Arc::new(FakeModel::default()), tool.clone()))
+                    .unwrap();
+            install(&h);
+            let driver = h.start_tasks(registry()).unwrap();
+            // Wait until the recovered child has registered its signal wait.
+            for _ in 0..100 {
+                if matches!(
+                    driver.get(child).unwrap().unwrap().state(),
+                    pi_rs_durable::task::TaskState::Waiting(_)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            driver
+                .signal(&Signal::new(
+                    uuid::Uuid::new_v4(),
+                    child,
+                    "go".into(),
+                    json!(null),
+                ))
+                .unwrap();
+            for _ in 0..100 {
+                if driver.get(child).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(driver.get(child).unwrap().unwrap().is_terminal());
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(matches!(
+                h.conversation(id).unwrap().submissions[0].status,
+                Status::Done { .. }
+            ));
+            assert_eq!(tool.0.lock().unwrap().len(), 1);
+            driver.shutdown().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_rejects_a_different_driver_handler() {
+    use pi_rs_durable::{
+        extension::GenerationEvent,
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    let selected: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+    let other: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
+    h.install_extension(Extension {
+        name: "lifecycle".into(),
+        hooks: vec![Arc::new(LifecycleHook {
+            events: Arc::default(),
+            task_event: Some(GenerationEvent::AfterRun),
+            park_event: None,
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        })],
+        tasks: vec![("job".into(), selected)],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job", true, other);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+    let error = h
+        .submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("task driver registration mismatch")
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let reopened = Harness::open_paused(
+        dir.path().join("db"),
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    assert!(
+        serde_json::to_value(reopened.conversation(id).unwrap()).unwrap()["phase"]["AfterRun"]
+            .is_object()
+    );
 }

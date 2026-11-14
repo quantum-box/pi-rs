@@ -21,7 +21,7 @@ the open harness until it is reopened.
 fork, explicit compaction, durable snapshot observation, and one-pass polling
 of accepted external jobs are supported. Background workers repoll pending jobs,
 and nested calls are journaled with parent-owned identities. This is a subset of the design below,
-not complete upstream parity: task-store is not wired into the scheduler, and
+not complete upstream parity: lifecycle child tasks do not yet receive conversation aborts, and
 there is no durable streaming progress, historical-entry fork, automatic
 compaction, or durable timers for polling. Runtime state still stores a whole
 conversation as one JSON value. See `crates/durable/README.md` for limits.

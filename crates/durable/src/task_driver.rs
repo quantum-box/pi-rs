@@ -24,10 +24,11 @@ pub enum Error {
     #[error("task driver stopped: {0}")]
     Stopped(String),
 }
-struct Shared {
+pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     owner: Arc<OwnedStore>,
     policies: HashMap<String, bool>,
+    definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
     state: Mutex<State>,
     wake: Condvar,
 }
@@ -46,10 +47,12 @@ impl Driver {
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
         let owner = scheduler.owner();
         let policies = scheduler.policies();
+        let definitions = scheduler.definitions();
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
             owner,
             policies,
+            definitions,
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
         });
@@ -95,6 +98,9 @@ impl Driver {
             shared,
             worker: Some(worker),
         }
+    }
+    pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
+        Arc::downgrade(&self.shared)
     }
     fn check(&self) -> Result<std::sync::MutexGuard<'_, State>, Error> {
         let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
@@ -186,5 +192,19 @@ impl Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl Shared {
+    pub(crate) fn policy_for(
+        &self,
+        name: &str,
+        handler: &Arc<dyn task_scheduler::Handler>,
+    ) -> Option<bool> {
+        if self.state.lock().ok()?.stop {
+            return None;
+        }
+        let (policy, registered) = self.definitions.get(name)?;
+        Arc::ptr_eq(handler, registered).then_some(*policy)
     }
 }

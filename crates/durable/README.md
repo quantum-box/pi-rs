@@ -66,10 +66,16 @@ responses; hook errors and non-string after-tool replacements have limited
 reporting. After-tools receives the completed round's calls; after-run receives
 `{"answer": ...}` after the answer and submission settlement are committed.
 Both run in persistent phases with a stable operation memo and may execute again
-after a crash. A nonempty task request or a hook error stops execution with an
-explicit error and leaves the phase for retry after reopening; no requested
-tasks are scheduled. This differs from upstream reporting and skipping invalid
-task requests. Provider-body and on-yield hooks are not integrated, and this
+after a crash. Nonempty requests are committed as conversation-owned tasks in
+the same transaction as a persistent wait phase and its child IDs. The runtime
+waits for all children to become terminal before proceeding. The host must start
+a task driver and register the exact selected extension handler with
+`Registry::register_shared` and its replay policy; a missing driver leaves the
+hook phase pending, and a mismatched registration fails closed. Reopen with the
+extensions and driver registered to resume. Harness users explicitly resume;
+Scheduler polls waiting phases. Hook errors fail closed. Failed child outcomes
+are currently ignored, as are after-tools terminate decisions, and invalid
+requests stop the phase instead of upstream's report-and-skip behavior. Provider-body and on-yield hooks are not integrated, and this
 runtime does not support terminate-round decisions. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
@@ -77,22 +83,13 @@ The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
 The scheduler rescans once per second and reopening resumes the wait. Signal
 keys are not yet subject to upstream single-wait or closed-after-deadline rules.
 
-`TaskStore::commit_owned_tasks` supplies a lower-level atomic checkpoint and
-registered-child creation primitive. `prepare_owned_tasks` exposes the same
-checks and writes for inclusion in a larger transaction. The caller must store the child IDs in
-its checkpoint, validate registrations, fence executors, and inspect the
-checkpoint after conflicts or uncertain commits. It is not yet wired into the
-conversation lifecycle: its checkpoint is a single owner record, whereas the
-runtime also commits transcript, observation and fork records. Full integration
-must compose all of those writes, wait for child outcomes, coordinate the task
-driver and conversation recovery, and propagate aborts before hook tasks can
-be enabled safely. In particular, lifecycle task registration must be bound to
-the active driver's definitions and replay policies; the persisted waiting phase
-must resume only after every child is terminal; and conversation abort must
-fence child execution and durably request child-first cleanup, including after
-restart. The existing driver is independently owned by the host and is not yet
-connected to these lifecycle operations.
-
+`TaskStore::commit_owned_tasks` and `prepare_owned_tasks` also expose the
+lower-level atomic checkpoint and child creation primitive to other hosts.
+Conversation abort does **not** propagate to hook children: they may continue
+running after the parent aborts, including after restart. Do not use hook tasks
+whose effects require parent cancellation until child-first abort and execution
+fencing are integrated. Task handler external effects require their own
+idempotency and reconciliation.
 Current limits and differences from upstream Pi Durable:
 
 - Historical fork currently accepts settled snapshots, not every upstream entry.

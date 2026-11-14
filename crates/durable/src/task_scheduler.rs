@@ -61,6 +61,25 @@ pub struct Registry {
     entries: HashMap<String, Registration>,
 }
 impl Registry {
+    pub fn register_shared(
+        &mut self,
+        kind: impl Into<String>,
+        replay_safe: bool,
+        handler: Arc<dyn Handler>,
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(kind.into()) {
+            Entry::Vacant(v) => {
+                v.insert(Registration {
+                    replay_safe,
+                    handler,
+                    abort: None,
+                });
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
     pub fn register(
         &mut self,
         kind: impl Into<String>,
@@ -159,6 +178,13 @@ pub struct Scheduler {
 impl Scheduler {
     pub(crate) fn owner(&self) -> Arc<OwnedStore> {
         self.attachment.owner.clone()
+    }
+    pub(crate) fn definitions(&self) -> HashMap<String, (bool, Arc<dyn Handler>)> {
+        self.registry
+            .entries
+            .iter()
+            .map(|(name, r)| (name.clone(), (r.replay_safe, r.handler.clone())))
+            .collect()
     }
     pub(crate) fn policies(&self) -> HashMap<String, bool> {
         self.registry

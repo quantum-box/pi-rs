@@ -439,8 +439,25 @@ impl Resolved {
     pub async fn generation(
         &self,
         event: GenerationEvent,
+        value: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        self.generation_inner(event, value, ctx, false).await
+    }
+    pub(crate) async fn lifecycle_generation(
+        &self,
+        event: GenerationEvent,
+        value: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
+        self.generation_inner(event, value, ctx, true).await
+    }
+    async fn generation_inner(
+        &self,
+        event: GenerationEvent,
         mut value: Value,
         ctx: &Context<'_>,
+        validate_owner: bool,
     ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
         let mut tasks = vec![];
         let mut reports = vec![];
@@ -467,6 +484,18 @@ impl Resolved {
                                 | GenerationEvent::AfterRun
                         ) =>
                     {
+                        if validate_owner
+                            && t.iter()
+                                .any(|task| !e.tasks.iter().any(|(name, _)| name == &task.name))
+                        {
+                            reports.push(failure(
+                                &e.name,
+                                "generation",
+                                "unselected task registration or task owned by another extension"
+                                    .into(),
+                            ));
+                            continue;
+                        }
                         tasks.append(&mut t);
                         if event == GenerationEvent::OnYield {
                             return (value, None, tasks, reports);

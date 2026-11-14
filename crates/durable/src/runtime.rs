@@ -207,6 +207,10 @@ enum Phase {
         answer: String,
         operation_id: Uuid,
     },
+    HookTasksWaiting {
+        children: Vec<Uuid>,
+        turns: Option<u32>,
+    },
     Tools {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -359,6 +363,7 @@ pub struct Harness {
     /// conflicts from changes to execution state.
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
     execution_gate: Option<Arc<std::sync::Mutex<()>>>,
+    task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
 }
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
@@ -414,6 +419,7 @@ impl Harness {
             storage_failed: Arc::new(AtomicBool::new(false)),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
+            task_driver: Arc::new(std::sync::Mutex::new(None)),
         };
         harness.recover()?;
         Ok(harness)
@@ -430,6 +436,7 @@ impl Harness {
             storage_failed: self.storage_failed.clone(),
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
+            task_driver: self.task_driver.clone(),
         }
     }
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
@@ -582,13 +589,22 @@ impl Harness {
         Ok(())
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
-        self.save_with_wake(state, expected, None)
+        self.save_composed(state, expected, None, &[])
     }
     fn save_with_wake(
         &mut self,
         state: &Conversation,
         expected: Expected,
         wake: Option<&crate::conversation_signal::PreparedWake>,
+    ) -> Result<(), Error> {
+        self.save_composed(state, expected, wake, &[])
+    }
+    fn save_composed(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
     ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
@@ -729,6 +745,20 @@ impl Harness {
                     checks.extend(prepared.checks);
                     mutations.extend(prepared.mutations);
                 }
+            }
+            if !children.is_empty() {
+                let batch = crate::task_store::TaskStore::new(self.owner.store())
+                    .prepare_owned_tasks(
+                        &crate::task::TaskOwner::Conversation(state.id),
+                        &key,
+                        expected.clone(),
+                        &serde_json::to_vec(&persisted)?,
+                        children,
+                    )
+                    .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
+                // The conversation check and mutation are already part of this save.
+                checks.extend(batch.checks.into_iter().skip(1));
+                mutations.extend(batch.mutations.into_iter().skip(1));
             }
             if let Some(wake) = wake {
                 checks.extend(wake.checks.clone());
@@ -1048,9 +1078,9 @@ impl Harness {
         &self,
         registry: crate::task_scheduler::Registry,
     ) -> Result<crate::task_driver::Driver, Error> {
-        Ok(crate::task_driver::Driver::start(
-            self.attach_tasks(registry)?,
-        ))
+        let driver = crate::task_driver::Driver::start(self.attach_tasks(registry)?);
+        *self.task_driver.lock().map_err(|_| Error::Failed)? = Some(driver.weak());
+        Ok(driver)
     }
     /// Read committed snapshots after a cursor. Earlier cursors may be
     /// resumed; snapshots are retained independently of model context.
@@ -1290,7 +1320,11 @@ impl Harness {
             if content.trim().is_empty() {
                 return Err(Error::Invalid("empty input".into()));
             }
-            let busy = c.active.is_some() || matches!(c.phase, Phase::AfterRun { .. });
+            let busy = c.active.is_some()
+                || matches!(
+                    c.phase,
+                    Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+                );
             if busy && options.reject_when_busy {
                 return Err(AdmissionError::Busy.into());
             }
@@ -1825,7 +1859,7 @@ impl Harness {
         self.save(&c, Expected::Version(version))?;
         Ok(true)
     }
-    async fn run_lifecycle_hook(
+    async fn run_yield_hook(
         &self,
         c: &Conversation,
         operation_id: Uuid,
@@ -1865,6 +1899,72 @@ impl Harness {
             return Err(Error::Interrupted);
         }
         Ok(continuation)
+    }
+    async fn run_lifecycle_hook(
+        &self,
+        c: &Conversation,
+        operation_id: Uuid,
+        event: crate::extension::GenerationEvent,
+        value: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<crate::task::Task>>, Error> {
+        if c.extensions.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let selected = self.selected_extensions(c)?;
+        let snapshot = serde_json::to_value(c)?;
+        let memo = self.extension_memo(operation_id)?;
+        let context = crate::extension::Context {
+            snapshot: &snapshot,
+            memo: &memo,
+        };
+        let (_, _, tasks, reports) = fenced_poll(
+            selected.lifecycle_generation(event, value, &context),
+            self.execution_gate.as_ref(),
+            cancel,
+        )
+        .await
+        .ok_or(Error::Interrupted)?;
+        self.subagent_store()?;
+        if !reports.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{event:?} hook failed: {reports:?}"
+            )));
+        }
+        if tasks.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let driver = self
+            .task_driver
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .as_ref()
+            .and_then(|driver| driver.upgrade());
+        let Some(driver) = driver else {
+            return Ok(None);
+        };
+        let mut children = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let handler = selected.task(&task.name).ok_or_else(|| {
+                Error::Invalid(format!("unselected task registration: {}", task.name))
+            })?;
+            let replay = driver.policy_for(&task.name, &handler).ok_or_else(|| {
+                Error::Invalid(format!("task driver registration mismatch: {}", task.name))
+            })?;
+            let child = crate::task::Task::new(
+                Uuid::new_v4(),
+                crate::task::TaskOwner::Conversation(c.id),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: task.input,
+                },
+                self.options.restart_limit,
+            )
+            .map_err(|e| Error::Invalid(format!("task creation: {e:?}")))?
+            .registered(task.name, replay);
+            children.push(child);
+        }
+        Ok(Some(children))
     }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
@@ -2429,7 +2529,7 @@ impl Harness {
                     operation_id,
                 } => {
                     let continuation = self
-                        .run_lifecycle_hook(
+                        .run_yield_hook(
                             &c,
                             operation_id,
                             crate::extension::GenerationEvent::OnYield,
@@ -2516,33 +2616,76 @@ impl Harness {
                     calls,
                     operation_id,
                 } => {
-                    self.run_lifecycle_hook(
-                        &c,
-                        operation_id,
-                        crate::extension::GenerationEvent::AfterTools,
-                        serde_json::to_value(&calls)?,
-                        cancel,
-                    )
-                    .await?;
-                    c.phase = Phase::Boundary {
-                        turns,
-                        answer: None,
+                    let Some(children) = self
+                        .run_lifecycle_hook(
+                            &c,
+                            operation_id,
+                            crate::extension::GenerationEvent::AfterTools,
+                            serde_json::to_value(&calls)?,
+                            cancel,
+                        )
+                        .await?
+                    else {
+                        return Ok(());
                     };
-                    self.save(&c, Expected::Version(version))?;
+                    c.phase = if children.is_empty() {
+                        Phase::Boundary {
+                            turns,
+                            answer: None,
+                        }
+                    } else {
+                        Phase::HookTasksWaiting {
+                            children: children.iter().map(|t| t.id()).collect(),
+                            turns: Some(turns),
+                        }
+                    };
+                    self.save_composed(&c, Expected::Version(version), None, &children)?;
                 }
                 Phase::AfterRun {
                     answer,
                     operation_id,
                 } => {
-                    self.run_lifecycle_hook(
-                        &c,
-                        operation_id,
-                        crate::extension::GenerationEvent::AfterRun,
-                        serde_json::json!({"answer": answer}),
-                        cancel,
-                    )
-                    .await?;
-                    c.phase = Phase::Idle;
+                    let Some(children) = self
+                        .run_lifecycle_hook(
+                            &c,
+                            operation_id,
+                            crate::extension::GenerationEvent::AfterRun,
+                            serde_json::json!({"answer": answer}),
+                            cancel,
+                        )
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    c.phase = if children.is_empty() {
+                        Phase::Idle
+                    } else {
+                        Phase::HookTasksWaiting {
+                            children: children.iter().map(|t| t.id()).collect(),
+                            turns: None,
+                        }
+                    };
+                    self.save_composed(&c, Expected::Version(version), None, &children)?;
+                }
+                Phase::HookTasksWaiting { children, turns } => {
+                    let store = crate::task_store::TaskStore::new(self.owner.store());
+                    for id in children {
+                        let task = store
+                            .load(id)
+                            .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+                            .ok_or_else(|| Error::Invalid(format!("missing hook child: {id}")))?
+                            .task;
+                        if task.owner() != &crate::task::TaskOwner::Conversation(c.id) {
+                            return Err(Error::Invalid("hook child owner mismatch".into()));
+                        }
+                        if !task.is_terminal() {
+                            return Ok(());
+                        }
+                    }
+                    c.phase = turns.map_or(Phase::Idle, |turns| Phase::Boundary {
+                        turns,
+                        answer: None,
+                    });
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Tools {
@@ -3624,7 +3767,10 @@ async fn drive_scheduled(
                 })
                 .transpose()?
                 .unwrap_or(false),
-            Phase::ToolGateSleeping { .. } => true,
+            Phase::ToolGateSleeping { .. }
+            | Phase::HookTasksWaiting { .. }
+            | Phase::AfterTools { .. }
+            | Phase::AfterRun { .. } => true,
             _ => false,
         };
         if !should_poll {
