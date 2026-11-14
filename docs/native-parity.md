@@ -1921,7 +1921,7 @@ rejected-token refresh, logout, re-login and concurrent configuration edits.
 Existing public-client fixtures also passed. Store tests preserve registration
 metadata across refresh and accept older files that have no registration field.
 The fixtures use a replacement browser launcher and a local authorization
-server. The later MCP checkpoint describes interactive upgrades for typed 403
+server. The MCP checkpoint above describes interactive upgrades for typed 403
 scope challenges.
 
 ### MCP client metadata registration checkpoint
