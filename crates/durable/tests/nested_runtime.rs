@@ -1242,11 +1242,12 @@ async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen
             reference: "opaque/\u{0}reference".into(),
         }
     );
-    let ids = child.ids.lock().unwrap();
-    assert_eq!(ids.len(), 2);
-    assert_eq!(ids[0], ids[1]);
-    assert_eq!(record["operation_id"], ids[0].to_string());
-    drop(ids);
+    {
+        let ids = child.ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(record["operation_id"], ids[0].to_string());
+    }
     drop(owner);
 
     let scheduler = Scheduler::open(&path, opts()).unwrap();
