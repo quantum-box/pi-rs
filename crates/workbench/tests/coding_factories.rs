@@ -1334,3 +1334,118 @@ async fn replaced_image_read_never_emits_stale_image_metadata() {
         vec![(Outcome::Succeeded("redacted".into()), None)]
     );
 }
+
+struct ImageMetadataPatch(u8);
+#[async_trait::async_trait]
+impl Extension for ImageMetadataPatch {
+    fn id(&self) -> &str {
+        "image-metadata-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        assert!(
+            matches!(outcome, Outcome::Structured { data, .. } if data["content"][1]["type"] == "image")
+        );
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: match self.0 {
+                2 => Some("replacement".into()),
+                3 => match outcome {
+                    Outcome::Structured { data, .. } => {
+                        data["content"][0]["text"].as_str().map(str::to_owned)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            details: Some(json!({"patched":true})),
+            is_error: (self.0 == 1).then_some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn image_read_metadata_only_patches_preserve_content_and_structured_value() {
+    for mode in 0..4 {
+        let root = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+            .unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(ImageMetadataPatch(mode)))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut recorded = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read image".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        recorded.push((
+                            outcome.clone(),
+                            pi_rs::tool_result_event_metadata(*operation_id),
+                        ));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded.len(), 1);
+        if mode >= 2 {
+            assert!(
+                matches!(&recorded[0], (Outcome::TextResult { output, details: Some(details), is_error: false }, None) if (if mode == 2 { output == "replacement" } else { output.contains("image") }) && details["patched"] == true)
+            );
+        } else {
+            let (
+                Outcome::StructuredWithDetails {
+                    data,
+                    attachments,
+                    details,
+                },
+                Some(structured),
+            ) = &recorded[0]
+            else {
+                panic!("structured outcome or metadata lost")
+            };
+            assert!(attachments.is_empty());
+            assert_eq!(details["patched"], true);
+            assert_eq!(data["content"][1]["type"], "image");
+            assert_eq!(structured["data"], data["content"][1]["data"]);
+            assert_eq!(structured["mimeType"], data["content"][1]["mimeType"]);
+            assert_eq!(structured["note"], data["content"][0]["text"]);
+            assert_eq!(recorded[0].0.is_error(), mode == 1);
+        }
+    }
+}
