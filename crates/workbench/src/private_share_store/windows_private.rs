@@ -121,6 +121,40 @@ fn private_directory_error(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, detail)
 }
 
+fn current_user_token_info() -> io::Result<Vec<usize>> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle and output pointer are valid.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = Token(token);
+    let mut needed = 0;
+    // SAFETY: a null buffer requests the required size.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 1024 * 1024 {
+        return Err(private_directory_error("token user size"));
+    }
+    let mut info = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: info is aligned and has at least `needed` writable bytes.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            info.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
 impl VerifiedDirectory {
     /// Create a directory with a protected inheritable DACL for its owner and
     /// LocalSystem, then validate it. The caller must independently secure and
@@ -128,13 +162,38 @@ impl VerifiedDirectory {
     pub fn create(path: &std::path::Path) -> io::Result<Self> {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
         };
-        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Security::{IsValidSid, SECURITY_ATTRIBUTES, TOKEN_USER};
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-        let sddl: Vec<u16> = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)\0"
+        let token_info = current_user_token_info()?;
+        // SAFETY: current_user_token_info returned a populated TOKEN_USER.
+        let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        if user.is_null() || unsafe { IsValidSid(user) } == 0 {
+            return Err(private_directory_error("invalid token user SID"));
+        }
+        let mut sid_string = std::ptr::null_mut();
+        // SAFETY: user points into token_info and the output pointer is valid.
+        if unsafe { ConvertSidToStringSidW(user, &mut sid_string) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid_allocation = LocalDescriptor(sid_string.cast());
+        let mut length = 0usize;
+        // SID strings are NUL-terminated ASCII; bound the scan defensively.
+        while length < 1024 && unsafe { *sid_string.add(length) } != 0 {
+            length += 1;
+        }
+        if length == 1024 {
+            return Err(private_directory_error("invalid token SID string"));
+        }
+        // SAFETY: ConvertSidToStringSidW returned length initialized UTF-16 units.
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_string, length) })
+            .map_err(|_| private_directory_error("invalid token SID string"))?;
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)\0")
             .encode_utf16()
             .collect();
+        drop(sid_allocation);
         let mut descriptor = std::ptr::null_mut();
         // SAFETY: valid NUL-terminated SDDL and writable out pointer.
         if unsafe {
@@ -175,16 +234,14 @@ impl VerifiedDirectory {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE, IsValidSid,
-            IsWellKnownSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID,
-            SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser, WinCreatorOwnerRightsSid,
-            WinLocalSystemSid,
+            GetSecurityDescriptorControl, INHERITED_ACE, IsValidSid, IsWellKnownSid,
+            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_USER,
+            WinCreatorOwnerRightsSid, WinLocalSystemSid,
         };
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         if !path.is_absolute()
             || path.components().any(|component| {
                 matches!(
@@ -218,37 +275,8 @@ impl VerifiedDirectory {
             ancestors.push(open_directory(ancestor)?);
         }
         let file = open_directory(path)?;
-        let mut token = std::ptr::null_mut();
-        // SAFETY: current process is a valid pseudo-handle and token is writable.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = Token(token);
-        let mut needed = 0;
-        // SAFETY: a null buffer requests the required size.
-        unsafe {
-            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-        }
-        if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 1024 * 1024 {
-            return Err(private_directory_error("token user size"));
-        }
-        // usize gives the returned TOKEN_USER structure adequate alignment.
-        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
-        let mut token_info = vec![0usize; words];
-        // SAFETY: aligned buffer has at least needed writable bytes.
-        if unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                token_info.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful GetTokenInformation populated a TOKEN_USER.
+        let token_info = current_user_token_info()?;
+        // SAFETY: current_user_token_info returned a populated TOKEN_USER.
         let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
         let mut owner: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
