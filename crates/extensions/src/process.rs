@@ -280,6 +280,8 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
         #[serde(default)]
         text_result_v2: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        presence_v1: bool,
     },
     BeforeCompaction {
         summary: String,
@@ -292,6 +294,12 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
 }
+#[derive(Serialize, Deserialize)]
+struct ToolResultPresence {
+    outcome: Option<Outcome>,
+    output_unchanged: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     version: u16,
@@ -315,6 +323,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
+    #[serde(default)]
+    result_presence_v1: bool,
     #[serde(default)]
     text_result_v2: bool,
     #[serde(default)]
@@ -1622,6 +1632,7 @@ impl Extension for ExecutableExtension {
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: !legacy,
+            presence_v1: false,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
@@ -1682,6 +1693,7 @@ impl Extension for ExecutableExtension {
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: true,
+            presence_v1: false,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
@@ -1693,6 +1705,58 @@ impl Extension for ExecutableExtension {
         .await
         .map_err(|error| error.to_string())??;
         Ok(updated)
+    }
+
+    async fn tool_result_update_with_presence(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        if !self.description.result_presence_v1 || !self.endpoint.text_result_v2 {
+            let result = match host {
+                Some(host) => {
+                    self.tool_result_update_with_host(call_data, outcome, context, state, host)
+                        .await?
+                }
+                None => {
+                    self.tool_result_update(call_data, outcome, context, state)
+                        .await?
+                }
+            };
+            return Ok((result, None));
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+            presence_v1: true,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let use_duplex = self.description.tool_hook_host_calls && host.is_some();
+        let runtime = tokio::runtime::Handle::current();
+        let result: ToolResultPresence = tokio::task::spawn_blocking(move || {
+            if use_duplex {
+                call_duplex(
+                    &path,
+                    request,
+                    host.expect("checked host"),
+                    &cancelled,
+                    &runtime,
+                )
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok((result.outcome, result.output_unchanged))
     }
 
     fn after_tool(
@@ -3073,6 +3137,7 @@ async fn dispatch_with_host(
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            result_presence_v1: true,
             text_result_v2: true,
             structured_text_result: true,
             tool_message_error: true,
@@ -3554,8 +3619,30 @@ async fn dispatch_with_host(
             operation_id,
             state,
             text_result_v2,
+            presence_v1,
         } => {
             let context = context(&operation_id)?;
+            if presence_v1 {
+                if !text_result_v2 {
+                    return Err("result presence requires text-result v2".into());
+                }
+                let host = host.supports_custom_messages().then_some(host);
+                return encode(
+                    pi_rs_core::track_tool_result_presence(
+                        extension.as_ref(),
+                        &call,
+                        &outcome,
+                        &context,
+                        state.as_ref(),
+                        host,
+                    )
+                    .await
+                    .map(|(outcome, output_unchanged)| ToolResultPresence {
+                        outcome,
+                        output_unchanged,
+                    }),
+                );
+            }
             let result = if host.supports_custom_messages() {
                 extension
                     .tool_result_update_with_host(&call, &outcome, &context, state.as_ref(), host)
@@ -3866,6 +3953,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn result_presence_protocol_preserves_legacy_and_distinguishes_same_text() {
+        struct Patch(bool);
+        #[async_trait::async_trait]
+        impl Extension for Patch {
+            fn id(&self) -> &str {
+                "presence"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                tokio::task::yield_now().await;
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: self.0.then(|| "same".into()),
+                    details: Some(serde_json::json!({"patched":true})),
+                    is_error: None,
+                }))
+            }
+        }
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                unreachable!()
+            }
+        }
+        let mut legacy_reference = None;
+        for replace in [false, true] {
+            for duplex in [false, true] {
+                let extension: Arc<dyn Extension> = Arc::new(Patch(replace));
+                let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+                    .await
+                    .unwrap();
+                assert_eq!(description["result_presence_v1"], true);
+                let request = |presence_v1| ProtocolRequest::ToolResult {
+                    call: pi_rs_core::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                    outcome: Outcome::Succeeded("same".into()),
+                    operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    state: None,
+                    text_result_v2: true,
+                    presence_v1,
+                };
+                let result = if duplex {
+                    dispatch_with_host(extension.clone(), request(true), Arc::new(Host)).await
+                } else {
+                    dispatch(extension.clone(), request(true)).await
+                }
+                .unwrap();
+                let result: ToolResultPresence = serde_json::from_value(result).unwrap();
+                assert_eq!(result.output_unchanged, Some(!replace));
+                assert!(
+                    matches!(result.outcome, Some(Outcome::SucceededWithDetails { output, details }) if output == "same" && details["patched"] == true)
+                );
+                let legacy = dispatch(extension.clone(), request(false)).await.unwrap();
+                if let Some(reference) = &legacy_reference {
+                    assert_eq!(&legacy, reference);
+                } else {
+                    legacy_reference = Some(legacy.clone());
+                }
+                assert!(
+                    serde_json::from_value::<Option<Outcome>>(legacy)
+                        .unwrap()
+                        .is_some()
+                );
+                let old_wire = serde_json::to_value(request(false)).unwrap();
+                assert!(old_wire.get("presence_v1").is_none());
+                let mut invalid = serde_json::to_value(request(true)).unwrap();
+                invalid["text_result_v2"] = serde_json::json!(false);
+                let error = dispatch(extension, serde_json::from_value(invalid).unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error, "result presence requires text-result v2");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_result_hook_is_advertised_and_dispatched() {
         struct Hook;
         #[async_trait::async_trait]
@@ -3905,6 +4085,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -3954,6 +4135,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -4003,6 +4185,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -5347,6 +5530,7 @@ else:
                     operation_id: "00000000-0000-4000-8000-000000000001".into(),
                     state: None,
                     text_result_v2: true,
+                    presence_v1: false,
                 },
             )
             .await
@@ -5361,6 +5545,63 @@ else:
                     matches!(outcome, Outcome::TextResultWithStructuredContent { details:Some(details), .. } if details["changed"] == true)
                 );
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_presence_is_negotiated_and_legacy_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'result_presence_v1':name!='legacy'}
+elif r['type']=='tool_result':
+    result={'status':'succeeded_with_details','detail':{'output':'same','details':{'patched':True}}}
+    if name=='legacy':
+        assert 'presence_v1' not in r
+        value=result
+    else:
+        assert r['presence_v1'] is True
+        value={'outcome':result,'output_unchanged':name=='metadata'}
+else: raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for (name, expected) in [
+            ("legacy", None),
+            ("metadata", Some(true)),
+            ("same_output", Some(false)),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let (outcome, presence) = ext
+                .tool_result_update_with_presence(
+                    &call,
+                    &Outcome::Succeeded("same".into()),
+                    &context,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, Some(Outcome::SucceededWithDetails { output, .. }) if output == "same")
+            );
+            assert_eq!(presence, expected);
         }
     }
 

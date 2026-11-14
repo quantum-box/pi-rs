@@ -814,6 +814,34 @@ tokio::task_local! {
     pub(crate) static STRUCTURED_PATCH_PRESERVATION: std::cell::Cell<(Option<bool>, bool)>;
 }
 
+/// Run a result hook while retaining trustworthy output-field presence.
+#[doc(hidden)]
+pub async fn track_tool_result_presence(
+    extension: &dyn Extension,
+    call: &crate::ToolCall,
+    outcome: &Outcome,
+    context: &ToolContext,
+    state: Option<&ExtensionState>,
+    host: Option<Arc<dyn ToolHost>>,
+) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+    let has_host = host.is_some();
+    STRUCTURED_PATCH_PRESERVATION
+        .scope(std::cell::Cell::new((None, false)), async {
+            let (result, explicit) = extension
+                .tool_result_update_with_presence(call, outcome, context, state, host)
+                .await?;
+            let tracking = STRUCTURED_PATCH_PRESERVATION.with(std::cell::Cell::get);
+            let preserves =
+                explicit.unwrap_or(tracking.0 == Some(true) && (!has_host || tracking.1));
+            let preserves = preserves
+                && result
+                    .as_ref()
+                    .is_none_or(|updated| updated.tool_content() == outcome.tool_content());
+            Ok((result, Some(preserves)))
+        })
+        .await
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -1336,6 +1364,31 @@ pub trait Extension: Send + Sync {
         let _ = STRUCTURED_PATCH_PRESERVATION
             .try_with(|tracking| tracking.set((tracking.get().0, true)));
         result
+    }
+
+    /// Override to report whether a result update leaves the output field
+    /// untouched. `None` means field presence is unknown; `Some(true)` means
+    /// output was not replaced, even with identical text. Existing hooks need
+    /// not implement this method.
+    async fn tool_result_update_with_presence(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        let result = match host {
+            Some(host) => {
+                self.tool_result_update_with_host(call, outcome, context, state, host)
+                    .await?
+            }
+            None => {
+                self.tool_result_update(call, outcome, context, state)
+                    .await?
+            }
+        };
+        Ok((result, None))
     }
 
     fn after_tool(

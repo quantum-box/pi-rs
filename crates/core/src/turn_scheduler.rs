@@ -337,33 +337,27 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = platform_time::timeout(tool_timeout, crate::extension::STRUCTURED_PATCH_PRESERVATION.scope(std::cell::Cell::new((None, false)), async {
-                    let result = match &host {
-                        Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.for_extension(extension.id()).unwrap_or_else(|| host.clone())).await,
-                        None => extension.tool_result_update(&invocation.call, &reply.outcome, &context, states.get(extension.id())).await,
-                    };
-                    (result, crate::extension::STRUCTURED_PATCH_PRESERVATION.with(std::cell::Cell::get))
-                })) => result,
+                result = platform_time::timeout(tool_timeout, async {
+                    let scoped_host = host.as_ref().map(|host| host.for_extension(extension.id()).unwrap_or_else(|| host.clone()));
+                    crate::track_tool_result_presence(extension.as_ref(), &invocation.call, &reply.outcome, &context, states.get(extension.id()), scoped_host).await
+                }) => result,
             };
             let error = match result {
-                Ok((Ok(Some(outcome)), preservation))
+                Ok(Ok((Some(outcome), preservation)))
                     if !matches!(
                         outcome,
                         Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
                     ) =>
                 {
-                    if preservation.0 != Some(true)
-                        || (host.is_some() && !preservation.1)
-                        || outcome.tool_content() != reply.outcome.tool_content()
-                    {
+                    if preservation != Some(true) {
                         replaced = true;
                     }
                     reply.outcome = outcome;
                     continue;
                 }
-                Ok((Ok(None), _)) => continue,
-                Ok((Ok(Some(_)), _)) => "invalid replacement outcome".to_owned(),
-                Ok((Err(error), _)) => error,
+                Ok(Ok((None, _))) => continue,
+                Ok(Ok((Some(_), _))) => "invalid replacement outcome".to_owned(),
+                Ok(Err(error)) => error,
                 Err(_) => "tool result hook timed out".to_owned(),
             };
             observer(Notification::ExtensionLifecycleError {

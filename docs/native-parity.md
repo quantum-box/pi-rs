@@ -682,9 +682,11 @@ truncation notices. The journal, SDK observers, result hooks, direct calls and
 programmatic calls retain their existing `Outcome` variants, and the public
 `Notification` variants are unchanged. In-process partial patches preserve
 the structured value when they only update metadata, and discard it when they
-explicitly replace output, including with the same text. Opaque custom hook
-overrides are treated conservatively when field presence is unavailable.
-Image read structured output remains a separate parity gap.
+explicitly replace output, including with the same text. Custom host hooks may
+opt in to reporting output-field presence; native executable extensions negotiate
+that capability and forward the field-presence result across the process boundary.
+Older executables and opaque overrides remain conservative when field presence is
+unavailable. Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
