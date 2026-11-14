@@ -1035,6 +1035,15 @@ Text reads now scan files with bounded memory, including files larger than
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
 
+### Image read omission checkpoint
+
+Image reads that cannot be decoded, converted or resized return Pi's text
+notice explaining why the image was omitted, including for injected read
+operations. Programmatic callers receive that text rather than an image.
+The native 20 MiB source limit, cancellation and filesystem errors remain
+separate failures. The existing restrictions on image formats and original
+image size continue to apply.
+
 ### RPC navigation checkpoint
 
 RPC clients can discover and cycle endpoint models, set or cycle thinking,

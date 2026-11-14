@@ -77,6 +77,59 @@ async fn local_factory_tools_resolve_relative_to_supplied_cwd() {
     );
 }
 
+#[tokio::test]
+async fn failed_image_preparation_returns_an_omission_note() {
+    struct Host;
+    #[async_trait::async_trait]
+    impl pi_rs::ToolHost for Host {
+        fn tools(&self) -> Vec<pi_rs::ToolSpec> {
+            Vec::new()
+        }
+        async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+            unreachable!()
+        }
+    }
+    struct CorruptImage;
+    #[async_trait::async_trait]
+    impl ReadOperations for CorruptImage {
+        async fn access(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+            Ok(b"GIF89a broken".to_vec())
+        }
+        async fn detect_image_mime_type(&self, _: &Path) -> Result<Option<String>> {
+            Ok(Some("image/gif".into()))
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("broken.gif"), b"GIF89a broken").unwrap();
+    let local = create_coding_tools(directory.path()).unwrap().tools();
+    let local = local
+        .into_iter()
+        .find(|tool| tool.spec().name == "read")
+        .unwrap();
+    let remote =
+        pi_rs_workbench::coding::create_read_tool(directory.path(), Arc::new(CorruptImage))
+            .unwrap();
+    for tool in [local, remote] {
+        let outcome = tool.invoke(json!({"path":"broken.gif"}), context()).await;
+        assert!(matches!(outcome, Outcome::Structured { ref data, .. }
+            if data["content"] == json!([{"type":"text", "text":"Read image file [image/gif]\n[Image omitted: could not be resized below the inline image size limit.]"}])));
+        let result = tool
+            .invoke_programmatic(
+                json!({"path":"broken.gif"}),
+                context(),
+                None,
+                Arc::new(Host),
+            )
+            .await;
+        assert!(
+            matches!(result.outcome, Outcome::Succeeded(ref text) if text == "Read image file [image/gif]\n[Image omitted: could not be resized below the inline image size limit.]")
+        );
+    }
+}
+
 #[derive(Default)]
 struct Remote {
     calls: Mutex<Vec<(String, PathBuf)>>,

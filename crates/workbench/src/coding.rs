@@ -853,6 +853,12 @@ impl Tool for RemoteReadTool {
     ) -> ToolReply {
         match self.invoke(args, context).await {
             Outcome::Structured { data, attachments } => {
+                if let Some(blocks) = data["content"].as_array()
+                    && !blocks.iter().any(|block| block["type"] == "image")
+                    && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
+                {
+                    return Outcome::Succeeded(text.to_owned()).into();
+                }
                 let mut image = data["content"]
                     .as_array()
                     .and_then(|blocks| blocks.iter().find(|b| b["type"] == "image"))
@@ -2084,6 +2090,12 @@ impl Tool for CodingTool {
         let outcome = self.invoke(args, context).await;
         match outcome {
             Outcome::Structured { data, attachments } if matches!(self.kind, Kind::Read { .. }) => {
+                if let Some(blocks) = data["content"].as_array()
+                    && !blocks.iter().any(|block| block["type"] == "image")
+                    && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
+                {
+                    return Outcome::Succeeded(text.to_owned()).into();
+                }
                 let mut image = data["content"]
                     .as_array()
                     .and_then(|blocks| blocks.iter().find(|block| block["type"] == "image"))
@@ -2200,11 +2212,32 @@ impl CodingTool {
             } = self.kind
         {
             let original_mime = format.to_mime_type();
-            let prepared = crate::image_profile::normalize_cancellable(
+            let profile = profile.unwrap_or_default();
+            let prepared = match crate::image_profile::normalize_cancellable(
                 reader,
-                profile.unwrap_or_default(),
+                profile,
                 cancellation,
-            )?;
+            ) {
+                Ok(prepared) => prepared,
+                Err(Error::Config(message))
+                    if profile.valid()
+                        && (message.starts_with("cannot prepare model image:")
+                            || message == "image cannot fit the configured model size limit") =>
+                {
+                    let reason = if matches!(
+                        original_mime,
+                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                    ) {
+                        "[Image omitted: could not be resized below the inline image size limit.]"
+                    } else {
+                        "[Image omitted: could not be converted to a supported inline image format.]"
+                    };
+                    return Ok(
+                        json!({"content":[{"type":"text", "text":format!("Read image file [{original_mime}]\n{reason}")}]}),
+                    );
+                }
+                Err(error) => return Err(error),
+            };
             crate::image_profile::check_cancelled(cancellation)?;
             let mut note = format!("Read image file [{}]", prepared.mime_type);
             if !matches!(
