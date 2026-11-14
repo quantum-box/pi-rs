@@ -124,6 +124,13 @@ impl<'a> TaskStore<'a> {
     /// untouched. Versions are not returned: a subsequent read may observe a
     /// later writer, so it must not be used as proof of an exclusive reservation.
     pub fn save(&self, tasks: &[Save<'_>]) -> Result<(), Error> {
+        let batch = self.prepare_save(tasks)?;
+        self.store.commit(&batch.checks, &batch.mutations)?;
+        Ok(())
+    }
+
+    /// Prepare task writes for an atomic commit with other checked records.
+    pub fn prepare_save(&self, tasks: &[Save<'_>]) -> Result<OwnedBatch, Error> {
         let mut checks = Vec::with_capacity(tasks.len());
         let mut mutations = Vec::with_capacity(tasks.len());
         let mut seen = std::collections::HashSet::new();
@@ -145,8 +152,7 @@ impl<'a> TaskStore<'a> {
                 value: serde_json::to_vec(task)?,
             });
         }
-        self.store.commit(&checks, &mutations)?;
-        Ok(())
+        Ok(OwnedBatch { checks, mutations })
     }
 
     /// Commit an owner's new checkpoint and its newly registered tasks in one

@@ -231,3 +231,24 @@ argument. Hook errors are collected by the extension dispatcher but the harness
 has no `onReport` callback and currently discards those reports. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
 still subject to the host's existing idle/manual and context-selection limits.
+
+### Experimental custom documents and checked composition
+
+`document::Documents` reads application-addressed JSON objects with store
+versions. `document::Transaction` stages version-checked puts and deletes for
+atomic commit, and can append `TaskStore::prepare_save` or
+`prepare_owned_tasks` batches. Each participant must provide checks for its
+writes; duplicate checks or writes are rejected. All checks see pre-commit
+state. A conflict rolls back all participants. Reload snapshots after conflict;
+commit errors may have an unknown outcome and require inspection on reopen.
+Versions are store-wide CAS tokens, not upstream document versions or commit
+sequence numbers. Addresses are caller-defined and do not enforce ownership.
+Raw prepared batches are trusted and must respect reserved namespaces and JSON
+invariants. Do not perform external effects while preparing a batch.
+
+This is a synchronous storage foundation, not upstream `Session.commit` or
+Chord: it has no draft callbacks, transaction snapshot reads, definitions,
+operation history, observation, fork/rewind, deferred persistence, or automatic
+lifecycle/ownership validation for arbitrary host batches. Existing conversation
+admission commits internally and cannot be composed with this API; task batches
+are low-level records and do not by themselves reserve executors or schedule work.
