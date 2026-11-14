@@ -95,15 +95,16 @@ async function run(text) {
 send.onclick = () => run(input.value);
 input.onkeydown = event => { if (event.key === 'Enter' && !send.disabled) send.click(); };
 cancel.onclick = () => { session.cancel(); status.textContent = 'キャンセルを要求しました…'; };
+function sessionError(error) { provider.disabled = model.disabled = browserModel.disabled = reopen.disabled = false; send.disabled = true; status.textContent = 'セッションを開けません。別タブで開いている場合は閉じてから再試行するか、接続先を切り替えてください: ' + String(error); }
 async function openSelected() { return (provider.value === 'browser' ? BrowserSession.open_demo : BrowserSession.open)(provider.value === 'browser' ? 'browser-qwen-v2' : provider.value === 'ollama' ? 'ollama-preview-v1' : 'tachyon-luna-v1', location.origin + '/demo-gateway', provider.value === 'browser' ? 'browser-qwen' : provider.value === 'ollama' ? 'ollama' : 'openai/gpt-6-luna', '', 600000); }
 provider.onchange = () => { document.querySelector('#browser-settings').hidden = provider.value !== 'browser'; document.querySelector('#ollama-settings').hidden = provider.value !== 'ollama'; document.querySelector('#tachyon-settings').hidden = provider.value !== 'tachyon'; reopen.click(); };
 reopen.onclick = async () => {
   provider.disabled = model.disabled = browserModel.disabled = send.disabled = reopen.disabled = true;
-  try { await session.close(); session.free(); session = await openSelected(); render(); status.textContent = '保存した会話を復元しました'; ready(); }
-  catch (error) { status.textContent = '復元できません: ' + String(error); }
+  try { if (session) { await session.close(); session.free(); session = null; } session = await openSelected(); render(); status.textContent = '保存した会話を復元しました'; ready(); }
+  catch (error) { sessionError(error); }
 };
 try { await init(); session = await openSelected(); render(); status.textContent = '準備完了'; ready(); }
-catch (error) { status.textContent = '起動できません: ' + String(error); }
+catch (error) { sessionError(error); }
 </script>
 </body>
 </html>
