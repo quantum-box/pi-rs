@@ -68,7 +68,7 @@ jobs:
         run: cargo +1.89.0 test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
 
   wasm-diagnostic:
-    name: Browser WASM core diagnostic (non-gating)
+    name: Browser WASM component and core checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -79,14 +79,9 @@ jobs:
         run: |
           rustup toolchain install 1.89.0 --profile minimal
           rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
-      # Diagnostic only: neither a passing compile nor this job implies browser support.
+      - name: Check portable tool arguments for wasm32-unknown-unknown
+        run: cargo +1.89.0 check --locked -p pi-rs-tool-arguments --target wasm32-unknown-unknown
       - name: Check core for wasm32-unknown-unknown
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          cargo +1.89.0 check --locked -p pi-rs-core --target wasm32-unknown-unknown > wasm-check.log 2>&1
-          status=$?
-          cat wasm-check.log
-          echo "Core wasm32-unknown-unknown cargo check exit code: $status (diagnostic only; not browser runtime validation)." >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: cargo +1.89.0 check --locked -p pi-rs-core --target wasm32-unknown-unknown
