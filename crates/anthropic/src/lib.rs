@@ -34,6 +34,13 @@ pub struct CatalogEntry {
     effort_levels: bool,
 }
 
+impl CatalogEntry {
+    /// Whether discovery explicitly identified a usable mode or disabled thinking.
+    pub fn has_known_thinking(&self) -> bool {
+        self.reasoning == Some(false) || self.thinking.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ThinkingMode {
     Adaptive,
@@ -67,6 +74,7 @@ pub struct Anthropic {
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
     configured_thinking: Option<CatalogEntry>,
+    configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
     cache_retention: CacheRetention,
     cache_tools: bool,
@@ -132,6 +140,7 @@ impl Anthropic {
             thinking_level: None,
             thinking_budgets: None,
             configured_thinking: None,
+            configured_thinking_is_fallback: false,
             allow_empty_signature: false,
             cache_retention: CacheRetention::None,
             cache_tools: true,
@@ -214,6 +223,7 @@ impl Anthropic {
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
+        self.configured_thinking_is_fallback = false;
         self.configured_thinking = Some(CatalogEntry {
             thinking_levels: vec![level.into()],
             thinking: Some(if adaptive {
@@ -225,6 +235,13 @@ impl Anthropic {
             effort_levels: adaptive,
             ..CatalogEntry::default()
         });
+        self
+    }
+
+    /// Use declared capabilities only when model discovery is unavailable.
+    pub fn with_fallback_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
+        self = self.with_configured_thinking(level, adaptive, disable);
+        self.configured_thinking_is_fallback = true;
         self
     }
 
@@ -367,7 +384,9 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
     };
     let capabilities = &model["capabilities"];
     let types = &capabilities["thinking"]["types"];
-    let thinking = if types["adaptive"]["supported"] == true {
+    let thinking = if capabilities["thinking"]["supported"] == false {
+        None
+    } else if types["adaptive"]["supported"] == true {
         Some(ThinkingMode::Adaptive)
     } else if types["enabled"]["supported"] == true {
         Some(ThinkingMode::Budgeted)
@@ -859,9 +878,10 @@ impl StreamUsage {
 #[async_trait::async_trait]
 impl Model for Anthropic {
     fn context_identity(&self) -> Option<String> {
-        // Unconfigured thinking can consult a changing remote model catalog.
+        // Thinking and discovered output limits can depend on a changing catalog.
         if !self.http_proxies.is_empty()
-            || (self.thinking_level.is_some() && self.configured_thinking.is_none())
+            || (self.thinking_level.is_some()
+                && (self.configured_thinking.is_none() || self.probe_context))
         {
             return None;
         }
@@ -882,6 +902,7 @@ impl Model for Anthropic {
             &self.thinking_level,
             &self.thinking_budgets,
             format!("{:?}", self.configured_thinking),
+            self.configured_thinking_is_fallback,
             self.allow_empty_signature,
             self.cache_retention.anthropic_control(),
             self.cache_tools,
@@ -921,12 +942,28 @@ impl Model for Anthropic {
     }
 
     async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
-        let details = if self.configured_thinking.is_some() {
-            self.configured_thinking.clone()
-        } else if self.thinking_level.is_some() {
+        let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
         } else {
             self.cached_model(&request.model)
+        };
+        let details = if self.configured_thinking_is_fallback
+            && discovered
+                .as_ref()
+                .is_some_and(CatalogEntry::has_known_thinking)
+        {
+            discovered
+        } else if let Some(mut configured) = self.configured_thinking.clone() {
+            if let Some(discovered) = discovered {
+                configured.id = discovered.id;
+                configured.context_window = discovered.context_window;
+                configured.max_output_tokens = discovered.max_output_tokens;
+                configured.reasoning = discovered.reasoning;
+                configured.images = discovered.images;
+            }
+            Some(configured)
+        } else {
+            discovered
         };
         if let Some(limit) = details.as_ref().and_then(|model| model.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);
@@ -1247,6 +1284,14 @@ mod tests {
                 .clone()
                 .with_configured_thinking("high", true, true)
                 .context_identity()
+        );
+        let configured = first.clone().with_configured_thinking("high", true, true);
+        assert!(configured.context_identity().is_none());
+        assert!(
+            configured
+                .with_context_probe(false)
+                .context_identity()
+                .is_some()
         );
         assert!(
             first

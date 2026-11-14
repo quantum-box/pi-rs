@@ -970,7 +970,15 @@ fn configured_messages_thinking_budget_respects_native_output_limits() {
             listener.local_addr().unwrap()
         );
         let server = std::thread::spawn(move || {
-            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET /anthropic/v1/models/") {
+                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
             assert!(first.starts_with("POST /anthropic/v1/messages "), "{first}");
             let mut length = 0;
             let mut headers = String::new();

@@ -3863,6 +3863,15 @@ keep their standard request shape. Compaction omits automatic cache
 markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
 
+A configured Anthropic `reasoning: true` declaration supplies fallback thinking
+levels when model discovery is unavailable or omits thinking capability. When the Models API returns a
+capability, its supported modes and levels drive both selection and requests;
+explicit adaptive or thinking-level-map overrides remain authoritative. Other
+discovered model metadata, including output limits, is retained with overrides.
+Automatic thinking discovery for configured Anthropic Messages-compatible models
+is restricted to the Anthropic provider; other gateways retain their declared
+capabilities without an additional Models API probe.
+
 ### Native Anthropic authorization header checkpoint
 
 The standard Anthropic Messages endpoint accepts an explicitly supplied
@@ -4210,3 +4219,16 @@ initial object property names, unfinished unescaped strings, and missing values.
 Offsets and columns in these diagnostics count UTF-16 units. Other malformed
 JSON, escaped unfinished strings and carriage-return position handling retain
 the native parser's diagnostics; full malformed-input parity remains open.
+
+### Shell execution transcript checkpoint
+
+Imported and live Pi-style shell executions display their output and completion
+status separately from the command, instead of showing the model-context
+`Ran ...` wrapper and Markdown fences in the terminal. Cancellation, nonzero
+exit status and truncation paths are included in the display output; the native
+excluded-from-context label is retained. Model context and journal data retain
+their existing framing and values. The terminal continues to use its generic
+tool styling and preview limits, so a long output may hide its status until expanded.
+Shell transcript rendering strips terminal escape sequences and normalizes line
+endings, including for imported and extension-provided output; journal and
+model-context text retain the original bytes.

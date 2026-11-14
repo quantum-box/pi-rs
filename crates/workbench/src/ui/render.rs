@@ -428,6 +428,12 @@ impl Entry {
                 numbered_diff,
                 ..
             } => {
+                // Shell output may contain terminal escape sequences, including
+                // partial sequences while a command is still streaming. Treat
+                // them as data, never as transcript styling.
+                let shell_output = matches!(name.as_str(), "bash" | "bash (excluded)")
+                    .then(|| strip_shell_ansi(output));
+                let output = shell_output.as_deref().unwrap_or(output);
                 let role = if *failed {
                     "toolErrorBg"
                 } else if *finished {
@@ -518,6 +524,58 @@ pub fn clean(text: &str) -> String {
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect::<String>()
         .replace('\t', "    ")
+}
+
+pub(crate) fn strip_shell_ansi(text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut result = String::with_capacity(text.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' | '\u{9b}' => {
+                let introducer = if ch == '\u{9b}' {
+                    Some('[')
+                } else {
+                    chars.next()
+                };
+                match introducer {
+                    Some('[') => {
+                        for next in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']' | 'P' | 'X' | '^' | '_') => {
+                        while let Some(next) = chars.next() {
+                            if next == '\u{7}' || next == '\u{9c}' {
+                                break;
+                            }
+                            if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(next) if ('\u{20}'..='\u{2f}').contains(&next) => {
+                        for next in chars.by_ref() {
+                            if ('\u{30}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                result.push('\n');
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     let width = width.max(1);
