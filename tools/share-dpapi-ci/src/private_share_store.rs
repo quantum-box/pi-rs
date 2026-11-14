@@ -492,9 +492,36 @@ mod unix {
         /// Invalidates the last generation before runtime preparation. The
         /// exclusive lock remains held until the generation is dropped.
         pub fn begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+            self.begin_inner(path, binding, false)
+        }
+
+        /// Fail closed immediately when another generation owns the session.
+        pub fn try_begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+            self.begin_inner(path, binding, true)
+        }
+
+        fn begin_inner(
+            &self,
+            path: &Path,
+            binding: Binding,
+            nonblocking: bool,
+        ) -> io::Result<Generation<'_>> {
             secure_dir(&self.directory)?;
             let lock = self.lock(path, &binding, true)?;
-            lock.lock()?;
+            if nonblocking {
+                match lock.try_lock() {
+                    Ok(()) => (),
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "share generation is busy",
+                        ));
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                }
+            } else {
+                lock.lock()?;
+            }
             let name = name_for(&self.key, path, binding.session_id, "json")?;
             let marker = name_for(&self.key, path, binding.session_id, "generation")?;
             let generation = uuid::Uuid::new_v4();
