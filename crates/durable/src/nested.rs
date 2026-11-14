@@ -19,7 +19,7 @@ use pi_rs_core::{CancellationToken, Invocation, Outcome, ToolCall, ToolHost, Too
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -67,6 +67,7 @@ struct Lifecycle {
     sealed: bool,
     active: usize,
     counts: HashMap<Uuid, u64>,
+    keyed: HashSet<Vec<u8>>,
 }
 
 /// One execution of one parent operation. Clone the Arc, not the host itself.
@@ -133,6 +134,20 @@ impl NestedHost {
     }
     fn key(&self, parent: Uuid, index: u64) -> Vec<u8> {
         format!("nested/{}/{parent}/{index:020}", self.shared.root).into_bytes()
+    }
+    fn explicit_key(&self, parent: Uuid, key: &str) -> Vec<u8> {
+        let encoded: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        format!("nested/{}/{parent}/k{encoded}", self.shared.root).into_bytes()
+    }
+    /// Execute or reattach to a nested call identified by a caller-scoped key.
+    /// Explicit keys follow upstream's path-segment rules. The same key may be
+    /// reused only with the same tool and JSON arguments.
+    pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
+        let positive_integer = !key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit());
+        if key.is_empty() || key.contains('/') || key == "__proto__" || positive_integer {
+            return self.fail("invalid nested call key");
+        }
+        self.call_inner(Some(key), name, arguments).await
     }
     fn fail(&self, reason: impl Into<String>) -> Outcome {
         self.shared.failed.store(true, Ordering::Release);
@@ -224,23 +239,32 @@ impl NestedHost {
             let s = std::str::from_utf8(&key)
                 .map_err(|_| InspectionError::Uncertain("invalid nested key".into()))?;
             let mut parts = s.rsplit('/');
-            let index: u64 = parts
+            let member = parts
                 .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| InspectionError::Uncertain("invalid nested index".into()))?;
+                .ok_or_else(|| InspectionError::Uncertain("invalid nested key".into()))?;
             let parent = parts
                 .next()
                 .and_then(|s| Uuid::parse_str(s).ok())
                 .ok_or_else(|| InspectionError::Uncertain("invalid nested parent".into()))?;
-            if l.counts.get(&parent).is_some_and(|count| index >= *count) {
-                return Err(InspectionError::Uncertain(
-                    "replay omitted a recorded nested call".into(),
-                ));
+            if let Some(count) = l.counts.get(&parent) {
+                let omitted = if member.starts_with('k') {
+                    !l.keyed.contains(&key)
+                } else {
+                    let index: u64 = member
+                        .parse()
+                        .map_err(|_| InspectionError::Uncertain("invalid nested index".into()))?;
+                    index >= *count
+                };
+                if omitted {
+                    return Err(InspectionError::Uncertain(
+                        "replay omitted a recorded nested call".into(),
+                    ));
+                }
             }
         }
         Ok(())
     }
-    async fn call_inner(&self, name: &str, arguments: Value) -> Outcome {
+    async fn call_inner(&self, explicit: Option<&str>, name: &str, arguments: Value) -> Outcome {
         let _active = match self.enter() {
             Ok(active) => active,
             Err(outcome) => return outcome,
@@ -252,19 +276,24 @@ impl NestedHost {
         if self.depth >= self.shared.max_depth {
             return self.fail("nested depth limit exceeded");
         }
-        let index = match self.shared.lifecycle.lock() {
+        let (key, call_id) = match self.shared.lifecycle.lock() {
             Ok(mut l) => {
-                let n = l.counts.entry(self.parent).or_default();
-                let Some(next) = n.checked_add(1) else {
-                    return self.fail("nested call index exhausted");
-                };
-                let index = *n;
-                *n = next;
-                index
+                if let Some(member) = explicit {
+                    let key = self.explicit_key(self.parent, member);
+                    l.keyed.insert(key.clone());
+                    (key, format!("nested-key-{member}"))
+                } else {
+                    let n = l.counts.entry(self.parent).or_default();
+                    let Some(next) = n.checked_add(1) else {
+                        return self.fail("nested call index exhausted");
+                    };
+                    let index = *n;
+                    *n = next;
+                    (self.key(self.parent, index), format!("nested-{index}"))
+                }
             }
             Err(_) => return self.fail("nested lifecycle lock poisoned"),
         };
-        let key = self.key(self.parent, index);
         let store = self.shared.owner.store();
         let entry = match store.get(&key) {
             Ok(v) => v,
@@ -293,7 +322,7 @@ impl NestedHost {
             let invocation = Invocation {
                 operation_id: Uuid::new_v4(),
                 call: ToolCall {
-                    id: format!("nested-{index}"),
+                    id: call_id.clone(),
                     name: name.into(),
                     arguments: arguments.to_string(),
                 },
@@ -349,7 +378,7 @@ impl NestedHost {
         let invocation = Invocation {
             operation_id: record.operation_id,
             call: ToolCall {
-                id: format!("nested-{index}"),
+                id: call_id.clone(),
                 name: name.into(),
                 arguments: record.arguments.to_string(),
             },
@@ -421,12 +450,12 @@ impl ToolHost for NestedHost {
         tools
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
-        self.call_inner(name, arguments).await
+        self.call_inner(None, name, arguments).await
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
         let mut outcomes = Vec::with_capacity(calls.len());
         for (name, args) in calls {
-            outcomes.push(self.call_inner(&name, args).await);
+            outcomes.push(self.call_inner(None, &name, args).await);
         }
         outcomes
     }
@@ -539,6 +568,93 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn keyed_replay_is_order_independent_and_rejects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        for (key, value) in [("α", 1), ("b", 2)] {
+            assert_eq!(
+                h.call_keyed(key, "fake", json!({"x": value})).await,
+                Outcome::Succeeded(json!({"x": value}).to_string())
+            );
+        }
+        h.seal_and_inspect().unwrap();
+        drop(h);
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        for (key, value) in [("b", 2), ("α", 1), ("b", 2)] {
+            assert_eq!(
+                h.call_keyed(key, "fake", json!({"x": value})).await,
+                Outcome::Succeeded(json!({"x": value}).to_string())
+            );
+        }
+        h.seal_and_inspect().unwrap();
+        drop(h);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        assert!(matches!(
+            h.call_keyed("b", "fake", json!({"x": 3})).await,
+            Outcome::Unknown(_)
+        ));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+        let h = host(&path, root, calls.clone(), ReplayPolicy::Unsafe, false, 2);
+        h.call_keyed("b", "fake", json!({"x": 2})).await;
+        assert!(h.seal_and_inspect().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn keyed_interrupted_calls_follow_their_replay_policy() {
+        for policy in [ReplayPolicy::Unsafe, ReplayPolicy::Safe] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let root = Uuid::new_v4();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let h = host(&path, root, calls.clone(), policy, true, 2);
+            let mut future = Box::pin(h.call_keyed("child", "fake", json!({})));
+            assert!(futures_util::poll!(future.as_mut()).is_pending());
+            drop(future);
+            assert!(h.seal_and_inspect().is_err());
+            drop(h);
+            let h = host(&path, root, calls.clone(), policy, false, 2);
+            let result = h.call_keyed("child", "fake", json!({})).await;
+            if policy == ReplayPolicy::Safe {
+                assert!(matches!(result, Outcome::Succeeded(_)));
+                h.seal_and_inspect().unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(matches!(result, Outcome::Unknown(_)));
+                assert!(h.seal_and_inspect().is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_keys_follow_upstream_validation() {
+        for key in ["", "a/b", "__proto__", "1", "999999999999999999999999"] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let h = host(
+                &dir.path().join("db"),
+                Uuid::new_v4(),
+                calls.clone(),
+                ReplayPolicy::Safe,
+                false,
+                2,
+            );
+            assert!(matches!(
+                h.call_keyed(key, "fake", json!({})).await,
+                Outcome::Unknown(_)
+            ));
+            assert!(h.seal_and_inspect().is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[tokio::test]
     async fn depth_and_concurrent_calls_poison_inspection() {
         let dir = tempfile::tempdir().unwrap();

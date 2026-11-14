@@ -69,10 +69,15 @@ arbitrarily large and are decoded in full. Bytes, metadata copying and peak
 memory are therefore not independently bounded. Existing history and execution
 paths still hydrate all messages. Store reads are synchronous and may block.
 
-Nested tool calls are journaled by parent operation and call order. A replayed
-parent reuses completed child results, while unsafe interrupted children block
-the parent for reconciliation even when it ignores the child's result. Nested
-calls are serialized, bounded in depth, and cannot update extension state.
+Nested tool calls are journaled by parent operation and call order. The standalone
+`NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
+completed results across reordered replay, rejecting a changed tool or arguments.
+The core `ToolHost` interface exposes only positional calls, so tools invoked by
+the runtime cannot request keys through it without a core integration change.
+Unsafe interrupted children block the parent for reconciliation even if ignored;
+so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
+serialized, bounded in depth, and cannot update extension state. A safe replay
+still requires destination-level idempotency for external effects.
 
 Selected extensions may provide tools and before/after-tool hooks. The runtime
 commits terminal tool output and state before invoking after-tool hooks; a crash
