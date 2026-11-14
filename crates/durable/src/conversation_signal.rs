@@ -299,7 +299,7 @@ impl<'a> Inbox<'a> {
                 }
             }
         }
-        if delivered.is_none() && !deadline.is_some_and(|d| now >= d) {
+        if delivered.is_none() && deadline.is_none_or(|d| now < d) {
             return Ok(None);
         }
         Ok(Some(PreparedWake {
