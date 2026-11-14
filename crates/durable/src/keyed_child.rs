@@ -88,8 +88,22 @@ fn prepare_park_with_documents(
         return Err(Error::DocumentContext);
     }
     let mut transaction = crate::document::Transaction::new();
-    transaction.append(documents.into_batch()?)?;
-    transaction.append(prepare_park_any(store, parent, checkpoint, keys)?)?;
+    let document_batch = documents.into_batch()?;
+    let mut park = prepare_park_any(store, parent, checkpoint, keys)?;
+    // A signal to a waited-for child may impose a deadline as well as the
+    // child's version check. Preserve that stronger check when composing.
+    for check in &mut park.checks {
+        if let Expected::Version(version) = check.expected
+            && let Some(deadline_check) = document_batch.checks.iter().find(|other| {
+                other.key == check.key
+                    && matches!(other.expected, Expected::VersionBefore(v, _) if v == version)
+            })
+        {
+            check.expected = deadline_check.expected.clone();
+        }
+    }
+    transaction.append(document_batch)?;
+    transaction.append(park)?;
     Ok(transaction)
 }
 
@@ -373,6 +387,70 @@ mod tests {
     }
 
     #[test]
+    fn signal_waited_child_preserves_deadline_and_atomic_park() {
+        use crate::task_store::{SignalResult, SignalToken};
+        for expired in [false, true] {
+            let db = Store::memory().unwrap();
+            let p = registered_parent(&db, true);
+            let (p, child, _) = admit_pair(&db, &p);
+            let token = SignalToken::new("answer", 1).unwrap();
+            let tasks = TaskStore::new(&db);
+            let current = tasks.load(child.id()).unwrap().unwrap();
+            tasks
+                .update(&current, |t| {
+                    t.start()?;
+                    t.wait(WaitFor::TypedSleep {
+                        until_millis: Some(if expired { 10 } else { 60_000 }),
+                        signals: vec![token.key("a").unwrap()],
+                    })
+                })
+                .unwrap();
+            let mut docs = crate::document::TaskDocuments::new(&db, &p.task).unwrap();
+            assert!(matches!(
+                docs.signal_at(child.id(), &token, "a", json!(1), 0).unwrap(),
+                SignalResult::Delivered
+            ));
+            docs.get(&address()).unwrap();
+            docs.put(&address(), json!({"saved":true}).as_object().unwrap().clone())
+                .unwrap();
+            let tx = prepare_park_with_documents(&db, &p, cp("parked"), &["a"], docs).unwrap();
+            if expired {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                assert!(matches!(
+                    tx.commit(&db),
+                    Err(crate::document::Error::Store(durable_store::Error::Conflict { .. }))
+                ));
+                assert_eq!(tasks.load(p.task.id()).unwrap().unwrap(), p);
+                assert!(
+                    crate::document::Documents::new(&db)
+                        .get(&address())
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                tx.commit(&db).unwrap();
+                assert!(matches!(
+                    tasks.load(p.task.id()).unwrap().unwrap().task.state(),
+                    TaskState::Waiting(WaitFor::TasksAny(_))
+                ));
+                assert!(
+                    crate::document::Documents::new(&db)
+                        .get(&address())
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            let result = tasks
+                .deliver_signal_at(child.id(), &token, "a", json!(1), 0)
+                .unwrap();
+            assert!(matches!(
+                (expired, result),
+                (true, SignalResult::Delivered) | (false, SignalResult::Duplicate)
+            ));
+        }
+    }
+
+    #[test]
     fn documents_and_keyed_park_commit_together_and_scheduler_wakes_after_reopen() {
         use crate::task_scheduler::{Registry, Scheduler, Step};
         use durable_store::owner::OwnedStore;
@@ -520,6 +598,42 @@ mod tests {
                 .unwrap(),
             p
         );
+        assert!(
+            crate::document::Documents::new(owner.store())
+                .get(&address())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn contended_gate_rechecks_parent_before_committing() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let p = registered_parent(owner.store(), true);
+        let (p, _, _) = admit_pair(owner.store(), &p);
+        let gate = owner.task_gate().lock().unwrap();
+        let (ready, received) = std::sync::mpsc::channel();
+        let other = owner.clone();
+        let snapshot = p.clone();
+        let worker = std::thread::spawn(move || {
+            let docs = staged(other.store(), &snapshot);
+            ready.send(()).unwrap();
+            park_with_documents(&other, &snapshot, cp("parked"), &["a"], docs)
+        });
+        received.recv().unwrap();
+        TaskStore::new(owner.store())
+            .update(&p, |task| task.request_abort())
+            .unwrap();
+        drop(gate);
+        assert!(matches!(worker.join().unwrap(), Err(Error::ParentClosed)));
+        let after = TaskStore::new(owner.store())
+            .load(p.task.id())
+            .unwrap()
+            .unwrap();
+        assert!(after.task.abort_requested());
+        assert_eq!(after.task.checkpoint(), p.task.checkpoint());
         assert!(
             crate::document::Documents::new(owner.store())
                 .get(&address())
