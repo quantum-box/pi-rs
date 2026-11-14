@@ -1472,8 +1472,9 @@ The tree selector orders records by ancestry, marks the active head and indents
 forks. Alt+Left/Right folds, unfolds or moves through parent/child records.
 The active branch is listed first at each fork and marked along its path.
 Branch connectors and gutters are rebuilt from the visible tree after filtering,
-so descendants attach to their nearest visible ancestor. Indentation remains
-capped at 12 levels; Pi's horizontal viewport for deeper trees remains open.
+so descendants attach to their nearest visible ancestor. Deep trees pan
+horizontally to keep the selected entry visible while retaining the selection
+gutter; clipping preserves wide characters and theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label without changing its identity. Direct `/checkout` releases its
 journal lock before restoring the view.
