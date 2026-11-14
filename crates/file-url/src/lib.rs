@@ -3,7 +3,17 @@ use std::path::PathBuf;
 
 /// Match Node's path validation before handing a path to a local or remote backend.
 pub fn to_file_path(input: &str) -> Result<PathBuf, String> {
-    let url = url::Url::parse(input).map_err(|error| error.to_string())?;
+    let parsed = url::Url::parse(input);
+    #[cfg(windows)]
+    let (url, fallback_host) = match parsed {
+        Ok(url) => (url, None),
+        Err(error) => match malformed_punycode_url(input) {
+            Some((url, host)) => (url, Some(host)),
+            None => return Err(error.to_string()),
+        },
+    };
+    #[cfg(not(windows))]
+    let url = parsed.map_err(|error| error.to_string())?;
     #[cfg(not(windows))]
     if url
         .host_str()
@@ -18,9 +28,55 @@ pub fn to_file_path(input: &str) -> Result<PathBuf, String> {
     #[cfg(windows)]
     if let Some(url::Host::Domain(host)) = url.host() {
         let text = path.to_str().ok_or_else(|| "invalid file URL".to_owned())?;
+        if let Some(decoded) = fallback_host {
+            return Ok(PathBuf::from(replace_unc_host(text, host, &decoded)?));
+        }
         return Ok(PathBuf::from(unicode_unc_path(text, host)?));
     }
     Ok(path)
+}
+
+// Node accepts some malformed ACE labels literally. Only retry simple ASCII
+// authorities, so the regular URL parser still handles all structural syntax.
+#[cfg(any(windows, test))]
+fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
+    let prefix = input.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let rest = &input[7..];
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..end];
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+    {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    let mut invalid_ace = false;
+    let decoded = host
+        .split('.')
+        .map(|label| {
+            let (decoded, status) = idna::domain_to_unicode(label);
+            if status.is_err() {
+                if !label.starts_with("xn--") {
+                    return None;
+                }
+                invalid_ace = true;
+                Some(label.to_owned())
+            } else {
+                Some(decoded)
+            }
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join(".");
+    if !invalid_ace {
+        return None;
+    }
+    let replacement = format!("file://pi-invalid-host.invalid{}", &rest[end..]);
+    Some((url::Url::parse(&replacement).ok()?, decoded))
 }
 
 /// Node checks encoded separators before decoding the path as UTF-8.
@@ -67,6 +123,13 @@ pub fn validate_path(path: &str, windows: bool) -> Result<(), String> {
 // Unicode. Replace only the validated host prefix, leaving the path intact.
 #[cfg(any(windows, test))]
 fn unicode_unc_path(path: &str, host: &str) -> Result<String, String> {
+    let (decoded, status) = idna::domain_to_unicode(host);
+    status.map_err(|_| "invalid file URL".to_owned())?;
+    replace_unc_host(path, host, &decoded)
+}
+
+#[cfg(any(windows, test))]
+fn replace_unc_host(path: &str, host: &str, decoded: &str) -> Result<String, String> {
     let prefix = format!("\\\\{host}");
     let suffix = path
         .strip_prefix(&prefix)
@@ -74,8 +137,6 @@ fn unicode_unc_path(path: &str, host: &str) -> Result<String, String> {
     if !suffix.is_empty() && !suffix.starts_with('\\') {
         return Err("invalid file URL".into());
     }
-    let (decoded, status) = idna::domain_to_unicode(host);
-    status.map_err(|_| "invalid file URL".to_owned())?;
     Ok(format!("\\\\{decoded}{suffix}"))
 }
 
@@ -117,6 +178,27 @@ mod tests {
         );
         assert!(unicode_unc_path(r"\\other\share", "xn--n3h").is_err());
     }
+    #[test]
+    fn malformed_ace_fallback_is_limited_to_safe_authorities() {
+        for (input, expected) in [
+            ("file://XN--BAD-/share", "xn--bad-"),
+            ("file://xn--bad-.xn--n3h/share", "xn--bad-.☃"),
+            ("file://xn--n3h.xn--bad-/share", "☃.xn--bad-"),
+        ] {
+            let (url, host) = malformed_punycode_url(input).unwrap();
+            assert_eq!(host, expected);
+            assert_eq!(url.path(), "/share");
+        }
+        for input in [
+            "file://user@xn--bad-/share",
+            "file://xn--bad-:99/share",
+            "file://xn--bad-%2f/share",
+            "file://xn--n3h/share",
+            "https://xn--bad-/share",
+        ] {
+            assert!(malformed_punycode_url(input).is_none(), "{input}");
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn windows_file_urls_keep_unicode_unc_and_drive_paths() {
@@ -129,5 +211,10 @@ mod tests {
             PathBuf::from(r"C:\hello")
         );
         assert!(to_file_path("file://xn--n3h/share/a%2fb").is_err());
+        assert_eq!(
+            to_file_path("file://xn--bad-.xn--n3h/share/a%20b").unwrap(),
+            PathBuf::from(r"\\xn--bad-.☃\share\a b")
+        );
+        assert!(to_file_path("file://xn--bad-/share/a%2fb").is_err());
     }
 }

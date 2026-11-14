@@ -364,6 +364,14 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
             .await,
             Outcome::Succeeded(_)
         ));
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"*", "path":"file://xn--bad-.xn--n3h/share/a%20b"}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
     }
     let paths = backend.paths.lock().unwrap();
     assert_eq!(paths[0], root.path().join("with space"));
@@ -372,5 +380,7 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
     assert_eq!(paths[2], root.path().join("literal\\name"));
     #[cfg(windows)]
     assert_eq!(paths[2], PathBuf::from(r"\\☃\share\a b"));
-    assert_eq!(paths.len(), 3);
+    #[cfg(windows)]
+    assert_eq!(paths[3], PathBuf::from(r"\\xn--bad-.☃\share\a b"));
+    assert_eq!(paths.len(), if cfg!(windows) { 4 } else { 3 });
 }
