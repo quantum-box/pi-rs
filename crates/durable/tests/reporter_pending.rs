@@ -75,6 +75,48 @@ impl Tool for PendingJob {
     }
 }
 #[tokio::test]
+async fn scheduler_polls_extension_provided_pending_tool() {
+    use pi_rs_durable::extension::Extension;
+    let dir = tempfile::tempdir().unwrap();
+    let job = Arc::new(PendingJob(AtomicUsize::new(0)));
+    let options = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    scheduler
+        .install_extension(Extension {
+            name: "jobs".into(),
+            tools: vec![job.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "parent".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["jobs".into()])
+        .unwrap();
+    scheduler.submit(id, None, "run".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        scheduler.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert!(job.0.load(Ordering::SeqCst) >= 2);
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
 async fn parent_reporter_continues_polling_pending_work() {
     let dir = tempfile::tempdir().unwrap();
     let job = Arc::new(PendingJob(AtomicUsize::new(0)));

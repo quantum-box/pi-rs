@@ -3262,8 +3262,15 @@ async fn drive_scheduled(
         let should_poll = match &state.phase {
             Phase::Pending { calls, index, .. } => calls
                 .get(*index)
-                .and_then(|call| worker.tools.get(&call.name))
-                .is_some_and(|tool| tool.tool.can_poll()),
+                .map(|call| {
+                    worker.resolved_tools(&state).map(|tools| {
+                        tools
+                            .get(&call.name)
+                            .is_some_and(|tool| tool.tool.can_poll())
+                    })
+                })
+                .transpose()?
+                .unwrap_or(false),
             _ => false,
         };
         if !should_poll {
