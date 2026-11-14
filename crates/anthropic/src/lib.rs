@@ -505,7 +505,9 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
     } else {
         let message = format!("Anthropic returned HTTP {status}");
         if status.as_u16() == 429 && is_permanent_quota(response).await {
-            Err(Error::Model(message))
+            Err(Error::Model(
+                "Anthropic account quota or billing limit reached (HTTP 429)".into(),
+            ))
         } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
             Err(Error::RetryableModel(message))
         } else {
@@ -1351,6 +1353,15 @@ mod tests {
                 matches!(error, pi_rs_core::Error::RetryableModel(_)),
                 !permanent
             );
+            if permanent {
+                assert!(
+                    matches!(&error, pi_rs_core::Error::Model(message) if message == "Anthropic account quota or billing limit reached (HTTP 429)")
+                );
+            } else {
+                assert!(
+                    matches!(&error, pi_rs_core::Error::RetryableModel(message) if message == "Anthropic returned HTTP 429 Too Many Requests")
+                );
+            }
             assert!(!error.to_string().contains("sentinel-secret"));
             server.join().unwrap();
         }

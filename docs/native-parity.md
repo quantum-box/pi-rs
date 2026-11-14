@@ -4249,6 +4249,7 @@ model-context text retain the original bytes.
 matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
+
 ### Messages quota retry classification
 
 Anthropic-compatible Messages requests inspect a bounded HTTP 429 response
