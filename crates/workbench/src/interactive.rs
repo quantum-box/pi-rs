@@ -692,6 +692,18 @@ struct PendingShare {
     started: Instant,
 }
 
+fn require_requested_live_share_context(
+    journal_key: Option<&[u8; 32]>,
+    snapshot: Option<&sessions::ShareSnapshot>,
+) -> Result<()> {
+    if journal_key.is_some() && snapshot.is_none() {
+        return Err(pi_rs::Error::Config(
+            "Live share context is unavailable; try sharing again".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn start_share_upload(
     view: &mut View,
     pending: PendingShare,
@@ -709,6 +721,7 @@ fn start_share_upload(
         status,
         "Share cancelled",
         move |_| async move {
+            require_requested_live_share_context(journal_key.as_ref(), snapshot.as_ref())?;
             let session = Session::snapshot(path)?;
             if let Some(snapshot) = &snapshot {
                 sessions::validate_live_share_journal(&session, snapshot, journal_key.as_ref())?;
@@ -7816,6 +7829,12 @@ mod tests {
         );
         let auth = super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
         assert!(auth.get("openai-chatgpt").is_some());
+    }
+
+    #[test]
+    fn requested_live_share_does_not_silently_drop_missing_context() {
+        assert!(super::require_requested_live_share_context(Some(&[1; 32]), None).is_err());
+        assert!(super::require_requested_live_share_context(None, None).is_ok());
     }
 
     #[test]

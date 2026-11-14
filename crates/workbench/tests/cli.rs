@@ -163,6 +163,7 @@ fn worker_returns_keyed_share_journal_tag() {
         .append_user_with_images("fixture".into(), Vec::new(), None)
         .unwrap();
     drop(session);
+    let stderr = tempfile::NamedTempFile::new().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
         .env("PI_RS_HOME", root.path().join("home"))
@@ -185,7 +186,7 @@ fn worker_returns_keyed_share_journal_tag() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
         .spawn()
         .unwrap();
     let mut child = Reap(child);
@@ -213,7 +214,12 @@ fn worker_returns_keyed_share_journal_tag() {
     let response = loop {
         let event = receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("worker did not return share context");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "worker did not return share context: {error}; stderr: {}",
+                    String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap_or_default())
+                )
+            });
         if event["id"] == "share" {
             break event;
         }
