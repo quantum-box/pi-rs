@@ -35,6 +35,24 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
     const reader = new BrowserFetch(root + '/slow-read', '', {}); await reader.open(); await reader.read();
     const waiting = reader.read(); await assert.rejects(reader.read(), /already pending/); reader.cancel(); await assert.rejects(waiting, /cancelled/); reader.free();
     const large = new BrowserFetch(root + '/large', '', {}); await large.open(); await assert.rejects(async () => { while (await large.read() !== undefined) {} }, /exceeds limit/); large.free();
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => new Response(new ReadableStream({start(controller) {
+        const bytes = new Uint8Array(1024 * 1024 + 1); bytes[bytes.length - 1] = 99;
+        controller.enqueue(bytes); controller.close();
+      }}));
+      const merged = new BrowserFetch(root, '', {}); await merged.open();
+      const first = await merged.read(); assert.equal(first.length, 1024 * 1024);
+      first.fill(0); const last = await merged.read(); assert.deepEqual([...last], [99]);
+      assert.equal(await merged.read(), undefined); merged.free();
+      const cancelled = new BrowserFetch(root, '', {}); await cancelled.open();
+      await cancelled.read(); cancelled.cancel(); await assert.rejects(cancelled.read(), /unavailable/); cancelled.free();
+      globalThis.fetch = async () => new Response(new ReadableStream({start(controller) {
+        controller.enqueue(new Uint8Array(16 * 1024 * 1024 + 1)); controller.close();
+      }}));
+      const oversized = new BrowserFetch(root, '', {}); await oversized.open();
+      await assert.rejects(oversized.read(), /exceeds limit/); oversized.free();
+    } finally { globalThis.fetch = originalFetch; }
     console.log('browser-fetch Node integration passed');
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

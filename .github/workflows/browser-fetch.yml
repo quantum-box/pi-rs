@@ -1,0 +1,50 @@
+name: Browser Fetch transport
+
+on:
+  pull_request:
+    paths:
+      - 'crates/browser-fetch/**'
+      - '.github/workflows/browser-fetch.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/browser-fetch/**'
+      - '.github/workflows/browser-fetch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/pi-fetch-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - id: chrome
+        uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4 # v2
+      - name: Install Rust and target
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Check and build transport
+        run: |
+          cargo +1.89.0 fmt --manifest-path crates/browser-fetch/Cargo.toml -- --check
+          cargo +1.89.0 clippy --locked --manifest-path crates/browser-fetch/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+          cargo +1.89.0 build --locked --manifest-path crates/browser-fetch/Cargo.toml --target wasm32-unknown-unknown
+      - name: Test Node and browser Fetch
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/pi-fetch-node" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/pi_rs_browser_fetch.wasm"
+          node crates/browser-fetch/tests/node-fetch.cjs "$RUNNER_TEMP/pi-fetch-node/pi_rs_browser_fetch.js"
+          wasm-bindgen --target web --out-dir "$RUNNER_TEMP/pi-fetch-web" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/pi_rs_browser_fetch.wasm"
+          node crates/browser-fetch/tests/browser-fetch.cjs "$RUNNER_TEMP/pi-fetch-web" "$CHROME_BIN"

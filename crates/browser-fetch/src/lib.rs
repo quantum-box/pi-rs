@@ -37,6 +37,7 @@ mod browser {
         reader: Option<ReadableStreamDefaultReader>,
         reading: bool,
         total: usize,
+        pending: Option<(Uint8Array, u32)>,
     }
 
     /// One POST with bounded streaming. The host owns endpoint and headers.
@@ -82,6 +83,7 @@ mod browser {
                     reader: None,
                     reading: false,
                     total: 0,
+                    pending: None,
                 })),
             })
         }
@@ -144,6 +146,14 @@ mod browser {
                 if state.phase != Phase::Streaming || state.reading {
                     return Err(error("stream unavailable or read already pending"));
                 }
+                if let Some((chunk, offset)) = state.pending.take() {
+                    let end = offset.saturating_add(MAX_CHUNK as u32).min(chunk.length());
+                    let result = chunk.slice(offset, end);
+                    if end < chunk.length() {
+                        state.pending = Some((chunk, end));
+                    }
+                    return Ok(result.into());
+                }
                 state.reading = true;
                 state.reader.as_ref().expect("streaming reader").clone()
             };
@@ -176,18 +186,25 @@ mod browser {
                 .map_err(|_| error("invalid stream chunk"))?;
             let length = chunk.length() as usize;
             state.total = state.total.saturating_add(length);
-            if length > MAX_CHUNK || state.total > MAX_RESPONSE {
+            if state.total > MAX_RESPONSE {
                 state.phase = Phase::Failed;
                 self.abort.abort();
                 return Err(error("response exceeds limit"));
             }
-            Ok(chunk.into())
+            if length > MAX_CHUNK {
+                let result = chunk.slice(0, MAX_CHUNK as u32);
+                state.pending = Some((chunk, MAX_CHUNK as u32));
+                Ok(result.into())
+            } else {
+                Ok(chunk.into())
+            }
         }
 
         pub fn cancel(&self) {
             let mut state = self.state.borrow_mut();
             if state.phase != Phase::Done {
                 state.phase = Phase::Cancelled;
+                state.pending = None;
                 self.abort.abort();
             }
         }

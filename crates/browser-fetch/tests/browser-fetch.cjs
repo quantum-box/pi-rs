@@ -11,6 +11,7 @@ const { once } = require('node:events');
   if (!dir || !chrome) throw Error('expected bindings directory and Chrome path');
   let redirects = 0;
   let cookieSeen = false;
+  let sameOriginCookieSeen = false;
   const api = http.createServer((req, res) => {
     if (req.url !== '/no-cors') {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -34,7 +35,9 @@ const assert = (x, msg) => { if (!x) throw Error(msg); };
 const reject = async (p, part) => { try { await p; throw Error('unexpected success'); } catch(e) { assert(String(e).includes(part), String(e)); } };
 try {
   document.cookie = 'pi_fetch_test=secret; SameSite=Lax';
+  assert(document.cookie.includes('pi_fetch_test=secret'), 'cookie setup');
   await init(); const base = ${JSON.stringify(origin)};
+  const same = new BrowserFetch(location.origin + '/same', '', {}); await same.open(); await same.read(); same.free();
   const request = new BrowserFetch(base + '/ok', '{}', {authorization:'Bearer private'});
   assert(await request.open() === 200, 'status'); let out = ''; for (;;) { const b = await request.read(); if (b === undefined) break; out += new TextDecoder().decode(b); }
   assert(out === 'ab', 'stream'); request.free();
@@ -47,6 +50,7 @@ try {
 } catch(e) { document.body.textContent = 'FAIL ' + String(e) + ' ' + (e.stack || ''); }
 </script></body>`;
   const site = http.createServer((req, res) => {
+    if (req.url === '/same') { sameOriginCookieSeen = !!req.headers.cookie; res.end('ok'); return; }
     if (req.url === '/') { res.setHeader('content-type', 'text/html'); res.end(html); return; }
     const name = path.basename(req.url);
     if (!['pi_rs_browser_fetch.js', 'pi_rs_browser_fetch_bg.wasm'].includes(name)) { res.writeHead(404).end(); return; }
@@ -82,7 +86,7 @@ try {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       socket.close();
-      if (text !== 'PASS' || redirects !== 0 || cookieSeen) throw Error(`browser failed: ${text} redirects=${redirects} cookieSeen=${cookieSeen}`);
+      if (text !== 'PASS' || redirects !== 0 || cookieSeen || sameOriginCookieSeen) throw Error(`browser failed: ${text} redirects=${redirects} cookieSeen=${cookieSeen} sameOriginCookieSeen=${sameOriginCookieSeen}`);
     } finally { child.kill('SIGKILL'); await once(child, 'close'); }
     console.log('browser-fetch Chrome integration passed (including CORS)');
   } finally { api.closeAllConnections(); site.closeAllConnections(); api.close(); site.close(); fs.rmSync(profile, {recursive:true, force:true}); }

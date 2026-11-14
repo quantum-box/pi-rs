@@ -19,8 +19,10 @@ forwarding caller-supplied secrets to another endpoint. Browser CORS and the
 host's authorization policy still apply; the transport does not authenticate
 users, keep secrets out of JavaScript, or decide which endpoints are trusted.
 Errors omit request URLs, credentials and response bodies. HTTP failures are
-reported by status. Request bodies are limited to 8 MiB, individual response
-chunks to 1 MiB and the total response to 16 MiB; excess data aborts the fetch.
+reported by status. Request bodies are limited to 8 MiB and total responses to
+16 MiB; excess data aborts the fetch. Browser-delivered chunks are returned as
+slices of at most 1 MiB, regardless of their original boundaries. The browser
+may allocate an incoming chunk before its size can be checked.
 Hosts must implement timeouts by calling `cancel()`. A stream permits one
 pending read. Call `cancel()` and await pending operations before releasing the
 object. There is no automatic retry, SSE decoding, session state or persistence.
@@ -37,6 +39,8 @@ node crates/browser-fetch/tests/browser-fetch.cjs /tmp/pi-fetch-web /path/to/chr
 ```
 
 The Node fixture exercises real local HTTP streaming, concurrent reads, aborts,
-limits and redirects. The Chrome fixture also exercises an actual cross-origin
-CORS preflight, CORS rejection, streaming and abort. Neither fixture connects to
-a model provider or executes a pi-rs session.
+limits, a browser-delivered chunk larger than 1 MiB, and redirects. The Chrome
+fixture also exercises an actual cross-origin CORS preflight, CORS rejection,
+same-origin cookie omission, streaming and abort. Dedicated CI runs both
+fixtures. Neither fixture connects to a model provider or executes a pi-rs
+session.
