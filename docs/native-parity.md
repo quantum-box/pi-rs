@@ -674,6 +674,12 @@ RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
 
+For text reads, Pi exposes the displayed page as both text content and a
+`structuredContent` string. Native local and injected read tools now retain
+that string in tool-result events, including continuation and truncation
+notices, while keeping truncation details separate and model-facing text
+unchanged. Image read structured output remains a separate parity gap.
+
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
 while scanning a single long line. Directory listing runs off the async

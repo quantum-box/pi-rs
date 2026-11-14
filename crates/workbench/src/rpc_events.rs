@@ -663,6 +663,36 @@ mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
 
+    #[tokio::test]
+    async fn text_read_result_projects_structured_content_and_details() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file"),
+            format!("{}\nnext", "x".repeat(51_201)),
+        )
+        .unwrap();
+        let tool = pi_rs_workbench::coding::create_read_tool(
+            root.path(),
+            std::sync::Arc::new(pi_rs_workbench::coding::LocalReadOperations),
+        )
+        .unwrap();
+        let outcome = tool
+            .invoke(
+                json!({"path":"file"}),
+                pi_rs::ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let event = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(false));
+        assert_eq!(event["structuredContent"], event["content"][0]["text"]);
+        assert_eq!(
+            event["details"]["truncation"]["firstLineExceedsLimit"],
+            true
+        );
+    }
+
     #[test]
     fn multimodal_tool_events_preserve_order_and_native_metadata() {
         let blocks = json!([
