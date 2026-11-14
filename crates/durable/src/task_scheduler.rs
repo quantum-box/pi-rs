@@ -22,7 +22,11 @@ use crate::task::{Checkpoint, Task, TaskOwner, TaskState, TransitionError, WaitF
 use crate::task_store::{self, Save, Signal, TaskStore, WakeResult};
 use durable_store::owner::{OwnedStore, OwnerError};
 use serde_json::Value;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{Arc, Mutex, OnceLock},
+};
 use uuid::Uuid;
 
 /// A handler computes one transition. For effects, use a stable idempotency key
@@ -95,12 +99,45 @@ pub enum Error {
     LiveChildren,
     #[error("handler failed with an uncertain outcome: {0}")]
     Handler(String),
+    #[error("a task scheduler is already attached to this owner")]
+    AlreadyAttached,
     #[error("scheduler must be reopened after an invocation or commit failure")]
     Poisoned,
 }
 
+// The owner lock prevents another OwnedStore for the same database, but Arc
+// clones share that lock. Fence recovery and execution across those clones too.
+fn attachments() -> &'static Mutex<HashSet<usize>> {
+    static ATTACHMENTS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    ATTACHMENTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct Attachment {
+    owner: Arc<OwnedStore>,
+}
+impl Attachment {
+    fn acquire(owner: Arc<OwnedStore>) -> Result<Self, Error> {
+        let key = Arc::as_ptr(&owner) as usize;
+        let mut active = attachments().lock().unwrap_or_else(|e| e.into_inner());
+        if !active.insert(key) {
+            return Err(Error::AlreadyAttached);
+        }
+        drop(active);
+        Ok(Self { owner })
+    }
+}
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        let key = Arc::as_ptr(&self.owner) as usize;
+        attachments()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+}
+
 pub struct Scheduler {
-    store: OwnedStore,
+    attachment: Attachment,
     registry: Registry,
     poisoned: bool,
 }
@@ -108,8 +145,17 @@ impl Scheduler {
     /// Opens exclusively and reconciles interrupted invocations. Parked tasks are
     /// untouched. Missing registrations leave their running records untouched.
     pub fn open(path: impl AsRef<Path>, registry: Registry) -> Result<Self, Error> {
+        Self::attach(Arc::new(OwnedStore::open(path)?), registry)
+    }
+
+    /// Attach to an existing owner. Only one task scheduler may be attached to
+    /// that owner at a time, including during recovery and handler execution.
+    /// The scheduler retains the owner until it is dropped. Callers must fence
+    /// all other task executors and direct TaskStore mutations themselves.
+    /// Failed attachment or recovery releases the in-process guard.
+    pub fn attach(owner: Arc<OwnedStore>, registry: Registry) -> Result<Self, Error> {
         let mut scheduler = Self {
-            store: OwnedStore::open(path)?,
+            attachment: Attachment::acquire(owner)?,
             registry,
             poisoned: false,
         };
@@ -117,7 +163,7 @@ impl Scheduler {
         Ok(scheduler)
     }
     fn ts(&self) -> TaskStore<'_> {
-        TaskStore::new(self.store.store())
+        TaskStore::new(self.attachment.owner.store())
     }
     fn check(&self) -> Result<(), Error> {
         if self.poisoned {
