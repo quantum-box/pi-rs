@@ -556,7 +556,7 @@ async fn standalone_share_snapshot_after(
     args.restore_session_model(source);
     super::thinking::adjust(&mut args);
     let session = Session::from_records(source.records().to_vec())?;
-    let runtime = configure_after(&args, false, before_configure).await?;
+    let runtime = configure_after(&args, false, before_configure, true).await?;
     standalone_share_snapshot_with_runtime(&args, source, session, runtime).await
 }
 
@@ -719,13 +719,14 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 }
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
-    configure_after(args, interactive_mcp, std::future::ready(())).await
+    configure_after(args, interactive_mcp, std::future::ready(()), false).await
 }
 
 async fn configure_after(
     args: &Cli,
     interactive_mcp: bool,
     before_preparation: impl std::future::Future<Output = ()>,
+    strict_mcp: bool,
 ) -> Result<Runtime> {
     before_preparation.await;
     super::packages::prepare(args).await?;
@@ -733,7 +734,15 @@ async fn configure_after(
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
-    let discovered = mcp_config::discover(args, false, interactive_mcp).await?;
+    let discovered = mcp_config::discover(args, false, interactive_mcp, strict_mcp).await?;
+    if strict_mcp && discovered.failed {
+        for connection in discovered.connected {
+            connection.close().await;
+        }
+        return Err(pi_rs::Error::Config(
+            "MCP discovery failed while preparing share context".into(),
+        ));
+    }
     let mcp_connections = discovered.connected;
     let result = async {
         let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;

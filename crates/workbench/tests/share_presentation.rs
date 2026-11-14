@@ -191,6 +191,129 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
 }
 
 #[test]
+fn standalone_share_requires_successful_relevant_mcp_discovery() {
+    for case in [
+        "invalid-map",
+        "invalid-server",
+        "missing-command",
+        "disabled-config",
+        "disabled-extension",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let path = root.path().join("session.jsonl");
+        drop(pi_rs::Session::open(&path).unwrap());
+        let original = std::fs::read(&path).unwrap();
+        let missing = root.path().join("missing-mcp-command");
+        let server = match case {
+            "invalid-map" => json!({"mcpServers": []}),
+            "invalid-server" => json!({"mcpServers": {"fixture": {"command": 42}}}),
+            "disabled-config" => {
+                json!({"mcpServers": {"fixture": {"command": missing, "enabled": false}}})
+            }
+            _ => json!({"mcpServers": {"fixture": {"command": missing}}}),
+        };
+        std::fs::write(home.join("mcp.json"), serde_json::to_vec(&server).unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "ollama",
+                "--model",
+                "fixture",
+                "--endpoint",
+                "http://127.0.0.1:9",
+            ])
+            .arg("--session")
+            .arg(&path);
+        if case == "disabled-extension" {
+            command.args(["--disable-extension", "mcp-fixture"]);
+        }
+        let child = command
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut uploaded = None;
+        loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                    uploaded = Some(body);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("Radius accept failed: {error}"),
+            }
+            if child.0.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "share timed out for {case}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.0.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let disabled = case.starts_with("disabled-");
+        assert_eq!(status.success(), disabled, "{case}: {stderr}");
+        if disabled {
+            let body = uploaded.expect("disabled server should not block sharing");
+            assert!(
+                body.windows(b"pi.share".len())
+                    .any(|part| part == b"pi.share")
+            );
+        } else {
+            assert!(stderr.contains("MCP"), "{case}: {stderr}");
+            assert!(uploaded.is_none(), "{case} uploaded an incomplete context");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[test]
 fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
     for pending_trust in [false, true] {
         let root = tempfile::tempdir().unwrap();

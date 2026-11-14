@@ -29,6 +29,7 @@ jobs:
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation standalone_share_requires_successful_relevant_mcp_discovery -- --test-threads=1
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation -- --test-threads=1
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli rpc_worker_starts_when_ -- --test-threads=1
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli worker_returns_keyed_share_journal_tag -- --test-threads=1

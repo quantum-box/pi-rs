@@ -58,10 +58,21 @@ pub enum McpCommand {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    configurations_with_mode(args, false)
+}
+
+fn configurations_with_mode(args: &Cli, strict: bool) -> Result<BTreeMap<String, Value>> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok(BTreeMap::new());
     }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
+    if strict
+        && user
+            .get("mcpServers")
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(Error::Config("MCP servers configuration is invalid".into()));
+    }
     let mut servers = user
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -69,6 +80,13 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         .unwrap_or_default();
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
+        if strict
+            && project
+                .get("mcpServers")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(Error::Config("MCP servers configuration is invalid".into()));
+        }
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
             merge_project_servers(&mut servers, entries)?;
         }
@@ -221,13 +239,14 @@ pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
 }
 
 pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
-    Ok(discover(args, report, false).await?.connected)
+    Ok(discover(args, report, false, false).await?.connected)
 }
 
 #[derive(Default)]
 pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
+    pub failed: bool,
 }
 
 #[derive(Clone)]
@@ -237,11 +256,32 @@ pub(super) struct PendingSignIn {
     pub challenge: Option<String>,
 }
 
-pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Result<Discovery> {
+pub(super) async fn discover(
+    args: &Cli,
+    report: bool,
+    interactive: bool,
+    strict: bool,
+) -> Result<Discovery> {
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
-    for (name, value) in configurations(args)? {
+    let mut discovery = Discovery::default();
+    for (name, value) in configurations_with_mode(args, strict)? {
+        let extension_id: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let relevant = value.get("enabled") != Some(&Value::Bool(false))
+            && !args
+                .disable_extension
+                .contains(&format!("mcp-{extension_id}"));
         if !normalized.insert(name.replace('-', "_")) {
+            discovery.failed |= relevant;
             if report {
                 output(
                     json!({"type":"mcp_server","name":name,"status":"invalid","error":"server name collides after normalization"}),
@@ -254,6 +294,7 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
         let config = match serde_json::from_value::<ServerConfig>(value) {
             Ok(config) => config,
             Err(error) => {
+                discovery.failed |= relevant;
                 if report {
                     output(
                         json!({"type":"mcp_server","name":name,"status":"invalid","error":error.to_string()}),
@@ -273,11 +314,10 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
         let args = args.clone();
         pending.push(async move {
             let result = connect(&args, &name, &config).await;
-            (name, config, result)
+            (name, config, relevant, result)
         });
     }
-    let mut discovery = Discovery::default();
-    for (name, config, result) in futures_util::future::join_all(pending).await {
+    for (name, config, relevant, result) in futures_util::future::join_all(pending).await {
         match result {
             Ok(extension) => {
                 if report {
@@ -295,6 +335,7 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
                 });
             }
             Err(error) => {
+                discovery.failed |= relevant;
                 if report {
                     output(
                         json!({"type":"mcp_server","name":name,"status":"error","error":error.to_string()}),
