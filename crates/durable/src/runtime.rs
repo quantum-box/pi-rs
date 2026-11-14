@@ -1275,7 +1275,10 @@ impl Harness {
                     "pi-rs/runtime/extensions".into(),
                     serde_json::to_value(&state.extensions)?,
                 ),
-                ("pi-rs/runtime/provider-adapter".into(), serde_json::to_value(&state.provider_adapter)?),
+                (
+                    "pi-rs/runtime/provider-adapter".into(),
+                    serde_json::to_value(&state.provider_adapter)?,
+                ),
                 (
                     "pi-rs/runtime/resets".into(),
                     serde_json::to_value(&state.resets)?,
@@ -3415,8 +3418,13 @@ impl Harness {
                             retries: c.retry_state.retries_scheduled,
                             restarts,
                         };
-                        let mut body = fenced_poll(adapter.prepare(&attempt, &request), self.execution_gate.as_ref(), cancel)
-                            .await.ok_or(Error::Interrupted)??;
+                        let mut body = fenced_poll(
+                            adapter.prepare(&attempt, &request),
+                            self.execution_gate.as_ref(),
+                            cancel,
+                        )
+                        .await
+                        .ok_or(Error::Interrupted)??;
                         if !c.extensions.is_empty() {
                             let selected = self.selected_extensions(&c)?;
                             let snapshot = serde_json::to_value(&c)?;
@@ -3426,9 +3434,16 @@ impl Harness {
                                 memo: &memo,
                             };
                             let (value, _, _, reports) = fenced_poll(
-                                selected.generation(crate::extension::GenerationEvent::BeforeProviderRequest, serde_json::json!({"model": request.model, "payload": body}), &context),
-                                self.execution_gate.as_ref(), cancel,
-                            ).await.ok_or(Error::Interrupted)?;
+                                selected.generation(
+                                    crate::extension::GenerationEvent::BeforeProviderRequest,
+                                    serde_json::json!({"model": request.model, "payload": body}),
+                                    &context,
+                                ),
+                                self.execution_gate.as_ref(),
+                                cancel,
+                            )
+                            .await
+                            .ok_or(Error::Interrupted)?;
                             self.subagent_store()?;
                             if !reports.is_empty() {
                                 return Err(Error::Invalid(format!(
@@ -4742,7 +4757,9 @@ impl Scheduler {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
         let mut harness = Harness::open_paused(path, options)?;
-        if let Some(adapter) = adapter { harness.install_provider_adapter(adapter)?; }
+        if let Some(adapter) = adapter {
+            harness.install_provider_adapter(adapter)?;
+        }
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
         if let Some((parent, config)) = management {
             harness.conversation(parent)?;

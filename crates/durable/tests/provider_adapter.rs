@@ -131,6 +131,45 @@ fn select(h: &mut Harness, hooks: usize) -> uuid::Uuid {
     id
 }
 #[tokio::test]
+async fn scheduler_preloads_adapter_before_recovery() {
+    use pi_rs_durable::{extension::Registry, runtime::Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(Regular::default());
+    let fake = Arc::new(Fake::default());
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        install(&mut h, fake.clone(), &["a"]);
+        id = select(&mut h, 1);
+        h.submit(id, None, "hello".into()).unwrap();
+    }
+    let mut registry = Registry::default();
+    registry
+        .install(Extension {
+            name: "e0".into(),
+            hooks: vec![Arc::new(Rewrite("a"))],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut scheduler = Scheduler::open_with_provider_adapter(
+        &path,
+        options(model.clone()),
+        registry,
+        fake.clone(),
+    )
+    .unwrap();
+    scheduler.wait(id).await.unwrap();
+    assert!(matches!(
+        scheduler.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(fake.seen.lock().unwrap()[0].1["order"], "a");
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn transforms_retry_and_regular_route() {
     let d = tempfile::tempdir().unwrap();
     let model = Arc::new(Regular::default());
