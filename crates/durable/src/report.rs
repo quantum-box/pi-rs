@@ -34,9 +34,9 @@ pub(crate) fn index(
             return Ok(());
         }
         let existing = store.get(&key)?;
-        if !legacy && existing.is_some() {
+        if !legacy && let Some(entry) = &existing {
             // Old databases may contain this identity without an index.
-            let old: ExtensionReportBatch = serde_json::from_slice(&existing.unwrap().value)?;
+            let old: ExtensionReportBatch = serde_json::from_slice(&entry.value)?;
             return index(store, key, &old, true);
         }
         // Migration must append the exact version guarded below, not the value

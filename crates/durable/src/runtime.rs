@@ -6545,7 +6545,6 @@ mod scheduler_tests {
             .await
             .is_err()
         );
-        drop(sub);
         scheduler.shutdown().await.unwrap();
         let h = Harness::open_paused(&path, options(model)).unwrap();
         assert_eq!(
