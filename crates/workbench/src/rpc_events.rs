@@ -24,6 +24,7 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    result_metadata: HashMap<Uuid, Value>,
     pending_tools: HashMap<u64, PendingTool>,
     aborted: bool,
     summary: bool,
@@ -51,6 +52,13 @@ impl Stream {
     pub fn observe(&mut self, event: &Value, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event["type"].as_str() {
+            Some("internal_tool_result_metadata") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok())
+                    && let Some(content) = event.get("structuredContent")
+                {
+                    self.result_metadata.insert(id, content.clone());
+                }
+            }
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
@@ -85,6 +93,13 @@ impl Stream {
     pub fn notify(&mut self, event: &Notification<'_>, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event {
+            Notification::ToolResultMetadata {
+                operation_id,
+                structured_content,
+            } => {
+                self.result_metadata
+                    .insert(*operation_id, (*structured_content).clone());
+            }
             Notification::SummaryRequest => {
                 self.finish_turn(&mut events);
                 self.summary = true;
@@ -309,11 +324,15 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_event_result_value(
+                    let mut result = tool_event_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
+                    let sidecar = self.result_metadata.remove(&operation_id);
+                    if let Some(content) = &sidecar {
+                        result["structuredContent"] = content.clone();
+                    }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -324,7 +343,9 @@ impl Stream {
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
-                        if matches!(outcome, Outcome::TextResultWithStructuredContent { .. }) {
+                        if sidecar.is_some()
+                            || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                        {
                             message
                                 .as_object_mut()
                                 .expect("result object")
@@ -663,67 +684,61 @@ mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
 
-    #[tokio::test]
-    async fn text_read_result_projects_structured_content_and_details() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("file"),
-            format!("{}\nnext", "x".repeat(51_201)),
-        )
-        .unwrap();
-        let tool = pi_rs_workbench::coding::create_read_tool(
-            root.path(),
-            std::sync::Arc::new(pi_rs_workbench::coding::LocalReadOperations),
-        )
-        .unwrap();
-        struct Host;
-        #[async_trait::async_trait]
-        impl pi_rs::ToolHost for Host {
-            fn tools(&self) -> Vec<pi_rs::ToolSpec> {
-                Vec::new()
-            }
-            async fn call(&self, _: &str, _: Value) -> Outcome {
-                unreachable!()
-            }
-        }
-        let context = || pi_rs::ToolContext {
-            operation_id: uuid::Uuid::new_v4(),
-            cancellation: pi_rs::CancellationToken::new(),
-        };
-        assert!(matches!(
-            tool.invoke(json!({"path":"file"}), context()).await,
-            Outcome::SucceededWithDetails { .. }
-        ));
-        assert!(matches!(
-            tool.invoke_programmatic(
-                json!({"path":"file"}),
-                context(),
+    #[test]
+    fn structured_read_metadata_is_correlated_and_not_added_to_messages() {
+        let operation_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "read-call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
                 None,
-                std::sync::Arc::new(Host)
-            )
-            .await
-            .outcome,
-            Outcome::SucceededWithDetails { .. }
-        ));
-        std::fs::write(root.path().join("small"), "hello").unwrap();
+            ),
+        );
+        let metadata = json!("page\n\n[1 more line]");
         assert!(
-            matches!(tool.invoke(json!({"path":"small"}), context()).await, Outcome::Succeeded(text) if text == "hello")
+            stream
+                .notify(
+                    &Notification::ToolResultMetadata {
+                        operation_id: other_id,
+                        structured_content: &json!("other")
+                    },
+                    &args
+                )
+                .is_empty()
         );
-        let outcome = tool
-            .invoke_transaction(
-                json!({"path":"file"}),
-                context(),
-                None,
-                std::sync::Arc::new(Host),
-            )
-            .await
-            .outcome;
-        let event = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(false));
-        assert_eq!(event["structuredContent"], event["content"][0]["text"]);
-        assert_eq!(
-            event["details"]["truncation"]["firstLineExceedsLimit"],
-            true
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(metadata.as_str().unwrap().into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
         );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"], metadata);
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert!(message["message"].get("structuredContent").is_none());
+        assert_eq!(stream.result_metadata.get(&other_id), Some(&json!("other")));
+        assert!(!stream.result_metadata.contains_key(&operation_id));
     }
 
     #[test]

@@ -423,6 +423,10 @@ pub trait Tool: Send + Sync {
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
     }
+    /// Ephemeral result metadata for event projection, separate from the SDK outcome.
+    fn event_structured_content(&self, _outcome: &Outcome) -> Option<Value> {
+        None
+    }
     /// Maximum serialized result bytes, bounded by the agent's 8 MiB ceiling.
     fn output_limit(&self) -> usize {
         1024 * 1024

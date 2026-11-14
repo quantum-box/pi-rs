@@ -315,12 +315,13 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         host: Option<Arc<dyn ToolHost>>,
-    ) {
+    ) -> bool {
+        let mut replaced = false;
         if matches!(
             reply.outcome,
             Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
         ) {
-            return;
+            return false;
         }
         for extension in registry
             .extensions
@@ -350,6 +351,7 @@ impl Agent<'_> {
                     ) =>
                 {
                     reply.outcome = outcome;
+                    replaced = true;
                     continue;
                 }
                 Ok(Ok(None)) => continue,
@@ -363,6 +365,7 @@ impl Agent<'_> {
                 message: &error,
             });
         }
+        replaced
     }
 }
 
@@ -422,6 +425,7 @@ enum TurnEvent {
         ToolReply,
         Option<u64>,
         Vec<(String, &'static str, String)>,
+        bool,
     ),
     Notified(usize, Outcome, Vec<(String, &'static str, String)>),
     PollPrepared(
@@ -950,7 +954,7 @@ impl Agent<'_> {
                             errors.push((extension.to_owned(), event, message.to_owned()));
                         }
                     };
-                    Self::turn_transform(
+                    let replaced = Self::turn_transform(
                         &registry,
                         timeout,
                         &invocation,
@@ -961,7 +965,7 @@ impl Agent<'_> {
                         Some(hook_host),
                     )
                     .await;
-                    TurnEvent::Transformed(index, reply, duration, errors)
+                    TurnEvent::Transformed(index, reply, duration, errors, replaced)
                 }
                 .boxed();
                 let started = start_turn_future(future).await;
@@ -1084,9 +1088,9 @@ impl Agent<'_> {
                                 futures.push(async move { let start = std::time::Instant::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); let errors = progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]); TurnEvent::Ran(index, reply, duration, errors) }.boxed());
                     }
                     TurnEvent::Ran(index, reply, duration, errors) => { for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); } calls[index].phase = TurnPhase::Done(Box::new(reply), duration); }
-                    TurnEvent::Transformed(index, reply, duration, errors) => {
+                    TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
-                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots));
+                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced);
                         let outcome = session.operations().into_iter().find_map(|(invocation,state)| if invocation.operation_id == calls[index].invocation.operation_id { if let OperationState::Finished(outcome) = state { Some(outcome) } else { None } } else { None }).unwrap_or_else(|| Outcome::Unknown("tool produced no durable result".into()));
                         if matches!(&finished, Err(Error::PendingOperation(_)))
                             && let Outcome::Pending { reference } = &outcome

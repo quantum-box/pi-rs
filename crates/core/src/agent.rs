@@ -226,6 +226,11 @@ pub enum Notification<'a> {
     ToolCallDelta(&'a crate::ToolCallDelta),
     /// A transient partial result from a running tool.
     ToolProgress(&'a crate::LifecycleEvent),
+    /// Ephemeral structured result for the next committed result of this operation.
+    ToolResultMetadata {
+        operation_id: Uuid,
+        structured_content: &'a serde_json::Value,
+    },
     /// A non-fatal failure in an observing extension hook.
     ExtensionLifecycleError {
         extension: &'a str,
@@ -2320,7 +2325,15 @@ impl Agent<'_> {
                     message,
                 });
             }
-            self.finish_tool(session, &invocation, reply, states, observer, replies)?;
+            self.finish_tool(
+                session,
+                &invocation,
+                reply,
+                states,
+                observer,
+                replies,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -2347,6 +2360,7 @@ impl Agent<'_> {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
         session: &mut Session,
@@ -2355,6 +2369,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
         replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+        allow_event_metadata: bool,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -2434,6 +2449,19 @@ impl Agent<'_> {
             outcome => outcome,
         };
         let operation_id = invocation.operation_id;
+        if allow_event_metadata
+            && let Some(value) = self
+                .registry
+                .tools
+                .get(&invocation.call.name)
+                .and_then(|registered| registered.tool.event_structured_content(&outcome))
+            && serde_json::to_vec(&value)?.len() <= max_output_bytes
+        {
+            observer(Notification::ToolResultMetadata {
+                operation_id,
+                structured_content: &value,
+            });
+        }
         let waiting = match &outcome {
             Outcome::Unknown(_) => Some(Error::Reconciliation(operation_id)),
             Outcome::Pending { .. } => Some(Error::PendingOperation(operation_id)),

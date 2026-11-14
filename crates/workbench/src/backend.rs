@@ -1471,6 +1471,16 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    if let pi_rs::Notification::ToolResultMetadata {
+        operation_id,
+        structured_content,
+    } = &event
+    {
+        output(
+            json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured_content}),
+        );
+        return;
+    }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {
             pi_rs::Event::SessionInfo {

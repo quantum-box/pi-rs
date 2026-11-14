@@ -732,25 +732,12 @@ struct CancellableReader<R> {
     inner: R,
     cancellation: pi_rs::CancellationToken,
 }
-// Add Pi's structured text projection only for agent execution; the public
-// direct and programmatic read results keep their established Outcome variants.
-fn structured_read_result(outcome: Outcome) -> Outcome {
+fn read_event_content(outcome: &Outcome) -> Option<Value> {
     match outcome {
-        Outcome::Succeeded(output) => Outcome::TextResultWithStructuredContent {
-            structured_content: json!(output),
-            output,
-            details: None,
-            is_error: false,
-        },
-        Outcome::SucceededWithDetails { output, details } => {
-            Outcome::TextResultWithStructuredContent {
-                structured_content: json!(output),
-                output,
-                details: Some(details),
-                is_error: false,
-            }
+        Outcome::Succeeded(output) | Outcome::SucceededWithDetails { output, .. } => {
+            Some(json!(output))
         }
-        other => other,
+        _ => None,
     }
 }
 
@@ -781,6 +768,9 @@ impl<R: Seek> Seek for CancellableReader<R> {
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
+    }
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        read_event_content(outcome)
     }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
@@ -865,15 +855,6 @@ impl Tool for RemoteReadTool {
             Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
             Err(error) => Outcome::Failed(error.to_string()),
         }
-    }
-    async fn invoke_transaction(
-        &self,
-        args: Value,
-        context: ToolContext,
-        _state: Option<&pi_rs::ExtensionState>,
-        _host: Arc<dyn ToolHost>,
-    ) -> ToolReply {
-        structured_read_result(self.invoke(args, context).await).into()
     }
     async fn invoke_programmatic(
         &self,
@@ -1992,6 +1973,13 @@ impl Tool for CodingTool {
         }
     }
 
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        if matches!(self.kind, Kind::Read { .. }) {
+            read_event_content(outcome)
+        } else {
+            None
+        }
+    }
     fn execution(&self) -> ToolExecution {
         match self.kind {
             Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => ToolExecution::ParallelRead,
@@ -2091,21 +2079,6 @@ impl Tool for CodingTool {
                 .await
         } else {
             self.invoke(args, context).await
-        }
-    }
-
-    async fn invoke_transaction(
-        &self,
-        args: Value,
-        context: ToolContext,
-        state: Option<&pi_rs::ExtensionState>,
-        host: Arc<dyn ToolHost>,
-    ) -> ToolReply {
-        let outcome = self.invoke_with_host(args, context, state, host).await;
-        if matches!(self.kind, Kind::Read { .. }) {
-            structured_read_result(outcome).into()
-        } else {
-            outcome.into()
         }
     }
 
