@@ -28,6 +28,7 @@ pub mod reset;
 pub mod retry_policy;
 pub mod runtime;
 pub mod state;
+pub mod streamed_output;
 pub mod subagent;
 pub mod subagent_management;
 pub mod task;

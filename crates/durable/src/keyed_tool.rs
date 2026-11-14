@@ -18,6 +18,7 @@ struct Dispatch {
     ordinary: Arc<dyn ToolHost>,
     claimed: AtomicBool,
     control: Arc<Mutex<crate::reset::ToolControl>>,
+    stream: Option<Arc<dyn StreamSink>>,
 }
 tokio::task_local! { static CURRENT_HOST: Dispatch; }
 
@@ -35,6 +36,7 @@ pub(crate) async fn scope<F: std::future::Future>(
         operation_id,
         ordinary,
         Arc::new(Mutex::new(Default::default())),
+        None,
         future,
     )
     .await
@@ -46,6 +48,7 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     control: Arc<Mutex<crate::reset::ToolControl>>,
+    stream: Option<Arc<dyn StreamSink>>,
     future: F,
 ) -> F::Output {
     let _invocation_scope = crate::nested::InvocationScope(nested.clone());
@@ -56,6 +59,7 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
         ordinary,
         claimed: AtomicBool::new(false),
         control,
+        stream,
     };
     CURRENT_HOST.scope(dispatch, future).await
 }
@@ -98,6 +102,7 @@ pub trait KeyedTool: Send + Sync {
 pub struct KeyedHost {
     ordinary: Arc<dyn ToolHost>,
     nested: Arc<NestedHost>,
+    stream: Option<Arc<dyn StreamSink>>,
 }
 impl KeyedHost {
     pub fn ordinary(&self) -> &Arc<dyn ToolHost> {
@@ -105,6 +110,138 @@ impl KeyedHost {
     }
     pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
         self.nested.call_keyed(key, name, arguments).await
+    }
+}
+
+/// Maximum UTF-8 bytes in an opt-in streamed result per attempt.
+pub const MAX_STREAMED_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[async_trait::async_trait]
+pub(crate) trait StreamSink: Send + Sync {
+    async fn record(&self, text: &str) -> ExtensionResult<()>;
+}
+
+/// An explicit durable-only result. `None` selects this attempt's streamed text;
+/// `Some("")` is an explicit empty result. Other outcomes remain ordinary replies.
+pub enum StreamedReply {
+    Success {
+        output: Option<String>,
+        state: Option<ExtensionState>,
+    },
+    Explicit(ToolReply),
+}
+
+/// A durable tool opting in to streamed text. Nested dispatch is not supported.
+#[async_trait::async_trait]
+pub trait StreamedTool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        Ok(arguments)
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+        output: StreamOutput,
+    ) -> StreamedReply;
+}
+
+struct StreamState {
+    text: String,
+    failed: bool,
+}
+struct StreamInner {
+    open: AtomicBool,
+    state: tokio::sync::Mutex<StreamState>,
+    sink: Arc<dyn StreamSink>,
+}
+/// Invocation-scoped append-only text. Each successful append is committed before returning.
+#[derive(Clone)]
+pub struct StreamOutput(Arc<StreamInner>);
+impl StreamOutput {
+    pub async fn append(&self, chunk: &str) -> ExtensionResult<()> {
+        let mut state = self.0.state.lock().await;
+        if !self.0.open.load(Ordering::Acquire) {
+            return Err("stream is closed".into());
+        }
+        if state.failed {
+            return Err("stream recording failed".into());
+        }
+        if chunk.len() > MAX_STREAMED_OUTPUT_BYTES.saturating_sub(state.text.len()) {
+            state.failed = true;
+            return Err("streamed output exceeds byte limit".into());
+        }
+        let mut next = state.text.clone();
+        next.push_str(chunk);
+        if let Err(error) = self.0.sink.record(&next).await {
+            state.failed = true;
+            return Err(error);
+        }
+        state.text = next;
+        Ok(())
+    }
+}
+struct StreamGuard(Arc<StreamInner>);
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.open.store(false, Ordering::Release);
+    }
+}
+
+/// Wrap this in `KeyedToolAdapter` and register it for durable execution.
+pub struct StreamedToolAdapter<T>(pub T);
+#[async_trait::async_trait]
+impl<T: StreamedTool> KeyedTool for StreamedToolAdapter<T> {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        self.0.prepare_arguments(arguments).await
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let Some(sink) = host.stream.clone() else {
+            return Outcome::Skipped("streamed tool requires model-issued durable attempt".into())
+                .into();
+        };
+        let inner = Arc::new(StreamInner {
+            open: AtomicBool::new(true),
+            state: tokio::sync::Mutex::new(StreamState {
+                text: String::new(),
+                failed: false,
+            }),
+            sink,
+        });
+        let guard = StreamGuard(inner.clone());
+        let reply = self
+            .0
+            .invoke(arguments, context, state, host, StreamOutput(inner.clone()))
+            .await;
+        let state = inner.state.lock().await;
+        drop(guard);
+        if state.failed {
+            return Outcome::Unknown(
+                "streamed output recording failed; reconciliation required".into(),
+            )
+            .into();
+        }
+        match reply {
+            StreamedReply::Success {
+                output,
+                state: tool_state,
+            } => ToolReply {
+                outcome: Outcome::Succeeded(output.unwrap_or_else(|| state.text.clone())),
+                state: tool_state,
+            },
+            StreamedReply::Explicit(reply) => reply,
+        }
     }
 }
 
@@ -183,17 +320,26 @@ impl<T: KeyedTool> Tool for KeyedToolAdapter<T> {
                 {
                     None
                 } else {
-                    Some(dispatch.nested.clone())
+                    Some((dispatch.nested.clone(), dispatch.stream.clone()))
                 }
             })
             .ok()
             .flatten();
-        let Some(nested) = nested else {
+        let Some((nested, stream)) = nested else {
             return Outcome::Skipped("keyed tool requires durable runtime".into()).into();
         };
         let (reply, control) = self
             .0
-            .invoke_controlled(arguments, context, state, KeyedHost { ordinary, nested })
+            .invoke_controlled(
+                arguments,
+                context,
+                state,
+                KeyedHost {
+                    ordinary,
+                    nested,
+                    stream,
+                },
+            )
             .await;
         let _ = CURRENT_HOST.try_with(|dispatch| {
             *dispatch.control.lock().expect("control mutex poisoned") = control
@@ -239,6 +385,61 @@ mod tests {
         async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
             unreachable!()
         }
+    }
+
+    struct RecordingSink {
+        fail: bool,
+        values: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl StreamSink for RecordingSink {
+        async fn record(&self, text: &str) -> ExtensionResult<()> {
+            if self.fail {
+                return Err("storage failure".into());
+            }
+            self.values.lock().unwrap().push(text.into());
+            Ok(())
+        }
+    }
+    fn test_output(sink: Arc<dyn StreamSink>) -> (StreamOutput, StreamGuard) {
+        let inner = Arc::new(StreamInner {
+            open: AtomicBool::new(true),
+            state: tokio::sync::Mutex::new(StreamState {
+                text: String::new(),
+                failed: false,
+            }),
+            sink,
+        });
+        (StreamOutput(inner.clone()), StreamGuard(inner))
+    }
+    #[tokio::test]
+    async fn streamed_output_bounds_utf8_and_fences_handles() {
+        let sink = Arc::new(RecordingSink {
+            fail: false,
+            values: Mutex::new(Vec::new()),
+        });
+        let (output, guard) = test_output(sink.clone());
+        output.append("é").await.unwrap();
+        output
+            .append(&"x".repeat(MAX_STREAMED_OUTPUT_BYTES - 2))
+            .await
+            .unwrap();
+        assert!(output.append("x").await.is_err());
+        assert_eq!(
+            sink.values.lock().unwrap().last().unwrap().len(),
+            MAX_STREAMED_OUTPUT_BYTES
+        );
+        assert!(output.append("").await.is_err());
+        drop(guard);
+        assert!(output.append("late").await.is_err());
+        let failed = Arc::new(RecordingSink {
+            fail: true,
+            values: Mutex::new(Vec::new()),
+        });
+        let (output, _guard) = test_output(failed);
+        assert!(output.append("never committed").await.is_err());
+        assert!(output.0.state.lock().await.failed);
+        assert!(output.0.state.lock().await.text.is_empty());
     }
 
     #[test]

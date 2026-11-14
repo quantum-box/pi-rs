@@ -676,6 +676,76 @@ pub struct ExtensionReportBatch {
     pub reports: Vec<crate::extension::Report>,
 }
 
+struct RuntimeStreamOutput {
+    owner: std::sync::Weak<OwnedStore>,
+    conversation: Uuid,
+    attempt: ToolAttempt,
+    storage_failed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
+    async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| "stream owner closed".to_string())?;
+        let store = owner.store();
+        loop {
+            let result = (|| -> Result<bool, Error> {
+                let key = Harness::key(self.conversation);
+                let Some(entry) = store.get(&key)? else {
+                    return Err(Error::Invalid("stream attempt missing".into()));
+                };
+                let state: Conversation = serde_json::from_slice(&entry.value)?;
+                if state.abort_requested
+                    || state.tool_attempt() != Some(self.attempt)
+                    || !matches!(
+                        state.phase,
+                        Phase::ToolRunning {
+                            replay_ready: false,
+                            ..
+                        }
+                    )
+                {
+                    return Err(Error::Invalid("stream attempt is no longer active".into()));
+                }
+                let output_key = crate::streamed_output::key(self.attempt.attempt_id);
+                let previous = store.get(&output_key)?;
+                let checks = [
+                    Check {
+                        key,
+                        expected: Expected::Version(entry.version),
+                    },
+                    Check {
+                        key: output_key.clone(),
+                        expected: previous
+                            .as_ref()
+                            .map_or(Expected::Missing, |v| Expected::Version(v.version)),
+                    },
+                ];
+                let mutations = [Mutation::Put {
+                    key: output_key,
+                    value: text.as_bytes().to_vec(),
+                }];
+                match store.commit(&checks, &mutations) {
+                    Ok(()) => Ok(true),
+                    Err(durable_store::Error::Conflict { .. }) => Ok(false),
+                    Err(error) => {
+                        self.storage_failed.store(true, Ordering::Release);
+                        Err(error.into())
+                    }
+                }
+            })();
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(error) => return Err(error.to_string().into()),
+            }
+        }
+    }
+}
+
 struct RuntimeToolProgress {
     owner: Arc<OwnedStore>,
     conversation: Uuid,
@@ -5372,6 +5442,19 @@ impl Harness {
                                                     invocation.operation_id,
                                                     progress_host.clone(),
                                                     control.clone(),
+                                                    c.tool_attempt().map(|attempt| {
+                                                        Arc::new(RuntimeStreamOutput {
+                                                            owner: Arc::downgrade(&self.owner),
+                                                            conversation: id,
+                                                            attempt,
+                                                            storage_failed: self
+                                                                .storage_failed
+                                                                .clone(),
+                                                        })
+                                                            as Arc<
+                                                                dyn crate::keyed_tool::StreamSink,
+                                                            >
+                                                    }),
                                                     crate::tool::execute(
                                                         reg.tool.as_ref(),
                                                         &invocation,

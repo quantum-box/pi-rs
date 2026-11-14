@@ -119,6 +119,31 @@ Callbacks are fenced by the conversation phase and attempt identity, and progres
 is sealed atomically with the corresponding transition. Legacy running attempts
 without an identity do not report durable progress until replay creates one.
 
+For model-issued calls, `KeyedToolAdapter::new(StreamedToolAdapter(tool))`
+provides a separate, opt-in `StreamedTool` contract. Register the adapter as
+usual with an explicit replay policy. `StreamOutput::append` appends UTF-8 text
+and commits the accumulated replacement to a separate attempt record before it
+returns. `StreamedReply::Success { output: None, state }` uses the accumulated
+text; `Some(text)` is explicit, including `Some("")`. `StreamedReply::Explicit`
+returns an ordinary `ToolReply` and does not use the stream. Existing tool replies
+and `report_progress` retain their behavior.
+
+Each attempt starts with an empty stream and is limited to 64 KiB of UTF-8 text.
+An append that would exceed this limit, or a recording failure, makes the
+attempt outcome unknown even if the tool ignores the error; reconciliation may
+be required. Append calls are serialized. Retained handles reject calls after
+settlement or cancellation; database writes are additionally fenced by the
+conversation version and attempt identity. A safe replay gets a fresh record,
+not the previous attempt's text. `streamed_output::load` reads committed text
+by attempt UUID after reopen, but the record is not a terminal result and records
+are not automatically deleted. The final result and extension state use the
+existing atomic conversation transition. Reopening an interrupted unsafe call
+does not promote the record into an error result. Nested calls cannot use this
+adapter because they do not have this runtime's model-issued attempt fence.
+Legacy running calls without an attempt identity also fail closed. There is no
+line limit, tail retention, truncation diagnostic, streamed details fallback, or
+upstream park/wake integration; this is not the upstream output API.
+
 `Harness::tool_progress_events` and `Scheduler::tool_progress_events` poll a
 separate, per-attempt stream of committed replacement states and its terminal
 seal. Discover attempt UUIDs with `Harness::tool_attempts` or `Scheduler::tool_attempts`:

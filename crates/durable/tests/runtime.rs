@@ -1378,3 +1378,314 @@ async fn failed_tool_retains_null_partial_in_snapshot_and_ordered_events() {
     assert_eq!(snapshot.state(), &State::Completed);
     assert_eq!(snapshot.retained_partial(), Some(&serde_json::Value::Null));
 }
+
+struct StreamedFixture {
+    calls: AtomicUsize,
+    mode: &'static str,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    saved: std::sync::Mutex<Option<pi_rs_durable::keyed_tool::StreamOutput>>,
+}
+#[async_trait]
+impl pi_rs_durable::keyed_tool::StreamedTool for StreamedFixture {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(
+        &self,
+        _: serde_json::Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: pi_rs_durable::keyed_tool::KeyedHost,
+        output: pi_rs_durable::keyed_tool::StreamOutput,
+    ) -> pi_rs_durable::keyed_tool::StreamedReply {
+        use pi_rs_durable::keyed_tool::{MAX_STREAMED_OUTPUT_BYTES, StreamedReply};
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode != "no_stream" {
+            output
+                .append(if n == 0 { "first" } else { "second" })
+                .await
+                .unwrap();
+        }
+        if self.mode == "chunks" {
+            output.append("é").await.unwrap();
+        }
+        *self.saved.lock().unwrap() = Some(output.clone());
+        if self.mode == "replay" {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        if self.mode == "oversize" {
+            assert!(
+                output
+                    .append(&"x".repeat(MAX_STREAMED_OUTPUT_BYTES))
+                    .await
+                    .is_err()
+            );
+        }
+        if self.mode == "failure" {
+            return StreamedReply::Explicit(Outcome::Failed("explicit failure".into()).into());
+        }
+        StreamedReply::Success {
+            output: if self.mode == "empty" {
+                Some(String::new())
+            } else if self.mode == "override" {
+                Some("explicit".into())
+            } else {
+                None
+            },
+            state: None,
+        }
+    }
+}
+fn stream_options(tool: Arc<StreamedFixture>) -> Options {
+    use pi_rs_durable::keyed_tool::{KeyedToolAdapter, StreamedToolAdapter};
+    let adapter = Arc::new(KeyedToolAdapter::new(StreamedToolAdapter(
+        SharedStreamedFixture(tool),
+    )));
+    Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![adapter.register(ReplayPolicy::Safe)],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    }
+}
+// Keep the fixture reusable when a scheduler is reopened.
+struct SharedStreamedFixture(Arc<StreamedFixture>);
+#[async_trait]
+impl pi_rs_durable::keyed_tool::StreamedTool for SharedStreamedFixture {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+    async fn invoke(
+        &self,
+        a: serde_json::Value,
+        c: ToolContext,
+        s: Option<&pi_rs_core::ExtensionState>,
+        h: pi_rs_durable::keyed_tool::KeyedHost,
+        o: pi_rs_durable::keyed_tool::StreamOutput,
+    ) -> pi_rs_durable::keyed_tool::StreamedReply {
+        self.0.invoke(a, c, s, h, o).await
+    }
+}
+fn stream_fixture(mode: &'static str) -> Arc<StreamedFixture> {
+    Arc::new(StreamedFixture {
+        calls: AtomicUsize::new(0),
+        mode,
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        saved: std::sync::Mutex::new(None),
+    })
+}
+#[tokio::test]
+async fn streamed_tool_completion_empty_failure_limit_and_reopen() {
+    use pi_rs_durable::runtime::Scheduler;
+    for (mode, expected) in [
+        ("fallback", Some("first")),
+        ("no_stream", Some("")),
+        ("chunks", Some("firsté")),
+        ("override", Some("explicit")),
+        ("empty", Some("")),
+        ("failure", Some("Tool failed: explicit failure")),
+        ("oversize", None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let tool = stream_fixture(mode);
+        let mut scheduler = Scheduler::open(&path, stream_options(tool.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        if mode != "oversize" {
+            tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if scheduler.blocked(id).unwrap().is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let records = scheduler
+            .tool_attempts(
+                id,
+                pi_rs_durable::observer::Cursor(0),
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .unwrap();
+        let attempt: pi_rs_durable::runtime::ToolAttempt =
+            serde_json::from_value(records.records[0].value["attempt"].clone()).unwrap();
+        let saved = tool.saved.lock().unwrap().take().unwrap();
+        assert!(saved.append("late").await.is_err());
+        if let Some(expected) = expected {
+            assert!(
+                scheduler
+                    .conversation(id)
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool { content, .. } if content == expected))
+            );
+        }
+        scheduler.shutdown().await.unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert_eq!(
+            pi_rs_durable::streamed_output::load(&store, attempt.attempt_id)
+                .unwrap()
+                .as_deref(),
+            match mode {
+                "no_stream" => None,
+                "chunks" => Some("firsté"),
+                _ => Some("first"),
+            }
+        );
+        drop(store);
+        let reopened = Scheduler::open(&path, stream_options(tool.clone())).unwrap();
+        if let Some(expected) = expected {
+            assert!(
+                reopened
+                    .conversation(id)
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool { content, .. } if content == expected))
+            );
+        }
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn streamed_tool_replay_is_fenced_by_attempt_and_reopened_result() {
+    use pi_rs_durable::{observer::Cursor, runtime::Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = stream_fixture("replay");
+    let mut scheduler = Scheduler::open(&path, stream_options(tool.clone())).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let first = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let old = tool.saved.lock().unwrap().take().unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert!(old.append("stale").await.is_err());
+    let mut scheduler = Scheduler::open(&path, stream_options(tool.clone())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_eq!(first.operation_id, second.operation_id);
+    assert!(old.append("stale again").await.is_err());
+    tool.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "second"))
+    );
+    assert_eq!(
+        scheduler
+            .tool_attempts(id, Cursor(0), std::num::NonZeroUsize::new(10).unwrap())
+            .unwrap()
+            .records
+            .len(),
+        2
+    );
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        pi_rs_durable::streamed_output::load(&store, first.attempt_id)
+            .unwrap()
+            .as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        pi_rs_durable::streamed_output::load(&store, second.attempt_id)
+            .unwrap()
+            .as_deref(),
+        Some("second")
+    );
+    drop(store);
+    let reopened = Scheduler::open(&path, stream_options(tool)).unwrap();
+    assert!(
+        reopened
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "second"))
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_unsafe_stream_is_not_promoted_or_replayed() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = stream_fixture("replay");
+    let options = || {
+        let mut options = stream_options(tool.clone());
+        options.tools[0].replay = ReplayPolicy::Unsafe;
+        options
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if !content.contains("first")))
+    );
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        pi_rs_durable::streamed_output::load(&store, attempt.attempt_id)
+            .unwrap()
+            .as_deref(),
+        Some("first")
+    );
+}
