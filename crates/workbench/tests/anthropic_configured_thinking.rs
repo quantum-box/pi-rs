@@ -13,6 +13,18 @@ use std::time::{Duration, Instant};
 enum FixtureEvent {
     Accepted,
     RequestLine,
+    Finished,
+}
+
+fn disconnected(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 fn fixture_write(result: std::io::Result<()>, stopping: &AtomicBool) -> bool {
@@ -47,7 +59,7 @@ fn serve_connection(
     match reader.read_line(&mut line) {
         Ok(0) => return false,
         Ok(_) => {}
-        Err(_) if stopping.load(Ordering::Acquire) => return false,
+        Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
         Err(error)
             if matches!(
                 error.kind(),
@@ -69,20 +81,16 @@ fn serve_connection(
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) if stopping.load(Ordering::Acquire) => return false,
-            Ok(0) => panic!("unexpected EOF in request headers"),
+            Ok(0) => return false,
             Ok(_) => {}
-            Err(_) if stopping.load(Ordering::Acquire) => return false,
+            Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
             Err(error) => panic!("read request headers: {error}"),
         }
         if line == "\r\n" {
             break;
         }
         if !line.ends_with('\n') {
-            if stopping.load(Ordering::Acquire) {
-                return false;
-            }
-            panic!("incomplete request header");
+            return false;
         }
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -115,15 +123,13 @@ fn serve_connection(
             ) {
                 return false;
             }
-        } else {
-            if !fixture_write(
-                socket.write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                ),
-                stopping,
-            ) {
-                return false;
-            }
+        } else if !fixture_write(
+            socket.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+            stopping,
+        ) {
+            return false;
         }
         return false;
     }
@@ -131,7 +137,7 @@ fn serve_connection(
     let mut bytes = vec![0; length];
     match reader.read_exact(&mut bytes) {
         Ok(()) => {}
-        Err(_) if stopping.load(Ordering::Acquire) => return false,
+        Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => return false,
         Err(error) => panic!("read request body: {error}"),
     }
     let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -208,6 +214,7 @@ fn serve_fixture(
                     let sender = sender.clone();
                     let stopping = stopping.clone();
                     let progress = accepted.clone();
+                    let finished = accepted.clone();
                     let expected = expected.to_owned();
                     let level = level.to_owned();
                     workers.push(std::thread::spawn(move || {
@@ -217,6 +224,9 @@ fn serve_fixture(
                             )
                         });
                         let _ = sender.send(result);
+                        if let Some(finished) = finished {
+                            let _ = finished.send(FixtureEvent::Finished);
+                        }
                     }));
                     if let Some(accepted) = &accepted {
                         let _ = accepted.send(FixtureEvent::Accepted);
@@ -381,7 +391,7 @@ fn idle_connection_does_not_block_following_model_request() {
             .unwrap()
         {
             FixtureEvent::RequestLine => break,
-            FixtureEvent::Accepted => {}
+            FixtureEvent::Accepted | FixtureEvent::Finished => {}
         }
     }
     let mut request = TcpStream::connect(address).unwrap();
@@ -429,7 +439,9 @@ fn fixture_limits_connections_and_finishes_at_deadline() {
         "fixture must fail when no model request arrives"
     );
     assert!(
-        received.try_recv().is_err(),
+        received
+            .try_iter()
+            .all(|event| !matches!(event, FixtureEvent::Accepted)),
         "only one connection may be accepted"
     );
     assert!(start.elapsed() < Duration::from_secs(10));
@@ -464,4 +476,57 @@ fn fixture_rejects_complete_invalid_model_request() {
         server.join().is_err(),
         "a complete request with invalid thinking must fail its assertion"
     );
+}
+
+#[test]
+fn early_header_disconnect_does_not_block_following_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (progress, received) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            Some(progress),
+            Duration::from_secs(15),
+            8,
+        )
+    });
+    for headers in [
+        b"GET /v1/models HTTP/1.1\r\nHost: partial".as_slice(),
+        b"GET /v1/models HTTP/1.1\r\nHost: complete\r\n".as_slice(),
+    ] {
+        let mut disconnected = TcpStream::connect(address).unwrap();
+        disconnected.write_all(headers).unwrap();
+        drop(disconnected);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match received
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                FixtureEvent::Finished => break,
+                FixtureEvent::Accepted | FixtureEvent::RequestLine => {}
+            }
+        }
+    }
+    let mut request = TcpStream::connect(address).unwrap();
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+    write!(
+        request,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    request.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("message_stop"));
+    server.join().unwrap();
 }
