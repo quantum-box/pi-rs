@@ -3335,7 +3335,7 @@ impl Agent<'_> {
                 let event =
                     compaction_failed_event(crate::CompactionReason::Manual, &error, cancel);
                 let idle = session.current_run_id().is_none();
-                crate::lifecycle::notify_session_with_host(
+                if let Err(notification_error) = crate::lifecycle::notify_session_with_host(
                     self.registry,
                     session,
                     event,
@@ -3343,7 +3343,15 @@ impl Agent<'_> {
                     observer,
                     idle,
                 )
-                .await?;
+                .await
+                {
+                    let message = notification_error.to_string();
+                    observer(Notification::ExtensionLifecycleError {
+                        extension: "session host",
+                        event: "session_compact_failed",
+                        message: &message,
+                    });
+                }
                 return Err(error);
             }
         };
@@ -3397,7 +3405,7 @@ impl Agent<'_> {
             Err(error) => compaction_failed_event(reason, error, cancellation),
         };
         let idle = session.current_run_id().is_none();
-        crate::lifecycle::notify_session_with_host(
+        let notification = crate::lifecycle::notify_session_with_host(
             self.registry,
             session,
             event,
@@ -3405,7 +3413,18 @@ impl Agent<'_> {
             observer,
             idle,
         )
-        .await?;
+        .await;
+        if let Err(notification_error) = notification {
+            if result.is_ok() {
+                return Err(notification_error);
+            }
+            let message = notification_error.to_string();
+            observer(Notification::ExtensionLifecycleError {
+                extension: "session host",
+                event: "session_compact_failed",
+                message: &message,
+            });
+        }
         result.map(|(spent, _)| spent)
     }
 
@@ -5151,6 +5170,102 @@ mod tree_tests {
         ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
             Err("migration failed".into())
         }
+    }
+
+    struct FailAfterCreateStore {
+        records: Vec<Record>,
+    }
+    impl crate::SessionStore for FailAfterCreateStore {
+        fn load(&mut self) -> Result<Vec<Record>> {
+            Ok(self.records.clone())
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            if !self.records.is_empty() {
+                return Err(Error::Session("fixture journal write failure".into()));
+            }
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct CompactionFailureMessage;
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureMessage {
+        fn id(&self) -> &str {
+            "failure-message"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "failure".into(),
+                        content: crate::ContextContent::Text("notice".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_keeps_original_error_when_listener_write_fails() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureMessage))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(FailAfterCreateStore { records: vec![] }).unwrap();
+        let mut reported = Vec::new();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |event| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    reported.push((extension.to_owned(), event.to_owned(), message.to_owned()));
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].1, "session_compact_failed");
+        assert!(reported[0].2.contains("fixture journal write failure"));
+        assert_eq!(session.records().len(), 1);
+        assert!(
+            session
+                .append(Event::User {
+                    content: "later".into(),
+                    input_id: None
+                })
+                .is_err()
+        );
     }
 
     #[tokio::test]
