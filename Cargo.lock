@@ -3046,6 +3046,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",

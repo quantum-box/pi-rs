@@ -48,9 +48,40 @@
 +        }
 --- a/src/connect.rs
 +++ b/src/connect.rs
-@@ -69,0 +70 @@
+@@ -13 +13 @@
+-use tower::util::{BoxCloneSyncServiceLayer, MapRequestLayer};
++use tower::util::BoxCloneSyncServiceLayer;
+@@ -42 +42,4 @@
+-    WithLayers(BoxCloneSyncService<Unnameable, Conn, BoxError>),
++    WithLayers(
++        BoxCloneSyncService<Unnameable, Conn, BoxError>,
++        Option<Option<Intercepted>>,
++    ),
+@@ -52,2 +55,2 @@
+-            Connector::Simple(service) => service.poll_ready(cx),
+-            Connector::WithLayers(service) => service.poll_ready(cx),
++            Connector::Simple(service) => Service::<Uri>::poll_ready(service, cx),
++            Connector::WithLayers(service, _) => service.poll_ready(cx),
+@@ -59,3 +62,13 @@
+-            Connector::Simple(service) => service.call(dst),
+-            Connector::WithLayers(service) => service.call(Unnameable(dst)),
+-        }
++            Connector::Simple(service) => Service::<Uri>::call(service, dst),
++            Connector::WithLayers(service, fixed) => service.call(Unnameable(dst, fixed.clone())),
++        }
++    }
++}
++
++impl Connector {
++    pub(crate) fn with_fixed(mut self, fixed: Option<Intercepted>) -> Self {
++        match &mut self {
++            Connector::Simple(service) => service.fixed = Some(fixed),
++            Connector::WithLayers(_, route) => *route = Some(fixed),
++        }
++        self
+@@ -69,0 +83 @@
 +#[derive(Clone)]
-@@ -89,0 +91,11 @@
+@@ -89,0 +104,11 @@
 +    pub(crate) fn uses_local_transport(&self) -> bool {
 +        #[cfg(unix)]
 +        if self.unix_socket.is_some() {
@@ -62,7 +93,7 @@
 +        }
 +        false
 +    }
-@@ -91,0 +104,7 @@
+@@ -91,0 +117,7 @@
 +        self.build_fixed(layers, None)
 +    }
 +    pub(crate) fn build_fixed(
@@ -70,11 +101,23 @@
 +        layers: Vec<BoxedConnectorLayer>,
 +        fixed: Option<Option<Intercepted>>,
 +    ) -> Connector {
-@@ -95,0 +115 @@
+@@ -95,0 +128 @@
 +            fixed,
-@@ -486,0 +507 @@
+@@ -132,4 +165 @@
+-        let unnameable_service = ServiceBuilder::new()
+-            .layer(MapRequestLayer::new(|request: Unnameable| request.0))
+-            .service(base_service);
+-        let mut service = BoxCloneSyncService::new(unnameable_service);
++        let mut service = BoxCloneSyncService::new(base_service);
+@@ -154 +184 @@
+-                Connector::WithLayers(service)
++                Connector::WithLayers(service, None)
+@@ -165 +195 @@
+-                Connector::WithLayers(service)
++                Connector::WithLayers(service, None)
+@@ -486,0 +517 @@
 +    fixed: Option<Option<Intercepted>>,
-@@ -803,0 +825,36 @@
+@@ -803,0 +835,36 @@
 +                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
 +                    let inner = hyper_tls::HttpsConnector::from((
 +                        http.clone(),
@@ -111,7 +154,7 @@
 +                        tls_info: false,
 +                    });
 +                }
-@@ -845,0 +903,34 @@
+@@ -845,0 +913,34 @@
 +                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
 +                    let inner =
 +                        hyper_rustls::HttpsConnector::from((http.clone(), tls_proxy.clone()));
@@ -146,14 +189,29 @@
 +                        tls_info: false,
 +                    });
 +                }
-@@ -888 +979,5 @@
+@@ -888 +989,5 @@
 -            Inner::Http(_) => (),
 +            Inner::Http(_) => {
 +                if proxy.tunnel_http() && dst.scheme_str() == Some("http") {
 +                    return Err("HTTP CONNECT requires a TLS-enabled connector".into());
 +                }
 +            }
-@@ -940,0 +1036,12 @@
+@@ -918,0 +1024,14 @@
++impl Service<Unnameable> for ConnectorService {
++    type Response = Conn;
++    type Error = BoxError;
++    type Future = Connecting;
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        Service::<Uri>::poll_ready(self, cx)
++    }
++    fn call(&mut self, request: Unnameable) -> Self::Future {
++        let mut service = self.clone();
++        service.fixed = request.1;
++        Service::<Uri>::call(&mut service, request.0)
++    }
++}
++
+@@ -940,0 +1060,12 @@
 +        if let Some(fixed) = &self.fixed {
 +            return match fixed.clone() {
 +                Some(proxy) => Box::pin(with_timeout(
@@ -166,9 +224,12 @@
 +                )),
 +            };
 +        }
+@@ -1338 +1469 @@
+-    pub struct Unnameable(pub(super) Uri);
++    pub struct Unnameable(pub(super) Uri, pub(super) Option<Option<Intercepted>>);
 --- a/src/async_impl/client.rs
 +++ b/src/async_impl/client.rs
-@@ -141,0 +142,69 @@
+@@ -141,0 +142,64 @@
 +    routing: Option<Arc<RouteRouting>>,
 +}
 +
@@ -184,8 +245,7 @@
 +
 +struct RouteRouting {
 +    builder: hyper_util::client::legacy::Builder,
-+    connector: crate::connect::ConnectorBuilder,
-+    layers: Vec<crate::connect::BoxedConnectorLayer>,
++    connector: crate::connect::Connector,
 +    proxies: Arc<Vec<ProxyMatcher>>,
 +    pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
 +}
@@ -220,11 +280,7 @@
 +        // Layer constructors can execute user code. Never call them while the
 +        // shared cache mutex is held; recheck after building for racing calls.
 +        drop(pools);
-+        let client = self.builder.build(
-+            self.connector
-+                .clone()
-+                .build_fixed(self.layers.clone(), Some(route)),
-+        );
++        let client = self.builder.build(self.connector.clone().with_fixed(route));
 +        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
 +        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
 +            let entry = pools.remove(index).expect("cached route");
@@ -238,7 +294,7 @@
 +        }
 +        client
 +    }
-@@ -153 +222,32 @@
+@@ -153 +217,32 @@
 -    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +        if let Some(routing) = &self.routing {
@@ -272,28 +328,30 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -1016,0 +1117,11 @@
+@@ -1017 +1112,12 @@
+-        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
 +        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
 +            && !connector_builder.uses_local_transport();
++        let connector = connector_builder.build(config.connector_layers);
 +        let routing = dynamic_routing.then(|| {
 +            Arc::new(RouteRouting {
 +                builder: builder.clone(),
-+                connector: connector_builder.clone(),
-+                layers: config.connector_layers.clone(),
++                connector: connector.clone(),
 +                proxies: proxies.clone(),
 +                pools: std::sync::Mutex::new(std::collections::VecDeque::new()),
 +            })
 +        });
-@@ -1019,0 +1131 @@
++        let hyper_client = builder.build(connector);
+@@ -1019,0 +1126 @@
 +            routing,
-@@ -1106,0 +1219 @@
+@@ -1106,0 +1214 @@
 +                dynamic_routing,
-@@ -2646,2 +2759,4 @@
+@@ -2646,2 +2754,4 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
 +        if !self.inner.dynamic_routing {
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2977,0 +3093 @@
+@@ -2977,0 +3088 @@
 +    dynamic_routing: bool,

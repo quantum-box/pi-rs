@@ -399,6 +399,15 @@ mod tests {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 use tokio::net::{TcpListener, TcpStream};
                 use tokio::time::{Duration, timeout};
+                #[derive(Clone)]
+                struct CountingLayer(Arc<AtomicUsize>);
+                impl<S> tower::Layer<S> for CountingLayer {
+                    type Service = S;
+                    fn layer(&self, service: S) -> S {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        service
+                    }
+                }
                 async fn request(socket: &mut BufReader<TcpStream>) -> String {
                     let mut result = String::new();
                     loop {
@@ -445,9 +454,11 @@ mod tests {
                     let third = request(&mut BufReader::new(other)).await;
                     (first, second, third)
                 });
+                let layers = Arc::new(AtomicUsize::new(0));
                 let client = $client::Client::builder()
                     .no_proxy()
                     .proxy(proxy)
+                    .connector_layer(CountingLayer(layers.clone()))
                     .build()
                     .unwrap();
                 for _ in 0..3 {
@@ -474,6 +485,7 @@ mod tests {
                 assert_eq!(auth(&first), auth(&second));
                 assert_ne!(auth(&first), auth(&third));
                 assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert_eq!(layers.load(Ordering::SeqCst), 1);
             }
         };
     }

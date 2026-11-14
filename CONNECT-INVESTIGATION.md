@@ -78,8 +78,10 @@ forward and tunnel connections. Concurrent requests need independent snapshots;
 eviction cannot invalidate a client currently in use.
 
 `ConnectorBuilder` owns the TLS, DNS, timeout and connector-layer configuration,
-and hyper's legacy builder is cloneable. The prototype clones them into
-route-specific clients and retains at most 32 routes. It removes
+and hyper's legacy builder is cloneable. The prototype shares a single layered
+connector across route-specific clients and retains at most 32 routes. The
+selected route travels in the opaque connector request, keeping shared layer
+state while isolating connection pools. It removes
 `Proxy-Authorization` for direct and tunneled dynamic routes, including when a
 caller explicitly supplied that header. Cache keys currently retain credential
 and proxy-header bytes in memory until eviction; they are not logged or written

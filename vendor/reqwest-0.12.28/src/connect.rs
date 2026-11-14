@@ -10,7 +10,7 @@ use hyper_util::rt::TokioIo;
 #[cfg(feature = "default-tls")]
 use native_tls_crate::{TlsConnector, TlsConnectorBuilder};
 use pin_project_lite::pin_project;
-use tower::util::{BoxCloneSyncServiceLayer, MapRequestLayer};
+use tower::util::BoxCloneSyncServiceLayer;
 use tower::{timeout::TimeoutLayer, util::BoxCloneSyncService, ServiceBuilder};
 use tower_service::Service;
 
@@ -39,7 +39,10 @@ pub(crate) enum Connector {
     Simple(ConnectorService),
     // at least one custom layer along with maybe an outer timeout layer
     // from `builder.connect_timeout()`
-    WithLayers(BoxCloneSyncService<Unnameable, Conn, BoxError>),
+    WithLayers(
+        BoxCloneSyncService<Unnameable, Conn, BoxError>,
+        Option<Option<Intercepted>>,
+    ),
 }
 
 impl Service<Uri> for Connector {
@@ -49,16 +52,26 @@ impl Service<Uri> for Connector {
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self {
-            Connector::Simple(service) => service.poll_ready(cx),
-            Connector::WithLayers(service) => service.poll_ready(cx),
+            Connector::Simple(service) => Service::<Uri>::poll_ready(service, cx),
+            Connector::WithLayers(service, _) => service.poll_ready(cx),
         }
     }
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         match self {
-            Connector::Simple(service) => service.call(dst),
-            Connector::WithLayers(service) => service.call(Unnameable(dst)),
+            Connector::Simple(service) => Service::<Uri>::call(service, dst),
+            Connector::WithLayers(service, fixed) => service.call(Unnameable(dst, fixed.clone())),
         }
+    }
+}
+
+impl Connector {
+    pub(crate) fn with_fixed(mut self, fixed: Option<Intercepted>) -> Self {
+        match &mut self {
+            Connector::Simple(service) => service.fixed = Some(fixed),
+            Connector::WithLayers(_, route) => *route = Some(fixed),
+        }
+        self
     }
 }
 
@@ -150,10 +163,7 @@ where {
         // otherwise we have user provided layers
         // so we need type erasure all the way through
         // as well as mapping the unnameable type of the layers back to Uri for the inner service
-        let unnameable_service = ServiceBuilder::new()
-            .layer(MapRequestLayer::new(|request: Unnameable| request.0))
-            .service(base_service);
-        let mut service = BoxCloneSyncService::new(unnameable_service);
+        let mut service = BoxCloneSyncService::new(base_service);
 
         for layer in layers {
             service = ServiceBuilder::new().layer(layer).service(service);
@@ -172,7 +182,7 @@ where {
                     .service(service);
                 let service = BoxCloneSyncService::new(service);
 
-                Connector::WithLayers(service)
+                Connector::WithLayers(service, None)
             }
             None => {
                 // no timeout, but still map err
@@ -183,7 +193,7 @@ where {
                     .map_err(|error: BoxError| cast_to_internal_error(error))
                     .service(service);
                 let service = BoxCloneSyncService::new(service);
-                Connector::WithLayers(service)
+                Connector::WithLayers(service, None)
             }
         }
     }
@@ -1012,6 +1022,20 @@ where
     }
 }
 
+impl Service<Unnameable> for ConnectorService {
+    type Response = Conn;
+    type Error = BoxError;
+    type Future = Connecting;
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Service::<Uri>::poll_ready(self, cx)
+    }
+    fn call(&mut self, request: Unnameable) -> Self::Future {
+        let mut service = self.clone();
+        service.fixed = request.1;
+        Service::<Uri>::call(&mut service, request.0)
+    }
+}
+
 impl Service<Uri> for ConnectorService {
     type Response = Conn;
     type Error = BoxError;
@@ -1395,7 +1419,7 @@ type BoxConn = Box<dyn AsyncConnWithInfo>;
 pub(crate) mod sealed {
     use super::*;
     #[derive(Debug)]
-    pub struct Unnameable(pub(super) Uri);
+    pub struct Unnameable(pub(super) Uri, pub(super) Option<Option<Intercepted>>);
 
     pin_project! {
         /// Note: the `is_proxy` member means *is plain text HTTP proxy*.

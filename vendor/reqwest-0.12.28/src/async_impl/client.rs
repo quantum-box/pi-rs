@@ -154,8 +154,7 @@ struct RouteKey {
 
 struct RouteRouting {
     builder: hyper_util::client::legacy::Builder,
-    connector: crate::connect::ConnectorBuilder,
-    layers: Vec<crate::connect::BoxedConnectorLayer>,
+    connector: crate::connect::Connector,
     proxies: Arc<Vec<ProxyMatcher>>,
     pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
 }
@@ -190,11 +189,7 @@ impl RouteRouting {
         // Layer constructors can execute user code. Never call them while the
         // shared cache mutex is held; recheck after building for racing calls.
         drop(pools);
-        let client = self.builder.build(
-            self.connector
-                .clone()
-                .build_fixed(self.layers.clone(), Some(route)),
-        );
+        let client = self.builder.build(self.connector.clone().with_fixed(route));
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
             let entry = pools.remove(index).expect("cached route");
@@ -1107,16 +1102,16 @@ impl ClientBuilder {
 
         let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
             && !connector_builder.uses_local_transport();
+        let connector = connector_builder.build(config.connector_layers);
         let routing = dynamic_routing.then(|| {
             Arc::new(RouteRouting {
                 builder: builder.clone(),
-                connector: connector_builder.clone(),
-                layers: config.connector_layers.clone(),
+                connector: connector.clone(),
                 proxies: proxies.clone(),
                 pools: std::sync::Mutex::new(std::collections::VecDeque::new()),
             })
         });
-        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
+        let hyper_client = builder.build(connector);
         let hyper_service = HyperService {
             hyper: hyper_client,
             routing,
