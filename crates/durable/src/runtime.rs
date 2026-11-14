@@ -43,6 +43,7 @@ type ResolvedOccurrences = (
     Vec<(Message, Option<MessageHistory>)>,
     std::collections::HashSet<Uuid>,
 );
+type ResolvedCompactionTarget = (Vec<Message>, (usize, usize));
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -3566,7 +3567,7 @@ impl Harness {
         &self,
         c: &Conversation,
         result: &crate::compact::CompactionResult,
-    ) -> Result<Option<(Vec<Message>, (usize, usize))>, Error> {
+    ) -> Result<Option<ResolvedCompactionTarget>, Error> {
         let Some(target) = result.retained_target() else {
             return if result.is_stale(&c.messages, c.context_generation) {
                 Ok(None)
