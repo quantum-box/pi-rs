@@ -35,6 +35,16 @@ fn fixture_write(result: std::io::Result<()>, stopping: &AtomicBool) -> bool {
     }
 }
 
+// Discovery clients can abandon a fully sent GET before reading the response.
+// A model POST still uses fixture_write so response failures remain visible.
+fn fixture_discovery_write(result: std::io::Result<()>, stopping: &AtomicBool) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) if stopping.load(Ordering::Acquire) || disconnected(&error) => false,
+        Err(error) => panic!("write discovery response: {error}"),
+    }
+}
+
 // Handle each accepted connection independently so an idle connection cannot
 // prevent the actual HTTP request from reaching its assertions.
 fn serve_connection(
@@ -113,7 +123,7 @@ fn serve_connection(
             } else {
                 model.to_string()
             };
-            if !fixture_write(
+            if !fixture_discovery_write(
                 write!(
                     socket,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -123,7 +133,7 @@ fn serve_connection(
             ) {
                 return false;
             }
-        } else if !fixture_write(
+        } else if !fixture_discovery_write(
             socket.write_all(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             ),
@@ -529,4 +539,82 @@ fn early_header_disconnect_does_not_block_following_request() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("message_stop"));
     server.join().unwrap();
+}
+
+#[test]
+fn disconnected_discovery_response_does_not_mask_other_write_errors() {
+    let stopping = AtomicBool::new(false);
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        assert!(!fixture_discovery_write(
+            Err(std::io::Error::from(kind)),
+            &stopping
+        ));
+        assert!(
+            std::panic::catch_unwind(|| fixture_write(Err(std::io::Error::from(kind)), &stopping))
+                .is_err()
+        );
+    }
+    assert!(
+        std::panic::catch_unwind(|| fixture_discovery_write(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &stopping
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn disconnected_discovery_client_does_not_block_model_request() {
+    for discovery in [0, 1] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (progress, received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_fixture(
+                listener,
+                discovery,
+                "budgeted",
+                "high",
+                Some(progress),
+                Duration::from_secs(15),
+                8,
+            )
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let _ = client.shutdown(Shutdown::Both);
+        drop(client);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match received
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                FixtureEvent::Finished => break,
+                FixtureEvent::Accepted | FixtureEvent::RequestLine => {}
+            }
+        }
+        let mut request = TcpStream::connect(address).unwrap();
+        request
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = r#"{"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+        write!(
+            request,
+            "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        request.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("message_stop"));
+        server.join().unwrap();
+    }
 }
