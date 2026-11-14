@@ -3522,7 +3522,9 @@ run settles. The last confirmed request is replayed with a one-token
 output cap when its published TTL and rates indicate at least $0.05 in
 expected savings. The worker checks the same session head and setting
 before dispatch, uses the original affinity and tool definitions, and
-stops on a changed context, a missed cache, or the 30-minute limit.
+stops on a changed context or the 30-minute limit. A failed refresh or cache
+miss schedules another decision on the normal cadence, as in Pi; failed
+refreshes add no usage entry, while completed misses retain their billed usage.
 Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions
