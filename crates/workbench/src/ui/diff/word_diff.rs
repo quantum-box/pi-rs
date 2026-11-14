@@ -373,7 +373,8 @@ mod tests {
     #[test]
     fn matches_jsdiff_8_0_4_fixtures() {
         use Tag::{Delete as D, Equal as E, Insert as I};
-        let cases: &[(&str, &str, &[(Tag, &str)])] = &[
+        type Fixture<'a> = (&'a str, &'a str, &'a [(Tag, &'a str)]);
+        let cases: &[Fixture<'_>] = &[
             (
                 "A x B y",
                 "A  c B  d",
