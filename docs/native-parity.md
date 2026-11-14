@@ -4249,3 +4249,11 @@ model-context text retain the original bytes.
 matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
+### Messages quota retry classification
+
+Anthropic-compatible Messages requests inspect a bounded HTTP 429 response
+prefix for Pi's account, quota and billing exhaustion markers. Those failures
+stop agent retries; transient rate limits remain retryable. Response bodies are
+not surfaced or logged. Classification falls back to the existing retry behavior
+when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Other provider adapters still need equivalent quota classification.

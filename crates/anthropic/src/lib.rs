@@ -432,6 +432,62 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
     })
 }
 
+// Pi excludes account and billing limits from agent retries even if a
+// provider wraps them in HTTP 429. Inspect only a bounded prefix and never
+// include provider response bodies in errors or logs.
+fn permanent_quota_error(body: &[u8], complete: bool) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    ];
+    if MARKERS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    text.match_indices("\"code\"").any(|(index, _)| {
+        let rest = text[index + 6..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            return false;
+        };
+        let rest = rest
+            .trim_start()
+            .strip_prefix('\"')
+            .unwrap_or(rest.trim_start());
+        rest.strip_prefix("1308").is_some_and(|tail| {
+            (complete || !tail.is_empty()) && !tail.starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+async fn is_permanent_quota(mut response: Response) -> bool {
+    const MAX_ERROR_BODY: usize = 64 * 1024;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut body = Vec::new();
+        let mut complete = false;
+        while body.len() < MAX_ERROR_BODY {
+            let Some(chunk) = response.chunk().await.ok()? else {
+                complete = true;
+                break;
+            };
+            let remaining = MAX_ERROR_BODY - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        Some(permanent_quota_error(&body, complete))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
     let response = request.send().await.map_err(|error| {
         Error::RetryableModel(
@@ -448,7 +504,9 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
         Ok(response)
     } else {
         let message = format!("Anthropic returned HTTP {status}");
-        if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+        if status.as_u16() == 429 && is_permanent_quota(response).await {
+            Err(Error::Model(message))
+        } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
             Err(Error::RetryableModel(message))
         } else {
             Err(Error::Model(message))
@@ -1261,6 +1319,66 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rate_limit_response_classification_and_redaction() {
+        use std::io::{Read, Write};
+        for (body, permanent) in [
+            (
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                write!(stream, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::new().get(format!("http://{address}/")),
+                ))
+                .unwrap_err();
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn permanent_quota_markers_do_not_retry() {
+        for body in [
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            r#"{"code" : "1308"}"#,
+            "FREEUSAGELIMITERROR",
+            "Monthly usage limit reached",
+            "BILLING",
+        ] {
+            assert!(
+                super::permanent_quota_error(body.as_bytes(), true),
+                "{body}"
+            );
+        }
+        assert!(!super::permanent_quota_error(br#"{"code":1308"#, false));
+        for body in [r#"{"code":13080}"#, "rate limit exceeded", "server busy"] {
+            assert!(
+                !super::permanent_quota_error(body.as_bytes(), true),
+                "{body}"
+            );
+        }
+    }
+
     use super::*;
 
     #[cfg(any(unix, windows))]
