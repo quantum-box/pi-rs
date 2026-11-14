@@ -718,6 +718,11 @@ checkout and in-memory forks. Explicit asynchronous close releases shared
 extensions after the last fork closes. Managed host-bound sessions continue to
 use the existing host API.
 
+For shutdown, `SessionControl::request_shutdown` permanently cancels current and
+subsequently registered runs; the owner still awaits the operation and calls
+`close` to finish cleanup. Ordinary `abort` remains limited to the active run.
+This is a native embedding control rather than an upstream Pi API.
+
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 

@@ -52,6 +52,21 @@ jobs:
           cargo +1.89.0 test --locked --example native_sdk_host
           cargo +1.89.0 test --locked -p pi-rs-ollama --example sdk_chat
 
+  tauri-sdk-fixture:
+    name: Tauri SDK fixture (macOS mock)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install supported Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt
+      - name: Check fixture formatting
+        run: cargo +1.89.0 fmt --manifest-path fixtures/tauri-sdk/Cargo.toml -- --check
+      - name: Test mock Tauri IPC
+        run: cargo +1.89.0 test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
+
   wasm-diagnostic:
     name: Browser WASM core diagnostic (non-gating)
     runs-on: ubuntu-latest

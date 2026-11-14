@@ -401,6 +401,7 @@ pub struct SessionControl {
     owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
+    shutdown: CancellationToken,
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
@@ -717,7 +718,7 @@ impl SessionControl {
         if closed.is_cancelled() {
             return Err(Error::Config("session is closed".into()));
         }
-        let token = CancellationToken::new();
+        let token = self.shutdown.child_token();
         *self.active.lock().expect("session control") = Some(token.clone());
         let active = ActiveRun {
             token,
@@ -1050,6 +1051,18 @@ impl SessionControl {
         let Ok(_guard) = self.scoped_guard() else {
             return;
         };
+        if let Some(active) = self.active.lock().expect("session control").as_ref() {
+            active.cancel();
+        }
+    }
+
+    /// Permanently cancel active and subsequently registered runs while the
+    /// owner waits to close the session. This does not itself close the session.
+    pub fn request_shutdown(&self) {
+        let Ok(_guard) = self.scoped_guard() else {
+            return;
+        };
+        self.shutdown.cancel();
         if let Some(active) = self.active.lock().expect("session control").as_ref() {
             active.cancel();
         }
@@ -1392,6 +1405,7 @@ impl SessionBuilder {
                 owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
+                shutdown: CancellationToken::new(),
                 auto_compaction,
                 retry,
                 input_hooks,
@@ -3005,7 +3019,7 @@ impl AgentSession {
         }
     }
     fn begin_run(&self) -> ActiveRun {
-        let token = CancellationToken::new();
+        let token = self.control.shutdown.child_token();
         *self.control.active.lock().expect("session control") = Some(token.clone());
         ActiveRun {
             token,
@@ -3424,6 +3438,28 @@ mod tests {
             explicit.limits.tool_timeout,
             std::time::Duration::from_secs(30)
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancellation_is_inherited_by_new_runs() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let active = session.begin_run();
+        control.abort();
+        assert!(active.token.is_cancelled());
+        drop(active);
+        let next = session.begin_run();
+        assert!(!next.token.is_cancelled(), "ordinary abort is not sticky");
+        control.request_shutdown();
+        assert!(next.token.is_cancelled());
+        drop(next);
+        let after_shutdown = session.begin_run();
+        assert!(after_shutdown.token.is_cancelled());
+        drop(after_shutdown);
+        assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -9133,6 +9169,94 @@ mod tests {
         }
     }
     struct InputExtension;
+
+    struct ShutdownIdleHook {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Extension for ShutdownIdleHook {
+        fn id(&self) -> &str {
+            "shutdown-idle-hook"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "shutdown-test".into(),
+                    content: crate::ContextContent::Text("trigger".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(crate::InputAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_hook_inherits_shutdown_before_and_after_registration() {
+        for shutdown_before_registration in [true, false] {
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let hook = Arc::new(ShutdownIdleHook {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .extension(hook.clone())
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            session.start().await.unwrap();
+            let control = session.controls();
+            let journal = if shutdown_before_registration {
+                Some(session.session.lock().await)
+            } else {
+                None
+            };
+            let submit_control = control.clone();
+            let submit = tokio::spawn(async move { submit_control.follow_up("queued").await });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                if shutdown_before_registration {
+                    while !control.input_order.state.lock().unwrap().busy {
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    hook.entered.notified().await;
+                }
+            })
+            .await
+            .expect("idle submission did not reach its gate");
+            control.request_shutdown();
+            drop(journal);
+            hook.release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), submit)
+                .await
+                .expect("idle submission did not settle")
+                .unwrap();
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(
+                hook.calls.load(Ordering::SeqCst),
+                usize::from(!shutdown_before_registration)
+            );
+            assert_eq!(model.0.load(Ordering::SeqCst), 0);
+            session.close().await.unwrap();
+        }
+    }
 
     #[async_trait::async_trait]
     impl Extension for InputExtension {
