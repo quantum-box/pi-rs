@@ -28,9 +28,7 @@ pub enum Error {
     UnreadOrWritten,
     #[error("duplicate task in admission")]
     DuplicateTask,
-    #[error(
-        "application entries require a directly conversation-owned task and a nonempty non-pi. kind"
-    )]
+    #[error("application entries require a valid active task ancestry and a nonempty non-pi. kind")]
     InvalidApplicationEntry,
 }
 
@@ -461,7 +459,12 @@ pub struct TaskDocuments<'a> {
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
     task: crate::task::Task,
-    entries: Option<(Option<u64>, Vec<crate::application_entry::ApplicationEntry>)>,
+    entries: Option<(
+        uuid::Uuid,
+        Option<u64>,
+        Vec<crate::application_entry::ApplicationEntry>,
+        Vec<Check>,
+    )>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
@@ -502,34 +505,62 @@ impl<'a> TaskDocuments<'a> {
         Ok(())
     }
     /// Stage an immutable application record with this task as its author.
-    /// Only directly conversation-owned tasks are supported. The returned ID is
+    /// Every task ancestor must exist and be active. The returned ID is
     /// provisional until the step commits and can change on replay.
     pub fn append_entry(&mut self, kind: &str, data: Value) -> Result<uuid::Uuid, Error> {
-        let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
-            return Err(Error::InvalidApplicationEntry);
-        };
         if kind.is_empty() || kind.starts_with("pi.") {
             return Err(Error::InvalidApplicationEntry);
         }
         if self.entries.is_none() {
+            let mut owner = self.task.owner().clone();
+            let mut seen = HashSet::from([self.task.id()]);
+            let mut checks = Vec::new();
+            let conversation = loop {
+                match owner {
+                    crate::task::TaskOwner::Conversation(id) => break id,
+                    crate::task::TaskOwner::Task(id) => {
+                        if !seen.insert(id) {
+                            return Err(Error::InvalidApplicationEntry);
+                        }
+                        let key = crate::task_store::key(id);
+                        let record = self
+                            .store
+                            .get(&key)?
+                            .ok_or(Error::InvalidApplicationEntry)?;
+                        let ancestor: crate::task::Task = serde_json::from_slice(&record.value)?;
+                        if ancestor.id() != id
+                            || ancestor.is_terminal()
+                            || ancestor.abort_requested()
+                        {
+                            return Err(Error::InvalidApplicationEntry);
+                        }
+                        checks.push(Check {
+                            key,
+                            expected: Expected::Version(record.version),
+                        });
+                        owner = ancestor.owner().clone();
+                    }
+                }
+            };
             let record = self
                 .store
-                .get(&crate::application_entry::key(*conversation))?;
+                .get(&crate::application_entry::key(conversation))?;
             let version = record.as_ref().map(|r| r.version);
             let entries = record
                 .map(|r| serde_json::from_slice(&r.value))
                 .transpose()?
                 .unwrap_or_default();
-            self.entries = Some((version, entries));
+            self.entries = Some((conversation, version, entries, checks));
         }
         let id = uuid::Uuid::new_v4();
+        let conversation = self.entries.as_ref().unwrap().0;
         self.entries
             .as_mut()
             .unwrap()
-            .1
+            .2
             .push(crate::application_entry::ApplicationEntry {
                 id,
-                conversation_id: *conversation,
+                conversation_id: conversation,
                 author_task_id: self.task.id(),
                 kind: kind.into(),
                 data,
@@ -557,11 +588,9 @@ impl<'a> TaskDocuments<'a> {
                 });
             }
         }
-        if let Some((version, entries)) = self.entries {
-            let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
-                return Err(Error::InvalidApplicationEntry);
-            };
-            let key = crate::application_entry::key(*conversation);
+        if let Some((conversation, version, entries, checks)) = self.entries {
+            batch.checks.extend(checks);
+            let key = crate::application_entry::key(conversation);
             batch.checks.push(Check {
                 key: key.clone(),
                 expected: version.map_or(Expected::Missing, Expected::Version),
@@ -640,5 +669,196 @@ impl<'a> AdmissionDocuments<'a> {
             }
         }
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod nested_entry_tests {
+    use super::*;
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn task(id: u128, owner: TaskOwner) -> Task {
+        Task::new(
+            Uuid::from_u128(id),
+            owner,
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ancestry_checks_fence_atomic_commit_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        let root = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
+        let middle = task(2, TaskOwner::Task(root.id()));
+        let author = task(3, TaskOwner::Task(middle.id()));
+        ts.save(&[
+            Save::Create(&root),
+            Save::Create(&middle),
+            Save::Create(&author),
+        ])
+        .unwrap();
+        let addr = Address {
+            scope: "s".into(),
+            name: "n".into(),
+            key: "k".into(),
+        };
+        let mut docs = TaskDocuments::new(&db, &author).unwrap();
+        docs.get(&addr).unwrap();
+        docs.put(&addr, json!({"value": 1}).as_object().unwrap().clone())
+            .unwrap();
+        docs.append_entry("app.test", json!(1)).unwrap();
+        let batch = docs.into_batch().unwrap();
+        let snapshot = ts.load(root.id()).unwrap().unwrap();
+        ts.update(&snapshot, |t| t.request_abort()).unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert!(Documents::new(&db).get(&addr).unwrap().is_none());
+        assert!(
+            crate::application_entry::list(&db, Uuid::from_u128(99))
+                .unwrap()
+                .is_empty()
+        );
+        let mut docs = TaskDocuments::new(&db, &author).unwrap();
+        assert!(matches!(
+            docs.append_entry("app.test", json!(1)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+    }
+
+    #[test]
+    fn missing_terminal_and_cyclic_ancestors_fail_closed() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let author = task(3, TaskOwner::Task(Uuid::from_u128(2)));
+        let mut docs = TaskDocuments::new(&db, &author).unwrap();
+        assert!(matches!(
+            docs.append_entry("app.test", json!(null)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+        let mut terminal = task(2, TaskOwner::Conversation(Uuid::from_u128(99)));
+        terminal.cancel().unwrap();
+        ts.save(&[Save::Create(&terminal)]).unwrap();
+        let mut docs = TaskDocuments::new(&db, &author).unwrap();
+        assert!(matches!(
+            docs.append_entry("app.test", json!(null)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+        let cycle_a = task(4, TaskOwner::Task(Uuid::from_u128(5)));
+        let cycle_b = task(5, TaskOwner::Task(cycle_a.id()));
+        let cyclic_author = task(6, TaskOwner::Task(cycle_a.id()));
+        ts.save(&[Save::Create(&cycle_a), Save::Create(&cycle_b)])
+            .unwrap();
+        let mut docs = TaskDocuments::new(&db, &cyclic_author).unwrap();
+        assert!(matches!(
+            docs.append_entry("app.test", json!(null)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+    }
+    #[test]
+    fn process_exit_discards_nested_staging() {
+        const ENV: &str = "PI_NESTED_ENTRY_CRASH_DB";
+        if let Ok(path) = std::env::var(ENV) {
+            let db = Store::open(path).unwrap();
+            let author = task(3, TaskOwner::Task(Uuid::from_u128(2)));
+            let mut docs = TaskDocuments::new(&db, &author).unwrap();
+            let addr = Address {
+                scope: "s".into(),
+                name: "crash".into(),
+                key: "".into(),
+            };
+            docs.get(&addr).unwrap();
+            docs.put(&addr, json!({"value": 1}).as_object().unwrap().clone())
+                .unwrap();
+            docs.append_entry("app.crash", json!(1)).unwrap();
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Store::open(&path).unwrap();
+            let root = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
+            let middle = task(2, TaskOwner::Task(root.id()));
+            let author = task(3, TaskOwner::Task(middle.id()));
+            TaskStore::new(&db)
+                .save(&[
+                    Save::Create(&root),
+                    Save::Create(&middle),
+                    Save::Create(&author),
+                ])
+                .unwrap();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("document::nested_entry_tests::process_exit_discards_nested_staging")
+            .env(ENV, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let db = Store::open(&path).unwrap();
+        let addr = Address {
+            scope: "s".into(),
+            name: "crash".into(),
+            key: "".into(),
+        };
+        assert!(Documents::new(&db).get(&addr).unwrap().is_none());
+        assert!(
+            crate::application_entry::list(&db, Uuid::from_u128(99))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            TaskStore::new(&db)
+                .load(Uuid::from_u128(3))
+                .unwrap()
+                .unwrap()
+                .task
+                .checkpoint()
+                .phase,
+            "start"
+        );
+    }
+    #[test]
+    fn deep_author_commits_to_root_conversation_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root_id = Uuid::from_u128(99);
+        {
+            let db = Store::open(&path).unwrap();
+            let root = task(1, TaskOwner::Conversation(root_id));
+            let middle = task(2, TaskOwner::Task(root.id()));
+            let author = task(3, TaskOwner::Task(middle.id()));
+            TaskStore::new(&db)
+                .save(&[
+                    Save::Create(&root),
+                    Save::Create(&middle),
+                    Save::Create(&author),
+                ])
+                .unwrap();
+            let mut docs = TaskDocuments::new(&db, &author).unwrap();
+            docs.append_entry("app.deep", json!(42)).unwrap();
+            let batch = docs.into_batch().unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+        }
+        let db = Store::open(&path).unwrap();
+        let entries = crate::application_entry::list(&db, root_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].conversation_id, root_id);
+        assert_eq!(entries[0].author_task_id, Uuid::from_u128(3));
+        assert_eq!(entries[0].data, json!(42));
     }
 }

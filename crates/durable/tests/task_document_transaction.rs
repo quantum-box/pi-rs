@@ -702,7 +702,7 @@ fn abort_during_handler_discards_entries_and_documents() {
 }
 
 #[test]
-fn append_across_steps_and_reject_reserved_or_nested_authors() {
+fn append_across_steps_with_nested_authors_and_reject_reserved_kinds() {
     struct Append;
     impl Handler for Append {
         fn run(&self, _: &Task) -> Result<Step, String> {
@@ -716,7 +716,7 @@ fn append_across_steps_and_reject_reserved_or_nested_authors() {
             assert!(docs.append_entry("", json!(null)).is_err());
             assert!(docs.append_entry("pi.reserved", json!(null)).is_err());
             if matches!(task.owner(), TaskOwner::Task(_)) {
-                assert!(docs.append_entry("app.child", json!(null)).is_err());
+                docs.append_entry("app.child", json!("child")).unwrap();
                 return Ok(Step::Succeed(json!(null)));
             }
             docs.append_entry("app.step", json!(task.checkpoint().phase))
@@ -747,7 +747,7 @@ fn append_across_steps_and_reject_reserved_or_nested_authors() {
     let entries = application_entry::list(&db, Uuid::from_u128(2)).unwrap();
     assert_eq!(
         entries.iter().map(|e| e.data.clone()).collect::<Vec<_>>(),
-        vec![json!("start"), json!("next")]
+        vec![json!("start"), json!("child"), json!("next")]
     );
     assert!(
         application_entry::list(&db, Uuid::new_v4())
