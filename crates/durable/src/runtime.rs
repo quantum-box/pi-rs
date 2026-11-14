@@ -8,6 +8,7 @@ use crate::{
         CompletedGeneration, GenerationProgress, collect_generation_with_metadata, model_request,
     },
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
+    retry_policy::{Decision, Failure, RetryPolicy, RetryState, StopReason, is_context_overflow},
 };
 use durable_store::{
     Check, Expected, Mutation,
@@ -119,6 +120,15 @@ enum Phase {
         request_id: Uuid,
         restarts: u32,
     },
+    FailedModel {
+        turns: u32,
+        request_id: Uuid,
+        reason: String,
+        decision: ModelFailureDecision,
+    },
+    RetryWait {
+        turns: u32,
+    },
     CompactionReady {
         preparation: Box<crate::compact::Preparation>,
         restarts: u32,
@@ -178,6 +188,13 @@ enum Phase {
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+enum ModelFailureDecision {
+    Retry,
+    Overflow,
+    Stop,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: Uuid,
     pub config: Config,
@@ -195,6 +212,10 @@ pub struct Conversation {
     input_modes: HashMap<Uuid, InputMode>,
     #[serde(default)]
     auto_compaction_attempted: bool,
+    #[serde(default)]
+    retry_state: RetryState,
+    #[serde(default)]
+    overflow_compaction_attempted: bool,
     #[serde(default)]
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
@@ -433,6 +454,8 @@ impl Harness {
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
+            retry_state: RetryState::default(),
+            overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
             phase: Phase::Idle,
@@ -458,6 +481,8 @@ impl Harness {
         state.aborted_generations.clear();
         state.input_modes.clear();
         state.auto_compaction_attempted = false;
+        state.retry_state = RetryState::default();
+        state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
         self.save(&state, Expected::Missing)?;
@@ -492,6 +517,8 @@ impl Harness {
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
+            retry_state: RetryState::default(),
+            overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
             phase: Phase::Idle,
@@ -869,6 +896,8 @@ impl Harness {
                     s.status = Status::Running;
                     c.active = Some(s.id);
                     c.auto_compaction_attempted = false;
+                    c.retry_state = RetryState::default();
+                    c.overflow_compaction_attempted = false;
                     c.messages.push(Message::User {
                         content: s.content.clone(),
                     });
@@ -1081,8 +1110,27 @@ impl Harness {
                     let response = match response {
                         Ok(r) => r,
                         Err(e) => {
-                            self.failed = true;
-                            return Err(e.into());
+                            if cancel.is_cancelled() || matches!(e, pi_rs_core::Error::Cancelled) {
+                                self.failed = true;
+                                return Err(Error::Interrupted);
+                            }
+                            let decision =
+                                Failure::from_error(&e).map_or(Decision::Stop, |failure| {
+                                    c.retry_state
+                                        .failed(RetryPolicy::default(), failure, unix_ms())
+                                });
+                            c.phase = Phase::FailedModel {
+                                turns,
+                                request_id,
+                                reason: e.to_string(),
+                                decision: match decision {
+                                    Decision::WaitUntil(_) => ModelFailureDecision::Retry,
+                                    Decision::ContextOverflow => ModelFailureDecision::Overflow,
+                                    _ => ModelFailureDecision::Stop,
+                                },
+                            };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
                         }
                     };
                     c.phase = Phase::Accounting {
@@ -1090,6 +1138,47 @@ impl Harness {
                         request_id,
                         response: Box::new(response),
                     };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::FailedModel {
+                    turns,
+                    request_id,
+                    reason,
+                    decision,
+                } => {
+                    let settlement = self
+                        .options
+                        .model
+                        .record_usage(request_id, &UsageReport::Unconfirmed);
+                    tokio::select! { biased;
+                        _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                        result = tokio::time::timeout(Duration::from_secs(120), settlement) => match result {
+                            Ok(Ok(())) => (),
+                            Ok(Err(e)) => { self.failed = true; return Err(e.into()); },
+                            Err(_) => { self.failed = true; return Err(Error::Interrupted); },
+                        }
+                    }
+                    match decision {
+                        ModelFailureDecision::Retry => c.phase = Phase::RetryWait { turns },
+                        ModelFailureDecision::Overflow => {
+                            start_overflow_compaction(&mut c, turns, reason)?
+                        }
+                        ModelFailureDecision::Stop => finish_failure(&mut c, reason),
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::RetryWait { turns } => {
+                    match c.retry_state.poll(unix_ms()) {
+                        Decision::WaitUntil(deadline) => {
+                            tokio::select! { biased;
+                                _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                                _ = tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(unix_ms()))) => (),
+                            }
+                            continue;
+                        }
+                        Decision::Ready => c.phase = Phase::ModelReady { turns },
+                        _ => return Err(Error::Invalid("retry deadline missing".into())),
+                    }
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::AbandonedModel {
@@ -1143,6 +1232,32 @@ impl Harness {
                             Err(_) => { self.failed = true; return Err(Error::Interrupted); },
                         }
                     }
+                    let window = tokio::select! {
+                        _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                        window = tokio::time::timeout(Duration::from_secs(5), self.options.model.context_window(&c.config.model)) => window.ok().flatten(),
+                    };
+                    let usage = response.usage.unwrap_or_default();
+                    let stop_reason = match response.metadata.finish_reason.as_deref() {
+                        Some("length") => StopReason::Length,
+                        Some("stop") | Some("end_turn") => StopReason::Stop,
+                        _ => StopReason::Other,
+                    };
+                    if is_context_overflow(Failure {
+                        stop_reason,
+                        provider: "",
+                        message: "",
+                        input_tokens: usage.input_tokens,
+                        cache_read_tokens: 0,
+                        output_tokens: usage.output_tokens,
+                        context_window: window.map(u64::from),
+                        transient_hint: false,
+                    }) {
+                        start_overflow_compaction(&mut c, turns, "model context overflow".into())?;
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    }
+                    c.retry_state = RetryState::default();
+                    c.overflow_compaction_attempted = false;
                     if response.is_truncated() && !response.calls.is_empty() {
                         finish_failure(&mut c, "truncated tool calls".into());
                     } else {
@@ -1678,23 +1793,7 @@ impl Scheduler {
             let _lock = lock.lock().await;
             worker.recover_conversation(id)?;
             loop {
-                if let Err(error) = worker.drive(id, &cancel).await {
-                    let mut fresh = worker.worker();
-                    let retryable = matches!(error, Error::Model(_))
-                        && fresh
-                            .conversation(id)
-                            .is_ok_and(|c| matches!(c.phase, Phase::ModelRunning { .. }));
-                    if !retryable {
-                        return Err(error);
-                    }
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(Error::Interrupted),
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => (),
-                    }
-                    fresh.recover_conversation(id)?;
-                    worker = fresh;
-                    continue;
-                }
+                worker.drive(id, &cancel).await?;
                 let state = worker.conversation(id)?;
                 let should_poll = match &state.phase {
                     Phase::Pending { calls, index, .. } => calls
@@ -1746,6 +1845,44 @@ impl Scheduler {
         }
         error.map_or(Ok(()), Err)
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn start_overflow_compaction(
+    c: &mut Conversation,
+    turns: u32,
+    reason: String,
+) -> Result<(), Error> {
+    if c.overflow_compaction_attempted {
+        finish_failure(c, reason);
+        return Ok(());
+    }
+    c.overflow_compaction_attempted = true;
+    c.auto_compaction_attempted = true;
+    if let Some(preparation) = crate::compact::prepare(
+        &c.messages,
+        c.config.model.clone(),
+        c.config.max_output_tokens,
+        0,
+        None,
+    )? {
+        c.compaction_return_turns = Some(turns);
+        c.phase = Phase::CompactionReady {
+            preparation: Box::new(preparation),
+            restarts: 0,
+        };
+    } else {
+        finish_failure(c, reason);
+    }
+    Ok(())
 }
 
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
@@ -1909,6 +2046,8 @@ mod scheduler_tests {
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
+            retry_state: RetryState::default(),
+            overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
             phase: Phase::Idle,
