@@ -60,7 +60,10 @@ try {
   site.listen(0, '127.0.0.1'); await once(site, 'listening');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-browser-fetch-'));
   try {
-    const child = spawn(chrome, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank'], {stdio:['ignore','ignore','pipe']});
+    const args = ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank'];
+    // GitHub-hosted Ubuntu runners cannot create Chrome's user namespace sandbox.
+    if (process.env.PI_FETCH_CHROME_NO_SANDBOX === '1') args.unshift('--no-sandbox');
+    const child = spawn(chrome, args, {stdio:['ignore','ignore','pipe']});
     let stderr = '';
     const endpoint = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error('Chrome debugging endpoint timeout')), 10000);

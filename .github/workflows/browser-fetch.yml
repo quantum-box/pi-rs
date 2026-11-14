@@ -43,6 +43,7 @@ jobs:
       - name: Test Node and browser Fetch
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          PI_FETCH_CHROME_NO_SANDBOX: '1'
         run: |
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/pi-fetch-node" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/pi_rs_browser_fetch.wasm"
           node crates/browser-fetch/tests/node-fetch.cjs "$RUNNER_TEMP/pi-fetch-node/pi_rs_browser_fetch.js"
