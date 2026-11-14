@@ -4215,6 +4215,14 @@ empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
 
+### RPC truncated JSON diagnostics
+
+Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
+initial object property names, unfinished unescaped strings, and missing values.
+Offsets and columns in these diagnostics count UTF-16 units. Other malformed
+JSON, escaped unfinished strings and carriage-return position handling retain
+the native parser's diagnostics; full malformed-input parity remains open.
+
 ### Shell execution transcript checkpoint
 
 Imported and live Pi-style shell executions display their output and completion
