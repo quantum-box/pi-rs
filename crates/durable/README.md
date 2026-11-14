@@ -498,14 +498,21 @@ checked batch. Reads must precede writes, and each written address must have
 been read and may be written once. The default method calls the existing `run`.
 `Fail` and abort handlers do not commit staged documents. Children can only be
 created through `Wait` and remain subject to its ownership and registration
-checks. A concurrent document or task change can conflict: the scheduler returns
-an error and must be dropped and reopened; a replay-safe invocation may then run
-again. The reservation is a separate durable commit, so recovery can see the
-old checkpoint in running state. Handler effects outside the store need their
-own idempotency. A storage error can have an unknown outcome; inspect recovered
-state before acting. This is not upstream's general asynchronous transaction:
-there are no entries, read-your-writes, consistent multi-document snapshot,
-automatic conflict retry, or arbitrary task creation in this callback.
+checks. A checked document conflict rolls back the entire batch. A replay-safe
+handler is returned to ready and retried on a later tick without reopening;
+contention retries do not consume the crash restart limit and can continue
+indefinitely. A non-replay-safe handler instead fails with a reconciliation
+reason because its external effects may already have happened. An abort that
+arrives during the invocation fences its output. Other task conflicts and
+storage errors still poison the scheduler and require reopening; storage errors
+can have an unknown outcome. The reservation is a separate durable commit,
+so a crash can leave the old checkpoint running. External effects require their
+own idempotency or reconciliation. Unlike upstream's transaction callback,
+this synchronous task callback has no entries, read-your-writes, consistent
+multi-document snapshot, or arbitrary task creation. Upstream commits writes
+through `runtime.commit()` and documents replay-safe tool recovery on restart;
+this scheduler additionally gates whole-handler conflict retries on its recorded
+and current replay policies.
 
 Generic `Task` records carry a positive definition version, JSON input, and a
 checkpoint. Older records without these fields read as version 1 with null input.

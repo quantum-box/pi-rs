@@ -3,12 +3,18 @@ use pi_rs_durable::{
     document::{Address, Documents, TaskDocuments, Transaction},
     task::{
         Checkpoint, Task, TaskOwner, TaskState, WaitFor,
-        scheduler::{Error, Handler, Registry, Scheduler, Step},
+        scheduler::{Handler, Registry, Scheduler, Step},
     },
     task_store::TaskStore,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use uuid::Uuid;
 
 fn cp(phase: &str) -> Checkpoint {
@@ -46,6 +52,7 @@ fn child() -> Task {
 }
 struct Work {
     conflict_path: Option<PathBuf>,
+    calls: Arc<AtomicUsize>,
 }
 impl Handler for Work {
     fn run(&self, _: &Task) -> Result<Step, String> {
@@ -59,7 +66,10 @@ impl Handler for Work {
             json!({"n": 1}).as_object().unwrap().clone(),
         )
         .unwrap();
-        if let Some(path) = &self.conflict_path {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = &self.conflict_path
+            && call == 0
+        {
             // Deterministically change a read-only dependency after it was read.
             let db = Store::open(path).unwrap();
             let mut tx = Transaction::new();
@@ -86,6 +96,7 @@ fn registry(path: Option<PathBuf>) -> Registry {
         true,
         Work {
             conflict_path: path,
+            calls: Arc::new(AtomicUsize::new(0)),
         },
     );
     r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
@@ -130,55 +141,111 @@ fn checkpoint_documents_and_child_survive_reopen_together() {
     );
 }
 #[test]
-fn read_only_conflict_rolls_back_step_and_reopen_recovers() {
+fn read_only_conflict_retries_on_next_tick_without_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     initialize(&path);
     let mut scheduler = Scheduler::open(&path, registry(Some(path.clone()))).unwrap();
     scheduler.submit(&parent()).unwrap();
-    assert!(matches!(
-        scheduler.tick(0),
-        Err(Error::Document(pi_rs_durable::document::Error::Store(
-            durable_store::Error::Conflict { .. }
-        )))
-    ));
-    assert!(matches!(scheduler.tick(0), Err(Error::Poisoned)));
-    drop(scheduler);
-    let db = Store::open(&path).unwrap();
-    let tasks = TaskStore::new(&db);
-    let p = tasks.load(parent().id()).unwrap().unwrap().task;
+    scheduler.tick(0).unwrap();
+    let p = scheduler.get(parent().id()).unwrap().unwrap();
     assert_eq!(p.checkpoint(), &cp("start"));
-    assert_eq!(p.state(), &TaskState::Running);
-    assert!(tasks.load(child().id()).unwrap().is_none());
+    assert_eq!(p.state(), &TaskState::Ready);
+    assert!(scheduler.get(child().id()).unwrap().is_none());
     assert_eq!(
-        Documents::new(&db)
+        Documents::new(&Store::open(&path).unwrap())
             .get(&address("write"))
             .unwrap()
             .unwrap()
             .value["n"],
         0
     );
-    drop(db);
-    let mut recovered = Scheduler::open(&path, registry(None)).unwrap();
-    recovered.tick(0).unwrap();
-    drop(recovered);
-    let db = Store::open(&path).unwrap();
+    scheduler.tick(0).unwrap();
     assert_eq!(
-        TaskStore::new(&db)
-            .load(parent().id())
-            .unwrap()
-            .unwrap()
-            .task
-            .checkpoint(),
+        scheduler.get(parent().id()).unwrap().unwrap().checkpoint(),
         &cp("next")
     );
-    assert!(TaskStore::new(&db).load(child().id()).unwrap().is_some());
+    assert!(scheduler.get(child().id()).unwrap().is_some());
     assert_eq!(
-        Documents::new(&db)
+        Documents::new(&Store::open(&path).unwrap())
             .get(&address("write"))
             .unwrap()
             .unwrap()
             .value["n"],
         1
     );
+}
+
+#[test]
+fn non_replay_safe_conflict_fails_without_reinvoking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize(&path);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut r = Registry::default();
+    r.register(
+        "parent",
+        false,
+        Work {
+            conflict_path: Some(path.clone()),
+            calls: calls.clone(),
+        },
+    );
+    r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let task = parent().registered("parent".into(), false);
+    let mut scheduler = Scheduler::open(&path, r).unwrap();
+    scheduler.submit(&task).unwrap();
+    scheduler.tick(0).unwrap();
+    assert!(
+        matches!(scheduler.get(task.id()).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+    );
+    assert!(scheduler.get(child().id()).unwrap().is_none());
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let mut reopened = Scheduler::open(&path, registry(None)).unwrap();
+    reopened.tick(0).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        0
+    );
+}
+
+#[test]
+fn child_creation_conflict_is_not_treated_as_document_retry() {
+    use pi_rs_durable::task_store::Save;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let handler_path = path.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let mut r = Registry::default();
+    r.register("parent", true, move |_: &Task| {
+        handler_calls.fetch_add(1, Ordering::SeqCst);
+        let db = Store::open(&handler_path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&child())]).unwrap();
+        Ok(Step::Wait {
+            checkpoint: cp("next"),
+            condition: WaitFor::Tasks(vec![child().id()]),
+            children: vec![child()],
+        })
+    });
+    r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let mut scheduler = Scheduler::open(&path, r).unwrap();
+    scheduler.submit(&parent()).unwrap();
+    assert!(matches!(
+        scheduler.tick(0),
+        Err(pi_rs_durable::task::scheduler::Error::Document(
+            pi_rs_durable::document::Error::Store(durable_store::Error::Conflict { .. })
+        ))
+    ));
+    assert!(matches!(
+        scheduler.tick(0),
+        Err(pi_rs_durable::task::scheduler::Error::Poisoned)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

@@ -6,7 +6,8 @@
 //! Interrupted invocations replay only when both recorded and current policies
 //! allow it. External effects cannot be made atomic with this
 //! store: handlers must be pure or use destination-side idempotency/reconciliation.
-//! A storage error or panic during an invocation requires dropping this scheduler
+//! A storage error other than a recovered checked-document conflict, or a panic,
+//! during an invocation requires dropping this scheduler
 //! and reopening it; never assume an unsuccessful commit did not happen.
 //!
 //! This scheduler supports direct-child all, any and fail-fast waits. It has no
@@ -31,7 +32,7 @@ use uuid::Uuid;
 pub trait Handler: Send + Sync {
     fn run(&self, task: &Task) -> Result<Step, String>;
     /// Stage checked documents alongside a successful step. The default keeps
-    /// existing handlers unchanged. Implementations must be replay-safe.
+    /// existing handlers unchanged. Conflict retries require replay-safe registration.
     fn run_with_documents(
         &self,
         task: &Task,
@@ -470,6 +471,7 @@ impl Scheduler {
 
     /// Reevaluate waits, then run one ready task. Returns whether progress occurred.
     /// Errors after reservation poison this instance, including handler errors.
+    /// Checked-document conflicts are recovered without returning an error.
     pub fn tick(&mut self, now_millis: i64) -> Result<bool, Error> {
         self.check()?;
         let owner = self.owner();
@@ -687,19 +689,44 @@ impl Scheduler {
         let mut batch = vec![Save::Update(&next)];
         batch.extend(children.iter().map(Save::Create));
         let mut transaction = crate::document::Transaction::new();
-        transaction.append(documents.into_batch()?)?;
+        let document_batch = documents.into_batch()?;
+        let document_keys: HashSet<_> = document_batch
+            .checks
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        transaction.append(document_batch)?;
         transaction.append(self.ts().prepare_save(&batch)?)?;
         match transaction.commit(owner.store()) {
             Ok(()) => {}
             Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
                 let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
-                if !current.task.abort_requested() {
+                if current.version != running.version {
+                    if current.task.abort_requested() {
+                        self.ts().update(&current, |task| task.yield_ready())?;
+                    } else {
+                        return Err(crate::document::Error::Store(
+                            durable_store::Error::Conflict { key },
+                        )
+                        .into());
+                    }
+                } else if document_keys.contains(&key) {
+                    // The checked batch definitely did not commit. Only registered
+                    // replay-safe invocations may be run again after external effects.
+                    if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                        self.ts().update(&current, |task| task.yield_ready())?;
+                    } else {
+                        self.finish_failed(
+                            &current,
+                            "document conflict: execution outcome requires reconciliation".into(),
+                        )?;
+                    }
+                } else {
                     return Err(
                         crate::document::Error::Store(durable_store::Error::Conflict { key })
                             .into(),
                     );
                 }
-                self.ts().update(&current, |task| task.yield_ready())?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -1061,6 +1088,77 @@ mod tests {
             s.get(t.id()).unwrap().unwrap().state(),
             TaskState::Succeeded(_)
         ));
+    }
+
+    #[test]
+    fn abort_during_document_handler_discards_conflicting_output() {
+        use crate::document::{Address, TaskDocuments, Transaction};
+        use durable_store::{Expected, Store};
+        struct AbortDuring {
+            path: std::path::PathBuf,
+        }
+        impl Handler for AbortDuring {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let addr = Address {
+                    scope: "race".into(),
+                    name: "doc".into(),
+                    key: "".into(),
+                };
+                docs.get(&addr).unwrap();
+                docs.put(&addr, json!({"attempt": true}).as_object().unwrap().clone())
+                    .unwrap();
+                let db = Store::open(&self.path).unwrap();
+                let mut tx = Transaction::new();
+                tx.put(
+                    &addr,
+                    Expected::Missing,
+                    json!({"external": true}).as_object().unwrap(),
+                )
+                .unwrap();
+                tx.commit(&db).unwrap();
+                request_abort_subtree(&TaskStore::new(&db), task.id()).unwrap();
+                Ok(Step::Continue(cp("must-not-commit")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register("job", true, AbortDuring { path: path.clone() });
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        let t = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            "job",
+            true,
+            5,
+        );
+        scheduler.submit(&t).unwrap();
+        scheduler.tick(0).unwrap();
+        let after = scheduler.get(t.id()).unwrap().unwrap();
+        assert!(after.abort_requested());
+        assert_eq!(after.state(), &TaskState::Ready);
+        assert_eq!(after.checkpoint(), t.checkpoint());
+        let db = Store::open(&path).unwrap();
+        let addr = Address {
+            scope: "race".into(),
+            name: "doc".into(),
+            key: "".into(),
+        };
+        assert_eq!(
+            crate::document::Documents::new(&db)
+                .get(&addr)
+                .unwrap()
+                .unwrap()
+                .value,
+            *json!({"external": true}).as_object().unwrap()
+        );
     }
 
     #[test]
