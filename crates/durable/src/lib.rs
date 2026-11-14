@@ -19,6 +19,7 @@ pub mod ownership_edge;
 pub mod poll;
 pub mod progress;
 pub mod recovery;
+pub mod report;
 pub mod reset;
 pub mod retry_policy;
 pub mod runtime;

@@ -770,6 +770,11 @@ impl Harness {
             .collect()
     }
 
+    /// Subscribe to committed extension batches, including batches from older databases.
+    pub fn subscribe_extension_reports(&self) -> Result<crate::report::Subscription<'_>, Error> {
+        crate::report::Subscription::open(self.owner.store())
+    }
+
     fn record_extension_reports(
         &self,
         conversation_id: Uuid,
@@ -788,22 +793,14 @@ impl Harness {
             phase: phase.into(),
             reports,
         };
-        match self.owner.store().commit(
-            &[Check {
-                key: key.clone(),
-                expected: Expected::Missing,
-            }],
-            &[Mutation::Put {
-                key,
-                value: serde_json::to_vec(&batch)?,
-            }],
+        let result = crate::report::index(self.owner.store(), key, &batch, false);
+        if matches!(
+            result,
+            Err(Error::Storage(_)) | Err(Error::Observer(crate::observer::Error::Store(_)))
         ) {
-            Ok(()) | Err(durable_store::Error::Conflict { .. }) => Ok(()),
-            Err(e) => {
-                self.storage_failed.store(true, Ordering::Release);
-                Err(e.into())
-            }
+            self.storage_failed.store(true, Ordering::Release);
         }
+        result
     }
 
     /// Opens under exclusive scheduler ownership and resumes all unfinished work.
@@ -5371,6 +5368,10 @@ impl Scheduler {
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
         self.harness.extension_reports()
     }
+    /// Subscribe to the durable extension report log.
+    pub fn subscribe_extension_reports(&self) -> Result<crate::report::Subscription<'_>, Error> {
+        self.harness.subscribe_extension_reports()
+    }
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
         self.harness.install_extension(extension)
     }
@@ -6463,6 +6464,52 @@ mod scheduler_tests {
         let reports = h.extension_reports().unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reports[0].error, "first");
+    }
+    #[tokio::test]
+    async fn report_subscription_drop_allows_scheduler_shutdown_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let scheduler = Scheduler::open(&path, options(model.clone())).unwrap();
+        scheduler
+            .harness
+            .record_extension_reports(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "phase",
+                vec![crate::extension::Report {
+                    extension: "test".into(),
+                    operation: "hook".into(),
+                    error: "error".into(),
+                }],
+            )
+            .unwrap();
+        let sub = scheduler.subscribe_extension_reports().unwrap();
+        let cursor = sub.read(0, 1).unwrap()[0].cursor;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                sub.next(cursor, 1, Duration::from_secs(60))
+            )
+            .await
+            .is_err()
+        );
+        drop(sub);
+        scheduler.shutdown().await.unwrap();
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert_eq!(
+            h.subscribe_extension_reports()
+                .unwrap()
+                .read(0, 1)
+                .unwrap()
+                .len(),
+            1
+        );
     }
     #[test]
     fn legacy_conversation_defaults_and_independent_boundary_selection() {

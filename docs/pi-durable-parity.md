@@ -1,5 +1,12 @@
 # Pi Durable compatibility inventory
 
+**Extension report subscription:** `Harness` and `Scheduler` expose a bounded,
+pull-based subscription over persisted extension error batches, with explicit
+consumer cursors and replay after reopening. This is an increment toward upstream
+`onReport`, not its callback or complete report taxonomy; see the
+[delivery guarantees](../crates/durable/README.md#extension-error-observation).
+
+
 **Opt-in Ollama adapter:** The standalone [durable-ollama crate](../crates/durable-ollama/README.md) prepares and dispatches validated post-hook OpenAI-compatible chat-completions bodies to a numeric loopback endpoint. It supports SSE text and tool calls but intentionally omits native Ollama NDJSON, provider compatibility options, reasoning replay and detailed accounting. It rejects partial reported usage and tool calls missing their arguments field; malformed argument JSON is retained for tool-error handling. It is not automatically installed or selected; see the crate README for its trust and cancellation boundaries.
 
 

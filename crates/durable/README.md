@@ -418,8 +418,8 @@ persisted before invocation. Hook-supplied summaries bypass model usage.
 This is a partial upstream durable hook: the host selects message ranges rather
 than upstream entry records, so it exposes messages and a message index rather
 than entry IDs or head markers. Manual compaction currently has no instructions
-argument. Hook errors are retained in the extension report log; the harness
-does not yet expose upstream's `onReport` callback. Empty hook
+argument. Hook errors are retained in the extension report log and available through the
+pull subscription described below; upstream's `onReport` callback is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
 still subject to the host's existing idle/manual and context-selection limits.
 
@@ -529,18 +529,41 @@ children; those still require their respective scheduler ownership paths.
 
 ### Extension error observation
 
-`Harness::extension_reports()` and `Scheduler::extension_reports()` return persisted
-batches with conversation and operation IDs, phase, extension, operation and error.
-The first batch for an operation and phase wins across retries and reopening. This
-is a polling log, not upstream's `onReport` callback: it has no cursor, deletion,
-retention policy, or notification and grows without bound. Hook task failures are
-reported when their parent observes them; general task failures and handler `Err` (which poisons the task driver), storage, host and
-listener errors are not covered. Invalid child decisions, malformed hook values,
-wrapped tools, and some tool execution errors are not yet reported here. A batch is
-committed separately from the phase decision; a crash can rerun hooks and their
-external effects, which require memoization or destination-level idempotency. The
-first recorded batch may differ from a later retry's errors; callback delivery and
-exactly-once external effects are not guaranteed.
+`Harness::extension_reports()` and `Scheduler::extension_reports()` return all
+persisted batches. `subscribe_extension_reports()` provides a pull subscription
+on either host: `read(cursor, limit)` returns up to 256 batches (batch byte sizes are not capped), and
+`next(cursor, limit, poll_interval).await` waits for a nonempty page. Begin at
+cursor 0 and save each delivery's cursor **after** successfully processing its
+batch. A cursor belongs to this database, not another database or an observer
+stream. Invalid future cursors, zero intervals and page limits outside 1..=256
+are rejected. Reopening and resubscribing from the saved cursor replays any
+unacknowledged batch; external side effects require idempotency or an atomic
+host-side checkpoint. Separate consumers maintain their own cursors.
+
+A new batch and its ordered index commit atomically; concurrent commits are
+serialized by the store. Legacy batches are indexed when a subscription opens,
+in bounded pages, before it returns. Legacy ordering is indexing order, not
+original commit order. A batch is visible only after its report commit, which is
+separate from the phase decision. The first batch for an operation and phase
+wins across retries. An unknown storage commit outcome requires reopening and
+reconciliation. No callback or delivery task runs on the execution path: a
+consumer error or panic does not advance its cursor or block execution, and a
+consumer may reenter the host. Dropping the pending future or subscription stops
+waiting; subscriptions borrow the host and must be dropped before host shutdown.
+Polling uses synchronous store reads on the calling async thread and adds latency
+up to the selected interval. Subscription setup scans the existing log and may
+perform storage writes; it can contend with execution. There is no deletion or
+retention policy, and the persistent log and index grow without bound.
+
+This is an increment toward upstream's [`onReport(report)`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md#errors), not callback parity:
+it exposes batches of extension errors rather than individual reports and does
+not cover general task failures and handler `Err` (which poisons the task driver),
+storage, host and listener errors. Hook task failures are reported when their
+parent observes them. Invalid child decisions, malformed hook values, wrapped
+tools, and some tool execution errors are not yet reported here. A crash can
+rerun hooks and their external effects, which require memoization or
+destination-level idempotency. The first recorded batch may differ from a later
+retry's errors; exactly-once external effects are not guaranteed.
 
 ### Generic task definition versions
 
