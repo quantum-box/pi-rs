@@ -179,6 +179,10 @@ callbacks or queued triggers run. For an ambiguous silent-overflow summary,
 resume retains the answer, settles any started summary request as unconfirmed
 when its outcome is unknown, and records a durable skip before accepting more
 work. Failed settlement leaves recovery pending for retry.
+Saved silent-overflow recovery runs before checking the current auto-compaction
+setting or model window. A resumed run restores request and output limits from
+its journal; missing or unconfirmed usage reserves the request's full output
+allowance, while a replayed reply or summary is charged once.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

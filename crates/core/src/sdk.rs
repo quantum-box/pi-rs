@@ -9523,7 +9523,7 @@ mod tests {
                 });
                 let mut session = SessionBuilder::new(model.clone(), "fixture")
                     .limits(Limits {
-                        context_window: Some(1000),
+                        context_window: if silent && !started { None } else { Some(1000) },
                         output_tokens_per_request: 16,
                         model_requests: 3,
                         compaction_tokens: Some(crate::CompactionTokens {
@@ -9534,6 +9534,12 @@ mod tests {
                     })
                     .open(&path)
                     .unwrap();
+                if silent && started {
+                    session
+                        .controls()
+                        .set_auto_compaction_enabled(false)
+                        .unwrap();
+                }
                 if silent && started {
                     assert!(
                         session
