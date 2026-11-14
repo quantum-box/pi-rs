@@ -2092,7 +2092,8 @@ rejected, and the separate shell-stream protocol retains its 4 MiB bound.
 Single-shot responses use the same 16 MiB allowance for negotiated structured
 result hooks and retain the 4 MiB bound for other requests. Duplex call batches
 are checked against the existing 4,096-call limit before their arguments are
-materialized; arbitrary JSON within an accepted call still uses the frame bound.
+materialized. Each raw JSON argument is limited to 1 MiB before decoding; an
+oversized argument rejects the frame, including any other calls in that batch.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count

@@ -19,6 +19,7 @@ const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
 // A duplex tool-result request and its completion can each contain an 8 MiB
 // journaled outcome, including JSON-escaped structured shell output.
 const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
+const MAX_NESTED_ARGUMENT_BYTES: usize = 1024 * 1024;
 // A lifecycle event can include an 8 MiB journaled tool result, whose JSON
 // representation may expand to six times its original size when escaped.
 const MAX_REQUEST: u64 = 64 * 1024 * 1024;
@@ -2148,8 +2149,19 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
                     mut sequence: A,
                 ) -> std::result::Result<Self::Value, A::Error> {
                     for _ in 0..4096 {
-                        if sequence.next_element::<serde::de::IgnoredAny>()?.is_none() {
-                            return Ok(BoundedCalls);
+                        match sequence.next_element::<(
+                            &'de serde_json::value::RawValue,
+                            &'de serde_json::value::RawValue,
+                        )>()? {
+                            None => return Ok(BoundedCalls),
+                            Some((_, arguments))
+                                if arguments.get().len() > MAX_NESTED_ARGUMENT_BYTES =>
+                            {
+                                return Err(serde::de::Error::custom(
+                                    "nested tool arguments exceed size limit",
+                                ));
+                            }
+                            Some(_) => {}
                         }
                     }
                     if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -5450,6 +5462,27 @@ else:
             Ok(_) => panic!("oversized batch accepted"),
         };
         assert!(error.contains("batch exceeds execution limit"));
+    }
+
+    #[test]
+    fn duplex_preflight_bounds_each_raw_argument_before_materialization() {
+        let at_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 2));
+        let frame = format!(
+            "{{\"calls\":[[\"first\",{{\"a\":1}}],[\"limit\",{at_limit}],[\"last\",[true,null]]],\"type\":\"call\"}}\n"
+        );
+        let parsed = read_duplex_frame(&mut std::io::Cursor::new(frame))
+            .unwrap_or_else(|error| panic!("valid batch rejected: {error}"));
+        assert!(
+            matches!(parsed, DuplexFrame::Call { calls } if calls.len() == 3 && calls[0].1["a"] == 1 && calls[1].1.as_str().unwrap().len() == MAX_NESTED_ARGUMENT_BYTES - 2 && calls[2].1 == serde_json::json!([true,null]))
+        );
+        let structured = format!("[{}{{}}]", "{},".repeat(2_000_000));
+        assert!(structured.len() > MAX_NESTED_ARGUMENT_BYTES);
+        let frame = format!("{{\"calls\":[[\"large\",{structured}]],\"type\":\"call\"}}\n");
+        let error = match read_duplex_frame(&mut std::io::Cursor::new(frame)) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized argument accepted"),
+        };
+        assert!(error.contains("nested tool arguments exceed size limit"));
     }
 
     #[cfg(unix)]
