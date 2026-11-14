@@ -853,6 +853,46 @@ pub fn copy_text(text: &str) -> Result<()> {
     Err(Error::Config("no working clipboard command found".into()))
 }
 
+// Async variant for cancellable device-code actions. Dropping the future
+// terminates an in-progress clipboard process rather than leaving a late write.
+pub(super) async fn copy_text_async(text: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (program, arguments) in candidates {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(*arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut stdin = child.stdin.take().expect("piped clipboard");
+        let result = stdin.write_all(text.as_bytes()).await;
+        drop(stdin);
+        let status = child.wait().await?;
+        result?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(Error::Config("no working clipboard command found".into()))
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ShareContext {

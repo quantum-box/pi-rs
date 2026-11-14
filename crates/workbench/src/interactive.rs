@@ -604,6 +604,7 @@ struct RemoteTask {
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
     device_code: Option<(String, String)>,
     device_copy: Option<std::sync::mpsc::Receiver<bool>>,
+    device_cancel: pi_rs::CancellationToken,
     _cancel: tokio::sync::oneshot::Sender<()>,
     logout_control: Option<super::chatgpt_auth::LogoutControl>,
     meta_login_control: Option<super::meta_auth::LoginControl>,
@@ -647,6 +648,7 @@ impl RemoteTask {
             receiver,
             device_code: None,
             device_copy: None,
+            device_cancel: pi_rs::CancellationToken::new(),
             _cancel: cancel,
             logout_control: None,
             meta_login_control: None,
@@ -661,6 +663,23 @@ impl RemoteTask {
                 .meta_login_control
                 .as_ref()
                 .is_none_or(|control| control.cancel_before_commit())
+    }
+}
+
+impl Drop for RemoteTask {
+    fn drop(&mut self) {
+        self.device_cancel.cancel();
+    }
+}
+
+async fn run_device_side_effect<T>(
+    cancel: pi_rs::CancellationToken,
+    action: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = action => Some(result),
     }
 }
 
@@ -4453,15 +4472,28 @@ pub(super) async fn run(
                     if view.local_editor.is_none() {
                         if let Some((url, code)) = take_device_code_action(&mut view, key, &keys) {
                             view.append("Opening browser and copying code");
-                            tokio::spawn(async move {
-                                let _ = pi_rs_workbench::oauth_callback::open_browser(&url).await;
-                            });
                             let (sender, receiver) = std::sync::mpsc::channel();
-                            if let Some(task) = &mut view.remote_task {
+                            let cancel = if let Some(task) = &mut view.remote_task {
                                 task.device_copy = Some(receiver);
-                            }
-                            tokio::task::spawn_blocking(move || {
-                                let _ = sender.send(sessions::copy_text(&code).is_ok());
+                                task.device_cancel.clone()
+                            } else {
+                                continue;
+                            };
+                            let browser_cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                let _ = run_device_side_effect(browser_cancel, async move {
+                                    pi_rs_workbench::oauth_callback::open_browser(&url).await
+                                })
+                                .await;
+                            });
+                            tokio::spawn(async move {
+                                if let Some(result) = run_device_side_effect(cancel, async move {
+                                    sessions::copy_text_async(&code).await
+                                })
+                                .await
+                                {
+                                    let _ = sender.send(result.is_ok());
+                                }
                             });
                         }
                         continue;
@@ -7490,6 +7522,63 @@ mod tests {
             super::take_device_code_action(&mut view, enter, &keys).is_none(),
             "cancellation discards an unused action"
         );
+    }
+
+    #[tokio::test]
+    async fn paused_device_side_effects_stop_on_cancel_and_login_replacement() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let make_task = || {
+            super::RemoteTask::start("Signing in to xAI", "xAI login cancelled", |_| async {
+                std::future::pending::<pi_rs::Result<Vec<String>>>().await
+            })
+        };
+        for replace in [false, true] {
+            let mut view = super::View {
+                remote_task: Some(make_task()),
+                ..Default::default()
+            };
+            let cancel = view.remote_task.as_ref().unwrap().device_cancel.clone();
+            let effects = Arc::new(AtomicUsize::new(0));
+            let mut releases = Vec::new();
+            let mut started = Vec::new();
+            let mut jobs = Vec::new();
+            for _ in 0..2 {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                releases.push(release_tx);
+                started.push(started_rx);
+                let effects = effects.clone();
+                jobs.push(tokio::spawn(super::run_device_side_effect(
+                    cancel.clone(),
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        effects.fetch_add(1, Ordering::SeqCst);
+                    },
+                )));
+            }
+            for ready in started {
+                ready.await.unwrap();
+            }
+            if replace {
+                view.remote_task = Some(make_task());
+            } else {
+                super::interrupt_remote_task(&mut view);
+            }
+            for release in releases {
+                let _ = release.send(());
+            }
+            for job in jobs {
+                assert!(job.await.unwrap().is_none());
+            }
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            if replace {
+                assert!(view.remote_task.is_some());
+            }
+        }
     }
 
     #[test]
