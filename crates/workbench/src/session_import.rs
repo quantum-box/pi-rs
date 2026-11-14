@@ -955,6 +955,8 @@ fn convert(
             let usage = append_imported_usage(&mut events, &entry["usage"]);
             let usage_metadata = summary_usage_metadata(&events);
             events.push(Event::Compacted {
+                details: entry.get("details").cloned(),
+                from_extension: entry["fromHook"].as_bool().unwrap_or(false),
                 summary: required(entry, "summary")?.into(),
                 system_prompt: entry
                     .get("systemMessage")

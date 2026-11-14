@@ -290,6 +290,10 @@ enum ProtocolRequest {
         keep_turns: usize,
         state: Option<ExtensionState>,
     },
+    BeforeSummaryCompaction {
+        preparation: pi_rs_core::CompactionPreparation,
+        state: Option<ExtensionState>,
+    },
     AfterCompaction {
         summary: String,
         keep_turns: usize,
@@ -364,6 +368,8 @@ struct Description {
     tree_hook_host_calls: bool,
     #[serde(default)]
     compaction_hook_host_calls: bool,
+    #[serde(default)]
+    before_summary_compaction_v1: bool,
     #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
@@ -1773,6 +1779,39 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
     }
+    fn handles_before_summary_compaction(&self) -> bool {
+        self.description.before_summary_compaction_v1
+    }
+
+    async fn before_summary_compaction(
+        &self,
+        preparation: &pi_rs_core::CompactionPreparation,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+        if !self.description.before_summary_compaction_v1 {
+            return Ok(None);
+        }
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let duplex = self.description.compaction_hook_host_calls;
+        tokio::task::spawn_blocking(move || {
+            if duplex {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     fn before_compaction(
         &self,
         compaction: &mut Compaction,
@@ -3307,6 +3346,7 @@ async fn dispatch_inner(
             transition_hook_host_calls: true,
             tree_hook_host_calls: true,
             compaction_hook_host_calls: true,
+            before_summary_compaction_v1: extension.handles_before_summary_compaction(),
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -3813,6 +3853,11 @@ async fn dispatch_inner(
                 }
             }))
         }
+        ProtocolRequest::BeforeSummaryCompaction { preparation, state } => encode(
+            extension
+                .before_summary_compaction(&preparation, state.as_ref(), host)
+                .await,
+        ),
         ProtocolRequest::BeforeCompaction {
             summary,
             keep_turns,
@@ -3945,6 +3990,131 @@ mod tests {
         }))
         .unwrap();
         assert!(!description.pi_lifecycle_fields);
+        assert!(!description.before_summary_compaction_v1);
+    }
+
+    struct PreSummaryFixture;
+    #[async_trait::async_trait]
+    impl Extension for PreSummaryFixture {
+        fn id(&self) -> &str {
+            "pre-summary"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &pi_rs_core::CompactionPreparation,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+            assert!(host.tools().is_empty());
+            Ok(Some(pi_rs_core::BeforeSummaryCompactionResult {
+                cancel: false,
+                compaction: Some(pi_rs_core::ExtensionCompaction {
+                    summary: "provided".into(),
+                    first_kept_entry: preparation.first_kept_entry,
+                    tokens_before: preparation.tokens_before,
+                    usage: None,
+                    details: None,
+                }),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_summary_dispatch_advertises_and_returns_hook_result() {
+        let fixture: Arc<dyn Extension> = Arc::new(PreSummaryFixture);
+        let descriptor: Description = serde_json::from_value(
+            dispatch(fixture.clone(), ProtocolRequest::Describe)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(descriptor.before_summary_compaction_v1);
+        let result = dispatch_with_host(
+            fixture,
+            ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: Some(8),
+                    tokens_before: 17,
+                    reason: pi_rs_core::CompactionReason::Threshold,
+                    will_retry: false,
+                    custom_instructions: None,
+                },
+                state: None,
+            },
+            Arc::new(DetachedHost),
+        )
+        .await
+        .unwrap();
+        let result: Option<pi_rs_core::BeforeSummaryCompactionResult> =
+            serde_json::from_value(result).unwrap();
+        let result = result.unwrap().compaction.unwrap();
+        assert_eq!(result.summary, "provided");
+        assert_eq!(result.first_kept_entry, Some(8));
+        assert_eq!(result.tokens_before, 17);
+    }
+
+    #[tokio::test]
+    async fn legacy_process_is_not_sent_pre_summary_request() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[]
+        }))
+        .unwrap();
+        let extension = ExecutableExtension {
+            description,
+            endpoint: Endpoint {
+                path: PathBuf::from("nonexistent-pre-summary-executable"),
+                flags: None,
+                pi_lifecycle_fields: false,
+                text_result_v2: false,
+                structured_text_result: false,
+            },
+        };
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: None,
+            tokens_before: 0,
+            reason: pi_rs_core::CompactionReason::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        assert!(!extension.handles_before_summary_compaction());
+        assert!(
+            extension
+                .before_summary_compaction(&preparation, None, Arc::new(DetachedHost))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pre_summary_request_round_trips_only_with_explicit_capability() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"modern", "dependencies":[], "commands":[], "tools":[],
+            "before_summary_compaction_v1":true
+        }))
+        .unwrap();
+        assert!(description.before_summary_compaction_v1);
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: pi_rs_core::CompactionPreparation {
+                branch_entries: vec![],
+                first_kept_entry: Some(7),
+                tokens_before: 42,
+                reason: pi_rs_core::CompactionReason::Manual,
+                will_retry: false,
+                custom_instructions: Some("instructions".into()),
+            },
+            state: None,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        let decoded: ProtocolRequest = serde_json::from_value(wire).unwrap();
+        assert!(
+            matches!(decoded, ProtocolRequest::BeforeSummaryCompaction { preparation, .. } if preparation.first_kept_entry == Some(7) && preparation.tokens_before == 42)
+        );
     }
 
     #[test]
@@ -5454,7 +5624,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'before_summary_compaction_v1':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -5473,6 +5643,7 @@ else:
     elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
     elif kind=='before_tree': result=None
+    elif kind=='before_summary_compaction': result={'cancel':False,'compaction':{'summary':'supplied','firstKeptEntry':1,'tokensBefore':2,'usage':None,'details':None}}
     elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
     elif kind=='after_compaction': result=None
     elif kind=='before_tool': result={'allow':True,'reason':None}
@@ -5645,6 +5816,23 @@ else:
                 .unwrap()
                 .is_none()
         );
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: Some(1),
+            tokens_before: 2,
+            reason: pi_rs_core::CompactionReason::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        let supplied = extension
+            .before_summary_compaction(&preparation, None, host.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(supplied.summary, "supplied");
+        assert_eq!(supplied.first_kept_entry, Some(1));
         let mut compaction = Compaction {
             summary: "summary".into(),
             keep_turns: 1,
@@ -5663,7 +5851,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 14);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 15);
     }
 
     #[tokio::test]
