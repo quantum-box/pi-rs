@@ -2001,7 +2001,7 @@ async fn execute(
         }
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let shared = destination.share(session, &args.workspace).await?;
+            let shared = destination.share(session, &args.workspace, None).await?;
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);

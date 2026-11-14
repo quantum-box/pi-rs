@@ -853,6 +853,21 @@ pub fn copy_text(text: &str) -> Result<()> {
     Err(Error::Config("no working clipboard command found".into()))
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ShareContext {
+    pub system_prompt: String,
+    pub tools: Vec<pi_rs::ToolSpec>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ShareSnapshot {
+    pub session_id: uuid::Uuid,
+    pub head: u64,
+    pub context: ShareContext,
+}
+
 pub(super) enum ShareDestination {
     Radius {
         endpoint: reqwest::Url,
@@ -915,6 +930,10 @@ impl ShareDestination {
         })
     }
 
+    pub(super) fn is_radius(&self) -> bool {
+        matches!(self, Self::Radius { .. })
+    }
+
     pub(super) fn status(&self) -> &'static str {
         match self {
             Self::Radius { .. } => "Uploading to Radius",
@@ -922,7 +941,12 @@ impl ShareDestination {
         }
     }
 
-    pub(super) async fn share(self, session: Session, workspace: &Path) -> Result<SharedSession> {
+    pub(super) async fn share(
+        self,
+        session: Session,
+        workspace: &Path,
+        snapshot: Option<ShareSnapshot>,
+    ) -> Result<SharedSession> {
         match self {
             Self::Radius {
                 mut endpoint,
@@ -930,8 +954,20 @@ impl ShareDestination {
                 proxies,
                 idle_timeout,
             } => {
+                if snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.session_id != session.session_id() || snapshot.head != session.head()
+                }) {
+                    return Err(Error::Config(
+                        "Session changed while preparing the share; try again".into(),
+                    ));
+                }
+                let context = snapshot;
                 let body = super::rpc_entries::Entries::new(&session)
-                    .write_share_branch(&session, workspace)?;
+                    .write_share_branch_with_context(
+                        &session,
+                        workspace,
+                        context.as_ref().map(|snapshot| &snapshot.context),
+                    )?;
                 drop(session);
                 let token = match *credential {
                     RadiusCredential::ApiKey(key) => key,
@@ -1077,7 +1113,7 @@ mod tests {
             proxies: vec![proxy],
             idle_timeout: None,
         };
-        let shared = destination.share(session, root.path()).await.unwrap();
+        let shared = destination.share(session, root.path(), None).await.unwrap();
         assert_eq!(shared.url, "https://example.com/shared");
         let (request, headers, _) = server.await.unwrap();
         assert!(request.starts_with("POST http://127.0.0.1:1/v1/artifacts?"));
@@ -1087,6 +1123,81 @@ mod tests {
                 .contains("authorization: bearer fixture-token")
         );
     }
+    #[tokio::test]
+    async fn radius_share_uploads_context_for_matching_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "live instructions".into(),
+                tools: vec![pi_rs::ToolSpec {
+                    name: "read".into(),
+                    description: "Read a file".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }],
+            },
+        };
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+            .unwrap();
+        let (_, _, body) = server.await.unwrap();
+        let entries: Vec<serde_json::Value> = body
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["type"], "custom");
+        assert_eq!(entries[1]["customType"], "pi.share");
+        assert!(entries[1]["parentId"].is_null());
+        assert_eq!(entries[1]["data"]["systemPrompt"], "live instructions");
+        assert_eq!(
+            entries[1]["data"]["tools"][0],
+            serde_json::json!({"name":"read","description":"Read a file","parameters":{"type":"object"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn radius_share_rejects_stale_snapshot_before_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head() + 1,
+            context: ShareContext {
+                system_prompt: "stale".into(),
+                tools: vec![],
+            },
+        };
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![],
+            idle_timeout: None,
+        };
+        let error = match destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+        {
+            Ok(_) => panic!("stale context accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Session changed"));
+    }
+
     #[test]
     fn session_ids_and_prefixes_resolve_without_changing_journals() {
         let root = tempfile::tempdir().unwrap();

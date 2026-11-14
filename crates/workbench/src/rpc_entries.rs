@@ -167,10 +167,30 @@ impl Entries {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub(super) fn write_share_branch(
         self,
         session: &Session,
         cwd: &std::path::Path,
+    ) -> Result<Vec<u8>> {
+        self.write_share_branch_with_context(session, cwd, None)
+    }
+
+    pub(super) fn write_share_branch_with_context(
+        self,
+        session: &Session,
+        cwd: &std::path::Path,
+        context: Option<&super::sessions::ShareContext>,
+    ) -> Result<Vec<u8>> {
+        self.write_share_branch_bounded(session, cwd, context, 128 * 1024 * 1024)
+    }
+
+    fn write_share_branch_bounded(
+        self,
+        session: &Session,
+        cwd: &std::path::Path,
+        context: Option<&super::sessions::ShareContext>,
+        limit: usize,
     ) -> Result<Vec<u8>> {
         let by_id: HashMap<_, _> = self
             .values
@@ -188,16 +208,35 @@ impl Entries {
         let header = session_header(session, cwd);
         let mut body = serde_json::to_vec(&header)?;
         body.push(b'\n');
+        if body.len() > limit {
+            return Err(Error::Config("session share exceeds 128 MiB".into()));
+        }
         let mut parent = Value::Null;
         for entry in branch.into_iter().rev() {
             let mut entry = entry.clone();
             entry["parentId"] = parent;
             serde_json::to_writer(&mut body, &entry)?;
             body.push(b'\n');
-            if body.len() > 128 * 1024 * 1024 {
+            if body.len() > limit {
                 return Err(Error::Config("session share exceeds 128 MiB".into()));
             }
             parent = entry["id"].clone();
+        }
+        if let Some(context) = context {
+            let id = loop {
+                let id = uuid::Uuid::new_v4().to_string()[..8].to_owned();
+                if !by_id.contains_key(id.as_str()) {
+                    break id;
+                }
+            };
+            let entry = json!({"type":"custom", "customType":"pi.share", "id":id,
+                "parentId":parent, "timestamp":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "data":context});
+            serde_json::to_writer(&mut body, &entry)?;
+            body.push(b'\n');
+            if body.len() > limit {
+                return Err(Error::Config("session share exceeds 128 MiB".into()));
+            }
         }
         Ok(body)
     }
@@ -713,6 +752,44 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn share_context_is_trailing_bounded_and_not_journaled() {
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        let before = session.records().len();
+        let context = super::super::sessions::ShareContext {
+            system_prompt: "actual prompt".into(),
+            tools: vec![pi_rs::ToolSpec {
+                name: "read".into(),
+                description: "description".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+        };
+        let body = super::Entries::new(&session)
+            .write_share_branch_with_context(&session, std::path::Path::new("."), Some(&context))
+            .unwrap();
+        let entries: Vec<serde_json::Value> = body
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let trailing = entries.last().unwrap();
+        assert_eq!(trailing["customType"], "pi.share");
+        assert_eq!(trailing["parentId"], entries[entries.len() - 2]["id"]);
+        assert_eq!(trailing["data"]["systemPrompt"], "actual prompt");
+        assert_eq!(session.records().len(), before);
+        let error = super::Entries::new(&session)
+            .write_share_branch_bounded(
+                &session,
+                std::path::Path::new("."),
+                Some(&context),
+                body.len() - 1,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("128 MiB"));
+    }
     use super::*;
     use std::io::Write;
 

@@ -2821,6 +2821,13 @@ fn slash(
         }
         "/share" => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let snapshot = if destination.is_radius() && !args.trust_pending {
+                worker
+                    .map(|worker| Worker::share_snapshot(worker, args))
+                    .transpose()?
+            } else {
+                None
+            };
             let status = destination.status();
             let path = args.session.clone();
             let workspace = args.workspace.clone();
@@ -2829,7 +2836,7 @@ fn slash(
                 "Share cancelled",
                 move |_| async move {
                     let session = Session::snapshot(path)?;
-                    let shared = destination.share(session, &workspace).await?;
+                    let shared = destination.share(session, &workspace, snapshot).await?;
                     let mut lines = vec![format!("Share URL: {}", shared.url)];
                     if let Some(gist) = shared.gist {
                         lines.push(format!("Gist: {gist}"));
@@ -5056,7 +5063,9 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if input.trim() == "/session" && view.draft_images.is_empty() {
+                        } else if matches!(input.trim(), "/session" | "/share")
+                            && view.draft_images.is_empty()
+                        {
                             if let Err(error) =
                                 slash(&input, &mut args, &mut view, Some(&mut worker))
                             {

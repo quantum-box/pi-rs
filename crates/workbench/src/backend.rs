@@ -140,6 +140,10 @@ enum Request {
     GetCommands {
         id: Option<serde_json::Value>,
     },
+    GetShareContext {
+        id: Option<serde_json::Value>,
+        session: PathBuf,
+    },
     ReadSession {
         request: serde_json::Value,
         path: PathBuf,
@@ -159,6 +163,7 @@ struct ReaderControls {
     command_catalog: Arc<Mutex<serde_json::Value>>,
     resources: Arc<Mutex<super::resources::Resources>>,
     resources_ready: tokio::sync::watch::Receiver<bool>,
+    share_ready: tokio::sync::watch::Receiver<bool>,
     registry: pi_rs::Registry,
     lifecycle_timeout: std::time::Duration,
     trace: bool,
@@ -177,6 +182,8 @@ struct ControlState {
 struct SessionSnapshot {
     records: Vec<pi_rs::Record>,
     entries: Option<super::rpc_entries::Cursor>,
+    share_base: Option<super::sessions::ShareContext>,
+    share_active: Option<super::sessions::ShareContext>,
 }
 
 impl SessionSnapshot {
@@ -185,7 +192,35 @@ impl SessionSnapshot {
         if let Some(cursor) = &mut entries {
             cursor.advance(&records);
         }
-        Self { records, entries }
+        Self {
+            records,
+            entries,
+            share_base: None,
+            share_active: None,
+        }
+    }
+
+    fn share_snapshot(&self) -> Result<super::sessions::ShareSnapshot> {
+        let session = Session::from_records(self.records.clone())?;
+        let base = self
+            .share_base
+            .as_ref()
+            .ok_or_else(|| Error::Config("share context is not ready".into()))?;
+        let context = if let Some(active) = &self.share_active {
+            active.clone()
+        } else {
+            let (system_prompt, tools) =
+                session.effective_system_context(&base.system_prompt, base.tools.clone());
+            super::sessions::ShareContext {
+                system_prompt,
+                tools,
+            }
+        };
+        Ok(super::sessions::ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context,
+        })
     }
 
     fn refresh(&mut self, session: &Session) {
@@ -296,6 +331,7 @@ async fn run_worker(
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
         tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
         inputs.clone(),
@@ -309,6 +345,7 @@ async fn run_worker(
             command_catalog: command_catalog.clone(),
             resources: shared_resources.clone(),
             resources_ready: ready_receiver,
+            share_ready: share_receiver,
             registry: runtime.registry.clone(),
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
@@ -357,7 +394,12 @@ async fn run_worker(
             },
         )
         .await?;
-    snapshot.lock().expect("session snapshot").refresh(&session);
+    {
+        let mut snapshot = snapshot.lock().expect("session snapshot");
+        snapshot.refresh(&session);
+        snapshot.share_base = Some(runtime.share_base());
+    }
+    share_ready.send_replace(true);
     let startup_trigger = session
         .host_binding()
         .is_none()
@@ -533,6 +575,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
                 }
@@ -585,6 +628,12 @@ async fn run_worker(
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
             }
+            {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.share_base = Some(runtime.share_base());
+                snapshot.share_active = None;
+            }
+            share_ready.send_replace(true);
             continue;
         }
         let request = match request {
@@ -683,10 +732,39 @@ async fn run_worker(
             }
             args.record_automatic_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
-            snapshot.lock().expect("session snapshot").refresh(session);
+            {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.refresh(session);
+                snapshot.share_base = Some(runtime.share_base());
+                snapshot.share_active = None;
+            }
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
+            let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
+                match &event {
+                    pi_rs::Notification::SummaryRequest => summary_request = true,
+                    pi_rs::Notification::Request(request) => {
+                        if !summary_request {
+                            let system_prompt = request
+                                .messages
+                                .iter()
+                                .filter_map(|message| match message {
+                                    pi_rs::Message::System { content } => Some(content.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            snapshot.lock().expect("session snapshot").share_active =
+                                Some(super::sessions::ShareContext {
+                                    system_prompt,
+                                    tools: request.tools.clone(),
+                                });
+                        }
+                        summary_request = false;
+                    }
+                    _ => {}
+                }
                 cache_capture.observe(&event);
                 observe_snapshot(event, args.trace, &snapshot);
             };
@@ -997,6 +1075,11 @@ async fn run_worker(
         };
         drop(operation);
         active.lock().expect("worker control").token = None;
+        {
+            let mut snapshot = snapshot.lock().expect("session snapshot");
+            snapshot.share_base = Some(runtime.share_base());
+            snapshot.share_active = None;
+        }
         if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
             let recorded = input.apply(session, &mut |event| {
                 observe_snapshot(event, args.trace, &snapshot)
@@ -1223,6 +1306,7 @@ fn read_requests(
         command_catalog,
         resources,
         resources_ready,
+        share_ready,
         registry,
         lifecycle_timeout,
         trace,
@@ -1282,6 +1366,37 @@ fn read_requests(
                         request.get("id").cloned(),
                         result,
                     );
+                }
+                Request::GetShareContext { id, session } => {
+                    let mut ready = share_ready.clone();
+                    let snapshot = snapshot.clone();
+                    let active = active.clone();
+                    runtime.spawn(async move {
+                        while !*ready.borrow_and_update() {
+                            if ready.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        // Refresh frontend edits to the same journal only while idle.
+                        let current = Session::snapshot(&session).ok();
+                        let result = {
+                            let state = active.lock().expect("worker control");
+                            let mut snapshot = snapshot.lock().expect("session snapshot");
+                            if state.token.is_none()
+                                && state.queued == 0
+                                && let Some(current) = current
+                                && Session::from_records(snapshot.records.clone()).is_ok_and(
+                                    |previous| previous.session_id() == current.session_id(),
+                                )
+                            {
+                                snapshot.refresh(&current);
+                            }
+                            snapshot.share_snapshot().and_then(|snapshot| {
+                                serde_json::to_value(snapshot).map_err(Into::into)
+                            })
+                        };
+                        control_response("get_share_context", id, result);
+                    });
                 }
                 Request::GetCommands { id } => {
                     let mut ready = resources_ready.clone();
