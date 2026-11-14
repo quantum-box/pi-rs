@@ -1672,6 +1672,27 @@ impl Session {
         Ok(records)
     }
 
+    pub(crate) fn fork_session_after_handoff(&self, requested: u64) -> Result<Self> {
+        let target = self.fork_target_after_handoff(requested)?;
+        let records = self.fork_records_after_handoff(requested)?;
+        let metadata = self
+            .path(target)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, original)| {
+                let forked = records.get(index)?;
+                (std::mem::discriminant(&original.event) == std::mem::discriminant(&forked.event))
+                    .then(|| {
+                        self.record_metadata
+                            .get(&original.id)
+                            .map(|value| (forked.id, value.clone()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        Self::from_records_with_metadata(records, metadata)
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -3496,6 +3517,8 @@ mod record_metadata_tests {
         let fork_path = directory.path().join("fork.jsonl");
         let fork = session.fork_to(id, &fork_path).unwrap();
         assert_eq!(fork.record_metadata(id), Some(&metadata));
+        let in_memory_fork = session.fork_session_after_handoff(id).unwrap();
+        assert_eq!(in_memory_fork.record_metadata(id), Some(&metadata));
         drop(session);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));

@@ -2393,7 +2393,7 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.journal()?.fork_records_after_handoff(record)?)?;
+        let session = self.journal()?.fork_session_after_handoff(record)?;
         let resolution = self.resolve_branch_model(&session, session.head())?;
         self.fork_snapshot(session, resolution)
     }
@@ -2411,8 +2411,7 @@ impl AgentSession {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
-        let records = journal.fork_records_after_handoff(record)?;
-        let snapshot = Session::from_records(records)?;
+        let snapshot = journal.fork_session_after_handoff(record)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.fork_snapshot_to(snapshot, resolution, &destination)
@@ -2458,7 +2457,7 @@ impl AgentSession {
             }
         };
         let target = journal.fork_target_after_handoff(target)?;
-        let snapshot = Session::from_records(journal.fork_records_after_handoff(target)?)?;
+        let snapshot = journal.fork_session_after_handoff(target)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.start().await?;
@@ -2482,7 +2481,7 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
-        let snapshot = Session::from_records(self.journal()?.fork_records_after_handoff(target)?)?;
+        let snapshot = self.journal()?.fork_session_after_handoff(target)?;
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
