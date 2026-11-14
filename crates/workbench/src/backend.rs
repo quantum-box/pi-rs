@@ -345,7 +345,13 @@ fn snapshot_for_share_with_hook(
     hook: impl FnOnce(),
 ) -> Result<super::sessions::ShareSnapshot> {
     snapshot_and_session_for_share_with_hook(active, snapshot, current, hook)
-        .map(|(snapshot, _session)| snapshot)
+        .map(|(snapshot, _session, _stamp)| snapshot)
+}
+
+#[derive(Clone, Copy)]
+struct ShareCaptureStamp {
+    revision: u64,
+    idle: bool,
 }
 
 // Keep the journal that produced the context alongside it. A future durable
@@ -355,7 +361,7 @@ fn snapshot_and_session_for_share_with_hook(
     snapshot: &Mutex<SessionSnapshot>,
     current: Option<Session>,
     hook: impl FnOnce(),
-) -> Result<(super::sessions::ShareSnapshot, Session)> {
+) -> Result<(super::sessions::ShareSnapshot, Session, ShareCaptureStamp)> {
     let changed = || Error::Config("Share context changed; try sharing again".into());
     let (revision, count, base, selected, pending, emit_entries, idle) = {
         let state = active.lock().expect("worker control");
@@ -439,10 +445,37 @@ fn snapshot_and_session_for_share_with_hook(
             std::mem::replace(&mut snapshot.entries, prepared.entries),
         )
     });
+    let stamp = ShareCaptureStamp {
+        revision: snapshot.revision,
+        idle,
+    };
     drop(snapshot);
     drop(state);
     drop(old);
-    Ok((result, session))
+    Ok((result, session, stamp))
+}
+
+fn finalize_share_capture(
+    active: &Mutex<ControlState>,
+    state_snapshot: &Mutex<SessionSnapshot>,
+    mut share: super::sessions::ShareSnapshot,
+    journal: Session,
+    stamp: ShareCaptureStamp,
+    key: Option<[u8; 32]>,
+) -> Result<(super::sessions::ShareSnapshot, Session)> {
+    if let Some(key) = key {
+        share.journal_tag = Some(super::sessions::share_journal_tag(&journal, &key)?);
+    }
+    let state = active.lock().expect("worker control");
+    let snapshot = state_snapshot.lock().expect("session snapshot");
+    if snapshot.revision != stamp.revision
+        || stamp.idle != (state.token.is_none() && state.queued == 0)
+    {
+        return Err(Error::Config(
+            "Share context changed; try sharing again".into(),
+        ));
+    }
+    Ok((share, journal))
 }
 
 #[cfg(test)]
@@ -485,12 +518,15 @@ where
             let current = if idle { read() } else { None };
             let result =
                 snapshot_and_session_for_share_with_hook(&active, &snapshot, current, || {})
-                    .and_then(|(mut snapshot, journal)| {
-                        if let Some(key) = journal_key {
-                            snapshot.journal_tag =
-                                Some(super::sessions::share_journal_tag(&journal, &key)?);
-                        }
-                        Ok((snapshot, journal))
+                    .and_then(|(share, journal, stamp)| {
+                        finalize_share_capture(
+                            &active,
+                            &snapshot,
+                            share,
+                            journal,
+                            stamp,
+                            journal_key,
+                        )
                     });
             let _ = send.send(result);
         })
@@ -2007,6 +2043,35 @@ mod share_context_tests {
     }
 
     #[test]
+    fn live_context_change_after_capture_is_rejected_before_response() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "before".into(),
+            tools: vec![],
+        }));
+        let active = Mutex::new(ControlState::default());
+        let snapshot = Mutex::new(worker);
+        let (share, journal, stamp) =
+            snapshot_and_session_for_share_with_hook(&active, &snapshot, None, || {}).unwrap();
+        {
+            let mut current = snapshot.lock().unwrap();
+            let registry = Registry::default();
+            current.track_share_event(
+                &Notification::ModelContext {
+                    system_prompt: "after",
+                    registry: &registry,
+                },
+                &mut false,
+            );
+        }
+        assert!(
+            finalize_share_capture(&active, &snapshot, share, journal, stamp, Some([7; 32]))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn captured_share_context_keeps_exact_source_journal() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session
@@ -2018,7 +2083,7 @@ mod share_context_tests {
             system_prompt: "live prompt".into(),
             tools: vec![],
         }));
-        let (share, captured) = snapshot_and_session_for_share_with_hook(
+        let (share, captured, _stamp) = snapshot_and_session_for_share_with_hook(
             &Mutex::new(ControlState::default()),
             &Mutex::new(worker),
             None,
@@ -2056,7 +2121,7 @@ mod share_context_tests {
             system_prompt: "live context".into(),
             tools: vec![],
         }));
-        let (share, journal) = snapshot_and_session_for_share_with_hook(
+        let (share, journal, _stamp) = snapshot_and_session_for_share_with_hook(
             &Mutex::new(ControlState::default()),
             &Mutex::new(worker),
             None,
