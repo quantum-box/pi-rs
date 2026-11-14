@@ -18,6 +18,10 @@ anthropic = ["dep:pi-rs-anthropic"]
 google = ["dep:pi-rs-google"]
 openai = ["dep:pi-rs-openai"]
 
+[[example]]
+name = "native_sdk_host"
+required-features = ["ollama"]
+
 [dependencies]
 pi-rs-bedrock = { path = "crates/bedrock", version = "0.1.0", optional = true }
 pi-rs-core = { path = "crates/core", version = "0.1.0" }

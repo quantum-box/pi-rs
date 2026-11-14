@@ -4,6 +4,9 @@ An embeddable Rust agent loop with streaming model responses, tools, an
 append-only session journal, and native Rust extensions. The workbench offers
 an interactive terminal, print and JSON output, and a JSONL control interface.
 
+For native Rust embedding, including a Tauri host example and the current
+browser-WASM limitations, see [the SDK embedding guide](docs/sdk-embedding.md).
+
 ## Interactive terminal
 
 ```sh
