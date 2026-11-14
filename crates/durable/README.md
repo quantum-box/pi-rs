@@ -559,6 +559,12 @@ the operation stale if its context generation or source prefix changed; an
 abort committed first settles it aborted. The stale check is conservative,
 not upstream's retained-entry head test: it can reject a cut that upstream
 would still accept after a preceding compaction.
+For tracked manual operations, queued resets committed before the summary's
+placement admission are placed first, making the summary stale; resets admitted
+after that checkpoint are placed afterward. Concurrent reset admissions merged
+into the checkpoint count as earlier. Older checkpoints without ordering data
+retain their previous placement behavior. This orders only manual summaries and
+resets, not a general inbox or independently scheduled compaction.
 Runtime-owned preparations also pin the context generation; a reset or another
 applied compaction invalidates the pinned generation even if message text later
 matches. Legacy in-flight preparations without a generation can finish while

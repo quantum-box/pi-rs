@@ -267,6 +267,10 @@ enum Phase {
     /// A completed, accounted summary awaiting an atomic placement decision.
     CompactionPlacement {
         result: Box<crate::compact::CompactionResult>,
+        /// Resets admitted before this manual result. None preserves legacy and
+        /// blocking automatic compaction behavior.
+        #[serde(default)]
+        resets_before: Option<Vec<Uuid>>,
     },
     Accounting {
         turns: u32,
@@ -1618,6 +1622,16 @@ impl Harness {
                     state.after_failed_run = latest.after_failed_run;
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
+                    }
+                    // A manual summary is admitted at this commit, not when
+                    // its hook or usage callback began. Reset admissions merged
+                    // into this commit therefore precede the summary.
+                    if let Phase::CompactionPlacement {
+                        resets_before: Some(before),
+                        ..
+                    } = &mut state.phase
+                    {
+                        *before = state.pending_resets.iter().map(|reset| reset.id).collect();
                     }
                     for (original, current) in base
                         .application_writes
@@ -4690,6 +4704,9 @@ impl Harness {
                             })?;
                             c.phase = Phase::CompactionPlacement {
                                 result: Box::new(result),
+                                resets_before: c.active_manual_compaction.map(|_| {
+                                    c.pending_resets.iter().map(|reset| reset.id).collect()
+                                }),
                             };
                         }
                     }
@@ -4785,10 +4802,34 @@ impl Harness {
                             Err(_) => { self.failed = true; return Err(Error::Interrupted); }
                         }
                     }
-                    c.phase = Phase::CompactionPlacement { result };
+                    c.phase = Phase::CompactionPlacement {
+                        result,
+                        resets_before: c
+                            .active_manual_compaction
+                            .map(|_| c.pending_resets.iter().map(|reset| reset.id).collect()),
+                    };
                     self.save(&c, Expected::Version(version))?;
                 }
-                Phase::CompactionPlacement { result } => {
+                Phase::CompactionPlacement {
+                    result,
+                    resets_before,
+                } => {
+                    if let Some(before) = resets_before {
+                        if before.len() > c.pending_resets.len()
+                            || !before
+                                .iter()
+                                .zip(&c.pending_resets)
+                                .all(|(id, reset)| *id == reset.id)
+                        {
+                            return Err(Error::Invalid(
+                                "compaction reset ordering is inconsistent".into(),
+                            ));
+                        }
+                        let prior: Vec<_> = c.pending_resets.drain(..before.len()).collect();
+                        for reset in prior {
+                            place_reset(&mut c, reset);
+                        }
+                    }
                     if c.active_manual_compaction.is_some()
                         && result.is_stale(&c.messages, c.context_generation)
                     {
@@ -7994,6 +8035,7 @@ mod scheduler_tests {
             .unwrap();
         c.phase = Phase::CompactionPlacement {
             result: Box::new(result),
+            resets_before: Some(vec![]),
         };
         h.save(&c, Expected::Version(version)).unwrap();
         (id, operation)
@@ -8103,13 +8145,103 @@ mod scheduler_tests {
         }
     }
     #[tokio::test]
+    async fn reset_after_manual_placement_admission_does_not_make_result_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (id, operation);
+        {
+            let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            (id, operation) = prepare_manual_placement(&mut h);
+            h.reset(id, Some("later reset".into())).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Applied
+            }
+        );
+        assert_eq!(
+            c.messages,
+            vec![Message::User {
+                content: "later reset".into()
+            }]
+        );
+    }
+    #[tokio::test]
+    async fn reset_racing_manual_result_commit_is_ordered_before_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (id, operation);
+        {
+            let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.messages = vec![
+                Message::User {
+                    content: "old".into(),
+                },
+                Message::User {
+                    content: "new".into(),
+                },
+            ];
+            h.save(&c, Expected::Version(version)).unwrap();
+            operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+            let mut result_worker = h.worker();
+            let mut reset_worker = h.worker();
+            let (mut snapshot, version) = result_worker.load(id).unwrap();
+            let Phase::CompactionHook { preparation, .. } = snapshot.phase else {
+                panic!("missing preparation")
+            };
+            let result = preparation
+                .finish(CompletedGeneration {
+                    content: "checkpoint".into(),
+                    calls: vec![],
+                    usage: None,
+                    metadata: Default::default(),
+                })
+                .unwrap();
+            snapshot.phase = Phase::CompactionPlacement {
+                result: Box::new(result),
+                resets_before: Some(vec![]),
+            };
+            let reset = reset_worker.reset(id, Some("first reset".into())).unwrap();
+            result_worker
+                .save(&snapshot, Expected::Version(version))
+                .unwrap();
+            let committed = result_worker.conversation(id).unwrap();
+            assert!(
+                matches!(committed.phase, Phase::CompactionPlacement { resets_before: Some(ref ids), .. } if ids == &vec![reset])
+            );
+        }
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Stale
+            }
+        );
+        assert_eq!(
+            c.messages,
+            vec![Message::User {
+                content: "first reset".into()
+            }]
+        );
+    }
+    #[tokio::test]
     async fn manual_placement_conflicts_with_concurrent_abort() {
         let dir = tempfile::tempdir().unwrap();
         let mut h =
             Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
         let (id, operation) = prepare_manual_placement(&mut h);
         let (mut candidate, version) = h.load(id).unwrap();
-        let Phase::CompactionPlacement { result } = candidate.phase.clone() else {
+        let Phase::CompactionPlacement { result, .. } = candidate.phase.clone() else {
             panic!("missing placement")
         };
         candidate.messages = result

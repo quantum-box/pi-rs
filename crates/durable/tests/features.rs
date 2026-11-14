@@ -560,6 +560,182 @@ async fn manual_compaction_restart_limit_has_terminal_status() {
 }
 
 #[tokio::test]
+async fn ordered_compaction_crash_child() {
+    let Ok(path) = std::env::var("PI_ORDERED_COMPACTION_DB") else {
+        return;
+    };
+    struct WaitingModel(String);
+    #[async_trait]
+    impl Model for WaitingModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                std::fs::write(format!("{}.running", self.0), b"running").unwrap();
+                Ok(stream::pending().boxed())
+            } else { ModelStub.stream(request).await }
+        }
+    }
+    let mut h = Harness::open_paused(
+        &path,
+        Options {
+            model: Arc::new(WaitingModel(path.clone())),
+            ..opts()
+        },
+    )
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let cancel = CancellationToken::new();
+    h.submit_and_run(id, None, "old".into(), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(id, None, "new".into(), &cancel)
+        .await
+        .unwrap();
+    let operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    let reset = h.reset(id, Some("after crash".into())).unwrap();
+    std::fs::write(format!("{path}.ids"), format!("{id} {operation} {reset}")).unwrap();
+    h.resume(&cancel).await.unwrap();
+}
+
+#[tokio::test]
+async fn reset_before_summary_survives_process_death_and_recovery() {
+    use pi_rs_durable::runtime::ManualCompactionStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let running = dir.path().join("db.running");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "ordered_compaction_crash_child"])
+        .env("PI_ORDERED_COMPACTION_DB", &path)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !running.exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("summary did not start")
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let ids = std::fs::read_to_string(dir.path().join("db.ids")).unwrap();
+    let mut ids = ids
+        .split_whitespace()
+        .map(|s| uuid::Uuid::parse_str(s).unwrap());
+    let id = ids.next().unwrap();
+    let operation = ids.next().unwrap();
+    let reset = ids.next().unwrap();
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    h.resume(&CancellationToken::new()).await.unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.manual_compactions[0].id, operation);
+    assert_eq!(
+        c.manual_compactions[0].status,
+        ManualCompactionStatus::Stale
+    );
+    assert!(c.resets.iter().any(|r| r.id == reset));
+    assert_eq!(
+        c.messages,
+        vec![Message::User {
+            content: "after crash".into()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn reset_queued_during_manual_summary_precedes_its_placement() {
+    use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
+    use tokio::sync::Semaphore;
+    struct GatedSummary {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+    #[async_trait]
+    impl Model for GatedSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                self.started.add_permits(1);
+                let release = self.release.clone();
+                Ok(stream::once(async move { release.acquire().await.unwrap().forget(); Ok(ModelEvent::Text("checkpoint".into())) }).chain(stream::iter(vec![Ok(ModelEvent::Complete { calls: vec![], usage: None })])).boxed())
+            } else { ModelStub.stream(request).await }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let started = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let mut s = Scheduler::open(
+        &path,
+        Options {
+            model: Arc::new(GatedSummary {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            ..opts()
+        },
+    )
+    .unwrap();
+    let operation = s.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let reset = s.reset(id, Some("handoff".into())).unwrap();
+    release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        s.wait_for_idle(id, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let c = s.conversation(id).unwrap();
+    assert_eq!(c.manual_compactions[0].id, operation);
+    assert_eq!(
+        c.manual_compactions[0].status,
+        ManualCompactionStatus::Stale
+    );
+    assert!(c.resets.iter().any(|r| r.id == reset));
+    assert_eq!(
+        c.messages,
+        vec![Message::User {
+            content: "handoff".into()
+        }]
+    );
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().manual_compactions[0].status,
+        ManualCompactionStatus::Stale
+    );
+}
+
+#[tokio::test]
 async fn manual_compaction_abort_during_summary_survives_reopen() {
     use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
     use tokio::sync::Semaphore;
