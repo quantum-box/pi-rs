@@ -4149,7 +4149,8 @@ be foregrounded. For a same-session launcher without job control, a separate
 supervisor resumes Pi if it still owns the terminal after one second. A shell
 that takes terminal ownership retains control until it foregrounds Pi. A shell
 `bg` resumes Pi's processes and the separately grouped external editor; an
-editor that reads the terminal while backgrounded is stopped by job control.
+editor that reads the terminal while backgrounded is stopped by job control,
+and subsequent `bg` signals continue it again.
 Pi upstream instead starts the editor in the same job group as Pi. The native
 terminal handoff waits for `fg`, including when the editor exits in the
 background. Cancellation restores

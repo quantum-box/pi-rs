@@ -87,3 +87,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"

@@ -7290,6 +7290,57 @@ struct EditorJobSupervisor {
     response: std::os::fd::RawFd,
 }
 
+// signal-hook preserves other SIGCONT listeners. Keep the editor child
+// unreaped until this registration is removed, so its process group cannot
+// be recycled while the callback can still signal it.
+#[cfg(unix)]
+struct EditorContinueForwarder {
+    id: signal_hook_registry::SigId,
+    state: std::sync::Arc<EditorContinueState>,
+}
+
+#[cfg(unix)]
+struct EditorContinueState {
+    active: std::sync::atomic::AtomicBool,
+    running: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl EditorContinueForwarder {
+    fn new(group: libc::pid_t) -> std::io::Result<Self> {
+        use std::sync::atomic::Ordering;
+        let state = std::sync::Arc::new(EditorContinueState {
+            active: std::sync::atomic::AtomicBool::new(true),
+            running: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let callback_state = state.clone();
+        // SAFETY: kill is async-signal-safe and the positive group ID belongs
+        // to the unreaped editor child until in-flight callbacks have finished.
+        let id = unsafe {
+            signal_hook_registry::register(libc::SIGCONT, move || {
+                callback_state.running.fetch_add(1, Ordering::SeqCst);
+                if callback_state.active.load(Ordering::SeqCst) {
+                    libc::kill(-group, libc::SIGCONT);
+                }
+                callback_state.running.fetch_sub(1, Ordering::SeqCst);
+            })
+        }?;
+        Ok(Self { id, state })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EditorContinueForwarder {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.state.active.store(false, Ordering::SeqCst);
+        signal_hook_registry::unregister(self.id);
+        while self.state.running.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[cfg(unix)]
 impl EditorJobSupervisor {
     fn start(tty: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result<Self> {
@@ -7424,18 +7475,13 @@ impl EditorJobSupervisor {
         })
     }
 
-    fn stop_and_wait(&self, editor_group: libc::pid_t) -> std::io::Result<()> {
+    fn stop_and_wait(&self) -> std::io::Result<()> {
         let command = 1u8;
         if unsafe { libc::write(self.control, (&command as *const u8).cast(), 1) } != 1 {
             return Err(std::io::Error::last_os_error());
         }
         if read_editor_supervisor_byte(self.response)? != 1 {
             return Err(std::io::Error::other("editor job supervisor stopped"));
-        }
-        // `bg` continues Pi's job without handing it the terminal. Resume the
-        // separate editor group too; terminal reads naturally stop it again.
-        if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
-            return Err(std::io::Error::last_os_error());
         }
         if read_editor_supervisor_byte(self.response)? != 1 {
             return Err(std::io::Error::other("editor job supervisor stopped"));
@@ -7552,6 +7598,7 @@ impl EditorForeground {
         }
         // A parent in the same session may still lack job control. If no shell
         // takes the terminal, wake the stopped job instead of hanging forever.
+        let forwarder = EditorContinueForwarder::new(editor_group)?;
         let watchdog = match EditorJobSupervisor::start(fd, group) {
             Ok(watchdog) => watchdog,
             Err(_) => {
@@ -7569,8 +7616,9 @@ impl EditorForeground {
         };
         // The helper stops the whole Pi group. Blocking for its response keeps
         // this thread from running past an asynchronously delivered SIGSTOP.
-        watchdog.stop_and_wait(editor_group)?;
+        watchdog.stop_and_wait()?;
         drop(watchdog);
+        drop(forwarder);
         // Restore the editor's terminal state before handing input back.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -8104,6 +8152,7 @@ mod tests {
         let plain_launcher = test_name.contains("without_job_control_launcher");
         let background_case = test_name.contains("background_job_continues_workers");
         let background_editor = test_name.contains("background_editor_finishes");
+        let repeat_background = test_name.contains("editor_repeated_background");
         let worker_case = test_name.contains("pauses_owned_worker") || background_case;
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
@@ -8180,6 +8229,28 @@ mod tests {
                     "editor stole shell terminal"
                 );
             }
+            if repeat_background {
+                let shell_group = unsafe { libc::getpgrp() };
+                super::set_foreground(0, shell_group).unwrap();
+                let signals = std::path::PathBuf::from(&program).with_extension("signals");
+                for count in 1..=2 {
+                    assert_eq!(
+                        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT) },
+                        0
+                    );
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while std::fs::read(&signals).map_or(0, |bytes| bytes.len()) < count {
+                        assert!(
+                            Instant::now() < until,
+                            "editor did not continue after bg {count}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // Give the editor time to block on its next terminal read.
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert_eq!(unsafe { libc::tcgetpgrp(0) }, shell_group);
+                }
+            }
             if test_name.contains("supervisor_retains_terminal") {
                 let shell_group = unsafe { libc::getpgrp() };
                 super::set_foreground(0, shell_group).unwrap();
@@ -8204,6 +8275,18 @@ mod tests {
             return;
         }
         if let Some(program) = std::env::var_os(CHILD) {
+            let observed_continues = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let listener = if repeat_background {
+                let observed = observed_continues.clone();
+                Some(unsafe {
+                    signal_hook_registry::register(libc::SIGCONT, move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .unwrap()
+                })
+            } else {
+                None
+            };
             let until = Instant::now() + Duration::from_secs(5);
             while unsafe { libc::tcgetpgrp(0) } != unsafe { libc::getpgrp() } {
                 assert!(Instant::now() < until, "supervisor did not foreground Pi");
@@ -8313,6 +8396,10 @@ mod tests {
                 .restore()
                 .expect("restore PTY foreground and original termios");
             drop(editor);
+            if let Some(listener) = listener {
+                assert!(observed_continues.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+                signal_hook_registry::unregister(listener);
+            }
             let mut restored: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
             // Darwin sets PENDIN internally when canonical input is restored;
@@ -8340,7 +8427,9 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("editor");
-        let script = if background_editor {
+        let script = if repeat_background {
+            "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\ntrap 'printf x >> \"${0}.signals\"' CONT\nwhile :; do read line; done\n"
+        } else if background_editor {
             "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nwhile [ ! -f \"${0}.finish\" ]; do sleep 0.05; done\nprintf finished > \"${0}.finished\"\n"
         } else {
             "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n"
@@ -8556,6 +8645,16 @@ mod tests {
     fn background_editor_finishes_without_stealing_terminal() {
         editor_pty_regression(
             "interactive::tests::background_editor_finishes_without_stealing_terminal",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_repeated_background_continues_after_terminal_stop() {
+        editor_pty_regression(
+            "interactive::tests::editor_repeated_background_continues_after_terminal_stop",
             true,
             false,
         );

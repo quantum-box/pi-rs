@@ -3032,6 +3032,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "shell-words",
+ "signal-hook-registry",
  "similar",
  "sse-stream",
  "syntect",
