@@ -204,6 +204,8 @@ enum Phase {
         index: usize,
         operation_id: Uuid,
         reason: String,
+        #[serde(default)]
+        arguments: Option<serde_json::Value>,
     },
     Pending {
         turns: u32,
@@ -211,6 +213,8 @@ enum Phase {
         index: usize,
         operation_id: Uuid,
         reference: String,
+        #[serde(default)]
+        arguments: Option<serde_json::Value>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1167,6 +1171,7 @@ impl Harness {
                                 operation_id,
                                 reason: "interrupted; external outcome requires reconciliation"
                                     .into(),
+                                arguments: Some(arguments),
                             }
                         }
                         ToolRecovery::Interrupted | ToolRecovery::RestartLimit => {
@@ -1325,6 +1330,7 @@ impl Harness {
                 calls,
                 index,
                 operation_id,
+                arguments,
                 ..
             } => {
                 c.phase = Phase::Blocked {
@@ -1334,6 +1340,7 @@ impl Harness {
                     operation_id,
                     reason: "local abort after dispatch; external outcome requires reconciliation"
                         .into(),
+                    arguments: Some(arguments),
                 };
             }
             Phase::Pending {
@@ -1342,6 +1349,7 @@ impl Harness {
                 index,
                 operation_id,
                 reference,
+                arguments,
             } => {
                 c.phase = Phase::Blocked {
                     turns,
@@ -1351,6 +1359,7 @@ impl Harness {
                     reason: format!(
                         "local abort; external operation pending ({reference}); reconciliation required"
                     ),
+                    arguments,
                 };
             }
             Phase::Blocked { .. } => (),
@@ -2136,14 +2145,19 @@ impl Harness {
                         operation_id,
                         call: call.clone(),
                     };
-                    let prepared = crate::tool::prepare(
-                        reg.tool.as_ref(),
-                        &invocation,
+                    let prepared = fenced_poll(
+                        crate::tool::prepare(
+                            reg.tool.as_ref(),
+                            &invocation,
+                            cancel,
+                            Duration::from_secs(120),
+                            valid_schema,
+                        ),
+                        self.execution_gate.as_ref(),
                         cancel,
-                        Duration::from_secs(120),
-                        valid_schema,
                     )
-                    .await;
+                    .await
+                    .ok_or(Error::Interrupted)?;
                     if cancel.is_cancelled() {
                         self.failed = true;
                         return Err(Error::Interrupted);
@@ -2346,6 +2360,7 @@ impl Harness {
                                 index,
                                 operation_id,
                                 reason,
+                                arguments: Some(arguments),
                             }
                         }
                         Outcome::Pending { reference } => {
@@ -2355,6 +2370,7 @@ impl Harness {
                                 index,
                                 operation_id,
                                 reference,
+                                arguments: Some(arguments),
                             }
                         }
                         other => {
@@ -2423,6 +2439,7 @@ impl Harness {
                     index,
                     operation_id,
                     reference,
+                    arguments,
                 } => {
                     let call = calls
                         .get(index)
@@ -2453,6 +2470,7 @@ impl Harness {
                                     index,
                                     operation_id,
                                     reference: next,
+                                    arguments,
                                 };
                                 self.save(&c, Expected::Version(version))?;
                             }
@@ -2465,12 +2483,14 @@ impl Harness {
                                 index,
                                 operation_id,
                                 reason,
+                                arguments,
                             };
                         }
                         crate::poll::PollResult::Outcome(outcome) => {
-                            let arguments =
+                            let arguments = arguments.unwrap_or_else(|| {
                                 pi_rs_core::parse_tool_arguments(&calls[index].arguments)
-                                    .unwrap_or(serde_json::Value::Null);
+                                    .unwrap_or(serde_json::Value::Null)
+                            });
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -2513,12 +2533,13 @@ impl Harness {
             ));
         }
         let (mut c, version) = self.load(id)?;
-        let (turns, calls, index, expected) = match c.phase.clone() {
+        let (turns, calls, index, expected, arguments) = match c.phase.clone() {
             Phase::Blocked {
                 turns,
                 calls,
                 index,
                 operation_id,
+                arguments,
                 ..
             }
             | Phase::Pending {
@@ -2526,8 +2547,9 @@ impl Harness {
                 calls,
                 index,
                 operation_id,
+                arguments,
                 ..
-            } => (turns, calls, index, operation_id),
+            } => (turns, calls, index, operation_id, arguments),
             _ => return Err(Error::Invalid("conversation is not blocked".into())),
         };
         if operation_id != expected {
@@ -2576,8 +2598,10 @@ impl Harness {
                 index: index + 1,
             };
         } else {
-            let arguments = pi_rs_core::parse_tool_arguments(&calls[index].arguments)
-                .unwrap_or(serde_json::Value::Null);
+            let arguments = arguments.unwrap_or_else(|| {
+                pi_rs_core::parse_tool_arguments(&calls[index].arguments)
+                    .unwrap_or(serde_json::Value::Null)
+            });
             c.phase = Phase::ToolFinished {
                 turns,
                 calls,

@@ -633,3 +633,200 @@ async fn after_tool_recovery_does_not_execute_tool_again() {
     assert!(tool.0.lock().unwrap().is_empty());
     assert_eq!(tool_message(&h.conversation(id).unwrap()), "hooked: ok");
 }
+
+struct ParkBeforeTool(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl Hook for ParkBeforeTool {
+    async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+        self.0.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn abort_during_before_tool_adds_skipped_result() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext("park", "p", Arc::new(ParkBeforeTool(entered.clone()))))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["park".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("aborted before dispatch"));
+    assert!(tool.0.lock().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
+
+struct PendingTool(Arc<std::sync::atomic::AtomicBool>);
+#[async_trait]
+impl Tool for PendingTool {
+    fn spec(&self) -> ToolSpec {
+        FakeTool::default().spec()
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        Outcome::Pending {
+            reference: "job".into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(Outcome::Succeeded("done".into()))
+        } else {
+            None
+        }
+    }
+}
+struct CaptureArguments(Arc<Mutex<Vec<Value>>>);
+#[async_trait]
+impl Hook for CaptureArguments {
+    async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+        Ok(BeforeTool::Rewrite(json!({"n":42})))
+    }
+    async fn after_tool(
+        &self,
+        call: &HookCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        self.0.lock().unwrap().push(call.arguments.clone());
+        Ok(None)
+    }
+}
+#[tokio::test]
+async fn pending_result_hook_receives_persisted_rewritten_arguments_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let captured = Arc::new(Mutex::new(vec![]));
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let extension = || Extension {
+        name: "provider".into(),
+        tools: vec![Arc::new(PendingTool(ready.clone()))],
+        hooks: vec![Arc::new(CaptureArguments(captured.clone()))],
+        ..Default::default()
+    };
+    let id;
+    {
+        let mut h = Harness::open_paused(
+            &path,
+            extension_only_options(Arc::new(FakeModel::default())),
+        )
+        .unwrap();
+        h.install_extension(extension()).unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["provider".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(h.blocked(id).unwrap().is_some());
+    }
+    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut h = Harness::open_paused(
+        &path,
+        extension_only_options(Arc::new(FakeModel::default())),
+    )
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*captured.lock().unwrap(), vec![json!({"n":42})]);
+    assert_eq!(tool_message(&h.conversation(id).unwrap()), "done");
+}
+
+#[tokio::test]
+async fn reconciled_pending_result_hook_receives_rewritten_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        extension_only_options(Arc::new(FakeModel::default())),
+    )
+    .unwrap();
+    h.install_extension(Extension {
+        name: "provider".into(),
+        tools: vec![Arc::new(PendingTool(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )))],
+        hooks: vec![Arc::new(CaptureArguments(captured.clone()))],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["provider".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let (operation, _) = h.blocked(id).unwrap().unwrap();
+    h.reconcile(id, operation, Outcome::Succeeded("reconciled".into()))
+        .unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*captured.lock().unwrap(), vec![json!({"n":42})]);
+    assert_eq!(tool_message(&h.conversation(id).unwrap()), "reconciled");
+}
+
+struct ParkGeneration(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl Hook for ParkGeneration {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        if event == pi_rs_durable::extension::GenerationEvent::BeforeRequest {
+            self.0.add_permits(1);
+            std::future::pending().await
+        } else {
+            Ok(pi_rs_durable::extension::GenerationDecision::Pass)
+        }
+    }
+}
+#[tokio::test]
+async fn abort_during_generation_hook_never_dispatches_model() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(model.clone(), Arc::new(FakeTool::default())),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext("park", "p", Arc::new(ParkGeneration(entered.clone()))))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["park".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    assert!(model.0.lock().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
