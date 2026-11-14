@@ -370,6 +370,9 @@ fn serialize_summary_source(
 }
 
 impl Preparation {
+    pub(crate) fn has_blocks(&self) -> bool {
+        self.source_blocks.is_some()
+    }
     pub(crate) fn source_matches(&self, messages: &[Message]) -> bool {
         self.source == messages
     }
@@ -427,6 +430,16 @@ impl Preparation {
         crate::extension::CompactionInput {
             reason,
             messages: self.source[self.system_end..self.first_kept].to_vec(),
+            content_blocks: self
+                .source_blocks
+                .as_ref()
+                .map(|blocks| {
+                    blocks
+                        .range(self.system_end..self.first_kept)
+                        .map(|(index, binding)| (index - self.system_end, binding.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             first_kept: self.first_kept,
             instructions: self.instructions.clone(),
         }

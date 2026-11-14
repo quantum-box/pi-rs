@@ -219,6 +219,9 @@ pub struct HookTask {
 pub struct CompactionInput {
     pub reason: CompactionReason,
     pub messages: Vec<pi_rs_core::Message>,
+    /// Ordered user blocks indexed into `messages`, preserving occurrence IDs.
+    /// A bound message is an empty placeholder; its blocks are the content.
+    pub content_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
     pub first_kept: usize,
     pub instructions: Option<String>,
 }
@@ -237,6 +240,11 @@ pub enum BeforeCompact {
 
 #[async_trait]
 pub trait Hook: Send + Sync {
+    /// Opt in only when `before_compact` handles ordered block bindings and
+    /// never treats the associated empty message placeholder as its content.
+    fn supports_compaction_blocks(&self) -> bool {
+        false
+    }
     async fn before_compact(
         &self,
         _input: &CompactionInput,
@@ -524,6 +532,17 @@ impl Resolved {
             parts.push(format!("<instructions>\n{text}\n</instructions>"));
         }
         (parts.join("\n\n"), reports)
+    }
+    pub(crate) fn supports_compaction_blocks(&self) -> bool {
+        self.extensions
+            .iter()
+            .flat_map(|extension| &extension.hooks)
+            .all(|hook| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.supports_compaction_blocks()
+                }))
+                .unwrap_or(false)
+            })
     }
     /// First decision wins; ordinary hook errors are collected and skipped.
     pub async fn before_compact(

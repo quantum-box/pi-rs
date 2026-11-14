@@ -4801,7 +4801,10 @@ impl Harness {
                 instructions,
             )?);
         }
-        if !c.extensions.is_empty() || !c.occurrence_epoch_proven || c.transcript.is_none() {
+        if !c.occurrence_epoch_proven
+            || c.transcript.is_none()
+            || !self.selected_extensions(c)?.supports_compaction_blocks()
+        {
             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
         let occurrences = self.resolved_occurrences(c.id, c.transcript.clone().unwrap())?;
@@ -4844,7 +4847,9 @@ impl Harness {
     ) -> Result<Option<Uuid>, Error> {
         let (mut c, version) = self.load(id)?;
         if !c.content_blocks.is_empty()
-            && (!c.extensions.is_empty() || !c.occurrence_epoch_proven || c.transcript.is_none())
+            && (!c.occurrence_epoch_proven
+                || c.transcript.is_none()
+                || !self.selected_extensions(&c)?.supports_compaction_blocks())
         {
             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
@@ -6321,6 +6326,9 @@ impl Harness {
                     reason,
                 } => {
                     let selected = self.selected_extensions(&c)?;
+                    if preparation.has_blocks() && !selected.supports_compaction_blocks() {
+                        return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                    }
                     let snapshot = serde_json::to_value(&c)?;
                     let memo = self.extension_memo(operation_id)?;
                     let context = crate::extension::Context {
@@ -6562,9 +6570,9 @@ impl Harness {
                     } else {
                         if !c.auto_compaction_attempted
                             && (c.content_blocks.is_empty()
-                                || (c.extensions.is_empty()
-                                    && c.occurrence_epoch_proven
-                                    && c.transcript.is_some()))
+                                || (c.occurrence_epoch_proven
+                                    && c.transcript.is_some()
+                                    && self.selected_extensions(&c)?.supports_compaction_blocks()))
                         {
                             let window = tokio::select! {
                                 _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
@@ -11957,6 +11965,9 @@ mod scheduler_tests {
         assert_eq!(c.content_blocks[&1].message_id, kept);
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
     }
+    struct LegacyCompactHook;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for LegacyCompactHook {}
     #[test]
     fn automatic_block_preparation_rejects_unproven_or_extension_contexts() {
         use serde_json::json;
@@ -11980,6 +11991,12 @@ mod scheduler_tests {
                 crate::transcript::Error::UnsupportedContentBlocks
             ))
         ));
+        h.install_extension(crate::extension::Extension {
+            name: "unsupported".into(),
+            hooks: vec![Arc::new(LegacyCompactHook)],
+            ..Default::default()
+        })
+        .unwrap();
         let mut unsupported = c;
         unsupported.extensions.push("unsupported".into());
         assert!(matches!(
@@ -11988,6 +12005,365 @@ mod scheduler_tests {
                 crate::transcript::Error::UnsupportedContentBlocks
             ))
         ));
+    }
+
+    struct BlockCompactHook {
+        decision: crate::extension::BeforeCompact,
+        seen: Arc<std::sync::Mutex<Vec<crate::extension::CompactionInput>>>,
+        entered: Arc<Semaphore>,
+        wait: bool,
+        memo_value: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for BlockCompactHook {
+        fn supports_compaction_blocks(&self) -> bool {
+            true
+        }
+        async fn before_compact(
+            &self,
+            input: &crate::extension::CompactionInput,
+            ctx: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            self.seen.lock().unwrap().push(input.clone());
+            let value = ctx
+                .memo
+                .get_or_insert("block-compact", serde_json::json!(self.memo_value))
+                .await?;
+            assert_eq!(value, serde_json::json!("first"));
+            self.entered.add_permits(1);
+            if self.wait {
+                std::future::pending::<()>().await;
+            }
+            Ok(self.decision.clone())
+        }
+    }
+    fn block_compact_extension(
+        hook: Arc<dyn crate::extension::Hook>,
+    ) -> crate::extension::Extension {
+        crate::extension::Extension {
+            name: "block-hook".into(),
+            hooks: vec![hook],
+            ..Default::default()
+        }
+    }
+    fn block_hook(
+        decision: crate::extension::BeforeCompact,
+        seen: Arc<std::sync::Mutex<Vec<crate::extension::CompactionInput>>>,
+        entered: Arc<Semaphore>,
+        wait: bool,
+        memo_value: &'static str,
+    ) -> Arc<dyn crate::extension::Hook> {
+        Arc::new(BlockCompactHook {
+            decision,
+            seen,
+            entered,
+            wait,
+            memo_value,
+        })
+    }
+    #[tokio::test]
+    async fn block_before_compact_decisions_preserve_hook_input_and_retained_history() {
+        use crate::extension::BeforeCompact;
+        use serde_json::json;
+        for decision in [
+            BeforeCompact::Pass,
+            BeforeCompact::Summary("hook summary".into()),
+            BeforeCompact::Decline,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+            let seen = Arc::new(std::sync::Mutex::new(vec![]));
+            let entered = Arc::new(Semaphore::new(0));
+            let (id, old_id, kept_id, original, before);
+            {
+                let mut h =
+                    Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+                h.install_extension(block_compact_extension(block_hook(
+                    decision.clone(),
+                    seen.clone(),
+                    entered.clone(),
+                    false,
+                    "first",
+                )))
+                .unwrap();
+                id = h.create_conversation(config()).unwrap();
+                h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+                original = vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    json!({"type":"text","text":"last","textSignature":"opaque"}),
+                ];
+                old_id = h.append_user_blocks(id, original.clone()).unwrap();
+                kept_id = h
+                    .append_user_blocks(
+                        id,
+                        vec![json!({"type":"image","data":"Ymll","mimeType":"image/png"})],
+                    )
+                    .unwrap();
+                let c = h.conversation(id).unwrap();
+                before = h.resolved_occurrences(id, c.transcript.unwrap()).unwrap();
+                h.request_manual_compaction(id, 0, Some("focus"))
+                    .unwrap()
+                    .unwrap();
+                h.resume_conversation(id, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                let c = h.conversation(id).unwrap();
+                assert_eq!(
+                    c.manual_compactions[0].status,
+                    if decision == BeforeCompact::Decline {
+                        ManualCompactionStatus::Declined
+                    } else {
+                        ManualCompactionStatus::Applied
+                    }
+                );
+                let history = h.resolved_occurrences(id, c.transcript.unwrap()).unwrap();
+                assert_eq!(history[1], before[1]);
+                assert_eq!(c.content_blocks[&1].message_id, kept_id);
+                assert_eq!(
+                    c.content_blocks.len(),
+                    if decision == BeforeCompact::Decline {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            }
+            let h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            assert_eq!(
+                h.conversation(id).unwrap().content_blocks[&1].message_id,
+                kept_id
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].content_blocks[&0].message_id, old_id);
+            assert_eq!(seen[0].content_blocks[&0].blocks, original);
+            assert_eq!(seen[0].instructions.as_deref(), Some("focus"));
+            assert_eq!(
+                model.0.lock().unwrap().len(),
+                if decision == BeforeCompact::Pass {
+                    1
+                } else {
+                    0
+                }
+            );
+        }
+    }
+    #[tokio::test]
+    async fn block_before_compact_runs_for_threshold_and_overflow() {
+        use crate::extension::{BeforeCompact, CompactionReason};
+        use serde_json::json;
+        for overflow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(AutoBlockModel {
+                window: if overflow { None } else { Some(3000) },
+                summaries: std::sync::Mutex::new(vec![]),
+            });
+            let adapter = Arc::new(AutoBlockAdapter {
+                calls: AtomicUsize::new(0),
+                overflow,
+                requests: std::sync::Mutex::new(vec![]),
+            });
+            let seen = Arc::new(std::sync::Mutex::new(vec![]));
+            let entered = Arc::new(Semaphore::new(0));
+            let mut h =
+                Harness::open_paused(dir.path().join("db"), auto_options(model.clone())).unwrap();
+            h.install_provider_adapter(adapter.clone()).unwrap();
+            h.install_extension(block_compact_extension(block_hook(
+                BeforeCompact::Pass,
+                seen.clone(),
+                entered,
+                false,
+                "first",
+            )))
+            .unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            h.select_provider_adapter(id, true).unwrap();
+            h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+            let old = h
+                .append_user_blocks(
+                    id,
+                    vec![
+                        json!({"type":"text","text":"old"}),
+                        json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    ],
+                )
+                .unwrap();
+            let kept = h
+                .append_user_blocks(
+                    id,
+                    vec![json!({"type":"image","data":"Ymll","mimeType":"image/png"})],
+                )
+                .unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.phase = Phase::ModelReady { turns: 0 };
+            h.save(&c, Expected::Version(version)).unwrap();
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(c.content_blocks.values().next().unwrap().message_id, kept);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                seen[0].reason,
+                if overflow {
+                    CompactionReason::Overflow
+                } else {
+                    CompactionReason::Threshold
+                }
+            );
+            assert_eq!(seen[0].content_blocks[&0].message_id, old);
+            assert_eq!(model.summaries.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn block_before_compact_rechecks_capability_after_admission() {
+        use crate::extension::BeforeCompact;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+        let seen = Arc::new(std::sync::Mutex::new(vec![]));
+        let entered = Arc::new(Semaphore::new(0));
+        let (id, kept_id);
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            h.install_extension(block_compact_extension(block_hook(
+                BeforeCompact::Pass,
+                seen.clone(),
+                entered.clone(),
+                false,
+                "first",
+            )))
+            .unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+            h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+                .unwrap();
+            kept_id = h
+                .append_user_blocks(
+                    id,
+                    vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+                )
+                .unwrap();
+            h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+            h.install_extension(block_compact_extension(Arc::new(LegacyCompactHook)))
+                .unwrap();
+            assert!(matches!(
+                h.resume_conversation(id, &CancellationToken::new()).await,
+                Err(Error::Transcript(
+                    crate::transcript::Error::UnsupportedContentBlocks
+                ))
+            ));
+            assert!(seen.lock().unwrap().is_empty());
+        }
+        let mut h = Harness::open_paused(&path, block_summary_options(model)).unwrap();
+        h.install_extension(block_compact_extension(block_hook(
+            BeforeCompact::Summary("safe".into()),
+            seen.clone(),
+            entered,
+            false,
+            "first",
+        )))
+        .unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.content_blocks[&1].message_id, kept_id);
+        assert_eq!(
+            c.manual_compactions[0].status,
+            ManualCompactionStatus::Applied
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn block_before_compact_replays_memo_after_reopen_or_honors_abort() {
+        use crate::extension::BeforeCompact;
+        use serde_json::json;
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+            let seen = Arc::new(std::sync::Mutex::new(vec![]));
+            let entered = Arc::new(Semaphore::new(0));
+            let (id, old_id, kept_id);
+            {
+                let mut h =
+                    Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+                h.install_extension(block_compact_extension(block_hook(
+                    BeforeCompact::Pass,
+                    seen.clone(),
+                    entered.clone(),
+                    true,
+                    "first",
+                )))
+                .unwrap();
+                id = h.create_conversation(config()).unwrap();
+                h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+                old_id = h
+                    .append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+                    .unwrap();
+                kept_id = h
+                    .append_user_blocks(
+                        id,
+                        vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+                    )
+                    .unwrap();
+                h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+                let stop = CancellationToken::new();
+                let trigger = stop.clone();
+                let started = entered.clone();
+                tokio::spawn(async move {
+                    started.acquire().await.unwrap().forget();
+                    trigger.cancel();
+                });
+                assert!(h.resume_conversation(id, &stop).await.is_err());
+            }
+            {
+                let mut h =
+                    Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+                h.install_extension(block_compact_extension(block_hook(
+                    BeforeCompact::Summary("replayed".into()),
+                    seen.clone(),
+                    entered.clone(),
+                    false,
+                    "different",
+                )))
+                .unwrap();
+                if abort {
+                    h.request_abort(id).unwrap();
+                }
+                h.resume_conversation(id, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                let c = h.conversation(id).unwrap();
+                assert_eq!(
+                    c.manual_compactions[0].status,
+                    if abort {
+                        ManualCompactionStatus::Aborted
+                    } else {
+                        ManualCompactionStatus::Applied
+                    }
+                );
+                assert_eq!(c.content_blocks[&1].message_id, kept_id);
+                assert_eq!(c.content_blocks.len(), if abort { 2 } else { 1 });
+            }
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), if abort { 1 } else { 2 });
+            if !abort {
+                assert_eq!(seen[0], seen[1]);
+            }
+            assert!(
+                seen.iter()
+                    .all(|input| input.content_blocks[&0].message_id == old_id)
+            );
+            assert!(model.0.lock().unwrap().is_empty());
+        }
     }
 
     struct BlockSummaryModel(std::sync::Mutex<Vec<ModelRequest>>);
