@@ -14,4 +14,5 @@ h3-quinn = "0.0.10"
 quinn = "0.11"
 rustls = { version = "0.23", features = ["ring"] }
 http = "1"
+bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }

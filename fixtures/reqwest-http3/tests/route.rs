@@ -35,9 +35,11 @@ macro_rules! h3_security {
                     .unwrap()
                     .unwrap();
                 let connection = incoming.await.unwrap();
-                let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-                    .await
-                    .unwrap();
+                let mut h3 = h3::server::Connection::<_, bytes::Bytes>::new(
+                    h3_quinn::Connection::new(connection),
+                )
+                .await
+                .unwrap();
                 let resolver = h3.accept().await.unwrap().unwrap();
                 let (request, mut stream) = resolver.resolve_request().await.unwrap();
                 assert!(!request.headers().contains_key("proxy-authorization"));

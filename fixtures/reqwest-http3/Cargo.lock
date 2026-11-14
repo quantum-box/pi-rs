@@ -1109,6 +1109,7 @@ dependencies = [
 name = "reqwest-http3-security-fixture"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "h3",
  "h3-quinn",
  "http",
