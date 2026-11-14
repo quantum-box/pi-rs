@@ -349,12 +349,34 @@ pub struct Conversation {
     #[serde(default)]
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_attempt: Option<ToolAttempt>,
     #[serde(default)]
     pub abort_requested: bool,
     phase: Phase,
 }
 
+/// Identity of one execution of a durable tool operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAttempt {
+    pub operation_id: Uuid,
+    pub attempt_id: Uuid,
+}
+
 impl Conversation {
+    /// The most recent attempt for the currently running, pending, blocked or
+    /// finishing operation. Legacy records may have no known attempt identity.
+    pub fn tool_attempt(&self) -> Option<ToolAttempt> {
+        let operation_id = match &self.phase {
+            Phase::ToolRunning { operation_id, .. }
+            | Phase::Pending { operation_id, .. }
+            | Phase::Blocked { operation_id, .. }
+            | Phase::ToolFinished { operation_id, .. } => *operation_id,
+            _ => return None,
+        };
+        self.tool_attempt
+            .filter(|attempt| attempt.operation_id == operation_id)
+    }
     /// Identity of the answer settling a submission. Older persisted answers
     /// predate answer IDs and return None.
     pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
@@ -1223,6 +1245,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            tool_attempt: None,
             abort_requested: false,
             phase: Phase::Idle,
         }
@@ -1246,6 +1269,7 @@ impl Harness {
                 "subagent history fork requires a settled parent".into(),
             ));
         }
+        state.tool_attempt = None;
         state.id = child;
         state.config = config;
         state.submissions.clear();
@@ -1279,6 +1303,7 @@ impl Harness {
                 "fork requires a settled conversation".into(),
             ));
         }
+        state.tool_attempt = None;
         state.id = Uuid::new_v4();
         state.active = None;
         state.abort_requested = false;
@@ -1367,6 +1392,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            tool_attempt: None,
             abort_requested: false,
             phase: Phase::Idle,
         };
@@ -3549,6 +3575,10 @@ impl Harness {
                         }
                         match prepared {
                             Ok(prepared) => {
+                                c.tool_attempt = Some(ToolAttempt {
+                                    operation_id,
+                                    attempt_id: Uuid::new_v4(),
+                                });
                                 c.phase = Phase::ToolRunning {
                                     turns,
                                     calls,
@@ -3767,6 +3797,10 @@ impl Harness {
                             valid_schema,
                         ) {
                             Ok(prepared) => {
+                                c.tool_attempt = Some(ToolAttempt {
+                                    operation_id,
+                                    attempt_id: Uuid::new_v4(),
+                                });
                                 c.phase = Phase::ToolRunning {
                                     turns,
                                     calls,
@@ -3802,6 +3836,10 @@ impl Harness {
                     ..
                 } => {
                     if replay_ready {
+                        c.tool_attempt = Some(ToolAttempt {
+                            operation_id,
+                            attempt_id: Uuid::new_v4(),
+                        });
                         if let Phase::ToolRunning { replay_ready, .. } = &mut c.phase {
                             *replay_ready = false;
                         }
@@ -5114,6 +5152,7 @@ mod scheduler_tests {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            tool_attempt: None,
             abort_requested: false,
             phase: Phase::Idle,
         };
@@ -5129,6 +5168,51 @@ mod scheduler_tests {
         latest.phase = Phase::ModelReady { turns: 0 };
         assert!(!admission_only(&base, &latest).unwrap());
     }
+    #[test]
+    fn legacy_tool_phases_have_no_invented_attempt() {
+        let mut conversation = Harness::empty_conversation(Uuid::new_v4(), config());
+        let operation_id = Uuid::new_v4();
+        let call = ToolCall {
+            id: "call".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        for phase in [
+            Phase::ToolRunning {
+                turns: 0,
+                calls: vec![call.clone()],
+                index: 0,
+                operation_id,
+                replay: ReplayPolicy::Safe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: false,
+            },
+            Phase::Pending {
+                turns: 0,
+                calls: vec![call.clone()],
+                index: 0,
+                operation_id,
+                reference: "job".into(),
+                arguments: None,
+            },
+            Phase::Blocked {
+                turns: 0,
+                calls: vec![call.clone()],
+                index: 0,
+                operation_id,
+                reason: "unknown".into(),
+                arguments: None,
+            },
+        ] {
+            conversation.phase = phase;
+            let mut json = serde_json::to_value(&conversation).unwrap();
+            json.as_object_mut().unwrap().remove("tool_attempt");
+            let restored: Conversation = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.tool_attempt(), None);
+        }
+    }
+
     #[test]
     fn conversation_abort_stops_at_persisted_background_task() {
         use crate::task::{Checkpoint, Task, TaskOwner};

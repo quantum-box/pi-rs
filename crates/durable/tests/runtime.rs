@@ -374,7 +374,11 @@ async fn child_crash_during_dispatched_tool() {
         model,
         tools: vec![RegisteredTool {
             tool,
-            replay: ReplayPolicy::Unsafe,
+            replay: if std::env::var_os("PI_DURABLE_CRASH_SAFE").is_some() {
+                ReplayPolicy::Safe
+            } else {
+                ReplayPolicy::Unsafe
+            },
         }],
         restart_limit: 5,
         max_turns: 8,
@@ -439,6 +443,87 @@ async fn killed_process_recovers_unsafe_call_without_reexecution() {
             answer: "finished".into()
         }
     );
+}
+
+#[tokio::test]
+async fn killed_process_replay_gets_new_persisted_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("child_crash_during_dispatched_tool")
+        .env("PI_DURABLE_CRASH_ROOT", root)
+        .env("PI_DURABLE_CRASH_SAFE", "1")
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !root.join("marker").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    ready.expect("child never dispatched");
+    let id = std::fs::read_to_string(root.join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let cancel = CancellationToken::new();
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: true,
+        cancel: Some(cancel.clone()),
+    });
+    let path = root.join("crash.sqlite");
+    let mut h = Harness::open_paused(
+        &path,
+        options(model.clone(), tool.clone(), ReplayPolicy::Safe),
+    )
+    .unwrap();
+    let first = h.conversation(id).unwrap().tool_attempt().unwrap();
+    assert!(h.resume(&cancel).await.is_err());
+    drop(h);
+    let h = Harness::open_paused(
+        &path,
+        options(model.clone(), tool.clone(), ReplayPolicy::Safe),
+    )
+    .unwrap();
+    let second = h.conversation(id).unwrap().tool_attempt().unwrap();
+    assert_eq!(first.operation_id, second.operation_id);
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    drop(h);
+    let h = Harness::open(
+        &path,
+        options(model, tool.clone(), ReplayPolicy::Safe),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    drop(h);
+    let _h = Harness::open_paused(
+        &path,
+        options(
+            Arc::new(FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            }),
+            tool.clone(),
+            ReplayPolicy::Safe,
+        ),
+    )
+    .unwrap();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
 }
 
 struct HangingTool {

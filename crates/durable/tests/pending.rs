@@ -71,8 +71,13 @@ impl Tool for Job {
     }
     async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
         assert_eq!(reference, "external-1");
-        self.polled.fetch_add(1, Ordering::SeqCst);
-        Some(Outcome::Succeeded("complete".into()))
+        if self.polled.fetch_add(1, Ordering::SeqCst) == 0 {
+            Some(Outcome::Pending {
+                reference: "external-1".into(),
+            })
+        } else {
+            Some(Outcome::Succeeded("complete".into()))
+        }
     }
 }
 fn options(job: Arc<Job>) -> Options {
@@ -97,6 +102,7 @@ async fn accepted_job_is_polled_after_reopen_without_redispatch() {
         polled: AtomicUsize::new(0),
     });
     let id;
+    let attempt;
     {
         let mut h = Harness::open(&path, options(job.clone()), &cancel)
             .await
@@ -111,7 +117,15 @@ async fn accepted_job_is_polled_after_reopen_without_redispatch() {
         h.submit_and_run(id, Some("job".into()), "work".into(), &cancel)
             .await
             .unwrap();
+        attempt = h.conversation(id).unwrap().tool_attempt().unwrap();
     }
+    let paused = Harness::open_paused(&path, options(job.clone())).unwrap();
+    assert_eq!(
+        paused.conversation(id).unwrap().tool_attempt(),
+        Some(attempt)
+    );
+    assert_eq!(job.dispatched.load(Ordering::SeqCst), 1);
+    drop(paused);
     let h = Harness::open(&path, options(job.clone()), &cancel)
         .await
         .unwrap();
@@ -122,7 +136,7 @@ async fn accepted_job_is_polled_after_reopen_without_redispatch() {
         }
     );
     assert_eq!(job.dispatched.load(Ordering::SeqCst), 1);
-    assert_eq!(job.polled.load(Ordering::SeqCst), 1);
+    assert_eq!(job.polled.load(Ordering::SeqCst), 2);
 }
 
 struct BlockingJob {

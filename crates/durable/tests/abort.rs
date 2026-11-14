@@ -192,6 +192,7 @@ async fn abort_dispatched_tool_blocks_replay_across_restart_even_when_safe() {
     let id = s.create_conversation(config()).unwrap();
     s.submit(id, None, "work".into()).unwrap();
     wait_permit(&tool.started).await;
+    let attempt = s.conversation(id).unwrap().tool_attempt().unwrap();
     s.abort(id).unwrap();
     tokio::time::timeout(Duration::from_secs(5), s.wait(id))
         .await
@@ -199,6 +200,8 @@ async fn abort_dispatched_tool_blocks_replay_across_restart_even_when_safe() {
         .unwrap();
     let (operation, reason) = s.blocked(id).unwrap().unwrap();
     assert!(reason.contains("external outcome"));
+    assert_eq!(attempt.operation_id, operation);
+    assert_eq!(s.conversation(id).unwrap().tool_attempt(), Some(attempt));
     assert_eq!(
         s.conversation(id).unwrap().submissions[0].status,
         Status::Unanswered {
@@ -211,6 +214,7 @@ async fn abort_dispatched_tool_blocks_replay_across_restart_even_when_safe() {
         .unwrap();
     assert_eq!(tool.count.load(Ordering::SeqCst), 1);
     assert_eq!(h.blocked(id).unwrap().unwrap().0, operation);
+    assert_eq!(h.conversation(id).unwrap().tool_attempt(), Some(attempt));
     h.reconcile(id, operation, Outcome::Succeeded("confirmed".into()))
         .unwrap();
     h.resume(&CancellationToken::new()).await.unwrap();
