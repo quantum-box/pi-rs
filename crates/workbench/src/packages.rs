@@ -1876,11 +1876,13 @@ async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u
     let stderr = child.child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
-            tokio::try_join!(
-                async { child.child.wait().await.map_err(Error::from) },
-                capture(stdout, 8 * 1024 * 1024),
-                capture(stderr, 64 * 1024)
-            )
+            // Keep the group leader unreaped until all inherited output pipes
+            // close. Its reserved PID prevents the process group ID being
+            // reused while a descendant still holds either pipe.
+            let (stdout, stderr) =
+                tokio::try_join!(capture(stdout, 8 * 1024 * 1024), capture(stderr, 64 * 1024))?;
+            let status = child.child.wait().await.map_err(Error::from)?;
+            Ok::<_, Error>((status, stdout, stderr))
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
