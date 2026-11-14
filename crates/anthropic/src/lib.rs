@@ -1544,8 +1544,13 @@ mod tests {
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
-                let mut request = [0_u8; 2048];
-                socket.read(&mut request).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0 && request.len() + count <= 16 * 1024);
+                    request.extend_from_slice(&buffer[..count]);
+                }
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
             let runtime = tokio::runtime::Builder::new_current_thread()

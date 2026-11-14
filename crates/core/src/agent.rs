@@ -1285,8 +1285,42 @@ impl Agent<'_> {
                     ));
                 }
                 if recovery.summary_started {
-                    // A prior process may have sent or completed a billable
-                    // request. Do not silently issue it a second time.
+                    // With no extensions there are no external compaction hooks
+                    // to replay. A validated completed summary can be committed
+                    // without a second billable provider request.
+                    if active.registry.extensions.is_empty()
+                        && let Some((summary, spent, billing)) =
+                            completed_overflow_summary(session, run_id)
+                        && spent <= budget
+                    {
+                        let retention = configured_retention(
+                            session,
+                            active.compaction_tokens(session).keep_recent_tokens,
+                            1,
+                        )?;
+                        active
+                            .commit_compaction_with_host(
+                                session,
+                                Compaction {
+                                    summary,
+                                    keep_turns: retention.keep_turns,
+                                },
+                                &states,
+                                billing,
+                                Some(retention),
+                                None,
+                                cancel,
+                                observer,
+                                Some(followups),
+                            )
+                            .await?;
+                        budget -= spent;
+                        compacted = true;
+                        pending = None;
+                        continue;
+                    }
+                    // An unconfirmed response or externally visible hook may
+                    // already have run. Never silently repeat either one.
                     return Err(Error::Model(
                         "interrupted overflow summary requires reconciliation".into(),
                     ));
@@ -2283,9 +2317,18 @@ impl Agent<'_> {
                 partial: if retain_reply {
                     content
                 } else {
-                    result
-                        .as_ref()
-                        .map_or(content, |reply| reply.content.clone())
+                    match &result {
+                        Ok(reply)
+                            if !reply.truncated
+                                && reply.invocations.is_empty()
+                                && !reply.content.trim().is_empty()
+                                && reply.content.len() <= 64 * 1024 =>
+                        {
+                            reply.content.clone()
+                        }
+                        Ok(_) => String::new(),
+                        Err(_) => content,
+                    }
                 },
                 reply: advertised_tools.and_then(|advertised_tools| {
                     result.as_ref().ok().map(|reply| RecordedReply {
@@ -4145,6 +4188,85 @@ fn overflow_recovery_attempted(session: &Session, run_id: Uuid) -> bool {
     let branch = session.branch();
     overflow_recovery_epoch(&branch, run_id).iter().any(|record| record.run_id == Some(run_id)
         && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
+}
+
+// A completed model summary can be reused only if its response is durable and
+// no later event changed the context from which its retention plan was chosen.
+type RecoveredSummary = (
+    String,
+    u32,
+    Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+);
+
+fn completed_overflow_summary(session: &Session, run_id: Uuid) -> Option<RecoveredSummary> {
+    let branch = session.branch();
+    let marker = branch.iter().rposition(|record| record.run_id == Some(run_id)
+        && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))?;
+    let request_index = branch[marker + 1..].iter().position(|record| {
+        record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. })
+    })? + marker
+        + 1;
+    let Event::ModelRequested {
+        request_id: Some(request_id),
+        max_output_tokens,
+        ..
+    } = &branch[request_index].event
+    else {
+        return None;
+    };
+    let following = &branch[request_index + 1..];
+    if following.iter().any(|record| {
+        matches!(
+            record.event,
+            Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::Assistant { .. }
+                | Event::ContextEdited { .. }
+                | Event::Compacted { .. }
+                | Event::SystemCheckpoint { .. }
+                | Event::ModelRequested { .. }
+        )
+    }) {
+        return None;
+    }
+    let completed = following.iter().find(|record| record.run_id == Some(run_id)
+        && matches!(&record.event, Event::ModelFinished { request_id: id, .. } if id == request_id))?;
+    let Event::ModelFinished {
+        partial,
+        usage,
+        failure: None,
+        metadata,
+        reply: None,
+        ..
+    } = &completed.event
+    else {
+        return None;
+    };
+    if metadata.finish_reason.as_deref() == Some("length")
+        || partial.trim().is_empty()
+        || partial.len() > 64 * 1024
+    {
+        return None;
+    }
+    let (spent, billing) = match usage {
+        UsageReport::Measured { usage } if usage.output_tokens <= u64::from(*max_output_tokens) => {
+            (
+                usage.output_tokens as u32,
+                Some((
+                    *usage,
+                    crate::SummaryUsageMetadata::from_completion(&completed.event)
+                        .map(|(_, metadata)| Box::new(metadata)),
+                )),
+            )
+        }
+        UsageReport::Estimated { output_tokens }
+            if *output_tokens <= u64::from(*max_output_tokens) =>
+        {
+            (*output_tokens as u32, None)
+        }
+        _ => return None,
+    };
+    Some((partial.clone(), spent, billing))
 }
 
 fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRecoveryState> {
@@ -6700,6 +6822,118 @@ mod tree_tests {
             0,
             "must not resend a potentially billable request"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_overflow_summary_is_reused_after_reopen_without_resending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow-completed.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let summary_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(summary_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id: summary_id,
+                metadata: Default::default(),
+                usage: UsageReport::Measured {
+                    usage: Usage {
+                        input_tokens: 9,
+                        output_tokens: 3,
+                    },
+                },
+                failure: None,
+                partial: "saved summary".into(),
+                reply: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let answer = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            1,
+            "only the retried turn may call the model"
+        );
+        assert!(session.records().iter().any(
+            |r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")
+        ));
     }
 
     struct LegacyCompaction(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
