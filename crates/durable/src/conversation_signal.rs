@@ -25,6 +25,8 @@ pub enum Error {
     Closed,
     #[error("cannot wait on a consumed or expired signal key")]
     InvalidWait,
+    #[error("signal key points to a missing receipt")]
+    Corrupt,
 }
 
 /// Signal IDs are scoped to a conversation and remain reserved after delivery.
@@ -103,7 +105,7 @@ impl<'a> Inbox<'a> {
         let target = conversation_key(signal.conversation_id);
         let mut fresh = signal.clone();
         fresh.consumed = false;
-        loop {
+        'retry: loop {
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
                 return if old.id == fresh.id
@@ -121,15 +123,26 @@ impl<'a> Inbox<'a> {
                 return Err(Error::InvalidWait);
             }
             if let Some(existing) = self.store.get(&sk)? {
-                return match serde_json::from_slice::<Slot>(&existing.value)? {
-                    Slot::Value(_) => Err(Error::Duplicate),
-                    Slot::Expired => Err(Error::Closed),
-                };
+                match serde_json::from_slice::<Slot>(&existing.value)? {
+                    // A concurrent insertion of this receipt may have committed
+                    // after our first read. Recheck its content for idempotency.
+                    Slot::Value(id) if id == fresh.id => {
+                        if self.store.get(&k)?.is_none() {
+                            return Err(Error::Corrupt);
+                        }
+                        continue;
+                    }
+                    Slot::Value(_) => return Err(Error::Duplicate),
+                    Slot::Expired => return Err(Error::Closed),
+                }
             }
             // Older stores predate slots; never accept another value for such a key.
             for (_, old) in self.store.list(&prefix(signal.conversation_id))? {
                 let old: Signal = serde_json::from_slice(&old.value)?;
                 if old.name == signal.name {
+                    if old.id == fresh.id {
+                        continue 'retry;
+                    }
                     return Err(Error::Duplicate);
                 }
             }
@@ -410,6 +423,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn concurrent_same_receipt_is_always_idempotent() {
+        for _ in 0..20 {
+            let store = Arc::new(Store::memory().unwrap());
+            let id = Uuid::new_v4();
+            create(&store, id);
+            let signal = Signal::new(Uuid::new_v4(), id, "key".into(), Value::Null);
+            let barrier = Arc::new(Barrier::new(9));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (store, signal, barrier) = (store.clone(), signal.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        Inbox::new(&store).send(&signal)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
     }
 
     #[test]
