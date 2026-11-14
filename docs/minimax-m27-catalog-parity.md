@@ -1,13 +1,19 @@
-# MiniMax M2.7 catalog parity
+# MiniMax M2.7 catalog compatibility
 
-The pinned Pi v1.5.0 catalog (`f9a26365568127461c47a07a37dcb42c140a3ac5`)
-includes MiniMax-M2.7 and MiniMax-M2.7-highspeed for both the international
-and China MiniMax providers. The native offline catalog includes these text-only,
-reasoning-capable Messages models, their 204,800-token context window,
-131,072-token output limit, and region-specific pricing. Native explicitly
-selects budgeted thinking, which is Pi's default when adaptive thinking is not
-specified. The existing regional endpoint and credential bindings are unchanged.
+Pinned Pi v1.5.0 (`f9a26365568127461c47a07a37dcb42c140a3ac5`) lists
+MiniMax-M2.7 and MiniMax-M2.7-highspeed for both direct MiniMax regions. Pi's
+Anthropic Messages adapter selects budgeted `thinking.type: enabled` for these
+entries because they do not opt into adaptive thinking.
 
-An offline CLI fixture checks catalog metadata and sends budgeted Messages
-requests to a local server for each provider/model combination. No live MiniMax
-service was contacted.
+The current [China Messages API reference](https://platform.minimax.cn/docs/api-reference/text-chat-anthropic)
+lists M3 and M3.1 Flash, describes adaptive thinking for those models, and does
+not document M2.7 or budgeted thinking. The [China model FAQ](https://platform.minimax.cn/docs/faq/models)
+and [international model FAQ](https://platform.minimax.io/docs/faq/models) describe
+M2.7 retirement and subscription routing. This does not establish a currently
+supported direct M2.7 Messages route or budgeted thinking contract.
+
+The native direct catalogs therefore continue to withhold those entries, as
+recorded in `native-parity.md`; manually configured models retain existing
+behavior. No live provider was contacted, and a loopback response cannot prove
+provider support. A regression keeps the withheld entries out of both direct
+catalogs while preserving the listed M3 models.
