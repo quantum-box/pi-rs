@@ -1503,9 +1503,14 @@ sources.
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
 only metadata retains automatic directory and native executable discovery.
-Cached local native resources are filtered against the current manifest before
-loading. A present `pi` value must be an object, and every resource field must
-be a string array; malformed manifests are rejected before package preparation.
+Cached local, Git and Cargo package resources are filtered against the current
+cached-root manifest before loading. A present `pi` value must be an object, and
+every resource field must be a string array. Local and Git manifests are checked
+before their Cargo build. Registry packages are different: `cargo install` builds
+the crate (including build scripts) before pi-rs obtains and validates its source
+manifest. Installing a registry package therefore requires trusting its build;
+validating before that build needs a separate source acquisition and resolution
+design that preserves Cargo's selected version, registry and integrity checks.
 
 ### MCP form elicitation checkpoint
 

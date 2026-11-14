@@ -8223,6 +8223,103 @@ mod tests {
         assert!(!sentinel.exists());
         std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
 
+        // Old indexes for local, Git and registry packages all carry a package
+        // root. Revalidate that root and apply exclusions to the whole list.
+        use sha2::Digest;
+        let manifest_path = pi_source.join("pi-package.json");
+        let manifest_with_exclusion = r#"{"pi":{"extensions":["extensions","!extensions/unexpected"],"themes":["assets/visual.json"]}}"#;
+        for source in [
+            pi_source
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "git:https://example.invalid/example/pkg".into(),
+            "cargo:example-pkg@1.0.0".into(),
+        ] {
+            std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+            let mut entries: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            let old_key = entries
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, entry)| {
+                    entry["source"]
+                        .as_str()
+                        .and_then(|s| std::fs::canonicalize(s).ok())
+                        == Some(canonical_source.clone())
+                })
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            let mut cached = entries.as_object_mut().unwrap().remove(&old_key).unwrap();
+            cached["source"] = serde_json::json!(source);
+            let key = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+            entries.as_object_mut().unwrap().insert(key, cached);
+            std::fs::write(&index, entries.to_string()).unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[source]}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "pi-theme",
+                "{source}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty(),
+                "{source}"
+            );
+            assert_eq!(resources.themes.len(), 1, "{source}");
+            std::fs::write(&manifest_path, r#"{"pi":null}"#).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{source}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{source}"
+            );
+            assert!(!sentinel.exists(), "{source} executed a cached extension");
+        }
+        // Fresh local preparation must not launch the excluded executable.
+        std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(
+            super::super::packages::transient_resources(&args)
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "preparation executed an excluded extension"
+        );
+        args.extensions.clear();
+        std::fs::remove_file(&manifest_path).unwrap();
+
         // Invalid resource fields and invalid pi values must be rejected both
         // for cached startup and before preparation can run any build script.
         for case in [

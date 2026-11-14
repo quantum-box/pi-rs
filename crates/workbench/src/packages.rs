@@ -206,54 +206,10 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
         let Some(package) = installed.get(&key(&declaration.source)) else {
             continue;
         };
-        let mut package: Installed = serde_json::from_value(package.clone())?;
-        if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
-            if !Path::new(&declaration.source).is_dir() {
-                continue;
-            }
-            let Ok((manifest, pi_package)) = local_startup_manifest(&package.root) else {
-                continue;
-            };
-            let Ok(pi) = manifest_pi(&manifest) else {
-                continue;
-            };
-            let Ok(themes) = collect_package_themes(&package.root, pi) else {
-                continue;
-            };
-            package.resources.themes = themes;
-            // Older indexes did not understand package.json and could have
-            // discovered native resources that its explicit Pi manifest excludes.
-            if has_resource_fields(pi) {
-                if pi_package {
-                    package.resources.extensions.clear();
-                    package.resources.skills.clear();
-                    package.resources.prompts.clear();
-                } else {
-                    let extensions = resource_patterns(pi, "extensions")?;
-                    package.resources.extensions.retain(|path| {
-                        extensions.iter().any(|name| {
-                            path.file_stem().is_some_and(|stem| stem == name.as_str())
-                                || manifest_selected(
-                                    path,
-                                    &package.root,
-                                    std::slice::from_ref(name),
-                                )
-                        })
-                    });
-                    let skills = resource_patterns(pi, "skills")?;
-                    package
-                        .resources
-                        .skills
-                        .retain(|path| manifest_selected(path, &package.root, &skills));
-                    let prompts = resource_patterns(pi, "prompts")?;
-                    let selected = collect_package_prompts(&package.root, &prompts);
-                    package
-                        .resources
-                        .prompts
-                        .retain(|path| selected.contains(path));
-                }
-            }
-        }
+        let package: Installed = serde_json::from_value(package.clone())?;
+        let Some(package) = revalidate_cached_package(package) else {
+            continue;
+        };
         for (name, paths, target) in [
             (
                 "extensions",
@@ -281,6 +237,41 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
         }
     }
     Ok(result)
+}
+
+fn revalidate_cached_package(mut package: Installed) -> Option<Installed> {
+    if !package.root.is_dir() || (!remote(&package.source) && !Path::new(&package.source).exists())
+    {
+        return None;
+    }
+    let (manifest, pi_package) = local_startup_manifest(&package.root).ok()?;
+    let pi = manifest_pi(&manifest).ok()?;
+    package.resources.themes = collect_package_themes(&package.root, pi).ok()?;
+    if has_resource_fields(pi) {
+        if pi_package {
+            package.resources.extensions.clear();
+            package.resources.skills.clear();
+            package.resources.prompts.clear();
+        } else {
+            let extensions = resource_patterns(pi, "extensions").ok()?;
+            package
+                .resources
+                .extensions
+                .retain(|path| extension_selected(path, &package.root, &extensions));
+            let skills = resource_patterns(pi, "skills").ok()?;
+            package
+                .resources
+                .skills
+                .retain(|path| manifest_selected(path, &package.root, &skills));
+            let prompts = resource_patterns(pi, "prompts").ok()?;
+            let selected = collect_package_prompts(&package.root, &prompts);
+            package
+                .resources
+                .prompts
+                .retain(|path| selected.contains(path));
+        }
+    }
+    Some(package)
 }
 /// Resolve themes for the startup picker without preparing packages or executing
 /// their extensions. Unindexed local sources can be inspected directly; missing
@@ -319,7 +310,11 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
                 resources,
             }
         } else if let Some(value) = installed.get(&key(&declaration.source)) {
-            serde_json::from_value::<Installed>(value.clone())?
+            let package = serde_json::from_value::<Installed>(value.clone())?;
+            let Some(package) = revalidate_cached_package(package) else {
+                continue;
+            };
+            package
         } else {
             continue;
         };
@@ -647,6 +642,17 @@ fn manifest_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource(path, root, filters, true)
 }
 fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots: bool) -> bool {
+    select_resource_with(filters, |pattern, exact| {
+        resource_matches(path, root, pattern, exact, directory_roots)
+    })
+}
+fn extension_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
+    select_resource_with(filters, |pattern, exact| {
+        resource_matches(path, root, pattern, exact, true)
+            || path.file_stem().is_some_and(|stem| stem == pattern)
+    })
+}
+fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool) -> bool {
     if filters.is_empty() {
         return false;
     }
@@ -654,28 +660,25 @@ fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots
         .iter()
         .filter(|filter| !filter.starts_with(['!', '+', '-']))
         .collect();
-    let mut included = plain.is_empty()
-        || plain
-            .iter()
-            .any(|pattern| resource_matches(path, root, pattern, false, directory_roots));
+    let mut included = plain.is_empty() || plain.iter().any(|pattern| matches(pattern, false));
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('!'))
-        .any(|pattern| resource_matches(path, root, pattern, false, directory_roots))
+        .any(|pattern| matches(pattern, false))
     {
         included = false;
     }
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('+'))
-        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+        .any(|pattern| matches(pattern, true))
     {
         included = true;
     }
     if filters
         .iter()
         .filter_map(|filter| filter.strip_prefix('-'))
-        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+        .any(|pattern| matches(pattern, true))
     {
         included = false;
     }
@@ -1102,12 +1105,12 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         installed_binaries.push(root.clone());
         root = root.parent().unwrap_or(Path::new(".")).into();
     }
-    // Check both files through the nonblocking descriptor reader before any
-    // executable discovery or Cargo invocation. A present but unusable file
-    // is an error, never an absent manifest that enables defaults.
+    // Check both files before executable discovery or local/Git Cargo builds.
+    // Registry `cargo install` above has already built the crate in order to
+    // locate its source; it cannot be prevalidated through this path.
     let pi_bytes = read_optional_manifest(&root, "pi-package.json")?;
     let cargo_bytes = read_optional_manifest(&root, "Cargo.toml")?;
-    // Validate every relevant manifest before Cargo can run a build script.
+    // Validate relevant manifests before the local/Git build below.
     local_startup_manifest(&root)?;
     let has_pi_manifest = pi_bytes.is_some();
     let has_cargo_manifest = cargo_bytes.is_some();
@@ -1238,12 +1241,7 @@ fn collect_package_resources(
         }
         installed_binaries
             .into_iter()
-            .filter(|path| {
-                names.iter().any(|name| {
-                    path.file_stem().is_some_and(|file| file == name.as_str())
-                        || manifest_selected(path, root, std::slice::from_ref(name))
-                })
-            })
+            .filter(|path| extension_selected(path, root, &names))
             .collect()
     } else if explicit {
         Vec::new()
@@ -1882,6 +1880,36 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extension_manifest_applies_includes_and_exclusions_together() {
+        let root = Path::new("/package");
+        let excluded = root.join("extensions/unexpected");
+        let allowed = root.join("extensions/allowed");
+        let filters = vec!["extensions".into(), "!extensions/unexpected".into()];
+        assert!(!extension_selected(&excluded, root, &filters));
+        assert!(extension_selected(&allowed, root, &filters));
+        let outside_binary = Path::new("/cache/bin/demo.exe");
+        assert!(extension_selected(outside_binary, root, &["demo".into()]));
+        assert!(!extension_selected(
+            outside_binary,
+            root,
+            &["demo".into(), "!demo".into()]
+        ));
+        assert!(extension_selected(
+            &excluded,
+            root,
+            &[
+                "extensions".into(),
+                "!extensions/unexpected".into(),
+                "+extensions/unexpected".into()
+            ]
+        ));
+        assert!(!extension_selected(
+            &excluded,
+            root,
+            &["extensions".into(), "-extensions/unexpected".into()]
+        ));
+    }
     #[test]
     fn absent_manifest_keeps_default_discovery_and_oversized_manifests_fail() {
         let directory = tempfile::tempdir().unwrap();
