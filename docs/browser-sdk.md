@@ -26,6 +26,7 @@ try {
   // A UI cancel button may call session.cancel() while pending is active.
   console.log(await pending);
   console.log(JSON.parse(session.messages()));
+  // After reopening an interrupted session, await session.resume() to continue it.
 } finally {
   // Cancel and await a pending prompt before closing. close waits for lock release.
   await session.close();
@@ -42,8 +43,11 @@ mutate the same session. Call `close()` before reopening; `free()` alone cannot
 wait for lock release. Page termination also releases the browser lock.
 
 Each journal record is committed by replacing a localStorage value before the
-operation returns. A later `open` validates and restores that journal. Storage
-errors and corrupt records fail the operation instead of silently starting a new
+operation returns. A later `open` validates and restores that journal. Call
+`resume()` to continue an interrupted run without adding a new user prompt. An
+interrupted model request can be sent and charged again. The current gateway
+protocol does not supply an idempotency key. Storage errors and corrupt records
+fail the operation instead of silently starting a new
 session. Browser storage quotas, user deletion, private browsing, and the
 browser's persistence policies apply. Other same-origin code can access this
 storage; the session may contain sensitive conversation text. The bearer token
@@ -66,7 +70,8 @@ The browser host currently provides no built-in tools, custom tool execution,
 extensions, provider-specific adapters, streaming UI events, multimodal input,
 branch navigation, or native filesystem and process access. It does not expose
 the complete native SDK surface. The browser Fetch adapter enforces an 8 MiB
-request body and a 16 MiB response limit. Chrome integration tests use a local
+request body and a 16 MiB response limit. Chrome integration tests include an
+in-flight page reload followed by `resume()`. They use a local
 mock gateway; they do not establish compatibility with a live model provider or
 other browsers. Build flags select browser randomness explicitly; the same
 unknown WASM target name alone does not establish browser support.

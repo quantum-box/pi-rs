@@ -228,25 +228,11 @@ impl BrowserSession {
         result
     }
     pub fn prompt(&self, input: String) -> js_sys::Promise {
-        let inner = self.inner.clone();
-        let sequence = inner.cancel_sequence.get();
-        future_to_promise(async move {
-            if inner.disposed.get() || inner.cancel_sequence.get() != sequence {
-                return Err(js_error("session cancelled"));
-            }
-            let mut session = inner
-                .session
-                .borrow_mut()
-                .take()
-                .ok_or_else(|| js_error("session busy or closed"))?;
-            let result = session
-                .prompt(input)
-                .await
-                .map(JsValue::from)
-                .map_err(|e| js_error(&e.to_string()));
-            *inner.session.borrow_mut() = Some(session);
-            result
-        })
+        self.run_input(Some(input))
+    }
+    /// Resume a previously interrupted or settled session without adding input.
+    pub fn resume(&self) -> js_sys::Promise {
+        self.run_input(None)
     }
     pub fn cancel(&self) {
         self.inner
@@ -283,6 +269,30 @@ impl BrowserSession {
         let session = slot.as_ref().ok_or_else(|| js_error("session busy"))?;
         let messages = session.messages().map_err(|e| js_error(&e.to_string()))?;
         serde_json::to_string(&messages).map_err(|_| js_error("message serialization failed"))
+    }
+}
+impl BrowserSession {
+    fn run_input(&self, input: Option<String>) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        let sequence = inner.cancel_sequence.get();
+        future_to_promise(async move {
+            if inner.disposed.get() || inner.cancel_sequence.get() != sequence {
+                return Err(js_error("session cancelled"));
+            }
+            let mut session = inner
+                .session
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| js_error("session busy or closed"))?;
+            let result = match input {
+                Some(input) => session.prompt(input).await,
+                None => session.resume().await,
+            }
+            .map(JsValue::from)
+            .map_err(|e| js_error(&e.to_string()));
+            *inner.session.borrow_mut() = Some(session);
+            result
+        })
     }
 }
 impl Drop for BrowserSession {

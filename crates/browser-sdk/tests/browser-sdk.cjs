@@ -11,6 +11,7 @@ const { once } = require('node:events');
   if (!dir || !chrome) throw Error('expected bindings directory and Chrome path');
   const requests = [];
   let aborted = false;
+  let resumeRequests = 0;
   const api = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'authorization,content-type');
@@ -19,7 +20,9 @@ const { once } = require('node:events');
     let body = ''; req.on('data', b => body += b); req.on('end', () => {
       const request = JSON.parse(body); request._auth = req.headers.authorization; requests.push(request);
       const last = request.messages.filter(m => m.role === 'user').at(-1)?.content;
-      if (last === 'fail me') { res.writeHead(403).end('private'); }
+      if (last === 'resume me' && ++resumeRequests === 1) { setTimeout(() => { if (!res.destroyed) res.end(JSON.stringify({text:'too late'})); }, 5000); }
+      else if (last === 'resume me') { res.end(JSON.stringify({text:'resumed'})); }
+      else if (last === 'fail me') { res.writeHead(403).end('private'); }
       else if (last === 'cancel me' || last === 'timeout me') {
         res.on('close', () => { if (!res.writableEnded) aborted = true; });
         setTimeout(() => { if (!res.destroyed) res.end(JSON.stringify({text:'too late'})); }, 3000);
@@ -37,11 +40,26 @@ const assert = (x, msg) => { if (!x) throw Error(msg); };
 const reject = async (p, part) => { let err; try { await p; } catch(e) { err = e; } assert(err && String(err).includes(part), String(err)); };
 try {
   await init(); const base = ${JSON.stringify(origin)};
-  if (sessionStorage.getItem('reloaded')) {
+  if (sessionStorage.getItem('reloaded') === 'resuming') {
+    let resumed; const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try { resumed = await BrowserSession.open('crash', base + '/gateway', 'test-model', 'secret', 1500); break; }
+      catch (e) { if (!String(e).includes('already open')) throw e; await new Promise(r => setTimeout(r, 20)); }
+    }
+    assert(resumed, 'crashed session lock released');
+    assert(await resumed.resume() === 'resumed', 'interrupted run did not resume');
+    assert(JSON.parse(resumed.messages()).some(m => m.content === 'resumed'), 'resumed answer not stored');
+    await resumed.close(); resumed.free();
+    document.body.textContent = 'PASS';
+  } else if (sessionStorage.getItem('reloaded')) {
     const restored = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
     assert(JSON.parse(restored.messages()).some(m => m.content === 'after timeout'), 'restored after page reload');
     await restored.close(); restored.free();
-    document.body.textContent = 'PASS';
+    const crash = await BrowserSession.open('crash', base + '/gateway', 'test-model', 'secret', 1500);
+    crash.prompt('resume me').catch(() => {});
+    while (!(await (await fetch('/resume-started')).json())) await new Promise(r => setTimeout(r, 20));
+    sessionStorage.setItem('reloaded', 'resuming');
+    location.reload();
   } else {
   const originalSetItem = Storage.prototype.setItem;
   Storage.prototype.setItem = function() { throw new DOMException('quota', 'QuotaExceededError'); };
@@ -104,6 +122,7 @@ try {
       res.end(`<!doctype html><script type="module">import init,{BrowserSession} from '/pkg/pi_rs_browser_sdk.js'; try { await init(); const session = await BrowserSession.open('test', ${JSON.stringify(origin)} + '/gateway', 'test-model', '', 1500); await session.close(); session.free(); parent.postMessage('unexpected', location.origin); } catch (e) { parent.postMessage(String(e).includes('already open') ? 'locked' : String(e), location.origin); }</script>`);
       return;
     }
+    if (req.url === '/resume-started') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(resumeRequests > 0)); return; }
     if (req.url === '/cancel-started') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(requests.some(r => r.messages.some(m => m.content === 'cancel me')))); return; }
     if (req.url === '/') { res.setHeader('content-type', 'text/html'); res.end(html); return; }
     const name = path.basename(req.url);
@@ -146,6 +165,7 @@ try {
       socket.close();
       if (text !== 'PASS') throw Error(`browser failed: ${text}`);
       if (requests.some(r => r.messages.some(m => m.content === 'never sent'))) throw Error('pre-start cancellation dispatched a request');
+      if (resumeRequests !== 2) throw Error('interrupted request was not resumed exactly once');
       if (requests.some(r => r._auth !== 'Bearer secret')) throw Error('gateway authorization header missing');
       if (requests.length < 4 || !requests[1].messages.some(m => m.content === 'first') || !requests[1].messages.some(m => m.content === 'answer one')) throw Error('restored context was not sent to gateway');
       if (!aborted) throw Error('cancel did not abort network request');

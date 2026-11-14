@@ -112,7 +112,7 @@ See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 An experimental text-only browser host uses the same Rust `AgentSession`, a
 Fetch gateway, and localStorage guarded by Web Locks. Its Chrome integration
 checks execution, communication, cancellation, timeout, lock exclusion and
-journal restoration after page reload. See [Browser SDK](browser-sdk.md) for
+journal restoration and resumption of an interrupted run after page reload. See [Browser SDK](browser-sdk.md) for
 build instructions, the gateway contract, storage semantics and limitations.
 It does not yet provide native tools, extensions, provider adapters or the
 complete SDK surface. The native Tauri fixture does not test this browser host.
