@@ -1108,8 +1108,8 @@ prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
 malformed UTF-8 in text attachments is decoded with replacement characters.
 For CLI attachments, image detection does not infer a format from the file
 extension. Malformed PNG headers and animated PNGs detected within the first
-4,100 bytes are treated as text, matching Pi's PNG sniffing; other format
-classification continues to use the native reader.
+4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
+also follows Pi; unsupported image formats are treated as text.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
