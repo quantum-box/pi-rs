@@ -1082,6 +1082,27 @@ impl Harness {
         };
         self.save_composed_locked(state, expected, wake, children, &[], None)
     }
+    fn save_hook_children(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        children: &[crate::task::Task],
+        handlers: &[Arc<dyn crate::task_scheduler::Handler>],
+    ) -> Result<(), Error> {
+        if children.is_empty() {
+            return self.save_composed(state, expected, None, children);
+        }
+        let driver = self
+            .task_driver
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .as_ref()
+            .and_then(|driver| driver.upgrade())
+            .ok_or_else(|| Error::Invalid("task driver is not running".into()))?;
+        driver.with_hook_children(children, handlers, state.id, || {
+            self.save_composed_locked(state, expected, None, children, &[], None)
+        })
+    }
     fn save_composed_locked(
         &mut self,
         state: &Conversation,
@@ -3282,9 +3303,16 @@ impl Harness {
         event: crate::extension::GenerationEvent,
         value: serde_json::Value,
         cancel: &CancellationToken,
-    ) -> Result<Option<(Option<serde_json::Value>, Vec<crate::task::Task>)>, Error> {
+    ) -> Result<
+        Option<(
+            Option<serde_json::Value>,
+            Vec<crate::task::Task>,
+            Vec<Arc<dyn crate::task_scheduler::Handler>>,
+        )>,
+        Error,
+    > {
         if c.extensions.is_empty() {
-            return Ok(Some((None, vec![])));
+            return Ok(Some((None, vec![], vec![])));
         }
         let selected = self.selected_extensions(c)?;
         let snapshot = serde_json::to_value(c)?;
@@ -3303,7 +3331,7 @@ impl Harness {
         self.subagent_store()?;
         self.record_extension_reports(c.id, operation_id, &format!("{event:?}"), reports)?;
         if tasks.is_empty() {
-            return Ok(Some((continuation, vec![])));
+            return Ok(Some((continuation, vec![], vec![])));
         }
         let driver = self
             .task_driver
@@ -3315,6 +3343,7 @@ impl Harness {
             return Ok(None);
         };
         let mut children = Vec::with_capacity(tasks.len());
+        let mut handlers = Vec::with_capacity(tasks.len());
         for task in tasks {
             let handler = selected.task(&task.name).ok_or_else(|| {
                 Error::Invalid(format!("unselected task registration: {}", task.name))
@@ -3334,8 +3363,9 @@ impl Harness {
             .map_err(|e| Error::Invalid(format!("task creation: {e:?}")))?
             .registered(task.name, replay);
             children.push(child);
+            handlers.push(handler);
         }
-        Ok(Some((continuation, children)))
+        Ok(Some((continuation, children, handlers)))
     }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
@@ -4017,7 +4047,7 @@ impl Harness {
                     answer,
                     operation_id,
                 } => {
-                    let Some((continuation, children)) = self
+                    let Some((continuation, children, handlers)) = self
                         .run_lifecycle_hook(
                             &c,
                             operation_id,
@@ -4035,7 +4065,12 @@ impl Harness {
                             answer,
                             children: children.iter().map(|t| t.id()).collect(),
                         };
-                        self.save_composed(&c, Expected::Version(version), None, &children)?;
+                        self.save_hook_children(
+                            &c,
+                            Expected::Version(version),
+                            &children,
+                            &handlers,
+                        )?;
                         continue;
                     }
                     let continuation = match continuation {
@@ -4181,7 +4216,7 @@ impl Harness {
                     calls,
                     operation_id,
                 } => {
-                    let Some((_, children)) = self
+                    let Some((_, children, handlers)) = self
                         .run_lifecycle_hook(
                             &c,
                             operation_id,
@@ -4204,13 +4239,13 @@ impl Harness {
                             turns: Some(turns),
                         }
                     };
-                    self.save_composed(&c, Expected::Version(version), None, &children)?;
+                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
                 }
                 Phase::AfterRun {
                     answer,
                     operation_id,
                 } => {
-                    let Some((_, children)) = self
+                    let Some((_, children, handlers)) = self
                         .run_lifecycle_hook(
                             &c,
                             operation_id,
@@ -4230,7 +4265,7 @@ impl Harness {
                             turns: None,
                         }
                     };
-                    self.save_composed(&c, Expected::Version(version), None, &children)?;
+                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
                 }
                 Phase::HookTasksWaiting { children, turns } => {
                     let store = crate::task_store::TaskStore::new(self.owner.store());

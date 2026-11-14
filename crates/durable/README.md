@@ -452,7 +452,10 @@ Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal task
 including their IDs, kinds, owners and current reasons; `blocked_reason` also
 inspects an individual record. The background driver's `replace_registry` waits
 for the current synchronous handler to finish, updates admission policies at the
-same boundary, and wakes its worker. Calling it or `blocked_tasks` from a handler
+same boundary, and wakes its worker. Lifecycle hook children are committed only
+when their selected handler identity, replay policy, and version still match the
+registry; replacement cannot interleave with that validation and commit. Calling
+it or `blocked_tasks` from a handler
 on that driver would deadlock. Replacement clears all cached migration failures,
 even for unchanged definitions, and reopening retries them. Snapshots are not a
 durable change log: short-lived changes can be missed and missing-migration and

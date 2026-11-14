@@ -441,6 +441,53 @@ impl Shared {
         }
         result
     }
+    // Called while the conversation execution gate may be held. Match the
+    // admission lock order: state before task gate, never scheduler or a
+    // conversation gate while holding state. Replacement holds state while
+    // publishing its registry, so validation and commit form one boundary.
+    pub(crate) fn with_hook_children<T>(
+        &self,
+        tasks: &[Task],
+        handlers: &[Arc<dyn task_scheduler::Handler>],
+        conversation: Uuid,
+        f: impl FnOnce() -> Result<T, crate::runtime::Error>,
+    ) -> Result<T, crate::runtime::Error> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        if state.stop
+            || tasks.len() != handlers.len()
+            || tasks.iter().zip(handlers).any(|(task, handler)| {
+                let Some(kind) = task.kind() else { return true };
+                let Some((replay, registered)) = state.definitions.get(kind) else {
+                    return true;
+                };
+                !Arc::ptr_eq(handler, registered)
+                    || state.policies.get(kind).copied()
+                        != Some((task.replay_safe(), task.definition_version()))
+                    || *replay != task.replay_safe()
+                    || task.definition_version() != 1
+                    || task.owner() != &TaskOwner::Conversation(conversation)
+                    || task.state() != &TaskState::Ready
+                    || task.abort_requested()
+            })
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "task driver registration mismatch".into(),
+            ));
+        }
+        let _gate = self
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        let result = f();
+        if result.is_ok() {
+            self.wake.notify_one();
+        }
+        result
+    }
     pub(crate) fn policy_for(
         &self,
         name: &str,
@@ -464,6 +511,145 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn hook_commit_and_registry_replacement_are_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler: Arc<dyn task_scheduler::Handler> =
+            Arc::new(|_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))));
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_shared("hook", true, handler.clone());
+        let mut scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), Default::default()).unwrap();
+        scheduler.replace_registry(registry).unwrap();
+        let shared = Arc::new(Shared {
+            owner: scheduler.owner(),
+            state: Mutex::new(State {
+                policies: scheduler.policies(),
+                definitions: scheduler.definitions(),
+                ..State::default()
+            }),
+            scheduler: Mutex::new(scheduler),
+            wake: Condvar::new(),
+            harness: None,
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
+        });
+        let conversation = Uuid::new_v4();
+        let child = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            1,
+        )
+        .unwrap()
+        .registered("hook".into(), true);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let commit_shared = shared.clone();
+        let commit_child = child.clone();
+        let commit_handler = handler.clone();
+        let commit = thread::spawn(move || {
+            commit_shared.with_hook_children(
+                &[commit_child.clone()],
+                &[commit_handler],
+                conversation,
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    TaskStore::new(commit_shared.owner.store())
+                        .save(&[Save::Create(&commit_child)])
+                        .unwrap();
+                    Ok(())
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The save holds both locks; replacement cannot publish a new definition.
+        assert!(shared.state.try_lock().is_err());
+        assert!(shared.owner.task_gate().try_lock().is_err());
+        let driver = Driver {
+            shared: shared.clone(),
+            worker: None,
+            cleanup: None,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let replacement = thread::spawn(move || {
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("hook", true, |_: &Task| {
+                Ok(task_scheduler::Step::Succeed(json!(null)))
+            });
+            started_tx.send(()).unwrap();
+            driver.replace_registry(registry).unwrap();
+            driver
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        let driver = replacement.join().unwrap();
+        assert!(
+            TaskStore::new(shared.owner.store())
+                .load(child.id())
+                .unwrap()
+                .is_some()
+        );
+        // Same policy/version with a different handler must fail before saving.
+        let mut called = false;
+        assert!(
+            shared
+                .with_hook_children(&[child.clone()], &[handler.clone()], conversation, || {
+                    called = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!called);
+        // Restore the selected handler, then independently reject a task with
+        // a different persisted version.
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_shared("hook", true, handler.clone());
+        driver.replace_registry(registry).unwrap();
+        let versioned = child
+            .clone()
+            .registered_versioned("hook".into(), true, 2, json!(null))
+            .unwrap();
+        assert!(
+            shared
+                .with_hook_children(&[versioned], &[handler.clone()], conversation, || Ok(()))
+                .is_err()
+        );
+        // The same selected handler is still rejected if replay changed.
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_shared("hook", false, handler.clone());
+        driver.replace_registry(registry).unwrap();
+        assert!(
+            shared
+                .with_hook_children(
+                    &[child.clone()],
+                    &[handler.clone()],
+                    conversation,
+                    || Ok(())
+                )
+                .is_err()
+        );
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_versioned(
+            "hook",
+            2,
+            true,
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+            None,
+        );
+        driver.replace_registry(registry).unwrap();
+        assert!(
+            shared
+                .with_hook_children(&[child], &[handler], conversation, || Ok(()))
+                .is_err()
+        );
+        driver.shutdown().unwrap();
+    }
 
     #[test]
     fn replacement_exposes_failures_and_restarts_blocked_work() {
@@ -629,6 +815,20 @@ mod tests {
             gate_held_tx.send(()).unwrap();
             lookup_rx.recv().unwrap();
             let policy = shared.policy_for("test", &handler);
+            let child = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "initial".into(),
+                    data: json!(null),
+                },
+                1,
+            )
+            .unwrap()
+            .registered("test".into(), true);
+            shared
+                .with_hook_children(&[child], &[handler], conversation, || Ok(()))
+                .unwrap();
             policy_done_tx.send(policy).unwrap();
         });
         gate_held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
