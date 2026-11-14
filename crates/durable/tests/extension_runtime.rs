@@ -2532,3 +2532,286 @@ async fn runtime_owner_stops_conversations_before_joining_task_driver() {
         .unwrap();
     Harness::open_paused(&path, opts()).unwrap();
 }
+
+struct ControlModel(Mutex<usize>);
+#[async_trait]
+impl Model for ControlModel {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        *self.0.lock().unwrap() += 1;
+        let answered = request
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }));
+        let calls = if answered {
+            vec![]
+        } else {
+            (0..2)
+                .map(|i| ToolCall {
+                    id: format!("call{i}"),
+                    name: "controlled".into(),
+                    arguments: format!("{{\"n\":{i}}}"),
+                })
+                .collect()
+        };
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text(
+                if answered { "followup" } else { "tool answer" }.into(),
+            )),
+            Ok(ModelEvent::Complete { calls, usage: None }),
+        ])
+        .boxed())
+    }
+}
+struct ControlledTool {
+    controls: [bool; 2],
+    calls: Arc<Mutex<Vec<usize>>>,
+    fail_second: bool,
+}
+#[async_trait]
+impl pi_rs_durable::keyed_tool::KeyedTool for ControlledTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "controlled".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}),
+        }
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        unreachable!()
+    }
+    async fn invoke_controlled(
+        &self,
+        args: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> (pi_rs_core::ToolReply, pi_rs_durable::reset::ToolControl) {
+        let n = args["n"].as_u64().unwrap() as usize;
+        self.calls.lock().unwrap().push(n);
+        if n == 1 && self.fail_second {
+            return (Outcome::Failed("failed".into()).into(), Default::default());
+        }
+        (
+            Outcome::Succeeded(format!("result {n}")).into(),
+            pi_rs_durable::reset::ToolControl {
+                terminate: self.controls[n],
+                ..Default::default()
+            },
+        )
+    }
+}
+struct ControlHook {
+    cancel: Option<CancellationToken>,
+    after_run: Arc<Mutex<usize>>,
+}
+#[async_trait]
+impl Hook for ControlHook {
+    async fn after_tool(
+        &self,
+        _: &HookCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+        Ok(None)
+    }
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        if matches!(event, pi_rs_durable::extension::GenerationEvent::AfterRun) {
+            *self.after_run.lock().unwrap() += 1;
+        }
+        Ok(pi_rs_durable::extension::GenerationDecision::Pass)
+    }
+}
+fn control_options(
+    model: Arc<ControlModel>,
+    calls: Arc<Mutex<Vec<usize>>>,
+    controls: [bool; 2],
+    fail_second: bool,
+) -> Options {
+    let tool = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ControlledTool {
+            controls,
+            calls,
+            fail_second,
+        },
+    ));
+    Options {
+        model,
+        tools: vec![tool.register(ReplayPolicy::Safe)],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    }
+}
+fn install_control_hook(
+    h: &Harness,
+    cancel: Option<CancellationToken>,
+    after_run: Arc<Mutex<usize>>,
+) {
+    h.install_extension(Extension {
+        name: "control-hook".into(),
+        hooks: vec![Arc::new(ControlHook { cancel, after_run })],
+        ..Default::default()
+    })
+    .unwrap();
+}
+#[tokio::test]
+async fn controlled_multi_tool_round_requires_every_result() {
+    for (controls, fail_second, expected) in [
+        ([true, true], false, 1),
+        ([true, false], false, 2),
+        ([false, true], false, 2),
+        ([true, true], true, 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(ControlModel(Mutex::new(0)));
+        let calls = Arc::new(Mutex::new(vec![]));
+        let after = Arc::new(Mutex::new(0));
+        let mut h = Harness::open_paused(
+            dir.path().join("db"),
+            control_options(model.clone(), calls.clone(), controls, fail_second),
+        )
+        .unwrap();
+        install_control_hook(&h, None, after.clone());
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["control-hook".into()])
+            .unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(*model.0.lock().unwrap(), expected);
+        assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+        assert_eq!(*after.lock().unwrap(), 1);
+        let c = h.conversation(id).unwrap();
+        assert!(
+            matches!(&c.submissions[0].status, Status::Done { answer } if answer == if expected == 1 { "tool answer" } else { "followup" })
+        );
+    }
+}
+#[tokio::test]
+async fn controlled_result_survives_cancel_and_reopen_without_reexecution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ControlModel(Mutex::new(0)));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let after = Arc::new(Mutex::new(0));
+    let id;
+    {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open_paused(
+            &path,
+            control_options(model.clone(), calls.clone(), [true, true], false),
+        )
+        .unwrap();
+        install_control_hook(&h, Some(cancel.clone()), after.clone());
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["control-hook".into()])
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![0]);
+    }
+    let mut h = Harness::open_paused(
+        &path,
+        control_options(model.clone(), calls.clone(), [true, true], false),
+    )
+    .unwrap();
+    install_control_hook(&h, None, after.clone());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+    assert_eq!(*model.0.lock().unwrap(), 1);
+    assert_eq!(*after.lock().unwrap(), 1);
+    assert!(
+        matches!(&h.conversation(id).unwrap().submissions[0].status, Status::Done { answer } if answer == "tool answer")
+    );
+}
+
+struct CrashControlHook;
+#[async_trait]
+impl Hook for CrashControlHook {
+    async fn after_tool(
+        &self,
+        _: &HookCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        std::process::abort()
+    }
+}
+#[tokio::test]
+async fn controlled_crash_worker() {
+    let Ok(path) = std::env::var("PI_CONTROL_CRASH_DB") else {
+        return;
+    };
+    let model = Arc::new(ControlModel(Mutex::new(0)));
+    let mut h = Harness::open_paused(
+        &path,
+        control_options(model, Arc::default(), [true, true], false),
+    )
+    .unwrap();
+    h.install_extension(Extension {
+        name: "control-hook".into(),
+        hooks: vec![Arc::new(CrashControlHook)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["control-hook".into()])
+        .unwrap();
+    std::fs::write(format!("{path}.id"), id.to_string()).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    panic!("expected crash");
+}
+#[tokio::test]
+async fn controlled_result_survives_process_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "controlled_crash_worker"])
+        .env("PI_CONTROL_CRASH_DB", &path)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    let id = std::fs::read_to_string(format!("{}.id", path.display()))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let model = Arc::new(ControlModel(Mutex::new(0)));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let after = Arc::new(Mutex::new(0));
+    let mut h = Harness::open_paused(
+        &path,
+        control_options(model.clone(), calls.clone(), [true, true], false),
+    )
+    .unwrap();
+    install_control_hook(&h, None, after.clone());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![1]);
+    assert_eq!(*model.0.lock().unwrap(), 0);
+    assert_eq!(*after.lock().unwrap(), 1);
+    assert!(
+        matches!(&h.conversation(id).unwrap().submissions[0].status, Status::Done { answer } if answer == "tool answer")
+    );
+}

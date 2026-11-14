@@ -17,6 +17,7 @@ struct Dispatch {
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     claimed: AtomicBool,
+    control: Arc<AtomicBool>,
 }
 tokio::task_local! { static CURRENT_HOST: Dispatch; }
 
@@ -28,6 +29,25 @@ pub(crate) async fn scope<F: std::future::Future>(
     ordinary: Arc<dyn ToolHost>,
     future: F,
 ) -> F::Output {
+    scope_with_control(
+        nested,
+        tool,
+        operation_id,
+        ordinary,
+        Arc::new(AtomicBool::new(false)),
+        future,
+    )
+    .await
+}
+
+pub(crate) async fn scope_with_control<F: std::future::Future>(
+    nested: Arc<NestedHost>,
+    tool: Arc<dyn Tool>,
+    operation_id: uuid::Uuid,
+    ordinary: Arc<dyn ToolHost>,
+    control: Arc<AtomicBool>,
+    future: F,
+) -> F::Output {
     let _invocation_scope = crate::nested::InvocationScope(nested.clone());
     let dispatch = Dispatch {
         nested,
@@ -35,6 +55,7 @@ pub(crate) async fn scope<F: std::future::Future>(
         operation_id,
         ordinary,
         claimed: AtomicBool::new(false),
+        control,
     };
     CURRENT_HOST.scope(dispatch, future).await
 }
@@ -54,6 +75,22 @@ pub trait KeyedTool: Send + Sync {
         state: Option<&ExtensionState>,
         host: KeyedHost,
     ) -> ToolReply;
+
+    /// Return a control with the reply to opt into durable round termination.
+    /// Only `terminate` is applied; handoff is not supported by this adapter.
+    /// Nested calls do not terminate their caller’s model round.
+    async fn invoke_controlled(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> (ToolReply, crate::reset::ToolControl) {
+        (
+            self.invoke(arguments, context, state, host).await,
+            Default::default(),
+        )
+    }
 }
 
 /// The invocation's ordinary host plus its durable keyed-call capability.
@@ -155,9 +192,13 @@ impl<T: KeyedTool> Tool for KeyedToolAdapter<T> {
         let Some(nested) = nested else {
             return Outcome::Skipped("keyed tool requires durable runtime".into()).into();
         };
-        self.0
-            .invoke(arguments, context, state, KeyedHost { ordinary, nested })
-            .await
+        let (reply, control) = self
+            .0
+            .invoke_controlled(arguments, context, state, KeyedHost { ordinary, nested })
+            .await;
+        let _ = CURRENT_HOST
+            .try_with(|dispatch| dispatch.control.store(control.terminate, Ordering::Release));
+        reply
     }
 }
 

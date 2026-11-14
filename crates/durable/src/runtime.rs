@@ -473,6 +473,8 @@ pub struct Conversation {
     #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
     #[serde(default)]
+    round_terminates: Vec<bool>,
+    #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
     #[serde(default)]
     answer_ids: HashMap<Uuid, Uuid>,
@@ -497,6 +499,23 @@ pub struct Conversation {
 pub struct ToolAttempt {
     pub operation_id: Uuid,
     pub attempt_id: Uuid,
+}
+
+fn terminate_tool_round(c: &mut Conversation) -> Result<Phase, Error> {
+    let answer = c
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant { content, calls, .. } if !calls.is_empty() => Some(content.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Invalid("missing tool-calling answer".into()))?;
+    finish_answer(c, answer.clone());
+    Ok(Phase::AfterRun {
+        answer,
+        operation_id: Uuid::new_v4(),
+    })
 }
 
 impl Conversation {
@@ -1871,6 +1890,7 @@ impl Harness {
             pending_resets: vec![],
             application_writes: vec![],
             tool_states: HashMap::new(),
+            round_terminates: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -2103,6 +2123,7 @@ impl Harness {
                 })
                 .collect(),
             tool_states: point.tool_states,
+            round_terminates: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -4554,6 +4575,7 @@ impl Harness {
                                 operation_id: Uuid::new_v4(),
                             };
                         } else {
+                            c.round_terminates = vec![false; response.calls.len()];
                             c.phase = Phase::Tools {
                                 turns: turns + 1,
                                 calls: response.calls,
@@ -4750,9 +4772,16 @@ impl Harness {
                         return Ok(());
                     };
                     c.phase = if children.is_empty() {
-                        Phase::Boundary {
-                            turns,
-                            answer: None,
+                        if !calls.is_empty()
+                            && c.round_terminates.len() == calls.len()
+                            && c.round_terminates.iter().all(|v| *v)
+                        {
+                            terminate_tool_round(&mut c)?
+                        } else {
+                            Phase::Boundary {
+                                turns,
+                                answer: None,
+                            }
                         }
                     } else {
                         Phase::HookTasksWaiting {
@@ -4826,7 +4855,11 @@ impl Harness {
                             terminate = true;
                         }
                     }
-                    c.phase = if terminate {
+                    c.phase = if terminate
+                        || (turns.is_some()
+                            && !c.round_terminates.is_empty()
+                            && c.round_terminates.iter().all(|v| *v))
+                    {
                         let answer = c
                             .messages
                             .iter()
@@ -5170,6 +5203,7 @@ impl Harness {
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
                     let tools = self.resolved_tools(&c)?;
+                    let control = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let reply = if let Some(reg) = tools.get(&call.name) {
                         let invocation = Invocation {
                             operation_id,
@@ -5207,21 +5241,24 @@ impl Harness {
                                             .map(|(host, _)| host.clone())
                                             .unwrap_or_else(|| host.clone());
                                         let reply = fenced_poll(
-                                            std::panic::AssertUnwindSafe(crate::keyed_tool::scope(
-                                                host.clone(),
-                                                reg.tool.clone(),
-                                                invocation.operation_id,
-                                                progress_host.clone(),
-                                                crate::tool::execute(
-                                                    reg.tool.as_ref(),
-                                                    &invocation,
-                                                    prepared,
-                                                    c.tool_states.get(&call.name),
-                                                    progress_host,
-                                                    cancel,
-                                                    Duration::from_secs(120),
+                                            std::panic::AssertUnwindSafe(
+                                                crate::keyed_tool::scope_with_control(
+                                                    host.clone(),
+                                                    reg.tool.clone(),
+                                                    invocation.operation_id,
+                                                    progress_host.clone(),
+                                                    control.clone(),
+                                                    crate::tool::execute(
+                                                        reg.tool.as_ref(),
+                                                        &invocation,
+                                                        prepared,
+                                                        c.tool_states.get(&call.name),
+                                                        progress_host,
+                                                        cancel,
+                                                        Duration::from_secs(120),
+                                                    ),
                                                 ),
-                                            ))
+                                            )
                                             .catch_unwind(),
                                             self.execution_gate.as_ref(),
                                             cancel,
@@ -5231,19 +5268,38 @@ impl Harness {
                                         match host.seal_and_wait().await {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
-                                                None => Outcome::Unknown(
-                                                    "local cancellation after dispatch".into(),
-                                                )
-                                                .into(),
-                                                Some(Err(_)) => Outcome::Unknown(
-                                                    "parent tool panicked after dispatch".into(),
-                                                )
-                                                .into(),
+                                                None => {
+                                                    control.store(
+                                                        false,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                    Outcome::Unknown(
+                                                        "local cancellation after dispatch".into(),
+                                                    )
+                                                    .into()
+                                                }
+                                                Some(Err(_)) => {
+                                                    control.store(
+                                                        false,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                    Outcome::Unknown(
+                                                        "parent tool panicked after dispatch"
+                                                            .into(),
+                                                    )
+                                                    .into()
+                                                }
                                             },
-                                            Err(error) => Outcome::Unknown(format!(
-                                                "nested tool requires reconciliation: {error}"
-                                            ))
-                                            .into(),
+                                            Err(error) => {
+                                                control.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                Outcome::Unknown(format!(
+                                                    "nested tool requires reconciliation: {error}"
+                                                ))
+                                                .into()
+                                            }
                                         }
                                     }
                                     Err(error) => {
@@ -5286,6 +5342,9 @@ impl Harness {
                             }
                         }
                         other => {
+                            if let Some(slot) = c.round_terminates.get_mut(index) {
+                                *slot = control.load(std::sync::atomic::Ordering::Acquire);
+                            }
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -7385,6 +7444,7 @@ mod scheduler_tests {
             pending_resets: vec![],
             application_writes: vec![],
             tool_states: HashMap::new(),
+            round_terminates: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
