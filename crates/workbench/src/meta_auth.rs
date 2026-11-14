@@ -64,7 +64,7 @@ impl Service {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15));
+            .timeout(Duration::from_secs(30));
         for proxy in super::http_proxy::configured(settings)? {
             builder = builder.proxy(proxy);
         }
@@ -463,7 +463,7 @@ mod tests {
         )
     }
 
-    async fn device_login_fixture(delayed_response: usize) {
+    async fn device_login_fixture(delayed_response: usize, delay: Duration) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -504,25 +504,21 @@ mod tests {
                 requests.push(String::from_utf8(bytes).unwrap());
                 // Delay either the in-flight token response or the mint past expiry.
                 if index == delayed_response {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(delay).await;
                 }
                 socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
             requests
         });
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        // Exercise the same timeout and redirect configuration used in production;
+        // only destinations are replaced with the isolated loopback fixture.
+        let mut mint = Service::new(&super::super::config::Settings::default()).unwrap();
+        mint.url = reqwest::Url::parse(&format!("{base}/muse-code/key")).unwrap();
         let service = DeviceService {
             authorization: reqwest::Url::parse(&format!("{base}/oidc/device/authorization/"))
                 .unwrap(),
             token: reqwest::Url::parse(&format!("{base}/oidc/device/token/")).unwrap(),
-            mint: Service {
-                url: reqwest::Url::parse(&format!("{base}/muse-code/key")).unwrap(),
-                client,
-            },
+            mint,
         };
         let credential = service
             .login(|url, code| {
@@ -551,12 +547,17 @@ mod tests {
     }
     #[tokio::test]
     async fn device_login_accepts_token_response_after_expiry() {
-        device_login_fixture(2).await;
+        device_login_fixture(2, Duration::from_secs(3)).await;
     }
 
     #[tokio::test]
     async fn device_login_allows_mint_to_finish_after_expiry() {
-        device_login_fixture(3).await;
+        device_login_fixture(3, Duration::from_secs(3)).await;
+    }
+
+    #[tokio::test]
+    async fn device_poll_uses_production_30_second_request_timeout() {
+        device_login_fixture(2, Duration::from_secs(16)).await;
     }
 
     #[tokio::test]
