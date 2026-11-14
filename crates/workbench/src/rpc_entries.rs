@@ -274,10 +274,7 @@ impl Entries {
             let mut descendants = children.remove(id).unwrap_or_default();
             descendants.reverse();
             descendants.sort_by_cached_key(|node| {
-                node["entry"]["timestamp"]
-                    .as_str()
-                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-                    .map(|timestamp| timestamp.timestamp_millis())
+                node["entry"]["timestamp"].as_str().and_then(tree_timestamp)
             });
             let mut node = json!({"entry":entry});
             node["children"] = Value::Array(descendants);
@@ -321,6 +318,36 @@ impl Entries {
             .collect();
         json!({"messages":messages})
     }
+}
+
+// JavaScript Date treats valid ISO date-only forms as UTC midnight, whereas
+// chrono's RFC 3339 parser requires a time and offset.
+fn tree_timestamp(value: &str) -> Option<i64> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let bytes = value.as_bytes();
+    if !matches!(bytes.len(), 4 | 7 | 10)
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || (bytes.len() >= 7 && (bytes[4] != b'-' || !bytes[5..7].iter().all(u8::is_ascii_digit)))
+        || (bytes.len() == 10 && (bytes[7] != b'-' || !bytes[8..10].iter().all(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    let year = value[..4].parse().ok()?;
+    let month = if bytes.len() >= 7 {
+        value[5..7].parse().ok()?
+    } else {
+        1
+    };
+    let day = if bytes.len() == 10 {
+        value[8..10].parse().ok()?
+    } else {
+        1
+    };
+    chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(0, 0, 0)
+        .map(|timestamp| timestamp.and_utc().timestamp_millis())
 }
 
 pub(super) struct Cursor {
@@ -1092,6 +1119,31 @@ mod tests {
             .collect();
         assert_eq!(names, ["earlier", "equal", "later"]);
         assert_eq!(tree["leafId"], children[1]["entry"]["id"]);
+    }
+
+    #[test]
+    fn imported_tree_orders_iso_date_only_timestamps_at_utc_midnight() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("february", Some("root"), "2025-02"),
+            ("january2", Some("root"), "2025-01-02"),
+            ("offset-equal", Some("root"), "2025-01-01T20:00:00-04:00"),
+            ("year", Some("root"), "2025"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["year", "january2", "offset-equal", "february"]);
+        assert_eq!(children[0]["entry"]["timestamp"], "2025");
+        assert_eq!(children[1]["entry"]["timestamp"], "2025-01-02");
     }
 
     #[test]
