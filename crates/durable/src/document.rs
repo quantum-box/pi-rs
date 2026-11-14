@@ -18,6 +18,10 @@ pub enum Error {
     Store(#[from] durable_store::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Signal(#[from] crate::task_store::Error),
+    #[error("at most one signal to another task may be staged per invocation")]
+    SignalComposition,
     #[error("stored document is not a JSON object")]
     InvalidDocument,
     #[error("a batch has duplicate checks or writes, or an unchecked write")]
@@ -505,6 +509,7 @@ pub struct TaskDocuments<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     task: crate::task::Task,
     entries: Option<PendingEntries>,
+    signal: Option<OwnedBatch>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
@@ -512,6 +517,7 @@ impl<'a> TaskDocuments<'a> {
             store,
             task: task.clone(),
             entries: None,
+            signal: None,
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
             writes: HashMap::new(),
@@ -544,6 +550,34 @@ impl<'a> TaskDocuments<'a> {
         self.writes.insert(address.clone(), value);
         Ok(())
     }
+    /// Stage one typed delivery before document or entry writes. The returned
+    /// outcome is provisional until this task's checkpoint commits. A conflict
+    /// replays only registered replay-safe handlers. Self-delivery is excluded.
+    pub fn signal_at(
+        &mut self,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+    ) -> Result<crate::task_store::SignalResult, Error> {
+        if !self.writes.is_empty() || self.entries.is_some() {
+            return Err(Error::ReadAfterWrite);
+        }
+        if self.signal.is_some() || task_id == self.task.id() {
+            return Err(Error::SignalComposition);
+        }
+        let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
+            task_id,
+            token,
+            key,
+            value,
+            || now_millis,
+        )?;
+        self.signal = Some(batch);
+        Ok(result)
+    }
+
     /// Stage an immutable application record with this task as its author.
     /// The root conversation and every task ancestor must exist and not be aborting. The returned ID is
     /// provisional until the step commits and can change on replay.
@@ -640,6 +674,10 @@ impl<'a> TaskDocuments<'a> {
                     None => Mutation::Delete { key },
                 });
             }
+        }
+        if let Some(signal) = self.signal {
+            batch.checks.extend(signal.checks);
+            batch.mutations.extend(signal.mutations);
         }
         if let Some((conversation, version, entries, checks)) = self.entries {
             batch.checks.extend(checks);

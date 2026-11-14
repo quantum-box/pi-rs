@@ -626,83 +626,94 @@ impl<'a> TaskStore<'a> {
         value: Value,
         mut now: impl FnMut() -> i64,
     ) -> Result<SignalResult, Error> {
-        let receipt_id = Uuid::new_v4();
         loop {
-            let Some(target) = self.load(task_id)? else {
-                return Ok(SignalResult::NotFound);
-            };
-            if target.task.is_terminal() || target.task.abort_requested() {
-                return Ok(SignalResult::Closed);
-            }
-            if key_text.is_empty() {
-                return Ok(SignalResult::Invalid);
-            }
-            let signal =
-                match Signal::new_typed(receipt_id, task_id, token, key_text, value.clone()) {
-                    Ok(signal) => signal,
-                    Err(Error::InvalidSignalPayload) => return Ok(SignalResult::Invalid),
-                    Err(error) => return Err(error),
-                };
-            let revision_key = signal_revision_key(task_id);
-            let revision = self.store.get(&revision_key)?;
-            let mut found = None;
-            for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
-                let old: Signal = serde_json::from_slice(&entry.value)?;
-                if old.typed_key() == signal.typed_key() {
-                    found = Some(if old.expired {
-                        SignalResult::Closed
-                    } else {
-                        SignalResult::Duplicate
-                    });
-                    break;
-                }
-            }
-            let expired = found.is_none()
-                && matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now() >= *deadline && signals.contains(signal.typed_key().unwrap()));
-            let mut signal = signal;
-            signal.expired = expired;
-            let receipt_key = signal_key(task_id, receipt_id);
-            let checks = [
-                Check {
-                    key: key(task_id),
-                    expected: Expected::Version(target.version),
-                },
-                Check {
-                    key: revision_key.clone(),
-                    expected: revision
-                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
-                },
-                Check {
-                    key: receipt_key.clone(),
-                    expected: Expected::Missing,
-                },
-            ];
-            let mutations = if found.is_some() {
-                vec![]
-            } else {
-                vec![
-                    Mutation::Put {
-                        key: receipt_key,
-                        value: serde_json::to_vec(&signal)?,
-                    },
-                    Mutation::Put {
-                        key: revision_key,
-                        value: vec![],
-                    },
-                ]
-            };
-            match self.store.commit(&checks, &mutations) {
-                Ok(()) => {
-                    return Ok(found.unwrap_or(if expired {
-                        SignalResult::Closed
-                    } else {
-                        SignalResult::Delivered
-                    }));
-                }
+            let (result, batch) =
+                self.prepare_signal_at(task_id, token, key_text, value.clone(), &mut now)?;
+            match self.store.commit(&batch.checks, &batch.mutations) {
+                Ok(()) => return Ok(result),
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    // The returned outcome is provisional until the batch commits. Callers must
+    // retry the entire enclosing operation on conflict.
+    pub(crate) fn prepare_signal_at(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key_text: &str,
+        value: Value,
+        mut now: impl FnMut() -> i64,
+    ) -> Result<(SignalResult, OwnedBatch), Error> {
+        let target = self.load(task_id)?;
+        let mut batch = OwnedBatch {
+            checks: vec![Check {
+                key: key(task_id),
+                expected: target
+                    .as_ref()
+                    .map_or(Expected::Missing, |t| Expected::Version(t.version)),
+            }],
+            mutations: vec![],
+        };
+        let Some(target) = target else {
+            return Ok((SignalResult::NotFound, batch));
+        };
+        if target.task.is_terminal() || target.task.abort_requested() {
+            return Ok((SignalResult::Closed, batch));
+        }
+        if key_text.is_empty() {
+            return Ok((SignalResult::Invalid, batch));
+        }
+        let receipt_id = Uuid::new_v4();
+        let mut signal = match Signal::new_typed(receipt_id, task_id, token, key_text, value) {
+            Ok(signal) => signal,
+            Err(Error::InvalidSignalPayload) => return Ok((SignalResult::Invalid, batch)),
+            Err(error) => return Err(error),
+        };
+        let revision_key = signal_revision_key(task_id);
+        let revision = self.store.get(&revision_key)?;
+        batch.checks.push(Check {
+            key: revision_key.clone(),
+            expected: revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+        });
+        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+            let old: Signal = serde_json::from_slice(&entry.value)?;
+            if old.typed_key() == signal.typed_key() {
+                return Ok((
+                    if old.expired {
+                        SignalResult::Closed
+                    } else {
+                        SignalResult::Duplicate
+                    },
+                    batch,
+                ));
+            }
+        }
+        let expired = matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now() >= *deadline && signals.contains(signal.typed_key().unwrap()));
+        signal.expired = expired;
+        let receipt_key = signal_key(task_id, receipt_id);
+        batch.checks.push(Check {
+            key: receipt_key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: receipt_key,
+            value: serde_json::to_vec(&signal)?,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: revision_key,
+            value: vec![],
+        });
+        Ok((
+            if expired {
+                SignalResult::Closed
+            } else {
+                SignalResult::Delivered
+            },
+            batch,
+        ))
     }
 
     /// Read a signal receipt, including whether it has been consumed.
