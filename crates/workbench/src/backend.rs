@@ -339,6 +339,18 @@ fn snapshot_for_share_with_hook(
     current: Option<Session>,
     hook: impl FnOnce(),
 ) -> Result<super::sessions::ShareSnapshot> {
+    snapshot_and_session_for_share_with_hook(active, snapshot, current, hook)
+        .map(|(snapshot, _session)| snapshot)
+}
+
+// Keep the journal that produced the context alongside it. A future durable
+// publisher must bind this exact journal, not reopen a potentially newer file.
+fn snapshot_and_session_for_share_with_hook(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+    hook: impl FnOnce(),
+) -> Result<(super::sessions::ShareSnapshot, Session)> {
     let changed = || Error::Config("Share context changed; try sharing again".into());
     let (revision, count, base, selected, pending, emit_entries, idle) = {
         let state = active.lock().expect("worker control");
@@ -424,7 +436,7 @@ fn snapshot_for_share_with_hook(
     drop(snapshot);
     drop(state);
     drop(old);
-    Ok(result)
+    Ok((result, session))
 }
 
 async fn share_snapshot_background<F>(
@@ -1851,6 +1863,31 @@ mod share_context_tests {
         assert_eq!(before.head, after.head);
         assert_ne!(before.context.system_prompt, after.context.system_prompt);
         assert_ne!(before.context.tools.len(), after.context.tools.len());
+    }
+
+    #[test]
+    fn captured_share_context_keeps_exact_source_journal() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let expected = serde_json::to_vec(session.records()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live prompt".into(),
+            tools: vec![],
+        }));
+        let (share, captured) = snapshot_and_session_for_share_with_hook(
+            &Mutex::new(ControlState::default()),
+            &Mutex::new(worker),
+            None,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(share.session_id, captured.session_id());
+        assert_eq!(share.head, captured.head());
+        assert_eq!(share.context.system_prompt, "live prompt");
+        assert_eq!(serde_json::to_vec(captured.records()).unwrap(), expected);
     }
 
     #[test]

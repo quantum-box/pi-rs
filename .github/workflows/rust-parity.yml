@@ -23,3 +23,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs refresh
       - name: Test private storage
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
+      - name: Test live share capture
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
