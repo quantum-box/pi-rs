@@ -1528,7 +1528,7 @@ fn markdown_at_depth(
                         if line.len() - trimmed.len() <= 3 {
                             trimmed
                                 .strip_prefix('>')
-                                .map(|line| line.strip_prefix(' ').unwrap_or(line))
+                                .map(|line| line.strip_prefix([' ', '\t']).unwrap_or(line))
                                 .unwrap_or(line)
                         } else {
                             line
@@ -1789,6 +1789,13 @@ mod tests {
             ("> - ~~`a\n>   b`~~", "a b"),
             ("1. ~~`a\n   b`~~", "a b"),
             ("- outer\n  - ~~`a\n    b`~~", "a b"),
+            ("> ~~`a\n>\tb`~~", "a b"),
+            ("-\t~~`a\n\tb`~~", "a b"),
+            ("1.\t~~`a\n\tb`~~", "a b"),
+            ("- ~~`a\n\tb`~~", "a   b"),
+            ("- ~~`a\n \tb`~~", "a    b"),
+            ("- ~~`a\n  \tb`~~", "a b"),
+            ("- ~~`a\n b`~~", "a  b"),
         ] {
             let lines = markdown(source, &theme, 120);
             assert!(
@@ -1808,6 +1815,7 @@ mod tests {
             "| a | b |\n|---|---|\n|https://example.com|keep|\n| ~~x~~ | y |",
             "| a | b |\n|---|---|\n|https://example.com ~~x~~|keep|",
             "| a | b |\n|---|---|\n|~~https://example.com~~|keep|",
+            "| a | b |\n|---|---|\n|~~x~~ https://example.com|keep|",
         ] {
             let lines = markdown_at_depth(
                 source,

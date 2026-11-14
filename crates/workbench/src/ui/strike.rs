@@ -347,48 +347,87 @@ enum Container {
 
 // Marked's block lexer removes container prefixes before inline lexing. Keep
 // byte boundaries into the original document for rendering and link guards.
-fn normalize_continuations(source: &str, containers: &[Container]) -> (String, Vec<usize>) {
+fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(String, Vec<usize>)> {
     let bytes = source.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut offsets = vec![0];
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        out.push(ch);
-        i += 1;
-        offsets.push(i);
-        if ch == b'\n' {
+    let mut position = 0;
+    for (line_number, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if frame_expired() {
+            return None;
+        }
+        let mut text = line.to_vec();
+        let mut map: Vec<usize> = (position..=position + line.len()).collect();
+        position += line.len();
+        if line_number > 0 {
+            let mut in_list = false;
             for container in containers {
+                if frame_expired() {
+                    return None;
+                }
                 match *container {
                     Container::Quote => {
-                        let begin = i;
-                        while i < bytes.len() && i - begin < 3 && bytes[i] == b' ' {
-                            i += 1;
-                        }
-                        if bytes.get(i) == Some(&b'>') {
-                            i += 1;
-                            if bytes.get(i) == Some(&b' ') {
-                                i += 1;
+                        let spaces = text
+                            .iter()
+                            .take_while(|byte| **byte == b' ')
+                            .take(3)
+                            .count();
+                        if text.get(spaces) == Some(&b'>') {
+                            let mut prefix = spaces + 1;
+                            if matches!(text.get(prefix), Some(b' ' | b'\t')) {
+                                prefix += 1;
                             }
-                        } else {
-                            i = begin;
+                            text.drain(..prefix);
+                            map.drain(..prefix);
                         }
                     }
                     Container::Item(indent) => {
-                        let begin = i;
-                        while i < bytes.len() && i - begin < indent && bytes[i] == b' ' {
-                            i += 1;
+                        in_list = true;
+                        // Marked expands every tab in a list continuation to four
+                        // spaces before removing the item indentation.
+                        let mut expanded = Vec::with_capacity(text.len());
+                        let mut expanded_map = vec![map[0]];
+                        for (index, byte) in text.iter().enumerate() {
+                            if *byte == b'\t' {
+                                for _ in 0..3 {
+                                    expanded.push(b' ');
+                                    expanded_map.push(map[index]);
+                                }
+                                expanded.push(b' ');
+                            } else {
+                                expanded.push(*byte);
+                            }
+                            expanded_map.push(map[index + 1]);
+                        }
+                        if expanded.len() > MAX_RUN_BYTES {
+                            return None;
+                        }
+                        text = expanded;
+                        map = expanded_map;
+                        if text.iter().take_while(|byte| **byte == b' ').count() >= indent {
+                            text.drain(..indent);
+                            map.drain(..indent);
                         }
                     }
                 }
             }
-            *offsets.last_mut().expect("newline boundary") = i;
+            // Marked's block text rule removes a further four-space indent.
+            if in_list && text.starts_with(b"    ") {
+                text.drain(..4);
+                map.drain(..4);
+            }
         }
+        *offsets.last_mut().expect("line boundary") = map[0];
+        out.extend(text);
+        if out.len() > MAX_RUN_BYTES {
+            return None;
+        }
+        offsets.extend_from_slice(&map[1..]);
     }
-    (
-        String::from_utf8(out).expect("only ASCII prefixes removed"),
+    Some((
+        String::from_utf8(out).expect("only ASCII prefixes changed"),
         offsets,
-    )
+    ))
 }
 
 fn item_indent(original: &str, start: usize) -> Option<usize> {
@@ -402,8 +441,16 @@ fn item_indent(original: &str, start: usize) -> Option<usize> {
         }
         digits + 1
     };
-    let spaces = line[marker..].iter().take_while(|b| **b == b' ').count();
-    (spaces > 0).then_some(marker + spaces.min(4))
+    let mut column = marker;
+    for byte in &line[marker..] {
+        match byte {
+            b' ' => column += 1,
+            b'\t' => column += 4 - column % 4,
+            _ => break,
+        }
+    }
+    let spaces = column - marker;
+    (spaces > 0).then_some(marker + if spaces > 4 { 1 } else { spaces })
 }
 
 fn inline_run(
@@ -430,7 +477,9 @@ fn inline_run(
     }
     // Marked's block table lexer removes a backslash before each pipe before
     // handing a cell to its inline lexer, including inside code spans.
-    let (source, offsets) = normalize_continuations(source, containers);
+    let Some((source, offsets)) = normalize_continuations(source, containers) else {
+        return nodes;
+    };
     let (source, offsets) = if cell_end.is_some() {
         let (source, mapped) = unescape_with_offsets(&source, b"|");
         (source, mapped.into_iter().map(|i| offsets[i]).collect())
@@ -540,6 +589,15 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_tab_offsets_remain_bounded_and_point_to_source() {
+        let (text, offsets) = normalize_continuations("a\n\tb", &[Container::Item(2)]).unwrap();
+        assert_eq!(text, "a\n  b");
+        assert_eq!(offsets, [0, 1, 2, 2, 3, 4]);
+        let large = format!("a\n{}b", "\t".repeat(MAX_RUN_BYTES / 4));
+        assert!(normalize_continuations(&large, &[Container::Item(2)]).is_none());
+    }
 
     #[test]
     fn exhausted_frame_budget_applies_to_every_inline_run_and_is_restored() {
