@@ -450,6 +450,13 @@ pub struct AdmissionDocuments<'a> {
     tasks: Vec<crate::task::Task>,
 }
 
+type PendingEntries = (
+    uuid::Uuid,
+    Option<u64>,
+    Vec<crate::application_entry::ApplicationEntry>,
+    Vec<Check>,
+);
+
 /// Checked document operations at one invocation-wide immutable revision.
 /// Staged values are visible to later reads. A staged new document has version
 /// zero; existing staged documents retain their original version until commit.
@@ -459,12 +466,7 @@ pub struct TaskDocuments<'a> {
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
     task: crate::task::Task,
-    entries: Option<(
-        uuid::Uuid,
-        Option<u64>,
-        Vec<crate::application_entry::ApplicationEntry>,
-        Vec<Check>,
-    )>,
+    entries: Option<PendingEntries>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
