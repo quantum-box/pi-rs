@@ -4316,11 +4316,11 @@ non-null content. Other specialized message variants remain open.
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
-(including lone surrogate escapes), and
-missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
-counted as line breaks. Other malformed JSON, including incomplete escapes,
-retains the native parser's diagnostics; full malformed-input parity remains
-open.
+(including lone surrogate escapes), dangling backslashes, incomplete Unicode
+escapes, and missing values. Offsets and columns count UTF-16 units; CR, LF and
+CRLF are counted as line breaks. Incomplete escapes following lone surrogate
+escapes and other malformed JSON retain the native parser's diagnostics; full
+malformed-input parity remains open.
 
 ### Shell execution transcript checkpoint
 
