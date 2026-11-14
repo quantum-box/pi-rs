@@ -311,8 +311,10 @@ enum TranscriptChange {
     },
 }
 
+type TranscriptChangeParts = (Vec<Message>, bool, Option<(Vec<Uuid>, u64, Uuid)>);
+
 impl TranscriptChange {
-    fn parts(self) -> Result<(Vec<Message>, bool, Option<(Vec<Uuid>, u64, Uuid)>), Error> {
+    fn parts(self) -> Result<TranscriptChangeParts, Error> {
         let (messages, base, metadata) = match self {
             Self::Append(messages) => (messages, false, None),
             Self::Replace(messages) => (messages, true, None),
