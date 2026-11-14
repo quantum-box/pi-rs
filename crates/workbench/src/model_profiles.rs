@@ -62,6 +62,12 @@ impl RequestHeaders {
         self.values.values().any(|value| value.starts_with('!'))
     }
 
+    pub fn has_dynamic_values(&self) -> bool {
+        self.values
+            .values()
+            .any(|value| value.starts_with('!') || value.contains('$'))
+    }
+
     pub fn static_headers(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(self.values.len());
         for (name, value) in &self.values {
@@ -601,6 +607,18 @@ impl ModelMetadata {
             .map(|input| input.contains(&Modality::Image))
     }
 
+    pub fn input_modalities(&self) -> Option<Vec<&'static str>> {
+        self.input.as_ref().map(|input| {
+            input
+                .iter()
+                .map(|modality| match modality {
+                    Modality::Text => "text",
+                    Modality::Image => "image",
+                })
+                .collect()
+        })
+    }
+
     pub fn prompt_cache_seconds(&self, retention: pi_rs::CacheRetention) -> Option<f64> {
         let cache = self.prompt_cache?;
         match retention {
@@ -748,6 +766,11 @@ impl Profiles {
             let mut ids = std::collections::BTreeSet::new();
             let mut model_endpoints = BTreeMap::new();
             for model in &mut profile.models {
+                // Pi defaults definitions to text; overrides remain partial.
+                model
+                    .metadata
+                    .input
+                    .get_or_insert_with(|| vec![Modality::Text]);
                 let adapter = match model.api.as_deref() {
                     None if builtin.is_none() && profile.api.is_none() => {
                         return Err(Error::Config(format!(

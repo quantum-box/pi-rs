@@ -282,13 +282,20 @@ impl Runtime {
         // Resolve every recorded identity through its own configured provider.
         // The journal id scopes the cache so credentials cannot cross sessions.
         for record in session.records() {
-            let pi_rs::Event::ModelSelected {
-                provider: Some(provider),
-                model,
-                ..
-            } = &record.event
-            else {
-                continue;
+            let (provider, model) = match &record.event {
+                pi_rs::Event::ModelSelected {
+                    provider: Some(provider),
+                    model,
+                    ..
+                }
+                | pi_rs::Event::BranchModelSelected {
+                    provider, model, ..
+                } => (provider, model),
+                pi_rs::Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => (&selection.provider, &selection.model),
+                _ => continue,
             };
             let Some(selected) = args.model_profiles.provider(provider) else {
                 continue;

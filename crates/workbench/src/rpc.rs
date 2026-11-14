@@ -40,9 +40,20 @@ pub(super) fn run(
     interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            if sender.send(line).is_err() {
-                break;
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            match read_rpc_line(&mut input) {
+                Ok(Some(line)) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
             }
         }
     });
@@ -299,11 +310,12 @@ pub(super) fn run(
                     Err(Error::Config("too many pending model queries".into())),
                 )?;
             } else {
+                let generation = next_model_generation(&args);
                 let args = args.clone();
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let result =
-                        available_models(&args, true).map(|(_, models)| json!({"models":models}));
+                    let result = available_models_at(&args, true, generation)
+                        .map(|(_, models)| json!({"models":models}));
                     let _ = sender.send(result);
                 });
                 model_queries.push((request, receiver));
@@ -707,6 +719,49 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
     }
 }
 
+// Pi's JSONL reader decodes malformed UTF-8 with replacement and splits only
+// on LF. A trailing CR is removed even on the final unterminated record.
+fn read_rpc_line(input: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if input.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod jsonl_framing_tests {
+    use super::read_rpc_line;
+    use std::io::BufReader;
+
+    #[test]
+    fn reads_lossy_utf8_with_lf_framing_and_final_cr() {
+        let bytes =
+            b"{\"id\":\"\xe3\x81\x82\xff\"}\r\n\n{\"id\":\"\xe2\x80\xa8\"}\n{\"id\":\"last\"}\r";
+        let mut input = BufReader::with_capacity(1, &bytes[..]);
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"あ�\"}"
+        );
+        assert_eq!(read_rpc_line(&mut input).unwrap().unwrap(), "");
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"\u{2028}\"}"
+        );
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"last\"}"
+        );
+        assert!(read_rpc_line(&mut input).unwrap().is_none());
+    }
+}
+
 fn parse_request(line: &str) -> Result<Value> {
     match serde_json::from_str(line) {
         Ok(Value::Object(request)) => Ok(Value::Object(request)),
@@ -936,6 +991,7 @@ fn command_cancellable(
             {
                 model_value(args, &provider, model)
             } else {
+                let generation = next_model_generation(args);
                 let current = args.clone();
                 let selected = provider.clone();
                 let candidate = model.to_owned();
@@ -951,8 +1007,15 @@ fn command_cancellable(
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
-                    Ok(Some(super::model_listing::with_details(
-                        model_value(&current, &catalog.provider, &candidate),
+                    remember_model_images(
+                        &current,
+                        &catalog.provider,
+                        &candidate,
+                        details.get(&candidate),
+                        generation,
+                    );
+                    Ok(Some(model_with_input_details(
+                        model_value_without_cache(&current, &catalog.provider, &candidate),
                         details.get(&candidate),
                     )))
                 })?
@@ -1163,6 +1226,32 @@ pub(super) fn snapshot_response(
 }
 
 pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
+    let value = model_value_without_cache(args, provider, model);
+    if value.get("input").is_some() {
+        return value;
+    }
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return value;
+    };
+    let images = args
+        .rpc_model_images
+        .lock()
+        .unwrap()
+        .entries
+        .get(&key)
+        .and_then(|entry| entry.images);
+    model_with_input_details(
+        value,
+        images
+            .map(|images| pi_rs::ollama::ModelDetails {
+                images: Some(images),
+                ..Default::default()
+            })
+            .as_ref(),
+    )
+}
+
+fn model_value_without_cache(args: &Cli, provider: &super::Provider, model: &str) -> Value {
     let configured = args.model_profiles.model(provider, model);
     let name = configured
         .as_ref()
@@ -1172,6 +1261,9 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
     if let Some(configured) = configured {
         configured.apply_catalog_metadata(&mut value);
+        if let Some(input) = configured.input_modalities() {
+            value["input"] = json!(input);
+        }
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(adapter, &mut details);
         super::model_listing::with_details(value, Some(&details))
@@ -1180,9 +1272,212 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     }
 }
 
+#[derive(Default)]
+pub(super) struct ModelImageCache {
+    generation: u64,
+    eviction_floor: u64,
+    entries: std::collections::BTreeMap<ModelCacheKey, ModelImageEntry>,
+    completed: std::collections::BTreeMap<ModelCacheScope, u64>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheKey {
+    scope: ModelCacheScope,
+    model: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheScope {
+    provider: String,
+    endpoint: String,
+    discovery_endpoint: String,
+    adapter: String,
+    profiles_revision: String,
+    auth_revision: String,
+    credential_hash: Option<String>,
+    discovery_credential_hash: Option<String>,
+}
+
+struct ModelImageEntry {
+    generation: u64,
+    images: Option<bool>,
+}
+
+const MAX_MODEL_IMAGE_ENTRIES: usize = 1024;
+const MAX_MODEL_IMAGE_SCOPES: usize = 128;
+
+impl ModelImageCache {
+    fn evict(&mut self) {
+        while self.entries.len() > MAX_MODEL_IMAGE_ENTRIES {
+            let (key, generation) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.generation)
+                .map(|(key, entry)| (key.clone(), entry.generation))
+                .expect("nonempty cache");
+            self.entries.remove(&key);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+        while self.completed.len() > MAX_MODEL_IMAGE_SCOPES {
+            let (scope, generation) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, generation)| *generation)
+                .map(|(scope, generation)| (scope.clone(), *generation))
+                .expect("nonempty cache");
+            self.completed.remove(&scope);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+    }
+}
+
+fn next_model_generation(args: &Cli) -> u64 {
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    cache.generation = cache
+        .generation
+        .checked_add(1)
+        .expect("model discovery generation overflow");
+    cache.generation
+}
+
+fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Option<ModelCacheKey> {
+    use sha2::{Digest, Sha256};
+    let endpoint = args.model_endpoint_for(provider, Some(model));
+    let discovery_endpoint = args.model_endpoint_for(provider, None);
+    let credential = args.model_credential_for(provider, endpoint);
+    let discovery_credential = args.model_credential_for(provider, discovery_endpoint);
+    // Resolving a command, OAuth credential, or dynamic header merely to make a
+    // cache key can run external code and may yield a different account than
+    // the request. Do not reuse capabilities when identity is unknowable.
+    if credential
+        .as_ref()
+        .is_some_and(super::model_auth::Credential::requires_resolution)
+        || discovery_credential
+            .as_ref()
+            .is_some_and(super::model_auth::Credential::requires_resolution)
+        || args
+            .model_profiles
+            .header_settings(provider, endpoint, Some(model))
+            .has_dynamic_values()
+        || args
+            .model_profiles
+            .header_settings(provider, discovery_endpoint, None)
+            .has_dynamic_values()
+    {
+        return None;
+    }
+    let digest = |credential: super::model_auth::Credential| {
+        credential
+            .literal()
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+    };
+    let credential_hash = credential.and_then(digest);
+    let discovery_credential_hash = discovery_credential.and_then(digest);
+    Some(ModelCacheKey {
+        model: model.to_owned(),
+        scope: ModelCacheScope {
+            provider: provider.id().to_owned(),
+            endpoint: endpoint.to_owned(),
+            discovery_endpoint: discovery_endpoint.to_owned(),
+            adapter: args
+                .model_profiles
+                .model_adapter(provider, model)
+                .api()
+                .to_owned(),
+            profiles_revision: args.model_profiles.revision().to_owned(),
+            auth_revision: args.model_keys.revision().to_owned(),
+            credential_hash,
+            discovery_credential_hash,
+        },
+    })
+}
+
+fn remember_model_images(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    details: Option<&pi_rs::ollama::ModelDetails>,
+    generation: u64,
+) {
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return;
+    };
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
+    if cache
+        .completed
+        .get(&key.scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    if cache
+        .entries
+        .get(&key)
+        .is_none_or(|entry| entry.generation <= generation)
+    {
+        // Keep unknown as a tombstone so an older discovery cannot revive it.
+        cache.entries.insert(
+            key,
+            ModelImageEntry {
+                generation,
+                images: details.and_then(|details| details.images),
+            },
+        );
+        cache.evict();
+    }
+}
+
+// A complete newer catalog also invalidates models it no longer lists. The
+// scope watermark prevents an older in-flight catalog from reintroducing them.
+fn complete_model_catalog(
+    args: &Cli,
+    provider: &super::Provider,
+    models: &[String],
+    generation: u64,
+) {
+    let Some(key) = model_cache_key(args, provider, "") else {
+        return;
+    };
+    let scope = key.scope;
+    let models: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
+    if cache
+        .completed
+        .get(&scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    for (key, entry) in &mut cache.entries {
+        if key.scope == scope
+            && entry.generation <= generation
+            && !models.contains(key.model.as_str())
+        {
+            entry.generation = generation;
+            entry.images = None;
+        }
+    }
+    cache.completed.insert(scope, generation);
+    cache.evict();
+}
+
 fn available_models(
     args: &Cli,
     include_details: bool,
+) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
+    available_models_at(args, include_details, next_model_generation(args))
+}
+
+fn available_models_at(
+    args: &Cli,
+    include_details: bool,
+    generation: u64,
 ) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
     use super::model_selection::ScopedChoice;
     if !include_details && !args.model_scope.is_empty() {
@@ -1207,10 +1502,20 @@ fn available_models(
             } else {
                 Default::default()
             };
+            if include_details && catalog.complete {
+                complete_model_catalog(&args, &catalog.provider, &catalog.models, generation);
+            }
             for model in catalog.models {
                 if include_details {
-                    rows.push(super::model_listing::with_details(
-                        model_value(&args, &catalog.provider, &model),
+                    remember_model_images(
+                        &args,
+                        &catalog.provider,
+                        &model,
+                        details.get(&model),
+                        generation,
+                    );
+                    rows.push(model_with_input_details(
+                        model_value_without_cache(&args, &catalog.provider, &model),
                         details.get(&model),
                     ));
                 }
@@ -1223,6 +1528,23 @@ fn available_models(
         }
         Ok((choices, rows))
     })
+}
+
+// Dynamic native catalogs can report image support without a Pi-style input
+// list. Preserve configured lists verbatim, and derive one only when the
+// discovered capability is known; an unknown capability remains unknown.
+fn model_with_input_details(model: Value, details: Option<&pi_rs::ollama::ModelDetails>) -> Value {
+    let mut model = super::model_listing::with_details(model, details);
+    if model.get("input").is_none()
+        && let Some(images) = details.and_then(|details| details.images)
+    {
+        model["input"] = if images {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+    }
+    model
 }
 
 fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>>(
@@ -1509,6 +1831,648 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_command_credentials_never_reuse_dynamic_capabilities() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_file = directory.path().join("token");
+        std::fs::write(&key_file, "first-key").unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                "apiKey":format!("!cat {}", shell_words::quote(key_file.to_str().unwrap()))
+            }}}))
+            .unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+        let credential = args.model_credential_for(&provider, endpoint).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(credential.resolve()).unwrap(), "first-key");
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        std::fs::write(&key_file, "second-key").unwrap();
+        assert_eq!(
+            runtime.block_on(credential.resolve()).unwrap(),
+            "second-key"
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn dynamic_header_and_oauth_credentials_disable_capability_reuse() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"!echo account"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"${ACCOUNT}"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({"xai":{
+            "type":"oauth", "access":"access", "refresh":"refresh", "expires":123
+        }}));
+        let xai = args.model_profiles.provider("xai").unwrap();
+        assert!(model_cache_key(&args, &xai, "dynamic").is_none());
+    }
+
+    #[test]
+    fn discovery_dynamic_header_cannot_be_hidden_by_model_override() {
+        for provider_value in ["!echo account", "${ACCOUNT}"] {
+            let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                    "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                    "headers":{"X-Account":provider_value},
+                    "modelOverrides":{"dynamic":{"headers":{"X-Account":"fixed"}}}
+                }}}))
+                .unwrap();
+            let provider = args.model_profiles.provider("relay").unwrap();
+            let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+            assert!(
+                !args
+                    .model_profiles
+                    .header_settings(&provider, endpoint, Some("dynamic"))
+                    .has_dynamic_values()
+            );
+            assert!(
+                args.model_profiles
+                    .header_settings(&provider, args.model_endpoint_for(&provider, None), None)
+                    .has_dynamic_values()
+            );
+            assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+            let known = pi_rs::ollama::ModelDetails {
+                images: Some(true),
+                ..Default::default()
+            };
+            remember_model_images(
+                &args,
+                &provider,
+                "dynamic",
+                Some(&known),
+                next_model_generation(&args),
+            );
+            assert!(
+                model_value(&args, &provider, "dynamic")
+                    .get("input")
+                    .is_none()
+            );
+            assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_capability_cache_eviction_is_bounded_and_blocks_stale_completions() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let old = next_model_generation(&args);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        for index in 0..=MAX_MODEL_IMAGE_ENTRIES {
+            let generation = next_model_generation(&args);
+            remember_model_images(
+                &args,
+                &provider,
+                &format!("model-{index}"),
+                None,
+                generation,
+            );
+        }
+        assert!(args.rpc_model_images.lock().unwrap().entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        assert!(
+            model_value(&args, &provider, "evicted")
+                .get("input")
+                .is_none()
+        );
+        let first = args.clone();
+        for index in 0..=MAX_MODEL_IMAGE_SCOPES {
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":format!("https://example.invalid/{index}")}}})).unwrap();
+            let generation = next_model_generation(&args);
+            complete_model_catalog(&args, &provider, &[], generation);
+        }
+        let cache = args.rpc_model_images.lock().unwrap();
+        assert!(cache.completed.len() <= MAX_MODEL_IMAGE_SCOPES);
+        assert!(cache.entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        let floor = cache.eviction_floor;
+        drop(cache);
+        assert!(old < floor);
+        remember_model_images(&first, &provider, "late", Some(&known), old);
+        assert!(
+            model_value(&first, &provider, "late")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discovery_results_use_own_capabilities_and_ignore_older_writes() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let old = next_model_generation(&args);
+        let new = next_model_generation(&args);
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let text = pi_rs::ollama::ModelDetails {
+            images: Some(false),
+            ..Default::default()
+        };
+        // Force the older request to publish, then let the newer request
+        // overwrite the shared cache before the older response is constructed.
+        let (published, first_published) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let older_args = args.clone();
+        let older_provider = provider.clone();
+        let older_vision = vision.clone();
+        let older = std::thread::spawn(move || {
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            published.send(()).unwrap();
+            released.recv().unwrap();
+            let response = model_with_input_details(
+                model_value_without_cache(&older_args, &older_provider, "dynamic"),
+                Some(&older_vision),
+            );
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            response
+        });
+        first_published.recv().unwrap();
+        remember_model_images(&args, &provider, "dynamic", Some(&text), new);
+        release.send(()).unwrap();
+        let old_response = older.join().unwrap();
+        assert_eq!(old_response["input"], json!(["text", "image"]));
+        assert_eq!(old_response["images"], true);
+        let current = model_value(&args, &provider, "dynamic");
+        assert_eq!(current["input"], json!(["text"]));
+        assert_eq!(current["images"], false);
+        let unknown = next_model_generation(&args);
+        remember_model_images(&args, &provider, "dynamic", None, unknown);
+        remember_model_images(&args, &provider, "dynamic", Some(&vision), old);
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        let old_catalog = next_model_generation(&args);
+        let new_catalog = next_model_generation(&args);
+        remember_model_images(
+            &args,
+            &provider,
+            "previously-listed",
+            Some(&vision),
+            old_catalog,
+        );
+        complete_model_catalog(&args, &provider, &[], new_catalog);
+        assert!(
+            model_value(&args, &provider, "previously-listed")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(&args, &provider, "removed", Some(&vision), old_catalog);
+        assert!(
+            model_value(&args, &provider, "removed")
+                .get("input")
+                .is_none()
+        );
+        // Adapter changes must isolate the cache even when the provider name,
+        // endpoint, profile and credentials are otherwise identical.
+        let first = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::ChatCompletions,
+        };
+        let second = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::OpenAiResponses,
+        };
+        args.provider = first.clone();
+        args.endpoint = "https://example.invalid/shared".into();
+        remember_model_images(
+            &args,
+            &first,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &first, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.provider = second.clone();
+        assert!(
+            model_value(&args, &second, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_capabilities_are_isolated_by_connection_configuration() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let profile = |api: &str, key: &str| {
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{"api":api,"baseUrl":"https://example.invalid/v1","apiKey":key}}})).unwrap()
+        };
+        args.model_profiles = profile("openai-completions", "first-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.model_profiles = profile("openai-completions", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key","key":"saved-secret"}}),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        args.model_profiles = profile("openai-responses", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_model_input_preserves_configured_modalities() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]},
+                {"id":"image-only", "input":["image"]}
+            ]}}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        for (id, input) in [
+            ("vision", json!(["text", "image"])),
+            ("text", json!(["text"])),
+            ("image-only", json!(["image"])),
+        ] {
+            let value = model_value(&args, &provider, id);
+            assert_eq!(value["input"], input, "{id}");
+            assert_eq!(
+                value["images"],
+                input.as_array().unwrap().contains(&json!("image"))
+            );
+        }
+        assert!(
+            model_value(&args, &provider, "unknown")
+                .get("input")
+                .is_none()
+        );
+        let meta = args.model_profiles.provider("meta").unwrap();
+        assert_eq!(
+            model_value(&args, &meta, "muse-spark-1.3")["input"],
+            json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn rpc_dynamic_model_input_reflects_known_capabilities_without_guessing() {
+        let model = json!({"id":"dynamic"});
+        for (images, expected) in [
+            (Some(true), Some(json!(["text", "image"]))),
+            (Some(false), Some(json!(["text"]))),
+            (None, None),
+        ] {
+            let details = pi_rs::ollama::ModelDetails {
+                images,
+                ..Default::default()
+            };
+            let result = model_with_input_details(model.clone(), Some(&details));
+            assert_eq!(result.get("input"), expected.as_ref());
+        }
+        let configured = json!({"input":["image"]});
+        let details = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_with_input_details(configured, Some(&details))["input"],
+            json!(["image"])
+        );
+    }
+
+    #[test]
+    fn rpc_rediscovery_clears_previously_known_dynamic_image_support() {
+        let args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+
+        let unknown = pi_rs::ollama::ModelDetails::default();
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&unknown),
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            None,
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_selection_and_state_expose_model_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("ollama").unwrap();
+        args.model = "vision".into();
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"text"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["id"], "text");
+        assert_eq!(state["model"]["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn rpc_configured_default_input_and_partial_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {
+                "models": [{"id":"default"}, {"id":"vision", "input":["text", "image"]}],
+                "modelOverrides": {"vision":{"name":"renamed"}}
+            }}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        assert_eq!(
+            model_value(&args, &provider, "default")["input"],
+            json!(["text"])
+        );
+        assert_eq!(
+            model_value(&args, &provider, "vision")["input"],
+            json!(["text", "image"])
+        );
+        let models = available_models(&args, true).unwrap().1;
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "default" && m["input"] == json!(["text"]))
+        );
+        args.provider = provider;
+        let result = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"default"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn rpc_dynamic_discovery_selection_state_and_cycle_keep_capabilities() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.clone();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                let body = if path.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"},{"id":"other"}]}"#
+                } else if path.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if path.starts_with("POST /api/show ") {
+                    if String::from_utf8_lossy(&request_body).contains("dynamic") {
+                        r#"{"capabilities":["vision"]}"#
+                    } else {
+                        r#"{}"#
+                    }
+                } else {
+                    panic!("unexpected request: {path}")
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut args =
+            Cli::try_parse_from(["pi", "--offline", "--no-session", "--endpoint", &endpoint])
+                .unwrap();
+        args.workspace = directory.path().to_path_buf();
+        args.session = directory.path().join("session.jsonl");
+        args.model = "other".into();
+        let models = command(
+            &json!({"type":"get_available_models"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+        );
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "other" && m.get("input").is_none())
+        );
+        args.rpc_model_images.lock().unwrap().entries.clear();
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"dynamic"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text", "image"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text", "image"]));
+        args.model = "other".into();
+        args.model_scope = ["other", "dynamic"]
+            .into_iter()
+            .map(|model| super::super::model_selection::ScopedChoice {
+                provider: args.provider.clone(),
+                model: model.into(),
+                thinking: None,
+            })
+            .collect();
+        let cycled = command(&json!({"type":"cycle_model"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycled["model"]["input"], json!(["text", "image"]));
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
 
     #[test]
     fn cache_warming_extension_errors_use_rpc_field_names() {

@@ -12,33 +12,67 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
 static TERMINAL_BACKGROUND: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_FOREGROUND: AtomicU32 = AtomicU32::new(0);
-static TERMINAL_PALETTE: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+static TERMINAL_PALETTE: std::sync::Mutex<PaletteState> =
+    std::sync::Mutex::new(PaletteState::new());
 
-#[cfg(any(unix, windows))]
-pub fn reset_terminal_background() {
-    TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
-    TERMINAL_FOREGROUND.store(0, Ordering::Relaxed);
-    clear_terminal_palette();
+struct PaletteState {
+    current: Option<[[u8; 3]; 16]>,
+    pending: [Option<[u8; 3]>; 16],
 }
 
-#[cfg(any(unix, windows))]
-pub fn clear_terminal_palette() {
-    for entry in &TERMINAL_PALETTE {
-        entry.store(0, Ordering::Relaxed);
+impl PaletteState {
+    const fn new() -> Self {
+        Self {
+            current: None,
+            pending: [None; 16],
+        }
+    }
+    fn begin(&mut self) {
+        self.pending = [None; 16];
+    }
+    fn record(&mut self, index: u8, color: [u8; 3]) -> bool {
+        let Some(slot) = self.pending.get_mut(index as usize) else {
+            return false;
+        };
+        *slot = Some(color);
+        let Some(colors) = self.pending.iter().copied().collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        let palette: [[u8; 3]; 16] = colors.try_into().expect("sixteen palette colors");
+        let changed = self.current != Some(palette);
+        self.current = Some(palette);
+        changed
     }
 }
 
 #[cfg(any(unix, windows))]
+pub fn reset_terminal_background() {
+    invalidate_terminal_default_colors();
+    clear_terminal_palette();
+}
+
+#[cfg(any(unix, windows))]
+pub fn invalidate_terminal_default_colors() {
+    TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
+    TERMINAL_FOREGROUND.store(0, Ordering::Relaxed);
+}
+
+#[cfg(any(unix, windows))]
+pub fn clear_terminal_palette() {
+    *TERMINAL_PALETTE.lock().expect("terminal palette") = PaletteState::new();
+}
+
+#[cfg(any(unix, windows))]
+pub fn begin_terminal_palette_query() {
+    TERMINAL_PALETTE.lock().expect("terminal palette").begin();
+}
+
+#[cfg(any(unix, windows))]
 pub fn set_terminal_palette(index: u8, red: u8, green: u8, blue: u8) -> bool {
-    let Some(entry) = TERMINAL_PALETTE.get(index as usize) else {
-        return false;
-    };
-    let value = 0x1000000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
-    let changed = entry.swap(value, Ordering::Relaxed) != value;
-    changed
-        && TERMINAL_PALETTE
-            .iter()
-            .all(|color| color.load(Ordering::Relaxed) != 0)
+    TERMINAL_PALETTE
+        .lock()
+        .expect("terminal palette")
+        .record(index, [red, green, blue])
 }
 
 fn unpack_terminal_color(value: u32) -> Option<[u8; 3]> {
@@ -328,11 +362,11 @@ impl Theme {
     }
     pub fn system() -> Self {
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
-        let palette: Option<Vec<_>> = TERMINAL_PALETTE
-            .iter()
-            .map(|value| unpack_terminal_color(value.load(Ordering::Relaxed)))
-            .collect();
-        Self::system_with_palette(background, palette.as_deref())
+        let palette = TERMINAL_PALETTE.lock().expect("terminal palette").current;
+        Self::system_with_palette(
+            background,
+            palette.as_ref().map(|palette| palette.as_slice()),
+        )
     }
 
     fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
@@ -554,6 +588,52 @@ mod tests {
         assert!(terminal_is_dark([0, 0, 0], Some([0, 0, 0])));
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_changes_theme_pair_while_requery_is_incomplete() {
+        const CHILD: &str = "PI_RS_THEME_APPEARANCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::theme::tests::appearance_changes_theme_pair_while_requery_is_incomplete",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 10, 20);
+        }
+        let saved = TERMINAL_PALETTE.lock().unwrap().current;
+        let theme = |setting| {
+            Theme::load(setting, &[], std::path::Path::new("."), false, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(theme("light/dark"), "dark");
+        invalidate_terminal_default_colors();
+        assert!(set_appearance(false));
+        begin_terminal_palette_query();
+        for index in 0..8 {
+            assert!(!set_terminal_palette(index, index, 30, 40));
+        }
+        assert_eq!(theme("light/dark"), "light");
+        assert_eq!(theme("dark"), "dark");
+        assert_eq!(TERMINAL_PALETTE.lock().unwrap().current, saved);
+        // A foreground reply without a fresh background must not restore stale appearance.
+        assert!(!set_terminal_color(true, 0, 0, 0));
+        assert_eq!(theme("light/dark"), "light");
+        assert!(!set_terminal_color(false, 255, 255, 255));
+        assert_eq!(theme("light/dark"), "light");
+        assert_eq!(TERMINAL_PALETTE.lock().unwrap().current, saved);
+    }
+
     #[test]
     fn colorfgbg_classifies_pi_terminal_palette_indexes() {
         for index in 0..=15 {
@@ -651,6 +731,42 @@ mod tests {
         );
         let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette[..15]));
         assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+    }
+
+    #[test]
+    fn palette_queries_publish_only_complete_snapshots_and_keep_last_valid_colors() {
+        let mut state = PaletteState::new();
+        for index in (0..16).rev() {
+            assert_eq!(state.record(index, [index, 10, 20]), index == 0);
+        }
+        let previous = state.current.unwrap();
+        assert_eq!(
+            Theme::system_with_palette(Some([0, 0, 0]), Some(&previous)).color("accent"),
+            Color::Rgb { r: 5, g: 10, b: 20 }
+        );
+
+        state.begin();
+        for index in 0..15 {
+            assert!(!state.record(index, [index, 30, 40]));
+            assert_eq!(state.current, Some(previous));
+        }
+        // A timed-out or incomplete query must not contaminate the next one.
+        state.begin();
+        for index in 0..15 {
+            assert!(!state.record(index, [index, 30, 40]));
+        }
+        assert!(state.record(15, [15, 30, 40]));
+        let updated = state.current.unwrap();
+        assert_eq!(
+            Theme::system_with_palette(Some([0, 0, 0]), Some(&updated)).color("accent"),
+            Color::Rgb { r: 5, g: 30, b: 40 }
+        );
+        state.begin();
+        for index in 0..16 {
+            assert!(!state.record(index, [index, 30, 40]));
+        }
+        assert!(!state.record(16, [1, 2, 3]));
+        assert_eq!(state.current, Some(updated));
     }
 
     #[test]

@@ -63,6 +63,8 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
+type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
+
 #[derive(Parser, Clone)]
 #[command(
     name = "pi-rs",
@@ -84,6 +86,8 @@ struct Cli {
     selection_discovery_pending: bool,
     #[arg(skip)]
     discovered_models: Vec<(String, String)>,
+    #[arg(skip)]
+    rpc_model_images: RpcModelImages,
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
     #[arg(skip)]
@@ -2535,6 +2539,13 @@ fn metadata(record: &pi_rs::Record) -> Value {
                 value["provider"] = json!(provider);
             }
             value
+        }
+        Event::BranchModelSelected {
+            target,
+            provider,
+            model,
+        } => {
+            json!({"event":"branch_model_selected", "target":target, "provider":provider, "model":model, "thinking":null})
         }
         Event::ContextEdited { target, .. } => json!({"event":"context_edited","target":target}),
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),

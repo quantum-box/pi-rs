@@ -23,11 +23,40 @@ app, a native server can own the session and expose an application-specific API.
 
 The [native host example](../examples/native_sdk_host.rs) demonstrates shared
 session state using an offline fixture; its tests check session reuse and that
-the state is `Send + Sync`. The following is a Tauri 2 integration sketch using the same
-pattern. It needs a Tauri project and its normal generated configuration; the
-Tauri glue itself is not built by this repository's CI. Add `pi-rs` (with the
+the state is `Send + Sync`. The standalone [Tauri SDK fixture](../fixtures/tauri-sdk/)
+compiles real Tauri 2 command macros and managed state against `pi-rs-core`.
+Its mock-runtime IPC tests invoke two prompts, an idle abort, and close, check
+session reuse, and verify that close cancels active and queued prompts, including
+one still starting before run registration. A separate integration test composes
+the public fixture commands with an application command. Run
+it on a native host with Tauri's platform
+prerequisites installed:
+
+```sh
+cargo test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
+```
+
+The fixture disables Tauri's default features and does not build the Wry
+webview runtime. It uses a fake model and Tauri's mock runtime: it does not test
+a real webview, frontend, application lifecycle, network provider, or package.
+The repository workflow runs the fixture on macOS. Linux builds may require
+GTK development libraries even without Wry. The [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+describe the platform dependencies.
+
+The following is a Tauri 2 integration sketch using the same pattern. It
+needs a Tauri project and its normal generated configuration. Add `pi-rs` (with the
 default `ollama` feature) and `tokio` with the `sync` feature to `src-tauri`.
 Use a local path to your checkout or a pinned Git revision of this repository.
+The fixture's `configure` installs one invoke handler and replaces any handler
+already set on the builder. To integrate with other application commands, use
+the fixture's public `session_state` and `commands` in one handler, as exercised
+by [the composition test](../fixtures/tauri-sdk/tests/composition.rs).
+Closing requests SDK shutdown before waiting for the session lock. The SDK
+cancels the active run and makes later run tokens inherit cancellation; ordinary
+`abort` still affects only the current run. The fixture rejects queued prompts
+and waits for an admitted prompt to settle so SDK cleanup can finish. Close can
+wait if startup itself never settles. This example uses an in-memory session
+without extension hooks or tools; cancellation cannot undo work already begun.
 
 ```rust
 use std::sync::Arc;
@@ -122,6 +151,7 @@ The public CI workflow includes a **non-gating diagnostic** running
 `cargo check --locked -p pi-rs-core --target wasm32-unknown-unknown`. Its log
 and job summary report the result; a successful compile would still not prove
 that a browser can run an agent, persist a session, or call a provider. The
-native example does not test WASM, Tauri, or a browser. Browser support needs
+native example and mock Tauri fixture do not test WASM, a real Tauri webview,
+or a browser. Browser support needs
 an explicit platform boundary, browser-safe randomness and transport, suitable
 storage, and browser execution tests before it can be claimed.

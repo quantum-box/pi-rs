@@ -263,7 +263,15 @@ impl Projection {
         if let Some(identity) = identity {
             self.request_identities.insert(record.id, identity);
         }
-        let selected = if matches!(record.event, Event::ModelSelected { .. }) {
+        let selected = if matches!(
+            record.event,
+            Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        ) {
             Some(record.id)
         } else {
             record
@@ -297,16 +305,25 @@ impl Projection {
 
     fn selected<'a>(&self, records: &'a [Record], id: u64) -> Option<ModelIdentity<'a>> {
         let model = self.models.get(&id)?;
-        let Event::ModelSelected {
-            model, provider, ..
-        } = &records[*model as usize - 1].event
-        else {
-            return None;
-        };
-        Some(ModelIdentity {
-            model,
-            provider: provider.as_deref().unwrap_or("ollama"),
-        })
+        match &records[*model as usize - 1].event {
+            Event::ModelSelected {
+                model, provider, ..
+            } => Some(ModelIdentity {
+                model,
+                provider: provider.as_deref().unwrap_or("ollama"),
+            }),
+            Event::BranchModelSelected {
+                model, provider, ..
+            } => Some(ModelIdentity { model, provider }),
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => Some(ModelIdentity {
+                model: &selection.model,
+                provider: &selection.provider,
+            }),
+            _ => None,
+        }
     }
 
     fn requested<'a>(&self, records: &'a [Record], id: Uuid) -> Option<ModelIdentity<'a>> {

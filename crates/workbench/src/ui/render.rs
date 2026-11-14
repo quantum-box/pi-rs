@@ -873,7 +873,7 @@ fn safe_hyperlink(url: &str) -> bool {
 
 // Parser formatting can split a local part across text events. Do not link a
 // trailing fragment if the original source immediately continues the address.
-fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
+pub(super) fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
     let mut has_content = false;
     for c in text[lower_bound..start].chars().rev() {
         if c.is_alphanumeric()
@@ -896,7 +896,7 @@ thread_local! {
     static BARE_WEB_MATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
+pub(super) fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
     static EMAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+"#).unwrap()
     });
@@ -1104,7 +1104,7 @@ fn protect_bare_links(text: &str, options: Options) -> String {
     let mut after_table = 0;
     let mut protected = 0usize;
     let mut formatting = Vec::new();
-    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+    for (event, range) in super::strike::events(text, text, options) {
         match event {
             Event::Start(Tag::Table(_)) => {
                 segments.push((after_table..range.start, false));
@@ -1112,7 +1112,14 @@ fn protect_bare_links(text: &str, options: Options) -> String {
             }
             Event::Start(Tag::TableCell) => segments.push((range, true)),
             Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
-                let marker = if matches!(tag, Tag::Emphasis) { 1 } else { 2 };
+                let marker = if matches!(tag, Tag::Emphasis)
+                    || matches!(tag, Tag::Strikethrough)
+                        && text.as_bytes().get(range.start + 1) != Some(&b'~')
+                {
+                    1
+                } else {
+                    2
+                };
                 formatting.push(range.end.saturating_sub(marker));
             }
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
@@ -1268,8 +1275,7 @@ fn markdown_at_depth(
     let mut code: Option<String> = None;
     let mut code_text = String::new();
     let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let loose_lists = loose_list_offsets(text, options);
     let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
@@ -1279,8 +1285,8 @@ fn markdown_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let protected_text = protect_bare_links(text, options);
-    let mut events = Parser::new_ext(&protected_text, options)
-        .into_offset_iter()
+    let mut events = super::strike::events(text, &protected_text, options)
+        .into_iter()
         .peekable();
     while let Some((event, mut range)) = events.next() {
         if quote_skip > 0 {
@@ -1325,17 +1331,21 @@ fn markdown_at_depth(
                     lines.extend(table.render(theme, width));
                 }
             }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                links.push((dest_url.into_string(), String::new()));
+            Event::Start(Tag::Link { dest_url, id, .. }) => {
+                let raw_label = id.strip_prefix("\0pi-marked-label:").map(str::to_owned);
+                links.push((dest_url.into_string(), String::new(), raw_label));
             }
             Event::End(TagEnd::Link) => {
-                if let Some((url, label)) = links.pop() {
+                if let Some((url, label, raw_label)) = links.pop() {
+                    let label = raw_label.as_deref().unwrap_or(&label);
                     let comparable_url = url.strip_prefix("mailto:").unwrap_or(&url);
                     if (!hyperlinks || !safe_hyperlink(&url))
                         && label != url
                         && label != comparable_url
                     {
-                        spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
+                        let mut suffix = Span::themed(format!(" ({url})"), theme, "mdLinkUrl");
+                        suffix.strikethrough = strikethrough > 0;
+                        spans.push(suffix);
                     }
                 }
             }
@@ -1511,14 +1521,17 @@ fn markdown_at_depth(
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                let body = text[range]
+                // The range indexes the original document; normalize only the
+                // extracted quote before recursively parsing its local text.
+                let quote = text[range].replace("\r\n", "\n").replace('\r', "\n");
+                let body = quote
                     .lines()
                     .map(|line| {
                         let trimmed = line.trim_start_matches(' ');
                         if line.len() - trimmed.len() <= 3 {
                             trimmed
                                 .strip_prefix('>')
-                                .map(|line| line.strip_prefix(' ').unwrap_or(line))
+                                .map(|line| line.strip_prefix([' ', '\t']).unwrap_or(line))
                                 .unwrap_or(line)
                         } else {
                             line
@@ -1592,7 +1605,7 @@ fn markdown_at_depth(
                     } else {
                         merged.as_str()
                     };
-                    if let Some((_, label)) = links.last_mut() {
+                    if let Some((_, label, _)) = links.last_mut() {
                         label.push_str(displayed);
                     }
                     let mut span = Span::themed(
@@ -1608,7 +1621,7 @@ fn markdown_at_depth(
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1 || !links.is_empty();
-                    span.hyperlink = links.last().and_then(|(url, _)| {
+                    span.hyperlink = links.last().and_then(|(url, _, _)| {
                         (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
                     });
                     span.italic = italic > 0;
@@ -1674,25 +1687,27 @@ fn markdown_at_depth(
                 }
             }
             Event::Code(text) => {
-                if let Some((_, label)) = links.last_mut() {
+                if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
                 }
                 let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links
-                    .last()
-                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
-                span.bold = heading > 0;
+                span.hyperlink = links.last().and_then(|(url, _, _)| {
+                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                });
+                span.bold = bold > 0 || heading > 0;
+                span.italic = italic > 0;
+                span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
             Event::SoftBreak => {
-                if let Some((_, label)) = links.last_mut() {
+                if let Some((_, label, _)) = links.last_mut() {
                     label.push(' ');
                 }
                 let mut span = Span::themed(" ", theme, "text");
-                span.hyperlink = links
-                    .last()
-                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
+                span.hyperlink = links.last().and_then(|(url, _, _)| {
+                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                });
                 spans.push(span);
             }
             Event::End(TagEnd::Item) => {
@@ -1768,6 +1783,561 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn marked_strike_normalizes_list_and_quote_continuations() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("- ~~`a\n  b`~~", "a b"),
+            ("- ~~`a\n    b`~~", "a   b"),
+            ("> - ~~`a\n>   b`~~", "a b"),
+            ("1. ~~`a\n   b`~~", "a b"),
+            ("- outer\n  - ~~`a\n    b`~~", "a b"),
+            ("> ~~`a\n>\tb`~~", "a b"),
+            ("-\t~~`a\n\tb`~~", "a b"),
+            ("1.\t~~`a\n\tb`~~", "a b"),
+            ("- ~~`a\n\tb`~~", "a   b"),
+            ("- ~~`a\n \tb`~~", "a    b"),
+            ("- ~~`a\n  \tb`~~", "a b"),
+            ("- ~~`a\n b`~~", "a  b"),
+            (" - ~~`a\n   b`~~", "a b"),
+            ("  - ~~`a\n    b`~~", "a b"),
+            ("   - ~~`a\n     b`~~", "a b"),
+            ("  - ~~`a\n\tb`~~", "a b"),
+            ("  -\t~~`a\n\tb`~~", "a b"),
+            ("  1. ~~`a\n     b`~~", "a b"),
+            ("  - outer\n    - ~~`a\n      b`~~", "a b"),
+            (">   - ~~`a\n>     b`~~", "a b"),
+        ] {
+            let lines = markdown(source, &theme, 120);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text == expected && span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_strike_normalizes_crlf_and_bare_cr() {
+        let theme = Theme::system();
+        for source in [
+            "~~`a\r\nb`~~",
+            "~~`a\rb`~~",
+            "- ~~`a\r\n  b`~~",
+            "- ~~`a\r  b`~~",
+            "> ~~`a\r\n> b`~~",
+            "> ~~`a\r> b`~~",
+            "> - ~~`a\r>   b`~~",
+        ] {
+            let lines = markdown(source, &theme, 120);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text == "a b" && span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| !span.text.contains('\r')),
+                "{source:?}: {lines:?}"
+            );
+        }
+        let source = "> ~~`a\r> b`~~\r> https://example.com";
+        let lines = markdown_at_depth(
+            source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn marked_table_autolink_does_not_consume_next_cell() {
+        let theme = Theme::system();
+        for source in [
+            "| a | b |\n|---|---|\n|https://example.com|keep|\n| ~~x~~ | y |",
+            "| a | b |\n|---|---|\n|https://example.com ~~x~~|keep|",
+            "| a | b |\n|---|---|\n|~~https://example.com~~|keep|",
+            "| a | b |\n|---|---|\n|~~x~~ https://example.com|keep|",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                120,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_table_autolink_normalizes_escaped_pipe_in_destination() {
+        let theme = Theme::system();
+        let source = "| a | b |\n|---|---|\n|https://example.com/a\\|b ~~x~~|keep|";
+        let lines = markdown_at_depth(
+            source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com/a|b")),
+            "{lines:?}"
+        );
+        assert!(
+            spans.iter().all(|span| !span
+                .hyperlink
+                .as_deref()
+                .is_some_and(|url| url.contains("\\|"))),
+            "{lines:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "x" && span.strikethrough),
+            "{lines:?}"
+        );
+        let unsafe_source = "| a | b |\n|---|---|\n|o’connor@example.com ~~x\\|y~~|keep|";
+        let lines = markdown_at_depth(
+            unsafe_source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.hyperlink.is_none()),
+            "{lines:?}"
+        );
+    }
+    #[test]
+    fn marked_strike_keeps_bare_and_angle_autolinks() {
+        let theme = Theme::system();
+        for source in [
+            "https://example.com ~~deleted~~",
+            "<https://example.com> ~~deleted~~",
+            "~~https://example.com~~",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+                "{source}: {lines:?}"
+            );
+            let struck = if source.starts_with("~~") {
+                "https://example.com"
+            } else {
+                "deleted"
+            };
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text == struck && span.strikethrough),
+                "{source}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_strike_runs_keep_safe_autolink_boundaries() {
+        let theme = Theme::system();
+        for source in [
+            "o’connor@example.com ~~x~~",
+            "user@example.com.中国 ~~x~~",
+            "www.user?tag@example.com ~~x~~",
+            "~~o’connor@example.com~~",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.hyperlink.is_none()),
+                "{source}: {lines:?}"
+            );
+        }
+        let oversized = format!("o’connor@example.com ~~{}", "x".repeat(65_536));
+        let lines = markdown_at_depth(
+            &oversized,
+            &theme,
+            160,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.hyperlink.is_none())
+        );
+        for (source, expected) in [
+            ("~~user@example.com~~", "mailto:user@example.com"),
+            ("~~https://example.com/path~~", "https://example.com/path"),
+            (
+                "[www.user?tag@example.com](https://example.com) ~~x~~",
+                "https://example.com",
+            ),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some(expected)),
+                "{source}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_strike_preserves_complete_native_mailboxes() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("o'connor@example.com ~~x~~", "mailto:o'connor@example.com"),
+            ("foo/bar@example.com ~~x~~", "mailto:foo%2Fbar@example.com"),
+            ("~~o'connor@example.com~~", "mailto:o'connor@example.com"),
+            ("~~foo/bar@example.com~~", "mailto:foo%2Fbar@example.com"),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some(expected)),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(
+                        |span| span.hyperlink.as_deref() != Some("mailto:connor@example.com")
+                            && span.hyperlink.as_deref() != Some("mailto:bar@example.com")
+                    ),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+    #[test]
+    fn strict_strike_matches_pinned_marked_delimiters_and_code_boundaries() {
+        let theme = Theme::system();
+        // Expected text and strike spans were generated by the pinned Pi
+        // MarkdownTokenizer with marked 18.0.11.
+        for (source, expected, deleted) in [
+            ("~foo ~~bar~~ baz~", "~foo bar baz~", "bar"),
+            ("~~a ~b~ c~~", "a ~b~ c", "a ~b~ c"),
+            ("~~x~~~", "~~x~~~", ""),
+            ("x~~~a~~y", "x~~~a~~y", ""),
+            (r"\~~~a~~", "~a", "a"),
+            ("~~a~~~b~~", "a~~~b", "a~~~b"),
+            ("*~~a`*~~", "*a`*", "a`*"),
+            ("*~~a*~~", "~~a~~", ""),
+            (r"~~a\~b~~", "a~b", "a~b"),
+            (r"\~~a~~", "~~a~~", ""),
+            ("~~a `b~~c` d", "a `bc` d", "a `b"),
+            ("`~~x~~` ~~y~~", "~~x~~ y", "y"),
+            ("~~a [link](url~~tail)", "a [link](urltail)", "a [link](url"),
+            ("~~a~~ ~~b~~", "a b", "ab"),
+        ] {
+            let lines = markdown(source, &theme, 200);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let rendered: String = spans.iter().map(|span| span.text.as_str()).collect();
+            let strike: String = spans
+                .iter()
+                .filter(|span| span.strikethrough)
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+            assert_eq!(strike, deleted, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn strict_strike_keeps_inline_and_reference_link_destinations() {
+        let theme = Theme::system();
+        let url = "https://example.com/a~b";
+        for source in [
+            "[~~hi~~](https://example.com/a~b)",
+            "~~[hi](https://example.com/a~b)~~",
+            "[~~hi~~][id]\n\n[id]: https://example.com/a~b",
+            "[~~hi~~][iD]\n\n[ID]: https://example.com/a~b",
+            "~~[hi][id]~~\n\n[id]: https://example.com/a~b",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                120,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                "hi",
+                "{source:?}"
+            );
+            assert!(
+                spans.iter().any(|span| span.text == "hi"
+                    && span.strikethrough
+                    && span.hyperlink.as_deref() == Some(url)),
+                "{source:?}"
+            );
+        }
+        let lines = markdown("~~[hi](https://example.com/a~b)~~", &theme, 120);
+        let suffix = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.text.contains("example.com"))
+            .unwrap();
+        assert!(suffix.strikethrough);
+
+        // Pi compares the raw link label, including Markdown delimiters.
+        let lines = markdown(
+            "[~~https://example.com~~](https://example.com)",
+            &theme,
+            120,
+        );
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(rendered, "https://example.com (https://example.com)");
+    }
+
+    #[test]
+    fn marked_strike_preserves_offsets_after_link_label_unescaping() {
+        let theme = Theme::system();
+        for source in [
+            r"[a\[b](https://example.com) ~~strike~~",
+            "[a\\[b][id] ~~strike~~\n\n[id]: https://example.com",
+            r"[a\]b](https://example.com) ~~strike~~",
+            r"[a\[b](https://example.com/~~dest) ~~strike~~",
+        ] {
+            let lines = markdown(source, &theme, 120);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+            assert!(
+                text.contains(if source.contains(r"\]b") {
+                    "a]b"
+                } else {
+                    "a[b"
+                }),
+                "{source:?}: {text:?}"
+            );
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text == "strike" && span.strikethrough),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_strike_unescapes_table_pipes_before_code_tokenization() {
+        let theme = Theme::system();
+        let source = "| header |\n| --- |\n| ~~a `x\\|y`~~ |";
+        let lines = markdown(source, &theme, 120);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("a ") && span.strikethrough)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "x|y" && span.strikethrough),
+            "{spans:?}"
+        );
+        assert!(!spans.iter().any(|span| span.text.contains(r"x\|y")));
+    }
+
+    #[test]
+    fn inline_code_in_strikethrough_inherits_strikethrough() {
+        let theme = Theme::system();
+        let lines = markdown("~~deleted `code`~~ and `plain`", &theme, 80);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        let code = spans.iter().find(|span| span.text == "code").unwrap();
+        assert!(code.strikethrough);
+        assert_eq!(code.color, theme.color("mdCode"));
+        assert!(
+            !spans
+                .iter()
+                .find(|span| span.text == "plain")
+                .unwrap()
+                .strikethrough
+        );
+    }
+    #[test]
+    fn markdown_requires_double_tildes_for_strikethrough() {
+        let theme = Theme::system();
+        for source in [
+            "~one~",
+            "before ~one~ after",
+            "~**bold**~",
+            "~~a ~b~ c~~",
+            "~~x~~~",
+        ] {
+            let lines = markdown(source, &theme, 80);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let rendered: String = spans.iter().map(|span| span.text.as_str()).collect();
+            let expected = match source {
+                "~**bold**~" => "~bold~",
+                "~~a ~b~ c~~" => "a ~b~ c",
+                _ => source,
+            };
+            assert_eq!(rendered, expected, "{source}");
+            if source == "~~a ~b~ c~~" {
+                assert!(spans.iter().all(|span| span.strikethrough));
+            } else {
+                assert!(spans.iter().all(|span| !span.strikethrough));
+            }
+            if source == "~**bold**~" {
+                assert!(spans.iter().any(|span| span.text == "bold" && span.bold));
+            }
+        }
+        let lines = markdown("~~deleted~~ and ~literal~", &theme, 80);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "deleted" && span.strikethrough)
+        );
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.text.contains('~'))
+                .all(|span| !span.strikethrough)
+        );
+        let lines = markdown_at_depth(
+            "~[label](https://example.com)~ `~code~`",
+            &theme,
+            80,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "~label~ ~code~"
+        );
+        assert!(
+            spans.iter().any(|span| span.text == "label"
+                && span.hyperlink.as_deref() == Some("https://example.com"))
+        );
+        let lines = markdown_at_depth(
+            "~https://example.com~",
+            &theme,
+            80,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "~https://example.com~"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com"))
+        );
+    }
     #[test]
     fn empty_fenced_code_has_one_indented_content_row() {
         for language in ["", "rust", "unknown-language"] {
