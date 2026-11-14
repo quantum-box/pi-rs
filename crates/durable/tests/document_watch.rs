@@ -42,7 +42,6 @@ fn ordered_pages_delete_and_resume_after_reopen() {
     let first = watch.poll(1).unwrap();
     assert_eq!(first[0].document.as_ref().unwrap().value["n"], 1);
     let cursor = watch.cursor();
-    drop(watch);
     drop(store);
     let store = Store::open(&path).unwrap();
     let docs = Documents::new(&store);
