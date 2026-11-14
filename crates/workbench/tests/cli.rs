@@ -147,6 +147,92 @@ fn rpc_worker_starts_when_agent_directory_is_read_only() {
 }
 
 #[test]
+fn worker_returns_keyed_share_journal_tag() {
+    use hmac::{Hmac, Mac};
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("fixture".into(), Vec::new(), None)
+        .unwrap();
+    drop(session);
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .arg("--session")
+        .arg(&path)
+        .arg("--workspace")
+        .arg(root.path())
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--stdin-control",
+            "serve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let mut input = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let key = [37u8; 32];
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"share", "type":"get_share_context", "session":path, "journal_key":key})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("worker did not return share context");
+        if event["id"] == "share" {
+            break event;
+        }
+    };
+    assert_eq!(response["success"], true, "{response}");
+    let tag: [u8; 32] = serde_json::from_value(response["data"]["journalTag"].clone()).unwrap();
+    let journal = Session::snapshot(&path).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    mac.update(b"pi-rs-live-share-journal-v1\0");
+    mac.update(&serde_json::to_vec(journal.records()).unwrap());
+    assert!(mac.verify_slice(&tag).is_ok());
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.0.try_wait().unwrap().is_some(), "worker did not exit");
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reader.is_finished(), "worker output did not close");
+    reader.join().unwrap();
+}
+
+#[test]
 fn missing_session_id_does_not_create_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))

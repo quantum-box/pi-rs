@@ -33,3 +33,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_rejects_different_journal
       - name: Test pending share correlation
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs pending_share_keeps_extension_dialog_and_response_correlated
+      - name: Test live worker journal tag
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli worker_returns_keyed_share_journal_tag
