@@ -52,6 +52,7 @@ try {
   assert(await session.prompt('first') === 'answer one', 'first answer');
   let messages = JSON.parse(session.messages());
   assert(messages.some(m => m.content === 'first') && messages.some(m => m.content === 'answer one'), 'saved messages');
+  assert(!localStorage.getItem('pi-rs:session:test').includes('secret'), 'token persisted in session');
   await session.close(); session.free();
   session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
   messages = JSON.parse(session.messages());
@@ -61,6 +62,7 @@ try {
   await reject(immediate, 'cancel');
   const pending = session.prompt('cancel me');
   while (!(await (await fetch('/cancel-started')).json())) await new Promise(r => setTimeout(r, 20));
+  await reject(session.close(), 'busy');
   session.cancel();
   await reject(pending, 'cancel');
   assert(await session.prompt('after cancel') === 'answer two', 'run after cancel');
@@ -72,8 +74,13 @@ try {
   await new Promise(r => setTimeout(r, 30));
   session.free();
   await reject(doomed, 'cancel');
-  await new Promise(r => setTimeout(r, 50));
-  session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
+  session = null;
+  const lockDeadline = Date.now() + 3000;
+  while (Date.now() < lockDeadline) {
+    try { session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500); break; }
+    catch (e) { if (!String(e).includes('already open')) throw e; await new Promise(r => setTimeout(r, 20)); }
+  }
+  assert(session !== null, 'lock released after free');
   await Promise.all([session.close(), session.close()]); session.free();
   sessionStorage.setItem('reloaded', 'yes');
   location.reload();

@@ -171,6 +171,7 @@ struct SessionInner {
     control: SessionControl,
     release: Function,
     release_promise: RefCell<Option<js_sys::Promise>>,
+    close_promise: RefCell<Option<js_sys::Promise>>,
     disposed: Cell<bool>,
     cancel_sequence: Cell<u64>,
 }
@@ -213,6 +214,7 @@ impl BrowserSession {
                     control,
                     release: release.clone(),
                     release_promise: RefCell::new(None),
+                    close_promise: RefCell::new(None),
                     disposed: Cell::new(false),
                     cancel_sequence: Cell::new(0),
                 }),
@@ -254,26 +256,27 @@ impl BrowserSession {
     }
     /// Close an idle session and wait for its cross-tab lock to be released.
     pub fn close(&self) -> js_sys::Promise {
+        if let Some(promise) = self.inner.close_promise.borrow().clone() {
+            return promise;
+        }
         let inner = self.inner.clone();
-        future_to_promise(async move {
-            let existing = inner.release_promise.borrow().clone();
-            let promise = if let Some(promise) = existing {
-                promise
-            } else {
-                let session = inner
-                    .session
-                    .borrow_mut()
-                    .take()
-                    .ok_or_else(|| js_error("session busy or closed"))?;
-                drop(session);
-                let value = inner.release.call0(&JsValue::UNDEFINED)?;
-                let promise = js_sys::Promise::resolve(&value);
-                *inner.release_promise.borrow_mut() = Some(promise.clone());
-                promise
+        let promise = future_to_promise(async move {
+            let session = inner.session.borrow_mut().take();
+            let Some(mut session) = session else {
+                *inner.close_promise.borrow_mut() = None;
+                return Err(js_error("session busy or closed"));
             };
-            JsFuture::from(promise).await?;
+            let close_result = session.close().await.map_err(|e| js_error(&e.to_string()));
+            drop(session);
+            let value = inner.release.call0(&JsValue::UNDEFINED)?;
+            let released = js_sys::Promise::resolve(&value);
+            *inner.release_promise.borrow_mut() = Some(released.clone());
+            JsFuture::from(released).await?;
+            close_result?;
             Ok(JsValue::UNDEFINED)
-        })
+        });
+        *self.inner.close_promise.borrow_mut() = Some(promise.clone());
+        promise
     }
     pub fn messages(&self) -> Result<String, JsValue> {
         let slot = self.inner.session.borrow();
