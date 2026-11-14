@@ -3424,3 +3424,177 @@ async fn added_tools_are_persisted_in_call_order_across_reopen() {
     assert_eq!(requests[0], vec!["controlled"]);
     assert_eq!(requests[1], vec!["controlled", "test", "aaa"]);
 }
+
+struct YieldDecisionHook(&'static str);
+#[async_trait]
+impl Hook for YieldDecisionHook {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision as D, GenerationEvent as E, HookTask};
+        if event != E::OnYield {
+            return Ok(D::Pass);
+        }
+        match self.0 {
+            "invalid" => Ok(D::Continue(json!({"bad": true}))),
+            "error" => Err("yield failed".into()),
+            "tasks" => {
+                let operation = ctx.snapshot["phase"]["OnYield"]["operation_id"].clone();
+                assert_eq!(
+                    ctx.memo.get_or_insert("replay", operation.clone()).await?,
+                    operation
+                );
+                Ok(D::Tasks(vec![HookTask {
+                    name: "review".into(),
+                    input: json!(null),
+                }]))
+            }
+            "continue"
+                if !ctx.snapshot["messages"]
+                    .to_string()
+                    .contains("retry answer") =>
+            {
+                Ok(D::Continue(json!("retry answer")))
+            }
+            _ => Ok(D::Pass),
+        }
+    }
+}
+
+#[tokio::test]
+async fn yield_invalid_and_failed_hooks_allow_later_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        options(model.clone(), Arc::new(FakeTool::default())),
+    )
+    .unwrap();
+    h.install_extension(Extension {
+        name: "yield".into(),
+        hooks: vec![
+            Arc::new(YieldDecisionHook("invalid")),
+            Arc::new(YieldDecisionHook("error")),
+            Arc::new(YieldDecisionHook("continue")),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["yield".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(c.submissions[0].status, Status::Done { .. }));
+    assert_eq!(
+        c.messages
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content == "retry answer"))
+            .count(),
+        1
+    );
+    assert_eq!(model.0.lock().unwrap().len(), 3);
+    let reports = h.extension_reports().unwrap();
+    let yields: Vec<_> = reports.iter().filter(|r| r.phase == "OnYield").collect();
+    assert_eq!(yields.len(), 2);
+    for batch in yields {
+        assert_eq!(batch.reports.len(), 2);
+        assert!(
+            batch.reports[0]
+                .error
+                .contains("continuation must be a string")
+        );
+        assert_eq!(batch.reports[1].error, "yield failed");
+    }
+}
+
+#[tokio::test]
+async fn yield_report_replay_deduplicates_and_later_hook_creates_child() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler_release = release.clone();
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        while !handler_release.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(Step::Succeed(json!(null)))
+    });
+    let install = |h: &mut Harness| {
+        h.install_extension(Extension {
+            name: "yield".into(),
+            hooks: vec![
+                Arc::new(YieldDecisionHook("invalid")),
+                Arc::new(YieldDecisionHook("error")),
+                Arc::new(YieldDecisionHook("tasks")),
+            ],
+            tasks: vec![("review".into(), handler.clone())],
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let id;
+    let reports;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        install(&mut h);
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["yield".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Running
+        ));
+        reports = h.extension_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reports.len(), 2);
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(h.extension_reports().unwrap(), reports);
+    }
+    let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+    install(&mut h);
+    let mut registry = Registry::default();
+    assert!(registry.register_shared("review", true, handler));
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+    let children = state["phase"]["YieldTasksWaiting"]["children"]
+        .as_array()
+        .unwrap();
+    assert_eq!(children.len(), 1);
+    let child = children[0].as_str().unwrap().parse().unwrap();
+    release.store(true, std::sync::atomic::Ordering::Release);
+    for _ in 0..200 {
+        if driver.get(child).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(driver.get(child).unwrap().unwrap().is_terminal());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(h.extension_reports().unwrap(), reports);
+    assert_eq!(tool.0.lock().unwrap().len(), 1);
+    driver.shutdown().unwrap();
+}

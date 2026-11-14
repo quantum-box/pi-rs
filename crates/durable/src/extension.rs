@@ -582,7 +582,14 @@ impl Resolved {
                         }
                     }
                     Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
-                        return (value, Some(v), tasks, reports);
+                        if v.is_string() {
+                            return (value, Some(v), tasks, reports);
+                        }
+                        reports.push(failure(
+                            &e.name,
+                            "generation",
+                            "OnYield continuation must be a string".into(),
+                        ));
                     }
                     Ok(GenerationDecision::Tasks(mut t))
                         if matches!(
