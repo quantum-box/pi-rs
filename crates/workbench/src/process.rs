@@ -14,6 +14,10 @@ pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
 pub(super) static SHARE_CONTEXT_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+// Retain uncertainty if a worker is replaced before its parent drains the
+// initialization event. This flag is local to the frontend process.
+pub(super) static DROPPED_SHARE_CONTEXT_POSSIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -830,6 +834,12 @@ impl Drop for Worker {
         let _ = self.child.wait();
         for reader in self.readers.drain(..) {
             let _ = reader.join();
+        }
+        if self.persistent {
+            let _ = self.drain_events();
+            if self.context_may_exist || !self.startup_proven_empty {
+                DROPPED_SHARE_CONTEXT_POSSIBLE.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 }

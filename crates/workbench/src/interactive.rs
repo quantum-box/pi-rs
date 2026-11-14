@@ -2923,6 +2923,8 @@ fn slash(
             view.append("Copied last response");
         }
         "/share" => {
+            view.share_context_may_exist |= super::process::DROPPED_SHARE_CONTEXT_POSSIBLE
+                .load(std::sync::atomic::Ordering::SeqCst);
             let destination = sessions::ShareDestination::configured(&args.settings)?;
             let id = if destination.is_radius() && !args.trust_pending {
                 if let Some(worker) = worker {
@@ -4105,7 +4107,11 @@ pub(super) async fn run(
                 if let Some(mut pending) = view.pending_share.take() {
                     // Only a worker known to have failed before context setup
                     // may use the legacy metadata-free fallback.
-                    if finished.startup_proven_empty && !view.share_context_may_exist {
+                    if finished.startup_proven_empty
+                        && !view.share_context_may_exist
+                        && !super::process::DROPPED_SHARE_CONTEXT_POSSIBLE
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         pending.journal_key = None;
                     }
                     start_share_upload(&mut view, pending, None);
