@@ -2279,6 +2279,18 @@ zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
 Complete native prompt checkpointing remains open.
 
+### Tool argument token estimates
+
+Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
+after parsing them. Native estimates now count JavaScript binary64 number
+rounding and exponent formatting as well as UTF-16 string units, including in
+imported assistant messages. This affects estimates and compaction boundaries;
+the original tool arguments and provider requests remain unchanged. Regressions
+cover exponent cutoffs, integers beyond 2^53, negative zero, nested values and
+escaped Unicode against Node 24. Inputs that Rust's JSON parser rejects, such as
+non-finite numeric overflow, retain the existing raw-input fallback, so complete
+JavaScript JSON parsing and token-estimator parity remain open.
+
 ### Directory listing limits checkpoint
 
 Directory listings now use the reference's combined notice when both the entry

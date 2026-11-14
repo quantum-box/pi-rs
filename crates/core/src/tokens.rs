@@ -24,6 +24,40 @@ fn text_chars(text: &str) -> u64 {
     text.encode_utf16().count() as u64
 }
 
+// Pi estimates parsed tool arguments with JSON.stringify. JSON numbers are
+// binary64 in JavaScript, including integers outside the exact 53-bit range.
+fn pi_json_chars(value: &serde_json::Value) -> u64 {
+    use serde_json::Value;
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.as_f64().map_or(4, |number| {
+            if number == 0.0 {
+                1
+            } else {
+                ryu_js::Buffer::new().format(number).len() as u64
+            }
+        }),
+        Value::String(text) => serde_json::to_string(text)
+            .map(|encoded| text_chars(&encoded))
+            .unwrap_or(0),
+        Value::Array(items) => items.iter().fold(
+            2_u64 + items.len().saturating_sub(1) as u64,
+            |chars, item| chars.saturating_add(pi_json_chars(item)),
+        ),
+        Value::Object(items) => items.iter().fold(
+            2_u64 + items.len().saturating_sub(1) as u64,
+            |chars, (key, item)| {
+                chars
+                    .saturating_add(pi_json_chars(&Value::String(key.clone())))
+                    .saturating_add(1)
+                    .saturating_add(pi_json_chars(item))
+            },
+        ),
+    }
+}
+
 /// Approximate a message using Pi's four UTF-16 units per token and image budget.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     native_message_chars(message).div_ceil(4)
@@ -55,11 +89,11 @@ fn pi_message_chars(message: &Message) -> u64 {
         Message::Assistant { content, calls, .. } => {
             calls.iter().fold(text_chars(content), |chars, call| {
                 let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|_| call.arguments.clone());
+                    .map(|value| pi_json_chars(&value))
+                    .unwrap_or_else(|_| text_chars(&call.arguments));
                 chars
                     .saturating_add(text_chars(&call.name))
-                    .saturating_add(text_chars(&arguments))
+                    .saturating_add(arguments)
             })
         }
         Message::Tool {
@@ -224,7 +258,7 @@ impl<'a> SourceTokenIndex<'a> {
                                 .as_str()
                                 .map(text_chars)
                                 .unwrap_or(0)
-                                .saturating_add(text_chars(&block["arguments"].to_string())),
+                                .saturating_add(pi_json_chars(&block["arguments"])),
                             _ => 0,
                         })
                     });
@@ -451,6 +485,37 @@ pub(crate) fn non_additive_native_system_checkpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_tool_argument_numbers_follow_javascript_stringify() {
+        // Lengths independently obtained with Node 24 JSON.stringify(JSON.parse(...)).
+        for (json, expected) in [
+            (r#"{"x":100000000000000000000}"#, 27),
+            (r#"{"x":1e21}"#, 11),
+            (r#"{"x":1e-6}"#, 14),
+            (r#"{"x":1e-7}"#, 10),
+            (r#"{"x":9007199254740993}"#, 22),
+            (r#"{"x":-0}"#, 7),
+            (r#"{"text":"\n🦀","values":[1e20,1e-7]}"#, 53),
+            (r#"{"v":9223372036854775807}"#, 25),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(pi_json_chars(&value), expected, "{json}");
+            let message = Message::Assistant {
+                content: String::new(),
+                calls: vec![crate::ToolCall {
+                    id: "id".into(),
+                    name: "call".into(),
+                    arguments: json.into(),
+                }],
+                replay: None,
+            };
+            assert_eq!(
+                estimate_message_tokens(&message),
+                (4_u64 + expected).div_ceil(4)
+            );
+        }
+    }
 
     #[test]
     fn replay_inline_images_use_fixed_allowance_but_signatures_remain_text() {

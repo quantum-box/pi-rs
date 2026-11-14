@@ -13,6 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }
 regex = "1"
+ryu-js = "1.0.3"
 pi-rs-tool-arguments = { path = "../tool-arguments", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
