@@ -6760,6 +6760,30 @@ mod scheduler_tests {
         assert_eq!(reports[0].reports[0].error, "first");
     }
     #[test]
+    fn dispatcher_missing_runtime_does_not_poison_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        assert!(matches!(
+            h.dispatch_extension_reports(0, Duration::from_secs(1), |_| async { Ok(()) }),
+            Err(Error::Invalid(_))
+        ));
+        assert!(!h.storage_failed.load(Ordering::Acquire));
+        assert!(
+            h.subscribe_extension_reports()
+                .unwrap()
+                .read(0, 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn report_migration_storage_failure_poisons_harness() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");

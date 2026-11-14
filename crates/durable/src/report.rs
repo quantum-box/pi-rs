@@ -182,10 +182,10 @@ impl<'a> Subscription<'a> {
 }
 
 /// Terminal delivery failure. `cursor` is the last successfully processed batch.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("report read failed after cursor {cursor}: {source}")]
-    Read { cursor: u64, source: Error },
+    Read { cursor: u64, source: Arc<Error> },
     #[error("report listener failed after cursor {cursor}: {message}")]
     Listener { cursor: u64, message: String },
     #[error("report listener panicked after cursor {cursor}")]
@@ -201,6 +201,7 @@ pub struct Dispatcher {
     stop: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<u64, DispatchError>>,
     cursor: Arc<AtomicU64>,
+    result: Option<Result<u64, DispatchError>>,
 }
 
 impl Dispatcher {
@@ -219,13 +220,15 @@ impl Dispatcher {
                 "report poll interval must be nonzero".into(),
             ));
         }
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Invalid("report dispatcher requires a Tokio runtime".into()))?;
         // Setup and cursor validation happen before the worker can call user code.
         let sub = Subscription::open(owner.store())?;
         sub.read(cursor, 1)?;
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let acknowledged = Arc::new(AtomicU64::new(cursor));
         let progress = acknowledged.clone();
-        let task = tokio::spawn(async move {
+        let task = runtime.spawn(async move {
             let sub = Subscription {
                 store: owner.store(),
             };
@@ -234,7 +237,7 @@ impl Dispatcher {
                 let page = tokio::select! {
                     biased;
                     _ = stopped.changed() => return Ok(cursor),
-                    result = sub.next(cursor, 1, poll) => result.map_err(|source| DispatchError::Read { cursor, source })?,
+                    result = sub.next(cursor, 1, poll) => result.map_err(|source| DispatchError::Read { cursor, source: Arc::new(source) })?,
                 };
                 if *stopped.borrow() {
                     return Ok(cursor);
@@ -263,20 +266,28 @@ impl Dispatcher {
             stop,
             task,
             cursor: acknowledged,
+            result: None,
         })
     }
 
-    /// Stop starting callbacks, wait for any in-flight callback, and return its
-    /// last acknowledged cursor or terminal failure. Safe to cancel and await again.
+    /// Request stop and wait for any callback already selected for delivery. Such a
+    /// callback may start after the stop request. Return the last acknowledged cursor
+    /// or terminal failure. Safe to cancel and await again;
+    /// subsequent calls return the same result.
     pub async fn close(&mut self) -> Result<u64, DispatchError> {
+        if let Some(result) = &self.result {
+            return result.clone();
+        }
         let _ = self.stop.send(true);
-        match (&mut self.task).await {
+        let result = match (&mut self.task).await {
             Ok(result) => result,
             Err(error) => Err(DispatchError::Worker {
                 cursor: self.cursor.load(Ordering::Acquire),
                 message: error.to_string(),
             }),
-        }
+        };
+        self.result = Some(result.clone());
+        result
     }
 }
 impl Drop for Dispatcher {
@@ -309,6 +320,53 @@ mod tests {
         )
         .into_bytes()
     }
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_without_runtime_returns_error_and_releases_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.db");
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let result = Dispatcher::start(owner, 0, Duration::from_secs(1), |_| async { Ok(()) });
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message.contains("Tokio runtime"))
+        );
+        OwnedStore::open(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatcher_close_is_repeatable_and_releases_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.db");
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let b = batch(1);
+        index(owner.store(), key(&b), &b, false).unwrap();
+        let (started, received) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let mut dispatcher = Dispatcher::start(owner, 0, Duration::from_secs(1), move |_| {
+            started.take().unwrap().send(()).unwrap();
+            async { Err("failure".into()) }
+        })
+        .unwrap();
+        received.await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(dispatcher.close().await,
+                Err(DispatchError::Listener { cursor: 0, ref message }) if message == "failure"));
+        }
+        // The handle may stay alive after close without retaining the store owner.
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let mut replay = Dispatcher::start(owner, 0, Duration::from_secs(1), move |_| {
+            sent.take().unwrap().send(()).unwrap();
+            async { Ok(()) }
+        })
+        .unwrap();
+        received.await.unwrap();
+        assert_eq!(replay.close().await.unwrap(), 1);
+        assert_eq!(replay.close().await.unwrap(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatcher_reentrant_failure_and_restart_replay() {

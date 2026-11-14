@@ -595,16 +595,19 @@ reports. Listener `Err(String)`, panic, or a read error stops that dispatcher;
 `close().await` returns the error and last successful cursor, and the host can
 restart from its durable checkpoint. Failures are not emitted as new reports.
 
-`close().await` requests stop, waits for an already running listener to finish,
-and returns its last successful cursor. It does not drain the log: later or
+`close().await` requests stop, waits for a listener already selected for delivery
+to finish, and returns its last successful cursor. A callback selected just before
+the stop request may start after the request. It does not drain the log: later or
 unstarted reports remain for replay. A listener that never completes can prevent
 close from completing; it must not await its own dispatcher's close. Cancelling
-the close future and awaiting it again is supported. Dropping the dispatcher
+the close future and awaiting it again is supported; subsequent calls return the
+same result. Dropping the dispatcher
 aborts the worker without waiting and cannot establish the awaited-close
 guarantee; close explicitly before releasing the host. A callback must not spawn
 untracked work if that work must finish before close. The dispatcher retains the
 store owner until its worker ends, and synchronous polling can block the Tokio
-thread during storage access. Start it inside a running Tokio runtime. Listener
+thread during storage access. Starting it outside a Tokio runtime returns an
+invalid-operation error before accessing the report store. Listener
 errors do not poison the host; setup storage errors follow subscription setup's
 poisoning rules and later read errors stop only the dispatcher.
 
