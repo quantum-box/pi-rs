@@ -589,41 +589,38 @@ impl<'a> TaskDocuments<'a> {
             crate::task_store::signal_revision_key(task_id),
         ];
         for check in batch.checks {
-            if shared.contains(&check.key) {
-                if let Some(existing) = self.signal.checks.iter_mut().find(|c| c.key == check.key) {
-                    existing.expected = match (&existing.expected, &check.expected) {
-                        (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y))
-                            if a == b =>
-                        {
-                            Expected::VersionBefore(*a, (*x).min(*y))
-                        }
-                        (Expected::Version(a), Expected::VersionBefore(b, x))
-                        | (Expected::VersionBefore(b, x), Expected::Version(a))
-                            if a == b =>
-                        {
-                            Expected::VersionBefore(*a, *x)
-                        }
-                        (a, b) if a == b => a.clone(),
-                        // Observations disagreed during staging. Force a commit conflict
-                        // so the normal replay-safe retry policy handles the race.
-                        _ => Expected::VersionBefore(0, std::time::Instant::now()),
-                    };
-                    continue;
-                }
+            if shared.contains(&check.key)
+                && let Some(existing) = self.signal.checks.iter_mut().find(|c| c.key == check.key)
+            {
+                existing.expected = match (&existing.expected, &check.expected) {
+                    (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
+                        Expected::VersionBefore(*a, (*x).min(*y))
+                    }
+                    (Expected::Version(a), Expected::VersionBefore(b, x))
+                    | (Expected::VersionBefore(b, x), Expected::Version(a))
+                        if a == b =>
+                    {
+                        Expected::VersionBefore(*a, *x)
+                    }
+                    (a, b) if a == b => a.clone(),
+                    // Observations disagreed during staging. Force a commit conflict
+                    // so the normal replay-safe retry policy handles the race.
+                    _ => Expected::VersionBefore(0, std::time::Instant::now()),
+                };
+                continue;
             }
             self.signal.checks.push(check);
         }
         for mutation in batch.mutations {
-            if let Mutation::Put { key, .. } = &mutation {
-                if *key == shared[1]
-                    && self
-                        .signal
-                        .mutations
-                        .iter()
-                        .any(|m| matches!(m, Mutation::Put { key: k, .. } if k == key))
-                {
-                    continue;
-                }
+            if let Mutation::Put { key, .. } = &mutation
+                && *key == shared[1]
+                && self
+                    .signal
+                    .mutations
+                    .iter()
+                    .any(|m| matches!(m, Mutation::Put { key: k, .. } if k == key))
+            {
+                continue;
             }
             self.signal.mutations.push(mutation);
         }
