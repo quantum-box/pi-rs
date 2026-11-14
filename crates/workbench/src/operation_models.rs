@@ -746,13 +746,17 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        let result = if has_images && self.args.settings.block_model_images() {
-            Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
-        } else if let Some(model) = catalogue.0.iter().find(|model| {
+        let model = catalogue.0.iter().find(|model| {
             model.api.kind() == kind
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
-        }) {
+        });
+        if let Some(model) = model {
+            initialize_image_result(model, &mut data);
+        }
+        let result = if has_images && self.args.settings.block_model_images() {
+            Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
+        } else if let Some(model) = model {
             let operation = self.perform(model, &args["context"], &keys, &mut data);
             tokio::select! {
                 biased;
@@ -774,6 +778,18 @@ impl Tool for Operations {
             data,
             attachments: vec![],
         }
+    }
+}
+
+fn initialize_image_result(entry: &Entry, data: &mut Value) {
+    if matches!(entry.api, Api::OpenRouterImages) && data.get("timestamp").is_none() {
+        data["api"] = json!(entry.api);
+        data["timestamp"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        );
     }
 }
 
@@ -837,6 +853,7 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
+        initialize_image_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
@@ -886,13 +903,15 @@ impl Operations {
         let body = send_model_request(&self.client, request, entry.api).await?;
         let body: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
-        data["api"] = json!(entry.api);
-        data["timestamp"] = json!(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        );
+        if !matches!(entry.api, Api::OpenRouterImages) {
+            data["api"] = json!(entry.api);
+            data["timestamp"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            );
+        }
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -907,10 +926,14 @@ impl Operations {
                     classifier_answers(&context["questions"], &result_body["answers"])?
             }
             Api::OpenRouterImages => {
-                data["output"] = json!(image_output(&body)?);
                 if let Some(id) = body["id"].as_str() {
                     data["responseId"] = json!(id);
                 }
+                // Keep accepted blocks if a later image fails native validation.
+                let output = data["output"]
+                    .as_array_mut()
+                    .expect("image operation output is initialized as an array");
+                image_output(&body, output)?;
             }
         }
         Ok(())
@@ -1001,18 +1024,171 @@ mod tests {
         assert!(request.starts_with(b"POST /v1/chat/completions "));
     }
 
+    #[tokio::test]
+    async fn openrouter_image_partial_results_keep_response_metadata() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHILD: &str = "PI_RS_IMAGE_RESULT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "operation_models::tests::openrouter_image_partial_results_keep_response_metadata"])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let valid_image = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let cases = [
+            (json!({"choices":[{}]}), vec![], true),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                    {"image_url":"data:image/png;base64,%%%"}
+                ]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":"https://example.org/image.png"},
+                    {"image_url":"data:;base64,YQ=="},
+                    {"image_url":"data:image/png;base64,"},
+                    {"image_url":"data:image/png;base64,aW1hZ2U="},
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}}
+                ]}}]}),
+                vec![
+                    json!({"type":"text","text":"caption"}),
+                    valid_image.clone(),
+                    valid_image,
+                ],
+                false,
+            ),
+        ];
+        for (mut body, expected_output, fails) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            body["id"] = json!("image-response");
+            body["usage"] = json!({"prompt_tokens":12, "completion_tokens":34});
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                assert_ne!(stream.read(&mut bytes).await.unwrap(), 0);
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-key", "models":[{
+                "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+            }]}});
+            let profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":config}))
+                    .unwrap();
+            let mut args = Cli::parse_from(["pi"]);
+            args.model_profiles = profiles;
+            let operation = Operations {
+                args,
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                }),
+            ).await.unwrap();
+            let Outcome::Structured { data, .. } = outcome else {
+                panic!("expected structured result")
+            };
+            assert_eq!(data["stopReason"], if fails { "error" } else { "stop" });
+            assert_eq!(data.get("errorMessage").is_some(), fails);
+            assert_eq!(data["api"], "openrouter-images");
+            assert!(data["timestamp"].as_u64().unwrap() > 0);
+            assert_eq!(data["responseId"], "image-response");
+            assert_eq!(data["usage"]["totalTokens"], 46);
+            assert_eq!(data["usage"]["cost"]["totalFromProvider"], false);
+            assert_eq!(data["output"], json!(expected_output));
+            server.await.unwrap();
+        }
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+            operation_id: uuid::Uuid::new_v4(), cancellation,
+        }).await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_early_error_retains_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let entry = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let mut data = json!({"stopReason":"stop", "output":[]});
+        assert!(
+            operation
+                .perform(
+                    entry,
+                    &json!({"input":[]}),
+                    &Keys::parse(&json!({})),
+                    &mut data
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
     #[test]
     fn openrouter_image_choices_validate_nonempty_responses() {
-        assert_eq!(
-            image_output(&json!({"choices":[]})).unwrap(),
-            Vec::<Value>::new()
-        );
-        assert!(image_output(&json!({})).is_err());
-        assert!(image_output(&json!({"choices":[{}]})).is_err());
-        assert_eq!(
-            image_output(&json!({"choices":[{"message":{"content":"description"}}]})).unwrap(),
-            vec![json!({"type":"text","text":"description"})]
-        );
+        let mut output = Vec::new();
+        image_output(&json!({"choices":[]}), &mut output).unwrap();
+        assert!(output.is_empty());
+        assert!(image_output(&json!({}), &mut output).is_err());
+        assert!(image_output(&json!({"choices":[{}]}), &mut output).is_err());
+        image_output(
+            &json!({"choices":[{"message":{"content":"description"}}]}),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, vec![json!({"type":"text","text":"description"})]);
     }
     #[test]
     fn openrouter_image_usage_keeps_reported_cache_counts() {
