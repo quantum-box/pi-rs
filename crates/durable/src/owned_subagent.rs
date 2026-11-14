@@ -789,6 +789,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn background_abort_cancels_active_children_and_waits_for_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Pending(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for Pending {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let child = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
+            .unwrap()
+            .child;
+        drop(h);
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(Pending(started.clone()));
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let driver = scheduler.start_tasks(Default::default()).unwrap();
+        scheduler.submit(child, None, "active".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            scheduler.abort_and_wait_with_background(parent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!scheduler.conversation(child).unwrap().abort_requested);
+        assert!(!matches!(
+            scheduler.conversation(child).unwrap().submissions[0].status,
+            crate::runtime::Status::Running
+        ));
+        assert!(driver.get(task).unwrap().unwrap().is_terminal());
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[test]
     fn task_abort_traverses_foreground_after_reopen() {
         let dir = tempfile::tempdir().unwrap();

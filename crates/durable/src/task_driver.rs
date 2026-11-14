@@ -384,9 +384,9 @@ fn cleanup_loop(shared: Arc<Shared>) {
                         if edge.edge.task_owner != *task.task.owner() {
                             return Err("ownership edge owner mismatch".into());
                         }
-                        if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
-                            continue;
-                        }
+                        // A background-inclusive conversation abort may mark a
+                        // child across either edge mode. Persisted marks, not
+                        // edge mode, decide which children need recovery.
                         let h = shared
                             .harness
                             .as_ref()
@@ -496,6 +496,21 @@ impl Shared {
     // admission lock order: state before task gate, never scheduler or a
     // conversation gate while holding state. Replacement holds state while
     // publishing its registry, so validation and commit form one boundary.
+    pub(crate) fn check_running_and_wake(&self) -> Result<(), crate::runtime::Error> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        if state.stop {
+            return Err(crate::runtime::Error::Invalid(format!(
+                "task driver stopped: {}",
+                state.failure.as_deref().unwrap_or("shutdown")
+            )));
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+
     pub(crate) fn with_hook_children<T>(
         &self,
         tasks: &[Task],

@@ -2288,3 +2288,58 @@ fn entry_id_fork_checks_inherited_chain_before_selecting_local_match() {
     assert_eq!(h.conversation(fork).unwrap().messages.len(), 2);
     assert!(h.fork_by_entry_id(child, inherited).is_err());
 }
+
+#[tokio::test]
+async fn background_abort_reaches_reused_child_through_terminal_anchor_after_reopen() {
+    use crate::task_store::TaskStore;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let other = h.create_conversation(config.clone()).unwrap();
+    let child = h
+        .ensure_subagent(parent, "worker", config.clone())
+        .unwrap()
+        .child;
+    let unrelated = h.ensure_subagent(other, "worker", config).unwrap().child;
+    let anchor = h.anchor_subagent(parent, "worker").unwrap();
+    let store = TaskStore::new(h.owner.store());
+    let snapshot = store.load(anchor).unwrap().unwrap();
+    store.update(&snapshot, |task| task.cancel()).unwrap();
+    drop(store);
+    h.submit(child, None, "first".into()).unwrap();
+    h.submit(child, None, "queued".into()).unwrap();
+    h.request_abort(parent).unwrap();
+    assert!(!h.conversation(child).unwrap().abort_requested);
+    h.request_abort_with_background(parent).unwrap();
+    h.request_abort_with_background(parent).unwrap();
+    assert!(h.conversation(child).unwrap().abort_requested);
+    assert!(!h.conversation(unrelated).unwrap().abort_requested);
+    assert!(matches!(
+        h.conversation(child).unwrap().submissions[1].status,
+        Status::Unanswered { .. }
+    ));
+    assert!(
+        TaskStore::new(h.owner.store())
+            .load(anchor)
+            .unwrap()
+            .unwrap()
+            .task
+            .is_terminal()
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(child).unwrap().abort_requested);
+    h.drive(child, &CancellationToken::new()).await.unwrap();
+    h.drive(parent, &CancellationToken::new()).await.unwrap();
+    assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+    h.submit(child, None, "reused".into()).unwrap();
+    h.request_abort_with_background(parent).unwrap();
+    assert!(h.conversation(child).unwrap().abort_requested);
+    assert!(!h.conversation(unrelated).unwrap().abort_requested);
+}

@@ -2860,6 +2860,13 @@ impl Harness {
         self.abort_owned_graph(Some(id), None).map(|_| ())
     }
 
+    /// Persist an abort across background ownership boundaries. The caller must
+    /// stop executing workers before driving the persisted marks.
+    pub fn request_abort_with_background(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_owned_graph_impl(Some(id), None, None, true)
+            .map(|_| ())
+    }
+
     /// Atomically persist an abort for a task and its foreground owned graph.
     /// The caller must stop executing workers before driving these marks.
     pub fn request_abort_task(&mut self, id: Uuid) -> Result<(), Error> {
@@ -2880,6 +2887,17 @@ impl Harness {
         task: Option<Uuid>,
         receipt: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Vec<Uuid>, Error> {
+        self.abort_owned_graph_impl(conversation, task, receipt, false)
+            .map(|(conversations, _)| conversations)
+    }
+
+    fn abort_owned_graph_impl(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+        receipt: Option<(Vec<u8>, Vec<u8>)>,
+        background: bool,
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -2890,7 +2908,7 @@ impl Harness {
             if let Some((key, _)) = &receipt
                 && store.get(key)?.is_some()
             {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             }
             let records = crate::task_store::TaskStore::new(store)
                 .list()
@@ -2922,7 +2940,8 @@ impl Harness {
                     let (state, version) = self.load(id)?;
                     states.push((state, version));
                     for r in &records {
-                        if r.task.owner() == &TaskOwner::Conversation(id) && !r.task.is_background()
+                        if r.task.owner() == &TaskOwner::Conversation(id)
+                            && (background || !r.task.is_background())
                         {
                             tq.push_back(r.task.id());
                         }
@@ -2934,7 +2953,9 @@ impl Harness {
                     }
                     let record = by_id.get(&id).ok_or(Error::NotFound)?;
                     for r in &records {
-                        if r.task.owner() == &TaskOwner::Task(id) && !r.task.is_background() {
+                        if r.task.owner() == &TaskOwner::Task(id)
+                            && (background || !r.task.is_background())
+                        {
                             tq.push_back(r.task.id());
                         }
                     }
@@ -2949,7 +2970,7 @@ impl Harness {
                             key: crate::ownership_edge::edge_key(edge.edge.child),
                             expected: Expected::Version(edge.version),
                         });
-                        if edge.edge.mode == Mode::Foreground {
+                        if background || edge.edge.mode == Mode::Foreground {
                             cq.push_back(edge.edge.child);
                         }
                     }
@@ -3003,7 +3024,12 @@ impl Harness {
             batch.checks.extend(edge_checks);
             batch.mutations.extend(task_batch.mutations);
             match self.commit_conversation_save(batch) {
-                Ok(()) => return Ok(conversations.into_iter().collect()),
+                Ok(()) => {
+                    return Ok((
+                        conversations.into_iter().collect(),
+                        tasks.into_iter().collect(),
+                    ));
+                }
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
             }
@@ -5521,6 +5547,33 @@ impl Scheduler {
         self.abort_graph(Some(id), None).map(|_| ())
     }
 
+    /// Persist and schedule abort across background ownership boundaries.
+    pub fn abort_with_background(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_background_graph(id).map(|_| ())
+    }
+
+    fn abort_background_graph(&mut self, id: Uuid) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+        let owner = self.harness.owner.clone();
+        let mut tasks = Vec::new();
+        let affected = owner
+            .conversation_controls()
+            .fence(|| {
+                let (conversations, reached) =
+                    self.harness
+                        .abort_owned_graph_impl(Some(id), None, None, true)?;
+                tasks = reached;
+                Ok(conversations)
+            })
+            .map_err(|error| match error {
+                durable_store::controls::FenceError::Poisoned => Error::Failed,
+                durable_store::controls::FenceError::Commit(error) => error,
+            })?;
+        for conversation in &affected {
+            self.schedule(*conversation);
+        }
+        Ok((affected, tasks))
+    }
+
     /// Abort a task and its foreground owned conversations.
     pub fn abort_task(&mut self, id: Uuid) -> Result<(), Error> {
         self.abort_graph(None, Some(id)).map(|_| ())
@@ -5567,6 +5620,55 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+    /// Abort across background boundaries and wait for the reached work to settle.
+    /// A task driver must be running for any nonterminal generic tasks.
+    pub async fn abort_and_wait_with_background(&mut self, id: Uuid) -> Result<(), Error> {
+        let (conversations, tasks) = self.abort_background_graph(id)?;
+        let mut first_error = None;
+        for conversation in &conversations {
+            if let Err(error) = self.wait(*conversation).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        for conversation in conversations {
+            if self.harness.conversation(conversation)?.abort_requested {
+                return Err(Error::Invalid(format!(
+                    "abort cleanup remains pending for conversation {conversation}"
+                )));
+            }
+        }
+        loop {
+            let store = crate::task_store::TaskStore::new(self.harness.owner.store());
+            let mut pending = false;
+            for id in &tasks {
+                let task = store
+                    .load(*id)
+                    .map_err(|e| Error::Invalid(format!("task lookup: {e}")))?
+                    .ok_or(Error::NotFound)?;
+                pending |= !task.task.is_terminal();
+            }
+            if !pending {
+                return Ok(());
+            }
+            let driver = self
+                .harness
+                .task_driver
+                .lock()
+                .map_err(|_| Error::Failed)?
+                .as_ref()
+                .and_then(|driver| driver.upgrade());
+            let Some(driver) = driver else {
+                return Err(Error::Invalid(
+                    "task driver is not running; abort cleanup remains pending".into(),
+                ));
+            };
+            driver.check_running_and_wake()?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {
