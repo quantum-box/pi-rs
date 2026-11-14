@@ -3591,6 +3591,7 @@ impl Agent<'_> {
                 .any(|entry| entry.id == boundary)
                 || before.is_some_and(|minimum| boundary > minimum)
                 || !has_summary_prefix(session, Some(boundary))
+                || !complete_compaction_boundary(&session.branch(), boundary)
             {
                 return Err(Error::Config(
                     "invalid extension compaction retention boundary".into(),
@@ -3809,8 +3810,28 @@ impl Agent<'_> {
         }
         let retain_from = match minimum_retention {
             Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            Some(retention) if extension_result.is_some() => {
+                // A legacy hook may request more turns, but cannot advance the
+                // extension's boundary and discard content it did not summarize.
+                match (
+                    retention.boundary,
+                    retain_from(&session.branch(), compaction.keep_turns),
+                ) {
+                    (Some(original), Some(recomputed)) => Some(original.min(recomputed)),
+                    (Some(original), None) => Some(original),
+                    (None, recomputed) => recomputed,
+                }
+            }
             _ => retain_from(&session.branch(), compaction.keep_turns),
         };
+        if extension_result.is_some()
+            && retain_from
+                .is_some_and(|boundary| !complete_compaction_boundary(&session.branch(), boundary))
+        {
+            return Err(Error::Config(
+                "compaction would split a message or tool exchange".into(),
+            ));
+        }
         let mut changes = ExtensionStates::new();
         for extension in &self.registry.extensions {
             let (sender, incoming) = mpsc::channel(32);
@@ -3952,6 +3973,53 @@ fn model_conversation_entries(
         .into_iter()
         .filter(|(source, _)| !excluded.contains(source))
         .collect()
+}
+
+// A cut can occur on an internal record. It must not separate legacy image
+// attachments from their user message or an assistant tool call from its result.
+fn complete_compaction_boundary(branch: &[&Record], boundary: u64) -> bool {
+    let mut last_plain_user = None;
+    let mut calls = HashMap::new();
+    let mut results = HashMap::new();
+    for record in branch {
+        match &record.event {
+            Event::User { .. }
+            | Event::CustomMessage { .. }
+            | Event::CustomMessageDelivered { .. }
+            | Event::BranchSummary { .. }
+            | Event::CompactionSummaryMessage { .. } => {
+                last_plain_user = Some(record.id);
+            }
+            Event::BashExecution { execution } if !execution.exclude_from_context => {
+                last_plain_user = Some(record.id);
+            }
+            Event::UserImages { .. } => {
+                if last_plain_user
+                    .take()
+                    .is_some_and(|user| user < boundary && record.id >= boundary)
+                {
+                    return false;
+                }
+            }
+            Event::UserWithImages { .. } => last_plain_user = None,
+            Event::Assistant { invocations, .. } => {
+                last_plain_user = None;
+                for invocation in invocations {
+                    calls.insert(invocation.operation_id, record.id);
+                }
+            }
+            Event::ToolFinished { operation_id, .. }
+            | Event::ToolReconciled { operation_id, .. } => {
+                results.insert(*operation_id, record.id);
+            }
+            _ => {}
+        }
+    }
+    calls.into_iter().all(|(operation, call)| {
+        results
+            .get(&operation)
+            .is_none_or(|result| (call < boundary) == (*result < boundary))
+    })
 }
 
 fn has_summary_prefix(session: &Session, boundary: Option<u64>) -> bool {
