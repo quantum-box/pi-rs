@@ -607,8 +607,9 @@ impl Session {
         let mut records = Vec::with_capacity(values.len());
         let mut metadata = BTreeMap::new();
         for value in values {
+            let legacy = legacy_compaction_metadata(&value);
             let stored: PersistedRecord = serde_json::from_value(value)?;
-            if let Some(extra) = stored.metadata {
+            if let Some(extra) = stored.metadata.or(legacy) {
                 metadata.insert(stored.record.id, extra);
             }
             records.push(stored.record);
@@ -2726,6 +2727,28 @@ struct PersistedRecord {
     metadata: Option<serde_json::Value>,
 }
 
+// Draft versions stored these fields inside Event::Compacted. Preserve them
+// while restoring the original public enum shape.
+fn legacy_compaction_metadata(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let event = value.get("event")?.as_object()?;
+    if event.get("type")?.as_str()? != "compacted" {
+        return None;
+    }
+    let from_extension = event
+        .get("from_extension")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let details = event.get("details");
+    if !from_extension && details.is_none() {
+        return None;
+    }
+    let mut result = serde_json::json!({"fromExtension":from_extension});
+    if let Some(details) = details {
+        result["details"] = details.clone();
+    }
+    Some(result)
+}
+
 fn encode_record(record: &Record, metadata: Option<&serde_json::Value>) -> Result<Vec<u8>> {
     if let Some(metadata) = metadata {
         if metadata.is_null() {
@@ -2766,7 +2789,14 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
             return Ok((records, metadata, offset, true));
         }
         let stored: PersistedRecord = serde_json::from_slice(&line)?;
-        if let Some(extra) = stored.metadata {
+        let legacy = if stored.metadata.is_none()
+            && matches!(stored.record.event, Event::Compacted { .. })
+        {
+            legacy_compaction_metadata(&serde_json::from_slice(&line)?)
+        } else {
+            None
+        };
+        if let Some(extra) = stored.metadata.or(legacy) {
             metadata.insert(stored.record.id, extra);
         }
         records.push(stored.record);
@@ -3509,6 +3539,43 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod record_metadata_tests {
     use super::*;
+
+    #[test]
+    fn legacy_compaction_fields_survive_journal_and_serialized_import() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        let mut values: Vec<_> = session
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).unwrap())
+            .collect();
+        values[1]["event"]["from_extension"] = true.into();
+        values[1]["event"]["details"] = serde_json::Value::Null;
+        let expected = serde_json::json!({"fromExtension":true,"details":null});
+        let imported = Session::from_serialized_records(values.clone()).unwrap();
+        assert_eq!(imported.record_metadata(2), Some(&expected));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let bytes = values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, bytes).unwrap();
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.record_metadata(2), Some(&expected));
+    }
 
     #[test]
     fn fork_remaps_overflow_retention_boundary() {
