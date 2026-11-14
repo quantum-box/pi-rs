@@ -400,4 +400,35 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn restoring_old_snapshot_and_marker_does_not_override_new_anchor() {
+        let root = std::env::temp_dir().join(format!("pi-share-replay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let binding = Binding {
+            session_id: uuid::Uuid::new_v4(),
+            head: 1,
+            journal_digest: [3; 32],
+            provenance_digest: [4; 32],
+        };
+        store
+            .begin(&path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"prompt":"old"}))
+            .unwrap();
+        let name = name_for(&store.key, &path, binding.session_id, "json").unwrap();
+        let marker = name_for(&store.key, &path, binding.session_id, "generation").unwrap();
+        let old_data = read(&store.directory, &name, MAX_BYTES * 2)
+            .unwrap()
+            .unwrap();
+        let old_marker = read(&store.directory, &marker, 65536).unwrap().unwrap();
+        drop(store.begin(&path, binding.clone()).unwrap());
+        write(&store.directory, &name, &old_data).unwrap();
+        write(&store.directory, &marker, &old_marker).unwrap();
+        assert_eq!(store.read(&path, &binding).unwrap(), None);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
