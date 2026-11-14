@@ -360,7 +360,14 @@ impl Handler for MultiSend {
     fn run(&self, _: &Task) -> Result<Step, String> {
         unreachable!()
     }
-    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "done" {
+            return Ok(Step::Succeed(json!(null)));
+        }
         let token = SignalToken::new("answer", 1).unwrap();
         let attempt = self.attempts.lock().unwrap().len();
         let now = if self.mode == 2 && attempt > 0 {
@@ -374,6 +381,15 @@ impl Handler for MultiSend {
                 docs.signal_at(Uuid::from_u128(id), &token, key, json!(key), now)
                     .unwrap(),
             );
+            if self.mode == 6 && attempt == 0 && id == 2 && key == "a" {
+                let db = Store::open(&self.path).unwrap();
+                assert_eq!(
+                    TaskStore::new(&db)
+                        .deliver_signal_at(Uuid::from_u128(2), &token, "b", json!("rival"), 99)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+            }
         }
         assert!(matches!(
             docs.signal_at(Uuid::from_u128(2), &token, "a", json!(4), now),
@@ -629,4 +645,72 @@ fn concurrent_abort_intent_discards_all_staged_signals() {
         .task;
     assert!(sender.abort_requested());
     assert_eq!(sender.checkpoint().phase, "start");
+}
+
+#[test]
+fn external_delivery_between_staging_calls_conflicts_and_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(vec![]));
+    let mut s = multi_setup(&path, None, 6, attempts.clone());
+    s.tick(99).unwrap();
+    assert_eq!(signal_value(&path, 2, "a"), None);
+    assert_eq!(signal_value(&path, 2, "b"), Some(json!("rival")));
+    assert_eq!(signal_value(&path, 3, "a"), None);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&addr())
+            .unwrap()
+            .is_none()
+    );
+    s.tick(99).unwrap();
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![
+            vec![
+                SignalResult::Delivered,
+                SignalResult::Duplicate,
+                SignalResult::Delivered
+            ],
+            vec![
+                SignalResult::Delivered,
+                SignalResult::Duplicate,
+                SignalResult::Delivered
+            ],
+        ]
+    );
+    assert_eq!(signal_value(&path, 2, "a"), Some(json!("a")));
+    assert_eq!(signal_value(&path, 3, "a"), Some(json!("a")));
+}
+
+#[test]
+fn driver_runs_all_receivers_after_multiple_atomic_deliveries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(vec![]));
+    let s = multi_setup(&path, None, 0, attempts.clone());
+    let driver = pi_rs_durable::task_driver::Driver::start(s);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if [2, 3].iter().all(|id| {
+            matches!(
+                driver.get(Uuid::from_u128(*id)).unwrap().unwrap().state(),
+                TaskState::Succeeded(_)
+            )
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "driver did not run both receivers"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![vec![SignalResult::Delivered; 3]]
+    );
+    for (id, key) in [(2, "a"), (2, "b"), (3, "a")] {
+        assert_eq!(signal_value(&path, id, key), Some(json!(key)));
+    }
 }
