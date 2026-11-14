@@ -5,30 +5,43 @@ const OPERATOR_ID = 'tn_01kxz0ytmhnab5vh53011cwctj';
 const MODEL = 'openai/gpt-6-luna';
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
-async function boundedJson(response) {
+async function readStream(response, onDelta) {
   if (!response.body) throw new Error('応答ストリームがありません');
   const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let buffer = '', text = '', total = 0, doneMarker = false;
+  function event(block) {
+    const data = block.split(/\r\n|\r|\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
+    if (!data) return;
+    if (data === '[DONE]') { doneMarker = true; return; }
+    const chunk = JSON.parse(data);
+    if (chunk.error) throw new Error('Gateway stream error');
+    const delta = chunk.choices?.[0]?.delta?.content;
+    if (typeof delta === 'string' && delta) { text += delta; onDelta(delta); }
+  }
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
+    while (!doneMarker) {
+      const part = await reader.read();
+      if (part.done) break;
+      total += part.value.byteLength;
       if (total > MAX_RESPONSE_BYTES) throw new Error('応答が大きすぎます');
-      chunks.push(value);
+      buffer += decoder.decode(part.value, { stream: true });
+      let match;
+      while ((match = /\r\n\r\n|\n\n|\r\r/.exec(buffer))) {
+        event(buffer.slice(0, match.index));
+        buffer = buffer.slice(match.index + match[0].length);
+        if (doneMarker) break;
+      }
     }
+    if (!doneMarker) throw new Error('Gateway stream ended before completion');
+    return text;
   } catch (error) {
     await reader.cancel().catch(() => {});
     throw error;
-  }
-  const data = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
-  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data));
+  } finally { reader.releaseLock(); }
 }
 
-export function createGatewayFetch({ fetchImpl, getToken, onError, origin }) {
+export function createGatewayFetch({ fetchImpl, getToken, onError, onDelta = () => {}, origin }) {
   return async function gatewayFetch(request, options) {
     if (!(request instanceof Request) || new URL(request.url).origin !== origin || new URL(request.url).pathname !== '/demo-gateway') {
       return fetchImpl(request, options);
@@ -49,7 +62,7 @@ export function createGatewayFetch({ fetchImpl, getToken, onError, origin }) {
       const response = await fetchImpl(API_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, 'x-operator-id': OPERATOR_ID },
-        body: JSON.stringify({ model: MODEL, messages, stream: false, max_completion_tokens: Math.min(source.max_output_tokens || 1024, 1024) }),
+        body: JSON.stringify({ model: MODEL, messages, stream: true }),
         signal: request.signal,
         credentials: 'omit',
         redirect: 'error',
@@ -58,10 +71,7 @@ export function createGatewayFetch({ fetchImpl, getToken, onError, origin }) {
         onError(`Tachyon Gateway がエラーを返しました（HTTP ${response.status}）。トークン、権限、利用枠を確認してください。`);
         return new Response('', { status: response.status });
       }
-      const data = await boundedJson(response);
-      const content = data.choices?.[0]?.message?.content;
-      const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part.type === 'text' && typeof part.text === 'string').map(part => part.text).join('') : null;
-      if (text === null) throw new Error('モデル応答にテキストがありません');
+      const text = await readStream(response, onDelta);
       return new Response(JSON.stringify({ text }), { status: 200, headers: { 'content-type': 'application/json' } });
     } catch (error) {
       if (error?.name !== 'AbortError') onError('Tachyon Gateway に接続できませんでした。');

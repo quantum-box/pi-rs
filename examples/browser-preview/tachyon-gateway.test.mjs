@@ -9,18 +9,21 @@ function request(messages = [{ role: 'user', content: 'hello' }], signal) {
 
 test('forwards text to the fixed Luna model and converts the gateway reply', async () => {
   let called;
-  const gateway = createGatewayFetch({ origin, getToken: () => ' token ', onError: assert.fail, fetchImpl: async (url, options) => {
+  const deltas = [];
+  const gateway = createGatewayFetch({ origin, getToken: () => ' token ', onError: assert.fail, onDelta: delta => deltas.push(delta), fetchImpl: async (url, options) => {
     called = { url, options };
-    return Response.json({ choices: [{ message: { content: 'hello from Luna' } }] });
+    const body = 'data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"from Luna\"}}]}\n\ndata: [DONE]\n\n';
+    return new Response(new ReadableStream({ start(controller) { const bytes = new TextEncoder().encode(body); for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.slice(i, i + 7)); controller.close(); } }));
   }});
   const response = await gateway(request([{ role: 'assistant', content: 'earlier', calls: [] }, { role: 'user', content: 'hello' }]));
   assert.deepEqual(await response.json(), { text: 'hello from Luna' });
+  assert.deepEqual(deltas, ['hello ', 'from Luna']);
   assert.equal(called.url, 'https://api.n1.tachy.one/v1/ai/chat/completions');
   assert.equal(called.options.headers.authorization, 'Bearer token');
   assert.equal(called.options.headers['x-operator-id'], 'tn_01kxz0ytmhnab5vh53011cwctj');
   assert.equal(called.options.credentials, 'omit');
   assert.equal(called.options.redirect, 'error');
-  assert.deepEqual(JSON.parse(called.options.body), { model: 'openai/gpt-6-luna', messages: [{role:'assistant',content:'earlier'},{role:'user',content:'hello'}], stream: false, max_completion_tokens: 1024 });
+  assert.deepEqual(JSON.parse(called.options.body), { model: 'openai/gpt-6-luna', messages: [{role:'assistant',content:'earlier'},{role:'user',content:'hello'}], stream: true });
 });
 
 test('reports gateway errors without exposing response content', async () => {
@@ -47,4 +50,17 @@ test('forwards cancellation and does not dispatch without a token', async () => 
   await new Promise(resolve => setTimeout(resolve, 0));
   controller.abort();
   await assert.rejects(pending, { name: 'AbortError' });
+});
+
+
+test('emits text before the response completes and rejects an incomplete stream', async () => {
+  let stream, received = '';
+  const gateway = createGatewayFetch({ origin, getToken: () => 'token', onError: () => {}, onDelta: delta => { received += delta; }, fetchImpl: async () => new Response(new ReadableStream({ start(controller) { stream = controller; } })) });
+  const pending = gateway(request());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  stream.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"途中"}}]}\n\n'));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(received, '途中');
+  stream.close();
+  await assert.rejects(pending, /before completion/);
 });
