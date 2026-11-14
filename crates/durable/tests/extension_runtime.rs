@@ -32,14 +32,17 @@ impl Model for FakeModel {
                 }),
             ]
         } else {
-            vec![Ok(ModelEvent::Complete {
-                calls: vec![ToolCall {
-                    id: "call".into(),
-                    name: "test".into(),
-                    arguments: "{\"n\":1}".into(),
-                }],
-                usage: None,
-            })]
+            vec![
+                Ok(ModelEvent::Text("tool answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "test".into(),
+                        arguments: "{\"n\":1}".into(),
+                    }],
+                    usage: None,
+                }),
+            ]
         };
         Ok(stream::iter(events).boxed())
     }
@@ -1759,7 +1762,9 @@ async fn after_tools_termination_settles_before_after_run_and_recovers_queued_in
             );
             let expected = if terminates { "tool answer" } else { "done" };
             assert!(
-                matches!(&c.submissions[0].status, Status::Done { answer } if answer == expected)
+                matches!(&c.submissions[0].status, Status::Done { answer } if answer == expected),
+                "expected {expected}: {:?}",
+                c.submissions[0].status
             );
             let snapshots = after_run.lock().unwrap();
             if terminates {
