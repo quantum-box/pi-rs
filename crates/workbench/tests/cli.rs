@@ -470,6 +470,48 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
 }
 
 #[test]
+fn model_listing_searches_ids_with_pi_token_swaps() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[
+            {"id":"nova-2p", "name":"DistinctSparkName"},
+            {"id":"nova-4x", "name":"Other"}
+        ]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for (search, expected, absent) in [
+        ("p2", "nova-2p", "nova-4x"),
+        ("DistinctSparkName", "No models matching", "nova-2p"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--list-models",
+                search,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains(absent), "{text}");
+    }
+}
+
+#[test]
 fn unrelated_provider_loads_legacy_responses_sampling_configuration() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

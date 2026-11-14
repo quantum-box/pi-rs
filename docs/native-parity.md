@@ -239,6 +239,13 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
+Completed tool-call JSON parsing and incremental argument previews live in the
+portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
+frontends. The standalone crate is compile-checked for
+`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
+on that target. Preview behavior retains the existing native parser's documented
+differences from Pi's streaming parser.
+
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
 alongside the native `extension` and `message` fields. `extensionPath` is the
 executable's resolved source path when available; embedded extensions without
@@ -861,7 +868,11 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Tests cover reader gating and custom-prompt precedence.
+loading. Declared `SKILL.md` files with missing descriptions report both the
+description problem and any invalid name diagnostics; unreadable skill files
+also report their source path. Empty-description checks use ECMAScript whitespace
+semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
+reader gating and custom-prompt precedence.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -4215,6 +4226,14 @@ empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
 
+### RPC truncated JSON diagnostics
+
+Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
+initial object property names, unfinished unescaped strings, and missing values.
+Offsets and columns in these diagnostics count UTF-16 units. Other malformed
+JSON, escaped unfinished strings and carriage-return position handling retain
+the native parser's diagnostics; full malformed-input parity remains open.
+
 ### Shell execution transcript checkpoint
 
 Imported and live Pi-style shell executions display their output and completion
@@ -4237,3 +4256,10 @@ A branch-local index shares reasoning and latest edits across message estimates;
 a 2,500-turn regression covers long histories and context usage.
 The separate native model-request safety budget retains its existing
 conservative estimate. Other token-estimator differences remain open.
+
+### Model listing search checkpoint
+
+`--list-models` searches provider and model IDs with Pi's tokenized fuzzy
+matching, including the ASCII letter/number swap (for example `p2` matches
+`nova-2p`). Display names alone do not match. The native JSON listing remains
+available; model scope and picker selection retain their existing behavior.
