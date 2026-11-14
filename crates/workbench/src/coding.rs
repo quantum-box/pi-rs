@@ -2119,6 +2119,10 @@ impl Tool for CodingTool {
     }
 }
 
+fn image_omission(mime: &str, reason: &str) -> Value {
+    json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
+}
+
 fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
     let locale = locale
         .split(['.', '@'])
@@ -2213,37 +2217,52 @@ impl CodingTool {
         {
             let original_mime = format.to_mime_type();
             let profile = profile.unwrap_or_default();
-            let prepared = match crate::image_profile::normalize_cancellable(
-                reader,
-                profile,
-                cancellation,
-            ) {
+            let supported = matches!(
+                original_mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            );
+            let prepared = if supported {
+                crate::image_profile::normalize_cancellable(reader, profile, cancellation)
+            } else {
+                let png = match crate::image_profile::convert_to_png_cancellable(
+                    reader,
+                    crate::image_profile::MAX_IMAGE_SOURCE_BYTES,
+                    cancellation,
+                ) {
+                    Ok(png) => png,
+                    Err(Error::Config(message))
+                        if message.starts_with("cannot prepare model image:") =>
+                    {
+                        return Ok(image_omission(
+                            original_mime,
+                            "[Image omitted: could not be converted to a supported inline image format.]",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                crate::image_profile::normalize_cancellable(
+                    image::ImageReader::with_format(Cursor::new(png), image::ImageFormat::Png),
+                    profile,
+                    cancellation,
+                )
+            };
+            let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(Error::Config(message))
                     if profile.valid()
                         && (message.starts_with("cannot prepare model image:")
                             || message == "image cannot fit the configured model size limit") =>
                 {
-                    let reason = if matches!(
+                    return Ok(image_omission(
                         original_mime,
-                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                    ) {
-                        "[Image omitted: could not be resized below the inline image size limit.]"
-                    } else {
-                        "[Image omitted: could not be converted to a supported inline image format.]"
-                    };
-                    return Ok(
-                        json!({"content":[{"type":"text", "text":format!("Read image file [{original_mime}]\n{reason}")}]}),
-                    );
+                        "[Image omitted: could not be resized below the inline image size limit.]",
+                    ));
                 }
                 Err(error) => return Err(error),
             };
             crate::image_profile::check_cancelled(cancellation)?;
             let mut note = format!("Read image file [{}]", prepared.mime_type);
-            if !matches!(
-                original_mime,
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            ) {
+            if !supported {
                 note.push_str(&format!(
                     "\n[Image converted from {original_mime} to {}.]",
                     prepared.mime_type
@@ -2279,6 +2298,33 @@ impl CodingTool {
                 mime_type,
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
             ) {
+                if self.unrestricted {
+                    let png = match crate::image_profile::convert_to_png_cancellable(
+                        reader,
+                        MAX_ORIGINAL_IMAGE_BYTES,
+                        cancellation,
+                    ) {
+                        Ok(png) => png,
+                        Err(Error::Config(message))
+                            if message.starts_with("cannot prepare model image:") =>
+                        {
+                            return Ok(image_omission(
+                                mime_type,
+                                "[Image omitted: could not be converted to a supported inline image format.]",
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if png.len() > MAX_ORIGINAL_IMAGE_BYTES {
+                        return Err(Error::Config(
+                            "image exceeds the 6 MiB original image limit".into(),
+                        ));
+                    }
+                    return Ok(json!({"content":[
+                        {"type":"text", "text":format!("Read image file [image/png]\n[Image converted from {mime_type} to image/png.]")},
+                        {"type":"image", "mimeType":"image/png", "data":base64::engine::general_purpose::STANDARD.encode(png)}
+                    ]}));
+                }
                 return Err(Error::Config("unsupported image format".into()));
             }
             let mut bytes = Vec::new();
@@ -4115,6 +4161,64 @@ mod tests {
                 "plain"
             );
         }
+    }
+
+    #[test]
+    fn bmp_conversion_and_resize_failures_are_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.bmp");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+            .save(&path)
+            .unwrap();
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_bytes: Some(1),
+                    ..Default::default()
+                }),
+                model_supports_images: None,
+            },
+        };
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/bmp]\n[Image omitted: could not be resized below the inline image size limit.]"
+        );
+        let tool = CodingTool {
+            kind: Kind::Read {
+                auto_resize: false,
+                profile: None,
+                model_supports_images: None,
+            },
+            ..tool
+        };
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/png]\n[Image converted from image/bmp to image/png.]"
+        );
+        assert_eq!(result["content"][1]["mimeType"], "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0,
+            [1, 2, 3]
+        );
+        std::fs::write(&path, b"BM broken").unwrap();
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/bmp]\n[Image omitted: could not be converted to a supported inline image format.]"
+        );
     }
 
     #[test]

@@ -88,6 +88,42 @@ pub(super) fn normalize_cancellable<R: BufRead + Seek>(
     normalize_encoded(bytes, format, profile, token)
 }
 
+pub(super) fn convert_to_png_cancellable<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    max_bytes: usize,
+    token: Option<&pi_rs::CancellationToken>,
+) -> Result<Vec<u8>> {
+    check_cancelled(token)?;
+    let format = reader
+        .format()
+        .ok_or_else(|| Error::Config("unknown image format".into()))?;
+    let mut bytes = Vec::new();
+    reader
+        .into_inner()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    check_cancelled(token)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::Config(if max_bytes == MAX_IMAGE_SOURCE_BYTES {
+            "image exceeds 20 MiB".into()
+        } else {
+            "image exceeds the 6 MiB original image limit".into()
+        }));
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().map_err(image_error)?;
+    check_cancelled(token)?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(image_error)?;
+    check_cancelled(token)?;
+    Ok(png)
+}
+
 pub fn normalize_content(
     content: ImageContent,
     profile: ImageResizeProfile,

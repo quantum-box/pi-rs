@@ -1040,9 +1040,13 @@ normalization and the separate write-size limit retain their existing bounds.
 Image reads that cannot be decoded, converted or resized return Pi's text
 notice explaining why the image was omitted, including for injected read
 operations. Programmatic callers receive that text rather than an image.
+Unsupported inline formats such as BMP are converted to PNG even with image
+resizing disabled; conversion and resize failures have distinct notices.
 The native 20 MiB source limit, cancellation and filesystem errors remain
-separate failures. The existing restrictions on image formats and original
-image size continue to apply.
+separate failures. When an injected backend only implements `read_file`, its
+whole response is buffered before the 20 MiB check; bounded transfer requires
+the optional streaming `open_file` operation. The 6 MiB limit when resizing
+is disabled still applies to the source and converted output.
 
 ### RPC navigation checkpoint
 
