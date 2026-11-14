@@ -846,6 +846,115 @@ fn minimax_regional_providers_use_the_messages_adapter() {
     }
 }
 
+#[test]
+fn configured_messages_thinking_budget_respects_native_output_limits() {
+    for (provider, model, level, preferred, request_limit, run_limit) in [
+        (
+            "anthropic",
+            "fixture-budgeted",
+            "low",
+            1536_u64,
+            2048_u32,
+            8192_u32,
+        ),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 3000),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 10000),
+        ("anthropic", "fixture-budgeted", "off", 0, 2048, 8192),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            r#"{"thinkingBudgets":{"low":1536,"high":3456}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("models.json"), json!({"providers":{"anthropic":{"models":[{"id":"fixture-budgeted","reasoning":true,"compat":{"forceAdaptiveThinking":false}}]}}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/anthropic/v1/messages",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /anthropic/v1/messages "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("x-api-key: fixture"));
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["max_tokens"], request_limit.min(run_limit));
+            if level == "off" {
+                assert_eq!(body["thinking"]["type"], "disabled");
+            } else {
+                assert_eq!(body["thinking"]["type"], "enabled");
+                assert_eq!(body["thinking"]["display"], "summarized");
+                assert_eq!(
+                    body["thinking"]["budget_tokens"],
+                    preferred.min(body["max_tokens"].as_u64().unwrap() - 1024)
+                );
+            }
+            let events = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"fixture\"}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                level,
+                "--max-output-tokens",
+                &request_limit.to_string(),
+                "--output-budget",
+                &run_limit.to_string(),
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}/{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
 fn responses_provider_streams_through_the_cli(provider: &str) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

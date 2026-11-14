@@ -65,6 +65,7 @@ pub struct Anthropic {
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
     thinking_level: Option<String>,
+    thinking_budgets: Option<Value>,
     configured_thinking: Option<CatalogEntry>,
     allow_empty_signature: bool,
     cache_retention: CacheRetention,
@@ -129,6 +130,7 @@ impl Anthropic {
             catalog: Default::default(),
             probe_context: true,
             thinking_level: None,
+            thinking_budgets: None,
             configured_thinking: None,
             allow_empty_signature: false,
             cache_retention: CacheRetention::None,
@@ -201,6 +203,11 @@ impl Anthropic {
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking_level = level.map(str::to_owned);
+        self
+    }
+
+    pub fn with_thinking_budget_settings(mut self, budgets: Option<Value>) -> Self {
+        self.thinking_budgets = budgets;
         self
     }
 
@@ -596,6 +603,7 @@ fn configure_thinking(
     details: Option<&CatalogEntry>,
     level: &str,
     max_output: u32,
+    budgets: Option<&Value>,
 ) -> Result<()> {
     if level == "off" {
         if let Some(model) = details.filter(|model| model.thinking.is_some()) {
@@ -622,12 +630,36 @@ fn configure_thinking(
             }
         }
         Some(ThinkingMode::Budgeted) => {
-            let preferred = match level {
-                "minimal" | "low" => 1024,
-                "medium" => 4096,
-                "high" => 8192,
-                "xhigh" => 16_384,
-                _ => 32_768,
+            let key = match level {
+                "minimal" => "minimal",
+                "low" => "low",
+                "medium" => "medium",
+                _ => "high",
+            };
+            let default = match level {
+                "minimal" => 1024,
+                "low" => 2048,
+                "medium" => 8192,
+                _ => 16_384,
+            };
+            let preferred = if let Some(budgets) = budgets {
+                let object = budgets
+                    .as_object()
+                    .ok_or_else(|| Error::Config("thinkingBudgets must be an object".into()))?;
+                match object.get(key) {
+                    None => default,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n >= 1024)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "thinkingBudgets.{key} must be an integer of at least 1024"
+                            ))
+                        })?,
+                }
+            } else {
+                default
             };
             let budget = preferred.min(max_output.saturating_sub(1024).max(1024));
             if budget >= max_output {
@@ -635,7 +667,8 @@ fn configure_thinking(
                     "Anthropic budgeted thinking needs at least 1025 output tokens".into(),
                 ));
             }
-            body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+            body["thinking"] =
+                json!({"type":"enabled","budget_tokens":budget,"display":"summarized"});
         }
         None => {}
     }
@@ -847,6 +880,7 @@ impl Model for Anthropic {
             self.auth.0.as_str(),
             self.auth.1.as_bytes(),
             &self.thinking_level,
+            &self.thinking_budgets,
             format!("{:?}", self.configured_thinking),
             self.allow_empty_signature,
             self.cache_retention.anthropic_control(),
@@ -912,7 +946,13 @@ impl Model for Anthropic {
         )?;
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if let Some(level) = self.thinking_level.as_deref() {
-            configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
+            configure_thinking(
+                &mut body,
+                details.as_ref(),
+                level,
+                max_output_tokens,
+                self.thinking_budgets.as_ref(),
+            )?;
         }
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
@@ -1449,8 +1489,8 @@ mod tests {
         .unwrap();
         assert_eq!(adaptive.thinking_levels, ["low", "high"]);
         let mut body = json!({});
-        assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048).is_err());
-        configure_thinking(&mut body, Some(&adaptive), "high", 2048).unwrap();
+        assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048, None).is_err());
+        configure_thinking(&mut body, Some(&adaptive), "high", 2048, None).unwrap();
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "high");
 
@@ -1459,12 +1499,30 @@ mod tests {
         }))
         .unwrap();
         let mut body = json!({});
-        assert!(configure_thinking(&mut body, Some(&legacy), "high", 1024).is_err());
-        configure_thinking(&mut body, Some(&legacy), "high", 2048).unwrap();
+        assert!(configure_thinking(&mut body, Some(&legacy), "high", 1024, None).is_err());
+        configure_thinking(&mut body, Some(&legacy), "high", 2048, None).unwrap();
         assert_eq!(
             body["thinking"],
-            json!({"type":"enabled","budget_tokens":1024})
+            json!({"type":"enabled","budget_tokens":1024,"display":"summarized"})
         );
+        let budgets = json!({"high": 3456, "low": "invalid"});
+        configure_thinking(&mut body, Some(&legacy), "xhigh", 10000, Some(&budgets)).unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 3456);
+        assert!(
+            configure_thinking(&mut body, Some(&legacy), "low", 10000, Some(&budgets)).is_err()
+        );
+        configure_thinking(&mut body, Some(&legacy), "high", 2048, Some(&budgets)).unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        for (level, expected) in [
+            ("minimal", 1024),
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 16384),
+            ("xhigh", 16384),
+        ] {
+            configure_thinking(&mut body, Some(&legacy), level, 20000, None).unwrap();
+            assert_eq!(body["thinking"]["budget_tokens"], expected);
+        }
     }
 
     #[test]

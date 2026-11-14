@@ -762,6 +762,9 @@ impl Client {
                 );
                 let mut client = client
                     .with_thinking(thinking)
+                    .with_thinking_budget_settings(
+                        args.settings.value().get("thinkingBudgets").cloned(),
+                    )
                     .with_cache_retention(retention, cache_tools);
                 if let Some(metadata) = metadata {
                     client =

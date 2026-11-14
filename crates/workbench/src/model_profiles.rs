@@ -543,6 +543,17 @@ impl ModelMetadata {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
+        if adapter == Adapter::Anthropic
+            && self.reasoning == Some(true)
+            && self.compat.force_adaptive_thinking == Some(false)
+            && self.thinking_level_map.is_empty()
+        {
+            return Some(
+                ["off", "minimal", "low", "medium", "high"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+        }
         if !matches!(
             adapter,
             Adapter::ChatCompletions
@@ -1661,6 +1672,14 @@ mod tests {
             assert_eq!(profiles.endpoint(&provider), endpoint);
             assert_eq!(builtin_chat::find(name).unwrap().env(), variable);
             assert_eq!(profiles.model_ids(&provider).len(), 2);
+            for id in ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"] {
+                assert!(
+                    !profiles
+                        .model_ids(&provider)
+                        .iter()
+                        .any(|model| model == id)
+                );
+            }
             let m3 = profiles.model(&provider, "MiniMax-M3").unwrap();
             assert_eq!(m3.levels(Adapter::Anthropic).unwrap(), ["off", "high"]);
             assert_eq!(m3.adaptive_thinking(), Some(true));

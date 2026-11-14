@@ -200,10 +200,28 @@ is underlined and destinations appear in parentheses only when they differ from
 the visible URL or email address. OSC 8 hyperlink capability remains open.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
-`MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled model
-catalogs include M3 and M3.1-Flash reasoning, image, context and pricing
-metadata; the same Anthropic-compatible streaming adapter is used for both
-regions. M2.7 needs its standard API adapter and remains unlisted.
+`MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
+include M3 and M3.1-Flash. Pi also lists M2.7 on these endpoints, but MiniMax's
+current regional Messages, OpenAI-compatible and standard API references list
+only M3 and M3.1-Flash as supported, so direct M2.7 entries are withheld. Both
+regional model-list FAQs say existing pay-as-you-go users can access M2.7 until
+November 18, 2026, and that subscription requests have routed to M3.1 Flash
+since October 19, 2026; their retired-model tables already list M2.7 as retired.
+The references do not specify a currently supported direct M2.7 route. See the
+[international model list](https://platform.minimax.io/docs/faq/models) and
+[China model list](https://platform.minimax.cn/docs/faq/models).
+
+Budgeted Messages requests use Pi's default level budgets or the selected
+`thinkingBudgets` override and summarized thinking display, subject to the
+native output ceiling. Overrides must be integers of at least 1,024 tokens;
+only the selected level is validated. Pi's simple API treats its requested
+maximum as an answer budget and adds thinking tokens (bounded by model and
+context capacity). In pi-rs the adapter receives only the hard ceiling: the
+smaller of the per-request limit and remaining run budget, possibly lowered by
+a context extension. Expanding it would exceed a host or extension limit;
+there is no separate answer budget and headroom to expand. Raising both
+`--max-output-tokens` and `--output-budget` permits a larger thinking budget
+within those limits.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
