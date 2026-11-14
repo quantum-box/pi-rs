@@ -223,10 +223,13 @@ pub(super) fn image_payload(entry: &Entry, context: &Value) -> Result<Value> {
 }
 
 pub(super) fn image_output(body: &Value) -> Result<Vec<Value>> {
-    let Some(message) = body["choices"]
-        .get(0)
-        .and_then(|choice| choice.get("message"))
-    else {
+    let choices = body["choices"]
+        .as_array()
+        .ok_or_else(|| Error::Model("image provider response is missing its choices".into()))?;
+    let Some(choice) = choices.first() else {
+        return Ok(Vec::new());
+    };
+    let Some(message) = choice.get("message").filter(|message| message.is_object()) else {
         return Err(Error::Model(
             "image provider response is missing its message".into(),
         ));
@@ -273,11 +276,11 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             let cached = detail
                 .and_then(|value| value["cached_tokens"].as_u64())
                 .unwrap_or_default()
-                .min(prompt);
+                .min(u64::from(u32::MAX));
             let written = detail
                 .and_then(|value| value["cache_write_tokens"].as_u64())
                 .unwrap_or_default()
-                .min(prompt);
+                .min(u64::from(u32::MAX));
             let read = cached.saturating_sub(written);
             (
                 prompt.saturating_sub(read + written),

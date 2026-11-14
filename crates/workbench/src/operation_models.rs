@@ -922,6 +922,136 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn openrouter_image_empty_choice_preserves_result_and_usage() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = json!({"id":"fixture-response", "choices":[], "usage":{
+                "prompt_tokens":100, "completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20}
+            }})
+            .to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-key", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"],
+            "cost":{"input":1.0,"output":2.0,"cacheRead":3.0,"cacheWrite":4.0}
+        }]}});
+        let profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let entry = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "fixture")
+            .unwrap();
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let mut data = json!({"stopReason":"stop", "output":[]});
+        let context = json!({"input":[{"type":"text","text":"draw"}]});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(data["stopReason"], "stop");
+        assert_eq!(data["responseId"], "fixture-response");
+        assert_eq!(data["output"], json!([]));
+        assert_eq!(data["usage"]["input"], 0);
+        assert_eq!(data["usage"]["output"], 10);
+        assert_eq!(data["usage"]["cacheRead"], 100);
+        assert_eq!(data["usage"]["cacheWrite"], 20);
+        assert_eq!(data["usage"]["totalTokens"], 130);
+        assert!((data["usage"]["cost"]["total"].as_f64().unwrap() - 0.0004).abs() < 1e-12);
+        let request = server.await.unwrap();
+        assert!(request.starts_with(b"POST /v1/chat/completions "));
+    }
+
+    #[test]
+    fn openrouter_image_choices_validate_nonempty_responses() {
+        assert_eq!(
+            image_output(&json!({"choices":[]})).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert!(image_output(&json!({})).is_err());
+        assert!(image_output(&json!({"choices":[{}]})).is_err());
+        assert_eq!(
+            image_output(&json!({"choices":[{"message":{"content":"description"}}]})).unwrap(),
+            vec![json!({"type":"text","text":"description"})]
+        );
+    }
+    #[test]
+    fn openrouter_image_usage_keeps_reported_cache_counts() {
+        let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images"
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        for (
+            prompt,
+            cached,
+            written,
+            expected_input,
+            expected_read,
+            expected_write,
+            expected_total,
+        ) in [
+            (100, 30, 10, 70, 20, 10, 110),
+            (100, 120, 0, 0, 120, 0, 130),
+            (100, 30, 120, 0, 0, 120, 130),
+        ] {
+            let result = usage(
+                entry,
+                &json!({"prompt_tokens":prompt, "completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":cached, "cache_write_tokens":written}}),
+            )
+            .unwrap();
+            assert_eq!(result["input"], expected_input);
+            assert_eq!(result["cacheRead"], expected_read);
+            assert_eq!(result["cacheWrite"], expected_write);
+            assert_eq!(result["totalTokens"], expected_total);
+        }
+    }
+
+    #[tokio::test]
     async fn configured_workers_ai_classifiers_use_cloudflare_protocol() {
         use clap::Parser;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
