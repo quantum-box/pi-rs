@@ -1650,6 +1650,12 @@ impl Agent<'_> {
                     && session.auto_compaction_control().enabled()
                     && request_index + 1 < active.limits.model_requests
                     && !overflow_recovery_attempted(session, run_id)
+                    && configured_retention(
+                        session,
+                        active.compaction_tokens(session).keep_recent_tokens,
+                        1,
+                    )
+                    .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
                 {
                     continue;
                 }
@@ -6768,6 +6774,51 @@ mod tree_tests {
                     .contains("private-fixture-secret")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn overflow_without_older_context_preserves_provider_failure() {
+        let registry = Registry::default();
+        let model = OverflowModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            always_fail: true,
+        };
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 3,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let error = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
     }
 
     struct LengthModel {
