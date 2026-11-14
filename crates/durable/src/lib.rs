@@ -30,3 +30,4 @@ pub mod task_scheduler;
 pub mod task_store;
 pub mod tool;
 pub mod transcript;
+pub mod tool_progress;

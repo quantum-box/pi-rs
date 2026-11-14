@@ -21,10 +21,19 @@ the open harness until it is reopened.
 fork, explicit compaction, durable snapshot observation, and one-pass polling
 of accepted external jobs are supported. Background workers repoll pending jobs,
 and nested calls are journaled with parent-owned identities. This is a subset of the design below,
-not complete upstream parity: lifecycle child tasks do not yet receive conversation aborts, and
-there is no durable streaming progress, historical-entry fork, automatic
-compaction, or durable timers for polling. Runtime state still stores a whole
-conversation as one JSON value. See `crates/durable/README.md` for limits.
+not complete upstream parity: tool-output progress is not automatically wired into the runtime,
+and entry-ID forks, full observer semantics, and distributed storage remain incomplete.
+The current capabilities and limits are documented in `crates/durable/README.md`.
+
+The experimental `tool_progress` API provides opt-in, bounded replacement
+partials and a scoped `ToolHost` adapter. Hosts must explicitly connect a sink,
+commit snapshots with their own lease checks, and fence completion or abort in
+their terminal transaction. A reopened store can inspect the last committed
+partial; it is display-only and is not a result or proof of replay safety.
+The scheduler, TUI, and observer log do not automatically publish these updates.
+There is no upstream-style publication cadence or automatic checkpoint timer;
+uncommitted updates may be lost. Callbacks already in flight when a scope closes
+must be fenced by the host transaction.
 
 ## Scope and compatibility
 
