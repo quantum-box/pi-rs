@@ -4253,3 +4253,17 @@ model-context text retain the original bytes.
 matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
+
+### Bedrock quota retry classification
+
+Bedrock service and stream exceptions stop agent retries when their redacted
+diagnostics contain Pi's account quota or billing exhaustion markers, even if
+AWS categorizes the exception as transient throttling. The model receives a
+fixed limit message; ordinary throttling remains retryable. Classification uses
+the existing bounded diagnostic, so markers omitted by redaction or truncation
+retain the native retry behavior. AWS SDK retries before an exception reaches
+the agent remain governed by the configured SDK policy.
+
+Pi's non-chat System One provider-level policy retries transient HTTP status
+codes including 429 without classifying the response body; native keeps that
+separate policy.

@@ -748,6 +748,51 @@ fn build_error(e: impl std::fmt::Display) -> Error {
     Error::Config(format!("invalid Bedrock request: {e}"))
 }
 
+// Pi's agent does not retry account or billing exhaustion even when a
+// provider reports it through a normally retryable service exception.
+// Classify the already redacted diagnostic and never echo the source text in
+// the permanent-limit message.
+fn permanent_bedrock_limit(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    ];
+    if MARKERS.iter().any(|marker| message.contains(marker)) {
+        return true;
+    }
+    message.match_indices("\"code\"").any(|(index, _)| {
+        let rest = message[index + 6..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            return false;
+        };
+        let rest = rest
+            .trim_start()
+            .strip_prefix('\"')
+            .unwrap_or(rest.trim_start());
+        rest.strip_prefix("1308")
+            .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+fn bedrock_service_error(message: String, retryable: bool) -> Error {
+    if retryable && permanent_bedrock_limit(&message) {
+        Error::Model("Bedrock account quota or billing limit reached".into())
+    } else if retryable {
+        Error::RetryableModel(message)
+    } else {
+        Error::Model(message)
+    }
+}
+
 fn request_error(
     e: aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
@@ -756,15 +801,11 @@ fn request_error(
 ) -> Error {
     if let Some(service) = e.as_service_error() {
         let message = diagnostic(service.meta(), service.request_id(), secrets);
-        if service.is_throttling_exception()
+        let retryable = service.is_throttling_exception()
             || service.is_model_timeout_exception()
             || service.is_service_unavailable_exception()
-            || service.is_internal_server_exception()
-        {
-            Error::RetryableModel(message)
-        } else {
-            Error::Model(message)
-        }
+            || service.is_internal_server_exception();
+        bedrock_service_error(message, retryable)
     } else {
         match &e {
                     aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
@@ -1237,7 +1278,8 @@ impl Model for Bedrock {
                         let code = if service.is_validation_exception() { Some("ValidationException") } else if service.is_throttling_exception() { Some("ThrottlingException") } else if service.is_service_unavailable_exception() { Some("ServiceUnavailableException") } else if service.is_internal_server_exception() { Some("InternalServerException") } else if service.is_model_stream_error_exception() { Some("ModelStreamErrorException") } else { None };
                         if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
                     }
-                    if service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception() { Error::RetryableModel(message) } else { Error::Model(message) }
+                    let retryable = service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception();
+                    bedrock_service_error(message, retryable)
                 } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
             })? else { break };
                 match event {
@@ -1298,6 +1340,36 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_classification_keeps_transient_and_secret_safe() {
+        for message in [
+            "Insufficient_Quota",
+            "Monthly usage limit reached",
+            "Billing issue",
+            r#"{"code":"1308"}"#,
+        ] {
+            assert!(
+                matches!(bedrock_service_error(message.into(), true), Error::Model(text) if text == "Bedrock account quota or billing limit reached")
+            );
+        }
+        for message in ["rate limit reached", r#"{"code":13080}"#] {
+            assert!(matches!(
+                bedrock_service_error(message.into(), true),
+                Error::RetryableModel(_)
+            ));
+        }
+        let metadata = aws_smithy_types::error::metadata::ErrorMetadata::builder()
+            .message("quota exceeded secret-token")
+            .build();
+        let redacted = diagnostic(&metadata, None, &["secret-token".into()]);
+        let error = bedrock_service_error(redacted, true);
+        assert!(!error.to_string().contains("secret-token"));
+        assert!(matches!(
+            bedrock_service_error("validation failed".into(), false),
+            Error::Model(_)
+        ));
+    }
+
     #[test]
     fn omitted_thinking_replays_empty_text_with_signature() {
         let replay = ProviderReplay {
