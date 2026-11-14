@@ -590,7 +590,18 @@ pub struct ExtensionCompaction {
     pub first_kept_entry: Option<u64>,
     pub tokens_before: u64,
     pub usage: Option<crate::Usage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_value"
+    )]
     pub details: Option<Value>,
+}
+
+fn deserialize_present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -2644,6 +2655,21 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compaction_details_preserve_missing_and_explicit_null() {
+        for details in [None, Some(Value::Null), Some(json!({"origin":"extension"}))] {
+            let mut wire =
+                json!({"summary":"summary","firstKeptEntry":1,"tokensBefore":2,"usage":null});
+            if let Some(value) = &details {
+                wire["details"] = value.clone();
+            }
+            let decoded: ExtensionCompaction = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.details, details);
+            let encoded = serde_json::to_value(decoded).unwrap();
+            assert_eq!(encoded.get("details"), wire.get("details"));
+        }
+    }
 
     struct InputHook(&'static str);
 
