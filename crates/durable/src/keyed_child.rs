@@ -35,6 +35,8 @@ struct Identity {
     replay_safe: bool,
     task_kind: String,
     task_version: u32,
+    initial_checkpoint: crate::task::Checkpoint,
+    restart_limit: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +111,8 @@ fn prepare(
         replay_safe: child.replay_safe(),
         task_kind: kind.into(),
         task_version: child.definition_version(),
+        initial_checkpoint: child.checkpoint().clone(),
+        restart_limit: child.restart_limit(),
     };
     let key = record_key(parent.task.id(), key);
     let parent_key = crate::task_store::key(parent.task.id());
@@ -143,6 +147,12 @@ fn prepare(
     }
     let mut batch = tasks.prepare_save(&[Save::Create(child)])?;
     batch.checks.push(parent_check);
+    // Abort and settlement discover children before committing parent updates.
+    // Advance the parent version so a traversal that missed this child retries.
+    batch.mutations.push(Mutation::Put {
+        key: crate::task_store::key(parent.task.id()),
+        value: serde_json::to_vec(&parent.task)?,
+    });
     batch.checks.push(Check {
         key: key.clone(),
         expected: Expected::Missing,
@@ -211,6 +221,7 @@ mod tests {
             admit(&db, &p, "a", "read", &json!({"x":1}), &a).unwrap(),
             a.id()
         );
+        let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
         assert_eq!(
             admit(&db, &p, "b", "read", &json!({"x":1}), &b).unwrap(),
             b.id()
@@ -252,6 +263,38 @@ mod tests {
             admit(&db, &p, "a", "read", &json!({"x":1}), &other_version),
             Err(Error::IdentityMismatch)
         ));
+        let changed_checkpoint = Task::new(
+            Uuid::from_u128(4),
+            TaskOwner::Task(p.task.id()),
+            Checkpoint {
+                phase: "other".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered_versioned("tool-task".into(), true, 1, json!({"x":1}))
+        .unwrap();
+        assert!(matches!(
+            admit(&db, &p, "a", "read", &json!({"x":1}), &changed_checkpoint),
+            Err(Error::IdentityMismatch)
+        ));
+        let changed_limit = Task::new(
+            Uuid::from_u128(4),
+            TaskOwner::Task(p.task.id()),
+            Checkpoint {
+                phase: "tool".into(),
+                data: json!({}),
+            },
+            4,
+        )
+        .unwrap()
+        .registered_versioned("tool-task".into(), true, 1, json!({"x":1}))
+        .unwrap();
+        assert!(matches!(
+            admit(&db, &p, "a", "read", &json!({"x":1}), &changed_limit),
+            Err(Error::IdentityMismatch)
+        ));
         assert_eq!(TaskStore::new(&db).list().unwrap().len(), 3);
     }
 
@@ -268,6 +311,7 @@ mod tests {
             db.commit(&second.checks, &second.mutations),
             Err(durable_store::Error::Conflict { .. })
         ));
+        let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
         assert_eq!(
             admit(&db, &p, "same", "read", &json!({}), &b).unwrap(),
             a.id()
@@ -276,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_prepared_keys_commit_without_losing_either_child() {
+    fn independent_prepared_keys_retry_after_parent_version_changes() {
         let db = Store::memory().unwrap();
         let p = parent(&db);
         let a = child(2, p.task.id(), true, json!({}));
@@ -284,7 +328,13 @@ mod tests {
         let first = prepare(&db, &p, "a", "read", &json!({}), &a).unwrap();
         let second = prepare(&db, &p, "b", "read", &json!({}), &b).unwrap();
         db.commit(&first.checks, &first.mutations).unwrap();
-        db.commit(&second.checks, &second.mutations).unwrap();
+        assert!(matches!(
+            db.commit(&second.checks, &second.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
+        assert_eq!(admit(&db, &p, "b", "read", &json!({}), &b).unwrap(), b.id());
+        let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
         assert_eq!(admit(&db, &p, "a", "read", &json!({}), &b).unwrap(), a.id());
         assert_eq!(admit(&db, &p, "b", "read", &json!({}), &a).unwrap(), b.id());
         assert_eq!(TaskStore::new(&db).list().unwrap().len(), 3);
@@ -300,6 +350,7 @@ mod tests {
                 if existing {
                     admit(&db, &p, "a", "read", &json!({}), &c).unwrap();
                 }
+                let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
                 let pending = prepare(&db, &p, "a", "read", &json!({}), &c).unwrap();
                 let tasks = TaskStore::new(&db);
                 tasks
@@ -330,6 +381,41 @@ mod tests {
     }
 
     #[test]
+    fn admission_fences_abort_snapshot_that_missed_child() {
+        let db = Store::memory().unwrap();
+        let p = parent(&db);
+        let c = child(2, p.task.id(), true, json!({}));
+        let mut abort = p.clone();
+        abort.task.request_abort().unwrap();
+        let tasks = TaskStore::new(&db);
+        let old_traversal = tasks.prepare_save(&[Save::Update(&abort)]).unwrap();
+        admit(&db, &p, "a", "read", &json!({}), &c).unwrap();
+        assert!(matches!(
+            db.commit(&old_traversal.checks, &old_traversal.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        crate::task_scheduler::request_abort_subtree(&tasks, p.task.id()).unwrap();
+        assert!(tasks.load(c.id()).unwrap().unwrap().task.abort_requested());
+    }
+
+    #[test]
+    fn admission_rejects_cycle_through_missing_ancestor() {
+        let db = Store::memory().unwrap();
+        let mut p = child(1, Uuid::from_u128(2), true, json!({}));
+        p.start().unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&p)]).unwrap();
+        let p = tasks.load(p.id()).unwrap().unwrap();
+        let c = child(2, p.task.id(), true, json!({}));
+        assert!(matches!(
+            admit(&db, &p, "a", "read", &json!({}), &c),
+            Err(Error::Task(TaskError::InvalidOwnership))
+        ));
+        assert!(db.get(&record_key(p.task.id(), "a")).unwrap().is_none());
+        assert!(tasks.load(c.id()).unwrap().is_none());
+    }
+
+    #[test]
     fn rejects_foreign_or_invalid_children_and_inconsistent_records() {
         let db = Store::memory().unwrap();
         let p = parent(&db);
@@ -356,6 +442,7 @@ mod tests {
             Err(Error::Invalid)
         ));
         admit(&db, &p, "a", "read", &json!({}), &c).unwrap();
+        let p = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
         let child_key = crate::task_store::key(c.id());
         db.commit(&[], &[Mutation::Delete { key: child_key }])
             .unwrap();
