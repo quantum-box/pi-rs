@@ -5,6 +5,7 @@
 
 pub mod compact;
 pub mod conversation;
+pub mod conversation_signal;
 pub mod extension;
 pub mod fork;
 pub mod model;

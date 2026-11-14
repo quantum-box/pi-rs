@@ -65,6 +65,10 @@ The runtime supports before-request message replacement and observes completed
 responses; hook errors and non-string after-tool replacements have limited
 reporting. Provider-body hooks, on-yield, after-tools and after-run hooks and
 their durable child tasks are not integrated. Tool sleep gates remain unsupported.
+The conversation signal inbox provides deduplicated receipts and transaction
+fragments for a future wake, but is not connected to runtime admission, phase
+persistence, scheduler rescanning, hook replay, abort, or recovery. In
+particular, it does not yet persist sleep deadlines or enable sleeping hooks.
 
 Current limits and differences from upstream Pi Durable:
 
