@@ -2177,3 +2177,114 @@ fn inherited_entry_rejects_ambiguous_and_unannotated_visible_batches() {
         .unwrap();
     assert!(h.fork_by_entry_id(child, id).is_err());
 }
+
+#[test]
+fn entry_id_fork_checks_inherited_chain_before_selecting_local_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "origin".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "inherited".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let inherited = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let child = h.fork(parent).unwrap();
+    let (mut state, version) = h.load(child).unwrap();
+    state.messages.push(Message::User {
+        content: "local".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let local = h
+        .view_positioned(child, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let local_fork = h.fork_by_entry_id(child, local).unwrap();
+    assert_eq!(h.conversation(local_fork).unwrap().messages.len(), 2);
+    let inherited_fork = h.fork_by_entry_id(child, inherited).unwrap();
+    assert_eq!(h.conversation(inherited_fork).unwrap().messages.len(), 1);
+
+    let cursor = h.conversation(child).unwrap().transcript.unwrap();
+    let transcript = crate::transcript::Transcript::new(h.owner.store(), child);
+    let page = transcript
+        .read(&cursor, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    let inherited_cursor = serde_json::to_value(page.next).unwrap();
+    let link: Uuid = serde_json::from_value(inherited_cursor["next"]["id"].clone()).unwrap();
+    let mut key = b"durable/transcript/entry/".to_vec();
+    key.extend_from_slice(link.as_bytes());
+    let original = h.owner.store().get(&key).unwrap().unwrap().value;
+    let before = serde_json::to_value(h.conversation(child).unwrap()).unwrap();
+    let mut entry: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    entry["value"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap()["ids"][0] = serde_json::to_value(local).unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_by_entry_id(child, local).is_err());
+    assert_eq!(
+        serde_json::to_value(h.conversation(child).unwrap()).unwrap(),
+        before
+    );
+    let mut entry: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let messages = entry["value"].as_object().unwrap().values().next().unwrap()["messages"].clone();
+    entry["value"] = serde_json::json!({"Append": messages});
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_by_entry_id(child, local).is_err());
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: original,
+            }],
+        )
+        .unwrap();
+    h.reset(child, Some("replacement".into())).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let fork = h.fork_by_entry_id(child, local).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages.len(), 2);
+    assert!(h.fork_by_entry_id(child, inherited).is_err());
+}

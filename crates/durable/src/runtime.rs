@@ -2025,6 +2025,7 @@ impl Harness {
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let mut cursor = crate::observer::Cursor(0);
         let mut last_reference = None;
+        let mut local_match = None;
         loop {
             let page = observer.read(cursor, std::num::NonZeroUsize::new(128).unwrap())?;
             for record in &page.records {
@@ -2047,20 +2048,23 @@ impl Harness {
                 let Some((ids, commit, origin)) = metadata else {
                     continue;
                 };
-                if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
-                    if origin != id {
-                        continue;
-                    }
-                    if commit != record.cursor.0 {
-                        return Err(crate::fork::Error::InvalidSnapshot.into());
-                    }
-                    return self.fork_at_position(
-                        id,
-                        ViewCursor {
+                if origin == id {
+                    let mut matches = ids
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| **candidate == entry_id);
+                    if let Some((index, _)) = matches.next() {
+                        if matches.next().is_some()
+                            || local_match.is_some()
+                            || commit != record.cursor.0
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        local_match = Some(ViewCursor {
                             cursor: reference,
                             remaining: Some(index + 1),
-                        },
-                    );
+                        });
+                    }
                 }
             }
             if !page.has_more {
@@ -2071,11 +2075,10 @@ impl Harness {
         // Inherited identities are valid only while their immutable batch is
         // reachable from the child's captured head, up to its replacement base.
         let (state, _) = self.load(id)?;
-        let Some(mut position) = state.transcript else {
-            return Err(crate::fork::Error::InvalidCursor.into());
-        };
+        let mut next_position = state.transcript;
         let mut found = None;
-        loop {
+        while let Some(current) = next_position {
+            let position = current;
             let page = transcript.read(&position, std::num::NonZeroUsize::MIN)?;
             let Some(batch) = page.records.first() else {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
@@ -2085,22 +2088,36 @@ impl Harness {
             let Some((ids, _commit, origin)) = metadata else {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             };
-            if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
-                if origin == id || found.is_some() {
+            let mut matches = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| **candidate == entry_id);
+            if let Some((index, _)) = matches.next() {
+                if matches.next().is_some() {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
-                // Rebind only the cursor's owner; fork_at_position independently
-                // proves that this exact immutable link belongs to the origin's
-                // recorded observation at the metadata commit.
-                let mut cursor = serde_json::to_value(&position)?;
-                cursor["transcript"] = serde_json::to_value(origin)?;
-                found = Some((
-                    origin,
-                    ViewCursor {
-                        cursor: serde_json::from_value(cursor)?,
-                        remaining: Some(index + 1),
-                    },
-                ));
+                if origin == id {
+                    if local_match.as_ref().is_none_or(|local| {
+                        local.cursor != position || local.remaining != Some(index + 1)
+                    }) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                } else {
+                    if local_match.is_some() || found.is_some() {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    // Rebind only the cursor's owner; fork_at_position independently
+                    // proves the link belongs to the origin's recorded observation.
+                    let mut cursor = serde_json::to_value(&position)?;
+                    cursor["transcript"] = serde_json::to_value(origin)?;
+                    found = Some((
+                        origin,
+                        ViewCursor {
+                            cursor: serde_json::from_value(cursor)?,
+                            remaining: Some(index + 1),
+                        },
+                    ));
+                }
             }
             if base {
                 break;
@@ -2108,11 +2125,12 @@ impl Harness {
             if !page.has_more {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
-            position = page.next;
+            next_position = Some(page.next);
         }
-        match found {
-            Some((origin, position)) => self.fork_at_position(origin, position),
-            None => Err(crate::fork::Error::InvalidCursor.into()),
+        match (local_match, found) {
+            (Some(position), None) => self.fork_at_position(id, position),
+            (None, Some((origin, position))) => self.fork_at_position(origin, position),
+            _ => Err(crate::fork::Error::InvalidCursor.into()),
         }
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
