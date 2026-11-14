@@ -137,6 +137,7 @@ pub enum ManualCompactionStatus {
     Declined,
     Aborted,
     RestartLimit,
+    Stale,
 }
 
 /// An operation ID is stable across summary attempts and process recovery.
@@ -262,6 +263,10 @@ enum Phase {
     CompactionAccounting {
         result: Box<crate::compact::CompactionResult>,
         request_id: Uuid,
+    },
+    /// A completed, accounted summary awaiting an atomic placement decision.
+    CompactionPlacement {
+        result: Box<crate::compact::CompactionResult>,
     },
     Accounting {
         turns: u32,
@@ -4502,14 +4507,9 @@ impl Harness {
                                 usage: None,
                                 metadata: Default::default(),
                             })?;
-                            c.messages =
-                                result.apply_in_context(&c.messages, c.context_generation)?;
-                            c.context_generation = Some(Uuid::new_v4());
-                            finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
-                            c.phase = c
-                                .compaction_return_turns
-                                .take()
-                                .map_or(Phase::Idle, |turns| Phase::ModelReady { turns });
+                            c.phase = Phase::CompactionPlacement {
+                                result: Box::new(result),
+                            };
                         }
                     }
                     self.save(&c, Expected::Version(version))?;
@@ -4604,14 +4604,33 @@ impl Harness {
                             Err(_) => { self.failed = true; return Err(Error::Interrupted); }
                         }
                     }
-                    c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
-                    c.context_generation = Some(Uuid::new_v4());
-                    finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
+                    c.phase = Phase::CompactionPlacement { result };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::CompactionPlacement { result } => {
+                    if c.active_manual_compaction.is_some()
+                        && result.is_stale(&c.messages, c.context_generation)
+                    {
+                        finish_manual_compaction(&mut c, ManualCompactionStatus::Stale)?;
+                    } else {
+                        c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
+                        c.context_generation = Some(Uuid::new_v4());
+                        finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
+                    }
                     c.phase = c
                         .compaction_return_turns
                         .take()
                         .map_or(Phase::Idle, |turns| Phase::ModelReady { turns });
-                    self.save(&c, Expected::Version(version))?;
+                    // Placement must be decided again if an admission or abort
+                    // commits after this snapshot, never merged over it.
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let saved = self.save(&c, Expected::Version(version));
+                    self.merge_admissions = merge;
+                    match saved {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
                 }
                 Phase::ModelReady { turns } => {
                     if !matches!(
@@ -7758,6 +7777,188 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+    fn placement_model() -> Arc<GatedModel> {
+        Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        })
+    }
+    fn prepare_manual_placement(h: &mut Harness) -> (Uuid, Uuid) {
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        c.messages = vec![
+            Message::User {
+                content: "old".into(),
+            },
+            Message::User {
+                content: "new".into(),
+            },
+        ];
+        h.save(&c, Expected::Version(version)).unwrap();
+        let operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let Phase::CompactionHook { preparation, .. } = c.phase else {
+            panic!("missing preparation")
+        };
+        let result = preparation
+            .finish(CompletedGeneration {
+                content: "checkpoint".into(),
+                calls: vec![],
+                usage: None,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        c.phase = Phase::CompactionPlacement {
+            result: Box::new(result),
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        (id, operation)
+    }
+    #[test]
+    fn manual_placement_process_child() {
+        let Ok(path) = std::env::var("PI_TEST_PLACEMENT_DB") else {
+            return;
+        };
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let (id, operation) = prepare_manual_placement(&mut h);
+        std::fs::write(format!("{path}.ready"), format!("{id} {operation}")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    #[tokio::test]
+    async fn manual_placement_survives_process_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = dir.path().join("db.ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::scheduler_tests::manual_placement_process_child",
+            ])
+            .env("PI_TEST_PLACEMENT_DB", &path)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not commit placement")
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let ids = std::fs::read_to_string(ready).unwrap();
+        let mut ids = ids
+            .split_whitespace()
+            .map(|id| Uuid::parse_str(id).unwrap());
+        let id = ids.next().unwrap();
+        let operation = ids.next().unwrap();
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Applied
+            }
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content.contains("checkpoint")))
+        );
+    }
+    #[tokio::test]
+    async fn manual_placement_settles_stale_or_abort_after_reopen() {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (id, operation);
+            {
+                let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+                (id, operation) = prepare_manual_placement(&mut h);
+                if abort {
+                    h.request_abort(id).unwrap();
+                } else {
+                    let (mut c, version) = h.load(id).unwrap();
+                    let old = c.messages.clone();
+                    place_reset(&mut c, crate::reset::Reset::new(Uuid::new_v4(), None));
+                    c.messages = old;
+                    h.save(&c, Expected::Version(version)).unwrap();
+                }
+            }
+            let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            h.resume(&CancellationToken::new()).await.unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(
+                c.manual_compactions[0],
+                ManualCompaction {
+                    id: operation,
+                    status: if abort {
+                        ManualCompactionStatus::Aborted
+                    } else {
+                        ManualCompactionStatus::Stale
+                    }
+                }
+            );
+            assert_eq!(
+                c.messages,
+                vec![
+                    Message::User {
+                        content: "old".into()
+                    },
+                    Message::User {
+                        content: "new".into()
+                    }
+                ]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn manual_placement_conflicts_with_concurrent_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let (id, operation) = prepare_manual_placement(&mut h);
+        let (mut candidate, version) = h.load(id).unwrap();
+        let Phase::CompactionPlacement { result } = candidate.phase.clone() else {
+            panic!("missing placement")
+        };
+        candidate.messages = result
+            .apply_in_context(&candidate.messages, candidate.context_generation)
+            .unwrap();
+        candidate.context_generation = Some(Uuid::new_v4());
+        finish_manual_compaction(&mut candidate, ManualCompactionStatus::Applied).unwrap();
+        candidate.phase = Phase::Idle;
+        let prepared = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        h.request_abort(id).unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(prepared),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Aborted
+            }
+        );
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content.contains("checkpoint")))
+        );
     }
     #[test]
     fn compact_context_identity_survives_reopen_and_rejects_reset_aba() {

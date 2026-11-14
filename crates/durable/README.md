@@ -545,7 +545,7 @@ optional manual instructions for the summary request and hook, including across
 recovery; `request_compaction` remains the instruction-free convenience API.
 `request_manual_compaction` returns an operation ID, or `None` when there is
 nothing to compact. Its `manual_compactions` record survives reopen and records
-whether the operation is running, applied, declined, aborted, or stopped at the
+whether the operation is running, applied, declined, stale, aborted, or stopped at the
 restart limit. The same ID is used for the hook across recovery; each model
 attempt has its own request ID. Records are not inherited by forks and currently
 grow without retention. Failures requiring reopen leave the operation running
@@ -553,6 +553,12 @@ until recovery or abort resolves it. This remains an idle-only conversation
 phase, not a separately scheduled upstream task. Admission also rejects an
 idle conversation with an unsettled abort, so that an earlier abort cannot
 cancel a newly accepted operation.
+After hook-supplied or accounted model output, the completed summary is
+persisted before placement. Placement atomically applies the result or settles
+the operation stale if its context generation or source prefix changed; an
+abort committed first settles it aborted. The stale check is conservative,
+not upstream's retained-entry head test: it can reject a cut that upstream
+would still accept after a preceding compaction.
 Runtime-owned preparations also pin the context generation; a reset or another
 applied compaction invalidates the pinned generation even if message text later
 matches. Legacy in-flight preparations without a generation can finish while

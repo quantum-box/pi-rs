@@ -215,6 +215,12 @@ impl Preparation {
 }
 
 impl CompactionResult {
+    /// A conservative check for a displaced selection. The host must compare
+    /// and commit the settlement in the same transaction as any context edit.
+    pub(crate) fn is_stale(&self, current: &[Message], generation: Option<Uuid>) -> bool {
+        self.preparation.context_generation != generation
+            || !current.starts_with(&self.preparation.source)
+    }
     /// Check the durable context identity as well as the message snapshot.
     /// A legacy preparation is valid only while the context is also legacy.
     pub(crate) fn apply_in_context(
