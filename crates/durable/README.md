@@ -189,3 +189,26 @@ that kind at the next eligible boundary. Post-tool boundaries select steers;
 final boundaries select both kinds in admission order, after queued resets
 and writes. Changes made during a run apply at the next boundary. Forks retain
 the selections.
+
+### Opt-in local coding tools
+
+Enable the `coding-tools` feature and pass
+`pi_rs_durable::coding_tools::local(workspace)?` as `Options::tools` (or extend
+that list) to register the workbench's `read`, `write`, `edit`, and `bash`.
+The directory must already exist. This is the local workbench profile: paths
+and shell commands can access resources outside the directory; it is not a
+sandbox. Supply authorization and isolation appropriate for the host.
+
+All four registrations default to `ReplayPolicy::Unsafe`, as in upstream's
+coding tools. A committed result is reused, but an interrupted dispatch may
+have partially run. The configured uncertain policy returns an interruption or
+requires host reconciliation. Cancellation or timeout cannot prove that a
+mutation or command did not happen. A host should change a replay policy only
+when it can establish that replay is safe for every call to that registration.
+
+The adapter uses pi-rs workbench schemas, output, image handling, shell and
+mutation behavior, which are not identical to upstream Durable's environment,
+structured outputs, diagnostics, streaming and file mutation queue. It does
+not install tools automatically, provide an environment abstraction, or add
+exactly-once execution. The optional dependency pulls in the workbench and its
+dependencies.

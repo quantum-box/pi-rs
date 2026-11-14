@@ -2251,6 +2251,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "pi-rs-core",
+ "pi-rs-workbench",
  "serde",
  "serde_json",
  "tempfile",

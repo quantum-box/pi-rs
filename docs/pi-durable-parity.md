@@ -1,5 +1,7 @@
 # Pi Durable compatibility inventory
 
+**Coding tools checkpoint:** The opt-in `coding-tools` feature registers the existing workbench local `read`, `write`, `edit`, and `bash` tools with unsafe replay policies. This is not a sandbox or an upstream environment adapter; schemas, structured results, streaming, diagnostics, image behavior, and file mutation serialization retain workbench behavior. Interrupted effects need interruption handling or reconciliation. Upstream reference: `packages/durable/src/tools` and `packages/durable/src/harness/tool.ts` at commit `3035f08d06c3054f99b6226ea1ad22353c49fc12`.
+
 This is an audit, not an implementation plan or a claim of complete compatibility.
 Compared 2026-11-14: upstream [`earendil-works/pi` 827383a15262905f82e418483825a49dbb1adbf5](https://github.com/earendil-works/pi/tree/827383a15262905f82e418483825a49dbb1adbf5/packages/durable) (the fetched upstream HEAD) with pi-rs `4ab1c4f442698d8b3888e603f6675e808d36fa16`. All pi-rs paths below refer to that commit. The experimental `pi-rs-durable` runtime is independent of the existing CLI, RPC, TUI and session journal; none is automatically backed by it ([README](../crates/durable/README.md)). A helper or a state type alone does not imply scheduler or user-facing support. This is an evidence-based inventory, not an exhaustive API or wire-format equivalence test.
 
