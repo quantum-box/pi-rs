@@ -7890,8 +7890,17 @@ mod tests {
             drop(editor);
             let mut restored: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
+            // Darwin sets PENDIN internally when canonical input is restored;
+            // it is a pending-input state bit, not an editor terminal setting.
+            #[cfg(target_vendor = "apple")]
+            let (restored_flags, baseline_flags) = (
+                restored.c_lflag & !libc::PENDIN,
+                baseline.c_lflag & !libc::PENDIN,
+            );
+            #[cfg(not(target_vendor = "apple"))]
+            let (restored_flags, baseline_flags) = (restored.c_lflag, baseline.c_lflag);
             assert_eq!(
-                restored.c_lflag, baseline.c_lflag,
+                restored_flags, baseline_flags,
                 "terminal local flags were not restored"
             );
             assert_eq!(
