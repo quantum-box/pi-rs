@@ -8076,6 +8076,71 @@ mod tests {
             "package must actually be prepared"
         );
 
+        // Simulate an index written before package.json themes were supported.
+        // It may also contain native resources that the Pi manifest excludes.
+        let mut old_index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+        let cached = old_index
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .find(|entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|source| std::fs::canonicalize(source).ok())
+                    == std::fs::canonicalize(&pi_source).ok()
+            })
+            .unwrap();
+        cached["resources"]["themes"] = serde_json::json!([]);
+        cached["resources"]["extensions"] = serde_json::json!([extension]);
+        let old_index = old_index.to_string();
+        std::fs::write(&index, &old_index).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert_eq!(
+            resources.themes,
+            vec![pi_source.join("assets/visual.json").canonicalize().unwrap()]
+        );
+        assert!(resources.extensions.is_empty());
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(!sentinel.exists());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":pi_source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            super::super::packages::resources(&args)
+                .unwrap()
+                .themes
+                .is_empty()
+        );
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+
+        // The higher-priority Pi manifest must not hide an unusable Cargo file.
+        std::fs::write(
+            pi_source.join("pi-package.json"),
+            r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(pi_source.join("Cargo.toml"), "[invalid").unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert!(resources.themes.is_empty() && resources.extensions.is_empty());
+        assert!(!sentinel.exists());
+        std::fs::remove_file(pi_source.join("Cargo.toml")).unwrap();
+        std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+
         // Present but malformed or unreadable manifests must never be treated
         // as absent and trigger conventional executable discovery.
         for case in ["malformed", "unreadable", "invalid-pi", "invalid-root"] {

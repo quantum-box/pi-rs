@@ -206,7 +206,34 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
         let Some(package) = installed.get(&key(&declaration.source)) else {
             continue;
         };
-        let package: Installed = serde_json::from_value(package.clone())?;
+        let mut package: Installed = serde_json::from_value(package.clone())?;
+        if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
+            if !Path::new(&declaration.source).is_dir() {
+                continue;
+            }
+            let Ok((manifest, pi_package)) = local_startup_manifest(&package.root) else {
+                continue;
+            };
+            let pi = manifest
+                .get("pi")
+                .filter(|value| value.is_object())
+                .unwrap_or(&manifest);
+            let Ok(themes) = collect_package_themes(&package.root, pi) else {
+                continue;
+            };
+            package.resources.themes = themes;
+            // Older indexes did not understand package.json and could have
+            // discovered native resources that its explicit Pi manifest excludes.
+            if pi_package
+                && ["extensions", "skills", "prompts", "themes"]
+                    .iter()
+                    .any(|name| pi.get(name).is_some())
+            {
+                package.resources.extensions.clear();
+                package.resources.skills.clear();
+                package.resources.prompts.clear();
+            }
+        }
         for (name, paths, target) in [
             (
                 "extensions",
@@ -245,15 +272,13 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
         .into_iter()
         .filter(|entry| entry.transient == transient)
     {
-        let package = if let Some(value) = installed.get(&key(&declaration.source)) {
-            serde_json::from_value::<Installed>(value.clone())?
-        } else if !remote(&declaration.source) {
+        let package = if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
             let root = PathBuf::from(&declaration.source);
             if !root.is_dir() {
                 continue;
             }
             let manifest = match local_startup_manifest(&root) {
-                Ok(manifest) => manifest,
+                Ok((manifest, _)) => manifest,
                 Err(_) => continue,
             };
             let pi = manifest
@@ -274,6 +299,8 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
                 version: None,
                 resources,
             }
+        } else if let Some(value) = installed.get(&key(&declaration.source)) {
+            serde_json::from_value::<Installed>(value.clone())?
         } else {
             continue;
         };
@@ -415,22 +442,34 @@ fn read_optional_manifest_after_probe(
 }
 
 // Mirror installation precedence without running Cargo or loading executables.
-fn local_startup_manifest(root: &Path) -> Result<Value> {
-    if let Some(bytes) = read_optional_manifest(root, "pi-package.json")? {
-        return parse_manifest_object(&root.join("pi-package.json"), &bytes, false);
-    }
-    if let Some(bytes) = read_optional_manifest(root, "Cargo.toml")? {
+fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
+    let pi_bytes = read_optional_manifest(root, "pi-package.json")?;
+    let cargo_bytes = read_optional_manifest(root, "Cargo.toml")?;
+    let cargo_manifest = if let Some(bytes) = cargo_bytes {
         let text = std::str::from_utf8(&bytes)
             .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
         let manifest: toml::Value = toml::from_str(text)
             .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        Some(manifest)
+    } else {
+        None
+    };
+    if let Some(bytes) = pi_bytes {
+        return Ok((
+            parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?,
+            false,
+        ));
+    }
+    if let Some(manifest) = cargo_manifest {
         let metadata = manifest
             .get("package")
             .and_then(|value| value.get("metadata"))
             .and_then(|value| value.get("pi"));
-        return Ok(json!({"pi": metadata}));
+        return Ok((json!({"pi": metadata}), false));
     }
-    Ok(read_optional_pi_package_json(root)?.unwrap_or_else(|| json!({})))
+    let manifest = read_optional_pi_package_json(root)?;
+    let pi_package = manifest.is_some();
+    Ok((manifest.unwrap_or_else(|| json!({})), pi_package))
 }
 
 // A present manifest is authoritative, including broken links or devices.
@@ -1797,7 +1836,7 @@ mod tests {
         std::fs::write(&theme, "{}").unwrap();
         assert!(read_optional_pi_package_json(root).unwrap().is_none());
         assert_eq!(
-            collect_package_themes(root, &local_startup_manifest(root).unwrap()).unwrap(),
+            collect_package_themes(root, &local_startup_manifest(root).unwrap().0).unwrap(),
             [theme]
         );
         for name in ["package.json", "pi-package.json", "Cargo.toml"] {
@@ -1882,6 +1921,40 @@ mod tests {
         )
         .unwrap();
         assert!(read_optional_pi_package_json(directory.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_manifest_does_not_hide_unusable_cargo_manifest() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("pi-package.json"), r#"{"pi":{"themes":[]}}"#).unwrap();
+        let cargo = root.join("Cargo.toml");
+        std::os::unix::fs::symlink(root.join("missing"), &cargo).unwrap();
+        assert!(local_startup_manifest(root).is_err());
+        std::fs::remove_file(&cargo).unwrap();
+        let name = std::ffi::CString::new(cargo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let root = root.to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(local_startup_manifest(&root));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cargo);
+        }
+        assert!(
+            result
+                .expect("Cargo FIFO blocked manifest inspection")
+                .is_err()
+        );
+        worker.join().unwrap();
     }
 
     #[test]

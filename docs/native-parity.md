@@ -684,6 +684,11 @@ before settings change. User and trusted-project declarations support resource
 filters. Packaged extensions, skills, prompts and themes load through the
 normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
 outside the requested native Rust equivalence.
+Local package theme manifests are read again when resources are resolved, so
+packages indexed by older versions gain their declared themes without a build.
+An explicit Pi `package.json` resource list contributes themes only and prevents
+previously cached native resources from being loaded. Unreadable local manifests
+are skipped instead of falling back to cached resources.
 
 ### System prompt checkpoint
 
