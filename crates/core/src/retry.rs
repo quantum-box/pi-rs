@@ -123,10 +123,14 @@ fn should_mask_provider_secret(secret: &str) -> bool {
     // A short header may be only a fragment of a longer matching expression
     // (for example `rate` within `rate limit`). Derive literal fragments from
     // the actual matcher so masking cannot remove those fragments either.
-    let matcher_fragment = transient_pattern()
-        .as_str()
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|part| !part.is_empty() && part.contains(&lower));
+    let words = lower.split(|c: char| !c.is_ascii_alphanumeric());
+    let matcher_fragment = words.clone().any(|word| !word.is_empty())
+        && words.filter(|word| !word.is_empty()).all(|word| {
+            transient_pattern()
+                .as_str()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|part| !part.is_empty() && part.contains(word))
+        });
     if transient_header_expression(&lower) || matcher_fragment {
         return false;
     }
@@ -753,6 +757,8 @@ mod quota_tests {
             "timeout",
             "service-is-unavailable",
             "rate:limit",
+            "rate:",
+            "http/2",
             "rate",
             "service",
         ] {
@@ -816,6 +822,22 @@ mod quota_tests {
             serde_json::json!({"error":{"message":"rate limit sk-provider-billing-secret"}});
         assert!(!permanent_provider_error(&value, &secrets));
         assert!(retryable_provider_error(&value, &secrets));
+    }
+
+    #[test]
+    fn partial_transient_headers_do_not_hide_errors_or_expose_credentials() {
+        let secrets = provider_error_secrets(
+            Some("sk-billing-timeout-secret"),
+            ["rate:", "http/2"].into_iter(),
+        );
+        for message in ["rate:limit", "http/2 stream failed"] {
+            let value = serde_json::json!({"error":{"message": format!("{message} sk-billing-timeout-secret")}});
+            assert!(retryable_provider_error(&value, &secrets), "{message}");
+            assert!(!permanent_provider_error(&value, &secrets), "{message}");
+        }
+        let echo = serde_json::json!("sk-billing-timeout-secret");
+        assert!(!permanent_provider_error(&echo, &secrets));
+        assert!(!retryable_provider_error(&echo, &secrets));
     }
 
     #[test]

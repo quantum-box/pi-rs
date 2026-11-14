@@ -666,6 +666,12 @@ mod tests {
                 true,
             ),
             ("rate---limit", false, false),
+            ("rate:limit sk-billing-timeout-secret", false, true),
+            (
+                "http/2 stream failed sk-billing-timeout-secret",
+                false,
+                true,
+            ),
             ("service-is-unavailable", false, true),
             ("sk-header-billing-timeout-secret", false, false),
             ("sk-billing-timeout-secret", false, false),
@@ -700,6 +706,8 @@ mod tests {
                     "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
                 );
                 headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers.insert("x-rate", "rate:".parse().unwrap());
+                headers.insert("x-proto", "http/2".parse().unwrap());
                 headers
             });
             let request = ModelRequest {
