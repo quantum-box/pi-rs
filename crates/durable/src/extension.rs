@@ -1,6 +1,13 @@
 //! Independent extension resolution and hook execution. Nothing here schedules
 //! work or persists state; a host must commit memo writes before returning.
-use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    collections::HashSet,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -13,6 +20,82 @@ use serde_json::Value;
 pub trait Memo: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Value>, String>;
     async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String>;
+}
+
+/// Durable first-writer-wins values scoped to one stable task identity.
+/// A failed store operation poisons all memo handles sharing the runtime's
+/// failure flag, because a failed commit may nevertheless have committed.
+pub struct DurableMemo {
+    owner: Arc<durable_store::owner::OwnedStore>,
+    task: uuid::Uuid,
+    failed: Arc<AtomicBool>,
+}
+
+impl DurableMemo {
+    pub(crate) fn new(
+        owner: Arc<durable_store::owner::OwnedStore>,
+        task: uuid::Uuid,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            owner,
+            task,
+            failed,
+        }
+    }
+
+    fn key(&self, key: &str) -> Vec<u8> {
+        let mut result = format!("runtime/extension-memo/{}/", self.task).into_bytes();
+        result.extend_from_slice(key.as_bytes());
+        result
+    }
+
+    fn read(&self, key: &[u8]) -> Result<Option<Value>, String> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err("store failed; reopen before using memo".into());
+        }
+        let entry = self.owner.store().get(key).map_err(|e| {
+            self.failed.store(true, Ordering::Release);
+            e.to_string()
+        })?;
+        entry
+            .map(|e| serde_json::from_slice(&e.value).map_err(|e| e.to_string()))
+            .transpose()
+    }
+}
+
+#[async_trait]
+impl Memo for DurableMemo {
+    async fn get(&self, key: &str) -> Result<Option<Value>, String> {
+        self.read(&self.key(key))
+    }
+
+    async fn get_or_insert(&self, key: &str, value: Value) -> Result<Value, String> {
+        let key = self.key(key);
+        if let Some(existing) = self.read(&key)? {
+            return Ok(existing);
+        }
+        let encoded = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        match self.owner.store().commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key: key.clone(),
+                value: encoded,
+            }],
+        ) {
+            Ok(()) => Ok(value),
+            Err(durable_store::Error::Conflict { .. }) => self
+                .read(&key)?
+                .ok_or_else(|| "memo disappeared after conflict".into()),
+            Err(error) => {
+                self.failed.store(true, Ordering::Release);
+                Err(error.to_string())
+            }
+        }
+    }
 }
 
 /// Committed data and durable task-scoped memo access supplied by the host.

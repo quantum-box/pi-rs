@@ -311,6 +311,15 @@ impl Harness {
         }
         Ok(self.owner.store())
     }
+    /// Obtain memo storage for a stable task identity. Entries survive reopen.
+    pub fn extension_memo(&self, task: Uuid) -> Result<crate::extension::DurableMemo, Error> {
+        self.subagent_store()?;
+        Ok(crate::extension::DurableMemo::new(
+            self.owner.clone(),
+            task,
+            self.storage_failed.clone(),
+        ))
+    }
     pub(crate) fn subagent_storage_failed(&mut self) {
         self.failed = true;
         self.storage_failed.store(true, Ordering::Release);
