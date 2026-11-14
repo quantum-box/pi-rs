@@ -553,7 +553,7 @@ static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_ne
 const SYNTAX_ROLES: &[(&str, &str)] = &[
     ("comment, punctuation.definition.comment", "syntaxComment"),
     (
-        "keyword, storage.modifier, storage.type.function",
+        "keyword, storage.modifier, storage.type.function, storage.type.js",
         "syntaxKeyword",
     ),
     ("entity.name.function, support.function", "syntaxFunction"),
@@ -1034,7 +1034,13 @@ fn markdown_at_depth(
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                previous_paragraph_end = None;
+                if lists.is_empty()
+                    && let Some(end) = previous_paragraph_end.take()
+                    && end <= range.start
+                    && text[end..range.start].trim().is_empty()
+                {
+                    lines.push(Line::default());
+                }
                 code = Some(match kind {
                     CodeBlockKind::Fenced(language) => {
                         language.split_whitespace().next().unwrap_or("").to_owned()
@@ -1065,14 +1071,32 @@ fn markdown_at_depth(
                         )],
                         width,
                     ));
-                    let syntax = SYNTAXES.find_syntax_by_token(&language);
+                    // Syntect's bundled grammars omit TypeScript and TSX. Use
+                    // its JavaScript grammar for their shared syntax.
+                    let syntax_language = if matches!(
+                        language.to_ascii_lowercase().as_str(),
+                        "ts" | "typescript" | "tsx"
+                    ) {
+                        "javascript"
+                    } else {
+                        &language
+                    };
+                    let syntax = SYNTAXES.find_syntax_by_token(syntax_language);
                     let mut highlighter =
                         syntax.map(|syntax| HighlightLines::new(syntax, &SYNTAX_THEME));
-                    for line in code_text.lines() {
+                    for line in code_text.split_inclusive('\n') {
+                        let display_line = line.strip_suffix('\n').unwrap_or(line);
+                        let terminated;
+                        let input = if line.ends_with('\n') {
+                            line
+                        } else {
+                            terminated = format!("{line}\n");
+                            &terminated
+                        };
                         let pieces = highlighter
                             .as_mut()
                             .and_then(|highlighter| {
-                                highlighter.highlight_line(line, &SYNTAXES).ok()
+                                highlighter.highlight_line(input, &SYNTAXES).ok()
                             })
                             .map(|pieces| {
                                 pieces
@@ -1082,11 +1106,17 @@ fn markdown_at_depth(
                                             .checked_sub(1)
                                             .and_then(|index| SYNTAX_ROLES.get(index))
                                             .map_or("text", |(_, role)| *role);
-                                        Span::themed(text, theme, role)
+                                        Span::themed(
+                                            text.strip_suffix('\n').unwrap_or(text),
+                                            theme,
+                                            role,
+                                        )
                                     })
                                     .collect::<Vec<_>>()
                             })
-                            .unwrap_or_else(|| vec![Span::themed(line, theme, "mdCodeBlock")]);
+                            .unwrap_or_else(|| {
+                                vec![Span::themed(display_line, theme, "mdCodeBlock")]
+                            });
                         let indent = width.saturating_sub(1).min(2);
                         for mut line in wrap(&pieces, width.saturating_sub(indent)) {
                             line.spans
@@ -1338,6 +1368,76 @@ mod tests {
         }
         let lines = markdown("```\ncode\n```", &Theme::system(), 80);
         assert_eq!(lines.len(), 3);
+        for source in [
+            "hello this is text\n```\ncode block\n```\nmore text",
+            "hello this is text\n\n```\ncode block\n```\n\nmore text",
+        ] {
+            let lines: Vec<String> = markdown(source, &Theme::system(), 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    "hello this is text",
+                    "",
+                    "```",
+                    "  code block",
+                    "```",
+                    "",
+                    "more text"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_code_preserves_line_states_and_typescript_fallback() {
+        let mut definition: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        definition["name"] = "custom".into();
+        definition["colors"]["syntaxKeyword"] = "#123456".into();
+        definition["colors"]["syntaxComment"] = "#654321".into();
+        definition["colors"]["mdCodeBlock"] = "#abcdef".into();
+        let theme = Theme::parse(&definition.to_string(), None).unwrap();
+        for language in ["javascript", "ts", "typescript", "tsx", "TypeScript"] {
+            let source = format!(
+                "```{language}\n// comment\nconst value = 1;\n\nconst jsx = <div>ok</div>;\n```"
+            );
+            let lines = markdown(&source, &theme, 80);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                spans.iter().any(|span| span.text.contains("comment")
+                    && span.color == theme.color("syntaxComment")),
+                "{language}"
+            );
+            assert!(
+                spans.iter().any(|span| span.text.contains("const")
+                    && span.color == theme.color("syntaxKeyword")),
+                "{language}: {spans:?}"
+            );
+            let rendered: Vec<String> = lines
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(
+                rendered,
+                [
+                    format!("```{language}"),
+                    "  // comment".into(),
+                    "  const value = 1;".into(),
+                    "  ".into(),
+                    "  const jsx = <div>ok</div>;".into(),
+                    "```".into()
+                ]
+            );
+        }
+        let lines = markdown(
+            "```python\n# comment\ndef hello():\n    pass\n```",
+            &theme,
+            80,
+        );
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| span.text.contains("def") && span.color == theme.color("syntaxKeyword")));
     }
     #[test]
     fn fenced_code_uses_active_theme_roles_and_plain_fallback() {
