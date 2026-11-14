@@ -784,13 +784,32 @@ impl Client {
                 }
                 Self::Anthropic(client)
             }
-            Self::Google(client) => Self::Google(
-                client
-                    .with_thinking(thinking)
-                    .with_thinking_budget_settings(
-                        args.settings.value().get("thinkingBudgets").cloned(),
-                    ),
-            ),
+            Self::Google(client) => {
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let mapped = thinking
+                    .filter(|level| *level != "off")
+                    .and_then(|level| {
+                        metadata
+                            .as_ref()
+                            .and_then(|model| model.mapped_effort(level))
+                            .flatten()
+                    })
+                    .map(str::to_ascii_lowercase);
+                if let Some(value) = &mapped
+                    && !matches!(value.as_str(), "minimal" | "low" | "medium" | "high")
+                {
+                    return Err(Error::Config(format!(
+                        "unsupported Google thinking level mapping {value:?}"
+                    )));
+                }
+                Self::Google(
+                    client
+                        .with_thinking(mapped.as_deref().or(thinking))
+                        .with_thinking_budget_settings(
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        ),
+                )
+            }
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -1065,6 +1084,101 @@ mod estimation_tests {
                 .with_thinking(Some("high")),
         );
         assert_eq!(reset.context_identity(), expected.context_identity());
+    }
+
+    #[tokio::test]
+    async fn google_mapped_levels_select_the_resolved_budget_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".pi")).unwrap();
+        std::fs::write(
+            workspace.path().join(".pi/settings.json"),
+            r#"{"thinkingBudgets":{"high":9000,"low":1234}}"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = position + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[end..end + length]).unwrap();
+            let response = "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            body
+        });
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = Provider::Google;
+        args.model = "gemini-2.5-flash".into();
+        args.thinking = Some("high".into());
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-2.5-flash":{"thinkingLevelMap":{"high":"LOW","max":"high"}}}}}})).unwrap();
+        let metadata = args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .unwrap();
+        assert!(
+            metadata
+                .levels(Adapter::Google)
+                .unwrap()
+                .contains(&"max".to_owned())
+        );
+        let base = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "fixture")
+                .unwrap()
+                .with_context_probe(false),
+        );
+        let mapped = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "fixture")
+                .unwrap()
+                .with_context_probe(false)
+                .with_thinking(Some("low"))
+                .with_thinking_budget_settings(Some(json!({"high":9000,"low":1234}))),
+        );
+        assert_eq!(mapped.context_identity(), expected.context_identity());
+        let request = ModelRequest {
+            model: args.model.clone(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 256,
+        };
+        let _stream = mapped.stream(request).await.unwrap();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget":1234,"includeThoughts":true})
+        );
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-2.5-flash":{"thinkingLevelMap":{"high":"extreme"}}}}}})).unwrap();
+        assert!(base.with_model_options(&args, false).is_err());
     }
 
     #[cfg(any(unix, windows))]

@@ -409,7 +409,7 @@ fn thinking_config(id: &str, level: Option<&str>) -> Option<Value> {
             let native = if high {
                 "HIGH"
             } else if family == ThinkingFamily::LevelPro {
-                "LOW"
+                if level == "medium" { "MEDIUM" } else { "LOW" }
             } else {
                 match level {
                     "off" | "minimal" => "MINIMAL",
@@ -1507,6 +1507,10 @@ mod tests {
             Some(json!({"thinkingLevel":"LOW","includeThoughts":true}))
         );
         assert_eq!(
+            thinking_config("gemini-3.1-pro", Some("medium")),
+            Some(json!({"thinkingLevel":"MEDIUM","includeThoughts":true}))
+        );
+        assert_eq!(
             thinking_config("gemini-2.5-flash-lite", Some("off")),
             Some(json!({"thinkingBudget":0}))
         );
@@ -1548,10 +1552,10 @@ mod tests {
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
                 }
             }
             let mut bytes = vec![0; length];

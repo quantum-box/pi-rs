@@ -548,6 +548,7 @@ impl ModelMetadata {
             Adapter::ChatCompletions
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
+                | Adapter::Google
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
         {
