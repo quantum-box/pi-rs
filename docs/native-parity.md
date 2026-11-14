@@ -3366,6 +3366,11 @@ extensions needing longer-lived tasks should use the async API. Queue controls
 submitted reentrantly during compaction hooks are serviced by the session owner.
 Async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
+Manual preparation failures also emit `session_compact_failed`; its error
+message identifies manual versus automatic threshold compaction, and aborted
+events omit the error message. Native compaction retains its existing
+preflight, error types, and extension replacement behavior; overflow recovery
+and Pi's pre-summary extension-provided compaction remain separate gaps.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`

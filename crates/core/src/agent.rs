@@ -3316,15 +3316,36 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        ensure_settled(session.operations())?;
-        let states = self.migrate(session, observer)?;
-        let retention = match keep_turns {
-            Some(turns) => RetentionPlan::turns(session, turns),
-            None => configured_retention(
-                session,
-                self.compaction_tokens(session).keep_recent_tokens,
-                1,
-            )?,
+        let preparation = (|| {
+            ensure_settled(session.operations())?;
+            let states = self.migrate(session, observer)?;
+            let retention = match keep_turns {
+                Some(turns) => RetentionPlan::turns(session, turns),
+                None => configured_retention(
+                    session,
+                    self.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )?,
+            };
+            Ok((states, retention))
+        })();
+        let (states, retention) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let event =
+                    compaction_failed_event(crate::CompactionReason::Manual, &error, cancel);
+                let idle = session.current_run_id().is_none();
+                crate::lifecycle::notify_session_with_host(
+                    self.registry,
+                    session,
+                    event,
+                    self.limits.model_timeout,
+                    observer,
+                    idle,
+                )
+                .await?;
+                return Err(error);
+            }
         };
         let limit = self
             .limits
@@ -3356,6 +3377,7 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<u32> {
         let reason = scope.reason;
+        let cancellation = scope.cancellation;
         let result = self
             .summarize_prefix_inner(session, states, scope, observer, inputs)
             .await;
@@ -3372,13 +3394,7 @@ impl Agent<'_> {
                 reason,
                 will_retry: false,
             },
-            Err(error) => crate::LifecycleEvent::SessionCompactFailed {
-                reason,
-                error_message: (!matches!(error, Error::Cancelled)).then(|| error.to_string()),
-                aborted: matches!(error, Error::Cancelled),
-                will_retry: false,
-                from_extension: false,
-            },
+            Err(error) => compaction_failed_event(reason, error, cancellation),
         };
         let idle = session.current_run_id().is_none();
         crate::lifecycle::notify_session_with_host(
@@ -3925,6 +3941,28 @@ struct SummaryScope<'a> {
     output_limit: u32,
     cancellation: &'a CancellationToken,
     reason: crate::CompactionReason,
+}
+
+fn compaction_failed_event(
+    reason: crate::CompactionReason,
+    error: &Error,
+    cancellation: &CancellationToken,
+) -> crate::LifecycleEvent {
+    let aborted = cancellation.is_cancelled() || matches!(error, Error::Cancelled);
+    let error_message = (!aborted).then(|| {
+        let prefix = match reason {
+            crate::CompactionReason::Manual => "Compaction failed",
+            crate::CompactionReason::Threshold => "Auto-compaction failed",
+        };
+        format!("{prefix}: {error}")
+    });
+    crate::LifecycleEvent::SessionCompactFailed {
+        reason,
+        error_message,
+        aborted,
+        will_retry: false,
+        from_extension: false,
+    }
 }
 struct DispatchScope<'a> {
     cancellation: &'a CancellationToken,
@@ -5073,6 +5111,137 @@ mod tree_tests {
     }
 
     struct NoModel;
+
+    struct CompactionFailureObserver(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureObserver {
+        fn id(&self) -> &str {
+            "compaction-failure-observer"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            }
+            Ok(())
+        }
+    }
+
+    struct FailedCompactionMigration;
+    #[async_trait::async_trait]
+    impl crate::Extension for FailedCompactionMigration {
+        fn id(&self) -> &str {
+            "failed-migration"
+        }
+        fn migrate(
+            &self,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            Err("migration failed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_preparation_and_preserves_error() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "session_compact_failed");
+        assert_eq!(events[0]["reason"], "manual");
+        assert_eq!(events[0]["aborted"], false);
+        assert_eq!(events[0]["willRetry"], false);
+        assert_eq!(events[0]["fromExtension"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Compaction failed: ")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_threshold_and_cancellation() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for cancelled in [false, true] {
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let retention = RetentionPlan::turns(&session, 0);
+            let result = agent
+                .summarize_prefix::<AgentInput>(
+                    &mut session,
+                    &ExtensionStates::new(),
+                    SummaryScope {
+                        retention,
+                        instructions: None,
+                        output_limit: 0,
+                        cancellation: &token,
+                        reason: crate::CompactionReason::Threshold,
+                    },
+                    &mut |_| {},
+                    None,
+                )
+                .await;
+            assert!(matches!(result, Err(Error::Budget)));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["reason"], "threshold");
+        assert_eq!(events[0]["aborted"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Auto-compaction failed: ")
+        );
+        assert_eq!(events[1]["aborted"], true);
+        assert!(events[1].get("errorMessage").is_none());
+    }
 
     #[async_trait::async_trait]
     impl Model for NoModel {
