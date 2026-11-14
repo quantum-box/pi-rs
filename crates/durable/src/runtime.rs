@@ -5556,7 +5556,7 @@ pub struct Scheduler {
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
-    worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, (Uuid, Option<String>)>>>,
+    worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
 }
 
 impl Scheduler {
@@ -5612,7 +5612,7 @@ impl Scheduler {
                 .lock()
                 .map_err(|_| Error::Failed)?
                 .get(&conversation)
-                .and_then(|(_, error)| error.clone())
+                .cloned()
             {
                 return Err(Error::Invalid(format!("scheduler worker failed: {error}")));
             }
@@ -6301,30 +6301,23 @@ impl Scheduler {
         let mut worker = self.harness.worker();
         worker.execution_gate = Some(control.gate);
         let errors = self.worker_errors.clone();
-        let execution = Uuid::new_v4();
-        errors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, (execution, None));
         let task = tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(async {
-                let _lock = lock.lock().await;
-                drive_scheduled(&mut worker, id, &cancel).await
-            })
-            .catch_unwind()
-            .await;
+            let _lock = lock.lock().await;
+            // A queued retry has not yet superseded the previous execution.
+            errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            let result = std::panic::AssertUnwindSafe(drive_scheduled(&mut worker, id, &cancel))
+                .catch_unwind()
+                .await;
             let failure = match &result {
                 Ok(Err(error)) => Some(error.to_string()),
                 Err(_) => Some("worker panicked".into()),
                 Ok(Ok(())) => None,
             };
             if let Some(failure) = failure {
-                let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((current, error)) = errors.get_mut(&id)
-                    && *current == execution
-                {
-                    *error = Some(failure);
-                }
+                errors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, failure);
             }
             match result {
                 Ok(result) => result,
@@ -7009,6 +7002,75 @@ mod scheduler_tests {
             max_output_tokens: 10,
         }
     }
+    struct GatedPanicModel {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+    #[async_trait::async_trait]
+    impl Model for GatedPanicModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            panic!("test worker failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_retry_does_not_hide_worker_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut opts = options(Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        }));
+        opts.model = Arc::new(GatedPanicModel {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let submission = scheduler
+            .submit(id, Some("duplicate".into()), "hello".into())
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+
+        // Queue a lock holder before the duplicate submission schedules its retry.
+        let lock = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .worker;
+        let mut holder = Box::pin(lock.lock());
+        assert!(matches!(
+            futures_util::poll!(&mut holder),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            scheduler
+                .submit(id, Some("duplicate".into()), "ignored".into())
+                .unwrap(),
+            submission
+        );
+        release.add_permits(1);
+        let guard = holder.await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.wait_for_submission(id, submission, &CancellationToken::new()),
+        )
+        .await
+        .expect("failure must remain observable while retry is queued");
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message.contains("worker panicked"))
+        );
+        scheduler.cancel.cancel();
+        drop(guard);
+        assert!(scheduler.shutdown().await.is_err());
+    }
+
     #[tokio::test]
     async fn submission_wait_reports_scheduler_stop() {
         let dir = tempfile::tempdir().unwrap();

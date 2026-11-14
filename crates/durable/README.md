@@ -843,7 +843,7 @@ This is an incremental counterpart to upstream's [`Submission.wait`](https://git
 it polls committed conversation state at 100 ms intervals rather than subscribing
 to session commits. A pending wait returns `Interrupted` on scheduler stop and
 reports a scheduled worker error or panic; a committed settlement takes precedence
-when observed. Re-scheduling starts a fresh worker-error observation, while
+when observed. A retry starts a fresh worker-error observation when it acquires the conversation worker lock, while
 `Scheduler::wait` and `shutdown` retain their own join/error behavior. A wait
 borrows the scheduler, so cancel or drop it before consuming the scheduler in
 `shutdown`. The wait does not start a task driver or resolve blocked work; a
