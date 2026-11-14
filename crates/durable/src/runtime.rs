@@ -1766,6 +1766,14 @@ impl Harness {
                     } else {
                         unreachable!()
                     };
+                    let retained_partial = if complete {
+                        match snapshot.state() {
+                            crate::tool_progress::State::Running(partial) => partial.clone(),
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        None
+                    };
                     let event = crate::observer::Observer::tool_progress(
                         self.owner.store(),
                         attempt.attempt_id,
@@ -1774,6 +1782,7 @@ impl Harness {
                         "conversation_id": state.id,
                         "attempt": attempt,
                         "state": terminal,
+                        "retained_partial": retained_partial,
                     }))?;
                     checks.extend(event.checks);
                     mutations.extend(event.mutations);

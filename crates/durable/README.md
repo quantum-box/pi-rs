@@ -108,8 +108,11 @@ fields remain visible. Legacy conversations without a transcript must first be
 saved by the runtime. Cursors are in-process handles, not a wire format.
 
 Tool progress is display-only: it is not a tool result or evidence that an effect
-is safe to replay. Each invocation uses a fresh attempt identity. Completion clears
-the partial; abort or an interrupted attempt retains the last committed partial.
+is safe to replay. Each invocation uses a fresh attempt identity. Completion, abort and interruption retain the last committed partial in the
+sealed attempt snapshot and event. Older completed snapshots without a partial
+remain readable. Read it with `Snapshot::retained_partial()` or the terminal
+event’s `retained_partial` field. Retention does not turn progress into
+authoritative output.
 Callbacks are fenced by the conversation phase and attempt identity, and progress
 is sealed atomically with the corresponding transition. Legacy running attempts
 without an identity do not report durable progress until replay creates one.
@@ -131,7 +134,7 @@ progress events exist. Legacy running attempts without IDs remain undiscoverable
 a subsequent replay is recorded. Discovery and progress cursors are independent;
 process every discovered attempt and retain its progress cursor. Discovery orders
 claims, while progress ordering is only per attempt. Both logs grow without retention;
-progress records store whole replacement partials (up to 1 MiB). Pages bound record
+progress records store whole replacement partials (running and aborted snapshots up to 1 MiB; completed envelopes up to 1 MiB plus 32 bytes). Pages bound record
 count, not total bytes; polling is synchronous and has no notification or automatic
 operation filter. This is not upstream's Chord operation stream.
 

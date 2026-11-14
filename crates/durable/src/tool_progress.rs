@@ -13,6 +13,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const MAX_PROGRESS_BYTES: usize = 1024 * 1024;
+// Leave room for the completed envelope around a legacy maximum-sized partial.
+const MAX_COMPLETED_BYTES: usize = MAX_PROGRESS_BYTES + 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,6 +40,7 @@ pub struct Snapshot {
     id: Uuid,
     version: Option<u64>,
     state: State,
+    retained_partial: Option<Value>,
 }
 
 pub struct Prepared {
@@ -48,22 +51,44 @@ pub struct Prepared {
 impl Snapshot {
     pub fn load(store: &Store, id: Uuid) -> Result<Self, Error> {
         let entry = store.get(&key(id))?;
-        let (version, state) = match entry {
+        let (version, state, retained_partial) = match entry {
             Some(entry) => {
-                if entry.value.len() > MAX_PROGRESS_BYTES {
+                if entry.value.len() > MAX_COMPLETED_BYTES {
                     return Err(Error::TooLarge);
                 }
-                (Some(entry.version), serde_json::from_slice(&entry.value)?)
+                let value: Value = serde_json::from_slice(&entry.value)?;
+                let state: State = serde_json::from_value(value.clone())?;
+                if entry.value.len() > MAX_PROGRESS_BYTES && state != State::Completed {
+                    return Err(Error::TooLarge);
+                }
+                let retained = if state == State::Completed {
+                    value
+                        .get("retained_partial")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                } else {
+                    None
+                };
+                (Some(entry.version), state, retained)
             }
-            None => (None, State::Running(None)),
+            None => (None, State::Running(None), None),
         };
-        Ok(Self { id, version, state })
+        Ok(Self {
+            id,
+            version,
+            state,
+            retained_partial,
+        })
     }
     pub fn is_persisted(&self) -> bool {
         self.version.is_some()
     }
     pub fn state(&self) -> &State {
         &self.state
+    }
+    /// Last committed display-only partial retained after completion, if any.
+    pub fn retained_partial(&self) -> Option<&Value> {
+        self.retained_partial.as_ref()
     }
     /// Stage a complete replacement. Failure leaves the previous value intact.
     pub fn update(&mut self, partial: Value) -> Result<(), Error> {
@@ -72,9 +97,10 @@ impl Snapshot {
         }
         let state = State::Running(Some(partial));
         encode(&state)?;
-        // The aborted envelope must also fit before accepting the update.
+        // Both terminal envelopes must fit before accepting the update.
         if let State::Running(partial) = &state {
             encode(&State::Aborted(partial.clone()))?;
+            encode_completed(partial)?;
         }
         self.state = state;
         Ok(())
@@ -93,12 +119,15 @@ impl Snapshot {
         self.prepare(&State::Aborted(partial.clone()))
     }
     pub fn prepare_complete(&self) -> Result<Prepared, Error> {
-        if !matches!(self.state, State::Running(_)) {
+        let State::Running(partial) = &self.state else {
             return Err(Error::Finished);
-        }
-        self.prepare(&State::Completed)
+        };
+        self.prepare_bytes(encode_completed(partial)?)
     }
     fn prepare(&self, state: &State) -> Result<Prepared, Error> {
+        self.prepare_bytes(encode(state)?)
+    }
+    fn prepare_bytes(&self, value: Vec<u8>) -> Result<Prepared, Error> {
         let key = key(self.id);
         Ok(Prepared {
             checks: vec![Check {
@@ -107,7 +136,7 @@ impl Snapshot {
             }],
             mutations: vec![Mutation::Put {
                 key,
-                value: encode(state)?,
+                value,
             }],
         })
     }
@@ -118,6 +147,17 @@ fn key(id: Uuid) -> Vec<u8> {
 fn encode(state: &State) -> Result<Vec<u8>, Error> {
     let bytes = serde_json::to_vec(state)?;
     if bytes.len() > MAX_PROGRESS_BYTES {
+        return Err(Error::TooLarge);
+    }
+    Ok(bytes)
+}
+
+fn encode_completed(partial: &Option<Value>) -> Result<Vec<u8>, Error> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "state": "completed",
+        "retained_partial": partial,
+    }))?;
+    if bytes.len() > MAX_COMPLETED_BYTES {
         return Err(Error::TooLarge);
     }
     Ok(bytes)
@@ -331,6 +371,62 @@ mod tests {
             Err(durable_store::Error::Conflict { .. })
         ));
         assert!(!Snapshot::load(&store, id).unwrap().is_persisted());
+    }
+    #[test]
+    fn completion_retains_partial_with_bounded_terminal_envelope_and_reads_legacy() {
+        assert_eq!(
+            serde_json::from_str::<State>(r#"{"state":"completed"}"#).unwrap(),
+            State::Completed
+        );
+        let store = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        let mut snapshot = Snapshot::load(&store, id).unwrap();
+        let overhead = serde_json::to_vec(&State::Aborted(Some(json!(""))))
+            .unwrap()
+            .len();
+        let max = "x".repeat(MAX_PROGRESS_BYTES - overhead);
+        snapshot.update(json!(max)).unwrap();
+        assert!(matches!(
+            snapshot.update(json!("x".repeat(MAX_PROGRESS_BYTES - overhead + 1))),
+            Err(Error::TooLarge)
+        ));
+        let checkpoint = snapshot.prepare_checkpoint().unwrap();
+        store
+            .commit(&checkpoint.checks, &checkpoint.mutations)
+            .unwrap();
+        let snapshot = Snapshot::load(&store, id).unwrap();
+        let complete = snapshot.prepare_complete().unwrap();
+        store.commit(&complete.checks, &complete.mutations).unwrap();
+        let completed = Snapshot::load(&store, id).unwrap();
+        assert_eq!(completed.state(), &State::Completed);
+        assert_eq!(completed.retained_partial(), Some(&json!(max)));
+    }
+    #[test]
+    fn old_maximum_checkpoint_can_complete_after_upgrade() {
+        let store = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        let overhead = serde_json::to_vec(&State::Aborted(Some(json!(""))))
+            .unwrap()
+            .len();
+        let partial = json!("x".repeat(1024 * 1024 - overhead));
+        let old = serde_json::to_vec(&State::Running(Some(partial.clone()))).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key(id),
+                    value: old,
+                }],
+            )
+            .unwrap();
+        let complete = Snapshot::load(&store, id)
+            .unwrap()
+            .prepare_complete()
+            .unwrap();
+        store.commit(&complete.checks, &complete.mutations).unwrap();
+        let completed = Snapshot::load(&store, id).unwrap();
+        assert_eq!(completed.state(), &State::Completed);
+        assert_eq!(completed.retained_partial(), Some(&partial));
     }
     #[test]
     fn stale_commit_and_oversize_are_rejected() {

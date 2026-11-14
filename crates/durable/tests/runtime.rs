@@ -1281,7 +1281,14 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         .tool_progress_events(second.attempt_id, fresh.next, limit)
         .unwrap();
     assert_eq!(done.records.len(), 1);
-    assert_eq!(done.records[0].value["state"]["state"], "completed");
+    assert_eq!(
+        done.records[0].value["state"],
+        json!({"state":"completed"})
+    );
+    assert_eq!(
+        done.records[0].value["retained_partial"],
+        json!({"text":"working"})
+    );
     assert!(
         scheduler
             .tool_progress_events(first.attempt_id, old.next, limit)
@@ -1295,8 +1302,10 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         Snapshot::load(&store, first.attempt_id).unwrap().state(),
         &State::Aborted(Some(json!({"text":"working"})))
     );
+    let completed = Snapshot::load(&store, second.attempt_id).unwrap();
+    assert_eq!(completed.state(), &State::Completed);
     assert_eq!(
-        Snapshot::load(&store, second.attempt_id).unwrap().state(),
-        &State::Completed
+        completed.retained_partial(),
+        Some(&json!({"text":"working"}))
     );
 }
