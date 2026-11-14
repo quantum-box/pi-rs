@@ -643,7 +643,16 @@ pub struct Conversation {
     tool_attempt: Option<ToolAttempt>,
     #[serde(default)]
     pub abort_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nested_resume: Option<NestedResume>,
     phase: Phase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NestedResume {
+    operation_id: Uuid,
+    restarts: u32,
+    dispatch_identity: DispatchIdentity,
 }
 
 /// Identity of one execution of a durable tool operation.
@@ -2625,6 +2634,7 @@ impl Harness {
             active: None,
             tool_attempt: None,
             abort_requested: false,
+            nested_resume: None,
             phase: Phase::Idle,
         }
     }
@@ -2905,6 +2915,7 @@ impl Harness {
             active: None,
             tool_attempt: None,
             abort_requested: false,
+            nested_resume: None,
             phase: Phase::Idle,
         };
         retry_document_fork(|| {
@@ -5707,6 +5718,65 @@ impl Harness {
         }
         Ok(Some((continuation, children, handlers)))
     }
+    fn prepare_nested_resume(&self, c: &mut Conversation) -> Result<bool, Error> {
+        if c.abort_requested || !c.extensions.is_empty() {
+            return Ok(false);
+        }
+        let Some(resume) = c.nested_resume.clone() else {
+            return Ok(false);
+        };
+        let Phase::Blocked {
+            tool_panicked: false,
+            turns,
+            calls,
+            index,
+            operation_id,
+            arguments: Some(arguments),
+            ..
+        } = c.phase.clone()
+        else {
+            return Ok(false);
+        };
+        if operation_id != resume.operation_id
+            || resume.restarts.saturating_add(1) >= self.options.restart_limit
+        {
+            return Ok(false);
+        }
+        let Some(call) = calls.get(index) else {
+            return Ok(false);
+        };
+        if c.allowed_tools
+            .as_ref()
+            .is_some_and(|names| !names.contains(&call.name))
+            || c.model_tools
+                .as_ref()
+                .is_some_and(|names| !names.contains(&call.name))
+        {
+            return Ok(false);
+        }
+        let Some(reg) = self.tools.get(&call.name) else {
+            return Ok(false);
+        };
+        if reg.replay != ReplayPolicy::Safe
+            || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
+            || !crate::nested::resolved_for_replay(self.owner.store(), operation_id)?
+        {
+            return Ok(false);
+        }
+        c.nested_resume = None;
+        c.phase = Phase::ToolRunning {
+            turns,
+            calls,
+            index,
+            operation_id,
+            arguments,
+            replay: ReplayPolicy::Safe,
+            restarts: resume.restarts.saturating_add(1),
+            replay_ready: true,
+            dispatch_identity: Some(resume.dispatch_identity),
+        };
+        Ok(true)
+    }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
             if cancel.is_cancelled() {
@@ -5720,6 +5790,13 @@ impl Harness {
                     continue;
                 }
                 return Ok(());
+            }
+            if self.prepare_nested_resume(&mut c)? {
+                match self.save(&c, Expected::Version(version)) {
+                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                    other => other?,
+                }
+                continue;
             }
             match c.phase.clone() {
                 Phase::Idle => {
@@ -7102,9 +7179,10 @@ impl Harness {
                     index,
                     operation_id,
                     arguments,
+                    replay,
+                    restarts,
                     replay_ready,
                     dispatch_identity: stored_identity,
-                    ..
                 } => {
                     if replay_ready {
                         c.tool_attempt = Some(ToolAttempt {
@@ -7124,6 +7202,7 @@ impl Harness {
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
                     let mut tool_panicked = false;
+                    let mut nested_resume_candidate = false;
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
@@ -7244,6 +7323,10 @@ impl Harness {
                                         // Even a failed report write must seal the nested host.
                                         let inspection = host.seal_and_wait().await;
                                         panic_report?;
+                                        nested_resume_candidate = inspection.is_err()
+                                            && host.only_pending_failure()
+                                            && !tool_panicked
+                                            && matches!(&reply, Some(Ok(reply)) if reply.state.is_none() && !matches!(reply.outcome, Outcome::Unknown(_) | Outcome::Pending { .. }));
                                         match inspection {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
@@ -7327,6 +7410,14 @@ impl Harness {
                     }
                     match reply.outcome {
                         Outcome::Unknown(reason) => {
+                            c.nested_resume = if nested_resume_candidate
+                                && replay == ReplayPolicy::Safe
+                                && restarts.saturating_add(1) < self.options.restart_limit
+                                && c.extensions.is_empty()
+                                && stored_identity == Some(DispatchIdentity::Other)
+                            {
+                                Some(NestedResume { operation_id, restarts, dispatch_identity: DispatchIdentity::Other })
+                            } else { None };
                             c.phase = Phase::Blocked {
                                 tool_panicked,
                                 turns,
@@ -7690,6 +7781,7 @@ impl Harness {
                 }
             }
         }
+        c.nested_resume = None;
         if c.abort_requested {
             if !self.conversation_tasks(c.id)?.is_empty() {
                 return Err(Error::Invalid("owned task cleanup is still pending".into()));
@@ -8392,8 +8484,9 @@ impl Scheduler {
         reference: &str,
         outcome: Outcome,
     ) -> Result<(), Error> {
-        self.harness
-            .reconcile_nested_pending(id, root, operation, reference, outcome)
+        self.harness.reconcile_nested_pending(id, root, operation, reference, outcome)?;
+        self.schedule(id);
+        Ok(())
     }
     pub fn cancel_nested_pending(
         &mut self,
@@ -8403,8 +8496,9 @@ impl Scheduler {
         reference: &str,
         reason: String,
     ) -> Result<(), Error> {
-        self.harness
-            .cancel_nested_pending(id, root, operation, reference, reason)
+        self.harness.cancel_nested_pending(id, root, operation, reference, reason)?;
+        self.schedule(id);
+        Ok(())
     }
     /// Record a known tool outcome and resume the conversation.
     pub fn reconcile(
@@ -10965,6 +11059,7 @@ mod scheduler_tests {
             active: None,
             tool_attempt: None,
             abort_requested: false,
+            nested_resume: None,
             phase: Phase::Idle,
         };
         let mut latest = base.clone();

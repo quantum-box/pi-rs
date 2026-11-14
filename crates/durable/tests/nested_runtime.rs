@@ -1187,11 +1187,13 @@ async fn killed_nested_poll_can_be_explicitly_reconciled_after_reopen() {
     )
     .unwrap();
     drop(h);
-    let mut h = Harness::open(root.join("db"), process_options(root, false), &cancel)
-        .await
-        .unwrap();
-    h.reconcile(id, parent, Outcome::Succeeded("parent confirmed".into()))
-        .unwrap();
+    let mut h = Harness::open(
+        root.join("db"),
+        process_options(root, false),
+        &cancel,
+    )
+    .await
+    .unwrap();
     h.resume_conversation(id, &cancel).await.unwrap();
     assert!(h.blocked(id).unwrap().is_none());
     assert_eq!(
@@ -1509,10 +1511,299 @@ async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
     .unwrap();
     drop(h);
     let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
-    h.reconcile(id, root, Outcome::Succeeded("parent done".into()))
-        .unwrap();
     h.resume_conversation(id, &cancel).await.unwrap();
     assert!(h.blocked(id).unwrap().is_none());
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
     assert_eq!(child.polled.load(Ordering::SeqCst), 2);
+}
+
+struct ReattachingParent {
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl Tool for ReattachingParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+    async fn invoke_with_host(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match host.call("child", json!({})).await {
+            Outcome::Succeeded(value) => Outcome::Succeeded(format!("observed:{value}")),
+            _ => Outcome::Succeeded("awaiting reconciliation".into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn confirmed_nested_result_replays_safe_parent_after_reopen_without_child_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let parent = Arc::new(ReattachingParent {
+        calls: AtomicUsize::new(0),
+    });
+    let child = Arc::new(UnknownPoll {
+        invoked: AtomicUsize::new(0),
+        polled: AtomicUsize::new(0),
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: parent.clone(),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let (root, _) = h.blocked(id).unwrap().unwrap();
+    let job = h.nested_pending_jobs(id, root).unwrap().pop().unwrap();
+    h.reconcile_nested_pending(
+        id,
+        root,
+        job.operation_id,
+        &job.reference,
+        Outcome::Succeeded("authoritative".into()),
+    )
+    .unwrap();
+    drop(h); // A process can die after the job commit but before scheduling replay.
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    assert!(h.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content == "observed:authoritative")
+    ));
+    assert_eq!(parent.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+    assert_eq!(child.polled.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn confirmed_nested_result_never_replays_unsafe_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let parent = Arc::new(ReattachingParent {
+        calls: AtomicUsize::new(0),
+    });
+    let child = Arc::new(UnknownPoll {
+        invoked: AtomicUsize::new(0),
+        polled: AtomicUsize::new(0),
+    });
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: parent.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let (root, _) = h.blocked(id).unwrap().unwrap();
+    let job = h.nested_pending_jobs(id, root).unwrap().pop().unwrap();
+    h.reconcile_nested_pending(
+        id,
+        root,
+        job.operation_id,
+        &job.reference,
+        Outcome::Succeeded("done".into()),
+    )
+    .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert_eq!(parent.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn scheduler_reattaches_after_confirmation_but_never_after_abort() {
+    use pi_rs_durable::runtime::Scheduler;
+    for abort in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Arc::new(ReattachingParent {
+            calls: AtomicUsize::new(0),
+        });
+        let child = Arc::new(UnknownPoll {
+            invoked: AtomicUsize::new(0),
+            polled: AtomicUsize::new(0),
+        });
+        let opts = Options {
+            model: Arc::new(FakeModel),
+            tools: vec![
+                RegisteredTool {
+                    tool: parent.clone(),
+                    replay: ReplayPolicy::Safe,
+                },
+                RegisteredTool {
+                    tool: child.clone(),
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        scheduler.wait(id).await.unwrap();
+        let (root, _) = scheduler.blocked(id).unwrap().unwrap();
+        let job = scheduler
+            .nested_pending_jobs(id, root)
+            .unwrap()
+            .pop()
+            .unwrap();
+        if abort {
+            scheduler.abort(id).unwrap();
+            scheduler.wait(id).await.unwrap();
+        }
+        if abort {
+            scheduler
+                .reconcile_nested_pending(
+                    id,
+                    root,
+                    job.operation_id,
+                    &job.reference,
+                    Outcome::Succeeded("confirmed".into()),
+                )
+                .unwrap();
+        } else {
+            scheduler
+                .cancel_nested_pending(
+                    id,
+                    root,
+                    job.operation_id,
+                    &job.reference,
+                    "remote cancellation confirmed".into(),
+                )
+                .unwrap();
+        }
+        scheduler.wait(id).await.unwrap();
+        if abort {
+            assert!(scheduler.blocked(id).unwrap().is_some());
+            assert!(scheduler.conversation(id).unwrap().abort_requested);
+            assert_eq!(parent.calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(scheduler.blocked(id).unwrap().is_none());
+            assert_eq!(parent.calls.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+        assert_eq!(child.polled.load(Ordering::SeqCst), 2);
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reattachment_rechecks_current_parent_replay_policy_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let parent = Arc::new(ReattachingParent {
+        calls: AtomicUsize::new(0),
+    });
+    let child = Arc::new(UnknownPoll {
+        invoked: AtomicUsize::new(0),
+        polled: AtomicUsize::new(0),
+    });
+    let opts = |policy| Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: parent.clone(),
+                replay: policy,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(&path, opts(ReplayPolicy::Safe), &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let (root, _) = h.blocked(id).unwrap().unwrap();
+    let job = h.nested_pending_jobs(id, root).unwrap().pop().unwrap();
+    h.reconcile_nested_pending(
+        id,
+        root,
+        job.operation_id,
+        &job.reference,
+        Outcome::Succeeded("done".into()),
+    )
+    .unwrap();
+    drop(h);
+    let h = Harness::open(&path, opts(ReplayPolicy::Unsafe), &cancel)
+        .await
+        .unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert_eq!(parent.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
 }

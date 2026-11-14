@@ -1035,11 +1035,19 @@ retries are accepted while the same root remains blocked; conflicting outcomes
 are rejected. References are retained in the journal, including after
 settlement. After a storage error, reopen and inspect before retrying.
 
-Settling a nested job does not determine the parent tool's outcome: the host
-must also supply an authoritative parent result with `reconcile`. Parent
+A confirmed job result can automatically reattach a direct nested call when
+the parent returned a known, stateless result and the only nested failure was
+a failed poll. The persisted and current parent replay policies must both be
+safe, the dispatch identity and tool selection must still match, the restart
+limit must permit replay, and every nested record must be terminal. The parent
+is replayed with its original operation ID and receives the recorded child result;
+the child is not dispatched or polled again. The scheduler schedules this after
+confirmation; a reopened harness also resumes it. A persisted conversation abort
+always prevents replay and remains marked until cleanup and parent settlement.
+
+Other cases require an authoritative parent result with `reconcile`. Parent
 settlement is rejected while any nested operation remains unresolved, including
 intermediate calls and unsafe effects. This is narrower than upstream's
-scheduler-owned nested task settlement: it does not replay an intermediate
-caller or infer its result, and does not offer reconciliation for arbitrary
-interrupted nested calls without a persisted pending reference. Explicit abort
-remains marked until nested work and owned task cleanup are settled.
+scheduler-owned nested task settlement: it does not replay intermediate callers,
+legacy blocked records, extension-selected or stateful parent calls, or arbitrary
+interrupted nested calls without a persisted pending reference.

@@ -306,5 +306,7 @@ is not independently represented. See [snapshot tests](../crates/durable/tests/t
 Nested pending-job reconciliation is a pi-rs host API with a narrower boundary
 than upstream's nested task scheduler. A host can record a verified terminal
 result or confirmed cancellation against the exact persisted operation and
-opaque reference, then separately reconcile the parent. It does not infer the
-parent result or reconcile an interrupted nested call lacking a pending reference.
+opaque reference. A replay-safe direct parent can reattach to the recorded result
+when its replay identity and policy still match; other parents require separate
+authoritative reconciliation. Interrupted calls without pending references and
+unresolved intermediate callers remain outside this automatic path.

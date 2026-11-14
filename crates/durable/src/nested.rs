@@ -73,6 +73,26 @@ pub(crate) fn pending_jobs(
     Ok(jobs)
 }
 
+// Automatic replay is restricted to a root with only terminal records and at
+// least one explicitly resolved job. Unresolved descendants remain barriers.
+pub(crate) fn resolved_for_replay(
+    store: &durable_store::Store,
+    root: Uuid,
+) -> Result<bool, crate::runtime::Error> {
+    let mut resolved = false;
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if matches!(
+            record.outcome,
+            None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
+        ) {
+            return Ok(false);
+        }
+        resolved |= record.resolution.is_some();
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn resolve_pending(
     store: &durable_store::Store,
     (conversation_key, conversation_version): (Vec<u8>, u64),
@@ -180,6 +200,7 @@ struct Shared {
     // Protects sealing, active calls, and the visited call counts together.
     lifecycle: Mutex<Lifecycle>,
     failed: AtomicBool,
+    non_pending_failure: AtomicBool,
     idle: tokio::sync::Notify,
 }
 #[derive(Default)]
@@ -212,6 +233,7 @@ impl Drop for Active {
             }
             self.0.idle.notify_one();
         } else {
+            self.0.non_pending_failure.store(true, Ordering::Release);
             self.0.failed.store(true, Ordering::Release);
         }
     }
@@ -230,10 +252,12 @@ impl Drop for InvocationScope {
                 .unwrap_or(0)
                 != 0
             {
+                self.0.shared.non_pending_failure.store(true, Ordering::Release);
                 self.0.shared.failed.store(true, Ordering::Release);
                 self.0.shared.cancellation.cancel();
             }
         } else {
+            self.0.shared.non_pending_failure.store(true, Ordering::Release);
             self.0.shared.failed.store(true, Ordering::Release);
         }
     }
@@ -269,6 +293,7 @@ impl NestedHost {
                 max_depth,
                 lifecycle: Mutex::new(lifecycle),
                 failed: AtomicBool::new(false),
+                non_pending_failure: AtomicBool::new(false),
                 idle: tokio::sync::Notify::new(),
             }),
             parent,
@@ -297,8 +322,17 @@ impl NestedHost {
         self.call_inner(Some(key), name, arguments).await
     }
     fn fail(&self, reason: impl Into<String>) -> Outcome {
+        self.shared.non_pending_failure.store(true, Ordering::Release);
         self.shared.failed.store(true, Ordering::Release);
         Outcome::Unknown(reason.into())
+    }
+    fn pending_failure(&self, reason: impl Into<String>) -> Outcome {
+        self.shared.failed.store(true, Ordering::Release);
+        Outcome::Unknown(reason.into())
+    }
+    pub(crate) fn only_pending_failure(&self) -> bool {
+        self.shared.failed.load(Ordering::Acquire)
+            && !self.shared.non_pending_failure.load(Ordering::Acquire)
     }
     fn enter(&self) -> Result<Active, Outcome> {
         let mut l = self
@@ -639,18 +673,18 @@ impl NestedHost {
                     return self.fail("nested polling cancelled");
                 }
                 Ok(crate::poll::PollResult::Unavailable | crate::poll::PollResult::TimedOut) => {
-                    return self.fail("nested polling failed; pending reference retained");
+                    return self.pending_failure("nested polling failed; pending reference retained");
                 }
                 Err(payload) => {
                     crate::extension::discard_panic_payload(payload);
-                    return self.fail("nested polling failed; pending reference retained");
+                    return self.pending_failure("nested polling failed; pending reference retained");
                 }
             };
             // Unknown is not a terminal observation. Keep the last accepted
             // reference so a later safe replay can reattach, while poisoning
             // this invocation so an ignoring parent cannot commit success.
             if matches!(outcome, Outcome::Unknown(_)) {
-                return self.fail(
+                return self.pending_failure(
                     "nested polling returned an uncertain outcome; pending reference retained",
                 );
             }
