@@ -665,7 +665,15 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
-        let auth = super::super::config::read_object(&dir.path().join("auth.json")).unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let _guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::auth_lock::acquire_async(&auth_path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let auth = super::super::config::read_object_unlocked(&auth_path).unwrap();
         assert_eq!(
             auth["openai-chatgpt"]["credential"]["refresh_token"],
             "old-refresh"

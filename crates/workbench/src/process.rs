@@ -36,6 +36,7 @@ pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(test)]
 pub(super) fn refresh_barrier() -> Result<RefreshBarrier> {
     let process = stop_new_refreshes();
     let worker = std::env::var_os(REFRESH_BARRIER_ENV)
