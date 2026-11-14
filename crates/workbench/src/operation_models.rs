@@ -679,7 +679,7 @@ impl Tool for Operations {
                 "Private native model catalogue and classifier or image invocation for codemode"
                     .into(),
             parameters: json!({"type":"object","properties":{
-                "action":{"enum":["list","classify","generateImages"]},
+                "action":{"enum":["list","resolve","classify","generateImages"]},
                 "type":{"enum":["chat","classifier","image"]},
                 "provider":{"type":"string"},"id":{"type":"string"},
                 "available":{"type":"boolean"},"context":{"type":"object"}
@@ -692,12 +692,75 @@ impl Tool for Operations {
     }
 
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let catalogue = self.args.model_profiles.operations();
+        let provider = args["provider"].as_str();
+        if args["action"] == "resolve" {
+            let kind = serde_json::from_value::<Kind>(args["type"].clone()).ok();
+            let found = catalogue.0.iter().any(|model| {
+                Some(model.api.kind()) == kind
+                    && Some(model.provider.as_str()) == provider
+                    && Some(model.model.id.as_str()) == args["id"].as_str()
+            });
+            return if found {
+                Outcome::Structured {
+                    data: json!(true),
+                    attachments: vec![],
+                }
+            } else {
+                let requested = match kind {
+                    Some(Kind::Classifier) => "classifier",
+                    Some(Kind::Image) => "image",
+                    _ => return Outcome::Failed("invalid model operation type".into()),
+                };
+                let id = args["id"].as_str().unwrap_or_default();
+                let provider = provider.unwrap_or_default();
+                let actual = if !self.chat_models(Some(provider), Some(id), false).is_empty() {
+                    Some("chat")
+                } else {
+                    [Kind::Image, Kind::Classifier]
+                        .into_iter()
+                        .find_map(|other| {
+                            (Some(other) != kind
+                                && catalogue.0.iter().any(|model| {
+                                    model.api.kind() == other
+                                        && model.provider == provider
+                                        && model.model.id == id
+                                }))
+                            .then_some(if other == Kind::Image {
+                                "image"
+                            } else {
+                                "classifier"
+                            })
+                        })
+                };
+                let article = |value| {
+                    if value == "image" {
+                        "an image"
+                    } else if value == "chat" {
+                        "a chat"
+                    } else {
+                        "a classifier"
+                    }
+                };
+                let hint = format!(
+                    "List the {requested} models you can use with models.getAvailableOfType(\"{requested}\")."
+                );
+                let message = if let Some(actual) = actual {
+                    format!(
+                        "\"{provider}/{id}\" is {} model, not {} model. {hint}",
+                        article(actual),
+                        article(requested)
+                    )
+                } else {
+                    format!("Unknown {requested} model \"{provider}/{id}\". {hint}")
+                };
+                Outcome::Failed(message)
+            };
+        }
         let keys = match Keys::load_async().await {
             Ok(keys) => keys,
             Err(error) => return Outcome::Failed(error.to_string()),
         };
-        let catalogue = self.args.model_profiles.operations();
-        let provider = args["provider"].as_str();
         if args["action"] == "list" {
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
             let entries = if kind == Kind::Chat {
@@ -723,6 +786,13 @@ impl Tool for Operations {
         } else {
             Kind::Image
         };
+        let Some(model) = catalogue.0.iter().find(|model| {
+            model.api.kind() == kind
+                && Some(model.provider.as_str()) == provider
+                && Some(model.model.id.as_str()) == args["id"].as_str()
+        }) else {
+            return Outcome::Failed("unknown model for this operation".into());
+        };
         let mut data = json!({
             "provider": provider.unwrap_or_default(),
             "model": args["id"].as_str().unwrap_or_default(),
@@ -747,25 +817,16 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        let model = catalogue.0.iter().find(|model| {
-            model.api.kind() == kind
-                && Some(model.provider.as_str()) == provider
-                && Some(model.model.id.as_str()) == args["id"].as_str()
-        });
-        if let Some(model) = model {
-            initialize_image_result(model, &mut data);
-        }
+        initialize_image_result(model, &mut data);
         let result = if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
-        } else if let Some(model) = model {
+        } else {
             let operation = self.perform(model, &args["context"], &keys, &mut data);
             tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => Err(Error::Cancelled),
                 result = operation => result,
             }
-        } else {
-            Err(Error::Config("unknown model for this operation".into()))
         };
         if let Err(error) = result {
             data["stopReason"] = json!(if matches!(error, Error::Cancelled) {
@@ -944,6 +1005,63 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolve_uses_catalogue_without_provider_request() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[
+            {"type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]}
+        ]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::new(),
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: Default::default(),
+        };
+        let resolve =
+            |kind, id| json!({"action":"resolve", "type":kind, "provider":"relay", "id":id});
+        assert!(matches!(
+            operation
+                .invoke(resolve("image", "fixture"), context())
+                .await,
+            Outcome::Structured { .. }
+        ));
+        let Outcome::Failed(wrong_type) = operation
+            .invoke(resolve("classifier", "fixture"), context())
+            .await
+        else {
+            panic!("wrong type accepted")
+        };
+        assert_eq!(
+            wrong_type,
+            "\"relay/fixture\" is an image model, not a classifier model. List the classifier models you can use with models.getAvailableOfType(\"classifier\")."
+        );
+        let Outcome::Failed(unknown) = operation
+            .invoke(resolve("image", "missing"), context())
+            .await
+        else {
+            panic!("unknown accepted")
+        };
+        assert_eq!(
+            unknown,
+            "Unknown image model \"relay/missing\". List the image models you can use with models.getAvailableOfType(\"image\")."
+        );
+        let chat = operation
+            .chat_models(None, None, false)
+            .into_iter()
+            .next()
+            .unwrap();
+        let request = json!({"action":"resolve", "type":"image", "provider":chat["provider"], "id":chat["id"]});
+        let Outcome::Failed(wrong_type) = operation.invoke(request, context()).await else {
+            panic!("chat model accepted")
+        };
+        assert!(wrong_type.contains("is a chat model, not an image model"));
+    }
 
     #[tokio::test]
     async fn openrouter_image_empty_choice_preserves_result_and_usage() {
@@ -1330,7 +1448,7 @@ mod tests {
                 entry.descriptor()["api"],
                 "cloudflare-workers-ai-system-one"
             );
-            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
                 "images":[{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]});
             let operation = Operations {
                 args: Cli::parse_from(["pi"]),
@@ -1472,7 +1590,7 @@ mod tests {
             let keys = Keys::parse(
                 &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"destination-key", "endpoint":entry.endpoint.as_str()}}),
             );
-            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
             let operation = Operations {
                 args: Cli::parse_from(["pi"]),
                 client: reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -1565,7 +1683,7 @@ mod tests {
                 "typesafe-system-one",
                 "systemone",
                 r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#,
-                json!({"state":"test","questions":{"ok":{"type":"bool","instructions":"decide","criteria":{"true":"yes","false":"no"}}}}),
+                json!({"state":{"text":"test"},"questions":{"ok":{"type":"bool","instructions":"decide","criteria":{"true":"yes","false":"no"}}}}),
             ),
         ] {
             let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1660,7 +1778,7 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay")
             .unwrap();
-        let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"test", "criteria":{"true":"yes", "false":"no"}}},
+        let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"test", "criteria":{"true":"yes", "false":"no"}}},
             "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
         let (body, opt_in) = classifier_payload(entry, &context).unwrap();
         assert_eq!(body["input"]["state"][0]["type"], "image_url");
@@ -1668,8 +1786,28 @@ mod tests {
         let mut without_image = context;
         without_image["images"] = json!([]);
         let (body, opt_in) = classifier_payload(entry, &without_image).unwrap();
-        assert_eq!(body["input"]["state"], "test");
+        assert_eq!(body["input"]["state"], json!({"text":"test"}));
         assert!(!opt_in);
+    }
+
+    #[test]
+    fn classifier_rejects_non_object_state_before_request() {
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1234", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one"
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let questions = json!({"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}});
+        for state in [json!(null), json!([]), json!("text"), json!(42)] {
+            let error = classifier_payload(entry, &json!({"state":state,"questions":questions}))
+                .unwrap_err();
+            assert!(error.to_string().contains("state must be an object"));
+        }
+        assert!(classifier_payload(entry, &json!({"state":{},"questions":questions})).is_ok());
     }
 
     #[tokio::test]
@@ -2112,7 +2250,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry.provider == provider && entry.model.id == "parity-fixture")
                 .unwrap();
-            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
                 "images":if with_image { json!([{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]) } else { json!([]) }});
             let operation = Operations {
                 args: Cli::parse_from(["pi"]),
@@ -2184,7 +2322,7 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay")
             .unwrap();
-        let context = json!({"state":"test", "questions":{"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}, "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}, "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
         let (body, opt_in) = classifier_payload(entry, &context).unwrap();
         assert!(body["assets"]["<image-1>"].is_object());
         assert!(!opt_in);

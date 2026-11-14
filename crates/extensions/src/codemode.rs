@@ -1318,6 +1318,101 @@ mod tests {
     }
 
     struct Host;
+    #[tokio::test]
+    async fn model_calls_validate_before_host_and_preserve_provider_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ModelHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for ModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                if args["id"] == "missing" {
+                    Outcome::Failed("unknown model".into())
+                } else if args["action"] == "resolve" {
+                    Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    }
+                } else {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Outcome::Structured {
+                        data: json!({"stopReason":"error","errorMessage":"provider failed","answers":{}}),
+                        attachments: vec![],
+                    }
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let code = r#"
+            const model = {provider: 'fixture', id: 'fixture'};
+            const q = {x:{type:'bool', instructions:'test', criteria:{true:'yes', false:'no'}}};
+            const invalid = [
+                () => models.classify(null, {state:{}, questions:q}),
+                () => models.classify(model, {state:null, questions:q}),
+                () => models.classify(model, {state:[], questions:q}),
+                () => models.classify(model, {state:{}, questions:{}}),
+                () => models.classify(model, {state:{}, questions:q, images:null}),
+                () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:[1]}}}),
+                () => models.classify(model, {state:{}, questions:q, images:Array(1)}),
+                () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:Array(1)}}}),
+                () => models.generateImages(model, {input:[]}),
+                () => models.generateImages(model, {input:Array(1)}),
+                () => models.generateImages(model, {input:[{type:'image', data:1, mimeType:'image/png'}]}),
+            ];
+            for (const call of invalid) {
+                let rejected = false;
+                try { await call(); } catch (_) { rejected = true; }
+                if (!rejected) throw new Error('invalid call succeeded');
+            }
+            for (const call of [
+                () => models.classify({provider:'fixture', id:'missing'}, null),
+                () => models.generateImages({provider:'fixture', id:'missing'}, {input:[]}),
+            ]) {
+                try { await call(); throw new Error('missing model succeeded'); }
+                catch (error) { if (!String(error).includes('unknown model')) throw error; }
+            }
+            for (const [call, message] of [
+                [() => models.classify(model, null), 'expects a context object'],
+                [() => models.generateImages(model, {input:[]}), 'context.input'],
+            ]) {
+                try { await call(); throw new Error('invalid context succeeded'); }
+                catch (error) { if (!String(error).includes(message)) throw error; }
+            }
+            try { await models.classify({provider:'fixture', id:'missing'}, {state:{}, questions:q}); throw new Error('missing model succeeded'); }
+            catch (error) { if (!String(error).includes('unknown model')) throw error; }
+            const result = await models.classify(model, {state:{}, questions:q});
+            if (result.stopReason !== 'error' || result.errorMessage !== 'provider failed') throw new Error('provider result lost');
+            text('ok');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(2)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(ModelHost(calls.clone())),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("script failed")
+        };
+        assert_eq!(data["isError"], false);
+        assert!(data["content"].to_string().contains("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
     #[async_trait::async_trait]
     impl ToolHost for Host {
         fn cancellation_safe_calls(&self) -> bool {
