@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, Usage, extract_tool_images,
 };
-use pi_rs_durable::model::{ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Response, Url, header::HeaderValue};
 use serde_json::{Value, json};
 use std::{
@@ -225,6 +225,25 @@ fn wire_request(
     thinking: Option<&str>,
     replay_scope: &str,
 ) -> Result<Value> {
+    wire_request_with_blocks(request, thinking, replay_scope, None)
+}
+
+fn wire_request_with_blocks(
+    request: &ModelRequest,
+    thinking: Option<&str>,
+    replay_scope: &str,
+    durable: Option<&DurableRequest>,
+) -> Result<Value> {
+    if let Some(durable) = durable {
+        let mut ids = BTreeSet::new();
+        if durable.blocks.iter().any(|(index, binding)| {
+            *index >= request.messages.len()
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+        }) {
+            return Err(Error::Config("invalid durable content bindings".into()));
+        }
+    }
     let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
     let explicit_tool_ids = uses_tool_call_ids(&identity.model);
@@ -232,7 +251,7 @@ fn wire_request(
     let mut system = Vec::new();
     let mut calls = BTreeMap::new();
     let mut tool_images = Vec::new();
-    for message in &request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
             push_content(
                 &mut contents,
@@ -240,6 +259,54 @@ fn wire_request(
                 std::mem::take(&mut tool_images),
                 false,
             );
+        }
+        if let Some(binding) = durable.and_then(|d| d.blocks.get(&index)) {
+            if !matches!(message, Message::User { content } if content.is_empty()) {
+                return Err(Error::Config("durable block placeholder mismatch".into()));
+            }
+            let mut parts = Vec::new();
+            for block in &binding.blocks {
+                let object = block
+                    .as_object()
+                    .ok_or_else(|| Error::Config("invalid content block".into()))?;
+                match block["type"].as_str() {
+                    Some("text") if object.len() == 2 => {
+                        let value = block["text"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid text block".into()))?;
+                        parts.push(json!({"text":value}));
+                    }
+                    Some("image")
+                        if object.len() == 3
+                            && object
+                                .keys()
+                                .all(|k| ["type", "data", "mimeType"].contains(&k.as_str())) =>
+                    {
+                        let image = pi_rs_core::ImageContent {
+                            data: block["data"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                            mime_type: block["mimeType"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                        };
+                        image.validate()?;
+                        parts.push(
+                            json!({"inlineData":{"mimeType":image.mime_type,"data":image.data}}),
+                        );
+                    }
+                    _ => return Err(Error::Config("unsupported durable block metadata".into())),
+                }
+            }
+            if parts.is_empty() {
+                return Err(Error::Config(
+                    "empty user block array unsupported by Google".into(),
+                ));
+            }
+            push_content(&mut contents, "user", parts, true);
+            continue;
         }
         match message {
             Message::System { content } => system.push(content.as_str()),
@@ -405,6 +472,35 @@ fn valid_content(body: &Value) -> bool {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for GoogleAdapter {
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_durable(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<Value> {
+        if !valid_model_id(model_id(&request.request.model)) {
+            return Err(Error::Config("invalid Google model ID".into()));
+        }
+        wire_request_with_blocks(&request.request, None, "google", Some(request))
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request, body)?;
+        if !request.blocks.is_empty()
+            && body.get("contents")
+                != wire_request_with_blocks(&request.request, None, "google", Some(request))?
+                    .get("contents")
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn id(&self) -> &str {
         "google-generative-ai/v1"
     }

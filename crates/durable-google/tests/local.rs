@@ -1,5 +1,6 @@
 use pi_rs_core::{CancellationToken, Error, Message, ModelRequest, ToolSpec};
-use pi_rs_durable::model::{ProviderAdapter, ProviderAttempt, collect_generation};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt, collect_generation};
+use pi_rs_durable::transcript::MessageContentBlocks;
 use pi_rs_durable_google::GoogleAdapter;
 use serde_json::{Value, json};
 use tokio::{
@@ -7,6 +8,57 @@ use tokio::{
     net::TcpListener,
 };
 use uuid::Uuid;
+
+#[tokio::test]
+async fn ordered_durable_blocks_are_preserved_and_hook_tampering_is_rejected() {
+    let adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+    let mut base = request();
+    base.messages = vec![
+        Message::User {
+            content: "before".into(),
+        },
+        Message::User {
+            content: String::new(),
+        },
+        Message::User {
+            content: "after".into(),
+        },
+    ];
+    let durable = DurableRequest {
+        request: base,
+        blocks: [(
+            1,
+            MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let a = attempt();
+    let mut body = adapter.prepare_durable(&a, &durable).await.unwrap();
+    assert_eq!(
+        body["contents"][0]["parts"],
+        json!([{"text":"before"},{"text":"first"},{"inlineData":{"mimeType":"image/png","data":"aGk="}},{"text":"last"},{"text":"after"}])
+    );
+    adapter.validate_durable(&a, &durable, &body).unwrap();
+    body["contents"][0]["parts"][1]["text"] = json!("changed");
+    assert!(adapter.validate_durable(&a, &durable, &body).is_err());
+    let mut bad = durable.clone();
+    bad.blocks.get_mut(&1).unwrap().blocks[0]["textSignature"] = json!("opaque");
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+    bad = durable.clone();
+    bad.blocks.get_mut(&1).unwrap().blocks.clear();
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+    bad = durable;
+    bad.blocks.get_mut(&1).unwrap().message_id = Uuid::nil();
+    assert!(adapter.prepare_durable(&a, &bad).await.is_err());
+}
 
 fn attempt() -> ProviderAttempt {
     ProviderAttempt {
