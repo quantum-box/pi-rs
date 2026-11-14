@@ -89,6 +89,7 @@ without `defaultProvider` are still accepted.
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, coherent local and remote coding/read-only tool factories, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
@@ -238,6 +239,13 @@ fullscreen actions. It displays effective user-configured bindings in readable
 form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
+
+Completed tool-call JSON parsing and incremental argument previews live in the
+portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
+frontends. The standalone crate is compile-checked for
+`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
+on that target. Preview behavior retains the existing native parser's documented
+differences from Pi's streaming parser.
 
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
 alongside the native `extension` and `message` fields. `extensionPath` is the
@@ -863,7 +871,11 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Tests cover reader gating and custom-prompt precedence.
+loading. Declared `SKILL.md` files with missing descriptions report both the
+description problem and any invalid name diagnostics; unreadable skill files
+also report their source path. Empty-description checks use ECMAScript whitespace
+semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
+reader gating and custom-prompt precedence.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -986,7 +998,10 @@ bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
 waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
-cancellation stop the wait sooner. Waiting counts toward the script deadline,
+cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
+admitting or releasing workers, allowing embedders to change the limit while
+running. Reducing it does not interrupt existing workers; native retains its
+1,024-worker ceiling and uses the default of two for invalid values. Waiting counts toward the script deadline,
 and a cancelled waiter does not release another script's worker. In the Rust
 SDK, `Codemode.timeout` remains a `Duration`;
 its default `Duration::MAX` means no deadline, while other values set a limit.
@@ -1311,8 +1326,11 @@ empty directory output and continuation notices.
 
 Single-file `grep` preserves the requested file name in its output when the
 path is a symbolic link, while workspace boundary checks still use the resolved
-target. Focused checks compare the output with Pi v1.5.0 for both linked and
-ordinary files, including context lines.
+target. For explicitly named binary files, NUL bytes are treated as line
+breaks while searching, matching Pi's ripgrep invocation; directory traversal
+continues to skip binary files. Context still comes from the original file, as
+in Pi. Focused checks compare both linked and ordinary files, including context
+lines.
 
 Unrestricted `grep` applies path-containing glob overrides to the absolute
 search paths passed to ripgrep by Pi. Basename globs, negated globs, and
@@ -3865,6 +3883,15 @@ keep their standard request shape. Compaction omits automatic cache
 markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
 
+A configured Anthropic `reasoning: true` declaration supplies fallback thinking
+levels when model discovery is unavailable or omits thinking capability. When the Models API returns a
+capability, its supported modes and levels drive both selection and requests;
+explicit adaptive or thinking-level-map overrides remain authoritative. Other
+discovered model metadata, including output limits, is retained with overrides.
+Automatic thinking discovery for configured Anthropic Messages-compatible models
+is restricted to the Anthropic provider; other gateways retain their declared
+capabilities without an additional Models API probe.
+
 ### Native Anthropic authorization header checkpoint
 
 The standard Anthropic Messages endpoint accepts an explicitly supplied
@@ -4204,3 +4231,31 @@ content blocks, matching its session-context projection. RPC messages report
 empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
+
+### RPC truncated JSON diagnostics
+
+Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
+initial object property names, unfinished unescaped strings, and missing values.
+Offsets and columns in these diagnostics count UTF-16 units. Other malformed
+JSON, escaped unfinished strings and carriage-return position handling retain
+the native parser's diagnostics; full malformed-input parity remains open.
+
+### Shell execution transcript checkpoint
+
+Imported and live Pi-style shell executions display their output and completion
+status separately from the command, instead of showing the model-context
+`Ran ...` wrapper and Markdown fences in the terminal. Cancellation, nonzero
+exit status and truncation paths are included in the display output; the native
+excluded-from-context label is retained. Model context and journal data retain
+their existing framing and values. The terminal continues to use its generic
+tool styling and preview limits, so a long output may hide its status until expanded.
+Shell transcript rendering strips terminal escape sequences and normalizes line
+endings, including for imported and extension-provided output; journal and
+model-context text retain the original bytes.
+
+### Model listing search checkpoint
+
+`--list-models` searches provider and model IDs with Pi's tokenized fuzzy
+matching, including the ASCII letter/number swap (for example `p2` matches
+`nova-2p`). Display names alone do not match. The native JSON listing remains
+available; model scope and picker selection retain their existing behavior.
