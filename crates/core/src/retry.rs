@@ -87,12 +87,12 @@ pub fn provider_error_secrets<'a>(
         if value.is_empty() {
             continue;
         }
-        if let Some((scheme, credential)) = value.split_once(' ')
+        if let Some((scheme, credential)) = value.split_once([' ', '\t'])
             && scheme.eq_ignore_ascii_case("bearer")
-            && !credential.is_empty()
+            && !credential.trim_start_matches([' ', '\t']).is_empty()
         {
             secrets.push(value.to_owned());
-            secrets.push(credential.to_owned());
+            secrets.push(credential.trim_start_matches([' ', '\t']).to_owned());
         } else if should_mask_provider_secret(value) {
             secrets.push(value.to_owned());
         }
@@ -112,90 +112,22 @@ fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
     masked
 }
 
-// A header value can itself be an ordinary classifier word. Suppressing such
-// a value would also suppress a real provider error; fixed diagnostics keep
-// even these ambiguous values out of the user's output.
-// Representative Pi transient messages protect header fragments too. A complete
-// match is additionally checked against the actual Pi pattern below.
-const TRANSIENT_EXAMPLES: &[&str] = &[
-    "overloaded",
-    "server_busy",
-    "servers are currently busy",
-    "currently experiencing high demand",
-    "model is at capacity",
-    "rate limit",
-    "too many requests",
-    "service is temporarily unavailable",
-    "server error",
-    "internal error",
-    "provider returned an error",
-    "exceeded request buffer limit while retrying upstream",
-    "unable to forward upstream",
-    "upstream request failed",
-    "upstream_stream_read_error",
-    "stream was interrupted",
-    "http/2 stream failed",
-    "network error",
-    "connection error",
-    "connection refused",
-    "connection lost",
-    "other side closed",
-    "fetch failed",
-    "request to host failed, reason:",
-    "getaddrinfo",
-    "enotfound",
-    "eai_again",
-    "upstream connect",
-    "reset before headers",
-    "socket hang up",
-    "socket connection was closed",
-    "timed out",
-    "timeout",
-    "terminated",
-    "websocket closed",
-    "websocket error",
-    "ended without",
-    "stream ended before message_stop",
-    "stream ended before a terminal response event",
-    "http2 request did not get a response",
-    "stream disconnected before completion",
-    "pending stream has been canceled",
-    "retry delay",
-    "you can retry your request",
-    "try your request again",
-    "please retry your request",
-    "resourceexhausted",
-    "subscription_sharing_usage_unavailable",
-    "subscription_sharing_user_unavailable",
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "520",
-    "524",
-];
-
+// A complete provider error expression in a header is ambiguous: preserving
+// the classification avoids hiding an actual error. Explicit tokens are always
+// masked, even when their contents coincide with an error expression.
 fn should_mask_provider_secret(secret: &str) -> bool {
     if secret.is_empty() {
         return false;
     }
     let lower = secret.to_ascii_lowercase();
-    let compact: String = lower
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    // An exact retry expression is ambiguous with echoed credentials, so keep
-    // the upstream retry behavior; diagnostics never expose the response text.
-    if TRANSIENT_EXAMPLES.iter().any(|example| {
-        example.contains(&lower)
-            || (!compact.is_empty()
-                && example
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .collect::<String>()
-                    .contains(&compact))
-    }) {
+    // A short header may be only a fragment of a longer matching expression
+    // (for example `rate` within `rate limit`). Derive literal fragments from
+    // the actual matcher so masking cannot remove those fragments either.
+    let matcher_fragment = transient_pattern()
+        .as_str()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|part| !part.is_empty() && part.contains(&lower));
+    if transient_header_expression(&lower) || matcher_fragment {
         return false;
     }
     ![
@@ -262,6 +194,29 @@ pub fn permanent_provider_error(value: &serde_json::Value, secrets: &[String]) -
         })
 }
 
+fn transient_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| regex::Regex::new(concat!(
+            r"overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|",
+            r"service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|",
+            r"exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http/?2 stream failed|",
+            r"network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|request to \S+ failed, reason:|",
+            r"getaddrinfo|enotfound|eai_again|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|",
+            r"websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|",
+            r"http2 request did not get a response|stream disconnected before completion|pending stream has been canceled|retry delay|you can retry your request|",
+            r"try your request again|please retry your request|resourceexhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable"
+        )).expect("valid provider retry pattern"))
+}
+
+fn transient_header_expression(text: &str) -> bool {
+    static WHOLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let whole = WHOLE.get_or_init(|| {
+        regex::Regex::new(&format!("^(?:{})$", transient_pattern().as_str()))
+            .expect("valid provider retry pattern")
+    });
+    whole.is_match(text) || matches!(text, "429" | "500" | "502" | "503" | "504" | "520" | "524")
+}
+
 /// Recognize Pi's transient provider messages without scanning unrelated
 /// metadata. Permanent quota markers always take precedence.
 #[doc(hidden)]
@@ -273,19 +228,7 @@ pub fn retryable_provider_error(value: &serde_json::Value, secrets: &[String]) -
     let error = value.get("error").unwrap_or(&value);
     let matches = |text: &str| {
         let lower = text.to_ascii_lowercase();
-        static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        // This is the pinned Pi retry.ts expression, except status boundaries
-        // are checked below because the Rust regex engine has no look-around.
-        let pattern = PATTERN.get_or_init(|| regex::Regex::new(concat!(
-            r"overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|",
-            r"service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|",
-            r"exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http/?2 stream failed|",
-            r"network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|request to \S+ failed, reason:|",
-            r"getaddrinfo|enotfound|eai_again|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|",
-            r"websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|",
-            r"http2 request did not get a response|stream disconnected before completion|pending stream has been canceled|retry delay|you can retry your request|",
-            r"try your request again|please retry your request|resourceexhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable"
-        )).expect("valid provider retry pattern"));
+        let pattern = transient_pattern();
         if pattern.is_match(&lower) {
             return true;
         }
@@ -770,6 +713,20 @@ mod quota_tests {
         }
     }
 
+    const TRANSIENT_EXAMPLES: &[&str] = &[
+        "overloaded",
+        "server_busy",
+        "rate limit",
+        "service is temporarily unavailable",
+        "service-is-unavailable",
+        "server error",
+        "timeout",
+        "request to host failed, reason:",
+        "resourceexhausted",
+        "429",
+        "503",
+    ];
+
     #[test]
     fn transient_messages_survive_header_collisions_and_secret_echoes() {
         for message in TRANSIENT_EXAMPLES {
@@ -792,13 +749,28 @@ mod quota_tests {
                 "credential echo: {message}"
             );
         }
-        for part in ["rate", "rate:", "limit", "service", "timeout", "server"] {
-            assert!(!should_mask_provider_secret(part), "{part}");
+        for phrase in [
+            "timeout",
+            "service-is-unavailable",
+            "rate:limit",
+            "rate",
+            "service",
+        ] {
+            assert!(!should_mask_provider_secret(phrase), "{phrase}");
         }
     }
 
     #[test]
     fn complete_credentials_are_masked_even_when_they_contain_retry_markers() {
+        for header in [
+            "Bearer  sk-billing-timeout-secret",
+            "bEaReR\t\t sk-billing-timeout-secret",
+        ] {
+            let secrets = provider_error_secrets(None, [header].into_iter());
+            let echo = serde_json::json!("sk-billing-timeout-secret");
+            assert!(!permanent_provider_error(&echo, &secrets));
+            assert!(!retryable_provider_error(&echo, &secrets));
+        }
         for credential in ["sk-billing-timeout-secret", "sk-timeout-secret", "timeout"] {
             let secrets = provider_error_secrets(Some(credential), ["timeout"].into_iter());
             let echo = serde_json::json!({"error":{"message":credential}});

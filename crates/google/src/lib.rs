@@ -1003,6 +1003,8 @@ mod tests {
             ("timeout sk-billing-timeout-secret", false, true),
             ("sk-billing-timeout-secret", false, true),
             ("sk-timeout-secret", false, true),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, true),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1021,6 +1023,11 @@ mod tests {
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert("x-routing", "timeout".parse().unwrap());
                     headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                    headers.insert(
+                        "x-bearer",
+                        "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                    );
+                    headers.insert("x-service", "service-is-unavailable".parse().unwrap());
                     headers
                 });
             let request = ModelRequest {
@@ -1048,6 +1055,11 @@ mod tests {
             assert!(!error.to_string().contains("sentinel-secret"));
             assert!(!error.to_string().contains("sk-billing-timeout-secret"));
             assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
             worker.join().unwrap();
         }
     }
@@ -1056,6 +1068,11 @@ mod tests {
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
             (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
             (
                 503,
@@ -1114,6 +1131,15 @@ mod tests {
             let model = Google::new(&format!("http://{address}"), credential)
                 .unwrap()
                 .with_context_probe(false);
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
             let result = model
                 .stream(ModelRequest {
                     model: "m".into(),
@@ -1132,6 +1158,11 @@ mod tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
             assert!(!error.to_string().contains("sk-billing-timeout-secret"));
             worker.join().unwrap();
         }

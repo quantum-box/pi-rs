@@ -666,6 +666,8 @@ mod tests {
                 true,
             ),
             ("rate---limit", false, false),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, false),
             ("sk-billing-timeout-secret", false, false),
             ("sk-timeout-secret", false, false),
             ("timeout sk-billing-timeout-secret", false, true),
@@ -693,6 +695,11 @@ mod tests {
                 headers.insert("x-plan", "quota exceeded".parse().unwrap());
                 headers.insert("x-routing", "timeout".parse().unwrap());
                 headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
                 headers
             });
             let request = ModelRequest {
@@ -720,6 +727,11 @@ mod tests {
             assert!(!error.to_string().contains("sentinel-secret"));
             assert!(!error.to_string().contains("sk-billing-timeout-secret"));
             assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
             worker.join().unwrap();
         }
     }
@@ -728,6 +740,11 @@ mod tests {
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
             (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
             (
                 503,
@@ -801,6 +818,15 @@ mod tests {
                 headers.insert("x-plan", "quota exceeded".parse().unwrap());
                 headers
             });
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
             let result = model.stream(request()).await;
             let error = match result {
                 Err(error) => error,
@@ -812,6 +838,11 @@ mod tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
             assert!(!error.to_string().contains(credential));
             worker.join().unwrap();
         }
