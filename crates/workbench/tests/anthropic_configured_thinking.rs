@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn configured_thinking_controls_wire_without_models_api() {
-    for (offline, adaptive, mapped, level, expected) in [
-        (true, false, false, "high", "budgeted"),
-        (false, false, false, "minimal", "budgeted"),
-        (true, true, false, "minimal", "low"),
-        (true, true, true, "minimal", "medium"),
+    for (offline, adaptive, mapped, level, expected, limit) in [
+        (true, false, false, "high", "budgeted", false),
+        (false, false, false, "minimal", "budgeted", false),
+        (true, false, true, "low", "budgeted", false),
+        (false, false, true, "low", "budgeted", true),
+        (true, true, false, "minimal", "low", false),
+        (true, true, true, "minimal", "medium", false),
     ] {
         let root = tempfile::tempdir().unwrap();
         let mut model = json!({"id":"fixture-model","reasoning":true});
@@ -18,7 +20,11 @@ fn configured_thinking_controls_wire_without_models_api() {
             model["compat"] = json!({"forceAdaptiveThinking":true});
         }
         if mapped {
-            model["thinkingLevelMap"] = json!({"minimal":"medium"});
+            model["thinkingLevelMap"] = if adaptive {
+                json!({"minimal":"medium"})
+            } else {
+                json!({"low":"high"})
+            };
         }
         std::fs::write(
             root.path().join("models.json"),
@@ -63,13 +69,26 @@ fn configured_thinking_controls_wire_without_models_api() {
                     }
                 }
                 if request.starts_with("GET ") {
-                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    if limit {
+                        let model = json!({"id":"fixture-model","max_tokens":4096,"max_input_tokens":200000,"capabilities":{"thinking":{"supported":false}}});
+                        let body = if request.contains("/models?") {
+                            json!({"data":[model],"has_more":false}).to_string()
+                        } else {
+                            model.to_string()
+                        };
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    } else {
+                        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
                     continue;
                 }
                 assert!(request.starts_with("POST /v1/messages "), "{request}");
                 let mut bytes = vec![0; length];
                 reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
+                if limit {
+                    assert_eq!(body["max_tokens"], 4096);
+                }
                 if expected == "budgeted" {
                     assert_eq!(body["thinking"]["type"], "enabled");
                     assert!(
@@ -77,6 +96,9 @@ fn configured_thinking_controls_wire_without_models_api() {
                             .as_u64()
                             .is_some_and(|value| value > 0)
                     );
+                    if level == "low" {
+                        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+                    }
                 } else {
                     assert_eq!(body["thinking"]["type"], "adaptive");
                     assert_eq!(body["output_config"]["effort"], expected);
@@ -108,6 +130,8 @@ fn configured_thinking_controls_wire_without_models_api() {
                 "fixture-model",
                 "--thinking",
                 level,
+                "--max-output-tokens",
+                "8192",
                 "--api-key",
                 "fixture",
                 "--endpoint",

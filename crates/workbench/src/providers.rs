@@ -780,13 +780,15 @@ impl Client {
                         if selected == "off" && mapped == Some(None) {
                             client = client.with_thinking(None);
                         } else {
-                            let effort = mapped.flatten().filter(|_| selected != "off").unwrap_or(
-                                if adaptive == Some(true) && selected == "minimal" {
+                            let effort = if adaptive == Some(true) && selected != "off" {
+                                mapped.flatten().unwrap_or(if selected == "minimal" {
                                     "low"
                                 } else {
                                     selected
-                                },
-                            );
+                                })
+                            } else {
+                                selected
+                            };
                             client = client.with_configured_thinking(
                                 effort,
                                 adaptive.unwrap_or(false),

@@ -921,12 +921,22 @@ impl Model for Anthropic {
     }
 
     async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
-        let details = if self.configured_thinking.is_some() {
-            self.configured_thinking.clone()
-        } else if self.thinking_level.is_some() {
+        let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
         } else {
             self.cached_model(&request.model)
+        };
+        let details = if let Some(mut configured) = self.configured_thinking.clone() {
+            if let Some(discovered) = discovered {
+                configured.id = discovered.id;
+                configured.context_window = discovered.context_window;
+                configured.max_output_tokens = discovered.max_output_tokens;
+                configured.reasoning = discovered.reasoning;
+                configured.images = discovered.images;
+            }
+            Some(configured)
+        } else {
+            discovered
         };
         if let Some(limit) = details.as_ref().and_then(|model| model.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);

@@ -17,3 +17,9 @@ thinking is explicitly selected. For adaptive thinking, an unmapped `minimal`
 level uses Pi's `low` effort; an explicit `thinkingLevelMap` still wins.
 The loopback fixture checks budgeted and adaptive request bodies without a
 working Models API, including an explicit mapping.
+
+When model discovery reports a smaller output limit, the request still respects
+that limit while configured thinking takes precedence over discovered thinking
+capabilities. Budgeted thinking uses the selected Pi level's budget; effort
+maps affect adaptive thinking. Loopback coverage includes a 4,096-token model
+limit and distinct mapped budgeted and adaptive cases.
