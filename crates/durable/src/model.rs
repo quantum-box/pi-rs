@@ -12,6 +12,7 @@ use pi_rs_core::{
     Result, ToolCall, ToolCallDelta, ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Construct a provider request from already prepared core conversation and tool definitions.
 pub fn model_request(
@@ -43,6 +44,53 @@ pub struct CompletedGeneration {
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub metadata: ModelMetadata,
+}
+
+/// Caller-provided identity and exact input for one model invocation.
+/// Persist the intent before invoking the model when recovery requires it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerationRequest {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub request: ModelRequest,
+}
+
+/// A completed invocation, including the identity and input needed for recovery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerationResult {
+    pub request: GenerationRequest,
+    pub generation: CompletedGeneration,
+}
+
+/// Invoke the existing session-aware model interface with caller-provided IDs.
+///
+/// The caller owns intent and checkpoint persistence, retries, usage settlement,
+/// and tool execution. An error or cancellation does not return partial output;
+/// it does not establish whether the remote provider executed the request.
+pub async fn generate_in_session<M, F>(
+    model: &M,
+    request: GenerationRequest,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<GenerationResult>
+where
+    M: Model + ?Sized,
+    F: FnMut(GenerationProgress),
+{
+    let generation = collect_generation(
+        model.stream_in_session(
+            request.request_id,
+            request.session_id,
+            request.request.clone(),
+        ),
+        cancel,
+        progress,
+    )
+    .await?;
+    Ok(GenerationResult {
+        request,
+        generation,
+    })
 }
 
 impl CompletedGeneration {
@@ -148,3 +196,111 @@ where
 #[cfg(test)]
 #[path = "model_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod session_adapter_tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use std::sync::Mutex;
+
+    struct TestModel {
+        seen: Mutex<Vec<GenerationRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for TestModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("session-aware interface must be used")
+        }
+
+        async fn stream_in_session(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            request: ModelRequest,
+        ) -> Result<ModelStream> {
+            self.seen.lock().unwrap().push(GenerationRequest {
+                request_id,
+                session_id,
+                request,
+            });
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Metadata(ModelMetadata {
+                    provider_request_id: Some("provider-id".into()),
+                    finish_reason: Some("tool_calls".into()),
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "tool-id".into(),
+                        name: "read".into(),
+                        arguments: "{\"path\":\"a\"}".into(),
+                    }],
+                    usage: Some(Usage {
+                        input_tokens: 5,
+                        output_tokens: 7,
+                    }),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_identity_input_and_completed_output_roundtrip() {
+        let model = TestModel {
+            seen: Mutex::new(Vec::new()),
+        };
+        let request = GenerationRequest {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            request: model_request(
+                "model",
+                vec![Message::User {
+                    content: "hi".into(),
+                }],
+                vec![],
+                42,
+            ),
+        };
+        let result =
+            generate_in_session(&model, request.clone(), &CancellationToken::new(), |_| {})
+                .await
+                .unwrap();
+        assert_eq!(*model.seen.lock().unwrap(), vec![request.clone()]);
+        assert_eq!(result.request, request);
+        assert_eq!(result.generation.content, "answer");
+        assert_eq!(result.generation.calls[0].id, "tool-id");
+        assert_eq!(result.generation.calls[0].arguments, "{\"path\":\"a\"}");
+        assert_eq!(result.generation.usage.unwrap().output_tokens, 7);
+        assert_eq!(
+            result.generation.metadata.provider_request_id.as_deref(),
+            Some("provider-id")
+        );
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<GenerationResult>(&bytes).unwrap(),
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_does_not_open_stream() {
+        let model = TestModel {
+            seen: Mutex::new(Vec::new()),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let request = GenerationRequest {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            request: model_request("model", vec![], vec![], 1),
+        };
+        assert!(matches!(
+            generate_in_session(&model, request, &cancel, |_| {}).await,
+            Err(Error::Cancelled)
+        ));
+        assert!(model.seen.lock().unwrap().is_empty());
+    }
+}
