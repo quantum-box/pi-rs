@@ -204,6 +204,7 @@ impl Terminal {
             }
             return Ok(());
         }
+        crate::ui::theme::begin_terminal_palette_query();
         self.color_queries.push_back(ColorQuery {
             started: Instant::now(),
             replied: 0,
@@ -4296,13 +4297,8 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        crate::ui::theme::reset_terminal_background();
                         if let Some(terminal) = &mut _terminal {
                             terminal.query_terminal_colors()?;
-                        }
-                        if theme.name == "system" {
-                            theme = Theme::system();
-                            dirty = true;
                         }
                         crate::ui::theme::set_appearance(dark)
                     }
