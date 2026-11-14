@@ -107,9 +107,11 @@ custom IDs are preserved across native export and reopen and used for
 model request and cache warming affinity. A separate internal UUID continues to
 identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
 external ID. RPC state, session statistics, resume search, share headers and
-model-shell metadata project the external ID. An ID invalid as an HTTP header is
-omitted from affinity headers; an ID containing NUL is omitted from the child
-process environment. Internal UUIDs remain accepted for native session lookup.
+model-shell metadata project the external ID. Empty IDs omit affinity headers;
+nonempty IDs use Fetch-compatible Latin-1 header bytes and whitespace
+normalization and fail before dispatch if invalid. An ID containing NUL is
+omitted from the child process environment. Internal UUIDs remain accepted for
+native session lookup.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
