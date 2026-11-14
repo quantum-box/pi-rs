@@ -1367,6 +1367,15 @@ model discovery and persistent CLI/RPC workers. The credential remains
 process-local. Regression tests verify the selected bearer header and check
 that session records and command output contain no key value.
 
+### Repeated CLI modes and session references
+
+Repeated `--mode`, `--tui-mode`, `--session`, `--session-id` and `--fork`
+options use their last value, as in Pi v1.5.0. Invalid mode values are still
+rejected even when a later value is valid. Native session-option conflicts and
+session ID validation remain in force, and arguments after `--` remain prompt
+text. Parser regressions cover these cases; a CLI fixture verifies that only
+the last named session is created.
+
 ### Regular-mode redraw checkpoint
 
 Regular mode replays committed entries when visibility settings, theme colors

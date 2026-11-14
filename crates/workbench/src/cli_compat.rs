@@ -24,6 +24,11 @@ pub(super) fn parse(
         "use-theme",
         "system-prompt",
         "exclude-tools",
+        "mode",
+        "tui-mode",
+        "session",
+        "session-id",
+        "fork",
     ] {
         let id = command
             .get_arguments()
@@ -403,6 +408,58 @@ mod tests {
         assert_eq!(args.exclude_tools.as_deref(), Some("bash"));
         assert_eq!(args.skill, ["one", "two"]);
         assert_eq!(args.prompt, ["--model", "literal"]);
+    }
+
+    #[test]
+    fn repeated_modes_and_session_references_keep_the_last_value() {
+        let args = cli(&[
+            "pi",
+            "--mode",
+            "text",
+            "--mode",
+            "json",
+            "--tui-mode",
+            "regular",
+            "--tui-mode",
+            "fullscreen",
+            "--session",
+            "first",
+            "--session",
+            "last",
+            "--",
+            "--mode",
+            "rpc",
+        ]);
+        assert!(matches!(args.mode, Some(super::super::OutputMode::Json)));
+        assert!(matches!(
+            args.tui_mode,
+            Some(super::super::TuiMode::Fullscreen)
+        ));
+        assert_eq!(args.session, std::path::Path::new("last"));
+        assert_eq!(args.prompt, ["--mode", "rpc"]);
+        let args = cli(&["pi", "--session-id", "first", "--session-id", "last"]);
+        assert_eq!(args.session_id.as_deref(), Some("last"));
+        let args = cli(&["pi", "--fork", "first", "--fork", "last"]);
+        assert_eq!(
+            args.fork_session.as_deref(),
+            Some(std::path::Path::new("last"))
+        );
+        for args in [
+            &["pi", "--mode", "bogus", "--mode", "json"][..],
+            &["pi", "--tui-mode", "bogus", "--tui-mode", "regular"][..],
+            &["pi", "--session-id", "invalid/id", "--session-id", "valid"][..],
+            &[
+                "pi",
+                "--session",
+                "one",
+                "--session",
+                "two",
+                "--session-id",
+                "id",
+            ][..],
+        ] {
+            assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
+        }
     }
 
     #[test]
