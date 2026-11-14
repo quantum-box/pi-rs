@@ -21,7 +21,9 @@ pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_ATTEMPTS: usize = 16;
 /// Upper bound on records inspected during one startup discovery.
 pub const MAX_DISCOVERY_OPERATIONS: usize = 128;
-const MAX_DISCOVERY_BYTES: usize = 16 * 1024 * 1024;
+// A completed operation retains the preparation twice and one bounded
+// generation. This leaves room for their enclosing metadata and attempts.
+const MAX_DISCOVERY_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Host-attested, versioned identities for the model and usage-settlement
 /// service. Change either identity whenever its replay semantics change.
@@ -131,6 +133,8 @@ pub struct Operation {
     placement_version: Option<u64>,
     #[serde(default)]
     provider: Option<ProviderIdentity>,
+    #[serde(default)]
+    auto_place: bool,
 }
 impl Operation {
     pub fn id(&self) -> Uuid {
@@ -153,6 +157,9 @@ impl Operation {
     }
     pub(crate) fn provider(&self) -> Option<&ProviderIdentity> {
         self.provider.as_ref()
+    }
+    pub(crate) fn auto_place(&self) -> bool {
+        self.auto_place
     }
 
     /// Derive the exact report to replay from the durable checkpoint. Once an
@@ -235,6 +242,7 @@ impl<'a> SummaryStore<'a> {
             attempts: vec![],
             placement_version: None,
             provider: None,
+            auto_place: false,
         };
         self.write(&op, Expected::Missing)
     }
@@ -259,6 +267,7 @@ impl<'a> SummaryStore<'a> {
                 attempts: vec![],
                 placement_version: None,
                 provider: Some(provider),
+                auto_place: false,
             },
             Expected::Missing,
         )
@@ -275,6 +284,7 @@ impl<'a> SummaryStore<'a> {
         conversation_key: Vec<u8>,
         version: u64,
         provider: ProviderIdentity,
+        auto_place: bool,
     ) -> Result<(), Error> {
         if id.is_nil() || session_id.is_nil() || version == 0 || !provider.valid() {
             return Err(Error::Identity);
@@ -290,6 +300,7 @@ impl<'a> SummaryStore<'a> {
             attempts: vec![],
             placement_version: Some(version),
             provider: Some(provider),
+            auto_place,
         };
         let key = Self::key(id);
         self.store
@@ -328,7 +339,6 @@ impl<'a> SummaryStore<'a> {
         let mut after = PREFIX.to_vec();
         let mut runnable = Vec::new();
         let mut blocked = Vec::new();
-        let mut bytes = 0usize;
         for count in 0..=MAX_DISCOVERY_OPERATIONS {
             let (_, mut page) = self.store.page_with_metadata(
                 b"durable/summary-discovery/unused",
@@ -342,8 +352,7 @@ impl<'a> SummaryStore<'a> {
             if count == MAX_DISCOVERY_OPERATIONS {
                 return Err(Error::Limit);
             }
-            bytes = bytes.saturating_add(entry.value.len());
-            if bytes > MAX_DISCOVERY_BYTES {
+            if entry.value.len() > MAX_DISCOVERY_RECORD_BYTES {
                 return Err(Error::Limit);
             }
             let id = Uuid::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidRecord)?)
@@ -372,13 +381,42 @@ impl<'a> SummaryStore<'a> {
             {
                 if op.provider.as_ref() != Some(provider) {
                     blocked.push(id);
-                } else if needs_worker {
+                } else if needs_worker
+                    || (op.auto_place
+                        && matches!(
+                            op.state,
+                            State::Completed { .. } | State::PlacementPending { .. }
+                        ))
+                {
                     runnable.push(id);
                 }
             }
             after = key;
         }
         unreachable!()
+    }
+
+    /// Public admissions are serialized by the owning Scheduler. Reserve
+    /// capacity before creating another operation so a successful admission
+    /// cannot make the next bounded startup scan exceed its record limit.
+    pub(crate) fn ensure_creation_capacity(&self) -> Result<(), Error> {
+        let mut after = PREFIX.to_vec();
+        for _ in 0..MAX_DISCOVERY_OPERATIONS {
+            let (_, mut page) = self.store.page_with_metadata(
+                b"durable/summary-discovery/unused",
+                PREFIX,
+                &after,
+                1,
+            )?;
+            let Some((key, entry)) = page.pop() else {
+                return Ok(());
+            };
+            if entry.value.len() > MAX_DISCOVERY_RECORD_BYTES {
+                return Err(Error::Limit);
+            }
+            after = key;
+        }
+        Err(Error::Limit)
     }
 
     /// Commit an immutable placement admission and the pending state together,
@@ -762,6 +800,7 @@ impl<'a> SummaryStore<'a> {
                     generation: generation.clone(),
                 }),
             ),
+            State::Completed { .. } | State::PlacementPending { .. } => (None, None),
             _ => return Err(Error::State),
         };
         op.state = State::Aborting { owner, accounting };

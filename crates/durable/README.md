@@ -596,15 +596,35 @@ Legacy in-flight preparations without a generation can finish while the
 conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
-An internal scheduler-owned summary worker can execute a persisted preparation,
-settle usage, and recover or abort when explicitly scheduled by operation ID.
-An internal placement call accepts only an idle context at the exact version
+`Scheduler::request_idle_independent_compaction` starts an independent summary
+for an idle conversation with no selected extensions. Supply and retain a
+unique operation ID; the call returns false if nothing can be compacted. On a
+storage error, reopen and inspect that ID before retrying because admission may
+have committed. Use
+`wait_independent_compaction`, `independent_compaction_status`, and
+`abort_independent_compaction` to observe or abort that operation. A failed
+worker can be retried with `resume_independent_compaction` or recovered on
+reopen. This path rejects selected extensions rather than skipping their
+`beforeCompact` hooks; use the existing manual compaction API when hooks or
+instructions are needed. Admission checks the conversation's own phase and
+queue, not activity in its owned tasks or descendants. Conversation abort and
+idle waits do not yet include this independent operation.
+
+```rust,ignore
+let operation = uuid::Uuid::new_v4();
+if scheduler.request_idle_independent_compaction(conversation, operation, 0)? {
+    let status = scheduler.wait_independent_compaction(operation).await?;
+    // Successful completion is Applied, Stale, or Aborted.
+}
+```
+
+The independent placement accepts only an idle context at the exact version
 captured at preparation; a change settles the operation stale. The context edit
 and terminal status commit together. Before an eligible placement decision,
 the internal path atomically stores a version-fenced pending state and an
 immutable placement-admission ticket. Its store commit sequence survives
 reopen and can be compared with tracked conversation commits. This is an
-ordering prerequisite, not yet a shared inbox or a public admission path.
+ordering prerequisite, not yet a shared inbox or busy admission path.
 Placement limits transcript records and
 processed payload sizes, but the storage API still materializes individual
 entries before their sizes can be checked. `Scheduler::open_with_summary_recovery`
@@ -612,10 +632,11 @@ opts into startup discovery with host-attested model and usage-settlement
 identities. The identities must cover the provider, account or tenant and
 request-ID settlement namespace, and change when replay semantics change.
 Legacy or mismatched operations are blocked and listed by
-`blocked_summary_recovery`; completed results still require explicit internal
-placement. Discovery fails before dispatch if there are more than 128 total
-summary records or 16 MiB of serialized records, including terminal records;
-there is currently no retention policy. The store materializes each record
+`blocked_summary_recovery`. Public operations automatically resume completed or
+pending placement after reopen. Discovery fails before dispatch if there are
+more than 128 total summary records or any record exceeds 4 MiB, including
+terminal records. Public admission rejects a full store; there is currently no
+retention policy. The store materializes each record
 before checking its size. Busy compaction admission is not exposed. Usage
 settlement requires request-ID idempotence; interrupted attempts are reported
 unconfirmed.

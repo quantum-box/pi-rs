@@ -18,6 +18,8 @@ pub(crate) enum Error {
     Interrupted,
     #[error("summary provider identity is missing or does not match")]
     Identity,
+    #[error("summary placement: {0}")]
+    Placement(String),
 }
 
 fn snapshot(store: &SummaryStore<'_>, id: Uuid) -> Result<Snapshot, Error> {

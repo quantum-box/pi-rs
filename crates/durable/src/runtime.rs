@@ -162,6 +162,16 @@ pub enum ManualCompactionStatus {
     Stale,
 }
 
+/// Status of the opt-in idle-only independent compaction path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndependentCompactionStatus {
+    Running,
+    Aborting,
+    Applied,
+    Stale,
+    Aborted,
+}
+
 /// An operation ID is stable across summary attempts and process recovery.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManualCompaction {
@@ -7985,6 +7995,145 @@ impl Harness {
         })
     }
 }
+struct SummaryPlacementDriver {
+    harness: Harness,
+    summary_provider: Option<SummaryProviderIdentity>,
+    cancel: CancellationToken,
+}
+impl SummaryPlacementDriver {
+    /// A conservative exact-version decision. Neither a changed conversation
+    /// nor an unbound legacy operation can ever become eligible again.
+    fn place_summary(&mut self, id: Uuid) -> Result<SummaryPlacement, Error> {
+        use crate::summary_store::{State, SummaryStore};
+        let provider = self
+            .summary_provider
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
+        for _ in 0..8 {
+            let owner = self.harness.owner.clone();
+            let store = SummaryStore::new(owner.store());
+            let snap = store
+                .get(id)
+                .map_err(|e| self.summary_store_error(e))?
+                .ok_or(Error::NotFound)?;
+            if snap.operation.provider() != Some(provider) {
+                return Err(Error::Invalid(
+                    "summary provider identity is missing or does not match".into(),
+                ));
+            }
+            let (result, pending) = match snap.operation.state() {
+                State::Placed { .. } => return Ok(SummaryPlacement::Placed),
+                State::Stale { .. } => return Ok(SummaryPlacement::Stale),
+                State::Completed { result, .. } => (result, false),
+                State::PlacementPending { result, .. } => (result, true),
+                State::Aborting { .. } | State::Aborted => return Err(Error::Interrupted),
+                _ => return Err(Error::Invalid("summary is not completed".into())),
+            };
+            let conversation = snap.operation.session_id();
+            let key = Harness::key(conversation);
+            let current = owner.store().get(&key)?;
+            let observed = current
+                .as_ref()
+                .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+            if pending {
+                store
+                    .placement_ticket(&snap)
+                    .map_err(|e| self.summary_store_error(e))?;
+            } else if let Some(version) = snap.operation.placement_version()
+                && current
+                    .as_ref()
+                    .is_some_and(|entry| entry.version == version)
+            {
+                match store.admit_placement(&snap, key.clone(), version) {
+                    Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
+                    Err(error) => return Err(self.summary_store_error(error)),
+                }
+            }
+            let mut placement = None;
+            if current.as_ref().map(|entry| entry.version) == snap.operation.placement_version()
+                && snap.operation.placement_version().is_some()
+            {
+                let (mut state, version) = self.harness.load_for_summary_placement(conversation)?;
+                if observed != Expected::Version(version) {
+                    continue;
+                }
+                if !state.is_working()
+                    && !state.abort_requested
+                    && state.content_blocks.is_empty()
+                    && result.source_matches(&state.messages)
+                    && !result.is_stale(&state.messages, state.context_generation)
+                {
+                    state.messages =
+                        result.apply_in_context(&state.messages, state.context_generation)?;
+                    state.context_generation = Some(Uuid::new_v4());
+                    placement = Some(self.harness.prepare_conversation_save_inner(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &[],
+                        &[],
+                        Some(result),
+                    )?);
+                }
+            }
+            let placed = placement.is_some();
+            let (checks, mutations) = store
+                .placement_batch(&snap, placed)
+                .map_err(|e| self.summary_store_error(e))?;
+            let mut batch = placement.unwrap_or_else(|| PreparedConversationSave {
+                owner: owner.clone(),
+                checks: vec![Check {
+                    key,
+                    expected: observed,
+                }],
+                mutations: vec![],
+            });
+            batch.extend(PreparedConversationSave {
+                owner,
+                checks,
+                mutations,
+            })?;
+            let bytes = batch
+                .mutations
+                .iter()
+                .map(|m| match m {
+                    Mutation::Put { key, value } => key.len().saturating_add(value.len()),
+                    Mutation::Delete { key } => key.len(),
+                })
+                .fold(0usize, usize::saturating_add);
+            if bytes > SUMMARY_MAX_BATCH_BYTES
+                || batch.checks.len() > 64
+                || batch.mutations.len() > 64
+            {
+                return Err(Error::Invalid(
+                    "independent summary placement batch exceeds limits".into(),
+                ));
+            }
+            match self.harness.commit_conversation_save(batch) {
+                Ok(()) => {
+                    return Ok(if placed {
+                        SummaryPlacement::Placed
+                    } else {
+                        SummaryPlacement::Stale
+                    });
+                }
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Invalid(
+            "independent summary placement conflicted repeatedly".into(),
+        ))
+    }
+    fn summary_store_error(&self, error: crate::summary_store::Error) -> Error {
+        if matches!(error, crate::summary_store::Error::Store(_)) {
+            self.harness.storage_failed.store(true, Ordering::Release);
+            self.cancel.cancel();
+        }
+        Error::Invalid(format!("summary: {error}"))
+    }
+}
+
 /// A background scheduler. Dropping it does not cancel already spawned work;
 /// those tasks retain scheduler ownership until they stop. Call `shutdown` to
 /// wait for all admitted work and release ownership deterministically.
@@ -8599,6 +8748,130 @@ impl Scheduler {
         }
         Ok(operation)
     }
+
+    /// Start an independent compaction of an idle conversation with a caller-
+    /// supplied unique operation ID. Returns false if there is nothing to compact.
+    /// Retain the ID: a storage error can leave admission outcome unknown, and
+    /// its status can be inspected after reopen. Requires recovery configuration and no
+    /// selected extensions. A concurrent conversation change settles it stale.
+    /// Idle here refers to the conversation's own phase and queue; owned
+    /// task and descendant activity is not included in this admission check.
+    /// Use the operation-specific wait and abort methods: conversation abort
+    /// and idle waits do not yet include this independent worker.
+    pub fn request_idle_independent_compaction(
+        &mut self,
+        conversation: Uuid,
+        id: Uuid,
+        keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        if id.is_nil() {
+            return Err(Error::Invalid("independent compaction ID is nil".into()));
+        }
+        if self.harness.failed
+            || self.harness.dirty.load(Ordering::Acquire)
+            || self.harness.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        if crate::summary_store::SummaryStore::new(self.harness.owner.store())
+            .get(id)
+            .map_err(|e| self.summary_store_error(e))?
+            .is_some()
+        {
+            return Err(Error::Invalid(
+                "independent compaction ID already exists".into(),
+            ));
+        }
+        if !self.create_independent_summary_impl(
+            id,
+            conversation,
+            None,
+            keep_recent_tokens,
+            true,
+        )? {
+            return Ok(false);
+        }
+        self.spawn_summary(id);
+        Ok(true)
+    }
+
+    /// Read an independent operation without driving it.
+    pub fn independent_compaction_status(
+        &self,
+        id: Uuid,
+    ) -> Result<IndependentCompactionStatus, Error> {
+        use crate::summary_store::{State, SummaryStore};
+        if self.harness.failed
+            || self.harness.dirty.load(Ordering::Acquire)
+            || self.harness.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        let provider = self
+            .summary_provider
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
+        let snap = SummaryStore::new(self.harness.owner.store())
+            .get(id)
+            .map_err(|e| self.summary_store_error(e))?
+            .ok_or(Error::NotFound)?;
+        if !snap.operation.auto_place() || snap.operation.provider() != Some(provider) {
+            return Err(Error::Invalid(
+                "independent compaction identity is missing or does not match".into(),
+            ));
+        }
+        Ok(match snap.operation.state() {
+            State::Placed { .. } => IndependentCompactionStatus::Applied,
+            State::Stale { .. } => IndependentCompactionStatus::Stale,
+            State::Aborting { .. } => IndependentCompactionStatus::Aborting,
+            State::Aborted => IndependentCompactionStatus::Aborted,
+            _ => IndependentCompactionStatus::Running,
+        })
+    }
+
+    /// Wait for this scheduler's worker, including placement. If an earlier
+    /// wait observed a failure, explicitly reschedule or reopen to recover.
+    pub async fn wait_independent_compaction(
+        &mut self,
+        id: Uuid,
+    ) -> Result<IndependentCompactionStatus, Error> {
+        let status = self.independent_compaction_status(id)?;
+        if self.summary_tasks.contains_key(&id) {
+            self.wait_summary(id).await?;
+        } else if matches!(
+            status,
+            IndependentCompactionStatus::Running | IndependentCompactionStatus::Aborting
+        ) {
+            return Err(Error::Invalid(
+                "independent compaction is not scheduled".into(),
+            ));
+        }
+        self.independent_compaction_status(id)
+    }
+
+    /// Explicitly retry an interrupted independent operation under its fence.
+    pub fn resume_independent_compaction(&mut self, id: Uuid) -> Result<(), Error> {
+        if !matches!(
+            self.independent_compaction_status(id)?,
+            IndependentCompactionStatus::Running | IndependentCompactionStatus::Aborting
+        ) {
+            return Err(Error::Invalid(
+                "independent compaction is already terminal".into(),
+            ));
+        }
+        self.schedule_summary(id)
+    }
+
+    /// Persist abort, cancel and join the worker, then settle usage before
+    /// returning. A placement that committed first remains terminal.
+    pub async fn abort_independent_compaction(
+        &mut self,
+        id: Uuid,
+    ) -> Result<IndependentCompactionStatus, Error> {
+        self.independent_compaction_status(id)?;
+        self.abort_summary(id).await?;
+        self.independent_compaction_status(id)
+    }
     /// Commits the admission before scheduling, including duplicate request IDs.
     pub fn submit(
         &mut self,
@@ -8924,14 +9197,42 @@ impl Scheduler {
         max_output_tokens: u32,
         keep_recent_tokens: usize,
     ) -> Result<bool, Error> {
+        self.create_independent_summary_impl(
+            id,
+            conversation,
+            Some(max_output_tokens),
+            keep_recent_tokens,
+            false,
+        )
+    }
+
+    fn create_independent_summary_impl(
+        &self,
+        id: Uuid,
+        conversation: Uuid,
+        max_output_tokens: Option<u32>,
+        keep_recent_tokens: usize,
+        auto_place: bool,
+    ) -> Result<bool, Error> {
         let provider = self
             .summary_provider
             .clone()
             .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
+        if auto_place {
+            crate::summary_store::SummaryStore::new(self.harness.owner.store())
+                .ensure_creation_capacity()
+                .map_err(|e| self.summary_store_error(e))?;
+        }
         let (state, version) = self.harness.load_for_summary_placement(conversation)?;
         if state.is_working() || state.abort_requested || !state.content_blocks.is_empty() {
             return Err(Error::Invalid(
                 "conversation is not eligible for independent placement".into(),
+            ));
+        }
+        if auto_place && (!matches!(state.phase, Phase::Idle) || !state.extensions.is_empty()) {
+            return Err(Error::Invalid(
+                "independent compaction requires an idle conversation without selected extensions"
+                    .into(),
             ));
         }
         let generation = state
@@ -8940,7 +9241,7 @@ impl Scheduler {
         let Some(preparation) = crate::compact::prepare(
             &state.messages,
             &state.config.model,
-            max_output_tokens,
+            max_output_tokens.unwrap_or(state.config.max_output_tokens),
             keep_recent_tokens,
             None,
         )?
@@ -8955,134 +9256,20 @@ impl Scheduler {
                 Harness::key(conversation),
                 version,
                 provider,
+                auto_place,
             )
             .map_err(|e| self.summary_store_error(e))?;
         Ok(true)
     }
 
-    /// A conservative exact-version decision. Neither a changed conversation
-    /// nor an unbound legacy operation can ever become eligible again.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn place_summary(&mut self, id: Uuid) -> Result<SummaryPlacement, Error> {
-        use crate::summary_store::{State, SummaryStore};
-        let provider = self
-            .summary_provider
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
-        for _ in 0..8 {
-            let owner = self.harness.owner.clone();
-            let store = SummaryStore::new(owner.store());
-            let snap = store
-                .get(id)
-                .map_err(|e| self.summary_store_error(e))?
-                .ok_or(Error::NotFound)?;
-            if snap.operation.provider() != Some(provider) {
-                return Err(Error::Invalid(
-                    "summary provider identity is missing or does not match".into(),
-                ));
-            }
-            let (result, pending) = match snap.operation.state() {
-                State::Placed { .. } => return Ok(SummaryPlacement::Placed),
-                State::Stale { .. } => return Ok(SummaryPlacement::Stale),
-                State::Completed { result, .. } => (result, false),
-                State::PlacementPending { result, .. } => (result, true),
-                _ => return Err(Error::Invalid("summary is not completed".into())),
-            };
-            let conversation = snap.operation.session_id();
-            let key = Harness::key(conversation);
-            let current = owner.store().get(&key)?;
-            let observed = current
-                .as_ref()
-                .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
-            if pending {
-                store
-                    .placement_ticket(&snap)
-                    .map_err(|e| self.summary_store_error(e))?;
-            } else if let Some(version) = snap.operation.placement_version()
-                && current
-                    .as_ref()
-                    .is_some_and(|entry| entry.version == version)
-            {
-                match store.admit_placement(&snap, key.clone(), version) {
-                    Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
-                    Err(error) => return Err(self.summary_store_error(error)),
-                }
-            }
-            let mut placement = None;
-            if current.as_ref().map(|entry| entry.version) == snap.operation.placement_version()
-                && snap.operation.placement_version().is_some()
-            {
-                let (mut state, version) = self.harness.load_for_summary_placement(conversation)?;
-                if observed != Expected::Version(version) {
-                    continue;
-                }
-                if !state.is_working()
-                    && !state.abort_requested
-                    && state.content_blocks.is_empty()
-                    && result.source_matches(&state.messages)
-                    && !result.is_stale(&state.messages, state.context_generation)
-                {
-                    state.messages =
-                        result.apply_in_context(&state.messages, state.context_generation)?;
-                    state.context_generation = Some(Uuid::new_v4());
-                    placement = Some(self.harness.prepare_conversation_save_inner(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &[],
-                        &[],
-                        Some(result),
-                    )?);
-                }
-            }
-            let placed = placement.is_some();
-            let (checks, mutations) = store
-                .placement_batch(&snap, placed)
-                .map_err(|e| self.summary_store_error(e))?;
-            let mut batch = placement.unwrap_or_else(|| PreparedConversationSave {
-                owner: owner.clone(),
-                checks: vec![Check {
-                    key,
-                    expected: observed,
-                }],
-                mutations: vec![],
-            });
-            batch.extend(PreparedConversationSave {
-                owner,
-                checks,
-                mutations,
-            })?;
-            let bytes = batch
-                .mutations
-                .iter()
-                .map(|m| match m {
-                    Mutation::Put { key, value } => key.len().saturating_add(value.len()),
-                    Mutation::Delete { key } => key.len(),
-                })
-                .fold(0usize, usize::saturating_add);
-            if bytes > SUMMARY_MAX_BATCH_BYTES
-                || batch.checks.len() > 64
-                || batch.mutations.len() > 64
-            {
-                return Err(Error::Invalid(
-                    "independent summary placement batch exceeds limits".into(),
-                ));
-            }
-            match self.harness.commit_conversation_save(batch) {
-                Ok(()) => {
-                    return Ok(if placed {
-                        SummaryPlacement::Placed
-                    } else {
-                        SummaryPlacement::Stale
-                    });
-                }
-                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                Err(error) => return Err(error),
-            }
+        SummaryPlacementDriver {
+            harness: self.harness.worker(),
+            summary_provider: self.summary_provider.clone(),
+            cancel: self.cancel.clone(),
         }
-        Err(Error::Invalid(
-            "independent summary placement conflicted repeatedly".into(),
-        ))
+        .place_summary(id)
     }
 
     #[allow(dead_code)]
@@ -9117,19 +9304,54 @@ impl Scheduler {
         let worker_cancel = cancel.clone();
         let root = self.cancel.clone();
         let storage_failed = self.harness.storage_failed.clone();
+        let mut placement = SummaryPlacementDriver {
+            harness: self.harness.worker(),
+            summary_provider: self.summary_provider.clone(),
+            cancel: self.cancel.clone(),
+        };
         let provider = self
             .summary_provider
             .clone()
             .expect("summary recovery requires a provider identity");
         let join = tokio::spawn(async move {
-            let result =
-                crate::summary_worker::run(owner, model, id, worker_cancel, provider).await;
-            if matches!(
-                &result,
-                Err(crate::summary_worker::Error::Store(
-                    crate::summary_store::Error::Store(_)
-                ))
-            ) {
+            let result = async {
+                crate::summary_worker::run(
+                    owner.clone(),
+                    model,
+                    id,
+                    worker_cancel.clone(),
+                    provider,
+                )
+                .await?;
+                if worker_cancel.is_cancelled() {
+                    return Err(crate::summary_worker::Error::Interrupted);
+                }
+                let snap = crate::summary_store::SummaryStore::new(owner.store())
+                    .get(id)?
+                    .ok_or(crate::summary_store::Error::NotFound)?;
+                if snap.operation.auto_place()
+                    && matches!(
+                        snap.operation.state(),
+                        crate::summary_store::State::Completed { .. }
+                            | crate::summary_store::State::PlacementPending { .. }
+                    )
+                {
+                    placement.place_summary(id).map_err(|error| match error {
+                        Error::Interrupted => crate::summary_worker::Error::Interrupted,
+                        other => crate::summary_worker::Error::Placement(other.to_string()),
+                    })?;
+                }
+                Ok(())
+            }
+            .await;
+            if storage_failed.load(Ordering::Acquire)
+                || matches!(
+                    &result,
+                    Err(crate::summary_worker::Error::Store(
+                        crate::summary_store::Error::Store(_)
+                    ))
+                )
+            {
                 storage_failed.store(true, Ordering::Release);
                 root.cancel();
             }
@@ -9177,10 +9399,7 @@ impl Scheduler {
                     marked = true;
                     break;
                 }
-                State::Completed { .. }
-                | State::PlacementPending { .. }
-                | State::Placed { .. }
-                | State::Stale { .. } => {
+                State::Placed { .. } | State::Stale { .. } => {
                     return Err(Error::Invalid("summary already completed".into()));
                 }
                 _ => match store.begin_abort(id, snap.version) {
