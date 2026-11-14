@@ -315,7 +315,7 @@ impl Scheduler {
     fn ts(&self) -> TaskStore<'_> {
         TaskStore::new(self.attachment.owner.store())
     }
-    fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), Error> {
         if self.poisoned {
             Err(Error::Poisoned)
         } else {

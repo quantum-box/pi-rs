@@ -43,6 +43,21 @@ pub(crate) struct Shared {
     notifications: Mutex<Option<SyncSender<()>>>,
     subscription: Mutex<Option<Receiver<()>>>,
 }
+
+#[allow(dead_code)] // Private handoff foundation; no tool dispatch is connected.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuiescentError {
+    #[error("scheduler is busy")]
+    Busy,
+    #[error("task driver has stopped")]
+    Stopped,
+    #[error("scheduler or driver lock poisoned")]
+    Poisoned,
+    #[error(transparent)]
+    Scheduler(#[from] task_scheduler::Error),
+    #[error(transparent)]
+    Lease(#[from] crate::executor_handoff::Error),
+}
 #[derive(Default)]
 struct State {
     stop: bool,
@@ -502,6 +517,36 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 impl Shared {
+    /// Commit only while the driver owns no executing scheduler handler. The
+    /// scheduler mutex is held through the conversation lease's checked commit;
+    /// try-lock avoids waiting while holding any conversation/task fence. The
+    /// stopped flag is checked at entry; shutdown may race an already-started
+    /// commit. This cannot join detached work or authorize external effects.
+    #[allow(dead_code)]
+    pub(crate) fn try_quiescent_commit(
+        &self,
+        binding: crate::executor_handoff::Binding,
+        batch: task_store::OwnedBatch,
+    ) -> Result<(), QuiescentError> {
+        let scheduler = self.scheduler.try_lock().map_err(|e| match e {
+            std::sync::TryLockError::WouldBlock => QuiescentError::Busy,
+            std::sync::TryLockError::Poisoned(_) => QuiescentError::Poisoned,
+        })?;
+        scheduler.check()?;
+        {
+            let state = self.state.lock().map_err(|_| QuiescentError::Poisoned)?;
+            if state.stop {
+                return Err(QuiescentError::Stopped);
+            }
+        }
+        let lease =
+            crate::executor_handoff::ConversationLease::acquire(self.owner.clone(), binding)?;
+        lease.commit(batch)?;
+        drop(lease);
+        drop(scheduler);
+        Ok(())
+    }
+
     fn notify_host(&self) {
         if let Ok(mut sender) = self.notifications.lock()
             && let Some(tx) = sender.as_ref()
@@ -652,6 +697,211 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn quiescent_commit_waits_for_handler_retirement_and_fences_abort_reopen() {
+        use crate::executor_handoff::{self, Binding};
+        use crate::runtime::{Harness, ToolAttempt};
+        use durable_store::{Check, Expected, Mutation};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("block", true, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        registry.register("parent", true, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!(null)))
+        });
+        let scheduler = task_scheduler::Scheduler::open(&path, registry.clone()).unwrap();
+        let owner = scheduler.owner();
+        let b = Binding {
+            conversation: Uuid::from_u128(1),
+            tool: ToolAttempt {
+                operation_id: Uuid::from_u128(2),
+                attempt_id: Uuid::from_u128(3),
+            },
+            task: Uuid::from_u128(4),
+            task_attempt: Uuid::from_u128(5),
+        };
+        let conversation = json!({"id":b.conversation,"config":{"model":"test","system_prompt":"","max_output_tokens":1},"messages":[],"submissions":[],"active":null,"tool_attempt":b.tool,"abort_requested":false,"phase":{"ToolRunning":{"turns":0,"calls":[],"index":0,"operation_id":b.tool.operation_id,"replay":"Safe","arguments":{},"restarts":0,"replay_ready":false}}});
+        let conv_key = Harness::key(b.conversation);
+        owner
+            .store()
+            .commit(
+                &[Check {
+                    key: conv_key.clone(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: conv_key,
+                    value: serde_json::to_vec(&conversation).unwrap(),
+                }],
+            )
+            .unwrap();
+        let mut parent = Task::new(
+            b.task,
+            TaskOwner::Conversation(b.conversation),
+            Checkpoint {
+                phase: "parent".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), true);
+        parent.start_attempt(b.task_attempt).unwrap();
+        TaskStore::new(owner.store())
+            .save(&[Save::Create(&parent)])
+            .unwrap();
+        let bind = executor_handoff::prepare_binding(owner.store(), &b).unwrap();
+        owner.store().commit(&bind.checks, &bind.mutations).unwrap();
+        let worker = Task::new(
+            Uuid::from_u128(20),
+            TaskOwner::Conversation(Uuid::from_u128(30)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("block".into(), true);
+        scheduler.submit(&worker).unwrap();
+        let shared = Arc::new(Shared {
+            owner: owner.clone(),
+            state: Mutex::new(State::default()),
+            scheduler: Mutex::new(scheduler),
+            wake: Condvar::new(),
+            harness: None,
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(None),
+            subscription: Mutex::new(None),
+        });
+        let ticking = shared.clone();
+        let thread = thread::spawn(move || ticking.scheduler.lock().unwrap().tick(0).unwrap());
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let effect = || task_store::OwnedBatch {
+            checks: vec![Check {
+                key: b"test/quiet".to_vec(),
+                expected: Expected::Missing,
+            }],
+            mutations: vec![Mutation::Put {
+                key: b"test/quiet".to_vec(),
+                value: vec![1],
+            }],
+        };
+        assert!(matches!(
+            shared.try_quiescent_commit(b.clone(), effect()),
+            Err(QuiescentError::Busy)
+        ));
+        assert!(owner.store().get(b"test/quiet").unwrap().is_none());
+        release_tx.send(()).unwrap();
+        assert!(thread.join().unwrap());
+        // Hold the task gate so the commit pauses after acquiring the scheduler
+        // mutex; another tick must not enter until the checked commit finishes.
+        let task_gate = owner.task_gate().lock().unwrap();
+        let committing = shared.clone();
+        let binding = b.clone();
+        let commit_thread = thread::spawn(move || {
+            loop {
+                let batch = task_store::OwnedBatch {
+                    checks: vec![Check {
+                        key: b"test/quiet".to_vec(),
+                        expected: Expected::Missing,
+                    }],
+                    mutations: vec![Mutation::Put {
+                        key: b"test/quiet".to_vec(),
+                        value: vec![1],
+                    }],
+                };
+                match committing.try_quiescent_commit(binding.clone(), batch) {
+                    Err(QuiescentError::Busy) => thread::yield_now(),
+                    result => break result,
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while shared.scheduler.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit did not acquire scheduler"
+            );
+            thread::yield_now();
+        }
+        assert!(owner.store().get(b"test/quiet").unwrap().is_none());
+        drop(task_gate);
+        commit_thread.join().unwrap().unwrap();
+        assert_eq!(
+            owner.store().get(b"test/quiet").unwrap().unwrap().value,
+            vec![1]
+        );
+        let tasks = TaskStore::new(owner.store());
+        let running = tasks.load(b.task).unwrap().unwrap();
+        tasks.update(&running, |task| task.recover()).unwrap();
+        let ready = tasks.load(b.task).unwrap().unwrap();
+        let mut next = b.clone();
+        next.task_attempt = Uuid::from_u128(6);
+        tasks
+            .update(&ready, |task| task.start_attempt(next.task_attempt))
+            .unwrap();
+        assert!(matches!(
+            shared.try_quiescent_commit(
+                b.clone(),
+                task_store::OwnedBatch {
+                    checks: vec![],
+                    mutations: vec![]
+                }
+            ),
+            Err(QuiescentError::Lease(executor_handoff::Error::Stale))
+        ));
+        let bind = executor_handoff::prepare_binding(owner.store(), &next).unwrap();
+        owner.store().commit(&bind.checks, &bind.mutations).unwrap();
+        shared
+            .try_quiescent_commit(
+                next.clone(),
+                task_store::OwnedBatch {
+                    checks: vec![],
+                    mutations: vec![],
+                },
+            )
+            .unwrap();
+        let running = tasks.load(b.task).unwrap().unwrap();
+        tasks.update(&running, |task| task.request_abort()).unwrap();
+        assert!(matches!(
+            shared.try_quiescent_commit(
+                next.clone(),
+                task_store::OwnedBatch {
+                    checks: vec![],
+                    mutations: vec![]
+                }
+            ),
+            Err(QuiescentError::Lease(executor_handoff::Error::Stale))
+        ));
+        shared.state.lock().unwrap().stop = true;
+        assert!(matches!(
+            shared.try_quiescent_commit(
+                next.clone(),
+                task_store::OwnedBatch {
+                    checks: vec![],
+                    mutations: vec![]
+                }
+            ),
+            Err(QuiescentError::Stopped)
+        ));
+        drop(shared);
+        drop(owner);
+        let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+        assert!(scheduler.get(b.task).unwrap().unwrap().abort_requested());
+        assert!(matches!(
+            executor_handoff::checks(scheduler.owner().store(), &next),
+            Err(executor_handoff::Error::Stale)
+        ));
+    }
 
     #[test]
     fn wake_hints_are_bounded_and_shutdown_races_are_safe() {
