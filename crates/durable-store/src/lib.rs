@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -489,6 +489,17 @@ impl Store {
             result.push((row.get(0)?, row.get(1)?, Entry { value, version }));
         }
         Ok(result)
+    }
+
+    /// First tracked put of a key, used to prove a copied log was installed
+    /// atomically with conversation creation.
+    pub fn first_commit_for_key(&self, key: &[u8]) -> Result<Option<u64>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT MIN(sequence) FROM durable_commit_versions WHERE key=?1",
+            [key],
+            |r| r.get(0),
+        )?)
     }
 
     /// Find the immutable fork snapshot from the last tracked runtime write at

@@ -240,6 +240,18 @@ impl<'a> Documents<'a> {
         child: uuid::Uuid,
         revision: u64,
     ) -> Result<OwnedBatch, Error> {
+        self.fork_scope_from(parent, parent, child, revision)
+    }
+
+    /// Historical values come from the entry owner; current-policy values come
+    /// from the immediate parent. Both are covered by the same revision fence.
+    pub(crate) fn fork_scope_from(
+        &self,
+        parent: uuid::Uuid,
+        current_parent: uuid::Uuid,
+        child: uuid::Uuid,
+        revision: u64,
+    ) -> Result<OwnedBatch, Error> {
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),
@@ -279,27 +291,48 @@ impl<'a> Documents<'a> {
             .document_policies_at(current)?
             .into_iter()
             .collect();
+        // Normalize both scopes to the historical owner's address; matching
+        // names and family keys identify the same logical document.
         let mut addresses = HashSet::new();
-        for key in historical_docs.keys().chain(current_docs.keys()) {
-            let address = Address::from_storage_key(key)?;
-            if address.scope == parent.to_string() {
+        for (key, scope) in historical_docs
+            .keys()
+            .map(|k| (k, parent))
+            .chain(current_docs.keys().map(|k| (k, current_parent)))
+        {
+            let mut address = Address::from_storage_key(key)?;
+            if address.scope == scope.to_string() {
+                address.scope = parent.to_string();
                 addresses.insert(address);
             }
         }
-        for key in historical_policies.keys().chain(current_policies.keys()) {
-            let [scope, name, key]: [String; 3] = serde_json::from_slice(
+        for (key, scope) in historical_policies
+            .keys()
+            .map(|k| (k, parent))
+            .chain(current_policies.keys().map(|k| (k, current_parent)))
+        {
+            let [found_scope, name, key]: [String; 3] = serde_json::from_slice(
                 key.strip_prefix(POLICY_PREFIX)
                     .ok_or(Error::InvalidDocument)?,
             )?;
-            if scope == parent.to_string() {
-                addresses.insert(Address { scope, name, key });
+            if found_scope == scope.to_string() {
+                addresses.insert(Address {
+                    scope: parent.to_string(),
+                    name,
+                    key,
+                });
             }
         }
         for address in addresses {
             let doc_key = address.storage_key()?;
             let policy_key = address.policy_key()?;
+            let current_address = Address {
+                scope: current_parent.to_string(),
+                ..address.clone()
+            };
+            let current_doc_key = current_address.storage_key()?;
+            let current_policy_key = current_address.policy_key()?;
             let old_policy = historical_policies.get(&policy_key);
-            let latest_policy = current_policies.get(&policy_key);
+            let latest_policy = current_policies.get(&current_policy_key);
             let parse =
                 |entry: Option<&durable_store::Entry>| -> Result<Option<ForkPolicy>, Error> {
                     entry
@@ -315,7 +348,7 @@ impl<'a> Documents<'a> {
                     && !historical_docs.contains_key(&doc_key)
                     && matches!(latest, Some(ForkPolicy::Current)));
             let (doc, policy_entry, policy) = if use_current {
-                (current_docs.get(&doc_key), latest_policy, latest)
+                (current_docs.get(&current_doc_key), latest_policy, latest)
             } else {
                 (historical_docs.get(&doc_key), old_policy, old)
             };

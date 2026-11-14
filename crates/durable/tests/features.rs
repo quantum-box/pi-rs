@@ -2276,7 +2276,21 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
             .iter()
             .all(|record| { record.task.owner() != &TaskOwner::Conversation(child) })
     );
-    assert!(h.fork_at_application_entry(child, entries[0].id).is_err());
+    let inherited = h.fork_at_application_entry(child, entries[0].id).unwrap();
+    assert_eq!(
+        application_entry::list(&db, inherited).unwrap(),
+        entries[..1]
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: inherited.to_string(),
+            ..address.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
     drop(h);
     drop(db);
     let mut h = Harness::open_paused(&path, opts()).unwrap();
@@ -2421,4 +2435,352 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     )
     .unwrap();
     assert!(h.fork_at_application_entry(parent, last.id).is_err());
+}
+
+#[tokio::test]
+async fn inherited_application_forks_use_origin_and_immediate_parent_after_reopen() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        application_entry,
+        document::{Address, Documents, ForkPolicy, TaskDocuments, Transaction},
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Append;
+    impl Handler for Append {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.local", json!(1)).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "origin".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let historical = Address {
+        scope: parent.to_string(),
+        name: "historical".into(),
+        key: "".into(),
+    };
+    let current = Address {
+        name: "current".into(),
+        ..historical.clone()
+    };
+    let current2 = Address {
+        name: "current2".into(),
+        ..historical.clone()
+    };
+    let db = Store::open(&path).unwrap();
+    let mut tx = Transaction::new();
+    for address in [&historical, &current, &current2] {
+        tx.put(
+            address,
+            Expected::Missing,
+            &json!({"n": 1}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+    }
+    tx.set_fork_policy(&current, Expected::Missing, &ForkPolicy::Current)
+        .unwrap();
+    tx.set_fork_policy(&current2, Expected::Missing, &ForkPolicy::Current)
+        .unwrap();
+    tx.commit(&db).unwrap();
+    let mut registry = Registry::default();
+    registry.register("app", true, Append);
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(parent),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("app".into(), true);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    tasks.submit(&task).unwrap();
+    tasks.tick(0).unwrap();
+    drop(tasks);
+    let entry = application_entry::list(&db, parent).unwrap().remove(0);
+    let child = h.fork_at_application_entry(parent, entry.id).unwrap();
+    h.submit_and_run(child, None, "child-only context".into(), &cancel)
+        .await
+        .unwrap();
+    let child_hist = Address {
+        scope: child.to_string(),
+        ..historical.clone()
+    };
+    let child_current = Address {
+        scope: child.to_string(),
+        ..current.clone()
+    };
+    let child_current2 = Address {
+        scope: child.to_string(),
+        ..current2.clone()
+    };
+    let mut tx = Transaction::new();
+    for address in [&child_hist, &child_current, &child_current2] {
+        let version = Documents::new(&db).get(address).unwrap().unwrap().version;
+        tx.put(
+            address,
+            Expected::Version(version),
+            &json!({"n": 2}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+    }
+    tx.commit(&db).unwrap();
+    let mut registry = Registry::default();
+    registry.register("app", true, Append);
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(child),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("app".into(), true);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    tasks.submit(&task).unwrap();
+    tasks.tick(0).unwrap();
+    drop(tasks);
+    let child_entries = application_entry::list(&db, child).unwrap();
+    assert_eq!(child_entries.len(), 2);
+    let own = h
+        .fork_at_application_entry(child, child_entries[1].id)
+        .unwrap();
+    assert_eq!(application_entry::list(&db, own).unwrap(), child_entries);
+    assert!(
+        h.conversation(own)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "child-only context"))
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: own.to_string(),
+            ..historical.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        2
+    );
+    let inherited = h.fork_at_application_entry(child, entry.id).unwrap();
+    assert_eq!(
+        application_entry::list(&db, inherited).unwrap(),
+        vec![entry.clone()]
+    );
+    assert!(
+        h.conversation(inherited)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|m| !matches!(m, Message::User { content } if content == "child-only context"))
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: inherited.to_string(),
+            ..historical.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        1
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: inherited.to_string(),
+            ..current.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        2
+    );
+    // Both current-policy values must come from one fenced parent revision,
+    // even as another connection atomically changes them during preparation.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let writer_gate = gate.clone();
+    let writer_path = path.clone();
+    let a = child_current.clone();
+    let b = child_current2.clone();
+    let writer = std::thread::spawn(move || {
+        let db = Store::open(writer_path).unwrap();
+        writer_gate.wait();
+        for n in 3..25 {
+            let mut tx = Transaction::new();
+            for address in [&a, &b] {
+                let version = Documents::new(&db).get(address).unwrap().unwrap().version;
+                tx.put(
+                    address,
+                    Expected::Version(version),
+                    &json!({"n": n}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+            }
+            tx.commit(&db).unwrap();
+            std::thread::yield_now();
+        }
+    });
+    gate.wait();
+    for _ in 0..10 {
+        let result = h.fork_at_application_entry(child, entry.id);
+        if let Err(ref error) = result {
+            assert!(
+                matches!(error, pi_rs_durable::runtime::Error::Storage(durable_store::Error::Conflict { key }) if key == b"durable/document-fork-revision")
+            );
+        }
+        if let Ok(raced) = result {
+            let a = h
+                .document(&Address {
+                    scope: raced.to_string(),
+                    ..current.clone()
+                })
+                .unwrap()
+                .unwrap()
+                .value["n"]
+                .clone();
+            let b = h
+                .document(&Address {
+                    scope: raced.to_string(),
+                    ..current2.clone()
+                })
+                .unwrap()
+                .unwrap()
+                .value["n"]
+                .clone();
+            assert_eq!(a, b);
+            assert_eq!(
+                h.document(&Address {
+                    scope: raced.to_string(),
+                    ..historical.clone()
+                })
+                .unwrap()
+                .unwrap()
+                .value["n"],
+                1
+            );
+            assert_eq!(
+                application_entry::list(&db, raced).unwrap(),
+                vec![entry.clone()]
+            );
+        }
+    }
+    writer.join().unwrap();
+    // Appends to the immediate parent's log cannot enlarge the selected
+    // inherited prefix, regardless of whether they win the race.
+    let mut registry = Registry::default();
+    registry.register("app", true, Append);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let task_gate = gate.clone();
+    let task_writer = std::thread::spawn(move || {
+        task_gate.wait();
+        for _ in 0..8 {
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(child),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("app".into(), true);
+            tasks.submit(&task).unwrap();
+            tasks.tick(0).unwrap();
+        }
+    });
+    gate.wait();
+    for _ in 0..8 {
+        let result = h.fork_at_application_entry(child, entry.id);
+        if let Err(ref error) = result {
+            assert!(
+                matches!(error, pi_rs_durable::runtime::Error::Storage(durable_store::Error::Conflict { key }) if key == b"durable/document-fork-revision")
+            );
+        }
+        if let Ok(raced) = result {
+            assert_eq!(
+                application_entry::list(&db, raced).unwrap(),
+                vec![entry.clone()]
+            );
+        }
+    }
+    task_writer.join().unwrap();
+    let sibling = h
+        .create_conversation(Config {
+            model: "unrelated".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    assert!(h.fork_at_application_entry(sibling, entry.id).is_err());
+    // A foreign prefix inserted after creation has no fork provenance.
+    let forged_key = format!("durable/application-entries/{sibling}").into_bytes();
+    db.commit(
+        &[],
+        &[durable_store::Mutation::Put {
+            key: forged_key,
+            value: serde_json::to_vec(&vec![entry.clone()]).unwrap(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(sibling, entry.id).is_err());
+    assert!(
+        h.fork_at_application_entry(inherited, child_entries[1].id)
+            .is_err()
+    );
+    drop(h);
+    drop(db);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = Store::open(&path).unwrap();
+    let grandchild = h.fork_at_application_entry(inherited, entry.id).unwrap();
+    assert_eq!(
+        application_entry::list(&db, grandchild).unwrap(),
+        vec![entry]
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: grandchild.to_string(),
+            ..historical
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        1
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: grandchild.to_string(),
+            ..current
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        2
+    );
 }

@@ -2229,7 +2229,7 @@ impl Harness {
         id: Uuid,
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
-        application_cut: Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
+        application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
     ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
@@ -2242,7 +2242,7 @@ impl Harness {
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let revision = match &application_cut {
-            Some((revision, _)) => *revision,
+            Some((revision, _, _)) => *revision,
             None => self
                 .owner
                 .store()
@@ -2361,9 +2361,16 @@ impl Harness {
             phase: Phase::Idle,
         };
         retry_document_fork(|| {
-            let mut batch = crate::document::Documents::new(self.owner.store())
-                .fork_scope(id, state.id, revision)?;
-            if let Some((_, entries)) = &application_cut {
+            let current_parent = application_cut
+                .as_ref()
+                .map_or(id, |(_, parent, _)| *parent);
+            let mut batch = crate::document::Documents::new(self.owner.store()).fork_scope_from(
+                id,
+                current_parent,
+                state.id,
+                revision,
+            )?;
+            if let Some((_, _, entries)) = &application_cut {
                 let target = crate::application_entry::key(state.id);
                 let mutation = batch
                     .mutations
@@ -2381,15 +2388,14 @@ impl Harness {
         })?;
         Ok(state.id)
     }
-    /// Fork at a local committed task application entry. The search examines at
-    /// most 256 application-log versions and rejects inherited or ambiguous IDs.
-    /// Documents use the entry commit's final revision; later entries in that
-    /// commit are excluded. Runtime writes in the same commit are rejected.
-    pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
-        self.load(id)?;
-        if entry_id.is_nil() || self.owner.store().legacy_version_boundary()? != 0 {
-            return Err(crate::fork::Error::InvalidSnapshot.into());
-        }
+    /// Locate a visible application entry in at most 256 recorded log versions.
+    /// A foreign prefix is accepted only when installed atomically with the
+    /// conversation's first tracked runtime snapshot; later appends must be local.
+    fn application_entry_cut(
+        &self,
+        id: Uuid,
+        entry_id: Uuid,
+    ) -> Result<(u64, u64, Vec<crate::application_entry::ApplicationEntry>), Error> {
         let key = crate::application_entry::key(id);
         let versions = self.owner.store().application_history(&key, 257)?;
         let mut previous: Vec<crate::application_entry::ApplicationEntry> = Vec::new();
@@ -2401,45 +2407,90 @@ impl Harness {
             if !entries.starts_with(&previous) || entries.len() <= previous.len() {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
-            for entry in &entries[previous.len()..] {
-                if entry.id.is_nil() || entry.conversation_id != id || !seen.insert(entry.id) {
+            let added = &entries[previous.len()..];
+            let foreign = added.iter().any(|entry| entry.conversation_id != id);
+            if foreign {
+                if !previous.is_empty() || added.iter().any(|entry| entry.conversation_id == id) {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let runtime_key = format!("runtime/conversation/{id}");
+                let prefix = format!("runtime/fork/{id}/");
+                let first = self
+                    .owner
+                    .store()
+                    .first_commit_for_key(runtime_key.as_bytes())?;
+                let snapshot = self.owner.store().runtime_snapshot_at(
+                    runtime_key.as_bytes(),
+                    prefix.as_bytes(),
+                    sequence,
+                )?;
+                if first != Some(sequence) || snapshot.as_ref().map(|s| s.0) != Some(sequence) {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
             }
-            if let Some(index) = entries[previous.len()..]
-                .iter()
-                .position(|entry| entry.id == entry_id)
-            {
-                let index = previous.len() + index;
-                let runtime_key = format!("runtime/conversation/{id}");
-                let prefix = format!("runtime/fork/{id}/");
-                let (runtime_sequence, snapshot_key) = self
-                    .owner
-                    .store()
-                    .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), sequence)?
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                // Without per-entry ordering, a runtime write in the same commit
-                // cannot be placed before or after this application entry.
-                if runtime_sequence >= sequence {
+            for entry in added {
+                if entry.id.is_nil() || entry.conversation_id.is_nil() || !seen.insert(entry.id) {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
-                let suffix = snapshot_key
-                    .strip_prefix(prefix.as_bytes())
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                let cursor = std::str::from_utf8(suffix)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                return self.fork_at_selected(
-                    id,
-                    crate::observer::Cursor(cursor),
-                    None,
-                    Some((revision, entries[..=index].to_vec())),
-                );
+            }
+            if let Some(index) = added.iter().position(|entry| entry.id == entry_id) {
+                let index = previous.len() + index;
+                return Ok((revision, sequence, entries[..=index].to_vec()));
             }
             previous = entries;
         }
         Err(crate::fork::Error::InvalidCursor.into())
+    }
+
+    /// Fork a visible task application entry, including a proven inherited
+    /// prefix. Historical state comes from its owner, current-policy documents
+    /// from the immediate parent. Unprovable histories fail closed.
+    pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.load(id)?;
+        if entry_id.is_nil() || self.owner.store().legacy_version_boundary()? != 0 {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let (mut revision, mut sequence, visible) = self.application_entry_cut(id, entry_id)?;
+        let origin = visible
+            .last()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .conversation_id;
+        if origin != id {
+            let (origin_revision, origin_sequence, origin_prefix) =
+                self.application_entry_cut(origin, entry_id)?;
+            if origin_prefix != visible
+                || origin_prefix
+                    .last()
+                    .is_none_or(|entry| entry.conversation_id != origin)
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            revision = origin_revision;
+            sequence = origin_sequence;
+        }
+        let runtime_key = format!("runtime/conversation/{origin}");
+        let prefix = format!("runtime/fork/{origin}/");
+        let (runtime_sequence, snapshot_key) = self
+            .owner
+            .store()
+            .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), sequence)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if runtime_sequence >= sequence {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let suffix = snapshot_key
+            .strip_prefix(prefix.as_bytes())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let cursor = std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        self.fork_at_selected(
+            origin,
+            crate::observer::Cursor(cursor),
+            None,
+            Some((revision, id, visible)),
+        )
     }
 
     /// Fork at the commit that first exposed this complete message batch.
