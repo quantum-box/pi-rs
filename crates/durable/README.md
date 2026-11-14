@@ -77,6 +77,16 @@ The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
 The scheduler rescans once per second and reopening resumes the wait. Signal
 keys are not yet subject to upstream single-wait or closed-after-deadline rules.
 
+`TaskStore::commit_owned_tasks` supplies a lower-level atomic checkpoint and
+registered-child creation primitive. The caller must store the child IDs in
+its checkpoint, validate registrations, fence executors, and inspect the
+checkpoint after conflicts or uncertain commits. It is not yet wired into the
+conversation lifecycle: its checkpoint is a single owner record, whereas the
+runtime also commits transcript, observation and fork records. Full integration
+must compose all of those writes, wait for child outcomes, coordinate the task
+driver and conversation recovery, and propagate aborts before hook tasks can
+be enabled safely.
+
 Current limits and differences from upstream Pi Durable:
 
 - Historical fork currently accepts settled snapshots, not every upstream entry.

@@ -36,6 +36,8 @@ pub enum Error {
     SignalTargetNotFound,
     #[error("signal target is closed")]
     SignalTargetClosed,
+    #[error("invalid owner checkpoint key or child task")]
+    InvalidOwnedBatch,
 }
 
 /// A task and the storage version that must be supplied for its next update.
@@ -134,6 +136,58 @@ impl<'a> TaskStore<'a> {
             mutations.push(Mutation::Put {
                 key,
                 value: serde_json::to_vec(task)?,
+            });
+        }
+        self.store.commit(&checks, &mutations)?;
+        Ok(())
+    }
+
+    /// Commit an owner's new checkpoint and its newly registered tasks in one
+    /// transaction. `expected` must be the version read before preparing the
+    /// tasks; on a conflict or uncertain commit, reload the owner checkpoint
+    /// before deciding whether to prepare the batch again. The checkpoint must
+    /// itself record the child IDs, so recovery can find the committed tasks.
+    ///
+    /// This is a storage primitive, not an executor lease: callers must fence
+    /// the previous owner and validate task kinds against their registry. Owner
+    /// records must live outside the task store's reserved namespaces.
+    pub fn commit_owned_tasks(
+        &self,
+        owner: &TaskOwner,
+        owner_key: &[u8],
+        expected: Expected,
+        checkpoint: &[u8],
+        children: &[Task],
+    ) -> Result<(), Error> {
+        if owner_key.is_empty() || owner_key.starts_with(b"durable/") {
+            return Err(Error::InvalidOwnedBatch);
+        }
+        let mut checks = vec![Check {
+            key: owner_key.to_vec(),
+            expected,
+        }];
+        let mut mutations = vec![Mutation::Put {
+            key: owner_key.to_vec(),
+            value: checkpoint.to_vec(),
+        }];
+        let mut seen = std::collections::HashSet::new();
+        for child in children {
+            if child.owner() != owner
+                || child.state() != &TaskState::Ready
+                || child.kind().is_none_or(str::is_empty)
+                || !seen.insert(child.id())
+                || matches!(owner, TaskOwner::Task(id) if *id == child.id())
+            {
+                return Err(Error::InvalidOwnedBatch);
+            }
+            let key = key(child.id());
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(child)?,
             });
         }
         self.store.commit(&checks, &mutations)?;
@@ -472,6 +526,107 @@ mod tests {
             Err(Error::DuplicateTask)
         ));
         assert_eq!(ts.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owned_batch_checkpoint_and_children_survive_reopen_and_fence_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned.db");
+        let owner = TaskOwner::Conversation(Uuid::from_u128(100));
+        let owner_key = b"runtime/conversation/100";
+        let child = task(1, 3).registered("extension.task".into(), true);
+        let checkpoint =
+            serde_json::to_vec(&json!({"phase": "after_run", "tasks": [child.id()]})).unwrap();
+        let version;
+        {
+            let db = Store::open(&path).unwrap();
+            db.commit(
+                &[Check {
+                    key: owner_key.to_vec(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: owner_key.to_vec(),
+                    value: b"finish".to_vec(),
+                }],
+            )
+            .unwrap();
+            version = db.get(owner_key).unwrap().unwrap().version;
+            TaskStore::new(&db)
+                .commit_owned_tasks(
+                    &owner,
+                    owner_key,
+                    Expected::Version(version),
+                    &checkpoint,
+                    std::slice::from_ref(&child),
+                )
+                .unwrap();
+        }
+        let db = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        assert_eq!(db.get(owner_key).unwrap().unwrap().value, checkpoint);
+        assert_eq!(ts.load(child.id()).unwrap().unwrap().task, child);
+        let another = task(2, 3).registered("extension.task".into(), true);
+        assert!(matches!(
+            ts.commit_owned_tasks(
+                &owner,
+                owner_key,
+                Expected::Version(version),
+                b"incorrect",
+                &[another]
+            ),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(ts.list().unwrap().len(), 1);
+        assert_eq!(db.get(owner_key).unwrap().unwrap().value, checkpoint);
+    }
+
+    #[test]
+    fn owned_batch_rejects_invalid_children_and_rolls_back_collisions() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let owner = TaskOwner::Conversation(Uuid::from_u128(100));
+        let existing = task(1, 3).registered("task".into(), true);
+        let fresh = task(2, 3).registered("task".into(), true);
+        ts.save(&[Save::Create(&existing)]).unwrap();
+        let key = b"runtime/owner";
+        assert!(matches!(
+            ts.commit_owned_tasks(
+                &owner,
+                key,
+                Expected::Missing,
+                b"next",
+                &[fresh.clone(), existing]
+            ),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(db.get(key).unwrap().is_none());
+        assert!(ts.load(fresh.id()).unwrap().is_none());
+        assert!(matches!(
+            ts.commit_owned_tasks(
+                &owner,
+                key,
+                Expected::Missing,
+                b"next",
+                &[fresh.clone(), fresh]
+            ),
+            Err(Error::InvalidOwnedBatch)
+        ));
+        assert!(matches!(
+            ts.commit_owned_tasks(
+                &TaskOwner::Conversation(Uuid::new_v4()),
+                key,
+                Expected::Missing,
+                b"next",
+                &[task(3, 3).registered("task".into(), true)]
+            ),
+            Err(Error::InvalidOwnedBatch)
+        ));
+        assert!(matches!(
+            ts.commit_owned_tasks(&owner, b"durable/task/x", Expected::Missing, b"next", &[]),
+            Err(Error::InvalidOwnedBatch)
+        ));
+        assert!(db.get(key).unwrap().is_none());
     }
 
     #[test]
