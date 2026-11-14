@@ -7233,18 +7233,35 @@ mod tests {
                 .unwrap();
             lock.lock().unwrap();
             let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let session_lock_path = path.join("chatgpt-sessions.lock");
             let control = super::super::chatgpt_auth::LogoutControl::default();
             let task = super::chatgpt_logout_task(control, move |control| async move {
-                super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    if success {
-                        Ok(())
-                    } else {
-                        Err(pi_rs::Error::Config("fixture failure".into()))
-                    }
-                })
+                super::super::chatgpt_auth::logout_with_cleanup_hook(
+                    path,
+                    lock,
+                    control,
+                    move |_| async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(pi_rs::Error::Config("fixture failure".into()))
+                        }
+                    },
+                    move || {
+                        let probe = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(session_lock_path)
+                            .unwrap();
+                        let blocked =
+                            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+                        cleanup_tx.send(blocked).unwrap();
+                    },
+                )
                 .await
             });
             let mut view = super::View {
@@ -7270,28 +7287,22 @@ mod tests {
                 .unwrap();
             session_lock.lock().unwrap();
             release_tx.send(()).unwrap();
+            assert!(
+                cleanup_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                "cleanup did not encounter the held session-store lock"
+            );
             // `started_rx` means logout already owns the auth lock. Reading
             // through that lock waits for durable local removal, keeping slow
             // filesystem syncs outside the event-delivery deadline below.
-            let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
-            let auth_path = directory.path().join("auth.json");
-            let reader = std::thread::spawn(move || {
-                let _ = cleared_tx.send(super::super::config::read_object(&auth_path));
-            });
-            assert!(matches!(
-                cleared_rx.recv_timeout(std::time::Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
             assert!(matches!(
                 view.remote_task.as_ref().unwrap().receiver.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
             drop(session_lock);
-            let auth = cleared_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap()
-                .unwrap();
-            reader.join().unwrap();
+            let auth =
+                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
             assert!(auth.get("openai-chatgpt").is_none());
             let task = view.remote_task.take().unwrap();
             assert!(matches!(

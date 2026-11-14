@@ -473,6 +473,22 @@ where
     F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
+    logout_with_cleanup_hook(directory, chat_lock, control, revoke, || {}).await
+}
+
+// The hook lets tests observe the boundary immediately before local cleanup.
+pub(super) async fn logout_with_cleanup_hook<F, Fut, H>(
+    directory: std::path::PathBuf,
+    chat_lock: std::fs::File,
+    control: LogoutControl,
+    revoke: F,
+    before_cleanup: H,
+) -> Result<bool>
+where
+    F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    H: FnOnce() + Send + 'static,
+{
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     let credential = parse_credential(&super::config::read_object_unlocked(&auth)?)?;
@@ -503,6 +519,7 @@ where
             Ok(runtime) => runtime.block_on(revoke(credential.clone())),
             Err(error) => Err(Error::Io(error)),
         };
+        before_cleanup();
         clear_session_locked(&directory, &guard, &credential.client_id)?;
         revoked.map(|()| true).map_err(|_| {
             Error::Config(
