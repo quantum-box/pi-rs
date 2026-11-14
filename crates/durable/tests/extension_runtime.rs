@@ -2128,8 +2128,6 @@ async fn synchronous_extension_panics_are_reported_and_replayed_after_reopen() {
             .unwrap()
             .is_empty()
     );
-    drop(subscription);
-
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut tx = Some(tx);
     let mut failed = h
