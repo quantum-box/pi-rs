@@ -108,6 +108,14 @@ impl<'a> Observer<'a> {
         }
     }
 
+    pub(crate) fn tool_attempts(store: &'a Store, conversation: Uuid) -> Self {
+        Self {
+            store,
+            stream: conversation,
+            prefix: b"durable/tool-attempts/",
+        }
+    }
+
     /// Capture the current committed head for a finite reconnect catch-up.
     /// Persist this stream-scoped cursor together with the processing cursor if
     /// the same catch-up must survive reopening.

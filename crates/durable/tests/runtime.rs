@@ -465,7 +465,7 @@ async fn killed_process_replay_gets_new_persisted_attempt() {
     child.kill().unwrap();
     child.wait().unwrap();
     ready.expect("child never dispatched");
-    let id = std::fs::read_to_string(root.join("id"))
+    let id: uuid::Uuid = std::fs::read_to_string(root.join("id"))
         .unwrap()
         .parse()
         .unwrap();
@@ -480,12 +480,41 @@ async fn killed_process_replay_gets_new_persisted_attempt() {
         cancel: Some(cancel.clone()),
     });
     let path = root.join("crash.sqlite");
+    // Simulate a database written before attempt discovery existed, while
+    // retaining its previously persisted current attempt and progress.
+    {
+        let store = durable_store::Store::open(&path).unwrap();
+        let mut prefix = b"durable/tool-attempts/".to_vec();
+        prefix.extend_from_slice(id.as_bytes());
+        prefix.push(b'/');
+        let mut head = prefix.clone();
+        head.push(b'h');
+        let mut record = prefix;
+        record.push(b'r');
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        store
+            .commit(
+                &[],
+                &[
+                    durable_store::Mutation::Delete { key: head },
+                    durable_store::Mutation::Delete { key: record },
+                ],
+            )
+            .unwrap();
+    }
     let mut h = Harness::open_paused(
         &path,
         options(model.clone(), tool.clone(), ReplayPolicy::Safe),
     )
     .unwrap();
     let first = h.conversation(id).unwrap().tool_attempt().unwrap();
+    let page_size = std::num::NonZeroUsize::new(1).unwrap();
+    assert!(
+        h.tool_attempts(id, pi_rs_durable::observer::Cursor(0), page_size)
+            .unwrap()
+            .records
+            .is_empty()
+    );
     assert!(h.resume(&cancel).await.is_err());
     drop(h);
     let h = Harness::open_paused(
@@ -494,6 +523,11 @@ async fn killed_process_replay_gets_new_persisted_attempt() {
     )
     .unwrap();
     let second = h.conversation(id).unwrap().tool_attempt().unwrap();
+    let discovered = h
+        .tool_attempts(id, pi_rs_durable::observer::Cursor(0), page_size)
+        .unwrap();
+    assert_eq!(discovered.records.len(), 1);
+    assert_eq!(discovered.records[0].value["attempt"], json!(second));
     assert_eq!(first.operation_id, second.operation_id);
     assert_ne!(first.attempt_id, second.attempt_id);
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
@@ -947,6 +981,7 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     };
     let mut scheduler = Scheduler::open(&path, opts()).unwrap();
     let id = scheduler.create_conversation(config()).unwrap();
+    let other = scheduler.create_conversation(config()).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
         .await
@@ -955,6 +990,18 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         .forget();
     let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
     let limit = std::num::NonZeroUsize::new(1).unwrap();
+    let discovered = scheduler
+        .tool_attempts(id, pi_rs_durable::observer::Cursor(0), limit)
+        .unwrap();
+    assert_eq!(discovered.records.len(), 1);
+    assert_eq!(discovered.records[0].value["attempt"], json!(attempt));
+    assert!(
+        scheduler
+            .tool_attempts(other, pi_rs_durable::observer::Cursor(0), limit)
+            .unwrap()
+            .records
+            .is_empty()
+    );
     assert_eq!(
         scheduler.view(id, limit).unwrap().tool_progress,
         Some(State::Running(Some(json!({"text":"working"}))))
@@ -1001,6 +1048,21 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     let store = durable_store::Store::open(&path).unwrap();
     drop(store);
     let reopened = Scheduler::open(&path, opts()).unwrap();
+    assert!(
+        reopened
+            .tool_attempts(id, discovered.next, limit)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .tool_attempts(id, pi_rs_durable::observer::Cursor(0), limit)
+            .unwrap()
+            .records[0]
+            .value["attempt"],
+        json!(attempt)
+    );
     let terminal = reopened
         .tool_progress_events(attempt.attempt_id, second.next, limit)
         .unwrap();
@@ -1077,6 +1139,20 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         .forget();
     let second = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
     let limit = std::num::NonZeroUsize::new(10).unwrap();
+    let one = std::num::NonZeroUsize::new(1).unwrap();
+    let page = scheduler
+        .tool_attempts(id, pi_rs_durable::observer::Cursor(0), one)
+        .unwrap();
+    assert_eq!(page.records[0].value["attempt"], json!(first));
+    assert!(page.has_more);
+    let page = scheduler.tool_attempts(id, page.next, one).unwrap();
+    assert_eq!(page.records[0].value["attempt"], json!(second));
+    assert!(!page.has_more);
+    assert!(
+        scheduler
+            .tool_attempts(id, pi_rs_durable::observer::Cursor(3), one)
+            .is_err()
+    );
     let old = scheduler
         .tool_progress_events(first.attempt_id, pi_rs_durable::observer::Cursor(0), limit)
         .unwrap();

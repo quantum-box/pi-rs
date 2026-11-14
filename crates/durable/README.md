@@ -116,17 +116,24 @@ without an identity do not report durable progress until replay creates one.
 
 `Harness::tool_progress_events` and `Scheduler::tool_progress_events` poll a
 separate, per-attempt stream of committed replacement states and its terminal
-seal. Obtain the attempt UUID from the conversation view, start at `Cursor(0)`,
+seal. Discover attempt UUIDs with `Harness::tool_attempts` or `Scheduler::tool_attempts`:
+poll the conversation-scoped stream from `Cursor(0)` in bounded pages, persist
+`next` after processing, and filter records by `attempt.operation_id` when tracking
+one operation. Each claim is recorded atomically before dispatch, including retries
+that never emit progress. Then start each attempt stream at `Cursor(0)`,
 and persist `next` after processing each bounded page. Every record includes
 `conversation_id`, `attempt` (operation and attempt IDs), and `state`. Reopen and
 resume with the same attempt UUID and cursor; replay creates a different stream.
 The cursor is exclusive and delivery is at least once if processing precedes
 cursor persistence. Progress and its event, including abort/completion, commit
-atomically under the existing attempt fence. Old attempts predating this feature
-are not backfilled. This log is unbounded on disk, stores whole replacement
-partials (up to the existing 1 MiB limit), and has no cross-attempt ordering,
-notifications, or automatic discovery of later attempts; use conversation views or
-history to discover attempts. It is not upstream's Chord operation stream.
+atomically under the existing attempt fence. Attempts claimed before discovery was introduced are not backfilled, even if their
+progress events exist. Legacy running attempts without IDs remain undiscoverable;
+a subsequent replay is recorded. Discovery and progress cursors are independent;
+process every discovered attempt and retain its progress cursor. Discovery orders
+claims, while progress ordering is only per attempt. Both logs grow without retention;
+progress records store whole replacement partials (up to 1 MiB). Pages bound record
+count, not total bytes; polling is synchronous and has no notification or automatic
+operation filter. This is not upstream's Chord operation stream.
 
 This pull API does not provide upstream's watch operations, `from`, automatic
 min/max window maintenance, or transcript entries for reset and compaction

@@ -1591,6 +1591,27 @@ impl Harness {
             key: fork_key,
             value: serde_json::to_vec(&fork_value)?,
         });
+        // Publish only newly claimed invocations, in the same commit as the
+        // running state and before the tool can report progress.
+        if let Some(previous) = old
+            && matches!(
+                state.phase,
+                Phase::ToolRunning {
+                    replay_ready: false,
+                    ..
+                }
+            )
+            && let Some(attempt) = state.tool_attempt()
+            && previous.tool_attempt() != Some(attempt)
+        {
+            let event = crate::observer::Observer::tool_attempts(self.owner.store(), state.id)
+                .prepare_append(&serde_json::json!({
+                    "conversation_id": state.id,
+                    "attempt": attempt,
+                }))?;
+            checks.extend(event.checks);
+            mutations.extend(event.mutations);
+        }
         let terminal = if state.abort_requested {
             match &state.phase {
                 Phase::ModelRunning { request_id, .. }
@@ -2659,6 +2680,29 @@ impl Harness {
         self.subagent_store()?;
         Ok(
             crate::observer::Observer::tool_progress(self.owner.store(), attempt_id)
+                .read(after, limit)?,
+        )
+    }
+
+    /// Discover committed attempts in conversation order. Filter by operation ID
+    /// after reading; the cursor is exclusive and scoped to this conversation.
+    pub fn tool_attempts(
+        &self,
+        conversation_id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.subagent_store()?;
+        if self
+            .owner
+            .store()
+            .get(&Self::key(conversation_id))?
+            .is_none()
+        {
+            return Err(Error::NotFound);
+        }
+        Ok(
+            crate::observer::Observer::tool_attempts(self.owner.store(), conversation_id)
                 .read(after, limit)?,
         )
     }
@@ -5824,6 +5868,14 @@ impl Scheduler {
     ) -> Result<crate::observer::Page, Error> {
         self.harness.tool_progress_events(attempt_id, after, limit)
     }
+    pub fn tool_attempts(
+        &self,
+        conversation_id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.harness.tool_attempts(conversation_id, after, limit)
+    }
     pub fn watch_view(
         &self,
         id: Uuid,
@@ -7193,6 +7245,76 @@ mod scheduler_tests {
             let restored: Conversation = serde_json::from_value(json).unwrap();
             assert_eq!(restored.tool_attempt(), None);
         }
+    }
+
+    #[test]
+    fn legacy_running_attempt_is_not_backfilled_and_new_claim_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let mut legacy = h.conversation(id).unwrap();
+        let operation_id = Uuid::new_v4();
+        legacy.phase = Phase::ToolRunning {
+            turns: 0,
+            calls: vec![],
+            index: 0,
+            operation_id,
+            replay: ReplayPolicy::Safe,
+            arguments: serde_json::json!({}),
+            restarts: 0,
+            replay_ready: false,
+        };
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: Harness::key(id),
+                    value: serde_json::to_vec(&legacy).unwrap(),
+                }],
+            )
+            .unwrap();
+        let (state, version) = h.load(id).unwrap();
+        h.save(&state, Expected::Version(version)).unwrap();
+        let limit = std::num::NonZeroUsize::new(1).unwrap();
+        assert!(
+            h.tool_attempts(id, crate::observer::Cursor(0), limit)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        let (mut state, version) = h.load(id).unwrap();
+        let attempt = ToolAttempt {
+            operation_id,
+            attempt_id: Uuid::new_v4(),
+        };
+        state.tool_attempt = Some(attempt);
+        let mut prepared = h
+            .prepare_conversation_save(&state, Expected::Version(version), None, &[], &[])
+            .unwrap();
+        prepared.checks.push(Check {
+            key: b"missing-guard".to_vec(),
+            expected: Expected::Version(1),
+        });
+        assert!(h.commit_conversation_save(prepared).is_err());
+        assert!(
+            h.tool_attempts(id, crate::observer::Cursor(0), limit)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert_eq!(h.conversation(id).unwrap().tool_attempt(), None);
+        h.save(&state, Expected::Version(version)).unwrap();
+        let page = h
+            .tool_attempts(id, crate::observer::Cursor(0), limit)
+            .unwrap();
+        assert_eq!(page.records[0].value["attempt"], serde_json::json!(attempt));
     }
 
     #[test]
