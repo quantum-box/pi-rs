@@ -4192,3 +4192,13 @@ content blocks, matching its session-context projection. RPC messages report
 empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
+
+### Shell execution transcript checkpoint
+
+Imported and live Pi-style shell executions display their output and completion
+status separately from the command, instead of showing the model-context
+`Ran ...` wrapper and Markdown fences in the terminal. Cancellation, nonzero
+exit status and truncation paths are included in the display output; the native
+excluded-from-context label is retained. Model context and journal data retain
+their existing framing and values. The terminal continues to use its generic
+tool styling and preview limits, so a long output may hide its status until expanded.

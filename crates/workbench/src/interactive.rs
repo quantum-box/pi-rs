@@ -38,6 +38,34 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
 
+// Shell output is displayed separately from the model-facing context framing.
+fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
+    let mut output = execution.output.clone();
+    let status = if execution.cancelled {
+        Some("(cancelled)".to_owned())
+    } else {
+        execution
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("(exit {code})"))
+    };
+    if let Some(status) = status {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&status);
+    }
+    if execution.truncated
+        && let Some(path) = &execution.full_output_path
+    {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format!("Output truncated. Full output: {path}"));
+    }
+    output
+}
+
 pub(super) fn new_session_path() -> PathBuf {
     session_path(&std::env::current_dir().unwrap_or_default(), None)
 }
@@ -1394,7 +1422,7 @@ impl View {
                         }
                         .into(),
                         arguments: json!({"command":execution.command}).to_string(),
-                        output: execution.context_text(),
+                        output: shell_display_output(execution),
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
@@ -1633,8 +1661,8 @@ impl View {
             Some("bash_execution_end") => {
                 self.shell_running = false;
                 let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code == Some(0) => pi_rs::Outcome::Succeeded(execution.context_text()),
-                    Ok(execution) => pi_rs::Outcome::Failed(execution.context_text()),
+                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
+                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
                     Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
                 };
                 self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
@@ -8158,6 +8186,98 @@ mod tests {
         );
         assert!(
             matches!(&view.lines[1], Entry::Tool { failed: true, finished: true, output, numbered_diff: false, .. } if output == "exact")
+        );
+    }
+
+    #[test]
+    fn imported_and_live_shell_display_output_without_context_framing() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"bashExecution","command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/output","excludeFromContext":true}}),
+            json!({"type":"message","id":"c","parentId":"b","message":{"role":"bashExecution","command":"sleep","output":"","exitCode":null,"cancelled":true,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let journal = directory.path().join("native.jsonl");
+        imported.export_jsonl(&journal).unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = journal;
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let shells: Vec<_> = view
+            .lines
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool {
+                    name,
+                    output,
+                    failed,
+                    ..
+                } => Some((name.as_str(), output.as_str(), *failed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shells,
+            [
+                ("bash", "hi\n", false),
+                (
+                    "bash (excluded)",
+                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
+                    true
+                ),
+                ("bash", "(cancelled)", true)
+            ]
+        );
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|entry| {
+                entry.render(
+                    &Theme::system(),
+                    100,
+                    true,
+                    true,
+                    TranscriptOptions::default(),
+                )
+            })
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
+        let original = imported
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } if execution.command == "echo hi" => {
+                    Some(execution)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(original.context_text(), "Ran `echo hi`\n```\nhi\n\n```");
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"live","command":"echo hi"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"live","data":{"command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: false, finished: true, .. }) if output == "hi\n")
+        );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"failed","command":"false"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"failed","data":{"command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
         );
     }
 
