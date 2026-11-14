@@ -2217,6 +2217,9 @@ impl CodingTool {
         {
             let original_mime = format.to_mime_type();
             let profile = profile.unwrap_or_default();
+            if !profile.valid() {
+                return Err(Error::Config("invalid model image resize profile".into()));
+            }
             let supported = matches!(
                 original_mime,
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
@@ -4366,6 +4369,32 @@ mod tests {
         assert_eq!(
             result["content"][0]["text"],
             "Read image file [image/bmp]\n[Image omitted: could not be converted to a supported inline image format.]"
+        );
+    }
+
+    #[test]
+    fn invalid_image_profile_precedes_conversion_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.bmp");
+        std::fs::write(&path, b"BM broken").unwrap();
+        let tool = CodingTool {
+            root: directory.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_bytes: Some(0),
+                    ..Default::default()
+                }),
+                model_supports_images: None,
+            },
+        };
+        let error = tool.read_image(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid model image resize profile")
         );
     }
 
