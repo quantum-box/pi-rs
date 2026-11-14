@@ -2016,20 +2016,13 @@ async fn execute(
         }
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let workspace = args.workspace.clone();
             let snapshot = if destination.is_radius() && !args.trust_pending {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    runtime::standalone_share_snapshot(&args, &session),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
+                runtime::standalone_share_snapshot_bounded(args, Duration::from_secs(10)).await
             } else {
                 None
             };
-            let shared = destination
-                .share(session, &args.workspace, snapshot)
-                .await?;
+            let shared = destination.share(session, &workspace, snapshot).await?;
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);
