@@ -1091,10 +1091,7 @@ impl Harness {
                 .map(|tool| tool.tool.spec())
                 .collect())
         } else {
-            let mut specs: Vec<_> = tools
-                .into_values()
-                .map(|tool| tool.tool.spec())
-                .collect();
+            let mut specs: Vec<_> = tools.into_values().map(|tool| tool.tool.spec()).collect();
             specs.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(specs)
         }
