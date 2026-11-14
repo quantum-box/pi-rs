@@ -4185,7 +4185,10 @@ Consecutive editor kill commands now combine their removed text in deletion
 order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching
 Pi's editor behavior. Focused editor tests cover both directions, multiline
-text, interrupted kills and yank cycling; other editor parity gaps remain open.
+text, interrupted kills and yank cycling; other editor parity gaps remain open. Word navigation and word deletion use ICU word
+boundaries and Pi’s ASCII punctuation rules, and move across a newline one
+line at a time. Native editing retains literal pasted text rather than Pi’s
+atomic paste markers.
 
 ### Session tree branch navigation checkpoint
 

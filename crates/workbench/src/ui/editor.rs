@@ -7,6 +7,83 @@ use super::editor_layout::Layout;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+const WORD_PUNCTUATION: &str = "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`";
+
+fn word_segments(text: &str) -> Vec<(usize, usize, bool)> {
+    let segmenter = icu_segmenter::WordSegmenter::new_dictionary(Default::default());
+    let mut start = 0;
+    let mut segments = Vec::new();
+    for (end, kind) in segmenter.segment_str(text).iter_with_word_type() {
+        if end > start {
+            let word = kind.is_word_like() || text[start..end].chars().any(char::is_alphanumeric);
+            segments.push((start, end, word));
+        }
+        start = end;
+    }
+    segments
+}
+
+fn word_space(text: &str) -> bool {
+    text.chars()
+        .any(|c| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+}
+
+fn word_boundary(text: &str, backward: bool) -> usize {
+    let mut segments = word_segments(text);
+    if backward {
+        while segments
+            .last()
+            .is_some_and(|&(a, b, _)| word_space(&text[a..b]))
+        {
+            segments.pop();
+        }
+        let Some(&(start, end, word)) = segments.last() else {
+            return 0;
+        };
+        if word {
+            text[start..end]
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| WORD_PUNCTUATION.contains(c))
+                .map_or(start, |(i, c)| start + i + c.len_utf8())
+        } else {
+            segments
+                .iter()
+                .rev()
+                .take_while(|&&(a, b, word)| !word && !word_space(&text[a..b]))
+                .last()
+                .map_or(start, |&(a, _, _)| a)
+        }
+    } else {
+        let mut iter = segments.into_iter().peekable();
+        let mut end = 0;
+        while iter
+            .peek()
+            .is_some_and(|&(a, b, _)| word_space(&text[a..b]))
+        {
+            end = iter.next().unwrap().1;
+        }
+        let Some((start, finish, word)) = iter.next() else {
+            return end;
+        };
+        if word {
+            text[start..finish]
+                .char_indices()
+                .find(|&(_, c)| WORD_PUNCTUATION.contains(c))
+                .map_or(finish, |(i, _)| start + i)
+        } else {
+            end = finish;
+            while iter
+                .peek()
+                .is_some_and(|&(a, b, word)| !word && !word_space(&text[a..b]))
+            {
+                end = iter.next().unwrap().1;
+            }
+            end
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Snapshot {
     text: String,
@@ -99,39 +176,25 @@ impl Editor {
                 .unwrap_or(self.text.len() - self.cursor)
     }
     fn word_left(&mut self) {
-        while self.cursor > 0
-            && self.text[..self.cursor]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace)
-        {
-            self.left();
-        }
-        while self.cursor > 0
-            && self.text[..self.cursor]
-                .chars()
-                .next_back()
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            self.left();
+        self.typing_word = false;
+        let start = self.line_start();
+        if self.cursor == start {
+            if self.cursor > 0 {
+                self.cursor -= 1;
+            }
+        } else {
+            self.cursor = start + word_boundary(&self.text[start..self.cursor], true);
         }
     }
     fn word_right(&mut self) {
-        while self.cursor < self.text.len()
-            && self.text[self.cursor..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
-        {
-            self.right();
-        }
-        while self.cursor < self.text.len()
-            && self.text[self.cursor..]
-                .chars()
-                .next()
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            self.right();
+        self.typing_word = false;
+        let end = self.line_end();
+        if self.cursor == end {
+            if self.cursor < self.text.len() {
+                self.cursor += 1;
+            }
+        } else {
+            self.cursor += word_boundary(&self.text[self.cursor..end], false);
         }
     }
     fn remove(&mut self, range: Range<usize>, kill: Option<bool>) {
@@ -409,6 +472,52 @@ mod tests {
             assert!(!editor.action(""));
             editor.type_character(character);
         }
+    }
+
+    #[test]
+    fn word_navigation_matches_punctuation_and_line_boundaries() {
+        let mut editor = Editor::default();
+        editor.replace("foo...bar/baz\n次の行".into());
+        editor.cursor = 0;
+        for position in [3, 6, 9, 10, 13, 14] {
+            editor.action("tui.editor.cursorWordRight");
+            assert_eq!(editor.cursor, position);
+        }
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(editor.cursor, 13);
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(editor.cursor, 10);
+    }
+
+    #[test]
+    fn word_navigation_handles_cjk_and_combining_text() {
+        let mut editor = Editor::default();
+        editor.replace("你好世界 test e\u{301}lan".into());
+        editor.cursor = 0;
+        editor.action("tui.editor.cursorWordRight");
+        assert_eq!(&editor.text[..editor.cursor], "你好");
+        editor.action("tui.editor.cursorWordRight");
+        assert_eq!(&editor.text[..editor.cursor], "你好世界");
+        editor.cursor = editor.text.len();
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(&editor.text[editor.cursor..], "e\u{301}lan");
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "你好世界 e\u{301}lan");
+    }
+
+    #[test]
+    fn word_deletion_uses_punctuation_and_preserves_undo() {
+        let mut editor = Editor::default();
+        editor.replace("foo.bar".into());
+        editor.cursor = editor.text.len();
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "foo.");
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "foo");
+        editor.action("tui.editor.yank");
+        assert_eq!(editor.text, "foo.bar");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "foo");
     }
 
     #[test]
