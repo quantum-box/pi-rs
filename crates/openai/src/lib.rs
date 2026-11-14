@@ -454,6 +454,10 @@ impl Model for OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        let error_secrets = pi_rs_core::provider_error_secrets(
+            Some(self.token.as_str()),
+            self.headers.values().filter_map(|v| v.to_str().ok()),
+        );
         let mut response = self
             .client
             .post(self.endpoint.clone())
@@ -467,7 +471,8 @@ impl Model for OpenAiResponses {
         if !response.status().is_success() {
             let status = response.status();
             if status.as_u16() == 429 || status.is_server_error() {
-                let info = pi_rs_core::provider_limit_info(response.bytes_stream()).await;
+                let info =
+                    pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
                 return Err(if info.permanent {
                     if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
                         response_error(info.recognized_code, Some(status))
@@ -581,12 +586,13 @@ impl Model for OpenAiResponses {
                     }
                     "response.failed" | "error" => {
                         let error = event["response"].get("error").filter(|error| !error.is_null()).or_else(|| event.get("error")).unwrap_or(&Value::Null);
-                        let code = error["code"].as_str();
-                        Err(if code == Some("subscription_sharing_usage_limit_exceeded") {
+                        let safe_error = pi_rs_core::sanitized_provider_error(error, &error_secrets);
+                        let code = safe_error["code"].as_str();
+                        Err(if matches!(code, Some("subscription_sharing_usage_limit_exceeded" | "subscription_sharing_user_not_eligible" | "subscription_sharing_usage_unavailable")) {
                             response_error(code, None)
-                        } else if pi_rs_core::permanent_provider_error(error) {
+                        } else if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                             Error::Model("OpenAI account quota or billing limit reached".into())
-                        } else if pi_rs_core::retryable_provider_error(error) {
+                        } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                             Error::RetryableModel("OpenAI returned a transient stream error".into())
                         } else {
                             response_error(code, None)
@@ -607,12 +613,66 @@ impl Model for OpenAiResponses {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn quota_stream_error_ignores_metadata_and_redacts() {
+    async fn subscription_stream_codes_take_precedence_over_transient_message() {
         use std::io::{Read, Write};
-        for permanent in [false, true] {
+        for (code, retryable) in [
+            ("subscription_sharing_usage_limit_exceeded", false),
+            ("subscription_sharing_user_not_eligible", false),
+            ("subscription_sharing_usage_unavailable", true),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"type":"response.failed","response":{"error":{"code":"error","message":if permanent {"quota exceeded"} else {"rate limit exceeded"},"request_id":"billing-sentinel-secret"}}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let event = json!({"type":"response.failed","response":{"error":{"code":code,"message":"rate limit exceeded"}}});
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "token".into(),
+                "fixture",
+            )
+            .unwrap();
+            let mut stream = model.stream(request()).await.unwrap();
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("missing error"),
+                }
+            };
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                retryable,
+                "{code}"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-provider-billing-secret", true, false),
+            (
+                "rate limit exceeded sk-provider-billing-secret",
+                false,
+                true,
+            ),
+            (
+                "request to https://example.invalid failed, reason: unexpected",
+                false,
+                true,
+            ),
+            ("rate---limit", false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type":"response.failed","response":{"error":{"code":"error","message":message,"request_id":"billing-sentinel-secret"}}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -622,7 +682,7 @@ mod tests {
             });
             let model = OpenAiResponses::new_api_provider(
                 &format!("http://{address}"),
-                "token".into(),
+                "sk-provider-billing-secret".into(),
                 "fixture",
             )
             .unwrap();
@@ -647,8 +707,9 @@ mod tests {
                 error.to_string().contains("quota or billing limit"),
                 permanent
             );
-            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }
@@ -668,6 +729,11 @@ mod tests {
                 true,
             ),
             (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                true,
+            ),
+            (
                 429,
                 r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
                 false,
@@ -682,6 +748,11 @@ mod tests {
                 r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
                 false,
             ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -693,7 +764,7 @@ mod tests {
             });
             let model = OpenAiResponses::new_api_provider(
                 &format!("http://{address}"),
-                "token".into(),
+                "sk-provider-billing-secret".into(),
                 "fixture",
             )
             .unwrap();
@@ -708,6 +779,7 @@ mod tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }

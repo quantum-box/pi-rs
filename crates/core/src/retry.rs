@@ -12,7 +12,7 @@ pub struct ProviderLimitInfo {
 }
 
 #[doc(hidden)]
-pub async fn provider_limit_info<S, B, E>(stream: S) -> ProviderLimitInfo
+pub async fn provider_limit_info<S, B, E>(stream: S, secrets: &[String]) -> ProviderLimitInfo
 where
     S: futures_util::Stream<Item = std::result::Result<B, E>>,
     B: AsRef<[u8]>,
@@ -36,6 +36,7 @@ where
             .ok()
             .or_else(|| (!complete).then(|| provider_prefix_value(&bytes)).flatten())
             .unwrap_or_default();
+        let value = sanitized_provider_error(&value, secrets);
         let error = value.get("error").unwrap_or(&value);
         let recognized_code = match error["code"].as_str() {
             Some("subscription_sharing_usage_limit_exceeded") => {
@@ -50,7 +51,7 @@ where
             _ => None,
         };
         Some(ProviderLimitInfo {
-            permanent: permanent_limit_body(&bytes, complete),
+            permanent: permanent_limit_body(&bytes, complete, secrets),
             recognized_code,
         })
     })
@@ -64,18 +65,74 @@ where
 }
 
 #[doc(hidden)]
-pub async fn permanent_provider_limit<S, B, E>(stream: S) -> bool
+pub async fn permanent_provider_limit<S, B, E>(stream: S, secrets: &[String]) -> bool
 where
     S: futures_util::Stream<Item = std::result::Result<B, E>>,
     B: AsRef<[u8]>,
 {
-    provider_limit_info(stream).await.permanent
+    provider_limit_info(stream, secrets).await.permanent
+}
+
+/// Collect configured credentials and header values without retaining them in diagnostics.
+#[doc(hidden)]
+pub fn provider_error_secrets<'a>(
+    token: Option<&'a str>,
+    headers: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for value in token.into_iter().chain(headers) {
+        if value.is_empty() {
+            continue;
+        }
+        secrets.push(value.to_owned());
+        if let Some((scheme, credential)) = value.split_once(' ')
+            && scheme.eq_ignore_ascii_case("bearer")
+            && !credential.is_empty()
+        {
+            secrets.push(credential.to_owned());
+        }
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    secrets
+}
+
+fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
+    let mut masked = text.to_owned();
+    for secret in secrets {
+        if !secret.is_empty() {
+            masked = masked.replace(secret, "\0\0");
+        }
+    }
+    masked
+}
+
+#[doc(hidden)]
+pub fn sanitized_provider_error(
+    value: &serde_json::Value,
+    secrets: &[String],
+) -> serde_json::Value {
+    let mut value = value.clone();
+    fn scrub(value: &mut serde_json::Value, secrets: &[String]) {
+        match value {
+            serde_json::Value::String(text) => *text = mask_provider_secrets(text, secrets),
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|v| scrub(v, secrets))
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(|v| scrub(v, secrets)),
+            _ => {}
+        }
+    }
+    scrub(&mut value, secrets);
+    value
 }
 
 // JSON envelope fields outside the provider error are metadata, not a reason
 // to suppress retries. Never scan request IDs or arbitrary nested values.
 #[doc(hidden)]
-pub fn permanent_provider_error(value: &serde_json::Value) -> bool {
+pub fn permanent_provider_error(value: &serde_json::Value, secrets: &[String]) -> bool {
+    let value = sanitized_provider_error(value, secrets);
+    let value = &value;
     let error = value.get("error").unwrap_or(value);
     if let Some(text) = error.as_str() {
         return permanent_limit_text(text.as_bytes(), true);
@@ -101,72 +158,28 @@ pub fn permanent_provider_error(value: &serde_json::Value) -> bool {
 /// Recognize Pi's transient provider messages without scanning unrelated
 /// metadata. Permanent quota markers always take precedence.
 #[doc(hidden)]
-pub fn retryable_provider_error(value: &serde_json::Value) -> bool {
-    if permanent_provider_error(value) {
+pub fn retryable_provider_error(value: &serde_json::Value, secrets: &[String]) -> bool {
+    if permanent_provider_error(value, secrets) {
         return false;
     }
-    let error = value.get("error").unwrap_or(value);
+    let value = sanitized_provider_error(value, secrets);
+    let error = value.get("error").unwrap_or(&value);
     let matches = |text: &str| {
         let lower = text.to_ascii_lowercase();
-        let compact: String = lower
-            .chars()
-            .filter(|c| !matches!(c, ' ' | '-' | '_' | '.'))
-            .collect();
-        const PATTERNS: &[&str] = &[
-            "overloaded",
-            "serverbusy",
-            "serversarecurrentlybusy",
-            "currentlyexperiencinghighdemand",
-            "modelisatcapacity",
-            "ratelimit",
-            "toomanyrequests",
-            "serviceunavailable",
-            "serviceisunavailable",
-            "servicetemporarilyunavailable",
-            "serviceistemporarilyunavailable",
-            "servererror",
-            "internalerror",
-            "providerreturnederror",
-            "providerreturnedanerror",
-            "exceededrequestbufferlimitwhileretryingupstream",
-            "unabletoforwardupstream",
-            "upstreamrequestfailed",
-            "upstreamstreamreaderror",
-            "streamwasinterrupted",
-            "http/2streamfailed",
-            "networkerror",
-            "connectionerror",
-            "connectionrefused",
-            "connectionlost",
-            "othersideclosed",
-            "fetchfailed",
-            "getaddrinfo",
-            "enotfound",
-            "eaiagain",
-            "upstreamconnect",
-            "resetbeforeheaders",
-            "sockethangup",
-            "socketconnectionwasclosed",
-            "timedout",
-            "timeout",
-            "terminated",
-            "websocketclosed",
-            "websocketerror",
-            "endedwithout",
-            "streamendedbeforemessagestop",
-            "streamendedbeforeaterminalresponseevent",
-            "http2requestdidnotgetaresponse",
-            "streamdisconnectedbeforecompletion",
-            "pendingstreamhasbeencanceled",
-            "retrydelay",
-            "youcanretryyourrequest",
-            "tryyourrequestagain",
-            "pleaseretryyourrequest",
-            "resourceexhausted",
-            "subscriptionsharingusageunavailable",
-            "subscriptionsharinguserunavailable",
-        ];
-        if PATTERNS.iter().any(|pattern| compact.contains(pattern)) {
+        static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        // This is the pinned Pi retry.ts expression, except status boundaries
+        // are checked below because the Rust regex engine has no look-around.
+        let pattern = PATTERN.get_or_init(|| regex::Regex::new(concat!(
+            r"overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|",
+            r"service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|",
+            r"exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http/?2 stream failed|",
+            r"network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|request to \S+ failed, reason:|",
+            r"getaddrinfo|enotfound|eai_again|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|",
+            r"websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|",
+            r"http2 request did not get a response|stream disconnected before completion|pending stream has been canceled|retry delay|you can retry your request|",
+            r"try your request again|please retry your request|resourceexhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable"
+        )).expect("valid provider retry pattern"));
+        if pattern.is_match(&lower) {
             return true;
         }
         ["429", "500", "502", "503", "504", "520", "524"]
@@ -276,10 +289,10 @@ fn provider_prefix_value(body: &[u8]) -> Option<serde_json::Value> {
     }
 }
 
-fn permanent_limit_body(bytes: &[u8], complete: bool) -> bool {
+fn permanent_limit_body(bytes: &[u8], complete: bool, secrets: &[String]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(value) => permanent_provider_error(&value),
+        Ok(value) => permanent_provider_error(&value, secrets),
         // A partial or invalid JSON document can contain arbitrary metadata;
         // do not mistake it for an error message.
         Err(_) if !complete && text.trim_start().starts_with('{') => {
@@ -294,10 +307,29 @@ fn permanent_limit_body(bytes: &[u8], complete: bool) -> bool {
                 b' '
             });
             provider_prefix_value(&probe).is_some_and(|next| next == value)
-                && permanent_provider_error(&value)
+                && permanent_provider_error(&value, secrets)
         }
         Err(_) if text.trim_start().starts_with(['{', '[']) => false,
-        Err(_) => permanent_limit_text(bytes, complete),
+        Err(_) => {
+            let mut masked = mask_provider_secrets(&String::from_utf8_lossy(bytes), secrets);
+            if !complete {
+                // A bounded body can end in the middle of an echoed secret.
+                let suffix = secrets
+                    .iter()
+                    .flat_map(|secret| {
+                        secret
+                            .char_indices()
+                            .skip(1)
+                            .map(move |(end, _)| &secret[..end])
+                    })
+                    .filter(|prefix| masked.ends_with(prefix))
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                masked.truncate(masked.len() - suffix);
+            }
+            permanent_limit_text(masked.as_bytes(), complete)
+        }
     }
 }
 
@@ -496,26 +528,26 @@ mod quota_tests {
             Ok::<_, ()>(b"insufficient_".to_vec()),
             Ok(b"quota".to_vec()),
         ]);
-        assert!(permanent_provider_limit(chunks).await);
+        assert!(permanent_provider_limit(chunks, &[]).await);
         let metadata =
             br#"{"error":{"message":"rate limit"},"request_id":"billing-secret"}"#.to_vec();
-        assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(metadata)])).await);
+        assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(metadata)]), &[]).await);
         let mut too_long = vec![b'x'; 64 * 1024];
         too_long.extend_from_slice(b"insufficient_quota");
-        assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(too_long)])).await);
+        assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(too_long)]), &[]).await);
         let failed = stream::iter(vec![Ok::<_, ()>(b"insufficient_".to_vec()), Err(())]);
-        assert!(!permanent_provider_limit(failed).await);
+        assert!(!permanent_provider_limit(failed, &[]).await);
         let pending = stream::pending::<std::result::Result<Vec<u8>, ()>>();
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
-                permanent_provider_limit(pending)
+                permanent_provider_limit(pending, &[])
             )
             .await
             .is_err()
         );
         let usage = br#"{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}"#.to_vec();
-        let info = provider_limit_info(stream::iter(vec![Ok::<_, ()>(usage)])).await;
+        let info = provider_limit_info(stream::iter(vec![Ok::<_, ()>(usage)]), &[]).await;
         assert!(info.permanent);
         assert_eq!(
             info.recognized_code,
@@ -533,7 +565,8 @@ mod quota_tests {
             let body = format!("{prefix}{long}\"}}}}");
             assert!(super::permanent_limit_body(
                 &body.as_bytes()[..64 * 1024],
-                false
+                false,
+                &[]
             ));
         }
         for prefix in [
@@ -545,24 +578,29 @@ mod quota_tests {
             let body = format!("{prefix}{long}");
             assert!(!super::permanent_limit_body(
                 &body.as_bytes()[..64 * 1024],
-                false
+                false,
+                &[]
             ));
         }
         assert!(!super::permanent_limit_body(
             br#"{"error":{"type":"insufficient_quota",!"#,
-            false
+            false,
+            &[]
         ));
         assert!(!super::permanent_limit_body(
             br#"{"error":{"code":1308"#,
-            false
+            false,
+            &[]
         ));
         assert!(super::permanent_limit_body(
             br#"{"error":{"code":1308 "#,
-            false
+            false,
+            &[]
         ));
         assert!(super::permanent_limit_body(
             br#"{"error":{"type":"insufficient_quota""#,
-            false
+            false,
+            &[]
         ));
     }
 
@@ -573,14 +611,55 @@ mod quota_tests {
             serde_json::json!({"code":503}),
             serde_json::json!("server_busy"),
         ] {
-            assert!(retryable_provider_error(&value));
+            assert!(retryable_provider_error(&value, &[]));
         }
         for value in [
             serde_json::json!({"error":{"message":"quota exceeded: rate limit"}}),
             serde_json::json!({"error":{"message":"invalid request"},"request_id":"rate_limit"}),
             serde_json::json!({"error":{"message":"request 14290"}}),
         ] {
-            assert!(!retryable_provider_error(&value));
+            assert!(!retryable_provider_error(&value, &[]));
+        }
+    }
+
+    #[test]
+    fn transient_patterns_and_secret_masking_follow_pi() {
+        let partial_secret = ["sk-provider-billing-secret".to_owned()];
+        assert!(!permanent_limit_body(
+            b"rate limit sk-provider-billing",
+            false,
+            &partial_secret
+        ));
+        let secrets = provider_error_secrets(
+            Some("sk-provider-billing-secret"),
+            ["Bearer header-quota exceeded-secret"].into_iter(),
+        );
+        for message in [
+            "rate limit",
+            "rate-limit",
+            "rate_limit",
+            "request to host failed, reason:",
+        ] {
+            assert!(
+                retryable_provider_error(&serde_json::json!(message), &secrets),
+                "{message}"
+            );
+        }
+        for message in [
+            "rate---limit",
+            "server busy",
+            "t o o many requests",
+            "rate limit sk-provider-billing-secret quota exceeded",
+        ] {
+            assert!(
+                !retryable_provider_error(&serde_json::json!(message), &secrets),
+                "{message}"
+            );
+        }
+        for secret in ["sk-provider-billing-secret", "header-quota exceeded-secret"] {
+            let value = serde_json::json!({"error":{"message":format!("rate limit {secret}")}});
+            assert!(!permanent_provider_error(&value, &secrets));
+            assert!(retryable_provider_error(&value, &secrets));
         }
     }
 
@@ -597,16 +676,19 @@ mod quota_tests {
         for value in ["rate limit exceeded", r#"{"code":13080}"#] {
             assert!(!permanent_limit_text(value.as_bytes(), true));
         }
-        assert!(!permanent_limit_body(br#"{"code":1308"#, false));
+        assert!(!permanent_limit_body(br#"{"code":1308"#, false, &[]));
         assert!(!permanent_limit_body(
             br#"{"request_id":"billing-secret"}"#,
-            true
+            true,
+            &[]
         ));
         assert!(permanent_provider_error(
-            &serde_json::json!({"error":{"code":1308}})
+            &serde_json::json!({"error":{"code":1308}}),
+            &[]
         ));
         assert!(permanent_provider_error(
-            &serde_json::json!({"error":{"message":"quota exceeded"}})
+            &serde_json::json!({"error":{"message":"quota exceeded"}}),
+            &[]
         ));
     }
 }

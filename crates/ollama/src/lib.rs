@@ -780,6 +780,10 @@ impl Model for Ollama {
         if let Some(control) = self.cache_retention.anthropic_control() {
             apply_anthropic_cache(&mut body, &control);
         }
+        let error_secrets = pi_rs_core::provider_error_secrets(
+            self.token.as_deref(),
+            self.headers.values().filter_map(|v| v.to_str().ok()),
+        );
         let builder = self
             .authenticate(self.client.post(self.endpoint.clone()))
             .json(&body);
@@ -812,7 +816,8 @@ impl Model for Ollama {
             let description = format!("HTTP status {status}");
             let permanent_quota = (matches!(status.as_u16(), 408 | 429)
                 || status.is_server_error())
-                && pi_rs_core::permanent_provider_limit(response.bytes_stream()).await;
+                && pi_rs_core::permanent_provider_limit(response.bytes_stream(), &error_secrets)
+                    .await;
             return Err(if permanent_quota {
                 Error::Model("Chat Completions account quota or billing limit reached".into())
             } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
@@ -902,9 +907,9 @@ impl Model for Ollama {
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
                 if let Some(error) = &chunk.error {
-                    Err(if pi_rs_core::permanent_provider_error(error) {
+                    Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                         Error::Model("Chat Completions account quota or billing limit reached".into())
-                    } else if pi_rs_core::retryable_provider_error(error) {
+                    } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("provider returned a transient stream error".into())
                     } else {
                         Error::Model("provider returned a stream error".into())
@@ -1166,7 +1171,7 @@ mod content_tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded"} else {"rate limit exceeded"},"request_id":"billing-sentinel-secret"}});
+            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded sk-provider-billing-secret"} else {"rate limit exceeded sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -1174,7 +1179,11 @@ mod content_tests {
                 let body = format!("data: {event}\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = Ollama::new(&format!("http://{address}"), None).unwrap();
+            let model = Ollama::new(
+                &format!("http://{address}"),
+                Some("sk-provider-billing-secret".into()),
+            )
+            .unwrap();
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![],
@@ -1198,6 +1207,7 @@ mod content_tests {
             );
             assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }
@@ -1217,6 +1227,11 @@ mod content_tests {
                 true,
             ),
             (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                true,
+            ),
+            (
                 429,
                 r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
                 false,
@@ -1232,6 +1247,11 @@ mod content_tests {
                 r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
                 false,
             ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1241,7 +1261,11 @@ mod content_tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = Ollama::new(&format!("http://{address}"), None).unwrap();
+            let model = Ollama::new(
+                &format!("http://{address}"),
+                Some("sk-provider-billing-secret".into()),
+            )
+            .unwrap();
             let result = model
                 .stream(ModelRequest {
                     model: "m".into(),
@@ -1260,6 +1284,7 @@ mod content_tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }

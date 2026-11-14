@@ -182,6 +182,13 @@ impl Google {
         self
     }
 
+    fn error_secrets(&self) -> Vec<String> {
+        pi_rs_core::provider_error_secrets(
+            self.api_key.to_str().ok(),
+            self.headers.values().filter_map(|v| v.to_str().ok()),
+        )
+    }
+
     fn url(&self, resource: Option<&str>) -> Url {
         let mut url = self.endpoint.clone();
         let mut segments = url.path_segments_mut().expect("HTTP base URL");
@@ -203,7 +210,7 @@ impl Google {
             .send()
             .await
             .map_err(|_| Error::Model("Google model catalog request failed".into()))?;
-        let mut response = check_status(response).await?;
+        let mut response = check_status(response, &self.error_secrets()).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -483,14 +490,14 @@ fn apply_thinking_budget(
     Ok(())
 }
 
-async fn check_status(response: Response) -> Result<Response> {
+async fn check_status(response: Response, secrets: &[String]) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let message = format!("Google Gemini returned HTTP {status}");
     if (status.as_u16() == 429 || status.is_server_error())
-        && pi_rs_core::permanent_provider_limit(response.bytes_stream()).await
+        && pi_rs_core::permanent_provider_limit(response.bytes_stream(), secrets).await
     {
         Err(Error::Model(
             "Google Gemini account quota or billing limit reached".into(),
@@ -836,7 +843,8 @@ impl Model for Google {
                     .into(),
                 )
             })?;
-        let response = check_status(response).await?;
+        let response = check_status(response, &self.error_secrets()).await?;
+        let error_secrets = self.error_secrets();
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
         let provider = self.provider.clone();
@@ -871,7 +879,7 @@ impl Model for Google {
                     .map_err(|_| Error::Model("invalid Google Gemini stream chunk".into()))?;
                 if let Some(error) = value.get("error") {
                     let code = error["code"].as_u64().unwrap_or_default();
-                    Err(if pi_rs_core::permanent_provider_error(error) {
+                    Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                         Error::Model("Google Gemini account quota or billing limit reached".into())
                     } else if code == 429 || (500..600).contains(&code) {
                         Error::RetryableModel("Google Gemini returned a transient stream error".into())
@@ -993,7 +1001,7 @@ mod tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"error":{"code":503,"message":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"}});
+            let event = json!({"error":{"code":503,"message":if permanent {"quota exceeded sk-provider-billing-secret"} else {"temporarily unavailable sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -1001,7 +1009,7 @@ mod tests {
                 let body = format!("data: {event}\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model = Google::new(&format!("http://{address}"), "key")
+            let model = Google::new(&format!("http://{address}"), "sk-provider-billing-secret")
                 .unwrap()
                 .with_context_probe(false);
             let request = ModelRequest {
@@ -1026,6 +1034,7 @@ mod tests {
                 permanent
             );
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }
@@ -1045,6 +1054,11 @@ mod tests {
                 true,
             ),
             (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                true,
+            ),
+            (
                 429,
                 r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
                 false,
@@ -1059,6 +1073,11 @@ mod tests {
                 r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
                 false,
             ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1068,19 +1087,28 @@ mod tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let client = Client::builder().no_proxy().build().unwrap();
-            let response = client
-                .get(format!("http://{address}/"))
-                .send()
-                .await
-                .unwrap();
-            let error = check_status(response).await.unwrap_err();
+            let model = Google::new(&format!("http://{address}"), "sk-provider-billing-secret")
+                .unwrap()
+                .with_context_probe(false);
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
             assert_eq!(matches!(error, Error::Model(_)), permanent);
             assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
             if permanent {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }

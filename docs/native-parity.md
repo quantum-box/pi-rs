@@ -4311,8 +4311,10 @@ Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
 recognize permanent account, billing and quota exhaustion in structured error
 message, code and type fields for retryable HTTP statuses and stream errors.
 Recognized transient stream errors remain retryable after permanent-limit checks.
-JSON metadata such as request IDs does not affect classification. Plain-text
-errors are also supported. HTTP body inspection is limited to 64 KiB and two
+JSON metadata such as request IDs does not affect classification. Known request
+credentials and configured header values are masked before classification, and
+transient stream matching follows the pinned Pi patterns. OpenAI subscription
+codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
 seconds. Complete error fields preceding a truncated later JSON field remain
 classifiable; incomplete values and unrelated metadata are ignored. Failed or
 timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or

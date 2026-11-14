@@ -570,6 +570,10 @@ impl Model for PiMessages {
                 request.max_output_tokens = request.max_output_tokens.min(limit);
             }
         }
+        let error_secrets = pi_rs::provider_error_secrets(
+            Some(token.as_str()),
+            self.headers.values().filter_map(|v| v.to_str().ok()),
+        );
         let requested_model = request.model.clone();
         let payload = client.encode(request);
         let response = self
@@ -594,7 +598,7 @@ impl Model for PiMessages {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
             let permanent_quota = (status.as_u16() == 429 || status.is_server_error())
-                && pi_rs::permanent_provider_limit(response.bytes_stream()).await;
+                && pi_rs::permanent_provider_limit(response.bytes_stream(), &error_secrets).await;
             return Err(if permanent_quota {
                 Error::Model("Pi Messages account quota or billing limit reached".into())
             } else if status.as_u16() == 429 || status.is_server_error() {
@@ -758,7 +762,7 @@ impl Model for PiMessages {
                         return;
                     }
                     "error" => {
-                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"]) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"]) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
+                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"], &error_secrets) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"], &error_secrets) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
                     }
                     _ => Err(Error::Model("Unknown Pi Messages stream event".into()))?,
                 }
@@ -816,7 +820,7 @@ mod tool_status_tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded"} else {"rate limit exceeded"},"request_id":"billing-sentinel-secret"});
+            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded sk-provider-billing-secret"} else {"rate limit exceeded sk-provider-billing-secret"},"request_id":"billing-sentinel-secret"});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -824,8 +828,12 @@ mod tool_status_tests {
                 let body = format!("data: {event}\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model =
-                PiMessages::new("fixture", &format!("http://{address}/"), "token".into()).unwrap();
+            let model = PiMessages::new(
+                "fixture",
+                &format!("http://{address}/"),
+                "sk-provider-billing-secret".into(),
+            )
+            .unwrap();
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![],
@@ -849,6 +857,7 @@ mod tool_status_tests {
             );
             assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }
@@ -870,6 +879,11 @@ mod tool_status_tests {
                 true,
             ),
             (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-provider-billing-secret"}}"#,
+                true,
+            ),
+            (
                 429,
                 r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
                 false,
@@ -884,6 +898,11 @@ mod tool_status_tests {
                 r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
                 false,
             ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-provider-billing-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -893,8 +912,12 @@ mod tool_status_tests {
                 let _ = socket.read(&mut request).unwrap();
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
-            let model =
-                PiMessages::new("fixture", &format!("http://{address}/"), "token".into()).unwrap();
+            let model = PiMessages::new(
+                "fixture",
+                &format!("http://{address}/"),
+                "sk-provider-billing-secret".into(),
+            )
+            .unwrap();
             let result = model
                 .stream(ModelRequest {
                     model: "m".into(),
@@ -913,6 +936,7 @@ mod tool_status_tests {
                 assert!(error.to_string().contains("quota or billing limit"));
             }
             assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-provider-billing-secret"));
             worker.join().unwrap();
         }
     }
