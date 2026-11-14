@@ -125,6 +125,15 @@ fn merge_project_servers(
                 serde_json::from_value(Value::Object(candidate)).map_err(|_| {
                     Error::Config(format!("project MCP server {name} override is invalid"))
                 })?;
+            if let Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(client)) = &config.oauth {
+                pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).map_err(
+                    |_| {
+                        Error::Config(format!(
+                            "project MCP server {name} override has invalid OAuth settings"
+                        ))
+                    },
+                )?;
+            }
             if matches!(
                 config.oauth,
                 Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(_))
@@ -623,6 +632,11 @@ mod tests {
         let mut servers = original.as_object().unwrap().clone();
         let invalid = json!({"service":{"enabled":true,"oauth":true}});
         assert!(merge_project_servers(&mut servers, invalid.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackPort":0}}});
+        let mut servers = original.as_object().unwrap().clone();
+        let enabled = json!({"service":{"enabled":true}});
+        assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
         assert_eq!(Value::Object(servers), original);
     }
 }
