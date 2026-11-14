@@ -737,6 +737,33 @@ fn read_event_content(outcome: &Outcome) -> Option<Value> {
         Outcome::Succeeded(output)
         | Outcome::SucceededWithDetails { output, .. }
         | Outcome::TextResult { output, .. } => Some(json!(output)),
+        Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } if attachments.is_empty() => {
+            let blocks = data.get("content")?.as_array()?;
+            let note = blocks
+                .iter()
+                .find_map(|block| {
+                    (block.get("type")?.as_str()? == "text")
+                        .then(|| block.get("text")?.as_str())
+                        .flatten()
+                })
+                .unwrap_or("");
+            if let Some(image) = blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            {
+                let data = image.get("data")?.as_str()?;
+                let mime_type = image.get("mimeType")?.as_str()?;
+                if data.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+                Some(json!({"type":"image", "data":data, "mimeType":mime_type, "note":note}))
+            } else {
+                Some(json!(note))
+            }
+        }
         _ => None,
     }
 }
@@ -3445,6 +3472,52 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_read_structured_projection_uses_first_text_and_image() {
+        use pi_rs::{AttachmentRef, Outcome};
+        use serde_json::json;
+        let image = Outcome::Structured {
+            data: json!({"content":[
+                {"type":"text", "text":"read note"},
+                {"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="},
+                {"type":"text", "text":"other"}
+            ]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&image),
+            Some(
+                json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"read note"})
+            )
+        );
+        let omitted = Outcome::Structured {
+            data: json!({"content":[{"type":"text", "text":"image omitted"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&omitted),
+            Some(json!("image omitted"))
+        );
+        let malformed = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "data":"x"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&malformed), None);
+        let external = Outcome::Structured {
+            data: json!({"content":[]}),
+            attachments: vec![AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert_eq!(super::read_event_content(&external), None);
+        let oversized = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "mimeType":"image/png", "data":"x".repeat(8 * 1024 * 1024 + 1)}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&oversized), None);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_structured_result_preserves_output_and_exit_status() {

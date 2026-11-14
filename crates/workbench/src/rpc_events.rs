@@ -732,6 +732,56 @@ mod streaming_tool_tests {
     }
 
     #[test]
+    fn image_read_sidecar_appears_only_in_execution_event() {
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "image-read".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let blocks = json!([{ "type":"text", "text":"image note" }, { "type":"image", "mimeType":"image/png", "data":"aW1hZ2U=" }]);
+        let structured =
+            json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"image note"});
+        stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured}), &args);
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Structured {
+                    data: json!({"content":blocks}),
+                    attachments: vec![],
+                },
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(end["result"]["structuredContent"], structured);
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["content"], blocks);
+        assert!(message["message"].get("structuredContent").is_none());
+    }
+
+    #[test]
     fn multimodal_tool_events_preserve_order_and_native_metadata() {
         let blocks = json!([
             {"type":"text","text":"before"},

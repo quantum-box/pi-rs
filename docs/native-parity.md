@@ -686,7 +686,10 @@ explicitly replace output, including with the same text. Custom host hooks may
 opt in to reporting output-field presence; native executable extensions negotiate
 that capability and forward the field-presence result across the process boundary.
 Older executables and opaque overrides remain conservative when field presence is
-unavailable. Image read structured output remains a separate parity gap.
+unavailable. Image reads use the same transient event path to project Pi's image
+structured result with its MIME type, encoded data and displayed note; image
+omission results project the note as a string. Existing image and event size
+limits remain in force; attachment-reference results are not synthesized.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
