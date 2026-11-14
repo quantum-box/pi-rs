@@ -225,23 +225,25 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
                 .proxies
                 .iter()
                 .find_map(|proxy| proxy.intercept(req.uri()));
-            if route.as_ref().is_none_or(|proxy| proxy.tunnel_http())
-                || req.uri().scheme() != Some(&Scheme::HTTP)
-            {
+            let forward_proxy = req.uri().scheme() == Some(&Scheme::HTTP)
+                && route.as_ref().is_some_and(|proxy| {
+                    !proxy.tunnel_http()
+                        && (proxy.uri().scheme() == Some(&Scheme::HTTP)
+                            || proxy.uri().scheme() == Some(&Scheme::HTTPS))
+                });
+            if !forward_proxy {
                 req.headers_mut().remove(PROXY_AUTHORIZATION);
             }
-            if req.uri().scheme() == Some(&Scheme::HTTP) {
+            if forward_proxy {
                 if let Some(proxy) = &route {
-                    if !proxy.tunnel_http() {
-                        if !req.headers().contains_key(PROXY_AUTHORIZATION) {
-                            if let Some(auth) = proxy.basic_auth() {
-                                req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
-                            }
+                    if !req.headers().contains_key(PROXY_AUTHORIZATION) {
+                        if let Some(auth) = proxy.basic_auth() {
+                            req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
                         }
-                        if let Some(headers) = proxy.custom_headers() {
-                            for (name, value) in headers {
-                                req.headers_mut().insert(name, value.clone());
-                            }
+                    }
+                    if let Some(headers) = proxy.custom_headers() {
+                        for (name, value) in headers {
+                            req.headers_mut().insert(name, value.clone());
                         }
                     }
                 }

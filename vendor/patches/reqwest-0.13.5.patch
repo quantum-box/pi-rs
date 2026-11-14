@@ -238,7 +238,7 @@
 +        }
 +        client
 +    }
-@@ -153 +222,30 @@
+@@ -153 +222,32 @@
 -    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +        if let Some(routing) = &self.routing {
@@ -246,23 +246,25 @@
 +                .proxies
 +                .iter()
 +                .find_map(|proxy| proxy.intercept(req.uri()));
-+            if route.as_ref().is_none_or(|proxy| proxy.tunnel_http())
-+                || req.uri().scheme() != Some(&Scheme::HTTP)
-+            {
++            let forward_proxy = req.uri().scheme() == Some(&Scheme::HTTP)
++                && route.as_ref().is_some_and(|proxy| {
++                    !proxy.tunnel_http()
++                        && (proxy.uri().scheme() == Some(&Scheme::HTTP)
++                            || proxy.uri().scheme() == Some(&Scheme::HTTPS))
++                });
++            if !forward_proxy {
 +                req.headers_mut().remove(PROXY_AUTHORIZATION);
 +            }
-+            if req.uri().scheme() == Some(&Scheme::HTTP) {
++            if forward_proxy {
 +                if let Some(proxy) = &route {
-+                    if !proxy.tunnel_http() {
-+                        if !req.headers().contains_key(PROXY_AUTHORIZATION) {
-+                            if let Some(auth) = proxy.basic_auth() {
-+                                req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
-+                            }
++                    if !req.headers().contains_key(PROXY_AUTHORIZATION) {
++                        if let Some(auth) = proxy.basic_auth() {
++                            req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
 +                        }
-+                        if let Some(headers) = proxy.custom_headers() {
-+                            for (name, value) in headers {
-+                                req.headers_mut().insert(name, value.clone());
-+                            }
++                    }
++                    if let Some(headers) = proxy.custom_headers() {
++                        for (name, value) in headers {
++                            req.headers_mut().insert(name, value.clone());
 +                        }
 +                    }
 +                }
@@ -270,7 +272,7 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -1016,0 +1115,11 @@
+@@ -1016,0 +1117,11 @@
 +        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
 +            && !connector_builder.uses_local_transport();
 +        let routing = dynamic_routing.then(|| {
@@ -282,16 +284,16 @@
 +                pools: std::sync::Mutex::new(std::collections::VecDeque::new()),
 +            })
 +        });
-@@ -1019,0 +1129 @@
+@@ -1019,0 +1131 @@
 +            routing,
-@@ -1106,0 +1217 @@
+@@ -1106,0 +1219 @@
 +                dynamic_routing,
-@@ -2646,2 +2757,4 @@
+@@ -2646,2 +2759,4 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
 +        if !self.inner.dynamic_routing {
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2977,0 +3091 @@
+@@ -2977,0 +3093 @@
 +    dynamic_routing: bool,
