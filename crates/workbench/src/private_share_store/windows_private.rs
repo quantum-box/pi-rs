@@ -475,6 +475,47 @@ impl VerifiedDirectory {
         Ok(file)
     }
 
+    pub(super) fn replace_private_file(&self, source: &str, target: &str) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        verify_private_acl(&self._handle, true)?;
+        let source: Vec<u16> = self
+            .child_path(source)?
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let target: Vec<u16> = self
+            .child_path(target)?
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: both paths are NUL-terminated children of the pinned directory.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_private_file(&self, name: &str) -> io::Result<()> {
+        verify_private_acl(&self._handle, true)?;
+        match std::fs::remove_file(self.child_path(name)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Open an existing private file without following reparse points.
     pub fn open_private_file(&self, name: &str) -> io::Result<std::fs::File> {
         verify_private_acl(&self._handle, true)?;

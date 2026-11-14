@@ -5,7 +5,7 @@
 //! side effects. Other platforms deliberately return unsupported.
 
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use serde_json::Value;
 
 /// Exact identity of the journal and the environment that produced a snapshot.
@@ -19,19 +19,30 @@ pub struct Binding {
     pub provenance_digest: [u8; 32],
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
     version: u32,
+    generation: uuid::Uuid,
     binding: Binding,
     context: Value,
     tag: [u8; 32],
 }
 
+#[cfg(any(unix, windows))]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Marker {
+    version: u32,
+    generation: uuid::Uuid,
+    clean: bool,
+    tag: [u8; 32],
+}
+
 #[cfg(unix)]
 mod unix {
-    use super::{Binding, Envelope, Value};
+    use super::{Binding, Envelope, Marker, Value};
     use hmac::{Hmac, Mac};
     use serde::{Serialize, de::DeserializeOwned};
     use sha2::Sha256;
@@ -47,6 +58,7 @@ mod unix {
 
     /// All operations remain relative to a verified private directory handle.
     pub struct Store {
+        parent: File,
         directory: File,
         key: [u8; 32],
     }
@@ -57,6 +69,8 @@ mod unix {
         store: &'a Store,
         lock: File,
         name: CString,
+        marker: CString,
+        generation: uuid::Uuid,
         binding: Binding,
     }
 
@@ -196,6 +210,114 @@ mod unix {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cache name"))
     }
 
+    fn atomic_write(
+        directory: &File,
+        target: &CString,
+        bytes: &[u8],
+        private_directory: bool,
+    ) -> io::Result<()> {
+        let temporary = CString::new(format!(".{}.tmp", uuid::Uuid::new_v4())).unwrap();
+        let result = (|| {
+            if private_directory {
+                secure_dir(directory)?;
+            } else {
+                secure_parent(directory)?;
+            }
+            let mut file = open_at(
+                directory,
+                &temporary,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?;
+            secure_file(&file)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            secure_file(&file)?;
+            if private_directory {
+                secure_dir(directory)?;
+            } else {
+                secure_parent(directory)?;
+            }
+            // SAFETY: both names and the directory descriptor are valid.
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    target.as_ptr(),
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            directory.sync_all()
+        })();
+        let _ = unlink_at(directory, &temporary);
+        result
+    }
+
+    fn write_marker(
+        directory: &File,
+        key: &[u8; 32],
+        name: &CString,
+        generation: uuid::Uuid,
+        clean: bool,
+        private_directory: bool,
+    ) -> io::Result<()> {
+        let tag = keyed_digest(
+            key,
+            "share-marker-v1",
+            &(name.as_bytes(), 1u32, generation, clean),
+        )?;
+        let marker = Marker {
+            version: 1,
+            generation,
+            clean,
+            tag,
+        };
+        atomic_write(
+            directory,
+            name,
+            &serde_json::to_vec(&marker)?,
+            private_directory,
+        )
+    }
+
+    fn read_marker(directory: &File, key: &[u8; 32], name: &CString) -> io::Result<Option<Marker>> {
+        let file = match open_at(directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        secure_file(&file)?;
+        if file.metadata()?.len() > 4096 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Ok(None);
+        }
+        let Ok(marker) = serde_json::from_slice::<Marker>(&bytes) else {
+            return Ok(None);
+        };
+        if marker.version != 1 || !marker.clean {
+            return Ok(None);
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
+        mac.update(b"share-marker-v1\0");
+        mac.update(&serde_json::to_vec(&(
+            name.as_bytes(),
+            marker.version,
+            marker.generation,
+            marker.clean,
+        ))?);
+        if mac.verify_slice(&marker.tag).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(marker))
+    }
+
     fn read_key(directory: &File) -> io::Result<Option<[u8; 32]>> {
         let name = CString::new("key-v1").unwrap();
         let mut file = match open_at(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
@@ -312,7 +434,11 @@ mod unix {
                     None => return Ok(None),
                 }
             };
-            Ok(Some(Self { directory, key }))
+            Ok(Some(Self {
+                parent,
+                directory,
+                key,
+            }))
         }
 
         /// Keyed fingerprint for complete journal or provenance inputs. The
@@ -370,12 +496,21 @@ mod unix {
             let lock = self.lock(path, &binding, true)?;
             lock.lock()?;
             let name = name_for(&self.key, path, binding.session_id, "json")?;
+            let marker = name_for(&self.key, path, binding.session_id, "generation")?;
+            let generation = uuid::Uuid::new_v4();
+            let anchor = name_for(&self.key, path, binding.session_id, "anchor")?;
+            // Anchor is outside the cache directory. An old snapshot and
+            // marker restored into that directory cannot revive a generation.
+            write_marker(&self.parent, &self.key, &anchor, generation, true, false)?;
+            write_marker(&self.directory, &self.key, &marker, generation, false, true)?;
             unlink_at(&self.directory, &name)?;
             self.directory.sync_all()?;
             Ok(Generation {
                 store: self,
                 lock,
                 name,
+                marker,
+                generation,
                 binding,
             })
         }
@@ -412,6 +547,18 @@ mod unix {
                 Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
+            secure_parent(&self.parent)?;
+            let anchor_name = name_for(&self.key, path, binding.session_id, "anchor")?;
+            let Some(anchor) = read_marker(&self.parent, &self.key, &anchor_name)? else {
+                return Ok(None);
+            };
+            let marker_name = name_for(&self.key, path, binding.session_id, "generation")?;
+            let Some(marker) = read_marker(&self.directory, &self.key, &marker_name)? else {
+                return Ok(None);
+            };
+            if anchor.generation != marker.generation {
+                return Ok(None);
+            }
             let name = name_for(&self.key, path, binding.session_id, "json")?;
             let file = match open_at(&self.directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
                 Ok(file) => file,
@@ -430,7 +577,10 @@ mod unix {
             let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
                 return Ok(None);
             };
-            if envelope.version != 1 || &envelope.binding != binding {
+            if envelope.version != 2
+                || envelope.generation != marker.generation
+                || &envelope.binding != binding
+            {
                 return Ok(None);
             }
             let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts 32 bytes");
@@ -438,6 +588,7 @@ mod unix {
             mac.update(&serde_json::to_vec(&(
                 name.as_bytes(),
                 envelope.version,
+                envelope.generation,
                 &envelope.binding,
                 &envelope.context,
             ))?);
@@ -476,10 +627,17 @@ mod unix {
             let tag = keyed_digest(
                 &self.store.key,
                 "share-envelope-v1",
-                &(self.name.as_bytes(), 1u32, &binding, &context),
+                &(
+                    self.name.as_bytes(),
+                    2u32,
+                    self.generation,
+                    &binding,
+                    &context,
+                ),
             )?;
             let envelope = Envelope {
-                version: 1,
+                version: 2,
+                generation: self.generation,
                 binding,
                 context,
                 tag,
@@ -491,42 +649,19 @@ mod unix {
                     "share cache too large",
                 ));
             }
-            let temporary = CString::new(format!(".{}.tmp", uuid::Uuid::new_v4())).unwrap();
-            let mut renamed = false;
-            let result = (|| {
-                let mut file = open_at(
-                    &self.store.directory,
-                    &temporary,
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                    0o600,
-                )?;
-                secure_file(&file)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                secure_file(&file)?;
-                secure_dir(&self.store.directory)?;
-                // SAFETY: both names refer to the same verified directory.
-                if unsafe {
-                    libc::renameat(
-                        self.store.directory.as_raw_fd(),
-                        temporary.as_ptr(),
-                        self.store.directory.as_raw_fd(),
-                        self.name.as_ptr(),
-                    )
-                } < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                renamed = true;
-                self.store.directory.sync_all()
-            })();
-            let _ = unlink_at(&self.store.directory, &temporary);
-            if result.is_err() && renamed {
-                let _ = unlink_at(&self.store.directory, &self.name);
-                let _ = self.store.directory.sync_all();
-            }
+            atomic_write(&self.store.directory, &self.name, &bytes, true)?;
+            // Publishing the marker is last: a crash before this point leaves
+            // the generation dirty even when the snapshot file exists.
+            write_marker(
+                &self.store.directory,
+                &self.store.key,
+                &self.marker,
+                self.generation,
+                true,
+                true,
+            )?;
             let _ = &self.lock;
-            result
+            Ok(())
         }
     }
 }
@@ -536,6 +671,10 @@ pub use unix::{Generation, Store};
 
 #[cfg(windows)]
 pub mod windows_private;
+#[cfg(windows)]
+mod windows_store;
+#[cfg(windows)]
+pub use windows_store::{Generation, Store};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -940,6 +1079,156 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&target, root.path().join("share-context-v1")).unwrap();
         assert!(Store::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn replayed_snapshot_is_rejected_after_a_new_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/replay.jsonl");
+        let binding = binding();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        let file = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|e| e.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let old = std::fs::read(&file).unwrap();
+        let generation = store.begin(path, binding.clone()).unwrap();
+        drop(generation);
+        std::fs::write(&file, &old).unwrap();
+        assert!(
+            store.read(path, &binding).unwrap().is_none(),
+            "dirty generation must reject replay"
+        );
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"new"}))
+            .unwrap();
+        std::fs::write(&file, old).unwrap();
+        assert!(
+            store.read(path, &binding).unwrap().is_none(),
+            "clean new generation must reject old snapshot"
+        );
+    }
+
+    #[test]
+    fn restoring_old_marker_and_snapshot_does_not_roll_back_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/rollback.jsonl");
+        let binding = binding();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        let paths: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|e| e.path())
+            .collect();
+        let old_snapshot = paths
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let old_marker = paths
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "generation"))
+            .unwrap();
+        let snapshot_bytes = std::fs::read(old_snapshot).unwrap();
+        let marker_bytes = std::fs::read(old_marker).unwrap();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"new"}))
+            .unwrap();
+        std::fs::write(old_snapshot, snapshot_bytes).unwrap();
+        std::fs::write(old_marker, marker_bytes).unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn restoring_cache_and_external_anchor_together_is_not_detectable_yet() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/full-rollback.jsonl");
+        let binding = binding();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let anchor = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "anchor"))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        let paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .collect();
+        let snapshot = paths
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let marker = paths
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "generation"))
+            .unwrap();
+        let saved = [
+            std::fs::read(&anchor).unwrap(),
+            std::fs::read(marker).unwrap(),
+            std::fs::read(snapshot).unwrap(),
+        ];
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"new"}))
+            .unwrap();
+        std::fs::write(anchor, &saved[0]).unwrap();
+        std::fs::write(marker, &saved[1]).unwrap();
+        std::fs::write(snapshot, &saved[2]).unwrap();
+        // Offline files alone cannot detect a rollback of every authenticated
+        // state file. This boundary must be addressed before integration.
+        assert_eq!(
+            store.read(path, &binding).unwrap(),
+            Some(serde_json::json!({"prompt":"old"}))
+        );
+    }
+
+    #[test]
+    fn tampered_generation_marker_is_a_miss() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"value"}))
+            .unwrap();
+        let marker = std::fs::read_dir(root.path().join("share-context-v1"))
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "generation"))
+            .unwrap();
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        value["generation"] = serde_json::json!(uuid::Uuid::new_v4());
+        std::fs::write(marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
     }
 
     #[test]
