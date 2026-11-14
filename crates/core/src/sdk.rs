@@ -9167,6 +9167,7 @@ mod tests {
             let run_id = Uuid::new_v4();
             let turn_id = Uuid::new_v4();
             let summary_id = Uuid::new_v4();
+            let steering_id = Uuid::new_v4();
             let mut journal = Session::open(&path).unwrap();
             journal.select_model("fixture", None).unwrap();
             journal
@@ -9291,6 +9292,17 @@ mod tests {
                     reply: None,
                 })
                 .unwrap();
+            if !silent {
+                journal
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "after recovery".into(),
+                        },
+                    })
+                    .unwrap();
+            }
             drop(journal);
             let model = Arc::new(ResumeSettlementModel {
                 summary_id,
@@ -9415,6 +9427,12 @@ mod tests {
                 assert!(attempts.iter().all(|(id, usage, metadata)| *id == summary_id && matches!(usage, crate::UsageReport::Measured { usage } if usage.input_tokens == 9 && usage.output_tokens == 3) && metadata.finish_reason.as_deref() == Some("stop")));
             }
             assert!(session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+            if !silent {
+                let journal = session.journal().unwrap();
+                let compacted = journal.records().iter().position(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")).unwrap();
+                let delivered = journal.records().iter().position(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)).unwrap();
+                assert!(compacted < delivered);
+            }
             assert_eq!(session.resume().await.unwrap(), "answer");
             assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
             assert_eq!(model.attempts.lock().unwrap().len(), 2);
@@ -9535,7 +9553,17 @@ mod tests {
                         .unwrap();
                 }
                 let trigger = Uuid::new_v4();
+                let steering_id = Uuid::new_v4();
                 if started && !silent {
+                    journal
+                        .append(Event::InputQueued {
+                            input: crate::QueuedInput {
+                                id: steering_id,
+                                kind: crate::InputKind::Steer,
+                                content: "queued steering".into(),
+                            },
+                        })
+                        .unwrap();
                     journal
                         .append(Event::CustomMessageQueued {
                             input: crate::QueuedCustomMessage {
@@ -9609,6 +9637,15 @@ mod tests {
                                 && matches!(usage, crate::UsageReport::Unconfirmed))
                     );
                     assert_eq!(model.attempts.lock().unwrap().len(), 2);
+                    assert!(
+                        session
+                            .journal()
+                            .unwrap()
+                            .queued_inputs()
+                            .iter()
+                            .any(|input| input.input.id == steering_id)
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
                     assert_eq!(
                         session.journal().unwrap().pending_custom_trigger(),
                         Some(trigger)

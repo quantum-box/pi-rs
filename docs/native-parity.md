@@ -176,6 +176,8 @@ recognizes interrupted compaction markers before a summary is complete, and
 recognizes a durable overflow or length stop before its marker is written. It
 restores the branch model before checking the interrupted request's identity;
 queued trigger turns do not overtake an unresolved compaction recovery.
+Queued steering and other deferred context are held until interrupted
+compaction is resolved; an unresolved request leaves them queued.
 SDK recovery defers session-start callbacks until recovery succeeds; when
 extensions are registered it settles known and unconfirmed recovery usage using
 the restored model, then requires reconciliation before invoking them. An

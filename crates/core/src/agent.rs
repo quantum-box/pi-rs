@@ -1088,117 +1088,121 @@ impl Agent<'_> {
         {
             self.finish_recovered_turn_end(session, run_id, assistant_record, version, &states, cancel, observer).await?;
         }
-        // The trigger UUID is its run ID, so a restart resumes the same run.
-        if let Some((_, message)) =
-            session
-                .queued_custom_messages()
-                .into_iter()
-                .find(|(_, message)| {
-                    message.id == run_id
-                        && message.delivery == crate::CustomMessageDelivery::TriggerTurn
-                })
-        {
-            commit(
-                session,
-                Event::CustomMessageDelivered {
-                    id: message.id,
-                    message: message.message,
-                },
-                observer,
-            )?;
-        }
-        let trigger_started = session
-            .branch()
-            .iter()
-            .find_map(|record| match &record.event {
-                Event::Run {
-                    state: RunState::Running,
-                    ..
-                } if record.run_id == Some(run_id) => Some(record.id),
-                _ => None,
-            });
-        if has_trigger_message(session, run_id)
-            && let Some(started_at) = trigger_started
-        {
-            for (queued_at, pending) in session.queued_custom_messages() {
-                if pending.delivery == crate::CustomMessageDelivery::NextTurn
-                    && queued_at < started_at
-                {
-                    commit(
-                        session,
-                        Event::CustomMessageDelivered {
-                            id: pending.id,
-                            message: pending.message,
-                        },
-                        observer,
-                    )?;
-                }
-            }
-        }
-        // A prior interrupted run may have left deferred messages while a tool
-        // needed reconciliation. Recovery above must finish before they appear.
-        for (queued_at, deferred) in session.queued_custom_messages() {
-            let origin = session.records()[(queued_at - 1) as usize].run_id;
-            if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
-                && origin != Some(run_id)
-                && !origin.is_some_and(|id| has_unfinished_turn_end(session, id))
+        let recovering_compaction =
+            resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id);
+        if !recovering_compaction {
+            // The trigger UUID is its run ID, so a restart resumes the same run.
+            if let Some((_, message)) =
+                session
+                    .queued_custom_messages()
+                    .into_iter()
+                    .find(|(_, message)| {
+                        message.id == run_id
+                            && message.delivery == crate::CustomMessageDelivery::TriggerTurn
+                    })
             {
                 commit(
                     session,
                     Event::CustomMessageDelivered {
-                        id: deferred.id,
-                        message: deferred.message,
+                        id: message.id,
+                        message: message.message,
                     },
                     observer,
                 )?;
             }
-        }
-        if let Some((id, content)) = input {
-            commit(
-                session,
-                Event::User {
-                    content,
-                    input_id: Some(id),
-                },
-                observer,
-            )?;
-        }
-        // Only messages queued before this run's initial user entry belong to it.
-        // This also covers image prompts and avoids consuming newly queued next-turn
-        // messages if a partially completed run is restored.
-        if let Some(initial_id) = session
-            .branch()
-            .iter()
-            .find_map(|record| match &record.event {
-                Event::User {
-                    input_id: Some(id), ..
+            let trigger_started = session
+                .branch()
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::Run {
+                        state: RunState::Running,
+                        ..
+                    } if record.run_id == Some(run_id) => Some(record.id),
+                    _ => None,
+                });
+            if has_trigger_message(session, run_id)
+                && let Some(started_at) = trigger_started
+            {
+                for (queued_at, pending) in session.queued_custom_messages() {
+                    if pending.delivery == crate::CustomMessageDelivery::NextTurn
+                        && queued_at < started_at
+                    {
+                        commit(
+                            session,
+                            Event::CustomMessageDelivered {
+                                id: pending.id,
+                                message: pending.message,
+                            },
+                            observer,
+                        )?;
+                    }
                 }
-                | Event::UserWithImages {
-                    input_id: Some(id), ..
-                } if *id == run_id => Some(record.id),
-                _ => None,
-            })
-        {
-            for (queued_at, input) in session.queued_custom_messages() {
-                if queued_at < initial_id
-                    && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
-                    && input.delivery == crate::CustomMessageDelivery::NextTurn
+            }
+            // A prior interrupted run may have left deferred messages while a tool
+            // needed reconciliation. Recovery above must finish before they appear.
+            for (queued_at, deferred) in session.queued_custom_messages() {
+                let origin = session.records()[(queued_at - 1) as usize].run_id;
+                if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
+                    && origin != Some(run_id)
+                    && !origin.is_some_and(|id| has_unfinished_turn_end(session, id))
                 {
                     commit(
                         session,
                         Event::CustomMessageDelivered {
-                            id: input.id,
-                            message: input.message,
+                            id: deferred.id,
+                            message: deferred.message,
                         },
                         observer,
                     )?;
                 }
             }
+            if let Some((id, content)) = input {
+                commit(
+                    session,
+                    Event::User {
+                        content,
+                        input_id: Some(id),
+                    },
+                    observer,
+                )?;
+            }
+            // Only messages queued before this run's initial user entry belong to it.
+            // This also covers image prompts and avoids consuming newly queued next-turn
+            // messages if a partially completed run is restored.
+            if let Some(initial_id) =
+                session
+                    .branch()
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::User {
+                            input_id: Some(id), ..
+                        }
+                        | Event::UserWithImages {
+                            input_id: Some(id), ..
+                        } if *id == run_id => Some(record.id),
+                        _ => None,
+                    })
+            {
+                for (queued_at, input) in session.queued_custom_messages() {
+                    if queued_at < initial_id
+                        && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
+                        && input.delivery == crate::CustomMessageDelivery::NextTurn
+                    {
+                        commit(
+                            session,
+                            Event::CustomMessageDelivered {
+                                id: input.id,
+                                message: input.message,
+                            },
+                            observer,
+                        )?;
+                    }
+                }
+            }
         }
-
         let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
-        if pending.is_none() {
+        if pending.is_none() && !recovering_compaction {
             apply_inputs(session, false, observer)?;
         }
         let current_entries: std::collections::HashSet<_> = session
@@ -1236,11 +1240,16 @@ impl Agent<'_> {
             .flatten()
             .filter(|_| !trigger_unanswered)
         {
-            if !apply_inputs(session, true, observer)? {
+            if recovering_compaction {
                 self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
+            }
+            if !apply_inputs(session, true, observer)? {
+                if !recovering_compaction {
+                    self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
+                }
                 return Ok(answer);
             }
-        } else if !session.branch().iter().any(|record| {
+        } else if !recovering_compaction && !session.branch().iter().any(|record| {
             matches!(
                 record.event,
                 Event::User { .. }
