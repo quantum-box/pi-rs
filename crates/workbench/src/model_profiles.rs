@@ -601,6 +601,18 @@ impl ModelMetadata {
             .map(|input| input.contains(&Modality::Image))
     }
 
+    pub fn input_modalities(&self) -> Option<Vec<&'static str>> {
+        self.input.as_ref().map(|input| {
+            input
+                .iter()
+                .map(|modality| match modality {
+                    Modality::Text => "text",
+                    Modality::Image => "image",
+                })
+                .collect()
+        })
+    }
+
     pub fn prompt_cache_seconds(&self, retention: pi_rs::CacheRetention) -> Option<f64> {
         let cache = self.prompt_cache?;
         match retention {

@@ -951,7 +951,7 @@ fn command_cancellable(
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
-                    Ok(Some(super::model_listing::with_details(
+                    Ok(Some(model_with_input_details(
                         model_value(&current, &catalog.provider, &candidate),
                         details.get(&candidate),
                     )))
@@ -1172,6 +1172,9 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
     if let Some(configured) = configured {
         configured.apply_catalog_metadata(&mut value);
+        if let Some(input) = configured.input_modalities() {
+            value["input"] = json!(input);
+        }
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(adapter, &mut details);
         super::model_listing::with_details(value, Some(&details))
@@ -1209,7 +1212,7 @@ fn available_models(
             };
             for model in catalog.models {
                 if include_details {
-                    rows.push(super::model_listing::with_details(
+                    rows.push(model_with_input_details(
                         model_value(&args, &catalog.provider, &model),
                         details.get(&model),
                     ));
@@ -1223,6 +1226,23 @@ fn available_models(
         }
         Ok((choices, rows))
     })
+}
+
+// Dynamic native catalogs can report image support without a Pi-style input
+// list. Preserve configured lists verbatim, and derive one only when the
+// discovered capability is known; an unknown capability remains unknown.
+fn model_with_input_details(model: Value, details: Option<&pi_rs::ollama::ModelDetails>) -> Value {
+    let mut model = super::model_listing::with_details(model, details);
+    if model.get("input").is_none()
+        && let Some(images) = details.and_then(|details| details.images)
+    {
+        model["input"] = if images {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+    }
+    model
 }
 
 fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>>(
@@ -1509,6 +1529,97 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn rpc_model_input_preserves_configured_modalities() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]},
+                {"id":"image-only", "input":["image"]}
+            ]}}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        for (id, input) in [
+            ("vision", json!(["text", "image"])),
+            ("text", json!(["text"])),
+            ("image-only", json!(["image"])),
+        ] {
+            let value = model_value(&args, &provider, id);
+            assert_eq!(value["input"], input, "{id}");
+            assert_eq!(
+                value["images"],
+                input.as_array().unwrap().contains(&json!("image"))
+            );
+        }
+        assert!(
+            model_value(&args, &provider, "unknown")
+                .get("input")
+                .is_none()
+        );
+        let meta = args.model_profiles.provider("meta").unwrap();
+        assert_eq!(
+            model_value(&args, &meta, "muse-spark-1.3")["input"],
+            json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn rpc_dynamic_model_input_reflects_known_capabilities_without_guessing() {
+        let model = json!({"id":"dynamic"});
+        for (images, expected) in [
+            (Some(true), Some(json!(["text", "image"]))),
+            (Some(false), Some(json!(["text"]))),
+            (None, None),
+        ] {
+            let details = pi_rs::ollama::ModelDetails {
+                images,
+                ..Default::default()
+            };
+            let result = model_with_input_details(model.clone(), Some(&details));
+            assert_eq!(result.get("input"), expected.as_ref());
+        }
+        let configured = json!({"input":["image"]});
+        let details = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_with_input_details(configured, Some(&details))["input"],
+            json!(["image"])
+        );
+    }
+
+    #[test]
+    fn rpc_selection_and_state_expose_model_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("ollama").unwrap();
+        args.model = "vision".into();
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"text"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["id"], "text");
+        assert_eq!(state["model"]["input"], json!(["text"]));
+    }
 
     #[test]
     fn cache_warming_extension_errors_use_rpc_field_names() {

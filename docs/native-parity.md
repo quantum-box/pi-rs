@@ -304,6 +304,13 @@ Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
 
+RPC model values expose Pi's `input` modality list for configured models in
+state, selection, cycling, and discovery responses. Discovery and selection
+responses for dynamic models derive the list from a reported image capability.
+When capability data is unavailable, including an uncached dynamic model in a
+state response, the list is omitted rather than guessed. The native `images`
+field remains available for existing clients.
+
 `set_model` checks the exact model ID against the selected provider's
 configured or discovered catalog before saving the selection. A missing
 provider or model reports `Model not found: <provider>/<model>`. Existing
