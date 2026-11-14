@@ -7594,8 +7594,7 @@ impl Harness {
         }
         crate::nested::resolve_pending(
             self.owner.store(),
-            Self::key(id),
-            version,
+            (Self::key(id), version),
             root,
             operation,
             reference,
@@ -7621,8 +7620,7 @@ impl Harness {
         }
         crate::nested::resolve_pending(
             self.owner.store(),
-            Self::key(id),
-            version,
+            (Self::key(id), version),
             root,
             operation,
             reference,

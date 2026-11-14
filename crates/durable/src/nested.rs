@@ -75,8 +75,7 @@ pub(crate) fn pending_jobs(
 
 pub(crate) fn resolve_pending(
     store: &durable_store::Store,
-    conversation_key: Vec<u8>,
-    conversation_version: u64,
+    (conversation_key, conversation_version): (Vec<u8>, u64),
     root: Uuid,
     operation: Uuid,
     reference: &str,
@@ -759,8 +758,7 @@ mod tests {
         assert!(
             resolve_pending(
                 &store,
-                conversation,
-                stale,
+                (conversation, stale),
                 root,
                 operation,
                 "opaque",
