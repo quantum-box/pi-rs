@@ -1,6 +1,6 @@
 //! Browser Fetch transport prototype. This is not a browser SDK or agent.
 #[cfg(target_arch = "wasm32")]
-mod browser {
+pub mod browser {
     use js_sys::{Object, Reflect, Uint8Array};
     use std::{cell::RefCell, rc::Rc};
     use wasm_bindgen::{JsCast, prelude::*};
