@@ -153,3 +153,32 @@ fn process_exit_before_commit_recovers_original_state() {
     assert_eq!(store.get(b"stable").unwrap().unwrap().value, b"yes");
     assert!(store.get(b"lost").unwrap().is_none());
 }
+
+#[test]
+fn bounded_page_respects_binary_prefix_and_cursor() {
+    let store = Store::memory().unwrap();
+    store
+        .commit(
+            &[],
+            &[
+                put(b"head", b"three"),
+                put(b"a\x00", b"zero"),
+                put(b"a\xff", b"ff"),
+                put(b"b", b"other"),
+            ],
+        )
+        .unwrap();
+    let (head, page) = store.page_with_metadata(b"head", b"a", b"a", 1).unwrap();
+    assert_eq!(head.unwrap().value, b"three");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, b"a\x00");
+    let (_, next) = store
+        .page_with_metadata(b"head", b"a", &page[0].0, 2)
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].0, b"a\xff");
+    let (_, none) = store
+        .page_with_metadata(b"head", b"a", &next[0].0, 2)
+        .unwrap();
+    assert!(none.is_empty());
+}

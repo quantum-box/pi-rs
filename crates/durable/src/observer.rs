@@ -17,8 +17,8 @@
 //! Watch is polling, including across processes and reconnects; it has no
 //! in-memory subscriber queue, notifications, or backpressure on writers. Slow
 //! readers resume from their cursor and retain all records, at the cost of
-//! unbounded disk growth. `Store::list` reads the entire stream on every page:
-//! the limit bounds returned records, not I/O or memory. Store operations are
+//! unbounded disk growth. Reads fetch at most the requested page plus one
+//! lookahead from the store. Store operations are
 //! synchronous and can block the calling async executor thread.
 
 use std::{num::NonZeroUsize, time::Duration};
@@ -123,42 +123,46 @@ impl<'a> Observer<'a> {
 
     /// Read up to `limit` records strictly after `after` from one snapshot.
     pub fn read(&self, after: Cursor, limit: NonZeroUsize) -> Result<Page, Error> {
-        let prefix = stream_prefix(self.stream);
-        let entries = self.store.list(&prefix)?;
-        let mut head = None;
+        let mut prefix = stream_prefix(self.stream);
+        prefix.push(b'r');
+        let (head, entries) = self.store.page_with_metadata(
+            &head_key(self.stream),
+            &prefix,
+            &record_key(self.stream, after.0),
+            limit.get().saturating_add(1),
+        )?;
+        let head = head
+            .as_ref()
+            .map(|entry| decode_head(&entry.value))
+            .transpose()?
+            .unwrap_or(0);
+        if after.0 > head {
+            return Err(Error::FutureCursor);
+        }
         let mut records = Vec::new();
-        let mut expected = 1u64;
+        let mut expected = after.0;
         let mut has_more = false;
         for (key, entry) in entries {
             let suffix = &key[prefix.len()..];
-            if suffix == b"h" {
-                head = Some(decode_head(&entry.value)?);
-            } else if suffix.len() == 9 && suffix[0] == b'r' {
-                let seq = u64::from_be_bytes(suffix[1..].try_into().map_err(|_| Error::Corrupt)?);
-                if seq != expected {
-                    return Err(Error::Corrupt);
-                }
-                expected = expected.checked_add(1).ok_or(Error::SequenceExhausted)?;
-                if seq > after.0 {
-                    if records.len() < limit.get() {
-                        records.push(Record {
-                            cursor: Cursor(seq),
-                            value: serde_json::from_slice(&entry.value)?,
-                        });
-                    } else {
-                        has_more = true;
-                    }
-                }
-            } else {
+            if suffix.len() != 8 {
                 return Err(Error::Corrupt);
             }
+            let seq = u64::from_be_bytes(suffix.try_into().map_err(|_| Error::Corrupt)?);
+            expected = expected.checked_add(1).ok_or(Error::SequenceExhausted)?;
+            if seq != expected || seq > head {
+                return Err(Error::Corrupt);
+            }
+            if records.len() < limit.get() {
+                records.push(Record {
+                    cursor: Cursor(seq),
+                    value: serde_json::from_slice(&entry.value)?,
+                });
+            } else {
+                has_more = true;
+            }
         }
-        let last = expected - 1;
-        if head.unwrap_or(0) != last || (head.is_some() && last == 0) {
+        if expected < head && !has_more {
             return Err(Error::Corrupt);
-        }
-        if after.0 > last {
-            return Err(Error::FutureCursor);
         }
         let next = records.last().map_or(after, |r| r.cursor);
         Ok(Page {

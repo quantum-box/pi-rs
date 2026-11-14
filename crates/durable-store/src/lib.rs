@@ -16,6 +16,8 @@ pub struct Entry {
     pub value: Vec<u8>,
     pub version: u64,
 }
+pub type KeyedEntry = (Vec<u8>, Entry);
+pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     pub key: Vec<u8>,
@@ -121,6 +123,53 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+    /// Read a metadata key and a bounded, ordered page from one SQLite snapshot.
+    /// `after` is exclusive and must be a key in or before the prefix range.
+    /// Pages across calls may observe newer commits.
+    pub fn page_with_metadata(
+        &self,
+        metadata_key: &[u8],
+        prefix: &[u8],
+        after: &[u8],
+        limit: usize,
+    ) -> Result<MetadataPage, Error> {
+        let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let metadata = tx
+            .query_row(
+                "SELECT value, version FROM durable_store_entries WHERE key=?1",
+                [metadata_key],
+                |r| {
+                    Ok(Entry {
+                        value: r.get(0)?,
+                        version: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        let end = prefix_end(prefix);
+        let rows = {
+            let query = if end.is_some() {
+                "SELECT key, value, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
+            } else {
+                "SELECT key, value, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
+            };
+            let mut stmt = tx.prepare(query)?;
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![prefix, after, end, limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    Entry {
+                        value: r.get(1)?,
+                        version: r.get(2)?,
+                    },
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok((metadata, rows))
+    }
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
@@ -167,4 +216,15 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(byte) = end.pop() {
+        if byte != u8::MAX {
+            end.push(byte + 1);
+            return Some(end);
+        }
+    }
+    None
 }
