@@ -127,6 +127,14 @@ execution time. Rust tools with a host can emit bounded progress while running;
 the built-in shell tool emits bounded cumulative output updates. Other built-in
 tool progress and completion-order notifications remain open.
 
+### Meta Responses API-key checkpoint
+
+The `meta` provider includes Pi v1.5.0's six Muse models, including their
+thinking levels, image limits, token limits and prices. It uses the Responses
+adapter and `META_API_KEY` on the official endpoint. Saved and configured
+credentials retain precedence and remain bound to their endpoint. Subscription
+OAuth and live Meta account acceptance remain open.
+
 ### xAI Responses checkpoint
 
 The native xAI provider uses the pinned Pi Responses catalog and
@@ -3378,7 +3386,7 @@ sessions, and header overrides.
 
 ### Chat catalog pricing checkpoint
 
-The 587 bundled chat entries retain the input, output, cache-read, and
+The bundled chat entries retain the input, output, cache-read, and
 cache-write prices from Pi v1.5.0. JSON listings, RPC, and Codemode expose
 these rates. A measured response without a provider total gets an
 estimate in the journal and session statistics. An explicit provider

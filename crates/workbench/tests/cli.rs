@@ -291,6 +291,11 @@ fn openai_api_key_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn meta_provider_streams_through_the_cli() {
+    responses_provider_streams_through_the_cli("meta");
+}
+
+#[test]
 fn xai_provider_streams_through_the_cli() {
     responses_provider_streams_through_the_cli("xai");
 }
@@ -850,16 +855,21 @@ fn responses_provider_streams_through_the_cli(provider: &str) {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
         assert!(first.starts_with("POST /v1/responses "), "{first}");
         let mut length = None;
+        let mut authorization = None;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             if line == "\r\n" || line.is_empty() {
                 break;
             }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("authorization:") {
+                authorization = Some(value.trim().to_owned());
+            }
             if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                 length = Some(value.trim().parse::<usize>().unwrap());
             }
         }
+        assert_eq!(authorization.as_deref(), Some("bearer fixture"));
         let mut body = vec![0; length.unwrap()];
         reader.read_exact(&mut body).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
