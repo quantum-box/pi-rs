@@ -977,8 +977,10 @@ preserve the order of native text and image content blocks. Details remain
 separate; extra native structured fields and attachment references are retained
 as `nativeData` and `nativeAttachments`; additional legacy envelope fields are
 preserved as `nativeEnvelope`. `structuredContent` is also exposed directly
-on the projected result. Unsupported or oversized blocks are
-kept with their original indexes in `nativeRejectedBlocks`, without moving
+on the projected result even when content cannot be projected. Image blocks
+retain their MIME types in event content; the separate provider-facing image
+guard still applies. Malformed, unknown or oversized blocks are kept with their
+original indexes in `nativeRejectedBlocks`, without moving
 supported blocks out of order. Plain text that happens to look like JSON and
 results with no recognized blocks retain their previous representation.
 The native provider-facing tool envelope is unchanged. Focused tests cover

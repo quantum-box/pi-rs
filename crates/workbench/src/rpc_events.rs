@@ -556,22 +556,17 @@ pub(super) fn tool_event_result_value(
     let Some(data) = envelope.get("data").and_then(Value::as_object) else {
         return result;
     };
-    let Some(blocks) = data.get("content").and_then(Value::as_array) else {
-        return result;
-    };
     let mut content = Vec::new();
     let mut rejected = Vec::new();
-    for (index, block) in blocks.iter().enumerate() {
+    let blocks = data.get("content").and_then(Value::as_array);
+    for (index, block) in blocks.into_iter().flatten().enumerate() {
         let valid = match block["type"].as_str() {
             Some("text") => block["text"].is_string(),
             Some("image") => {
                 block["data"]
                     .as_str()
                     .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
-                    && matches!(
-                        block["mimeType"].as_str(),
-                        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-                    )
+                    && block["mimeType"].is_string()
             }
             _ => false,
         };
@@ -581,10 +576,11 @@ pub(super) fn tool_event_result_value(
             rejected.push(json!({"index":index,"block":block}));
         }
     }
-    if content.is_empty() && !blocks.is_empty() {
-        return result;
+    if let Some(blocks) = blocks
+        && (!content.is_empty() || blocks.is_empty())
+    {
+        result["content"] = json!(content);
     }
-    result["content"] = json!(content);
     if let Some(structured_content) = data.get("structuredContent") {
         result["structuredContent"] = structured_content.clone();
     }
@@ -723,10 +719,12 @@ mod streaming_tool_tests {
             data: json!({"content":[{"type":"custom","value":1}]}),
             attachments: vec![],
         };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
         assert_eq!(
-            tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true)),
-            tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))
+            result["content"],
+            tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"]
         );
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"]["type"], "custom");
     }
 
     #[test]
@@ -743,14 +741,10 @@ mod streaming_tool_tests {
         let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
         assert_eq!(
             result["content"],
-            json!([{"type":"text","text":"before"}, supported, {"type":"text","text":"after"}])
+            json!([{"type":"text","text":"before"}, rejected_mime, supported, {"type":"text","text":"after"}])
         );
-        assert_eq!(
-            result["nativeRejectedBlocks"][0],
-            json!({"index":1,"block":rejected_mime})
-        );
-        assert_eq!(result["nativeRejectedBlocks"][1]["index"], 3);
-        assert_eq!(result["nativeRejectedBlocks"][1]["block"], rejected_size);
+        assert_eq!(result["nativeRejectedBlocks"][0]["index"], 3);
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"], rejected_size);
         assert_eq!(result["nativeData"]["nativeInfo"], "kept");
         assert_eq!(result["details"]["code"], 42);
         let operation_id = Uuid::new_v4();
@@ -828,15 +822,37 @@ mod streaming_tool_tests {
             result["content"],
             json!([
                 {"type":"text","text":"before"},
+                {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
                 {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
                 {"type":"text","text":"after"}
             ])
         );
-        assert_eq!(result["nativeRejectedBlocks"][0]["index"], 1);
-        assert_eq!(
-            result["nativeRejectedBlocks"][0]["block"],
-            envelope["data"]["content"][1]
-        );
+        assert!(result.get("nativeRejectedBlocks").is_none());
+    }
+
+    #[test]
+    fn structured_content_survives_missing_or_unprojectable_content() {
+        for content in [None, Some(json!([{"type":"custom","value":1}]))] {
+            let mut data = json!({"structuredContent":{"answer":42}});
+            if let Some(content) = content {
+                data["content"] = content;
+            }
+            let outcome = Outcome::Structured {
+                data,
+                attachments: vec![],
+            };
+            let result =
+                tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+            assert_eq!(result["structuredContent"], json!({"answer":42}));
+        }
+        let image = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let outcome = Outcome::Structured {
+            data: json!({"content":[image],"structuredContent":{"answer":42}}),
+            attachments: vec![],
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(result["content"], json!([image]));
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
     }
 
     #[test]
