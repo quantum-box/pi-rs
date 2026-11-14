@@ -364,6 +364,7 @@ pub struct Harness {
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
     execution_gate: Option<Arc<std::sync::Mutex<()>>>,
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
@@ -420,6 +421,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: Arc::new(std::sync::Mutex::new(None)),
+            clock: Arc::new(wall_time_millis),
         };
         harness.recover()?;
         Ok(harness)
@@ -437,6 +439,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: self.task_driver.clone(),
+            clock: self.clock.clone(),
         }
     }
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
@@ -1051,10 +1054,15 @@ impl Harness {
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
     }
+    /// Override wall time for durable gate deadlines. Set before driving work.
+    pub fn set_signal_clock(&mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        self.clock = clock;
+    }
     /// Durably deliver an idempotent signal to a conversation hook gate.
     pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
         self.conversation(signal.conversation_id)?;
-        crate::conversation_signal::Inbox::new(self.owner.store()).send(signal)?;
+        crate::conversation_signal::Inbox::new(self.owner.store())
+            .send_with_clock(signal, self.clock.as_ref())?;
         Ok(())
     }
     /// Attach one generic task scheduler to the same locked store. Its owner
@@ -2771,12 +2779,7 @@ impl Harness {
                     signals,
                 } => {
                     let wake = crate::conversation_signal::Inbox::new(self.owner.store())
-                        .prepare_wake(
-                            id,
-                            &signals,
-                            until_millis,
-                            unix_ms().try_into().unwrap_or(i64::MAX),
-                        )?;
+                        .prepare_wake(id, &signals, until_millis, (self.clock)())?;
                     let Some(wake) = wake else {
                         return Ok(());
                     };
@@ -2897,6 +2900,8 @@ impl Harness {
                         {
                             return Err(Error::Invalid("invalid extension sleep".into()));
                         }
+                        let wait = crate::conversation_signal::Inbox::new(self.owner.store())
+                            .prepare_wait(id, &sleep.signals)?;
                         c.phase = Phase::ToolGateSleeping {
                             turns,
                             calls,
@@ -2905,7 +2910,15 @@ impl Harness {
                             until_millis: sleep.until_millis,
                             signals: sleep.signals.clone(),
                         };
-                        self.save(&c, Expected::Version(version))?;
+                        let merge = self.merge_admissions;
+                        self.merge_admissions = false;
+                        let result =
+                            self.save_with_wake(&c, Expected::Version(version), Some(&wait));
+                        self.merge_admissions = merge;
+                        match result {
+                            Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                            other => other?,
+                        }
                         return Ok(());
                     }
                     let rejection = match decision {
@@ -3811,6 +3824,30 @@ async fn fenced_poll<F: std::future::Future>(
             future.as_mut().poll(cx).map(Some)
         }) => result,
     }
+}
+
+pub(crate) fn wall_time_millis() -> i64 {
+    unix_ms().try_into().unwrap_or(i64::MAX)
+}
+
+pub(crate) fn signal_target_closed(
+    bytes: &[u8],
+    name: &str,
+    now: i64,
+) -> Result<bool, crate::conversation_signal::Error> {
+    let c: serde_json::Value = serde_json::from_slice(bytes)?;
+    let sleeping = c.get("phase").and_then(|p| p.get("ToolGateSleeping"));
+    Ok(c.get("abort_requested")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || sleeping.is_some_and(|s| {
+            s.get("until_millis")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|d| now >= d)
+                && s.get("signals")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(name)))
+        }))
 }
 
 fn unix_ms() -> u64 {

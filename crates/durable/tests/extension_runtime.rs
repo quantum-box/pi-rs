@@ -1547,3 +1547,78 @@ async fn lifecycle_rejects_a_different_driver_handler() {
             .is_object()
     );
 }
+
+struct TimedSignalGate;
+#[async_trait]
+impl Hook for TimedSignalGate {
+    async fn before_tool(&self, _: &HookCall, ctx: &Context<'_>) -> Result<BeforeTool, String> {
+        if ctx.snapshot["phase"]["ToolPreparing"]["wake"].is_object() {
+            return Ok(BeforeTool::Pass);
+        }
+        Ok(BeforeTool::Sleep(Sleep {
+            signals: vec!["approval".into()],
+            until_millis: Some(100),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn gate_deadline_and_early_signal_survive_restart() {
+    use pi_rs_durable::conversation_signal::{Error as SignalError, Signal};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    for early in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let clock = Arc::new(AtomicI64::new(99));
+        let model = Arc::new(FakeModel::default());
+        let tool = Arc::new(FakeTool::default());
+        let id;
+        let signal;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+            let clock = clock.clone();
+            h.set_signal_clock(Arc::new(move || clock.load(Ordering::SeqCst)));
+            h.install_extension(ext("gate", "p", Arc::new(TimedSignalGate)))
+                .unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["gate".into()]).unwrap();
+            signal = Signal::new(Uuid::new_v4(), id, "approval".into(), json!(1));
+            if early {
+                h.send_signal(&signal).unwrap();
+            }
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        clock.store(100, Ordering::SeqCst);
+        let mut h = Harness::open_paused(&path, options(model, tool.clone())).unwrap();
+        let c = clock.clone();
+        h.set_signal_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+        h.install_extension(ext("gate", "p", Arc::new(TimedSignalGate)))
+            .unwrap();
+        if early {
+            h.send_signal(&signal).unwrap();
+            let other = Signal::new(Uuid::new_v4(), id, "approval".into(), json!(2));
+            assert!(matches!(
+                h.send_signal(&other),
+                Err(pi_rs_durable::runtime::Error::Signal(
+                    SignalError::Duplicate
+                ))
+            ));
+        } else {
+            assert!(matches!(
+                h.send_signal(&signal),
+                Err(pi_rs_durable::runtime::Error::Signal(SignalError::Closed))
+            ));
+        }
+        h.resume(&CancellationToken::new()).await.unwrap();
+        assert_eq!(tool.0.lock().unwrap().len(), 1);
+        let later = Signal::new(Uuid::new_v4(), id, "approval".into(), json!(3));
+        assert!(matches!(
+            h.send_signal(&later),
+            Err(pi_rs_durable::runtime::Error::Signal(
+                SignalError::Duplicate | SignalError::Closed
+            ))
+        ));
+    }
+}

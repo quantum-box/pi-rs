@@ -81,7 +81,7 @@ an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
 The scheduler rescans once per second and reopening resumes the wait. Signal
-keys are not yet subject to upstream single-wait or closed-after-deadline rules.
+names are conversation-scoped single-value keys: a wake consumes its key, and a deadline closes empty keys. A repeated receipt ID is idempotent; a different ID for an occupied key is rejected. The `set_signal_clock` hook supports deterministic deadline tests. Unlike upstream typed signal/key pairs, this API uses a single string name.
 
 `TaskStore::commit_owned_tasks` and `prepare_owned_tasks` also expose the
 lower-level atomic checkpoint and child creation primitive to other hosts.

@@ -19,6 +19,12 @@ pub enum Error {
     NotFound,
     #[error("signal ID already used with different content")]
     Mismatch,
+    #[error("signal key already has a value")]
+    Duplicate,
+    #[error("signal key is closed")]
+    Closed,
+    #[error("cannot wait on a consumed or expired signal key")]
+    InvalidWait,
 }
 
 /// Signal IDs are scoped to a conversation and remain reserved after delivery.
@@ -58,6 +64,17 @@ fn revision(id: Uuid) -> Vec<u8> {
     format!("runtime/conversation-signal-revision/{id}").into_bytes()
 }
 
+// Hex encoding keeps arbitrary names unambiguous in the store keyspace.
+fn slot(conversation: Uuid, name: &str) -> Vec<u8> {
+    let encoded: String = name.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("runtime/conversation-signal-slot/{conversation}/{encoded}").into_bytes()
+}
+#[derive(Serialize, Deserialize)]
+enum Slot {
+    Value(Uuid),
+    Expired,
+}
+
 pub struct Inbox<'a> {
     store: &'a Store,
 }
@@ -68,7 +85,21 @@ impl<'a> Inbox<'a> {
 
     /// Insert once, checking the target version so deletion cannot race insertion.
     pub fn send(&self, signal: &Signal) -> Result<(), Error> {
+        self.send_with_clock(signal, &crate::runtime::wall_time_millis)
+    }
+
+    /// Deliver using an injected Unix-millisecond timestamp.
+    pub fn send_at(&self, signal: &Signal, now: i64) -> Result<(), Error> {
+        self.send_with_clock(signal, &|| now)
+    }
+
+    pub(crate) fn send_with_clock(
+        &self,
+        signal: &Signal,
+        clock: &dyn Fn() -> i64,
+    ) -> Result<(), Error> {
         let k = key(signal.conversation_id, signal.id);
+        let sk = slot(signal.conversation_id, &signal.name);
         let target = conversation_key(signal.conversation_id);
         let mut fresh = signal.clone();
         fresh.consumed = false;
@@ -86,7 +117,55 @@ impl<'a> Inbox<'a> {
                 };
             }
             let entry = self.store.get(&target)?.ok_or(Error::NotFound)?;
+            if signal.name.is_empty() {
+                return Err(Error::InvalidWait);
+            }
+            if let Some(existing) = self.store.get(&sk)? {
+                return match serde_json::from_slice::<Slot>(&existing.value)? {
+                    Slot::Value(_) => Err(Error::Duplicate),
+                    Slot::Expired => Err(Error::Closed),
+                };
+            }
+            // Older stores predate slots; never accept another value for such a key.
+            for (_, old) in self.store.list(&prefix(signal.conversation_id))? {
+                let old: Signal = serde_json::from_slice(&old.value)?;
+                if old.name == signal.name {
+                    return Err(Error::Duplicate);
+                }
+            }
+            let closed = crate::runtime::signal_target_closed(&entry.value, &signal.name, clock())?;
+            if closed {
+                let checks = [
+                    Check {
+                        key: target.clone(),
+                        expected: Expected::Version(entry.version),
+                    },
+                    Check {
+                        key: sk.clone(),
+                        expected: Expected::Missing,
+                    },
+                ];
+                let writes = [
+                    Mutation::Put {
+                        key: sk.clone(),
+                        value: serde_json::to_vec(&Slot::Expired)?,
+                    },
+                    Mutation::Put {
+                        key: revision(signal.conversation_id),
+                        value: vec![],
+                    },
+                ];
+                match self.store.commit(&checks, &writes) {
+                    Ok(()) => return Err(Error::Closed),
+                    Err(durable_store::Error::Conflict { .. }) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
             let checks = [
+                Check {
+                    key: sk.clone(),
+                    expected: Expected::Missing,
+                },
                 Check {
                     key: k.clone(),
                     expected: Expected::Missing,
@@ -97,6 +176,10 @@ impl<'a> Inbox<'a> {
                 },
             ];
             let writes = [
+                Mutation::Put {
+                    key: sk.clone(),
+                    value: serde_json::to_vec(&Slot::Value(signal.id))?,
+                },
                 Mutation::Put {
                     key: k.clone(),
                     value: serde_json::to_vec(&fresh)?,
@@ -121,6 +204,38 @@ impl<'a> Inbox<'a> {
             .transpose()
     }
 
+    /// Fence validation against concurrent deliveries and expiration.
+    pub fn prepare_wait(
+        &self,
+        conversation: Uuid,
+        names: &[String],
+    ) -> Result<PreparedWake, Error> {
+        let rk = revision(conversation);
+        let rev = self.store.get(&rk)?;
+        let entries = self.store.list(&prefix(conversation))?;
+        for name in names {
+            if let Some(entry) = self.store.get(&slot(conversation, name))? {
+                if matches!(serde_json::from_slice::<Slot>(&entry.value)?, Slot::Expired) {
+                    return Err(Error::InvalidWait);
+                }
+            }
+            for (_, entry) in &entries {
+                let signal: Signal = serde_json::from_slice(&entry.value)?;
+                if signal.name == *name && signal.consumed {
+                    return Err(Error::InvalidWait);
+                }
+            }
+        }
+        Ok(PreparedWake {
+            signal: None,
+            checks: vec![Check {
+                key: rk,
+                expected: rev.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+            }],
+            mutations: vec![],
+        })
+    }
+
     /// Prepare a wake for an absolute Unix-millisecond deadline or matching signal.
     /// Commit the returned checks and mutations together with a version-checked
     /// conversation transition. Conflict requires reloading and rescanning.
@@ -139,20 +254,49 @@ impl<'a> Inbox<'a> {
         }];
         let mut mutations = Vec::new();
         let mut delivered = None;
-        for (k, entry) in self.store.list(&prefix(conversation))? {
-            let mut signal: Signal = serde_json::from_slice(&entry.value)?;
-            if !signal.consumed && names.contains(&signal.name) {
-                signal.consumed = true;
-                checks.push(Check {
-                    key: k.clone(),
-                    expected: Expected::Version(entry.version),
-                });
-                mutations.push(Mutation::Put {
-                    key: k,
-                    value: serde_json::to_vec(&signal)?,
-                });
-                delivered = Some(signal);
+        let entries = self.store.list(&prefix(conversation))?;
+        for name in names {
+            for (k, entry) in &entries {
+                let mut signal: Signal = serde_json::from_slice(&entry.value)?;
+                if !signal.consumed && signal.name == *name {
+                    signal.consumed = true;
+                    checks.push(Check {
+                        key: k.clone(),
+                        expected: Expected::Version(entry.version),
+                    });
+                    mutations.push(Mutation::Put {
+                        key: k.clone(),
+                        value: serde_json::to_vec(&signal)?,
+                    });
+                    delivered = Some(signal);
+                    break;
+                }
+            }
+            if delivered.is_some() {
                 break;
+            }
+        }
+        if delivered.is_none() && deadline.is_some_and(|d| now >= d) {
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    continue;
+                }
+                let sk = slot(conversation, name);
+                if self.store.get(&sk)?.is_none()
+                    && !entries.iter().any(|(_, e)| {
+                        serde_json::from_slice::<Signal>(&e.value).is_ok_and(|s| s.name == *name)
+                    })
+                {
+                    checks.push(Check {
+                        key: sk.clone(),
+                        expected: Expected::Missing,
+                    });
+                    mutations.push(Mutation::Put {
+                        key: sk,
+                        value: serde_json::to_vec(&Slot::Expired)?,
+                    });
+                }
             }
         }
         if delivered.is_none() && !deadline.is_some_and(|d| now >= d) {
@@ -187,7 +331,7 @@ mod tests {
                 }],
                 &[Mutation::Put {
                     key: conversation_key(id),
-                    value: b"sleeping".to_vec(),
+                    value: b"{}".to_vec(),
                 }],
             )
             .unwrap();
@@ -333,5 +477,84 @@ mod tests {
         assert!(inbox.receipt(other, signal.id).unwrap().is_none());
         let missing = Signal::new(Uuid::new_v4(), other, "go".into(), Value::Null);
         assert!(matches!(inbox.send(&missing), Err(Error::NotFound)));
+    }
+    #[test]
+    fn slots_are_single_use_and_expiration_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = Uuid::new_v4();
+        let a = Signal::new(Uuid::new_v4(), id, "a".into(), Value::Null);
+        {
+            let store = Store::open(&path).unwrap();
+            create(&store, id);
+            let inbox = Inbox::new(&store);
+            inbox.send_at(&a, 0).unwrap();
+            let duplicate = Signal::new(Uuid::new_v4(), id, "a".into(), Value::Null);
+            assert!(matches!(
+                inbox.send_at(&duplicate, 0),
+                Err(Error::Duplicate)
+            ));
+            let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+            let wake = inbox
+                .prepare_wake(id, &["a".into(), "b".into()], Some(5), 5)
+                .unwrap()
+                .unwrap();
+            assert_eq!(wake.signal.as_ref().unwrap().id, a.id);
+            commit_wake(&store, id, version, wake).unwrap();
+            assert!(matches!(
+                inbox.prepare_wait(id, &["a".into()]),
+                Err(Error::InvalidWait)
+            ));
+            let version = store.get(&conversation_key(id)).unwrap().unwrap().version;
+            let wake = inbox
+                .prepare_wake(id, &["b".into()], Some(5), 5)
+                .unwrap()
+                .unwrap();
+            commit_wake(&store, id, version, wake).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let inbox = Inbox::new(&store);
+        inbox.send_at(&a, 50).unwrap();
+        assert!(matches!(
+            inbox.prepare_wait(id, &["b".into()]),
+            Err(Error::InvalidWait)
+        ));
+        let late = Signal::new(Uuid::new_v4(), id, "b".into(), Value::Null);
+        assert!(matches!(inbox.send_at(&late, 50), Err(Error::Closed)));
+    }
+    #[test]
+    fn concurrent_distinct_receipts_compete_for_one_key_and_fence_wait() {
+        let store = Arc::new(Store::memory().unwrap());
+        let id = Uuid::new_v4();
+        create(&store, id);
+        let inbox = Inbox::new(&store);
+        let wait = inbox.prepare_wait(id, &["one".into()]).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|n| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let signal =
+                        Signal::new(Uuid::new_v4(), id, "one".into(), serde_json::json!(n));
+                    barrier.wait();
+                    Inbox::new(&store).send_at(&signal, 0)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(Error::Duplicate)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            store.commit(&wait.checks, &wait.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
     }
 }
