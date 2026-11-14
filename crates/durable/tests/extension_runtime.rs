@@ -1195,6 +1195,25 @@ async fn abort_during_lifecycle_hook_stops_without_replaying_tool() {
             .unwrap()
             .unwrap()
             .forget();
+        if event == GenerationEvent::AfterRun {
+            let error = scheduler
+                .submit_with_options(
+                    id,
+                    None,
+                    "later".into(),
+                    pi_rs_durable::runtime::AdmissionOptions {
+                        reject_when_busy: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                pi_rs_durable::runtime::Error::Admission(
+                    pi_rs_durable::runtime::AdmissionError::Busy
+                )
+            ));
+        }
         scheduler.abort_and_wait(id).await.unwrap();
         let c = scheduler.conversation(id).unwrap();
         assert_eq!(tool.0.lock().unwrap().len(), 1);

@@ -1269,7 +1269,7 @@ impl Harness {
             if content.trim().is_empty() {
                 return Err(Error::Invalid("empty input".into()));
             }
-            let busy = c.active.is_some();
+            let busy = c.active.is_some() || matches!(c.phase, Phase::AfterRun { .. });
             if busy && options.reject_when_busy {
                 return Err(AdmissionError::Busy.into());
             }
