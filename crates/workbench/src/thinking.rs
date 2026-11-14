@@ -146,8 +146,12 @@ pub(super) fn set(args: &mut Cli, requested: &str) -> Result<()> {
 }
 
 pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
+    let reasoning = args
+        .model_profiles
+        .model(&args.provider, &args.model)
+        .and_then(|model| model.reasoning);
     let levels = available(args);
-    if levels.iter().all(|level| level == "off") {
+    if levels.is_empty() || (reasoning != Some(true) && levels.iter().all(|level| level == "off")) {
         return Ok(None);
     }
     let current = args.thinking.as_deref().unwrap_or("off");
@@ -156,7 +160,9 @@ pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
         .position(|level| level == current)
         .map_or(0, |index| (index + 1) % levels.len());
     let next = levels[index].clone();
-    persist(args, &next)?;
+    if args.thinking.as_deref() != Some(next.as_str()) {
+        persist(args, &next)?;
+    }
     Ok(Some(next))
 }
 
@@ -181,6 +187,33 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_uses_reasoning_flag_when_only_off_is_available() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({
+            "providers":{"anthropic":{"models":[
+                {"id":"off-only", "reasoning":true,
+                 "thinkingLevelMap":{"minimal":null,"low":null,"medium":null,"high":null}},
+                {"id":"plain", "reasoning":false}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("anthropic").unwrap();
+        args.model = "off-only".into();
+        args.thinking = Some("off".into());
+        assert_eq!(available(&mut args), ["off"]);
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert!(!args.session.exists());
+        assert!(args.selection_events.is_empty());
+
+        args.model = "plain".into();
+        assert_eq!(cycle(&mut args).unwrap(), None);
+        assert!(!args.session.exists());
+    }
 
     #[test]
     fn declared_reasoning_displays_discovered_anthropic_capabilities() {
