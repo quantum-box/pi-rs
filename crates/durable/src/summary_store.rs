@@ -12,9 +12,10 @@ use pi_rs_core::UsageReport;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const PREFIX: &[u8] = b"durable/summary-operation/";
+pub(crate) const PREFIX: &[u8] = b"durable/summary-operation/";
 const REQUEST_PREFIX: &[u8] = b"durable/summary-request/";
 const PLACEMENT_PREFIX: &[u8] = b"durable/summary-placement/";
+const OWNER_PREFIX: &[u8] = b"durable/summary-owner/";
 /// Bounds the persisted request and result separately, in serialized bytes.
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Bounds both retries and the retained attempt/usage history per operation.
@@ -24,6 +25,13 @@ pub const MAX_DISCOVERY_OPERATIONS: usize = 128;
 // A completed operation retains the preparation twice and one bounded
 // generation. This leaves room for their enclosing metadata and attempts.
 const MAX_DISCOVERY_RECORD_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_HOOK_SNAPSHOT_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct HookCheckpoint {
+    pub extensions: Vec<String>,
+    pub snapshot: serde_json::Value,
+}
 
 /// Host-attested, versioned identities for the model and usage-settlement
 /// service. Change either identity whenever its replay semantics change.
@@ -66,6 +74,7 @@ pub enum Error {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum State {
+    HookPending,
     Ready,
     Reserved {
         request_id: Uuid,
@@ -96,6 +105,7 @@ pub enum State {
     Stale {
         request_id: Uuid,
     },
+    Declined,
     Aborting {
         owner: Option<Uuid>,
         #[serde(default)]
@@ -135,6 +145,8 @@ pub struct Operation {
     provider: Option<ProviderIdentity>,
     #[serde(default)]
     auto_place: bool,
+    #[serde(default)]
+    hook: Option<HookCheckpoint>,
 }
 impl Operation {
     pub fn id(&self) -> Uuid {
@@ -160,6 +172,16 @@ impl Operation {
     }
     pub(crate) fn auto_place(&self) -> bool {
         self.auto_place
+    }
+    pub(crate) fn hook(&self) -> Option<&HookCheckpoint> {
+        self.hook.as_ref()
+    }
+    pub(crate) fn is_live_owned(&self) -> bool {
+        self.auto_place
+            && !matches!(
+                self.state,
+                State::Placed { .. } | State::Stale { .. } | State::Aborted | State::Declined
+            )
     }
 
     /// Derive the exact report to replay from the durable checkpoint. Once an
@@ -199,6 +221,26 @@ pub struct Snapshot {
     pub version: u64,
 }
 
+pub(crate) fn decode_entry(key: &[u8], entry: durable_store::Entry) -> Result<Snapshot, Error> {
+    if entry.value.len() > MAX_DISCOVERY_RECORD_BYTES {
+        return Err(Error::Limit);
+    }
+    let id = Uuid::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidRecord)?)
+        .map_err(|_| Error::InvalidRecord)?;
+    let operation: Operation = serde_json::from_slice(&entry.value)?;
+    if operation.id != id
+        || id.is_nil()
+        || operation.session_id.is_nil()
+        || operation.attempts.len() > MAX_ATTEMPTS
+    {
+        return Err(Error::InvalidRecord);
+    }
+    Ok(Snapshot {
+        operation,
+        version: entry.version,
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PlacementTicket {
     pub operation: Uuid,
@@ -219,6 +261,9 @@ impl<'a> SummaryStore<'a> {
     }
     fn placement_key(id: Uuid) -> Vec<u8> {
         [PLACEMENT_PREFIX, id.as_bytes()].concat()
+    }
+    fn owner_key(id: Uuid) -> Vec<u8> {
+        [OWNER_PREFIX, id.as_bytes()].concat()
     }
 
     #[cfg(test)]
@@ -243,6 +288,7 @@ impl<'a> SummaryStore<'a> {
             placement_version: None,
             provider: None,
             auto_place: false,
+            hook: None,
         };
         self.write(&op, Expected::Missing)
     }
@@ -268,6 +314,7 @@ impl<'a> SummaryStore<'a> {
                 placement_version: None,
                 provider: Some(provider),
                 auto_place: false,
+                hook: None,
             },
             Expected::Missing,
         )
@@ -284,6 +331,7 @@ impl<'a> SummaryStore<'a> {
         (conversation_key, version): (Vec<u8>, u64),
         provider: ProviderIdentity,
         auto_place: bool,
+        hook: Option<HookCheckpoint>,
     ) -> Result<(), Error> {
         if id.is_nil() || session_id.is_nil() || version == 0 || !provider.valid() {
             return Err(Error::Identity);
@@ -291,38 +339,127 @@ impl<'a> SummaryStore<'a> {
         if serde_json::to_vec(&preparation)?.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::Limit);
         }
+        if hook.as_ref().is_some_and(|hook| {
+            serde_json::to_vec(hook).map_or(true, |value| value.len() > MAX_HOOK_SNAPSHOT_BYTES)
+        }) {
+            return Err(Error::Limit);
+        }
         let op = Operation {
             id,
             session_id,
             preparation,
-            state: State::Ready,
+            state: if hook.is_some() {
+                State::HookPending
+            } else {
+                State::Ready
+            },
             attempts: vec![],
             placement_version: Some(version),
             provider: Some(provider),
             auto_place,
+            hook,
         };
         let key = Self::key(id);
+        let owner_key = Self::owner_key(session_id);
+        let owner_entry = if auto_place {
+            self.store.get(&owner_key)?
+        } else {
+            None
+        };
+        let mut checks = vec![
+            Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            },
+            Check {
+                key: conversation_key,
+                expected: Expected::Version(version),
+            },
+        ];
+        let mut mutations = vec![Mutation::Put {
+            key,
+            value: serde_json::to_vec(&op)?,
+        }];
+        if auto_place {
+            checks.push(Check {
+                key: owner_key.clone(),
+                expected: owner_entry
+                    .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            });
+            mutations.push(Mutation::Put {
+                key: owner_key,
+                value: id.as_bytes().to_vec(),
+            });
+        }
         self.store
-            .commit(
-                &[
-                    Check {
-                        key: key.clone(),
-                        expected: Expected::Missing,
-                    },
-                    Check {
-                        key: conversation_key,
-                        expected: Expected::Version(version),
-                    },
-                ],
-                &[Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&op)?,
-                }],
-            )
+            .commit(&checks, &mutations)
             .map_err(|error| match error {
                 durable_store::Error::Conflict { .. } => Error::Conflict,
                 other => Error::Store(other),
             })
+    }
+
+    /// Read all summary records with the same bounded scan used at startup.
+    pub(crate) fn list(&self) -> Result<Vec<Snapshot>, Error> {
+        let mut after = PREFIX.to_vec();
+        let mut result = Vec::new();
+        for count in 0..=MAX_DISCOVERY_OPERATIONS {
+            let (_, mut page) = self.store.page_with_metadata(
+                b"durable/summary-discovery/unused",
+                PREFIX,
+                &after,
+                1,
+            )?;
+            let Some((key, entry)) = page.pop() else {
+                return Ok(result);
+            };
+            if count == MAX_DISCOVERY_OPERATIONS || entry.value.len() > MAX_DISCOVERY_RECORD_BYTES {
+                return Err(Error::Limit);
+            }
+            after = key.clone();
+            result.push(decode_entry(&key, entry)?);
+        }
+        unreachable!()
+    }
+
+    /// Check admission epochs before scanning, so a concurrently created
+    /// summary forces the enclosing graph abort transaction to retry.
+    pub(crate) fn prepare_owned_abort(
+        &self,
+        conversations: &std::collections::HashSet<Uuid>,
+    ) -> Result<(Vec<Check>, Vec<Mutation>), Error> {
+        let mut checks = Vec::new();
+        let mut mutations = Vec::new();
+        for id in conversations {
+            let key = Self::owner_key(*id);
+            let entry = self.store.get(&key)?;
+            checks.push(Check {
+                key,
+                expected: entry.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+            });
+        }
+        for snap in self.list()? {
+            if !conversations.contains(&snap.operation.session_id)
+                || !snap.operation.is_live_owned()
+            {
+                continue;
+            }
+            if matches!(snap.operation.state, State::Aborting { .. }) {
+                continue;
+            }
+            let mut op = snap.operation;
+            Self::mark_aborting(&mut op)?;
+            let key = Self::key(op.id);
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(snap.version),
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(&op)?,
+            });
+        }
+        Ok((checks, mutations))
     }
 
     /// Bounded discovery is all-or-nothing: if the store exceeds its work or
@@ -331,7 +468,7 @@ impl<'a> SummaryStore<'a> {
     pub(crate) fn discover(
         &self,
         provider: &ProviderIdentity,
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+    ) -> Result<(Vec<(Uuid, Uuid)>, Vec<Uuid>), Error> {
         if !provider.valid() {
             return Err(Error::Identity);
         }
@@ -366,7 +503,8 @@ impl<'a> SummaryStore<'a> {
             }
             let needs_worker = matches!(
                 op.state,
-                State::Ready
+                State::HookPending
+                    | State::Ready
                     | State::Reserved { .. }
                     | State::Running { .. }
                     | State::Accounting { .. }
@@ -387,7 +525,7 @@ impl<'a> SummaryStore<'a> {
                             State::Completed { .. } | State::PlacementPending { .. }
                         ))
                 {
-                    runnable.push(id);
+                    runnable.push((id, op.session_id));
                 }
             }
             after = key;
@@ -416,6 +554,44 @@ impl<'a> SummaryStore<'a> {
             after = key;
         }
         Err(Error::Limit)
+    }
+
+    /// Checkpoint the first hook decision before starting any model request.
+    pub(crate) fn finish_hook(
+        &self,
+        id: Uuid,
+        version: u64,
+        decision: crate::extension::BeforeCompact,
+    ) -> Result<(), Error> {
+        let mut op = self.load(id, version)?;
+        if !matches!(op.state, State::HookPending) || op.hook.is_none() {
+            return Err(Error::State);
+        }
+        op.state = match decision {
+            crate::extension::BeforeCompact::Pass => State::Ready,
+            crate::extension::BeforeCompact::Decline => State::Declined,
+            crate::extension::BeforeCompact::Summary(content) => {
+                let generation = CompletedGeneration {
+                    content,
+                    calls: vec![],
+                    usage: None,
+                    metadata: Default::default(),
+                };
+                if serde_json::to_vec(&generation)?.len() > MAX_PAYLOAD_BYTES {
+                    return Err(Error::Limit);
+                }
+                let result = op
+                    .preparation
+                    .clone()
+                    .finish(generation)
+                    .map_err(|e| Error::InvalidResult(e.to_string()))?;
+                State::Completed {
+                    request_id: op.id,
+                    result: Box::new(result),
+                }
+            }
+        };
+        self.write(&op, Expected::Version(version))
     }
 
     /// Commit an immutable placement admission and the pending state together,
@@ -781,11 +957,15 @@ impl<'a> SummaryStore<'a> {
     /// the caller must stop and join its executor before finishing the abort.
     pub fn begin_abort(&self, id: Uuid, version: u64) -> Result<(), Error> {
         let mut op = self.load(id, version)?;
+        Self::mark_aborting(&mut op)?;
+        self.write(&op, Expected::Version(version))
+    }
+    fn mark_aborting(op: &mut Operation) -> Result<(), Error> {
         let (owner, accounting) = match op.state {
-            State::Ready => (None, None),
+            State::HookPending | State::Ready => (None, None),
             State::Reserved { owner, .. } => (Some(owner), None),
             State::Running { owner, request_id } => {
-                Self::mark_unconfirmed(&mut op, request_id)?;
+                Self::mark_unconfirmed(op, request_id)?;
                 (Some(owner), None)
             }
             State::Accounting {
@@ -803,7 +983,7 @@ impl<'a> SummaryStore<'a> {
             _ => return Err(Error::State),
         };
         op.state = State::Aborting { owner, accounting };
-        self.write(&op, Expected::Version(version))
+        Ok(())
     }
     /// Caller must have joined the matching executor before this transition.
     pub fn finish_abort(&self, id: Uuid, version: u64, owner: Option<Uuid>) -> Result<(), Error> {

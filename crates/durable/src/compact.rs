@@ -260,6 +260,9 @@ fn serialize_summary_source(
 }
 
 impl Preparation {
+    pub(crate) fn source_matches(&self, messages: &[Message]) -> bool {
+        self.source == messages
+    }
     pub(crate) fn first_kept(&self) -> usize {
         self.first_kept
     }

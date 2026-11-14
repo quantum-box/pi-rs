@@ -597,24 +597,28 @@ conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
 `Scheduler::request_idle_independent_compaction` starts an independent summary
-for an idle conversation with no selected extensions. Supply and retain a
+for an idle conversation. Supply and retain a
 unique operation ID; the call returns false if nothing can be compacted. On a
 storage error, reopen and inspect that ID before retrying because admission may
 have committed. Use
 `wait_independent_compaction`, `independent_compaction_status`, and
 `abort_independent_compaction` to observe or abort that operation. A failed
 worker can be retried with `resume_independent_compaction` or recovered on
-reopen. This path rejects selected extensions rather than skipping their
-`beforeCompact` hooks; use the existing manual compaction API when hooks or
-instructions are needed. Admission checks the conversation's own phase and
-queue, not activity in its owned tasks or descendants. Conversation abort and
-idle waits do not yet include this independent operation.
+reopen. Selected `beforeCompact` hooks run from a persisted admission snapshot
+with operation-scoped durable memo; the first decision wins. Use
+`request_idle_independent_compaction_with_instructions` for optional
+instructions. Admission checks the conversation's own phase and queue, not
+activity in its owned tasks or descendants. Conversation abort marks owned
+independent operations atomically and waits for their cancellation and usage
+settlement; foreground idle waits include them. Hook replay after interruption
+may execute the hook again, as on the existing manual path. Recovery requires
+the selected extensions and matching summary provider identity.
 
 ```rust,ignore
 let operation = uuid::Uuid::new_v4();
 if scheduler.request_idle_independent_compaction(conversation, operation, 0)? {
     let status = scheduler.wait_independent_compaction(operation).await?;
-    // Successful completion is Applied, Stale, or Aborted.
+    // Successful completion is Applied, Stale, Aborted, or Declined.
 }
 ```
 

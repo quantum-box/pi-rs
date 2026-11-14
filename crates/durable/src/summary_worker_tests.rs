@@ -107,6 +107,7 @@ fn identity() -> SummaryProviderIdentity {
 fn open_manual(path: impl AsRef<std::path::Path>, options: Options) -> Result<Scheduler, Error> {
     let mut scheduler = Scheduler::open(path, options)?;
     scheduler.summary_provider = Some(identity());
+    scheduler.harness.summary_provider = Some(identity());
     Ok(scheduler)
 }
 fn open_auto(
@@ -275,7 +276,123 @@ async fn public_idle_compaction_abort_cancels_and_settles() {
 }
 
 #[tokio::test]
-async fn public_idle_compaction_rejects_selected_extensions_and_busy_state() {
+async fn conversation_idle_wait_includes_public_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    started(&model).await;
+    let stop = CancellationToken::new();
+    let mut wait = Box::pin(scheduler.wait_for_idle(conversation, &stop));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err()
+    );
+    model.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), &mut wait)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(wait);
+    assert_eq!(
+        scheduler.wait_independent_compaction(id).await.unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn conversation_abort_joins_summary_and_waits_for_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    model.block_settlement.store(true, Ordering::SeqCst);
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let original = scheduler.conversation(conversation).unwrap().messages;
+    let id = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    started(&model).await;
+    let mut abort = Box::pin(scheduler.abort_and_wait(conversation));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            permit = model.settlement_started.acquire() => permit.unwrap().forget(),
+            result = &mut abort => panic!("abort completed before settlement: {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut abort)
+            .await
+            .is_err()
+    );
+    model.settlement_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), &mut abort)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(abort);
+    assert_eq!(
+        scheduler.independent_compaction_status(id).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    assert_eq!(
+        scheduler.wait_independent_compaction(id).await.unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    assert_eq!(
+        scheduler.conversation(conversation).unwrap().messages,
+        original
+    );
+    assert_eq!(
+        model.settlements.lock().unwrap()[0].1,
+        UsageReport::Unconfirmed
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_summary_admission_invalidates_graph_abort_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let first = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    started(&model).await;
+    let owner = scheduler.harness.owner.clone();
+    let (checks, mutations) = SummaryStore::new(owner.store())
+        .prepare_owned_abort(&[conversation].into_iter().collect())
+        .unwrap();
+    let second = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    started(&model).await;
+    assert!(matches!(
+        owner.store().commit(&checks, &mutations),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    scheduler.abort_and_wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(first).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    assert_eq!(
+        scheduler.independent_compaction_status(second).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_idle_compaction_runs_selected_hook_and_rejects_busy_state() {
     struct HookCounter(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait::async_trait]
     impl crate::extension::Hook for HookCounter {
@@ -305,7 +422,19 @@ async fn public_idle_compaction_rejects_selected_extensions_and_busy_state() {
     scheduler
         .select_extensions(conversation, vec!["hooks".into()])
         .unwrap();
-    assert!(request_public(&mut scheduler, conversation).is_err());
+    let operation = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert!(
+        matches!(&scheduler.conversation(conversation).unwrap().messages[0], Message::User { content } if content.contains("hook summary"))
+    );
     scheduler.select_extensions(conversation, vec![]).unwrap();
     let (mut state, version) = scheduler.harness.load(conversation).unwrap();
     state.phase = Phase::ModelReady { turns: 0 };
@@ -315,7 +444,237 @@ async fn public_idle_compaction_rejects_selected_extensions_and_busy_state() {
         .unwrap();
     assert!(request_public(&mut scheduler, conversation).is_err());
     assert!(model.calls.lock().unwrap().is_empty());
-    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_hooks_report_errors_and_first_decision_wins() {
+    struct Hook {
+        calls: Arc<Mutex<Vec<(usize, Option<String>)>>>,
+        index: usize,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for Hook {
+        async fn before_compact(
+            &self,
+            input: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((self.index, input.instructions.clone()));
+            match self.index {
+                0 => Err("reported hook failure".into()),
+                1 => Ok(crate::extension::BeforeCompact::Decline),
+                _ => Ok(crate::extension::BeforeCompact::Summary("ignored".into())),
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let original = scheduler.conversation(conversation).unwrap().messages;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    scheduler
+        .install_extension(crate::extension::Extension {
+            name: "hooks".into(),
+            hooks: (0..3)
+                .map(|index| {
+                    Arc::new(Hook {
+                        calls: calls.clone(),
+                        index,
+                    }) as Arc<dyn crate::extension::Hook>
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["hooks".into()])
+        .unwrap();
+    let id = Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_idle_independent_compaction_with_instructions(
+                conversation,
+                id,
+                0,
+                Some("preserve paths")
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        scheduler.wait_independent_compaction(id).await.unwrap(),
+        IndependentCompactionStatus::Declined
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            (0, Some("preserve paths".into())),
+            (1, Some("preserve paths".into()))
+        ]
+    );
+    assert!(
+        scheduler
+            .extension_reports()
+            .unwrap()
+            .iter()
+            .any(|batch| batch.operation_id == id && batch.phase == "before_compact")
+    );
+    assert!(model.calls.lock().unwrap().is_empty());
+    assert!(model.settlements.lock().unwrap().is_empty());
+    assert_eq!(
+        scheduler.conversation(conversation).unwrap().messages,
+        original
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_hook_replays_with_the_same_durable_memo_after_reopen() {
+    struct ReplayHook {
+        started: Semaphore,
+        release: Semaphore,
+        values: Mutex<Vec<serde_json::Value>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for ReplayHook {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            context: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            let value = context
+                .memo
+                .get_or_insert("token", serde_json::json!(Uuid::new_v4()))
+                .await?;
+            self.values.lock().unwrap().push(value);
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|e| e.to_string())?
+                .forget();
+            Ok(crate::extension::BeforeCompact::Summary("from hook".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(0);
+    let hook = Arc::new(ReplayHook {
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+        values: Mutex::new(Vec::new()),
+    });
+    let extension = crate::extension::Extension {
+        name: "replay".into(),
+        hooks: vec![hook.clone()],
+        ..Default::default()
+    };
+    let mut scheduler = open_auto(&path, model.clone(), identity()).unwrap();
+    scheduler.install_extension(extension.clone()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    scheduler
+        .select_extensions(conversation, vec!["replay".into()])
+        .unwrap();
+    let id = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.shutdown().await.unwrap();
+    let mut registry = crate::extension::Registry::default();
+    registry.install(extension).unwrap();
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        opts(model.clone()),
+        registry,
+        None,
+        identity(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    hook.release.add_permits(1);
+    assert_eq!(
+        scheduler.wait_independent_compaction(id).await.unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    let values = hook.values.lock().unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], values[1]);
+    drop(values);
+    assert!(model.calls.lock().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn conversation_abort_fences_a_running_independent_hook() {
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct BlockHook {
+        started: Semaphore,
+        dropped: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for BlockHook {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            let _guard = DropFlag(self.dropped.clone());
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let hook = Arc::new(BlockHook {
+        started: Semaphore::new(0),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    scheduler
+        .install_extension(crate::extension::Extension {
+            name: "block".into(),
+            hooks: vec![hook.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["block".into()])
+        .unwrap();
+    let id = request_public(&mut scheduler, conversation)
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(conversation).await.unwrap();
+    assert!(hook.dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        scheduler.independent_compaction_status(id).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    assert!(model.calls.lock().unwrap().is_empty());
+    assert!(model.settlements.lock().unwrap().is_empty());
     scheduler.shutdown().await.unwrap();
 }
 
@@ -544,7 +903,7 @@ async fn public_placement_storage_error_fails_closed_until_reopen() {
     let conversation = placement_conversation(&mut scheduler);
     let id = Uuid::new_v4();
     scheduler
-        .create_independent_summary_impl(id, conversation, None, 0, true)
+        .create_independent_summary_impl(id, conversation, None, 0, true, None)
         .unwrap();
     crate::summary_worker::run(
         scheduler.harness.owner.clone(),
@@ -552,6 +911,7 @@ async fn public_placement_storage_error_fails_closed_until_reopen() {
         id,
         CancellationToken::new(),
         identity(),
+        None,
     )
     .await
     .unwrap();
@@ -585,7 +945,7 @@ async fn public_recovery_resumes_completed_and_admitted_placement() {
         let id = Uuid::new_v4();
         assert!(
             scheduler
-                .create_independent_summary_impl(id, conversation, None, 0, true)
+                .create_independent_summary_impl(id, conversation, None, 0, true, None)
                 .unwrap()
         );
         crate::summary_worker::run(
@@ -594,6 +954,7 @@ async fn public_recovery_resumes_completed_and_admitted_placement() {
             id,
             CancellationToken::new(),
             identity(),
+            None,
         )
         .await
         .unwrap();
@@ -634,7 +995,7 @@ async fn public_abort_can_win_after_completion_or_placement_admission() {
         let original = scheduler.conversation(conversation).unwrap().messages;
         let id = Uuid::new_v4();
         scheduler
-            .create_independent_summary_impl(id, conversation, None, 0, true)
+            .create_independent_summary_impl(id, conversation, None, 0, true, None)
             .unwrap();
         crate::summary_worker::run(
             scheduler.harness.owner.clone(),
@@ -642,6 +1003,7 @@ async fn public_abort_can_win_after_completion_or_placement_admission() {
             id,
             CancellationToken::new(),
             identity(),
+            None,
         )
         .await
         .unwrap();
@@ -1352,6 +1714,7 @@ async fn creation_rejects_a_changed_conversation_version() {
             (Harness::key(conversation), version),
             identity(),
             false,
+            None,
         ),
         Err(crate::summary_store::Error::Conflict)
     ));
@@ -1828,6 +2191,7 @@ async fn executor_guard_rechecks_identity_before_recovery() {
             model: "different".into(),
             settlement: identity().settlement,
         },
+        None,
     )
     .await;
     assert!(matches!(

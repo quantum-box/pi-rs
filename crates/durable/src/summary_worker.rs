@@ -20,6 +20,8 @@ pub(crate) enum Error {
     Identity,
     #[error("summary placement: {0}")]
     Placement(String),
+    #[error("summary hook: {0}")]
+    Hook(String),
 }
 
 fn snapshot(store: &SummaryStore<'_>, id: Uuid) -> Result<Snapshot, Error> {
@@ -35,6 +37,7 @@ pub(crate) async fn run(
     id: Uuid,
     cancel: CancellationToken,
     provider: summary_store::ProviderIdentity,
+    hook_harness: Option<&crate::runtime::Harness>,
 ) -> Result<(), Error> {
     let _guard = tokio::select! {
         biased;
@@ -60,7 +63,30 @@ pub(crate) async fn run(
             | State::PlacementPending { .. }
             | State::Placed { .. }
             | State::Stale { .. }
-            | State::Aborted => return Ok(()),
+            | State::Aborted
+            | State::Declined => return Ok(()),
+            State::HookPending => {
+                let checkpoint = snap
+                    .operation
+                    .hook()
+                    .ok_or(summary_store::Error::InvalidRecord)?;
+                let harness = hook_harness
+                    .ok_or_else(|| Error::Hook("hook runtime is unavailable".into()))?;
+                let decision = harness
+                    .run_independent_before_compact(
+                        id,
+                        snap.operation.session_id(),
+                        snap.operation.preparation(),
+                        checkpoint,
+                        &cancel,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::runtime::Error::Interrupted => Error::Interrupted,
+                        other => Error::Hook(other.to_string()),
+                    })?;
+                store.finish_hook(id, snap.version, decision)?;
+            }
             State::Reserved { owner: old, .. } | State::Running { owner: old, .. } => {
                 store.recover(id, snap.version, *old)?;
             }

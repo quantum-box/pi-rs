@@ -170,6 +170,7 @@ pub enum IndependentCompactionStatus {
     Applied,
     Stale,
     Aborted,
+    Declined,
 }
 
 /// An operation ID is stable across summary attempts and process recovery.
@@ -1047,6 +1048,7 @@ pub struct Harness {
     options: Options,
     tools: HashMap<String, RegisteredTool>,
     provider_adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+    summary_provider: Option<SummaryProviderIdentity>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     failed: bool,
     dirty: Arc<AtomicBool>,
@@ -1339,6 +1341,41 @@ impl Harness {
         result
     }
 
+    pub(crate) async fn run_independent_before_compact(
+        &self,
+        operation: Uuid,
+        conversation: Uuid,
+        preparation: &crate::compact::Preparation,
+        checkpoint: &crate::summary_store::HookCheckpoint,
+        cancel: &CancellationToken,
+    ) -> Result<crate::extension::BeforeCompact, Error> {
+        let state: Conversation = serde_json::from_value(checkpoint.snapshot.clone())?;
+        if state.id != conversation
+            || state.extensions != checkpoint.extensions
+            || !preparation.source_matches(&state.messages)
+        {
+            return Err(Error::Invalid("invalid independent hook snapshot".into()));
+        }
+        let selected = self.selected_extensions(&state)?;
+        let memo = self.extension_memo(operation)?;
+        let context = crate::extension::Context {
+            snapshot: &checkpoint.snapshot,
+            memo: &memo,
+        };
+        let input = preparation.hook_input(crate::extension::CompactionReason::Manual);
+        let gate = self.owner.conversation_controls().get(conversation).gate;
+        let (decision, reports) = fenced_poll(
+            selected.before_compact(&input, &context),
+            Some(&gate),
+            cancel,
+        )
+        .await
+        .ok_or(Error::Interrupted)?;
+        self.subagent_store()?;
+        self.record_extension_reports(conversation, operation, "before_compact", reports)?;
+        Ok(decision)
+    }
+
     /// Opens under exclusive scheduler ownership and resumes all unfinished work.
     /// A cancelled or failed open drops the owner; the next open can recover it.
     pub async fn open(
@@ -1375,6 +1412,7 @@ impl Harness {
             options,
             tools,
             provider_adapter: None,
+            summary_provider: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
@@ -1395,6 +1433,7 @@ impl Harness {
             options: self.options.clone(),
             tools: self.tools.clone(),
             provider_adapter: self.provider_adapter.clone(),
+            summary_provider: self.summary_provider.clone(),
             extensions: self.extensions.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
@@ -5235,11 +5274,25 @@ impl Harness {
                 }
                 state.abort_requested = true;
             }
+            let (summary_checks, summary_mutations) =
+                crate::summary_store::SummaryStore::new(store)
+                    .prepare_owned_abort(&conversations)
+                    .map_err(|error| {
+                        if matches!(error, crate::summary_store::Error::Store(_)) {
+                            self.storage_failed.store(true, Ordering::Release);
+                        }
+                        Error::Invalid(format!("summary abort preparation: {error}"))
+                    })?;
             let refs: Vec<_> = states
                 .iter()
                 .map(|(s, v)| (s, Expected::Version(*v)))
                 .collect();
             let mut batch = self.prepare_saves(&refs)?;
+            batch.extend(PreparedConversationSave {
+                owner: owner.clone(),
+                checks: summary_checks,
+                mutations: summary_mutations,
+            })?;
             let task_batch = crate::task_store::TaskStore::new(store)
                 .prepare_save(
                     &updates
@@ -5605,6 +5658,48 @@ impl Harness {
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
         // Keep the conversation marked until all owned cleanup has finished.
+        let summaries = crate::summary_store::SummaryStore::new(self.owner.store())
+            .list()
+            .map_err(|e| Error::Invalid(format!("summary abort lookup: {e}")))?;
+        if let Some(summary) = summaries
+            .into_iter()
+            .find(|s| s.operation.session_id() == c.id && s.operation.is_live_owned())
+        {
+            if !matches!(
+                summary.operation.state(),
+                crate::summary_store::State::Aborting { .. }
+            ) {
+                return Err(Error::Invalid("owned summary has no abort mark".into()));
+            }
+            let provider = self.summary_provider.clone().ok_or_else(|| {
+                Error::Invalid(
+                    "summary provider identity is not configured for abort cleanup".into(),
+                )
+            })?;
+            if summary.operation.provider() != Some(&provider) {
+                return Err(Error::Invalid(
+                    "summary provider identity does not match abort cleanup".into(),
+                ));
+            }
+            crate::summary_worker::run(
+                self.owner.clone(),
+                self.options.model.clone(),
+                summary.operation.id(),
+                cancel.clone(),
+                provider,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                crate::summary_worker::Error::Interrupted => Error::Interrupted,
+                crate::summary_worker::Error::Store(crate::summary_store::Error::Store(error)) => {
+                    self.storage_failed.store(true, Ordering::Release);
+                    Error::Storage(error)
+                }
+                other => Error::Invalid(format!("summary abort cleanup: {other}")),
+            })?;
+            return Ok(true);
+        }
         if !self.conversation_tasks(c.id)?.is_empty() {
             return Ok(false);
         }
@@ -8283,10 +8378,12 @@ impl Scheduler {
             crate::task_store::PREFIX,
             crate::ownership_edge::PREFIX,
             b"runtime/conversation/",
+            crate::summary_store::PREFIX,
         ])?;
         let mut records = Vec::new();
         let mut edges = Vec::new();
         let mut snapshots = HashMap::new();
+        let mut summaries = Vec::new();
         for (key, entry) in snapshot {
             if key.starts_with(crate::task_store::PREFIX) {
                 records.push(
@@ -8297,6 +8394,11 @@ impl Scheduler {
                 edges.push(
                     crate::ownership_edge::decode(&key, entry)
                         .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?,
+                );
+            } else if key.starts_with(crate::summary_store::PREFIX) {
+                summaries.push(
+                    crate::summary_store::decode_entry(&key, entry)
+                        .map_err(|e| Error::Invalid(format!("summary idle lookup: {e}")))?,
                 );
             } else {
                 snapshots.insert(key, entry);
@@ -8317,6 +8419,15 @@ impl Scheduler {
                 let entry = snapshots.get(&Harness::key(id)).ok_or(Error::NotFound)?;
                 let conversation: Conversation = serde_json::from_slice(&entry.value)?;
                 busy |= conversation.is_working();
+                busy |= summaries.iter().any(|summary| {
+                    summary.operation.auto_place()
+                        && summary.operation.session_id() == id
+                        && (summary.operation.is_live_owned()
+                            || self
+                                .summary_tasks
+                                .get(&summary.operation.id())
+                                .is_some_and(|task| !task.join.is_finished()))
+                });
                 for record in &records {
                     if record.task.owner() == &TaskOwner::Conversation(id)
                         && !record.task.is_background()
@@ -8486,6 +8597,7 @@ impl Scheduler {
             harness.install_provider_adapter(adapter)?;
         }
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
+        harness.summary_provider = summary_provider.clone();
         if let Some((parent, config, allowed_tools)) = management {
             harness.conversation(parent)?;
             let mut worker = harness.worker();
@@ -8525,8 +8637,8 @@ impl Scheduler {
         for id in ids {
             scheduler.schedule(id);
         }
-        for id in summaries {
-            scheduler.spawn_summary(id);
+        for (id, conversation) in summaries {
+            scheduler.spawn_summary(id, conversation);
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
@@ -8752,17 +8864,33 @@ impl Scheduler {
     /// Start an independent compaction of an idle conversation with a caller-
     /// supplied unique operation ID. Returns false if there is nothing to compact.
     /// Retain the ID: a storage error can leave admission outcome unknown, and
-    /// its status can be inspected after reopen. Requires recovery configuration and no
-    /// selected extensions. A concurrent conversation change settles it stale.
+    /// its status can be inspected after reopen. Requires recovery configuration.
+    /// Selected before-compact hooks run against a persisted admission snapshot.
+    /// A concurrent conversation change settles the result stale.
     /// Idle here refers to the conversation's own phase and queue; owned
     /// task and descendant activity is not included in this admission check.
-    /// Use the operation-specific wait and abort methods: conversation abort
-    /// and idle waits do not yet include this independent worker.
+    /// Conversation abort and foreground idle waits include this worker.
     pub fn request_idle_independent_compaction(
         &mut self,
         conversation: Uuid,
         id: Uuid,
         keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        self.request_idle_independent_compaction_with_instructions(
+            conversation,
+            id,
+            keep_recent_tokens,
+            None,
+        )
+    }
+
+    /// Admit an idle independent compaction with optional before-compact instructions.
+    pub fn request_idle_independent_compaction_with_instructions(
+        &mut self,
+        conversation: Uuid,
+        id: Uuid,
+        keep_recent_tokens: usize,
+        instructions: Option<&str>,
     ) -> Result<bool, Error> {
         if id.is_nil() {
             return Err(Error::Invalid("independent compaction ID is nil".into()));
@@ -8788,10 +8916,11 @@ impl Scheduler {
             None,
             keep_recent_tokens,
             true,
+            instructions,
         )? {
             return Ok(false);
         }
-        self.spawn_summary(id);
+        self.spawn_summary(id, conversation);
         Ok(true)
     }
 
@@ -8825,6 +8954,7 @@ impl Scheduler {
             State::Stale { .. } => IndependentCompactionStatus::Stale,
             State::Aborting { .. } => IndependentCompactionStatus::Aborting,
             State::Aborted => IndependentCompactionStatus::Aborted,
+            State::Declined => IndependentCompactionStatus::Declined,
             _ => IndependentCompactionStatus::Running,
         })
     }
@@ -8837,7 +8967,19 @@ impl Scheduler {
     ) -> Result<IndependentCompactionStatus, Error> {
         let status = self.independent_compaction_status(id)?;
         if self.summary_tasks.contains_key(&id) {
-            self.wait_summary(id).await?;
+            if let Err(error) = self.wait_summary(id).await {
+                let status = self.independent_compaction_status(id)?;
+                if matches!(
+                    status,
+                    IndependentCompactionStatus::Aborted
+                        | IndependentCompactionStatus::Applied
+                        | IndependentCompactionStatus::Stale
+                        | IndependentCompactionStatus::Declined
+                ) {
+                    return Ok(status);
+                }
+                return Err(error);
+            }
         } else if matches!(
             status,
             IndependentCompactionStatus::Running | IndependentCompactionStatus::Aborting
@@ -9203,6 +9345,7 @@ impl Scheduler {
             Some(max_output_tokens),
             keep_recent_tokens,
             false,
+            None,
         )
     }
 
@@ -9213,6 +9356,7 @@ impl Scheduler {
         max_output_tokens: Option<u32>,
         keep_recent_tokens: usize,
         auto_place: bool,
+        instructions: Option<&str>,
     ) -> Result<bool, Error> {
         let provider = self
             .summary_provider
@@ -9229,10 +9373,9 @@ impl Scheduler {
                 "conversation is not eligible for independent placement".into(),
             ));
         }
-        if auto_place && (!matches!(state.phase, Phase::Idle) || !state.extensions.is_empty()) {
+        if auto_place && !matches!(state.phase, Phase::Idle) {
             return Err(Error::Invalid(
-                "independent compaction requires an idle conversation without selected extensions"
-                    .into(),
+                "independent compaction requires an idle conversation".into(),
             ));
         }
         let generation = state
@@ -9243,10 +9386,19 @@ impl Scheduler {
             &state.config.model,
             max_output_tokens.unwrap_or(state.config.max_output_tokens),
             keep_recent_tokens,
-            None,
+            instructions,
         )?
         else {
             return Ok(false);
+        };
+        let hook = if auto_place && !state.extensions.is_empty() {
+            self.harness.selected_extensions(&state)?;
+            Some(crate::summary_store::HookCheckpoint {
+                extensions: state.extensions.clone(),
+                snapshot: serde_json::to_value(&state)?,
+            })
+        } else {
+            None
         };
         crate::summary_store::SummaryStore::new(self.harness.owner.store())
             .create_bound(
@@ -9256,6 +9408,7 @@ impl Scheduler {
                 (Harness::key(conversation), version),
                 provider,
                 auto_place,
+                hook,
             )
             .map_err(|e| self.summary_store_error(e))?;
         Ok(true)
@@ -9292,12 +9445,18 @@ impl Scheduler {
                 "summary provider identity is missing or does not match".into(),
             ));
         }
-        self.spawn_summary(id);
+        self.spawn_summary(id, snap.operation.session_id());
         Ok(())
     }
 
-    fn spawn_summary(&mut self, id: Uuid) {
-        let cancel = self.cancel.child_token();
+    fn spawn_summary(&mut self, id: Uuid, conversation: Uuid) {
+        let cancel = self
+            .harness
+            .owner
+            .conversation_controls()
+            .get(conversation)
+            .cancel
+            .child_token();
         let owner = self.harness.owner.clone();
         let model = self.harness.options.model.clone();
         let worker_cancel = cancel.clone();
@@ -9308,6 +9467,7 @@ impl Scheduler {
             summary_provider: self.summary_provider.clone(),
             cancel: self.cancel.clone(),
         };
+        let hook_harness = self.harness.worker();
         let provider = self
             .summary_provider
             .clone()
@@ -9320,6 +9480,7 @@ impl Scheduler {
                     id,
                     worker_cancel.clone(),
                     provider,
+                    Some(&hook_harness),
                 )
                 .await?;
                 if worker_cancel.is_cancelled() {
@@ -9343,6 +9504,30 @@ impl Scheduler {
                 Ok(())
             }
             .await;
+            let result = match result {
+                Err(crate::summary_worker::Error::Store(
+                    crate::summary_store::Error::Conflict | crate::summary_store::Error::State,
+                )) => {
+                    match crate::summary_store::SummaryStore::new(placement.harness.owner.store())
+                        .get(id)
+                    {
+                        Ok(Some(snapshot))
+                            if matches!(
+                                snapshot.operation.state(),
+                                crate::summary_store::State::Aborting { .. }
+                                    | crate::summary_store::State::Aborted
+                            ) =>
+                        {
+                            Ok(())
+                        }
+                        Ok(_) => Err(crate::summary_worker::Error::Store(
+                            crate::summary_store::Error::Conflict,
+                        )),
+                        Err(error) => Err(crate::summary_worker::Error::Store(error)),
+                    }
+                }
+                other => other,
+            };
             if storage_failed.load(Ordering::Acquire)
                 || matches!(
                     &result,
@@ -9398,7 +9583,7 @@ impl Scheduler {
                     marked = true;
                     break;
                 }
-                State::Placed { .. } | State::Stale { .. } => {
+                State::Placed { .. } | State::Stale { .. } | State::Declined => {
                     return Err(Error::Invalid("summary already completed".into()));
                 }
                 _ => match store.begin_abort(id, snap.version) {
@@ -9438,6 +9623,7 @@ impl Scheduler {
             id,
             self.cancel.child_token(),
             provider,
+            None,
         )
         .await
         .map_err(|e| match e {
