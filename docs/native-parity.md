@@ -182,6 +182,9 @@ work. Failed settlement leaves recovery pending for retry.
 Ordinary silent-summary model or budget failures also record the skip before
 returning the answer. A saved summary's incurred usage is settled even when
 the restored run budget prevents further work.
+Saved summary usage is settled even when current request limits or the
+auto-compaction setting prevent replay. Cancellation during a silent summary
+returns cancellation and leaves the durable operation available for recovery.
 Saved silent-overflow recovery runs before checking the current auto-compaction
 setting or model window. A resumed run restores request and output limits from
 its journal; missing or unconfirmed usage reserves the request's full output

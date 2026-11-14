@@ -1248,9 +1248,12 @@ impl Agent<'_> {
         // restart. Pending replies and saved summaries are charged below when
         // replayed, so exclude them here to avoid charging them twice.
         let pending_id = pending.as_ref().map(|(id, ..)| *id);
-        let saved_summary_id =
-            completed_overflow_summary(session, run_id, "pi-rs:overflow-recovery", self.model_name)
-                .map(|(_, _, _, _, id, _, _)| id);
+        let saved_summary =
+            completed_overflow_summary(session, run_id, "pi-rs:overflow-recovery", self.model_name);
+        if let Some((_, _, _, _, id, usage, metadata)) = &saved_summary {
+            self.settle_usage(*id, usage, metadata).await?;
+        }
+        let saved_summary_id = saved_summary.as_ref().map(|(_, _, _, _, id, _, _)| *id);
         let excluded = [pending_id, saved_summary_id];
         let branch = session.branch();
         let completions: HashMap<_, _> = branch
@@ -1371,22 +1374,16 @@ impl Agent<'_> {
                     // to replay. A validated completed summary can be committed
                     // without a second billable provider request.
                     if active.registry.extensions.is_empty()
-                        && let Some((
-                            summary,
-                            spent,
-                            billing,
-                            retention,
-                            request_id,
-                            usage,
-                            metadata,
-                        )) = completed_overflow_summary(
-                            session,
-                            run_id,
-                            "pi-rs:overflow-recovery",
-                            active.model_name,
-                        )
+                        && let Some((summary, spent, billing, retention, _, _, _)) =
+                            completed_overflow_summary(
+                                session,
+                                run_id,
+                                "pi-rs:overflow-recovery",
+                                active.model_name,
+                            )
                     {
-                        active.settle_usage(request_id, &usage, &metadata).await?;
+                        // The durable completion was settled before limits and
+                        // auto-compaction gates were evaluated.
                         if spent > budget {
                             return Err(Error::Budget);
                         }
@@ -2218,6 +2215,9 @@ impl Agent<'_> {
             )
             .await;
         if let Err(error) = result {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             if self.registry.extensions.is_empty()
                 && completed_overflow_summary(
                     session,
@@ -7113,6 +7113,88 @@ mod tree_tests {
     }
 
     struct SilentOverflowModel(std::sync::atomic::AtomicUsize, Option<u64>);
+    struct CancelSilentSummary(CancellationToken);
+    #[async_trait::async_trait]
+    impl Model for CancelSilentSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            if request.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                self.0.cancel();
+                return Ok(Box::pin(futures_util::stream::pending()));
+            }
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1001,
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_silent_summary_preserves_recoverable_marker() {
+        let cancel = CancellationToken::new();
+        let model = CancelSilentSummary(cancel.clone());
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 2,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert!(matches!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert!(resumable_compaction_run(&session).is_some());
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow")));
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+        assert_eq!(
+            session
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event, Event::ModelRequested { .. }))
+                .count(),
+            2
+        );
+    }
     #[async_trait::async_trait]
     impl Model for SilentOverflowModel {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
@@ -8003,6 +8085,44 @@ mod tree_tests {
             0,
             "the completed summary already used the last request"
         );
+        for disabled in [false, true] {
+            let mut blocked_session = Session::from_records(session.records().to_vec()).unwrap();
+            if disabled {
+                blocked_session.auto_compaction_control().set_enabled(false);
+            }
+            let settlement_model = RecoverySettlementModel {
+                turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+                summary_id,
+                fail_once: std::sync::atomic::AtomicBool::new(false),
+                settlements: std::sync::Mutex::new(Vec::new()),
+                allowances: std::sync::Mutex::new(Vec::new()),
+            };
+            let blocked_agent = Agent {
+                model: &settlement_model,
+                model_name: "fixture",
+                registry: &limited_registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..limited_agent.limits.clone()
+                },
+            };
+            assert!(
+                blocked_agent
+                    .run_correlated(
+                        &mut blocked_session,
+                        run_id,
+                        None,
+                        &mut limited_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(settlement_model.settlements.lock().unwrap().len(), 1);
+            assert_eq!(settlement_model.turn.0.load(Ordering::SeqCst), 0);
+        }
         let mut unknown_records = session.records().to_vec();
         for record in &mut unknown_records {
             if let Event::ModelFinished {
