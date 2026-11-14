@@ -3500,6 +3500,19 @@ mod record_metadata_tests {
     use super::*;
 
     #[test]
+    fn metadata_envelope_rejects_duplicate_record_fields() {
+        let record = Session::with_store(MemoryStore::default())
+            .unwrap()
+            .records()[0]
+            .clone();
+        let valid = serde_json::to_string(&record).unwrap();
+        assert!(serde_json::from_str::<PersistedRecord>(&valid).is_ok());
+        let duplicate = valid.replacen("\"id\":1", "\"id\":1,\"id\":2", 1);
+        assert_ne!(duplicate, valid);
+        assert!(serde_json::from_str::<PersistedRecord>(&duplicate).is_err());
+    }
+
+    #[test]
     fn file_metadata_is_atomic_and_survives_reopen_and_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("metadata.jsonl");
