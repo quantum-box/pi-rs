@@ -597,12 +597,12 @@ impl<'a> TaskStore<'a> {
         key_text: &str,
         value: Value,
     ) -> Result<SignalResult, Error> {
-        self.deliver_signal_at(
+        self.deliver_signal_with_clock(
             task_id,
             token,
             key_text,
             value,
-            crate::runtime::wall_time_millis(),
+            crate::runtime::wall_time_millis,
         )
     }
 
@@ -614,6 +614,17 @@ impl<'a> TaskStore<'a> {
         key_text: &str,
         value: Value,
         now_millis: i64,
+    ) -> Result<SignalResult, Error> {
+        self.deliver_signal_with_clock(task_id, token, key_text, value, || now_millis)
+    }
+
+    fn deliver_signal_with_clock(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key_text: &str,
+        value: Value,
+        mut now: impl FnMut() -> i64,
     ) -> Result<SignalResult, Error> {
         let receipt_id = Uuid::new_v4();
         loop {
@@ -647,7 +658,7 @@ impl<'a> TaskStore<'a> {
                 }
             }
             let expired = found.is_none()
-                && matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now_millis >= *deadline && signals.contains(signal.typed_key().unwrap()));
+                && matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now() >= *deadline && signals.contains(signal.typed_key().unwrap()));
             let mut signal = signal;
             signal.expired = expired;
             let receipt_key = signal_key(task_id, receipt_id);
@@ -1066,6 +1077,46 @@ mod tests {
     use super::*;
     use crate::task::{Checkpoint, TaskOwner, TaskState, WaitFor};
     use serde_json::json;
+
+    #[test]
+    fn wall_clock_is_refreshed_after_delivery_conflict() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let t = task(1, 3);
+        let token = SignalToken::new("answer", 1).unwrap();
+        ts.save(&[Save::Create(&t)]).unwrap();
+        ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(t.id()).unwrap().unwrap(), |t| {
+            t.wait(WaitFor::TypedSleep {
+                until_millis: Some(100),
+                signals: vec![token.key("a").unwrap()],
+            })
+        })
+        .unwrap();
+        let mut calls = 0;
+        let result = ts
+            .deliver_signal_with_clock(t.id(), &token, "a", json!(1), || {
+                calls += 1;
+                if calls == 1 {
+                    // Change the revision after it was read, forcing a retry.
+                    assert_eq!(
+                        ts.deliver_signal_at(t.id(), &token, "other", json!(2), 99)
+                            .unwrap(),
+                        SignalResult::Delivered
+                    );
+                    99
+                } else {
+                    100
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result, SignalResult::Closed);
+        assert_eq!(
+            ts.read_typed_signal_state(t.id(), &token, "a").unwrap(),
+            Some(SignalState::Expired)
+        );
+    }
     use std::sync::{Arc, Barrier};
 
     fn task(id: u128, limit: u32) -> Task {

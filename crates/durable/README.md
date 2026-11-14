@@ -224,7 +224,8 @@ Current limits and differences from upstream Pi Durable:
   `WaitFor::TypedSleep` persists ordered typed keys and an optional deadline.
   A wake consumes the first available key; a deadline expires empty keys atomically
   with the wake. `read_typed_signal_state` distinguishes expired keys from values,
-  and `Task::typed_wake` persists signal, expired, or time wake reasons. A delivery
+  and `Task::typed_wake` persists signal, expired, or time wake reasons through
+  recovery until checkpoint progress, another wait, or termination. A delivery
   to an expired key returns closed. `deliver_signal` uses wall time; deterministic
   hosts should use `deliver_signal_at` with the same clock as scheduler ticks.
   The older `send_signal` retains receipt idempotency semantics and reports

@@ -210,6 +210,7 @@ impl Task {
             self.abort_requested = true;
             self.restarts = 0;
         }
+        self.typed_wake = None;
         if matches!(self.state, TaskState::Waiting(_)) {
             self.state = TaskState::Ready;
         }
@@ -235,8 +236,7 @@ impl Task {
         self.restart_limit
     }
 
-    /// Signal receipt associated with the most recently completed wait. It is
-    /// retained across recovery and cleared when a new wait is registered.
+    /// Wake reason retained through recovery until progress, parking, or termination.
     pub fn typed_wake(&self) -> Option<&TypedWake> {
         self.typed_wake.as_ref()
     }
@@ -284,6 +284,7 @@ impl Task {
         }
         self.checkpoint = checkpoint;
         self.restarts = 0;
+        self.typed_wake = None;
         Ok(())
     }
 
@@ -336,12 +337,14 @@ impl Task {
     pub fn succeed(&mut self, result: Value) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Succeeded(result);
+        self.typed_wake = None;
         Ok(())
     }
 
     pub fn fail(&mut self, reason: String) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Failed(reason);
+        self.typed_wake = None;
         Ok(())
     }
 
@@ -350,6 +353,7 @@ impl Task {
             return Err(TransitionError::InvalidState);
         }
         self.state = TaskState::Failed("abort restart limit".into());
+        self.typed_wake = None;
         Ok(())
     }
 
@@ -362,6 +366,7 @@ impl Task {
             return Err(TransitionError::InvalidState);
         }
         self.state = TaskState::Cancelled;
+        self.typed_wake = None;
         Ok(())
     }
 

@@ -226,3 +226,48 @@ fn first_listed_value_wins_and_consumed_or_expired_keys_reject_waits() {
         WakeResult::Woken { signal: Some(_) }
     ));
 }
+
+#[test]
+fn wake_survives_recovery_but_not_checkpoint_progress() {
+    use pi_rs_durable::task::TypedWake;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id = Uuid::new_v4();
+    let token = SignalToken::new("answer", 1).unwrap();
+    {
+        let db = Store::open(&path).unwrap();
+        let store = TaskStore::new(&db);
+        setup(&store, id, &token);
+        store
+            .poll_wait(&store.load(id).unwrap().unwrap(), 100)
+            .unwrap();
+        store.reserve(&store.load(id).unwrap().unwrap()).unwrap();
+        store.recover(&store.load(id).unwrap().unwrap()).unwrap();
+    }
+    let db = Store::open(&path).unwrap();
+    let store = TaskStore::new(&db);
+    assert_eq!(
+        store.load(id).unwrap().unwrap().task.typed_wake(),
+        Some(&TypedWake::Expired)
+    );
+    store.reserve(&store.load(id).unwrap().unwrap()).unwrap();
+    store
+        .update(&store.load(id).unwrap().unwrap(), |t| {
+            t.advance(Checkpoint {
+                phase: "next".into(),
+                data: json!(null),
+            })
+        })
+        .unwrap();
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .load(id)
+            .unwrap()
+            .unwrap()
+            .task
+            .typed_wake(),
+        None
+    );
+}
