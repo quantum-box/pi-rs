@@ -7220,9 +7220,30 @@ type ExternalEditorChild = Box<dyn process_wrap::std::ChildWrapper>;
 #[cfg(not(windows))]
 type ExternalEditorChild = std::process::Child;
 
+struct ExternalEditorFile {
+    _directory: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+impl ExternalEditorFile {
+    fn new(text: &str) -> std::io::Result<Self> {
+        let directory = tempfile::Builder::new().prefix("pi-editor-").tempdir()?;
+        let path = directory.path().join("prompt.md");
+        // Close the file before launching the editor. Windows applications may
+        // open it without sharing access with an existing writable handle.
+        std::fs::write(&path, text)?;
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 struct RunningExternalEditor {
     child: ExternalEditorChild,
-    file: tempfile::NamedTempFile,
+    file: ExternalEditorFile,
     target: ExternalEditorTarget,
     #[cfg(unix)]
     _foreground: Option<EditorForeground>,
@@ -7521,8 +7542,7 @@ impl RunningExternalEditor {
         let Some((program, arguments)) = parts.split_first() else {
             return Err(Error::Config("external editor is empty".into()));
         };
-        let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-        file.write_all(text.as_bytes())?;
+        let file = ExternalEditorFile::new(text)?;
         #[cfg(unix)]
         let foreground = EditorForeground::prepare()?;
         let mut process = std::process::Command::new(program);
@@ -8367,9 +8387,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let wrapper = directory.path().join("editor.cmd");
         let marker = directory.path().join("descendant-finished");
+        let ready = directory.path().join("wrapper-ready");
         std::fs::write(&wrapper, format!(
-            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho started>\"%~1\"\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"\r\n",
+            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho edited>\"%~1\"\r\necho ready>\"{}\"\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"\r\n",
             marker.display().to_string().replace('\'', "''"),
+            ready.display(),
         )).unwrap();
         let mut editor = super::RunningExternalEditor::start(
             &format!("\"{}\"", wrapper.display()),
@@ -8378,13 +8400,15 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !std::fs::read_to_string(editor.file.path())
-            .unwrap()
-            .contains("started")
-        {
+        while !ready.exists() {
             assert!(Instant::now() < deadline, "wrapper did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            std::fs::read_to_string(editor.file.path())
+                .unwrap()
+                .contains("edited")
+        );
         editor.cancel();
         drop(editor);
         std::thread::sleep(Duration::from_secs(4));
@@ -8399,7 +8423,7 @@ mod tests {
         let wrapper = directory.path().join("editor.cmd");
         let marker = directory.path().join("descendant-finished");
         std::fs::write(&wrapper, format!(
-            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho started>\"%~1\"\r\nexit /b 0\r\n",
+            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho edited>\"%~1\"\r\nexit /b 0\r\n",
             marker.display().to_string().replace('\'', "''"),
         )).unwrap();
         let mut editor = super::RunningExternalEditor::start(
@@ -8413,6 +8437,11 @@ mod tests {
             assert!(Instant::now() < deadline, "wrapper did not exit");
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            std::fs::read_to_string(editor.file.path())
+                .unwrap()
+                .contains("edited")
+        );
         drop(editor);
         std::thread::sleep(Duration::from_secs(4));
         assert!(!marker.exists(), "descendant survived its wrapper");
