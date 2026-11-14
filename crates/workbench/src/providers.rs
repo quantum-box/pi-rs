@@ -442,6 +442,20 @@ impl Deferred {
 }
 
 impl Client {
+    /// Resolve dynamic credentials and request headers once before deciding
+    /// which affinity defaults are actually needed.
+    pub(super) async fn resolve_affinity_headers(&self) -> Result<(Self, HeaderMap)> {
+        match self {
+            Self::Deferred(deferred) => deferred.resolve_with_headers().await,
+            Self::Ollama(client) => Ok((self.clone(), client.context_headers())),
+            Self::Anthropic(client) => Ok((self.clone(), client.context_headers())),
+            Self::Google(client) => Ok((self.clone(), client.context_headers())),
+            Self::OpenAi(client) => Ok((self.clone(), client.context_headers())),
+            Self::PiMessages(client) => Ok((self.clone(), client.context_headers())),
+            _ => Ok((self.clone(), HeaderMap::new())),
+        }
+    }
+
     pub fn deferred(
         provider: Provider,
         adapter: Adapter,
@@ -764,10 +778,6 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
-                let gateway = matches!(
-                    args.provider.id(),
-                    "fireworks" | "openrouter" | "vercel-ai-gateway"
-                );
                 let mut client = client
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
@@ -778,21 +788,35 @@ impl Client {
                     client =
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
                     let adaptive = metadata.adaptive_thinking();
-                    if metadata.reasoning == Some(true) && (gateway || adaptive.is_some()) {
+                    if metadata.reasoning == Some(true) {
+                        // Messages-compatible gateways need not implement Anthropic's
+                        // Models API. Keep their configured capabilities local.
+                        if args.provider.id() != "anthropic" {
+                            client = client.with_context_probe(false);
+                        }
                         let selected = thinking.unwrap_or("off");
                         let mapped = metadata.mapped_effort(selected);
                         if selected == "off" && mapped == Some(None) {
                             client = client.with_thinking(None);
                         } else {
-                            let effort = mapped
-                                .flatten()
-                                .filter(|_| selected != "off")
-                                .unwrap_or(selected);
-                            client = client.with_configured_thinking(
-                                effort,
-                                adaptive.unwrap_or(false),
-                                true,
-                            );
+                            let effort = if adaptive == Some(true) && selected != "off" {
+                                mapped.flatten().unwrap_or(if selected == "minimal" {
+                                    "low"
+                                } else {
+                                    selected
+                                })
+                            } else {
+                                selected
+                            };
+                            client = if adaptive.is_some() || metadata.has_thinking_level_map() {
+                                client.with_configured_thinking(
+                                    effort,
+                                    adaptive.unwrap_or(false),
+                                    true,
+                                )
+                            } else {
+                                client.with_fallback_thinking(effort, false, true)
+                            };
                             if matches!(args.provider.id(), "minimax" | "minimax-cn")
                                 && args.model == "MiniMax-M3"
                             {
@@ -934,25 +958,26 @@ impl Client {
         })
     }
 
-    pub async fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+    pub async fn thinking_levels(&self, model: &str) -> Option<(Vec<String>, Option<bool>)> {
         match self {
             Self::Ollama(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                Some((details.thinking_levels?, details.reasoning))
             }
-            Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
-            Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+            Self::Anthropic(client) => client
+                .model(model)
+                .await
+                .filter(|entry| entry.has_known_thinking())
+                .map(|entry| (entry.thinking_levels, entry.reasoning)),
+            Self::Google(client) => client
+                .model(model)
+                .await
+                .map(|entry| (entry.thinking_levels, Some(entry.reasoning))),
             Self::PiMessages(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                Some((details.thinking_levels?, details.reasoning))
             }
-            Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
+            Self::OpenAi(_) => Some((pi_rs::openai::thinking_levels(model), None)),
             Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await

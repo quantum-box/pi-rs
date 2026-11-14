@@ -11,6 +11,20 @@ pub struct Document {
     normalized: OnceLock<[String; 4]>,
 }
 impl Document {
+    pub fn from_session(
+        session: &pi_rs::Session,
+        cwd: String,
+        messages: String,
+        local: bool,
+    ) -> Self {
+        Self::new(
+            session.name().unwrap_or_default().into(),
+            session.external_session_id(),
+            cwd,
+            messages,
+            local,
+        )
+    }
     pub fn cwd(&self) -> &str {
         &self.fields[2]
     }
@@ -224,6 +238,32 @@ fn position_score(text: &[u16], positions: &[usize]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_external_identity_is_searchable_after_reopen_and_fork_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.jsonl");
+        std::fs::write(
+            &input,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"legacy-search-id\"}\n",
+        )
+        .unwrap();
+        let imported = crate::session_import::read(&input).unwrap();
+        let exported = dir.path().join("export.jsonl");
+        imported.export_jsonl(&exported).unwrap();
+        let reopened = crate::session_import::read(&exported).unwrap();
+        let document = Document::from_session(&reopened, String::new(), String::new(), true);
+        assert!(Query::new("legacy-search-id").score(&document).is_some());
+        let fork =
+            pi_rs::Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+        let document = Document::from_session(&fork, String::new(), String::new(), true);
+        assert!(Query::new("legacy-search-id").score(&document).is_none());
+        assert!(
+            Query::new(&fork.session_id().to_string())
+                .score(&document)
+                .is_some()
+        );
+    }
 
     fn document() -> Document {
         Document::new(

@@ -65,12 +65,55 @@ fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Re
         });
     }
     if value.starts_with("file://") {
-        return reqwest::Url::parse(value)
-            .map_err(|error| Error::Config(error.to_string()))?
+        let url = reqwest::Url::parse(value).map_err(|error| Error::Config(error.to_string()))?;
+        validate_file_url_path(url.path(), cfg!(windows))?;
+        return url
             .to_file_path()
             .map_err(|_| Error::Config("invalid file URL".into()));
     }
     Ok(PathBuf::from(value))
+}
+
+// Node's fileURLToPath rejects encoded separators before decoding, and its
+// decodeURIComponent rejects malformed escapes and invalid UTF-8. Checking the
+// URL path rather than the whole URL leaves query and fragment semantics intact.
+fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
+    let input = path.as_bytes();
+    let escape = |index: usize| -> Option<u8> {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        Some(digit(*input.get(index + 1)?)? * 16 + digit(*input.get(index + 2)?)?)
+    };
+    for (index, &character) in input.iter().enumerate() {
+        if character == b'%'
+            && let Some(byte) = escape(index)
+            && (byte == b'/' || (windows && byte == b'\\'))
+        {
+            let message = if windows {
+                "File URL path must not include encoded \\ or / characters"
+            } else {
+                "File URL path must not include encoded / characters"
+            };
+            return Err(Error::Config(message.into()));
+        }
+    }
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            decoded.push(escape(index).ok_or_else(|| Error::Config("URI malformed".into()))?);
+            index += 3;
+        } else {
+            decoded.push(input[index]);
+            index += 1;
+        }
+    }
+    std::str::from_utf8(&decoded).map_err(|_| Error::Config("URI malformed".into()))?;
+    Ok(())
 }
 
 pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
@@ -157,6 +200,53 @@ fn windows_shell_path(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_url_validation_matches_node_separator_and_utf8_rules() {
+        let message = |path: &str, windows: bool| match validate_file_url_path(path, windows) {
+            Err(Error::Config(message)) => message,
+            result => panic!("expected invalid URL path, got {result:?}"),
+        };
+        for path in ["/tmp/a%2Fb", "/tmp/a%2fb", "/tmp/%zz%2F"] {
+            assert_eq!(
+                message(path, false),
+                "File URL path must not include encoded / characters"
+            );
+            assert_eq!(
+                message(path, true),
+                "File URL path must not include encoded \\ or / characters"
+            );
+        }
+        assert!(validate_file_url_path("/tmp/a%5Cb", false).is_ok());
+        assert_eq!(
+            message("/tmp/a%5Cb", true),
+            "File URL path must not include encoded \\ or / characters"
+        );
+        for path in ["/tmp/%zz", "/tmp/%", "/tmp/%FF", "/tmp/%C3%28"] {
+            assert_eq!(message(path, false), "URI malformed");
+        }
+        assert!(validate_file_url_path("/tmp/a%20b/%E6%97%A5", false).is_ok());
+        assert!(validate_file_url_path("/tmp/a%252Fb", false).is_ok());
+    }
+
+    #[test]
+    fn file_urls_reject_encoded_separator_before_filesystem_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("folder").join("note.txt");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "contents").unwrap();
+        let file_url = reqwest::Url::from_file_path(&nested).unwrap().to_string();
+        let escaped = file_url.replace("folder/note.txt", "folder%2Fnote.txt");
+        assert_ne!(escaped, file_url);
+        assert!(
+            matches!(input(&escaped, None), Err(Error::Config(message)) if message.contains("encoded"))
+        );
+        assert_eq!(input(&file_url, None).unwrap(), nested);
+        assert_eq!(
+            input(&format!("{file_url}?ignored=%2F#%FF"), None).unwrap(),
+            nested
+        );
+    }
 
     #[test]
     fn normalizes_mentions_spaces_home_and_file_urls_without_trimming() {

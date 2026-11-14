@@ -428,6 +428,19 @@ impl CodingTools {
 
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, false)
+    }
+
+    /// Read CLI text attachments using Pi's replacement decoding and input bound.
+    pub fn read_attachment_lossy(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, true)
+    }
+
+    fn read_attachment_inner(
+        &self,
+        path: &Path,
+        lossy: bool,
+    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
         let tool = CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
@@ -442,23 +455,58 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        if let Some(image) = tool.read_image(&path)? {
-            let blocks = image["content"].as_array().expect("image content");
-            let images = blocks
-                .iter()
-                .filter(|block| block["type"] == "image")
-                .cloned()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()?;
-            let hints = blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok((hints, images))
+        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(&path)? {
+            Ok(None)
+        } else if lossy {
+            tool.read_image_inner(&path, false)
         } else {
-            Ok((tool.text(&path)?, Vec::new()))
-        }
+            tool.read_image(&path)
+        };
+        finish_attachment(image, || {
+            if !lossy {
+                return tool.text(&path);
+            }
+            use std::io::Read as _;
+            let metadata = path.metadata()?;
+            if !metadata.is_file() || (!tool.unrestricted && metadata.len() > MAX_FILE_BYTES) {
+                return Err(Error::Config(
+                    "expected a regular text file up to 4 MiB".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(Error::Config(
+                    "attachments exceed the 8 MiB input limit".into(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }
+}
+
+fn finish_attachment(
+    image: Result<Option<Value>>,
+    read_text: impl FnOnce() -> Result<String>,
+) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+    if let Some(image) = image? {
+        let blocks = image["content"].as_array().expect("image content");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()?;
+        let hints = blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok((hints, images))
+    } else {
+        Ok((read_text()?, Vec::new()))
     }
 }
 
@@ -732,6 +780,42 @@ struct CancellableReader<R> {
     inner: R,
     cancellation: pi_rs::CancellationToken,
 }
+fn read_event_content(outcome: &Outcome) -> Option<Value> {
+    match outcome {
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
+        Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } if attachments.is_empty() => {
+            let blocks = data.get("content")?.as_array()?;
+            let note = blocks
+                .iter()
+                .find_map(|block| {
+                    (block.get("type")?.as_str()? == "text")
+                        .then(|| block.get("text")?.as_str())
+                        .flatten()
+                })
+                .unwrap_or("");
+            if let Some(image) = blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            {
+                let data = image.get("data")?.as_str()?;
+                let mime_type = image.get("mimeType")?.as_str()?;
+                if data.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+                Some(json!({"type":"image", "data":data, "mimeType":mime_type, "note":note}))
+            } else {
+                Some(json!(note))
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<R> CancellableReader<R> {
     fn check(&self) -> std::io::Result<()> {
         if self.cancellation.is_cancelled() {
@@ -759,6 +843,9 @@ impl<R: Seek> Seek for CancellableReader<R> {
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
+    }
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        read_event_content(outcome)
     }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
@@ -1622,7 +1709,7 @@ impl BashOperations for LocalBashOperations {
             task.abort();
         }
         process.finished = true;
-        Ok(status.expect("shell status observed").code())
+        Ok(Some(exit_code(status.expect("shell status observed"))))
     }
 }
 
@@ -1776,11 +1863,7 @@ impl RemoteShellTool {
             .map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?
             .ok_or_else(|| {
                 Error::Config(shell_status(
-                    if output.display.is_empty() {
-                        "(no output)"
-                    } else {
-                        &output.display
-                    },
+                    &output.result_display(),
                     "Command terminated without an exit code",
                 ))
             })?;
@@ -1848,17 +1931,13 @@ impl Tool for RemoteShellTool {
 }
 
 fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
+    let text = output.result_display();
     let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
     if output.script_truncated
         && let Some(path) = &output.path
     {
         structured_content["full_output_path"] = json!(path);
     }
-    let text = if output.display.is_empty() {
-        "(no output)".into()
-    } else {
-        output.display
-    };
     Outcome::TextResultWithStructuredContent {
         output: if code == 0 {
             text
@@ -1969,6 +2048,13 @@ impl Tool for CodingTool {
         }
     }
 
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        if matches!(self.kind, Kind::Read { .. }) {
+            read_event_content(outcome)
+        } else {
+            None
+        }
+    }
     fn execution(&self) -> ToolExecution {
         match self.kind {
             Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => ToolExecution::ParallelRead,
@@ -2202,10 +2288,19 @@ impl CodingTool {
     }
 
     fn read_image(&self, path: &Path) -> Result<Option<Value>> {
+        self.read_image_inner(path, true)
+    }
+
+    fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+        let reader = if infer_extension {
+            image::ImageReader::open(path)?
+        } else {
+            image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
+        .with_guessed_format()?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
@@ -2658,7 +2753,12 @@ impl CodingTool {
         let mut grep = if is_find {
             None
         } else {
-            Some(crate::file_search::Grep::new(args, limit)?)
+            let grep = crate::file_search::Grep::new(args, limit)?;
+            Some(if base.is_file() {
+                grep.with_explicit_file()
+            } else {
+                grep
+            })
         };
         let mut results = Vec::new();
         let mut walker = ignore::WalkBuilder::new(&base);
@@ -2847,17 +2947,6 @@ impl CodingTool {
             return Err(Error::Config(shell_status(
                 &result.output.display,
                 "Command aborted",
-            )));
-        }
-        if self.unrestricted && result.status.code().is_none() {
-            let text = if result.output.display.is_empty() {
-                "(no output)"
-            } else {
-                &result.output.display
-            };
-            return Err(Error::Config(shell_status(
-                text,
-                "Command terminated without an exit code",
             )));
         }
         Ok(result)
@@ -3341,7 +3430,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        128 + status.signal().unwrap_or(0)
+        status.signal().map_or(1, |signal| 128 + signal)
     }
     #[cfg(not(unix))]
     {
@@ -3434,6 +3523,63 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_read_structured_projection_uses_first_text_and_image() {
+        use pi_rs::{AttachmentRef, Outcome};
+        use serde_json::json;
+        let image = Outcome::Structured {
+            data: json!({"content":[
+                {"type":"text", "text":"read note"},
+                {"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="},
+                {"type":"text", "text":"other"}
+            ]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&image),
+            Some(
+                json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"read note"})
+            )
+        );
+        let omitted = Outcome::Structured {
+            data: json!({"content":[{"type":"text", "text":"image omitted"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&omitted),
+            Some(json!("image omitted"))
+        );
+        let malformed = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "data":"x"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&malformed), None);
+        let external = Outcome::Structured {
+            data: json!({"content":[]}),
+            attachments: vec![AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert_eq!(super::read_event_content(&external), None);
+        let oversized = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "mimeType":"image/png", "data":"x".repeat(8 * 1024 * 1024 + 1)}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&oversized), None);
+    }
+
+    #[test]
+    fn attachment_image_io_invalid_data_does_not_fall_back_to_text() {
+        let image_error = std::io::Error::new(std::io::ErrorKind::InvalidData, "image read failed");
+        let result = super::finish_attachment(Err(image_error.into()), || {
+            panic!("image errors must not invoke text decoding")
+        });
+        assert!(
+            matches!(result, Err(pi_rs::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_structured_result_preserves_output_and_exit_status() {
@@ -3470,15 +3616,30 @@ mod tests {
             assert_eq!(structured_content["truncated"], false);
             assert!(structured_content["wall_time_seconds"].as_f64().is_some());
         }
-        let terminated = tool
-            .bash(
-                &serde_json::json!({"command":"kill -TERM $$"}),
-                &pi_rs::CancellationToken::new(),
-            )
-            .await;
-        assert!(
-            matches!(terminated, pi_rs::Outcome::Failed(ref message) if message.contains("Command terminated without an exit code"))
-        );
+        for (signal, code) in [("TERM", 143), ("KILL", 137)] {
+            let terminated = tool
+                .bash(
+                    &serde_json::json!({"command":format!("printf partial; kill -{signal} $$")}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                structured_content,
+                is_error,
+                ..
+            } = terminated
+            else {
+                panic!("signal termination must return a structured result")
+            };
+            assert_eq!(
+                output,
+                format!("partial\n\nCommand exited with code {code}")
+            );
+            assert!(is_error);
+            assert_eq!(structured_content["output"], "partial");
+            assert_eq!(structured_content["exit_code"], code);
+        }
     }
 
     #[test]
@@ -3508,6 +3669,38 @@ mod tests {
         );
         assert!(details.is_some());
         std::fs::remove_file(structured_content["full_output_path"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+        for code in [0, 2] {
+            let input = format!("{}\n", "x".repeat(300_000));
+            let mut output = super::super::shell_output::Accumulator::default();
+            for chunk in input.as_bytes().chunks(313) {
+                output.append(chunk).unwrap();
+            }
+            let output = output.finish().unwrap();
+            let path = output.path.clone().unwrap();
+            let outcome = super::shell_outcome(output, code, 0.0);
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                details,
+                structured_content,
+                is_error,
+            } = outcome
+            else {
+                panic!("missing structured result")
+            };
+            assert!(output.starts_with(
+                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
+            ));
+            assert_eq!(is_error, code != 0);
+            assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(structured_content["output"], input);
+            assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
+            std::fs::remove_file(path).unwrap();
+        }
     }
     use super::*;
 
@@ -3801,6 +3994,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output.script, "unset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_shell_receives_external_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default();
+        config.set_context_with_external_id(
+            ShellContext {
+                id: uuid::Uuid::new_v4(),
+                path: None,
+                provider: "fixture".into(),
+                model: "model".into(),
+                reasoning_level: None,
+            },
+            "legacy 日本語".into(),
+        );
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"printf '%s' \"$PI_SESSION_ID\""}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.script, "legacy 日本語");
     }
 
     #[cfg(unix)]
@@ -5369,6 +5593,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grep_explicit_binary_file_and_directory_use_distinct_binary_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("binary.dat"),
+            b"match first\nnext line\n\0remaining match\n",
+        )
+        .unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"match", "path":"binary.dat"}), &token)
+                .unwrap()
+                .tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"match"}), &token)
+                .unwrap()
+                .tool_content(),
+            "No matches found"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn grep_normalizes_backslashes_only_for_directory_results() {
@@ -5609,40 +5862,103 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.script.contains("日本語"));
-        let ready = root
-            .path()
-            .join("ready.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
-        let leaked = root
-            .path()
-            .join("leaked.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
+        use base64::Engine as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        struct ProcessHandle(HANDLE);
+        impl Drop for ProcessHandle {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns a successful OpenProcess handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+        let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+        let ready = root.path().join("ready.txt");
+        let pid_file = root.path().join("child.pid");
+        let leaked = root.path().join("leaked.txt");
         let script = format!(
-            "Set-Content -LiteralPath '{ready}' -Value ready; Start-Sleep -Seconds 10; Set-Content -LiteralPath '{leaked}' -Value leaked"
+            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 60; [IO.File]::WriteAllText('{}','leaked')",
+            quote(&pid_file),
+            quote(&ready),
+            quote(&leaked),
         );
+        let utf16 = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         let command = format!(
-            "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
+            "$ErrorActionPreference='Stop'; Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' | Out-Null; Start-Sleep -Seconds 60"
         );
-        assert!(
-            tool.shell(
-                &json!({"command":command,"timeout":5}),
-                &pi_rs::CancellationToken::new()
-            )
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let task_cancel = cancellation.clone();
+        let mut shell = tokio::spawn(async move {
+            tool.shell(&json!({"command":command,"timeout":20}), &task_cancel)
+                .await
+        });
+        let readiness = async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
             .await
-            .is_err()
-        );
+        };
+        tokio::select! {
+            result = &mut shell => panic!("shell ended before child readiness: {}", match result {
+                Ok(Ok(_)) => "unexpected success".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => error.to_string(),
+            }),
+            result = readiness => result.expect("child did not report readiness before deadline"),
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: requesting a synchronization-only handle for the reported child PID.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         assert!(
-            root.path().join("ready.txt").exists(),
-            "child process must have started"
+            !raw.is_null(),
+            "cannot open child process: {}",
+            std::io::Error::last_os_error()
         );
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        let child = ProcessHandle(raw);
+        // SAFETY: the guard holds a live process handle. A zero timeout only observes its state.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 0) },
+            WAIT_TIMEOUT,
+            "child must be running before timeout"
+        );
+        let result = match tokio::time::timeout(Duration::from_secs(35), &mut shell).await {
+            Ok(result) => result.expect("shell task panicked"),
+            Err(_) => {
+                cancellation.cancel();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                if stopped.is_err() {
+                    shell.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                }
+                panic!("shell did not finish within the outer deadline after child readiness");
+            }
+        };
         assert!(
-            !root.path().join("leaked.txt").exists(),
-            "timed-out descendants must be terminated"
+            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 20 seconds")),
+            "expected the configured timeout"
         );
+        // SAFETY: the process handle remains owned by the guard during the wait.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 5000) },
+            WAIT_OBJECT_0,
+            "timed-out descendant must terminate"
+        );
+        assert!(!leaked.exists(), "timed-out descendant must not continue");
     }
 }

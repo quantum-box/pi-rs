@@ -8,8 +8,20 @@ pub(super) const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", 
 pub(super) fn reported(args: &Cli) -> Option<&[String]> {
     args.thinking_profile
         .as_ref()
-        .filter(|(model, _)| model == &args.model)
-        .map(|(_, levels)| levels.as_slice())
+        .filter(|(model, _, _)| model == &args.model)
+        .map(|(_, levels, _)| levels.as_slice())
+}
+
+pub(super) fn adopted_reasoning(args: &Cli) -> Option<bool> {
+    args.thinking_profile
+        .as_ref()
+        .filter(|(model, _, _)| model == &args.model)
+        .and_then(|(_, _, reasoning)| *reasoning)
+        .or_else(|| {
+            args.model_profiles
+                .model(&args.provider, &args.model)
+                .and_then(|model| model.reasoning)
+        })
 }
 
 pub(super) fn available(args: &mut Cli) -> Vec<String> {
@@ -34,13 +46,22 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return filter_levels(levels.to_vec());
     }
-    if let Some(levels) = args
-        .model_profiles
-        .model(&args.provider, &args.model)
-        .and_then(|model| model.levels(adapter))
-    {
-        let levels = filter_levels(levels);
-        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+    let configured = metadata.as_ref().and_then(|model| model.levels(adapter));
+    let discover_first = adapter == super::providers::Adapter::Anthropic
+        && args.provider.id() == "anthropic"
+        && args.allow_model_probes()
+        && metadata.as_ref().is_some_and(|model| {
+            model.reasoning == Some(true)
+                && model.adaptive_thinking().is_none()
+                && !model.has_thinking_level_map()
+        });
+    if let Some(levels) = configured.as_ref().filter(|_| !discover_first) {
+        let levels = filter_levels(levels.clone());
+        args.thinking_profile = Some((
+            args.model.clone(),
+            levels.clone(),
+            metadata.as_ref().and_then(|model| model.reasoning),
+        ));
         return levels;
     }
     let fallback = || match adapter {
@@ -95,12 +116,12 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     .join()
     .ok()
     .flatten();
-    if let Some(levels) = discovered {
+    if let Some((levels, reasoning)) = discovered {
         let levels = filter_levels(levels);
-        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+        args.thinking_profile = Some((args.model.clone(), levels.clone(), reasoning));
         levels
     } else {
-        filter_levels(fallback())
+        filter_levels(configured.unwrap_or_else(fallback))
     }
 }
 
@@ -142,7 +163,8 @@ pub(super) fn set(args: &mut Cli, requested: &str) -> Result<()> {
 
 pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
     let levels = available(args);
-    if levels.iter().all(|level| level == "off") {
+    let reasoning = adopted_reasoning(args);
+    if levels.is_empty() || (reasoning != Some(true) && levels.iter().all(|level| level == "off")) {
         return Ok(None);
     }
     let current = args.thinking.as_deref().unwrap_or("off");
@@ -151,7 +173,9 @@ pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
         .position(|level| level == current)
         .map_or(0, |index| (index + 1) % levels.len());
     let next = levels[index].clone();
-    persist(args, &next)?;
+    if args.thinking.as_deref() != Some(next.as_str()) {
+        persist(args, &next)?;
+    }
     Ok(Some(next))
 }
 
@@ -176,6 +200,171 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_uses_reasoning_flag_when_only_off_is_available() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({
+            "providers":{"anthropic":{"models":[
+                {"id":"off-only", "reasoning":true,
+                 "thinkingLevelMap":{"minimal":null,"low":null,"medium":null,"high":null}},
+                {"id":"plain", "reasoning":false}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("anthropic").unwrap();
+        args.model = "off-only".into();
+        args.thinking = Some("off".into());
+        assert_eq!(available(&mut args), ["off"]);
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert!(!args.session.exists());
+        assert!(args.selection_events.is_empty());
+
+        args.model = "plain".into();
+        assert_eq!(cycle(&mut args).unwrap(), None);
+        assert!(!args.session.exists());
+    }
+
+    #[test]
+    fn cycling_unspecified_to_off_persists_without_duplicate_hook() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.thinking = None;
+        args.thinking_profile = Some((args.model.clone(), vec!["off".into()], Some(true)));
+
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(args.thinking.as_deref(), Some("off"));
+        let session = Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some((args.model.clone(), Some("off".into())))
+        );
+        drop(session);
+        // Native treats an unspecified level as off for hook comparisons.
+        assert!(args.selection_events.is_empty());
+        let before = std::fs::read(&args.session).unwrap();
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(std::fs::read(&args.session).unwrap(), before);
+        assert!(args.selection_events.is_empty());
+    }
+
+    #[test]
+    fn declared_reasoning_displays_discovered_anthropic_capabilities() {
+        use clap::Parser;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for (capabilities, expected, discovered) in [
+            (
+                serde_json::json!({}),
+                vec!["off", "minimal", "low", "medium", "high"],
+                false,
+            ),
+            (
+                serde_json::json!({"thinking":{"supported":false}}),
+                vec!["off"],
+                true,
+            ),
+            (
+                serde_json::json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}}),
+                vec!["off", "low", "high"],
+                true,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({"id":"fixture-model","capabilities":capabilities})
+                    .to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--provider",
+                "anthropic",
+                "--model",
+                "fixture-model",
+                "--endpoint",
+                &endpoint,
+                "--api-key",
+                "fixture",
+            ])
+            .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            args.session = directory.path().join("session.jsonl");
+            args.thinking = None;
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&serde_json::json!({
+                    "providers":{"anthropic":{"models":[{"id":"fixture-model","reasoning":true}]}}
+                }))
+                .unwrap();
+            args.provider = args.model_profiles.provider("anthropic").unwrap();
+            assert_eq!(available(&mut args), expected);
+            if discovered {
+                assert_eq!(reported(&args).unwrap(), expected);
+            } else {
+                assert!(reported(&args).is_none());
+            }
+            if expected == ["off"] {
+                assert_eq!(adopted_reasoning(&args), Some(false));
+                assert_eq!(cycle(&mut args).unwrap(), None);
+                assert!(!args.session.exists());
+                assert!(args.selection_events.is_empty());
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_anthropic_reasoning_without_map_supports_default_levels() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({
+            "providers": {"anthropic": {"models": [
+                {"id":"custom-reasoning", "reasoning":true},
+                {"id":"custom-plain", "reasoning":false},
+                {"id":"custom-mapped", "reasoning":true,
+                 "thinkingLevelMap":{"off":null, "medium":null, "xhigh":"high"}}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("anthropic").unwrap();
+        args.model = "custom-reasoning".into();
+        args.thinking = Some("high".into());
+        adjust(&mut args);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert_eq!(
+            available(&mut args),
+            ["off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("minimal"));
+
+        args.model = "custom-plain".into();
+        assert_eq!(available(&mut args), ["off"]);
+        args.model = "custom-mapped".into();
+        assert_eq!(available(&mut args), ["minimal", "low", "high", "xhigh"]);
+    }
 
     #[test]
     fn vercel_reasoning_model_retains_offline_thinking_level() {

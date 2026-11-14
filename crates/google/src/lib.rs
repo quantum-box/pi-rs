@@ -182,6 +182,15 @@ impl Google {
         self
     }
 
+    fn error_secrets(&self) -> Vec<String> {
+        pi_rs_core::provider_error_secrets(
+            self.api_key.to_str().ok(),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        )
+    }
+
     fn url(&self, resource: Option<&str>) -> Url {
         let mut url = self.endpoint.clone();
         let mut segments = url.path_segments_mut().expect("HTTP base URL");
@@ -203,7 +212,7 @@ impl Google {
             .send()
             .await
             .map_err(|_| Error::Model("Google model catalog request failed".into()))?;
-        let mut response = check_status(response)?;
+        let mut response = check_status(response, &self.error_secrets()).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -483,13 +492,19 @@ fn apply_thinking_budget(
     Ok(())
 }
 
-fn check_status(response: Response) -> Result<Response> {
+async fn check_status(response: Response, secrets: &[String]) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let message = format!("Google Gemini returned HTTP {status}");
-    if status.as_u16() == 429 || status.is_server_error() {
+    if (status.as_u16() == 429 || status.is_server_error())
+        && pi_rs_core::permanent_provider_limit(response.bytes_stream(), secrets).await
+    {
+        Err(Error::Model(
+            "Google Gemini account quota or billing limit reached".into(),
+        ))
+    } else if status.as_u16() == 429 || status.is_server_error() {
         Err(Error::RetryableModel(message))
     } else {
         Err(Error::Model(message))
@@ -830,7 +845,8 @@ impl Model for Google {
                     .into(),
                 )
             })?;
-        let response = check_status(response)?;
+        let response = check_status(response, &self.error_secrets()).await?;
+        let error_secrets = self.error_secrets();
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
         let provider = self.provider.clone();
@@ -865,7 +881,9 @@ impl Model for Google {
                     .map_err(|_| Error::Model("invalid Google Gemini stream chunk".into()))?;
                 if let Some(error) = value.get("error") {
                     let code = error["code"].as_u64().unwrap_or_default();
-                    Err(if code == 429 || (500..600).contains(&code) {
+                    Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
+                        Error::Model("Google Gemini account quota or billing limit reached".into())
+                    } else if code == 429 || (500..600).contains(&code) || pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("Google Gemini returned a transient stream error".into())
                     } else {
                         Error::Model("Google Gemini returned a stream error".into())
@@ -979,6 +997,305 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn code_less_stream_errors_use_transient_classifier() {
+        use std::io::{Read, Write};
+        for (message, retryable, permanent) in [
+            ("server overloaded", true, false),
+            ("server overloaded: quota exceeded", false, true),
+            ("invalid request", false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"error":{"message":message}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Google::new(&format!("http://{address}"), "ordinary-key")
+                .unwrap()
+                .with_context_probe(false);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = model.stream(request).await.unwrap();
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("missing stream error"),
+                }
+            };
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                retryable,
+                "{message}"
+            );
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent,
+                "{message}"
+            );
+            assert!(!error.to_string().contains("ordinary-key"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_header_error_literals_are_not_classified() {
+        use std::io::{Read, Write};
+        for (name, value) in [("x-api-key", "quota exceeded"), ("x-auth-token", "timeout")] {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let event = json!({"error":{"code":400,"message":value}});
+                let worker = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(
+                            count != 0 && request.len() + count <= 32 * 1024,
+                            "incomplete request headers"
+                        );
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("{name}: {value}")),
+                        "header missing from fixture request"
+                    );
+                    let body = if streaming {
+                        format!("data: {event}\n\n")
+                    } else {
+                        json!({"error":{"message":value}}).to_string()
+                    };
+                    let status = if streaming { "200 OK" } else { "503 Fixture" };
+                    let content_type = if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                });
+                let model = Google::new(&format!("http://{address}"), "ordinary-key")
+                    .unwrap()
+                    .with_context_probe(false)
+                    .with_headers({
+                        let mut headers = reqwest::header::HeaderMap::new();
+                        headers.insert(name, value.parse().unwrap());
+                        headers
+                    });
+                let request = ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let error = match model.stream(request).await {
+                    Err(error) => error,
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Err(error)) => break error,
+                            Some(Ok(_)) => {}
+                            None => panic!("missing stream error"),
+                        }
+                    },
+                };
+                assert_eq!(
+                    matches!(error, Error::RetryableModel(_)),
+                    !streaming,
+                    "{name} {streaming}"
+                );
+                assert!(!error.to_string().contains(value));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+            ("sk-billing-timeout-secret", false, true),
+            ("sk-timeout-secret", false, true),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"error":{"code":503,"message":message,"request_id":"billing-sentinel-secret"}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Google::new(&format!("http://{address}"), "sk-billing-timeout-secret")
+                .unwrap()
+                .with_context_probe(false)
+                .with_headers({
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert("x-routing", "timeout".parse().unwrap());
+                    headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                    headers.insert(
+                        "x-bearer",
+                        "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                    );
+                    headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                    headers
+                });
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model = Google::new(&format!("http://{address}"), credential)
+                .unwrap()
+                .with_context_probe(false);
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[cfg(any(unix, windows))]

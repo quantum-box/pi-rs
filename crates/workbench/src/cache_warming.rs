@@ -584,6 +584,7 @@ impl Candidate {
                 Err(reason) => return stop(reason, None),
             };
             let states = self.registry.as_ref().map(|_| snapshot.extension_states());
+            let external_id = snapshot.external_session_id();
             drop(snapshot);
             let mut decision = self.policy.decision(scope, prompt_tokens);
             let suggested = decision.action;
@@ -642,7 +643,7 @@ impl Candidate {
                 context.scope.head()
             };
             status::publish(&self.path, status::State::Refreshing { decision, head });
-            let result = timeout(self.timeout, self.refresh()).await;
+            let result = timeout(self.timeout, self.refresh(&external_id)).await;
             if result.is_err() {
                 // Dropping the local request does not prove that the provider
                 // stopped processing it. Do not overlap it with a retry.
@@ -696,10 +697,15 @@ impl Candidate {
         Ok((scope, prompt_tokens, deadline, snapshot))
     }
 
-    async fn refresh(&self) -> Option<(Usage, ModelMetadata)> {
+    async fn refresh(&self, external_id: &str) -> Option<(Usage, ModelMetadata)> {
         let mut stream = self
             .model
-            .stream_in_session(Uuid::new_v4(), self.session, self.request.clone())
+            .stream_in_session_with_identity(
+                Uuid::new_v4(),
+                self.session,
+                external_id,
+                self.request.clone(),
+            )
             .await
             .ok()?;
         let mut metadata = ModelMetadata::default();

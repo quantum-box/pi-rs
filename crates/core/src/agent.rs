@@ -1,3 +1,4 @@
+use crate::runtime::time as platform_time;
 #[path = "turn_scheduler.rs"]
 mod turn_scheduler;
 
@@ -1248,7 +1249,7 @@ impl Agent<'_> {
             let update = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                update = tokio::time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
+                update = platform_time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
             };
             if let Some(update) = update {
                 runtime_registry = update.registry;
@@ -1348,7 +1349,7 @@ impl Agent<'_> {
                 let preparation = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = tokio::time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
+                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
                         result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
                 let prepared = match preparation {
@@ -1381,7 +1382,7 @@ impl Agent<'_> {
                             delay_ms,
                             error_message: message,
                         }));
-                        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                        let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
                         tokio::pin!(sleep);
                         let waited = loop {
                             tokio::select! {
@@ -1512,7 +1513,7 @@ impl Agent<'_> {
                         delay_ms,
                         error_message: message.clone(),
                     }));
-                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
                     tokio::pin!(sleep);
                     let waited = loop {
                         tokio::select! {
@@ -1569,7 +1570,7 @@ impl Agent<'_> {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(Error::Cancelled),
-                    update = tokio::time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
+                    update = platform_time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
                 }
             };
             let dispatch_update = match dispatch_update {
@@ -1812,7 +1813,7 @@ impl Agent<'_> {
                 }),
             };
             let result = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     self.limits.model_timeout,
                     extension.before_request_with_host(
                         &mut guarded,
@@ -1873,7 +1874,7 @@ impl Agent<'_> {
                 }),
             };
             let result = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     self.limits.model_timeout,
                     extension.context_with_system_with_host(
                         &mut guarded,
@@ -2020,9 +2021,14 @@ impl Agent<'_> {
         let mut reasoning_delta_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
+            let external_id = session.external_session_id();
             let opening = if retain_reply {
-                self.model
-                    .stream_in_session(request_id, session_id, request)
+                self.model.stream_in_session_with_identity(
+                    request_id,
+                    session_id,
+                    &external_id,
+                    request,
+                )
             } else {
                 self.model
                     .stream_for_summary(request_id, session_id, request)
@@ -2106,7 +2112,7 @@ impl Agent<'_> {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, collect) =>
+            result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
         let (usage, failure) = match &result {
@@ -2157,7 +2163,7 @@ impl Agent<'_> {
         usage: &UsageReport,
         metadata: &ModelMetadata,
     ) -> Result<()> {
-        tokio::time::timeout(
+        platform_time::timeout(
             self.limits.model_timeout,
             self.model
                 .record_usage_with_metadata(request_id, usage, metadata),
@@ -2320,7 +2326,15 @@ impl Agent<'_> {
                     message,
                 });
             }
-            self.finish_tool(session, &invocation, reply, states, observer, replies)?;
+            self.finish_tool(
+                session,
+                &invocation,
+                reply,
+                states,
+                observer,
+                replies,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -2347,6 +2361,7 @@ impl Agent<'_> {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
         session: &mut Session,
@@ -2355,6 +2370,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
         replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+        allow_event_metadata: bool,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -2434,6 +2450,17 @@ impl Agent<'_> {
             outcome => outcome,
         };
         let operation_id = invocation.operation_id;
+        let event_metadata = if allow_event_metadata {
+            self.registry
+                .tools
+                .get(&invocation.call.name)
+                .and_then(|registered| registered.tool.event_structured_content(&outcome))
+                .filter(|value| {
+                    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max_output_bytes)
+                })
+        } else {
+            None
+        };
         let waiting = match &outcome {
             Outcome::Unknown(_) => Some(Error::Reconciliation(operation_id)),
             Outcome::Pending { .. } => Some(Error::PendingOperation(operation_id)),
@@ -2441,16 +2468,18 @@ impl Agent<'_> {
         };
         let changes = self.tool_state_changes(&invocation.call.name, &outcome, states, update);
         let persisted = changes.as_ref().cloned().unwrap_or_default();
-        commit_with_reply(
-            session,
-            Event::ToolFinished {
-                operation_id,
-                outcome,
-                states: persisted,
-            },
-            observer,
-            replies,
-        )?;
+        with_tool_result_event_metadata(operation_id, event_metadata, || {
+            commit_with_reply(
+                session,
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: persisted,
+                },
+                observer,
+                replies,
+            )
+        })?;
         if let Some(error) = waiting {
             return Err(error);
         }
@@ -2914,8 +2943,8 @@ impl Agent<'_> {
                 label: options.label.map(str::to_owned),
             };
             let states = session.extension_states();
-            let deadline =
-                tokio::time::Instant::now() + self.limits.tool_timeout.min(Duration::from_secs(10));
+            let deadline = platform_time::Instant::now()
+                + self.limits.tool_timeout.min(Duration::from_secs(10));
             for extension in self
                 .registry
                 .extensions
@@ -2925,7 +2954,7 @@ impl Agent<'_> {
                 let (sender, mut incoming) = mpsc::channel(32);
                 let host = Arc::new(LifecycleMessageHost { sender, idle: true });
                 let result = {
-                    let future = tokio::time::timeout_at(
+                    let future = platform_time::timeout_at(
                         deadline,
                         extension.before_tree_with_host(
                             &preparation,
@@ -3134,7 +3163,7 @@ impl Agent<'_> {
         let prepared = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))??,
         };
         let active = Agent {
@@ -3294,7 +3323,7 @@ impl Agent<'_> {
                 biased;
                 _ = cancel.cancelled() => break Err(Error::Cancelled),
                 _ = waiting.cancel.cancelled() => break Err(Error::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                _ = platform_time::sleep(Duration::from_millis(delay_ms)) => {}
             }
         };
         if retries > 0 {
@@ -3316,15 +3345,44 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        ensure_settled(session.operations())?;
-        let states = self.migrate(session, observer)?;
-        let retention = match keep_turns {
-            Some(turns) => RetentionPlan::turns(session, turns),
-            None => configured_retention(
-                session,
-                self.compaction_tokens(session).keep_recent_tokens,
-                1,
-            )?,
+        let preparation = (|| {
+            ensure_settled(session.operations())?;
+            let states = self.migrate(session, observer)?;
+            let retention = match keep_turns {
+                Some(turns) => RetentionPlan::turns(session, turns),
+                None => configured_retention(
+                    session,
+                    self.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )?,
+            };
+            Ok((states, retention))
+        })();
+        let (states, retention) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let event =
+                    compaction_failed_event(crate::CompactionReason::Manual, &error, cancel);
+                let idle = session.current_run_id().is_none();
+                if let Err(notification_error) = crate::lifecycle::notify_session_with_host(
+                    self.registry,
+                    session,
+                    event,
+                    self.limits.model_timeout,
+                    observer,
+                    idle,
+                )
+                .await
+                {
+                    let message = notification_error.to_string();
+                    observer(Notification::ExtensionLifecycleError {
+                        extension: "session host",
+                        event: "session_compact_failed",
+                        message: &message,
+                    });
+                }
+                return Err(error);
+            }
         };
         let limit = self
             .limits
@@ -3356,6 +3414,7 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<u32> {
         let reason = scope.reason;
+        let cancellation = scope.cancellation;
         let result = self
             .summarize_prefix_inner(session, states, scope, observer, inputs)
             .await;
@@ -3372,16 +3431,10 @@ impl Agent<'_> {
                 reason,
                 will_retry: false,
             },
-            Err(error) => crate::LifecycleEvent::SessionCompactFailed {
-                reason,
-                error_message: (!matches!(error, Error::Cancelled)).then(|| error.to_string()),
-                aborted: matches!(error, Error::Cancelled),
-                will_retry: false,
-                from_extension: false,
-            },
+            Err(error) => compaction_failed_event(reason, error, cancellation),
         };
         let idle = session.current_run_id().is_none();
-        crate::lifecycle::notify_session_with_host(
+        let notification = crate::lifecycle::notify_session_with_host(
             self.registry,
             session,
             event,
@@ -3389,7 +3442,18 @@ impl Agent<'_> {
             observer,
             idle,
         )
-        .await?;
+        .await;
+        if let Err(notification_error) = notification {
+            if result.is_ok() {
+                return Err(notification_error);
+            }
+            let message = notification_error.to_string();
+            observer(Notification::ExtensionLifecycleError {
+                extension: "session host",
+                event: "session_compact_failed",
+                message: &message,
+            });
+        }
         result.map(|(spent, _)| spent)
     }
 
@@ -3448,7 +3512,7 @@ impl Agent<'_> {
         let prepared = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))??,
         };
         let active = Agent {
@@ -3524,7 +3588,7 @@ impl Agent<'_> {
             None => tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
+                result = platform_time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
             },
         };
         Ok(window)
@@ -3765,6 +3829,7 @@ fn configured_retention(
         return Ok(RetentionPlan::turns(session, fallback));
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let entries = conversation_entries(&branch, session.operations());
     let candidates: Vec<_> = entries
         .iter()
@@ -3783,9 +3848,7 @@ fn configured_retention(
     let mut cut = first;
     let mut accumulated = 0_u64;
     for (index, (source, message)) in entries.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(crate::tokens::estimate_budget_source_tokens(
-            session, *source, message,
-        ));
+        accumulated = accumulated.saturating_add(token_index.estimate(*source, message));
         if accumulated >= target {
             cut = candidates
                 .iter()
@@ -3842,6 +3905,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         return Ok(1);
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let floor = retain_from(&branch, usize::MAX).unwrap_or(u64::MAX);
     let turns: Vec<_> = branch
         .iter()
@@ -3864,9 +3928,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         let middle = low + (high - low) / 2;
         let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
         let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
-                session, *source, message,
-            ))
+            tokens.saturating_add(token_index.estimate(*source, message))
         });
         if tokens >= target {
             low = middle + 1;
@@ -3926,6 +3988,28 @@ struct SummaryScope<'a> {
     cancellation: &'a CancellationToken,
     reason: crate::CompactionReason,
 }
+
+fn compaction_failed_event(
+    reason: crate::CompactionReason,
+    error: &Error,
+    cancellation: &CancellationToken,
+) -> crate::LifecycleEvent {
+    let aborted = cancellation.is_cancelled() || matches!(error, Error::Cancelled);
+    let error_message = (!aborted).then(|| {
+        let prefix = match reason {
+            crate::CompactionReason::Manual => "Compaction failed",
+            crate::CompactionReason::Threshold => "Auto-compaction failed",
+        };
+        format!("{prefix}: {error}")
+    });
+    crate::LifecycleEvent::SessionCompactFailed {
+        reason,
+        error_message,
+        aborted,
+        will_retry: false,
+        from_extension: false,
+    }
+}
 struct DispatchScope<'a> {
     cancellation: &'a CancellationToken,
     advertised: &'a HashSet<String>,
@@ -3981,7 +4065,7 @@ async fn serve_compaction_hook<T, I: Into<AgentInput> + Send>(
     observer: &mut Observer<'_>,
     inputs: &mut Option<&mut mpsc::Receiver<I>>,
 ) -> Result<crate::ExtensionResult<T>> {
-    let future = tokio::time::timeout(timeout, future);
+    let future = platform_time::timeout(timeout, future);
     tokio::pin!(future);
     loop {
         tokio::select! {
@@ -4534,6 +4618,78 @@ fn branch_excerpt(entry: Message) -> String {
     }
 }
 
+thread_local! {
+    static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Returns transient result metadata only while the matching committed-record
+/// observer is being called on the current thread. Never persists the value.
+#[doc(hidden)]
+pub fn tool_result_event_metadata(operation_id: Uuid) -> Option<serde_json::Value> {
+    TOOL_EVENT_METADATA.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|(id, _)| *id == operation_id)
+            .and_then(|(_, value)| value.clone())
+    })
+}
+
+fn with_tool_result_event_metadata<T>(
+    id: Uuid,
+    value: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            TOOL_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    TOOL_EVENT_METADATA.with(|stack| stack.borrow_mut().push((id, value)));
+    let _guard = Pop;
+    f()
+}
+
+#[cfg(test)]
+mod metadata_scope_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_scope_is_correlated_nested_and_unwind_safe() {
+        let outer = Uuid::new_v4();
+        let inner = Uuid::new_v4();
+        assert!(tool_result_event_metadata(outer).is_none());
+        with_tool_result_event_metadata(outer, Some(serde_json::json!("outer")), || {
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            with_tool_result_event_metadata(inner, None, || {
+                assert!(tool_result_event_metadata(outer).is_none());
+                assert!(tool_result_event_metadata(inner).is_none());
+            });
+            let _ = std::panic::catch_unwind(|| {
+                with_tool_result_event_metadata(inner, Some(serde_json::json!("inner")), || {
+                    assert_eq!(
+                        tool_result_event_metadata(inner),
+                        Some(serde_json::json!("inner"))
+                    );
+                    panic!("test unwind");
+                })
+            });
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            assert!(tool_result_event_metadata(inner).is_none());
+        });
+        assert!(tool_result_event_metadata(outer).is_none());
+    }
+}
+
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {
     observer(Notification::Committed(session.append(event)?));
     Ok(())
@@ -4936,6 +5092,222 @@ fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Opti
 }
 
 #[cfg(test)]
+mod retention_estimate_tests {
+    use super::*;
+
+    fn session_with_reasoning(reasoning: &str) -> (Session, u64) {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let completion = session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some(reasoning.into()),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        (session, completion)
+    }
+
+    #[test]
+    fn long_history_retention_and_usage_share_indexed_reasoning() {
+        const TURNS: usize = 2500;
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for _ in 0..TURNS {
+            session
+                .append(Event::User {
+                    content: "x".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        reasoning: Some("r".repeat(8)),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "ok".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.context_usage_estimate().tokens, (TURNS * 4) as u64);
+        let retention = configured_retention(&session, Some(u64::MAX), 1).unwrap();
+        assert_eq!(retention.keep_turns, TURNS);
+        assert!(!retention.split_turn);
+        assert_eq!(
+            retained_turn_count(&session, Some(u64::MAX)).unwrap(),
+            TURNS
+        );
+    }
+
+    #[test]
+    fn recent_token_cut_counts_assistant_thinking() {
+        let (session, completion) = session_with_reasoning(&"r".repeat(400));
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert_eq!(retention.boundary, Some(completion));
+        assert!(retention.split_turn);
+        let (without_thinking, _) = session_with_reasoning("");
+        let retention = configured_retention(&without_thinking, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn complete_turn_retention_counts_reasoning_in_latest_turn() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "next".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some("r".repeat(400)),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        assert_eq!(retained_turn_count(&session, Some(100)).unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_token_cut_ignores_tool_envelope_metadata() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                usage: None,
+                request_id: None,
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            })
+            .unwrap();
+        session.append(Event::ToolFinished {
+            operation_id,
+            outcome: crate::Outcome::Structured {
+                data: serde_json::json!({"content":[{"type":"text","text":"ok"}], "metadata":"z".repeat(4000)}),
+                attachments: vec![],
+            },
+            states: Default::default(),
+        }).unwrap();
+        let retention = configured_retention(&session, Some(50), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn recent_token_cut_uses_edited_thinking_not_stale_metadata() {
+        let (mut session, _) = session_with_reasoning(&"r".repeat(400));
+        let assistant = session
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Thinking {
+                        thinking: "z".repeat(800),
+                        thinking_signature: None,
+                        redacted: false,
+                    },
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        assert!(
+            configured_retention(&session, Some(100), 1)
+                .unwrap()
+                .split_turn
+        );
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+}
+
+#[cfg(test)]
 mod request_callback_marker_tests {
     use super::*;
 
@@ -5073,6 +5445,252 @@ mod tree_tests {
     }
 
     struct NoModel;
+
+    struct CompactionFailureObserver(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureObserver {
+        fn id(&self) -> &str {
+            "compaction-failure-observer"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            }
+            Ok(())
+        }
+    }
+
+    struct FailedCompactionMigration;
+    #[async_trait::async_trait]
+    impl crate::Extension for FailedCompactionMigration {
+        fn id(&self) -> &str {
+            "failed-migration"
+        }
+        fn migrate(
+            &self,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            Err("migration failed".into())
+        }
+    }
+
+    struct FailAfterCreateStore {
+        records: Vec<Record>,
+    }
+    impl crate::SessionStore for FailAfterCreateStore {
+        fn load(&mut self) -> Result<Vec<Record>> {
+            Ok(self.records.clone())
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            if !self.records.is_empty() {
+                return Err(Error::Session("fixture journal write failure".into()));
+            }
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct CompactionFailureMessage;
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureMessage {
+        fn id(&self) -> &str {
+            "failure-message"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "failure".into(),
+                        content: crate::ContextContent::Text("notice".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_keeps_original_error_when_listener_write_fails() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureMessage))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(observed.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(FailAfterCreateStore { records: vec![] }).unwrap();
+        let mut reported = Vec::new();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |event| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    reported.push((extension.to_owned(), event.to_owned(), message.to_owned()));
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "later listener must receive the event"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, message)| extension == "session host"
+                    && event == "session_compact_failed"
+                    && message.contains("fixture journal write failure"))
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, _)| extension == "failure-message"
+                    && event == "session_compact_failed")
+        );
+        assert_eq!(session.records().len(), 1);
+        assert!(
+            session
+                .append(Event::User {
+                    content: "later".into(),
+                    input_id: None
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_preparation_and_preserves_error() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "session_compact_failed");
+        assert_eq!(events[0]["reason"], "manual");
+        assert_eq!(events[0]["aborted"], false);
+        assert_eq!(events[0]["willRetry"], false);
+        assert_eq!(events[0]["fromExtension"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Compaction failed: ")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_threshold_and_cancellation() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for cancelled in [false, true] {
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let retention = RetentionPlan::turns(&session, 0);
+            let result = agent
+                .summarize_prefix::<AgentInput>(
+                    &mut session,
+                    &ExtensionStates::new(),
+                    SummaryScope {
+                        retention,
+                        instructions: None,
+                        output_limit: 0,
+                        cancellation: &token,
+                        reason: crate::CompactionReason::Threshold,
+                    },
+                    &mut |_| {},
+                    None,
+                )
+                .await;
+            assert!(matches!(result, Err(Error::Budget)));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["reason"], "threshold");
+        assert_eq!(events[0]["aborted"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Auto-compaction failed: ")
+        );
+        assert_eq!(events[1]["aborted"], true);
+        assert!(events[1].get("errorMessage").is_none());
+    }
 
     #[async_trait::async_trait]
     impl Model for NoModel {
@@ -5702,7 +6320,7 @@ mod nested_host_tests {
             .unwrap();
         cancel.cancel();
         // The dispatcher still owns the other sender when cancellation occurs.
-        let outcomes = tokio::time::timeout(Duration::from_secs(1), call)
+        let outcomes = platform_time::timeout(Duration::from_secs(1), call)
             .await
             .expect("cancelled call remained blocked")
             .unwrap();
@@ -5987,7 +6605,7 @@ mod queue_tests {
                 parent_operation: Uuid::nil(),
             })
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             Duration::from_secs(3),
             agent.reject_truncated_tools(
                 &mut session,
@@ -6070,7 +6688,7 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
@@ -6084,14 +6702,14 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
             let (reply, result) = oneshot::channel();
             sender.send(AgentInput::ClearQueue { reply }).await.unwrap();
-            let removed = tokio::time::timeout(Duration::from_secs(1), result)
+            let removed = platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()

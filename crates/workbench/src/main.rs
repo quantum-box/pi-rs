@@ -54,7 +54,7 @@ mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;
-mod streaming_json;
+use pi_rs::StreamingJson;
 mod thinking;
 mod tool_selection;
 mod ui;
@@ -115,7 +115,7 @@ struct Cli {
     #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
-    thinking_profile: Option<(String, Vec<String>)>,
+    thinking_profile: Option<(String, Vec<String>, Option<bool>)>,
     #[arg(skip)]
     initial_images: Vec<pi_rs::ImageContent>,
     #[arg(skip)]

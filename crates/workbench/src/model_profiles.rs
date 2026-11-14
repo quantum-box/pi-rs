@@ -549,9 +549,10 @@ impl ModelMetadata {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
+        // Pi exposes the default five levels for a reasoning model even when
+        // its configuration does not specify a thinkingLevelMap.
         if adapter == Adapter::Anthropic
             && self.reasoning == Some(true)
-            && self.compat.force_adaptive_thinking == Some(false)
             && self.thinking_level_map.is_empty()
         {
             return Some(
@@ -634,6 +635,10 @@ impl ModelMetadata {
 
     pub fn adaptive_thinking(&self) -> Option<bool> {
         self.compat.force_adaptive_thinking
+    }
+
+    pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
     }
 
     pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {

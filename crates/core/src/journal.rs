@@ -639,6 +639,24 @@ impl Session {
         }
     }
 
+    /// Pi-compatible externally visible identity; the native UUID remains the
+    /// stable key for existing SDKs, stores, and host isolation.
+    pub fn external_session_id(&self) -> String {
+        let native = self.session_id().to_string();
+        self.records
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi-rs:external-session-id"
+                        && entry["native_id"].as_str() == Some(native.as_str()) =>
+                {
+                    entry["id"].as_str().map(str::to_owned)
+                }
+                _ => None,
+            })
+            .unwrap_or(native)
+    }
+
     pub fn head(&self) -> u64 {
         self.head
     }
@@ -756,6 +774,7 @@ impl Session {
 
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
+        let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
         let entries = conversation_entries_unrepaired(&branch, self.operations());
         let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
         let invalidated_at = branch
@@ -821,9 +840,7 @@ impl Session {
                 entries[index + 1..]
                     .iter()
                     .fold(0_u64, |tokens, (source, message)| {
-                        tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                            self, *source, message,
-                        ))
+                        tokens.saturating_add(token_index.estimate(*source, message))
                     });
             // Pi estimates each system delta that follows the measured reply.
             let trailing_tokens = branch
@@ -853,9 +870,7 @@ impl Session {
             })
             .saturating_add(crate::tokens::estimate_system_tokens(&branch));
         let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                self, *source, message,
-            ))
+            tokens.saturating_add(token_index.estimate(*source, message))
         });
         crate::ContextUsageEstimate {
             tokens,

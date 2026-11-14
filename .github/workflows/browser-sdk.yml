@@ -1,0 +1,53 @@
+name: Browser SDK
+
+on:
+  pull_request:
+    paths:
+      - 'crates/core/**'
+      - 'crates/browser-fetch/**'
+      - 'crates/browser-sdk/**'
+      - '.github/workflows/browser-sdk.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/**'
+      - 'crates/browser-fetch/**'
+      - 'crates/browser-sdk/**'
+      - '.github/workflows/browser-sdk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - id: chrome
+        uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4 # v2
+      - name: Install Rust and target
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Check and build browser SDK
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: |
+          cargo +1.89.0 fmt --manifest-path crates/browser-sdk/Cargo.toml -- --check
+          cargo +1.89.0 clippy --locked --manifest-path crates/browser-sdk/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+          cargo +1.89.0 build --locked --manifest-path crates/browser-sdk/Cargo.toml --target wasm32-unknown-unknown
+      - name: Exercise browser SDK in Chrome
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          PI_FETCH_CHROME_NO_SANDBOX: '1'
+        run: |
+          wasm-bindgen --target web --out-dir "$RUNNER_TEMP/pi-sdk-web" crates/browser-sdk/target/wasm32-unknown-unknown/debug/pi_rs_browser_sdk.wasm
+          node crates/browser-sdk/tests/browser-sdk.cjs "$RUNNER_TEMP/pi-sdk-web" "$CHROME_BIN"

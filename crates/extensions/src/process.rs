@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
+// Maximum compact-JSON overhead of {"outcome":...,"output_unchanged":false}.
+const PRESENCE_RESPONSE_OVERHEAD: u64 = 37;
 // A duplex tool-result request and its completion can each contain an 8 MiB
 // journaled outcome, including JSON-escaped structured shell output.
 const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
@@ -280,6 +282,8 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
         #[serde(default)]
         text_result_v2: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        presence_v1: bool,
     },
     BeforeCompaction {
         summary: String,
@@ -292,6 +296,12 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
 }
+#[derive(Serialize, Deserialize)]
+struct ToolResultPresence {
+    outcome: Option<Outcome>,
+    output_unchanged: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     version: u16,
@@ -315,6 +325,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
+    #[serde(default)]
+    result_presence_v1: bool,
     #[serde(default)]
     text_result_v2: bool,
     #[serde(default)]
@@ -1622,6 +1634,7 @@ impl Extension for ExecutableExtension {
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: !legacy,
+            presence_v1: false,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
@@ -1682,6 +1695,7 @@ impl Extension for ExecutableExtension {
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: true,
+            presence_v1: false,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
@@ -1693,6 +1707,58 @@ impl Extension for ExecutableExtension {
         .await
         .map_err(|error| error.to_string())??;
         Ok(updated)
+    }
+
+    async fn tool_result_update_with_presence(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        if !self.description.result_presence_v1 || !self.endpoint.text_result_v2 {
+            let result = match host {
+                Some(host) => {
+                    self.tool_result_update_with_host(call_data, outcome, context, state, host)
+                        .await?
+                }
+                None => {
+                    self.tool_result_update(call_data, outcome, context, state)
+                        .await?
+                }
+            };
+            return Ok((result, None));
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+            presence_v1: true,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let use_duplex = self.description.tool_hook_host_calls && host.is_some();
+        let runtime = tokio::runtime::Handle::current();
+        let result: ToolResultPresence = tokio::task::spawn_blocking(move || {
+            if use_duplex {
+                call_duplex(
+                    &path,
+                    request,
+                    host.expect("checked host"),
+                    &cancelled,
+                    &runtime,
+                )
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok((result.outcome, result.output_unchanged))
     }
 
     fn after_tool(
@@ -2057,6 +2123,74 @@ enum DuplexFrame {
     },
 }
 
+// Count the old response envelope without allocating another copy of its
+// potentially large outcome. Only the negotiated wrapper may exceed the cap.
+fn check_presence_response(
+    response: &std::result::Result<Value, String>,
+    limit: u64,
+    duplex: bool,
+    newline: bool,
+) -> ExtensionResult<()> {
+    #[derive(Serialize)]
+    struct Single<'a> {
+        version: u16,
+        response: std::result::Result<&'a Value, &'a String>,
+    }
+    #[derive(Serialize)]
+    struct Complete<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        response: std::result::Result<&'a Value, &'a String>,
+    }
+    struct Counter {
+        length: u64,
+        limit: u64,
+    }
+    impl Write for Counter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.length = self.length.saturating_add(data.len() as u64);
+            if self.length > self.limit {
+                return Err(std::io::Error::other("response limit exceeded"));
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let response = match response {
+        Ok(value) => Ok(value.get("outcome").ok_or("invalid presence response")?),
+        Err(error) => Err(error),
+    };
+    let mut counter = Counter {
+        length: u64::from(newline),
+        limit,
+    };
+    let result = if duplex {
+        serde_json::to_writer(
+            &mut counter,
+            &Complete {
+                kind: "complete",
+                response,
+            },
+        )
+    } else {
+        serde_json::to_writer(
+            &mut counter,
+            &Single {
+                version: PROTOCOL,
+                response,
+            },
+        )
+    };
+    result.map_err(|_| {
+        format!(
+            "native extension response exceeds {} MiB",
+            limit / (1024 * 1024)
+        )
+    })
+}
+
 fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
     write_bounded_line(writer, value, MAX_MESSAGE)
 }
@@ -2143,7 +2277,15 @@ fn read_bounded_frame(reader: &mut impl BufRead, limit: u64) -> ExtensionResult<
 
 // Inspect call count without allocating their arbitrary JSON arguments. The
 // frame may put `type` after `calls`, so borrow the raw array before parsing it.
+#[cfg(test)]
 fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> {
+    read_duplex_frame_with_presence(reader, false)
+}
+
+fn read_duplex_frame_with_presence(
+    reader: &mut impl BufRead,
+    presence: bool,
+) -> ExtensionResult<DuplexFrame> {
     #[derive(Deserialize)]
     struct Preflight<'a> {
         #[serde(rename = "type", borrow)]
@@ -2194,9 +2336,17 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
             deserializer.deserialize_seq(Visitor)
         }
     }
-    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE)?;
+    let allowance = if presence {
+        PRESENCE_RESPONSE_OVERHEAD
+    } else {
+        0
+    };
+    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE + allowance)?;
     let prefix: Preflight<'_> = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if bytes.len() as u64 > MAX_DUPLEX_MESSAGE && (!presence || prefix.kind != "complete") {
+        return Err("native extension frame exceeds 16 MiB".into());
+    }
     if prefix.kind == "call"
         && let Some(calls) = prefix.calls
     {
@@ -2262,8 +2412,12 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
             .map_err(|error| format!("invalid native extension frame: {error}"))?;
         return Ok(DuplexFrame::CheckedCall { calls });
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid native extension frame: {error}"))
+    let frame: DuplexFrame = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if presence && let DuplexFrame::Complete { response } = &frame {
+        check_presence_response(response, MAX_DUPLEX_MESSAGE, true, bytes.ends_with(b"\n"))?;
+    }
+    Ok(frame)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2382,6 +2536,14 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     {
         *result = endpoint.project_outcome(result);
     }
+    let presence = matches!(
+        &request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -2400,7 +2562,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = read_duplex_frame(&mut output);
+            let frame = read_duplex_frame_with_presence(&mut output, presence);
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
@@ -2702,6 +2864,14 @@ impl ToolHost for RemoteHost {
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
     let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
+    let presence = matches!(
+        &request.request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
@@ -2719,7 +2889,21 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         .io
         .lock()
         .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
-    duplex_write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
+    if presence {
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true)
+            .map_err(Error::Config)?;
+    }
+    write_bounded_line(
+        &mut io.1,
+        &DuplexFrame::Complete { response },
+        MAX_DUPLEX_MESSAGE
+            + if presence {
+                PRESENCE_RESPONSE_OVERHEAD
+            } else {
+                0
+            },
+    )
+    .map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -2810,7 +2994,14 @@ fn call<T: serde::de::DeserializeOwned>(
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
-    let response_limit = if endpoint.text_result_v2
+    let presence_response = matches!(
+        &request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            ..
+        }
+    );
+    let legacy_response_limit = if endpoint.text_result_v2
         && endpoint.structured_text_result
         && matches!(
             &request,
@@ -2823,6 +3014,12 @@ fn call<T: serde::de::DeserializeOwned>(
     } else {
         MAX_MESSAGE
     };
+    let response_limit = legacy_response_limit
+        + if presence_response {
+            PRESENCE_RESPONSE_OVERHEAD
+        } else {
+            0
+        };
     let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
     if wire["type"] == "lifecycle" && wire["event"]["type"] == "tool_execution_end" {
         let result = &mut wire["event"]["result"];
@@ -2911,6 +3108,14 @@ fn call<T: serde::de::DeserializeOwned>(
         .map_err(|error| format!("invalid native extension response: {error}"))?;
     if envelope.version != PROTOCOL {
         return Err("unsupported native extension protocol version".into());
+    }
+    if presence_response {
+        check_presence_response(
+            &envelope.response,
+            legacy_response_limit,
+            false,
+            bytes.ends_with(b"\n"),
+        )?;
     }
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
@@ -3046,7 +3251,7 @@ async fn dispatch(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
 ) -> ExtensionResult<Value> {
-    dispatch_with_host(extension, request, Arc::new(DetachedHost)).await
+    dispatch_inner(extension, request, None).await
 }
 
 async fn dispatch_with_host(
@@ -3054,6 +3259,16 @@ async fn dispatch_with_host(
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
 ) -> ExtensionResult<Value> {
+    dispatch_inner(extension, request, Some(host)).await
+}
+
+async fn dispatch_inner(
+    extension: Arc<dyn Extension>,
+    request: ProtocolRequest,
+    host: Option<Arc<dyn ToolHost>>,
+) -> ExtensionResult<Value> {
+    let host_available = host.is_some();
+    let host = host.unwrap_or_else(|| Arc::new(DetachedHost));
     match request {
         ProtocolRequest::Describe => encode(Ok(Description {
             id: extension.id().into(),
@@ -3073,6 +3288,7 @@ async fn dispatch_with_host(
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            result_presence_v1: true,
             text_result_v2: true,
             structured_text_result: true,
             tool_message_error: true,
@@ -3554,8 +3770,32 @@ async fn dispatch_with_host(
             operation_id,
             state,
             text_result_v2,
+            presence_v1,
         } => {
             let context = context(&operation_id)?;
+            if presence_v1 {
+                if !text_result_v2 {
+                    return Err("result presence requires text-result v2".into());
+                }
+                // A duplex host can support nested calls without supporting
+                // custom messages; single-shot dispatch has no host at all.
+                let host = host_available.then_some(host);
+                return encode(
+                    pi_rs_core::track_tool_result_presence(
+                        extension.as_ref(),
+                        &call,
+                        &outcome,
+                        &context,
+                        state.as_ref(),
+                        host,
+                    )
+                    .await
+                    .map(|(outcome, output_unchanged)| ToolResultPresence {
+                        outcome,
+                        output_unchanged,
+                    }),
+                );
+            }
             let result = if host.supports_custom_messages() {
                 extension
                     .tool_result_update_with_host(&call, &outcome, &context, state.as_ref(), host)
@@ -3866,6 +4106,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presence_duplex_host_is_independent_of_custom_message_capability() {
+        struct Host {
+            custom: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                self.custom
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                assert_eq!(name, "nested");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Outcome::Succeeded("nested-result".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                if self.custom {
+                    Ok(())
+                } else {
+                    Err("custom messages unavailable".into())
+                }
+            }
+        }
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "nested-hook"
+            }
+            async fn tool_result_update_with_host(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<Option<Outcome>> {
+                assert_eq!(
+                    host.call("nested", serde_json::json!({})).await,
+                    Outcome::Succeeded("nested-result".into())
+                );
+                let message = pi_rs_core::CustomMessage {
+                    custom_type: "hook".into(),
+                    content: pi_rs_core::ContextContent::Text("message".into()),
+                    display: false,
+                    details: None,
+                };
+                assert_eq!(
+                    host.send_message(message, pi_rs_core::CustomMessageDelivery::NextTurn)
+                        .await
+                        .is_ok(),
+                    host.supports_custom_messages()
+                );
+                Ok(Some(Outcome::Succeeded("host-used".into())))
+            }
+            async fn tool_result_update(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Outcome>> {
+                Ok(Some(Outcome::Succeeded("detached".into())))
+            }
+        }
+        let request = |presence_v1| ProtocolRequest::ToolResult {
+            call: pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            outcome: Outcome::Succeeded("original".into()),
+            operation_id: "00000000-0000-4000-8000-000000000001".into(),
+            state: None,
+            text_result_v2: true,
+            presence_v1,
+        };
+        for custom in [false, true] {
+            let host = Arc::new(Host {
+                custom,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let response = dispatch_with_host(Arc::new(Hook), request(true), host.clone())
+                .await
+                .unwrap();
+            let result: ToolResultPresence = serde_json::from_value(response).unwrap();
+            assert_eq!(result.outcome, Some(Outcome::Succeeded("host-used".into())));
+            assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        let host = Arc::new(Host {
+            custom: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let legacy: Option<Outcome> = serde_json::from_value(
+            dispatch_with_host(Arc::new(Hook), request(false), host.clone())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy, Some(Outcome::Succeeded("detached".into())));
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let single: ToolResultPresence =
+            serde_json::from_value(dispatch(Arc::new(Hook), request(true)).await.unwrap()).unwrap();
+        assert_eq!(single.outcome, Some(Outcome::Succeeded("detached".into())));
+
+        // The actual duplex proxy still fails closed before writing a frame.
+        let remote = RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        };
+        let message = pi_rs_core::CustomMessage {
+            custom_type: "hook".into(),
+            content: pi_rs_core::ContextContent::Text("message".into()),
+            display: false,
+            details: None,
+        };
+        assert_eq!(
+            remote
+                .send_message(message, pi_rs_core::CustomMessageDelivery::NextTurn)
+                .await
+                .unwrap_err(),
+            "custom message delivery is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn result_presence_protocol_preserves_legacy_and_distinguishes_same_text() {
+        struct Patch(bool);
+        #[async_trait::async_trait]
+        impl Extension for Patch {
+            fn id(&self) -> &str {
+                "presence"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                tokio::task::yield_now().await;
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: self.0.then(|| "same".into()),
+                    details: Some(serde_json::json!({"patched":true})),
+                    is_error: None,
+                }))
+            }
+        }
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                unreachable!()
+            }
+        }
+        let mut legacy_reference = None;
+        for replace in [false, true] {
+            for duplex in [false, true] {
+                let extension: Arc<dyn Extension> = Arc::new(Patch(replace));
+                let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+                    .await
+                    .unwrap();
+                assert_eq!(description["result_presence_v1"], true);
+                let request = |presence_v1| ProtocolRequest::ToolResult {
+                    call: pi_rs_core::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                    outcome: Outcome::Succeeded("same".into()),
+                    operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    state: None,
+                    text_result_v2: true,
+                    presence_v1,
+                };
+                let result = if duplex {
+                    dispatch_with_host(extension.clone(), request(true), Arc::new(Host)).await
+                } else {
+                    dispatch(extension.clone(), request(true)).await
+                }
+                .unwrap();
+                let result: ToolResultPresence = serde_json::from_value(result).unwrap();
+                assert_eq!(result.output_unchanged, Some(!replace));
+                assert!(
+                    matches!(result.outcome, Some(Outcome::SucceededWithDetails { output, details }) if output == "same" && details["patched"] == true)
+                );
+                let legacy = dispatch(extension.clone(), request(false)).await.unwrap();
+                if let Some(reference) = &legacy_reference {
+                    assert_eq!(&legacy, reference);
+                } else {
+                    legacy_reference = Some(legacy.clone());
+                }
+                assert!(
+                    serde_json::from_value::<Option<Outcome>>(legacy)
+                        .unwrap()
+                        .is_some()
+                );
+                let old_wire = serde_json::to_value(request(false)).unwrap();
+                assert!(old_wire.get("presence_v1").is_none());
+                let mut invalid = serde_json::to_value(request(true)).unwrap();
+                invalid["text_result_v2"] = serde_json::json!(false);
+                let error = dispatch(extension, serde_json::from_value(invalid).unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error, "result presence requires text-result v2");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_result_hook_is_advertised_and_dispatched() {
         struct Hook;
         #[async_trait::async_trait]
@@ -3905,6 +4379,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -3954,6 +4429,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -4003,6 +4479,7 @@ mod tests {
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
                 text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -5347,6 +5824,7 @@ else:
                     operation_id: "00000000-0000-4000-8000-000000000001".into(),
                     state: None,
                     text_result_v2: true,
+                    presence_v1: false,
                 },
             )
             .await
@@ -5361,6 +5839,217 @@ else:
                     matches!(outcome, Outcome::TextResultWithStructuredContent { details:Some(details), .. } if details["changed"] == true)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn duplex_presence_wrapper_preserves_complete_frame_boundary() {
+        let empty = Outcome::Succeeded(String::new());
+        let frame = |outcome: &Outcome| DuplexFrame::Complete {
+            response: Ok(serde_json::to_value(outcome).unwrap()),
+        };
+        let mut original = Vec::new();
+        duplex_write_line(&mut original, &frame(&empty)).unwrap();
+        let count = MAX_DUPLEX_MESSAGE as usize - original.len();
+        let outcome = Outcome::Succeeded("x".repeat(count));
+        original.clear();
+        duplex_write_line(&mut original, &frame(&outcome)).unwrap();
+        assert_eq!(original.len() as u64, MAX_DUPLEX_MESSAGE);
+        assert!(matches!(
+            read_duplex_frame(&mut std::io::Cursor::new(&original)),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        drop(original);
+
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(outcome),
+            output_unchanged: Some(false),
+        })
+        .unwrap());
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).unwrap();
+        let wrapped = DuplexFrame::Complete { response };
+        assert!(duplex_write_line(&mut std::io::sink(), &wrapped).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &wrapped,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD
+        );
+        assert!(matches!(
+            read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        assert!(read_duplex_frame(&mut std::io::Cursor::new(&bytes)).is_err());
+        drop(bytes);
+        drop(wrapped);
+
+        // A shorter boolean wrapper must not admit a one-byte oversized outcome.
+        let oversized = Outcome::Succeeded("x".repeat(count + 1));
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(oversized),
+            output_unchanged: Some(true),
+        })
+        .unwrap());
+        assert!(check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &DuplexFrame::Complete { response },
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
+        drop(bytes);
+
+        // The allowance never applies to progress or other nonterminal frames.
+        let empty_progress = DuplexFrame::Progress {
+            partial_result: serde_json::json!(""),
+        };
+        let mut bytes = Vec::new();
+        duplex_write_line(&mut bytes, &empty_progress).unwrap();
+        let progress_size = MAX_DUPLEX_MESSAGE as usize + 1 - bytes.len();
+        let frame = DuplexFrame::Progress {
+            partial_result: serde_json::json!("x".repeat(progress_size)),
+        };
+        bytes.clear();
+        write_bounded_line(
+            &mut bytes,
+            &frame,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_shot_presence_wrapper_preserves_legacy_frame_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+presence=name.startswith('presence')
+def wire(v): return json.dumps({'version':1,'response':{'Ok':v}},separators=(',',':'))+'\n'
+if r['type']=='describe':
+    v={'id':name,'dependencies':[],'commands':[],'tools':[],'tool_result_hook':True,'text_result_v2':True,'result_presence_v1':presence}
+    print(wire(v),end='');sys.exit(0)
+outcome={'status':'succeeded','detail':''}
+n=4*1024*1024-len(wire(outcome))
+if name.endswith('_over') or name.endswith('_short'): n+=1
+outcome['detail']='x'*n
+assert len(wire(outcome))==4*1024*1024+(1 if name.endswith('_over') or name.endswith('_short') else 0)
+if presence:
+    assert r['presence_v1'] is True
+    v={'outcome':outcome,'output_unchanged':name.endswith('_short')}
+else:
+    assert 'presence_v1' not in r
+    v=outcome
+print(wire(v),end='')
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for (name, accepted) in [
+            ("legacy", true),
+            ("legacy_over", false),
+            ("presence", true),
+            ("presence_over", false),
+            ("presence_short", false),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let result = ext
+                .tool_result_update_with_presence(
+                    &call,
+                    &Outcome::Succeeded("same".into()),
+                    &context,
+                    None,
+                    None,
+                )
+                .await;
+            if accepted {
+                assert!(
+                    matches!(result, Ok((Some(Outcome::Succeeded(_)), _))),
+                    "{name}: {result:?}"
+                );
+            } else {
+                assert!(
+                    result.unwrap_err().contains("response exceeds 4 MiB"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_presence_is_negotiated_and_legacy_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'result_presence_v1':name!='legacy'}
+elif r['type']=='tool_result':
+    result={'status':'succeeded_with_details','detail':{'output':'same','details':{'patched':True}}}
+    if name=='legacy':
+        assert 'presence_v1' not in r
+        value=result
+    else:
+        assert r['presence_v1'] is True
+        value={'outcome':result,'output_unchanged':name=='metadata'}
+else: raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for (name, expected) in [
+            ("legacy", None),
+            ("metadata", Some(true)),
+            ("same_output", Some(false)),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let (outcome, presence) = ext
+                .tool_result_update_with_presence(
+                    &call,
+                    &Outcome::Succeeded("same".into()),
+                    &context,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, Some(Outcome::SucceededWithDetails { output, .. }) if output == "same")
+            );
+            assert_eq!(presence, expected);
         }
     }
 

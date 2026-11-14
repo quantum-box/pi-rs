@@ -428,6 +428,12 @@ impl Entry {
                 numbered_diff,
                 ..
             } => {
+                // Shell output may contain terminal escape sequences, including
+                // partial sequences while a command is still streaming. Treat
+                // them as data, never as transcript styling.
+                let shell_output = matches!(name.as_str(), "bash" | "bash (excluded)")
+                    .then(|| strip_shell_ansi(output));
+                let output = shell_output.as_deref().unwrap_or(output);
                 let role = if *failed {
                     "toolErrorBg"
                 } else if *finished {
@@ -518,6 +524,58 @@ pub fn clean(text: &str) -> String {
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect::<String>()
         .replace('\t', "    ")
+}
+
+pub(crate) fn strip_shell_ansi(text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut result = String::with_capacity(text.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' | '\u{9b}' => {
+                let introducer = if ch == '\u{9b}' {
+                    Some('[')
+                } else {
+                    chars.next()
+                };
+                match introducer {
+                    Some('[') => {
+                        for next in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']' | 'P' | 'X' | '^' | '_') => {
+                        while let Some(next) = chars.next() {
+                            if next == '\u{7}' || next == '\u{9c}' {
+                                break;
+                            }
+                            if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(next) if ('\u{20}'..='\u{2f}').contains(&next) => {
+                        for next in chars.by_ref() {
+                            if ('\u{30}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                result.push('\n');
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     let width = width.max(1);
@@ -1228,23 +1286,43 @@ fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
     Some(format!("{} ", &line[..end]))
 }
 
-// Pulldown-cmark emits paragraph events inside loose list items, but does not
-// expose the list's looseness directly. Record it before rendering so every
-// pair of items receives the same spacing, including the first pair.
+// Pulldown-cmark does not expose list looseness directly. Paragraph events
+// identify ordinary loose lists; trailing blank lines identify block-only
+// sibling items. Record it before rendering so every pair is spaced alike.
 fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet<usize> {
     let mut loose = std::collections::HashSet::new();
-    let mut lists = Vec::new();
+    let mut lists: Vec<(usize, usize, bool)> = Vec::new();
     let mut quote_depth = 0usize;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
-            Event::Start(Tag::List(_)) => lists.push((range.start, quote_depth)),
+            Event::Start(Tag::List(_)) => lists.push((range.start, quote_depth, false)),
             Event::End(TagEnd::List(_)) => {
                 lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                if let Some((offset, _, previous_blank)) = lists.last_mut() {
+                    if *previous_blank {
+                        loose.insert(*offset);
+                    }
+                    *previous_blank = false;
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if let Some((_, list_quote_depth, previous_blank)) = lists.last_mut() {
+                    // Item ranges include blank lines between sibling items.
+                    // Inspect only the trailing line, not blank lines inside
+                    // fenced code or a nested blockquote.
+                    let mut lines = text[range].split('\n').rev();
+                    *previous_blank = lines.next() == Some("")
+                        && lines
+                            .next()
+                            .is_some_and(|line| blank_list_separator(line, *list_quote_depth));
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
             Event::End(TagEnd::BlockQuote(_)) => quote_depth -= 1,
             Event::Start(Tag::Paragraph) => {
-                if let Some(&(offset, list_quote_depth)) = lists.last()
+                if let Some(&(offset, list_quote_depth, _)) = lists.last()
                     && quote_depth == list_quote_depth
                 {
                     loose.insert(offset);
@@ -1254,6 +1332,20 @@ fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet
         }
     }
     loose
+}
+
+fn blank_list_separator(line: &str, quote_depth: usize) -> bool {
+    let mut rest = line.trim_matches([' ', '\t', '\r']);
+    if rest.is_empty() {
+        return true;
+    }
+    for _ in 0..quote_depth {
+        let Some(after) = rest.strip_prefix('>') else {
+            return false;
+        };
+        rest = after.trim_start_matches([' ', '\t']);
+    }
+    rest.is_empty()
 }
 
 fn markdown_at_depth(
@@ -2566,6 +2658,30 @@ mod tests {
                 vec!["- outer", "    - one", "", "    - two", "- next"],
             ),
             ("- > quote\n- next", vec!["- ", "│ quote", "- next"]),
+            (
+                "- > first\n\n- > second\n- > third",
+                vec!["- ", "│ first", "", "- ", "│ second", "", "- ", "│ third"],
+            ),
+            (
+                "- > first\r\n \r\n- > second",
+                vec!["- ", "│ first", "", "- ", "│ second"],
+            ),
+            (
+                "- > first\n- > second",
+                vec!["- ", "│ first", "- ", "│ second"],
+            ),
+            (
+                "- outer\n  - > first\n\n  - > second\n- next",
+                vec![
+                    "- outer",
+                    "    - ",
+                    "│ first",
+                    "",
+                    "    - ",
+                    "│ second",
+                    "- next",
+                ],
+            ),
         ] {
             let actual: Vec<String> = markdown(source, &theme, 80)
                 .iter()
@@ -2573,6 +2689,49 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "{source}");
         }
+    }
+
+    #[test]
+    fn blank_lines_inside_fenced_code_do_not_make_the_list_loose() {
+        let source = "- ```\n  a\n\n  b\n  ```\n- ```\n  c\n  ```";
+        assert!(
+            loose_list_offsets(source, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quoted_block_only_loose_list_keeps_item_spacing() {
+        let source = "> - > first\n>\n> - > second";
+        let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+        assert!(!loose_list_offsets(source, options).is_empty());
+        assert!(blank_list_separator(" > >  ", 2));
+        assert!(!blank_list_separator("> > content", 2));
+        assert!(!blank_list_separator("> >", 1));
+        let lines = markdown(source, &Theme::system(), 80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line == "│ "), "{text:?}");
+    }
+
+    #[test]
+    fn loose_block_lists_keep_configured_bullet_style() {
+        let theme = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
+        let lines = markdown("- > first\n\n- > second", &theme, 80);
+        let bullets: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.text == "- ")
+            .collect();
+        assert_eq!(bullets.len(), 2);
+        assert!(
+            bullets
+                .iter()
+                .all(|span| span.color == theme.color("mdListBullet"))
+        );
+        assert!(lines.iter().any(|line| line.spans.is_empty()));
     }
 
     #[test]

@@ -7,10 +7,6 @@ use unicode_width::UnicodeWidthStr;
 use super::{Cli, OutputMode, model_selection, output};
 
 pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
-    let terms: Vec<_> = search
-        .split(|character: char| character.is_whitespace() || character == '/')
-        .filter(|term| !term.is_empty())
-        .collect();
     let mut catalogs = if args.connection_explicit {
         vec![
             model_selection::catalog(args, args.provider.clone(), args.allow_model_probes())
@@ -29,12 +25,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         let mut models: Vec<_> = catalog
             .models
             .iter()
-            .filter(|model| {
-                let candidate = format!("{provider} {model} {}", catalog.display_name(model));
-                terms
-                    .iter()
-                    .all(|term| model_selection::fuzzy(term, &candidate))
-            })
+            .filter(|model| list_matches(search, provider, model))
             .cloned()
             .collect();
         models.sort();
@@ -65,6 +56,34 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Pi's fuzzy filter retries ASCII letter/digit tokens in the opposite order
+// when their normal subsequence does not match. The searchable text consists
+// of the provider and model ID, not the display name.
+fn list_matches(search: &str, provider: &str, model: &str) -> bool {
+    let candidate = format!("{provider} {model}");
+    search
+        .split(|c: char| ((c.is_whitespace() && c != '\u{85}') || c == '\u{feff}') || c == '/')
+        .filter(|token| !token.is_empty())
+        .all(|token| {
+            if model_selection::fuzzy(token, &candidate) {
+                return true;
+            }
+            let token = token.to_lowercase();
+            let bytes = token.as_bytes();
+            let split = bytes.iter().position(|c| !c.is_ascii_alphabetic());
+            let split = split
+                .filter(|&i| i > 0 && i < bytes.len() && bytes[i..].iter().all(u8::is_ascii_digit))
+                .or_else(|| {
+                    let i = bytes.iter().position(|c| !c.is_ascii_digit())?;
+                    (i > 0 && i < bytes.len() && bytes[i..].iter().all(u8::is_ascii_alphabetic))
+                        .then_some(i)
+                });
+            split.is_some_and(|i| {
+                model_selection::fuzzy(&format!("{}{}", &token[i..], &token[..i]), &candidate)
+            })
+        })
 }
 
 pub(super) fn with_details(mut model: Value, details: Option<&ModelDetails>) -> Value {
@@ -142,6 +161,19 @@ fn table(mut rows: Vec<[String; 6]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_list_search_matches_pi_token_swaps_and_searchable_fields() {
+        assert!(list_matches("p2", "ollama", "nova-2p"));
+        assert!(list_matches("2p", "ollama", "nova-p2"));
+        assert!(list_matches("K2", "ollama", "nova-2k"));
+        assert!(list_matches("oll / p2", "ollama", "nova-2p"));
+        assert!(list_matches("OLL\u{feff}p2", "ollama", "nova-2p"));
+        assert!(!list_matches("p2", "ollama", "nova-4x"));
+        assert!(!list_matches("p-2", "ollama", "nova-2p"));
+        assert!(!list_matches("SparkName", "ollama", "nova-2p"));
+        assert!(!list_matches("oll\u{85}p2", "ollama", "nova-2p"));
+    }
 
     #[test]
     fn table_distinguishes_missing_metadata_from_reported_capabilities() {

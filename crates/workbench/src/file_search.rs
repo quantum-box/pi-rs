@@ -48,6 +48,13 @@ impl Grep {
             context,
         })
     }
+    /// Ripgrep converts NUL bytes to line breaks for explicit file arguments.
+    pub fn with_explicit_file(mut self) -> Self {
+        self.searcher
+            .set_binary_detection(BinaryDetection::convert(0));
+        self
+    }
+
     pub fn search(
         &mut self,
         path: &Path,
@@ -488,6 +495,37 @@ fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_binary_file_uses_ripgrep_nul_line_boundaries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"match first\nnext line\n\0remaining match\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match"}), 100)
+            .unwrap()
+            .with_explicit_file();
+        grep.search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            grep.finish().tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100)
+            .unwrap()
+            .with_explicit_file();
+        grep.search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            grep.finish().tool_content(),
+            "binary.dat:1: match first\nbinary.dat-2- next line\nbinary.dat-3- \0remaining match\nbinary.dat:4: "
+        );
+
+        let mut directory_grep = Grep::new(&json!({"pattern":"match"}), 100).unwrap();
+        directory_grep
+            .search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(directory_grep.finish().tool_content(), "No matches found");
+    }
 
     #[test]
     fn reading_search_input_stops_after_cancellation() {
