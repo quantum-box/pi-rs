@@ -51,8 +51,12 @@ The fixture's `configure` installs one invoke handler and replaces any handler
 already set on the builder. To integrate with other application commands, use
 the fixture's public `session_state` and `commands` in one handler, as exercised
 by [the composition test](../fixtures/tauri-sdk/tests/composition.rs).
-Closing signals all admitted prompts before waiting for the session lock;
-the fixture cancels their futures and rejects subsequent prompts.
+Closing signals all admitted prompts before waiting for the session lock.
+The fixture rejects queued prompts and repeatedly signals abort while an
+admitted prompt settles, so SDK run cleanup can finish even if shutdown raced
+with run registration. Close waits for that cleanup; a startup operation that
+never settles can consequently delay close. This example uses an in-memory
+session without extension hooks or tools.
 
 ```rust
 use std::sync::Arc;

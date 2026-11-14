@@ -13,6 +13,8 @@ pub struct AppState {
     admissions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     startup_gate: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    startup_release: tokio::sync::Notify,
 }
 
 /// Commands can be composed with application commands in one invoke handler.
@@ -32,23 +34,44 @@ pub mod commands {
             _ = closing.wait_for(|closing| *closing) => return Err(closed()),
             session = state.session.lock() => session,
         };
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let run = async {
+            #[cfg(test)]
+            {
+                let gate = state.startup_gate.lock().unwrap().take();
+                if let Some(entered) = gate {
+                    entered.send(()).unwrap();
+                    state.startup_release.notified().await;
+                }
+            }
+            session.prompt(text).await
+        };
+        tokio::pin!(run);
+        let run = std::future::poll_fn(|cx| {
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+            run.as_mut().poll(cx)
+        });
+        tokio::pin!(run);
         tokio::select! {
             biased;
-            _ = closing.wait_for(|closing| *closing) => {
-                state.control.abort();
-                Err(closed())
-            }
-            result = async {
+            _ = async { let _ = closing.wait_for(|closing| *closing).await; } => {
+                if !started.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(closed());
+                }
                 #[cfg(test)]
-                {
-                    let gate = state.startup_gate.lock().unwrap().take();
-                    if let Some(entered) = gate {
-                        entered.send(()).unwrap();
-                        std::future::pending::<()>().await;
+                state.startup_release.notify_one();
+                state.control.abort();
+                // Startup can yield before the SDK registers its active run.
+                // Keep signalling until it does, and let the SDK finish cleanup.
+                loop {
+                    tokio::select! {
+                        _ = &mut run => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => state.control.abort(),
                     }
                 }
-                session.prompt(text).await
-            } => result.map_err(|error| error.to_string()),
+                Err(closed())
+            }
+            result = &mut run => result.map_err(|error| error.to_string()),
         }
     }
 
@@ -84,6 +107,8 @@ pub fn session_state(model: Arc<dyn Model>, model_name: &str) -> pi_rs_core::Res
         admissions: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(test)]
         startup_gate: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        startup_release: tokio::sync::Notify::new(),
     })
 }
 
@@ -201,6 +226,9 @@ mod tests {
         .unwrap()
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
+        let mut events = tauri::async_runtime::block_on(async {
+            app.state::<AppState>().session.lock().await.subscribe()
+        });
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .unwrap();
@@ -263,6 +291,13 @@ mod tests {
         close_thread.join().unwrap();
         prompt_thread.join().unwrap();
         queued_thread.join().unwrap();
+        let mut ended = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, pi_rs_core::SessionEvent::RunEnded { .. }) {
+                ended = true;
+            }
+        }
+        assert!(ended, "cancelled run must emit its end event before close");
         assert!(
             tauri::test::get_ipc_response(
                 &webview,
@@ -275,10 +310,15 @@ mod tests {
     #[test]
     fn mock_ipc_close_cancels_prompt_before_run_registration() {
         use std::time::Duration;
-        let app = configure(tauri::test::mock_builder(), Arc::new(Fixture), "fixture")
-            .unwrap()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
+        let (model_entered, model_started) = std::sync::mpsc::channel();
+        let app = configure(
+            tauri::test::mock_builder(),
+            Arc::new(StalledModel(std::sync::Mutex::new(Some(model_entered)))),
+            "fixture",
+        )
+        .unwrap()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
         let (entered, started) = std::sync::mpsc::channel();
         *app.state::<AppState>().startup_gate.lock().unwrap() = Some(entered);
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -303,6 +343,9 @@ mod tests {
                 tauri::test::get_ipc_response(&close_view, request("close", serde_json::json!({})));
             sender.send(response.is_ok()).unwrap();
         });
+        model_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run did not register after startup");
         assert!(
             close_result
                 .recv_timeout(Duration::from_secs(5))
