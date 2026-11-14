@@ -1372,7 +1372,7 @@ impl Harness {
                     )?;
                 }
             }
-            Phase::Tools { calls, index, .. } => {
+            Phase::Tools { calls, index, .. } | Phase::ToolPreparing { calls, index, .. } => {
                 for i in index..calls.len() {
                     append_tool(
                         &mut c,

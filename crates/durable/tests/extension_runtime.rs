@@ -280,6 +280,43 @@ struct WaitHook {
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,
 }
+
+#[tokio::test]
+async fn abort_during_before_tool_records_skipped_call_without_dispatch() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext(
+            "gate",
+            "p",
+            Arc::new(WaitHook {
+                entered: entered.clone(),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+        ))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["gate".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("aborted before dispatch"));
+    scheduler.shutdown().await.unwrap();
+}
 #[async_trait]
 impl Hook for WaitHook {
     async fn before_tool(&self, call: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
