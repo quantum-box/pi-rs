@@ -734,9 +734,9 @@ struct CancellableReader<R> {
 }
 fn read_event_content(outcome: &Outcome) -> Option<Value> {
     match outcome {
-        Outcome::Succeeded(output) | Outcome::SucceededWithDetails { output, .. } => {
-            Some(json!(output))
-        }
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
         _ => None,
     }
 }

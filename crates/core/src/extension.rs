@@ -809,6 +809,10 @@ pub enum UserBashReplacement {
     },
 }
 
+tokio::task_local! {
+    pub(crate) static STRUCTURED_PATCH_PRESERVATION: std::cell::Cell<(Option<bool>, bool)>;
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -1300,12 +1304,21 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
         let replacement = self.tool_result(call, outcome, context, state).await?;
+        if replacement.is_some() {
+            let _ = STRUCTURED_PATCH_PRESERVATION
+                .try_with(|state| state.set((Some(false), state.get().1)));
+        }
         let current = replacement.as_ref().unwrap_or(outcome);
         match self
             .tool_result_patch_v2(call, current, context, state)
             .await?
         {
-            Some(patch) => patch.apply(current).map(Some),
+            Some(patch) => {
+                let preserves = patch.output.is_none() && replacement.is_none();
+                let _ = STRUCTURED_PATCH_PRESERVATION
+                    .try_with(|state| state.set((Some(preserves), state.get().1)));
+                patch.apply(current).map(Some)
+            }
             None => Ok(replacement),
         }
     }
@@ -1318,7 +1331,10 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<Outcome>> {
-        self.tool_result_update(call, outcome, context, state).await
+        let result = self.tool_result_update(call, outcome, context, state).await;
+        let _ = STRUCTURED_PATCH_PRESERVATION
+            .try_with(|tracking| tracking.set((tracking.get().0, true)));
+        result
     }
 
     fn after_tool(

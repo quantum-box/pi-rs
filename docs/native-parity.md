@@ -678,11 +678,12 @@ For text reads, Pi exposes the displayed page as both text content and a
 `structuredContent` string. Native agent tool-result events receive this string
 through operation-correlated transient metadata, including continuation and
 truncation notices. The journal, SDK observers, result hooks, direct calls and
-programmatic calls retain their existing `Outcome` variants. If a result hook
-returns a replacement, native conservatively omits the transient structured
-value, including for metadata-only replacements, because legacy hook results
-do not identify whether text was explicitly replaced. Image read structured
-output remains a separate parity gap.
+programmatic calls retain their existing `Outcome` variants, and the public
+`Notification` variants are unchanged. In-process partial patches preserve
+the structured value when they only update metadata, and discard it when they
+explicitly replace output, including with the same text. Opaque custom hook
+overrides are treated conservatively when field presence is unavailable.
+Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even

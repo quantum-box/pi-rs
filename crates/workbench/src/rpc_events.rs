@@ -93,18 +93,18 @@ impl Stream {
     pub fn notify(&mut self, event: &Notification<'_>, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event {
-            Notification::ToolResultMetadata {
-                operation_id,
-                structured_content,
-            } => {
-                self.result_metadata
-                    .insert(*operation_id, (*structured_content).clone());
-            }
             Notification::SummaryRequest => {
                 self.finish_turn(&mut events);
                 self.summary = true;
             }
-            Notification::Committed(record) => self.record(record.event.clone(), args, &mut events),
+            Notification::Committed(record) => {
+                if let Event::ToolFinished { operation_id, .. } = &record.event
+                    && let Some(content) = pi_rs::tool_result_event_metadata(*operation_id)
+                {
+                    self.result_metadata.insert(*operation_id, content);
+                }
+                self.record(record.event.clone(), args, &mut events)
+            }
             Notification::Text(delta) if !self.assistant.is_null() => {
                 self.delta("text", delta, &mut events);
             }
@@ -705,17 +705,7 @@ mod streaming_tool_tests {
             ),
         );
         let metadata = json!("page\n\n[1 more line]");
-        assert!(
-            stream
-                .notify(
-                    &Notification::ToolResultMetadata {
-                        operation_id: other_id,
-                        structured_content: &json!("other")
-                    },
-                    &args
-                )
-                .is_empty()
-        );
+        stream.result_metadata.insert(other_id, json!("other"));
         assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
         let mut events = Vec::new();
         stream.record(

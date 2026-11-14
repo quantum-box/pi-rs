@@ -3258,7 +3258,6 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::SummaryRequest
         | Notification::ModelContext { .. }
         | Notification::ToolProgress(_)
-        | Notification::ToolResultMetadata { .. }
         | Notification::BranchState(_) => return,
         Notification::QueueUpdated {
             steering,
