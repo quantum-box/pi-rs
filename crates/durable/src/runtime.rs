@@ -3641,6 +3641,26 @@ impl Harness {
                 .ok_or(crate::fork::Error::InvalidSnapshot)?,
         )?;
         let source = source.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        // Observer streams accept arbitrary public appends. Only the runtime's
+        // separately reserved fork snapshot proves this was a runtime commit.
+        let key = format!("runtime/fork/{origin}/{commit:020}");
+        let snapshot = self
+            .owner
+            .store()
+            .get(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+        let captured: Option<crate::transcript::Cursor> = serde_json::from_value(
+            snapshot
+                .get("_transcript")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        if captured.as_ref() != Some(&source)
+            || snapshot.get("conversation_id") != Some(&serde_json::to_value(origin)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         let mut rebound = serde_json::to_value(source)?;
         rebound["transcript"] = serde_json::to_value(transcript_id)?;
         if serde_json::from_value::<crate::transcript::Cursor>(rebound)? != *position {

@@ -1381,7 +1381,7 @@ fn legacy_batches_are_readable_but_cannot_claim_entry_history_or_fork() {
 
 #[test]
 fn compacted_replacement_rejects_collision_and_unproven_tail() {
-    for case in 0..3 {
+    for case in 0..5 {
         let collision = case == 0;
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
@@ -1447,9 +1447,21 @@ fn compacted_replacement_rejects_collision_and_unproven_tail() {
         observation
             .set_value(&serde_json::json!({"_transcript": cursor}))
             .unwrap();
+        let forged_snapshot = serde_json::json!({
+            "conversation_id": id,
+            "_transcript": if case == 4 { prior.entries[0].position.cursor.clone() } else { cursor.clone() },
+        });
         state.transcript = Some(cursor);
         state.messages.clear();
         let mut mutations = batch.mutations;
+        if case != 3 {
+            // Exercise projection and collision checks independently of the
+            // missing-runtime-snapshot rejection tested above.
+            mutations.push(Mutation::Put {
+                key: format!("runtime/fork/{id}/{:020}", observation.cursor.0).into_bytes(),
+                value: serde_json::to_vec(&forged_snapshot).unwrap(),
+            });
+        }
         mutations.push(Mutation::Put {
             key: Harness::key(id),
             value: serde_json::to_vec(&state).unwrap(),
@@ -1458,6 +1470,11 @@ fn compacted_replacement_rejects_collision_and_unproven_tail() {
         checks.extend(observation.checks);
         mutations.extend(observation.mutations);
         h.owner.store().commit(&checks, &mutations).unwrap();
+        if case == 3 {
+            // This is an otherwise valid projection, appended through the
+            // public transcript and observer APIs, without a runtime commit.
+            assert!(h.resolved_occurrences(id, state.transcript.clone().unwrap()).is_err());
+        }
         if collision {
             assert!(
                 h.view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())

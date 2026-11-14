@@ -61,14 +61,19 @@ original commit, origin and boundary; their new summary has a new ID. Other
 replacement batches assign fresh IDs, and an interior fork currently materializes
 a new transcript with fresh IDs. Legacy messages without provenance stay
 unidentified. Loading a compacted context and authorizing a fork verify the
-predecessor projection, original observation links and ID uniqueness; these
-checks scan the retained transcript history and are unbounded. Positioned page
+predecessor projection, original observation links, matching runtime-owned fork
+snapshots and ID uniqueness; these checks scan the retained transcript history
+and are unbounded. Positioned page
 reads remain bounded and expose structurally checked metadata; the fork APIs
 perform the full authorization. Annotated occurrences in a shared immutable
 chain can be selected by ID using their origin’s historical cut. See the parity
 document for remaining limitations. The new replacement record is not readable
 by older pi-rs versions; use a compatible version when reopening a store after
 such a compaction.
+Observer streams can be appended through the public observer API, so an
+observation alone is not proof of a runtime commit. Compacted contexts whose
+annotated origins lack a matching runtime fork snapshot fail closed. Runtime
+fork snapshot keys must remain reserved to the runtime.
 Collision checks cover the predecessor chain; the store has no global index
 of occurrence IDs across unrelated conversation branches.
 
