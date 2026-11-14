@@ -99,13 +99,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("broken.png"),
-            b"\x89PNG\r\n\x1a\ncorrupt",
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR",
         )
         .unwrap();
         let (text, images) = expand(&["@broken.png".into()], directory.path(), true, None).unwrap();
         assert!(images.is_empty());
         assert!(text.contains("[Image omitted:"), "{text}");
         assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn short_and_animated_png_are_decoded_as_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let short = b"\x89PNG\r\n\x1a\ncorrupt";
+        std::fs::write(directory.path().join("short.png"), short).unwrap();
+        let mut animated = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        animated.extend_from_slice(&[0; 17]); // IHDR data and CRC
+        animated.extend_from_slice(b"\0\0\0\x08acTL");
+        std::fs::write(directory.path().join("animated.png"), &animated).unwrap();
+        for (name, bytes) in [
+            ("short.png", short.as_slice()),
+            ("animated.png", animated.as_slice()),
+        ] {
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
     }
 
     #[test]

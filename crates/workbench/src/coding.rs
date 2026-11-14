@@ -455,7 +455,12 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        finish_attachment(tool.read_image(&path), || {
+        let image = if lossy && png_attachment_is_text(&path)? {
+            Ok(None)
+        } else {
+            tool.read_image(&path)
+        };
+        finish_attachment(image, || {
             if !lossy {
                 return tool.text(&path);
             }
@@ -478,6 +483,47 @@ impl CodingTools {
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         })
     }
+}
+
+// Pi sniffs the first 4100 bytes and treats malformed or animated PNG as text.
+// Other formats retain the native reader's existing classification.
+fn png_attachment_is_text(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut prefix = Vec::new();
+    std::fs::File::open(path)?
+        .take(4100)
+        .read_to_end(&mut prefix)?;
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if !prefix.starts_with(PNG) {
+        return Ok(false);
+    }
+    if prefix.len() < 16 || prefix[8..12] != [0, 0, 0, 13] || &prefix[12..16] != b"IHDR" {
+        return Ok(true);
+    }
+    let mut offset = 8usize;
+    while offset + 8 <= prefix.len() {
+        let length = u32::from_be_bytes(prefix[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &prefix[offset + 4..offset + 8];
+        if kind == b"acTL" {
+            return Ok(true);
+        }
+        if kind == b"IDAT" {
+            return Ok(false);
+        }
+        let Some(next) = offset
+            .checked_add(length)
+            .and_then(|end| end.checked_add(12))
+        else {
+            break;
+        };
+        if next > prefix.len() {
+            break;
+        }
+        offset = next;
+    }
+    Ok(false)
 }
 
 fn finish_attachment(
