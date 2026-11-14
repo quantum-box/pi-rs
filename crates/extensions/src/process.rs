@@ -2100,6 +2100,11 @@ fn read_bounded_line<T: serde::de::DeserializeOwned>(
     reader: &mut impl BufRead,
     limit: u64,
 ) -> ExtensionResult<T> {
+    let bytes = read_bounded_frame(reader, limit)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))
+}
+fn read_bounded_frame(reader: &mut impl BufRead, limit: u64) -> ExtensionResult<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(limit + 1)
@@ -2113,6 +2118,59 @@ fn read_bounded_line<T: serde::de::DeserializeOwned>(
     }
     if bytes.is_empty() {
         return Err("native extension connection closed".into());
+    }
+    Ok(bytes)
+}
+
+// Inspect call count without allocating their arbitrary JSON arguments. The
+// frame may put `type` after `calls`, so borrow the raw array before parsing it.
+fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> {
+    #[derive(Deserialize)]
+    struct Preflight<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        calls: Option<&'a serde_json::value::RawValue>,
+    }
+    struct BoundedCalls;
+    impl<'de> Deserialize<'de> for BoundedCalls {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = BoundedCalls;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("an array of at most 4096 tool calls")
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    for _ in 0..4096 {
+                        if sequence.next_element::<serde::de::IgnoredAny>()?.is_none() {
+                            return Ok(BoundedCalls);
+                        }
+                    }
+                    if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "native extension batch exceeds execution limit",
+                        ));
+                    }
+                    Ok(BoundedCalls)
+                }
+            }
+            deserializer.deserialize_seq(Visitor)
+        }
+    }
+    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE)?;
+    let prefix: Preflight<'_> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if prefix.kind == "call"
+        && let Some(calls) = prefix.calls
+    {
+        serde_json::from_str::<BoundedCalls>(calls.get())
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension frame: {error}"))
@@ -2252,7 +2310,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = duplex_read_line::<DuplexFrame>(&mut output);
+            let frame = read_duplex_frame(&mut output);
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
@@ -2601,6 +2659,19 @@ fn call<T: serde::de::DeserializeOwned>(
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
+    let response_limit = if endpoint.text_result_v2
+        && endpoint.structured_text_result
+        && matches!(
+            &request,
+            ProtocolRequest::ToolResult {
+                outcome: Outcome::TextResultWithStructuredContent { .. },
+                ..
+            }
+        ) {
+        MAX_DUPLEX_MESSAGE
+    } else {
+        MAX_MESSAGE
+    };
     let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
     if wire["type"] == "lifecycle" && wire["event"]["type"] == "tool_execution_end" {
         let result = &mut wire["event"]["result"];
@@ -2625,12 +2696,13 @@ fn call<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = output
-            .take(MAX_MESSAGE + 1)
+            .take(response_limit + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = reader.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut completed_read = None;
     let status = loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(
@@ -2641,6 +2713,18 @@ fn call<T: serde::de::DeserializeOwned>(
             return Err(
                 "native extension exceeded 30 seconds; outcome requires reconciliation".into(),
             );
+        }
+        if completed_read.is_none()
+            && let Ok(result) = read.try_recv()
+        {
+            let bytes = result.map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > response_limit {
+                return Err(format!(
+                    "native extension response exceeds {} MiB",
+                    response_limit / (1024 * 1024)
+                ));
+            }
+            completed_read = Some(bytes);
         }
         if let Some(status) = child
             .process
@@ -2655,16 +2739,22 @@ fn call<T: serde::de::DeserializeOwned>(
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| "extension input writer timed out")?
         .map_err(|error| error.to_string())?;
-    let bytes = read
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "extension output reader timed out")?
-        .map_err(|error| error.to_string())?;
+    let bytes = match completed_read {
+        Some(bytes) => bytes,
+        None => read
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "extension output reader timed out")?
+            .map_err(|error| error.to_string())?,
+    };
     child.finished = true;
     if !status.success() {
         return Err(format!("native extension exited with {status}"));
     }
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension response exceeds 4 MiB".into());
+    if bytes.len() as u64 > response_limit {
+        return Err(format!(
+            "native extension response exceeds {} MiB",
+            response_limit / (1024 * 1024)
+        ));
     }
     let envelope: Envelope = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension response: {error}"))?;
@@ -5338,6 +5428,110 @@ else:
                 .unwrap_err()
                 .contains("16 MiB")
         );
+    }
+
+    #[test]
+    fn duplex_batch_checks_count_before_materializing_arguments() {
+        let call = r#"["tool",{}]"#;
+        let valid = format!(
+            "{{\"calls\":[{}],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(",")
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(valid)), Ok(DuplexFrame::Call { calls }) if calls.len() == 4096)
+        );
+        let invalid = format!(
+            "{{\"calls\":[{},[\"tool\",[{}]]],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(","),
+            vec!["{}"; 100_000].join(",")
+        );
+        let error = match read_duplex_frame(&mut std::io::Cursor::new(invalid)) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized batch accepted"),
+        };
+        assert!(error.contains("batch exceeds execution limit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    value={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'structured_text_result':True}
+else:
+    value=r['outcome']
+    assert len(value['detail']['structured_content']['output']) == 1024 * 1024
+    value['detail']['details']={'updated':True}
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update(&call, &outcome, &context, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(returned, Outcome::TextResultWithStructuredContent { details:Some(details), structured_content, .. } if details["updated"] == true && structured_content["output"].as_str().unwrap().len() == 1024 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_unnegotiated_oversize_response_fails_without_waiting_for_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys, time
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    print(json.dumps({'version':1,'response':{'Ok':{'id':'old','dependencies':[],'commands':[],'tools':[],'tool_result_hook':True}}}))
+else:
+    sys.stdout.write('x' * (5 * 1024 * 1024))
+    sys.stdout.flush()
+    time.sleep(20)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            extension.tool_result_update(&call, &Outcome::Succeeded("ok".into()), &context, None),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("response exceeds 4 MiB"));
     }
 
     #[tokio::test]
