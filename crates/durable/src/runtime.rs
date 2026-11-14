@@ -1261,6 +1261,11 @@ impl Harness {
                     // partial and retry the whole atomic transition.
                     continue;
                 }
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if key == b"durable/document-fork-revision" =>
+                {
+                    return Err(Error::Storage(durable_store::Error::Conflict { key }));
+                }
                 Err(Error::Storage(durable_store::Error::Conflict { .. }))
                     if self.merge_admissions =>
                 {
@@ -1912,9 +1917,22 @@ impl Harness {
         state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
-        let batch = crate::document::Documents::new(self.owner.store())
-            .fork_scope(id, state.id, revision)?;
-        self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))?;
+        loop {
+            let batch = crate::document::Documents::new(self.owner.store())
+                .fork_scope(id, state.id, revision)?;
+            match self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
+            {
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if key == b"durable/document-fork-revision" =>
+                {
+                    continue;
+                }
+                result => {
+                    result?;
+                    break;
+                }
+            }
+        }
         Ok(state.id)
     }
     /// Fork a committed observation cut, including cuts during active work.
@@ -2042,9 +2060,22 @@ impl Harness {
             abort_requested: false,
             phase: Phase::Idle,
         };
-        let batch = crate::document::Documents::new(self.owner.store())
-            .fork_scope(id, state.id, revision)?;
-        self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))?;
+        loop {
+            let batch = crate::document::Documents::new(self.owner.store())
+                .fork_scope(id, state.id, revision)?;
+            match self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
+            {
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if key == b"durable/document-fork-revision" =>
+                {
+                    continue;
+                }
+                result => {
+                    result?;
+                    break;
+                }
+            }
+        }
         Ok(state.id)
     }
     /// Fork at the commit that first exposed this complete message batch.

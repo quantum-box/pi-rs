@@ -529,10 +529,13 @@ remains unchanged. Copies and child creation commit atomically. A fork of a fork
 An optional per-address `ForkPolicy` can be set with
 `Transaction::set_fork_policy`, using the policy version returned by
 `Documents::fork_policy` (or `Expected::Missing`). `Copy` selects the value at
-the fork cut; `Initial { value }` stores an object to use as the initial child
+the fork cut; `Current` selects the latest committed value and policy when the
+fork commits, even for a historical cut; `Initial { value }` stores an object to use as the initial child
 value. The policy and initial object are persisted, independently versioned,
 and inherited by the child. Policy changes can be committed atomically with
-document writes, and historical forks use the policy at the selected cut. An
+document writes. Historical forks select by the policy at the cut: `Current`
+then copies the latest value and policy, including deletion; addresses first
+introduced after the cut participate when their latest policy is `Current`. An
 absent policy, including for legacy documents, means copy. Policies belong to
 addresses and survive document deletion and recreation. A fork inherits policies
 even when the corresponding document is missing, without creating that document. Policies affect only conversation-scoped fork copies.
@@ -545,8 +548,13 @@ reads and forks fail closed. Interior message cuts additionally require equal
 document revisions across the surrounding commit; unrelated document writes
 can therefore conservatively prevent such a fork. Revision enumeration scans
 retained history and copying is proportional to the documents found. History is
-unbounded. This is a subset of upstream: there are no upstream-style current-at-fork policies for historical cuts,
-typed definitions, task ownership, deferred visibility,
+unbounded. A database-wide revision fence retries forks after any concurrent document,
+policy, or application-entry mutation, including unrelated scopes; sustained writes can
+starve a fork. Historical `Copy` and `Initial` retain their cut semantics even if
+the current policy changes. Unlike upstream, `Initial` eagerly copies a persisted
+object when the source exists, and mutable per-address policies do not model upstream
+document incarnations or duplicate-source rejection. This is a subset of upstream:
+there are no typed definitions, task ownership, deferred visibility,
 or general Chord transactions. Subagent history seeding is separate and does not
 copy application documents.
 

@@ -32,6 +32,8 @@ pub enum Expected {
     Version(u64),
     /// Document key has no mutations after this history boundary.
     DocumentUnchangedSince(u64),
+    /// The database-wide document revision is still exactly this boundary.
+    DocumentRevision(u64),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
@@ -541,6 +543,14 @@ impl Store {
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
                 Expected::Version(v) => version == Some(v),
+                Expected::DocumentRevision(revision) => {
+                    let current: u64 = tx.query_row(
+                        "SELECT revision FROM durable_document_history_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    current == revision
+                }
                 Expected::DocumentUnchangedSince(revision) => {
                     if !check.key.starts_with(b"durable/document/") {
                         return Err(Error::InvalidSnapshot);

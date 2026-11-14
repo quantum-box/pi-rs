@@ -70,6 +70,8 @@ pub struct Document {
 pub enum ForkPolicy {
     /// Copy the value at the selected boundary.
     Copy,
+    /// Copy the latest committed value and policy when the fork commits.
+    Current,
     /// Start each fork with this stored initial JSON object.
     Initial { value: Map<String, Value> },
 }
@@ -251,63 +253,99 @@ impl<'a> Documents<'a> {
                 value: entry.value,
             });
         }
-        for (key, entry) in self.store.documents_at(revision)? {
-            let parts: [String; 3] =
-                serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;
-            if parts[0] != parent.to_string() {
-                continue;
+        // A global revision fence also detects addresses created or deleted while
+        // preparing the copy. The caller retries this batch on a fence conflict.
+        let current = self.store.document_snapshot()?;
+        batch.checks.push(Check {
+            key: b"durable/document-fork-revision".to_vec(),
+            expected: Expected::DocumentRevision(current),
+        });
+        let historical_docs: HashMap<_, _> =
+            self.store.documents_at(revision)?.into_iter().collect();
+        let historical_policies: HashMap<_, _> = self
+            .store
+            .document_policies_at(revision)?
+            .into_iter()
+            .collect();
+        let current_docs: HashMap<_, _> = self.store.documents_at(current)?.into_iter().collect();
+        let current_policies: HashMap<_, _> = self
+            .store
+            .document_policies_at(current)?
+            .into_iter()
+            .collect();
+        let mut addresses = HashSet::new();
+        for key in historical_docs.keys().chain(current_docs.keys()) {
+            let address = Address::from_storage_key(key)?;
+            if address.scope == parent.to_string() {
+                addresses.insert(address);
             }
-            // Policy and value are read at the same immutable cut.
-            Self::decode(Some(entry.clone()))?;
-            let source_address = Address::from_storage_key(&key)?;
-            let policy_entry = self
-                .store
-                .document_at(&source_address.policy_key()?, revision)?;
-            let policy = policy_entry
-                .as_ref()
-                .map(|e| serde_json::from_slice::<ForkPolicy>(&e.value))
-                .transpose()?;
-            let target = Address {
-                scope: child.to_string(),
-                name: parts[1].clone(),
-                key: parts[2].clone(),
-            }
-            .storage_key()?;
-            let value = match policy {
-                Some(ForkPolicy::Initial { value }) => serde_json::to_vec(&value)?,
-                _ => entry.value,
-            };
-            batch.checks.push(Check {
-                key: target.clone(),
-                expected: Expected::Missing,
-            });
-            batch.mutations.push(Mutation::Put { key: target, value });
         }
-        // Policies are address-level state and must survive even when the
-        // corresponding document is absent at the cut.
-        for (key, entry) in self.store.document_policies_at(revision)? {
+        for key in historical_policies.keys().chain(current_policies.keys()) {
             let [scope, name, key]: [String; 3] = serde_json::from_slice(
                 key.strip_prefix(POLICY_PREFIX)
                     .ok_or(Error::InvalidDocument)?,
             )?;
-            if scope != parent.to_string() {
-                continue;
+            if scope == parent.to_string() {
+                addresses.insert(Address { scope, name, key });
             }
-            let _: ForkPolicy = serde_json::from_slice(&entry.value)?;
-            let target = Address {
+        }
+        for address in addresses {
+            let doc_key = address.storage_key()?;
+            let policy_key = address.policy_key()?;
+            let old_policy = historical_policies.get(&policy_key);
+            let latest_policy = current_policies.get(&policy_key);
+            let parse =
+                |entry: Option<&durable_store::Entry>| -> Result<Option<ForkPolicy>, Error> {
+                    entry
+                        .map(|e| serde_json::from_slice(&e.value).map_err(Error::from))
+                        .transpose()
+                };
+            let old = parse(old_policy)?;
+            let latest = parse(latest_policy)?;
+            // Existing historical addresses keep their cut policy; addresses first
+            // introduced later participate only when their latest policy is Current.
+            let use_current = matches!(old, Some(ForkPolicy::Current))
+                || (old_policy.is_none()
+                    && !historical_docs.contains_key(&doc_key)
+                    && matches!(latest, Some(ForkPolicy::Current)));
+            let (doc, policy_entry, policy) = if use_current {
+                (current_docs.get(&doc_key), latest_policy, latest)
+            } else {
+                (historical_docs.get(&doc_key), old_policy, old)
+            };
+            let target_address = Address {
                 scope: child.to_string(),
-                name,
-                key,
+                name: address.name,
+                key: address.key,
+            };
+            if let Some(entry) = doc {
+                Self::decode(Some(entry.clone()))?;
+                let value = if !use_current {
+                    match policy {
+                        Some(ForkPolicy::Initial { value }) => serde_json::to_vec(&value)?,
+                        _ => entry.value.clone(),
+                    }
+                } else {
+                    entry.value.clone()
+                };
+                let target = target_address.storage_key()?;
+                batch.checks.push(Check {
+                    key: target.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put { key: target, value });
             }
-            .policy_key()?;
-            batch.checks.push(Check {
-                key: target.clone(),
-                expected: Expected::Missing,
-            });
-            batch.mutations.push(Mutation::Put {
-                key: target,
-                value: entry.value,
-            });
+            if let Some(entry) = policy_entry {
+                let target = target_address.policy_key()?;
+                batch.checks.push(Check {
+                    key: target.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put {
+                    key: target,
+                    value: entry.value.clone(),
+                });
+            }
         }
         Ok(batch)
     }
@@ -981,5 +1019,85 @@ mod nested_entry_tests {
         assert_eq!(entries[0].conversation_id, root_id);
         assert_eq!(entries[0].author_task_id, Uuid::from_u128(3));
         assert_eq!(entries[0].data, json!(42));
+    }
+}
+
+#[cfg(test)]
+mod fork_current_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn fork_fence_rejects_concurrent_creation_and_atomic_value_policy_change() {
+        let db = Store::memory().unwrap();
+        let parent = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::new_v4();
+        let address = Address {
+            scope: parent.to_string(),
+            name: "a".into(),
+            key: "".into(),
+        };
+        let mut tx = Transaction::new();
+        tx.put(
+            &address,
+            Expected::Missing,
+            json!({"n": 1}).as_object().unwrap(),
+        )
+        .unwrap();
+        tx.set_fork_policy(&address, Expected::Missing, &ForkPolicy::Current)
+            .unwrap();
+        tx.commit(&db).unwrap();
+        let docs = Documents::new(&db);
+        let cut = docs.snapshot().unwrap();
+        let batch = docs.fork_scope(parent, child, cut).unwrap();
+        // A writer on another thread commits while the prepared fork is pending.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &address,
+                        Expected::Version(docs.get(&address).unwrap().unwrap().version),
+                        json!({"n": 2}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                    tx.set_fork_policy(
+                        &address,
+                        Expected::Version(docs.fork_policy(&address).unwrap().unwrap().version),
+                        &ForkPolicy::Copy,
+                    )
+                    .unwrap();
+                    tx.commit(&db).unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let batch = docs.fork_scope(parent, child, cut).unwrap();
+        let new_address = Address {
+            name: "new".into(),
+            ..address.clone()
+        };
+        let mut tx = Transaction::new();
+        tx.set_fork_policy(&new_address, Expected::Missing, &ForkPolicy::Current)
+            .unwrap();
+        tx.commit(&db).unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let batch = docs.fork_scope(parent, child, cut).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let copied = Address {
+            scope: child.to_string(),
+            ..address
+        };
+        assert_eq!(docs.get(&copied).unwrap().unwrap().value["n"], 2);
+        assert_eq!(
+            docs.fork_policy(&copied).unwrap().unwrap().policy,
+            ForkPolicy::Copy
+        );
     }
 }
