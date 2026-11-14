@@ -265,10 +265,15 @@ For restricted children use `Scheduler::open_with_restricted_subagent_management
 with an explicit child allowlist, including on reopen. `None` retains the existing
 unrestricted behavior; `Some(vec![])` disables all child tools. The bound selection
 is recorded per named child, and changing it for an existing name is rejected.
-The tool exposes `list` and `send` (optional `follow_up` or `steer` mode).
+The tool exposes `list`, `stop`, and `send` (optional `follow_up` or `steer` mode).
 A send creates the named child if needed and queues its answer as a parent
 follow-up. Calls with the same persisted operation ID reuse the first message,
-child and reporter; a new operation ID is a new send. Errors after admission
+child and reporter; a new operation ID is a new send. `stop` addresses only a
+named child of the bound parent, atomically persists the abort and a receipt for
+the tool operation, then cancels and schedules cleanup of its foreground owned
+graph. Replaying the operation, including after reopening, does not stop later
+work. The child and transcript remain available for new sends. Existing reporters
+remain active and report aborted submissions as failures. Errors after admission
 starts are uncertain and require reconciliation. The reporter runs while the
 scheduler is open. Extension tools are currently marked unsafe for automatic
 replay, so an interrupted invocation may require manual reconciliation even
@@ -279,7 +284,8 @@ including forks; named children start without selected extensions. Do not regist
 this tool globally or replace the bound extension with another implementation.
 `ToolContext` does not identify the caller or its owning task. In particular,
 this API cannot verify a caller through independently implemented `ToolHost`s
-or implement ownership-safe stop or wait. The host must trust the configured tools and registry. It must also ensure
+or implement task-owner-scoped stop or wait. Stop is scoped by the bound parent
+and its named reservation, not by a calling task. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is
 provided. Named links are independent, not task-owned background anchors.
@@ -292,8 +298,8 @@ cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.
 Dropping a scheduler stops its reporter poller; reopening resumes unfinished
 intents. Report delivery can be delayed by other work in the same child
-conversation. Reporter receipts and answer IDs are retained and scanned without
-a retention policy.
+conversation. Reporter receipts, stop receipts and answer IDs are retained without
+a retention policy; reporter receipts are scanned.
 Full upstream semantics require ownership/background boundaries and corresponding
 task, tool and reporting integration.
 

@@ -51,6 +51,9 @@ enum Args {
     List {
         name: Option<String>,
     },
+    Stop {
+        name: String,
+    },
     Send {
         name: String,
         message: String,
@@ -69,10 +72,11 @@ impl Tool for Management {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "subagent".into(),
-            description: "List named background subagents, or send a message to one (creating it if needed). Answers arrive as follow-up messages. Each send is a separate request.".into(),
+            description: "List named background subagents, send a message to one (creating it if needed), or stop its current work. Answers arrive as follow-up messages. Each send is a separate request.".into(),
             parameters: json!({
                 "oneOf": [
                     {"type":"object","properties":{"action":{"const":"list"},"name":{"type":"string","minLength":1,"maxLength":128}},"required":["action"],"additionalProperties":false},
+                    {"type":"object","properties":{"action":{"const":"stop"},"name":{"type":"string","minLength":1,"maxLength":128}},"required":["action","name"],"additionalProperties":false},
                     {"type":"object","properties":{"action":{"const":"send"},"name":{"type":"string","minLength":1,"maxLength":128},"message":{"type":"string","minLength":1,"maxLength":65536},"mode":{"enum":["follow_up","steer"]}},"required":["action","name","message"],"additionalProperties":false}
                 ]
             }),
@@ -89,6 +93,84 @@ impl Tool for Management {
         let valid_name = |name: &str| {
             !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
         };
+        if let Args::Stop { name } = &args {
+            if !valid_name(name) {
+                return Outcome::Failed("invalid subagent name".into());
+            }
+            let mut worker = match self.harness.lock() {
+                Ok(harness) => harness.worker(),
+                Err(_) => {
+                    return Outcome::Unknown(
+                        "subagent store lock poisoned; reopen the scheduler".into(),
+                    );
+                }
+            };
+            let name = name.clone();
+            let parent = self.parent;
+            let operation_id = context.operation_id;
+            let runtime = tokio::runtime::Handle::current();
+            return match tokio::task::spawn_blocking(move || {
+                let harness = &mut worker;
+                let key = format!("runtime/subagent-stop/{parent}/{operation_id}").into_bytes();
+                let owner = harness.owner.clone();
+                let mut stopped = name.clone();
+                let result = owner.conversation_controls().fence(
+                    || -> Result<Vec<Uuid>, crate::runtime::Error> {
+                        if let Some(entry) = harness.subagent_store()?.get(&key)? {
+                            stopped = serde_json::from_slice(&entry.value)?;
+                            return Ok(Vec::new());
+                        }
+                        let link = harness.subagent(parent, &name)?.ok_or_else(|| {
+                            crate::runtime::Error::Invalid(format!("unknown subagent: {name}"))
+                        })?;
+                        harness.conversation(link.child)?;
+                        harness.abort_owned_graph_once(
+                            Some(link.child),
+                            None,
+                            Some((key, serde_json::to_vec(&name)?)),
+                        )
+                    },
+                );
+                if let Ok(affected) = &result {
+                    for id in affected {
+                        let mut cleanup = harness.worker();
+                        let shutdown = owner.conversation_controls().root();
+                        let id = *id;
+                        runtime.spawn(async move {
+                            let _ = cleanup.drive_owned_cleanup(id, &shutdown).await;
+                        });
+                    }
+                }
+                (result, stopped)
+            })
+            .await
+            {
+                Ok((Ok(_), stopped)) => Outcome::Succeeded(format!("Stopped {stopped}.")),
+                Ok((Err(durable_store::controls::FenceError::Poisoned), _)) => {
+                    Outcome::Unknown("subagent control lock poisoned; reopen the scheduler".into())
+                }
+                Ok((
+                    Err(durable_store::controls::FenceError::Commit(
+                        crate::runtime::Error::Invalid(e),
+                    )),
+                    _,
+                )) => Outcome::Failed(e),
+                Ok((
+                    Err(durable_store::controls::FenceError::Commit(
+                        crate::runtime::Error::NotFound,
+                    )),
+                    _,
+                )) => Outcome::Failed("subagent conversation not found".into()),
+                Ok((Err(durable_store::controls::FenceError::Commit(e)), _)) => {
+                    Outcome::Unknown(format!(
+                        "subagent stop failed or may have committed: {e}; reconcile before retrying"
+                    ))
+                }
+                Err(e) => Outcome::Unknown(format!(
+                    "subagent stop may have committed: {e}; reconcile before retrying"
+                )),
+            };
+        }
         let mut harness = match self.harness.lock() {
             Ok(harness) => harness,
             Err(_) => {
@@ -110,6 +192,7 @@ impl Tool for Management {
                     Err(e) => Outcome::Failed(e.to_string()),
                 }
             }
+            Args::Stop { .. } => unreachable!(),
             Args::Send {
                 name,
                 message,
@@ -420,6 +503,219 @@ mod tests {
                 .child,
             child
         );
+    }
+
+    #[tokio::test]
+    async fn stop_is_parent_scoped_and_replay_does_not_stop_later_work_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let other = h.create_conversation(config()).unwrap();
+        let child = h.ensure_subagent(parent, "worker", config()).unwrap().child;
+        let other_child = h.ensure_subagent(other, "worker", config()).unwrap().child;
+        h.submit_with_mode(
+            child,
+            Some("first".into()),
+            "first".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+        h.submit_with_mode(
+            other_child,
+            Some("other".into()),
+            "other".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: None,
+        };
+        let op = Uuid::new_v4();
+        let first = tool
+            .invoke(json!({"action":"stop","name":"worker"}), context(op))
+            .await;
+        assert!(matches!(first, Outcome::Succeeded(_)));
+        // Wait until cleanup has released its worker before reopening the store.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !tool
+                    .harness
+                    .lock()
+                    .unwrap()
+                    .conversation(child)
+                    .unwrap()
+                    .abort_requested
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let worker_lock = tool
+            .harness
+            .lock()
+            .unwrap()
+            .owner
+            .conversation_controls()
+            .get(child)
+            .worker;
+        let guard = worker_lock.lock().await;
+        {
+            let h = tool.harness.lock().unwrap();
+            assert!(matches!(
+                h.conversation(child).unwrap().submissions[0].status,
+                crate::runtime::Status::Unanswered { .. }
+            ));
+            assert!(matches!(
+                h.conversation(other_child).unwrap().submissions[0].status,
+                crate::runtime::Status::Running
+            ));
+        }
+        drop(guard);
+        drop(worker_lock);
+        drop(tool);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.submit_with_mode(
+            child,
+            Some("later".into()),
+            "later".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: None,
+        };
+        let repeated = tool
+            .invoke(json!({"action":"stop","name":"different"}), context(op))
+            .await;
+        assert_eq!(format!("{first:?}"), format!("{repeated:?}"));
+        assert!(matches!(
+            tool.harness
+                .lock()
+                .unwrap()
+                .conversation(child)
+                .unwrap()
+                .submissions[1]
+                .status,
+            crate::runtime::Status::Running
+        ));
+        assert!(!matches!(
+            tool.invoke(
+                json!({"action":"stop","name":"missing"}),
+                context(Uuid::new_v4())
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+    }
+
+    struct StopModel;
+    #[async_trait]
+    impl Model for StopModel {
+        async fn stream(&self, req: ModelRequest) -> Result<ModelStream, Error> {
+            use pi_rs_core::{Message, ToolCall};
+            if req
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "child task"))
+            {
+                return Ok(stream::pending().boxed());
+            }
+            let start = req
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "start"));
+            let result = req
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }));
+            let events = if start && !result {
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "stop".into(),
+                        name: "subagent".into(),
+                        arguments: json!({"action":"stop","name":"worker"}).to_string(),
+                    }],
+                    usage: None,
+                })]
+            } else {
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            };
+            Ok(stream::iter(events).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn model_stop_drains_child_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = || {
+            let mut o = options();
+            o.model = Arc::new(StopModel);
+            o
+        };
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let (link, _) = h
+            .submit_subagent_reported(
+                parent,
+                "worker",
+                config(),
+                ReportedInput {
+                    history: false,
+                    request_id: "request".into(),
+                    content: "child task".into(),
+                    mode: InputMode::FollowUp,
+                },
+            )
+            .unwrap();
+        drop(h);
+        let mut scheduler = Scheduler::open_with_subagent_management(
+            &path,
+            opts(),
+            Default::default(),
+            parent,
+            config(),
+        )
+        .unwrap();
+        scheduler
+            .select_extensions(parent, vec![extension_name(parent)])
+            .unwrap();
+        scheduler.submit(parent, None, "start".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let parent_state = scheduler.conversation(parent).unwrap();
+                let child = scheduler.conversation(link.child).unwrap();
+                if parent_state
+                    .submissions
+                    .iter()
+                    .any(|s| s.content.contains("[subagent worker failed:"))
+                    && !child.abort_requested
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(scheduler.reporter_error().is_none());
+        scheduler.shutdown().await.unwrap();
     }
 
     struct CallingModel;

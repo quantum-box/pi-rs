@@ -637,7 +637,7 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
 }
 
 pub struct Harness {
-    owner: Arc<OwnedStore>,
+    pub(crate) owner: Arc<OwnedStore>,
     options: Options,
     tools: HashMap<String, RegisteredTool>,
     provider_adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
@@ -2666,6 +2666,15 @@ impl Harness {
         conversation: Option<Uuid>,
         task: Option<Uuid>,
     ) -> Result<Vec<Uuid>, Error> {
+        self.abort_owned_graph_once(conversation, task, None)
+    }
+
+    pub(crate) fn abort_owned_graph_once(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+        receipt: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<Uuid>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -2673,6 +2682,11 @@ impl Harness {
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
             let store = owner.store();
+            if let Some((key, _)) = &receipt {
+                if store.get(key)?.is_some() {
+                    return Ok(Vec::new());
+                }
+            }
             let records = crate::task_store::TaskStore::new(store)
                 .list()
                 .map_err(|e| Error::Invalid(format!("task list: {e}")))?;
@@ -2771,6 +2785,16 @@ impl Harness {
                 )
                 .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
             batch.checks.extend(task_batch.checks);
+            if let Some((key, value)) = &receipt {
+                batch.checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
             batch.checks.extend(edge_checks);
             batch.mutations.extend(task_batch.mutations);
             match self.commit_conversation_save(batch) {
