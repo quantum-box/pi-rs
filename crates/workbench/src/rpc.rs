@@ -299,11 +299,12 @@ pub(super) fn run(
                     Err(Error::Config("too many pending model queries".into())),
                 )?;
             } else {
+                let generation = next_model_generation(&args);
                 let args = args.clone();
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let result =
-                        available_models(&args, true).map(|(_, models)| json!({"models":models}));
+                    let result = available_models_at(&args, true, generation)
+                        .map(|(_, models)| json!({"models":models}));
                     let _ = sender.send(result);
                 });
                 model_queries.push((request, receiver));
@@ -936,6 +937,7 @@ fn command_cancellable(
             {
                 model_value(args, &provider, model)
             } else {
+                let generation = next_model_generation(args);
                 let current = args.clone();
                 let selected = provider.clone();
                 let candidate = model.to_owned();
@@ -956,9 +958,10 @@ fn command_cancellable(
                         &catalog.provider,
                         &candidate,
                         details.get(&candidate),
+                        generation,
                     );
                     Ok(Some(model_with_input_details(
-                        model_value(&current, &catalog.provider, &candidate),
+                        model_value_without_cache(&current, &catalog.provider, &candidate),
                         details.get(&candidate),
                     )))
                 })?
@@ -1169,29 +1172,18 @@ pub(super) fn snapshot_response(
 }
 
 pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
-    let configured = args.model_profiles.model(provider, model);
-    let name = configured
-        .as_ref()
-        .and_then(|metadata| metadata.name.as_deref())
-        .unwrap_or(model);
-    let adapter = args.model_profiles.model_adapter(provider, model);
-    let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
-    let value = if let Some(configured) = configured {
-        configured.apply_catalog_metadata(&mut value);
-        if let Some(input) = configured.input_modalities() {
-            value["input"] = json!(input);
-        }
-        let mut details = pi_rs::ollama::ModelDetails::default();
-        configured.apply(adapter, &mut details);
-        super::model_listing::with_details(value, Some(&details))
-    } else {
-        value
-    };
+    let value = model_value_without_cache(args, provider, model);
     if value.get("input").is_some() {
         return value;
     }
     let key = model_cache_key(args, provider, model);
-    let images = args.rpc_model_images.lock().unwrap().get(&key).copied();
+    let images = args
+        .rpc_model_images
+        .lock()
+        .unwrap()
+        .entries
+        .get(&key)
+        .and_then(|entry| entry.images);
     model_with_input_details(
         value,
         images
@@ -1203,16 +1195,89 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     )
 }
 
-fn model_cache_key(
-    args: &Cli,
-    provider: &super::Provider,
-    model: &str,
-) -> (String, String, String) {
-    (
-        provider.id().to_owned(),
-        args.model_endpoint_for(provider, Some(model)).to_owned(),
-        model.to_owned(),
-    )
+fn model_value_without_cache(args: &Cli, provider: &super::Provider, model: &str) -> Value {
+    let configured = args.model_profiles.model(provider, model);
+    let name = configured
+        .as_ref()
+        .and_then(|metadata| metadata.name.as_deref())
+        .unwrap_or(model);
+    let adapter = args.model_profiles.model_adapter(provider, model);
+    let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
+    if let Some(configured) = configured {
+        configured.apply_catalog_metadata(&mut value);
+        if let Some(input) = configured.input_modalities() {
+            value["input"] = json!(input);
+        }
+        let mut details = pi_rs::ollama::ModelDetails::default();
+        configured.apply(adapter, &mut details);
+        super::model_listing::with_details(value, Some(&details))
+    } else {
+        value
+    }
+}
+
+#[derive(Default)]
+pub(super) struct ModelImageCache {
+    generation: u64,
+    entries: std::collections::BTreeMap<ModelCacheKey, ModelImageEntry>,
+    completed: std::collections::BTreeMap<ModelCacheScope, u64>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheKey {
+    scope: ModelCacheScope,
+    model: String,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheScope {
+    provider: String,
+    endpoint: String,
+    adapter: String,
+    profiles_revision: String,
+    auth_revision: String,
+    credential_hash: Option<String>,
+}
+
+struct ModelImageEntry {
+    generation: u64,
+    images: Option<bool>,
+}
+
+fn next_model_generation(args: &Cli) -> u64 {
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    cache.generation = cache
+        .generation
+        .checked_add(1)
+        .expect("model discovery generation overflow");
+    cache.generation
+}
+
+fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> ModelCacheKey {
+    use sha2::{Digest, Sha256};
+    let endpoint = args.model_endpoint_for(provider, Some(model));
+    let credential_hash = args
+        .model_credential_for(provider, endpoint)
+        .and_then(|credential| {
+            credential
+                .literal()
+                .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+        });
+    ModelCacheKey {
+        model: model.to_owned(),
+        scope: ModelCacheScope {
+            provider: provider.id().to_owned(),
+            endpoint: endpoint.to_owned(),
+            adapter: args
+                .model_profiles
+                .model_adapter(provider, model)
+                .api()
+                .to_owned(),
+            profiles_revision: args.model_profiles.revision().to_owned(),
+            auth_revision: args.model_keys.revision().to_owned(),
+            credential_hash,
+        },
+    }
 }
 
 fn remember_model_images(
@@ -1220,22 +1285,74 @@ fn remember_model_images(
     provider: &super::Provider,
     model: &str,
     details: Option<&pi_rs::ollama::ModelDetails>,
+    generation: u64,
 ) {
     let key = model_cache_key(args, provider, model);
     let mut cache = args.rpc_model_images.lock().unwrap();
-    match details.and_then(|details| details.images) {
-        Some(images) => {
-            cache.insert(key, images);
-        }
-        None => {
-            cache.remove(&key);
+    if cache
+        .completed
+        .get(&key.scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    if cache
+        .entries
+        .get(&key)
+        .is_none_or(|entry| entry.generation <= generation)
+    {
+        // Keep unknown as a tombstone so an older discovery cannot revive it.
+        cache.entries.insert(
+            key,
+            ModelImageEntry {
+                generation,
+                images: details.and_then(|details| details.images),
+            },
+        );
+    }
+}
+
+// A complete newer catalog also invalidates models it no longer lists. The
+// scope watermark prevents an older in-flight catalog from reintroducing them.
+fn complete_model_catalog(
+    args: &Cli,
+    provider: &super::Provider,
+    models: &[String],
+    generation: u64,
+) {
+    let scope = model_cache_key(args, provider, "").scope;
+    let models: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    if cache
+        .completed
+        .get(&scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    for (key, entry) in &mut cache.entries {
+        if key.scope == scope
+            && entry.generation <= generation
+            && !models.contains(key.model.as_str())
+        {
+            entry.generation = generation;
+            entry.images = None;
         }
     }
+    cache.completed.insert(scope, generation);
 }
 
 fn available_models(
     args: &Cli,
     include_details: bool,
+) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
+    available_models_at(args, include_details, next_model_generation(args))
+}
+
+fn available_models_at(
+    args: &Cli,
+    include_details: bool,
+    generation: u64,
 ) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
     use super::model_selection::ScopedChoice;
     if !include_details && !args.model_scope.is_empty() {
@@ -1260,11 +1377,20 @@ fn available_models(
             } else {
                 Default::default()
             };
+            if include_details && catalog.complete {
+                complete_model_catalog(&args, &catalog.provider, &catalog.models, generation);
+            }
             for model in catalog.models {
                 if include_details {
-                    remember_model_images(&args, &catalog.provider, &model, details.get(&model));
+                    remember_model_images(
+                        &args,
+                        &catalog.provider,
+                        &model,
+                        details.get(&model),
+                        generation,
+                    );
                     rows.push(model_with_input_details(
-                        model_value(&args, &catalog.provider, &model),
+                        model_value_without_cache(&args, &catalog.provider, &model),
                         details.get(&model),
                     ));
                 }
@@ -1582,6 +1708,173 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn discovery_results_use_own_capabilities_and_ignore_older_writes() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let old = next_model_generation(&args);
+        let new = next_model_generation(&args);
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let text = pi_rs::ollama::ModelDetails {
+            images: Some(false),
+            ..Default::default()
+        };
+        // Force the older request to publish, then let the newer request
+        // overwrite the shared cache before the older response is constructed.
+        let (published, first_published) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let older_args = args.clone();
+        let older_provider = provider.clone();
+        let older_vision = vision.clone();
+        let older = std::thread::spawn(move || {
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            published.send(()).unwrap();
+            released.recv().unwrap();
+            let response = model_with_input_details(
+                model_value_without_cache(&older_args, &older_provider, "dynamic"),
+                Some(&older_vision),
+            );
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            response
+        });
+        first_published.recv().unwrap();
+        remember_model_images(&args, &provider, "dynamic", Some(&text), new);
+        release.send(()).unwrap();
+        let old_response = older.join().unwrap();
+        assert_eq!(old_response["input"], json!(["text", "image"]));
+        assert_eq!(old_response["images"], true);
+        let current = model_value(&args, &provider, "dynamic");
+        assert_eq!(current["input"], json!(["text"]));
+        assert_eq!(current["images"], false);
+        let unknown = next_model_generation(&args);
+        remember_model_images(&args, &provider, "dynamic", None, unknown);
+        remember_model_images(&args, &provider, "dynamic", Some(&vision), old);
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        let old_catalog = next_model_generation(&args);
+        let new_catalog = next_model_generation(&args);
+        remember_model_images(
+            &args,
+            &provider,
+            "previously-listed",
+            Some(&vision),
+            old_catalog,
+        );
+        complete_model_catalog(&args, &provider, &[], new_catalog);
+        assert!(
+            model_value(&args, &provider, "previously-listed")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(&args, &provider, "removed", Some(&vision), old_catalog);
+        assert!(
+            model_value(&args, &provider, "removed")
+                .get("input")
+                .is_none()
+        );
+        // Adapter changes must isolate the cache even when the provider name,
+        // endpoint, profile and credentials are otherwise identical.
+        let first = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::ChatCompletions,
+        };
+        let second = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::OpenAiResponses,
+        };
+        args.provider = first.clone();
+        args.endpoint = "https://example.invalid/shared".into();
+        remember_model_images(
+            &args,
+            &first,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &first, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.provider = second.clone();
+        assert!(
+            model_value(&args, &second, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_capabilities_are_isolated_by_connection_configuration() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let profile = |api: &str, key: &str| {
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{"api":api,"baseUrl":"https://example.invalid/v1","apiKey":key}}})).unwrap()
+        };
+        args.model_profiles = profile("openai-completions", "first-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.model_profiles = profile("openai-completions", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key","key":"saved-secret"}}),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        args.model_profiles = profile("openai-responses", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn rpc_model_input_preserves_configured_modalities() {
         let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
         args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
@@ -1651,22 +1944,46 @@ mod tests {
             images: Some(true),
             ..Default::default()
         };
-        remember_model_images(&args, &provider, "dynamic", Some(&known));
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
         assert_eq!(
             model_value(&args, &provider, "dynamic")["input"],
             json!(["text", "image"])
         );
 
         let unknown = pi_rs::ollama::ModelDetails::default();
-        remember_model_images(&args, &provider, "dynamic", Some(&unknown));
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&unknown),
+            next_model_generation(&args),
+        );
         assert!(
             model_value(&args, &provider, "dynamic")
                 .get("input")
                 .is_none()
         );
 
-        remember_model_images(&args, &provider, "dynamic", Some(&known));
-        remember_model_images(&args, &provider, "dynamic", None);
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            None,
+            next_model_generation(&args),
+        );
         assert!(
             model_value(&args, &provider, "dynamic")
                 .get("input")
@@ -1768,6 +2085,7 @@ mod tests {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1839,7 +2157,7 @@ mod tests {
                 .iter()
                 .any(|m| m["id"] == "other" && m.get("input").is_none())
         );
-        args.rpc_model_images.lock().unwrap().clear();
+        args.rpc_model_images.lock().unwrap().entries.clear();
         let selected = command(
             &json!({"type":"set_model", "provider":"ollama", "modelId":"dynamic"}),
             &mut args,

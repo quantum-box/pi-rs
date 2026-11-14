@@ -63,8 +63,7 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
-type RpcModelImages =
-    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, String, String), bool>>>;
+type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
 
 #[derive(Parser, Clone)]
 #[command(

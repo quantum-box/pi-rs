@@ -311,7 +311,11 @@ Known dynamic capabilities are retained for subsequent state and cycling
 responses in the same RPC session. When capability data is unavailable, the
 list is omitted rather than guessed. Configured model definitions default to
 text input, while partial overrides inherit the existing model's modalities.
-The native `images` field remains available for existing clients.
+Concurrent discoveries return their own capability data; older completions do
+not overwrite newer cache results or restore models removed from a complete
+catalog. Cached capabilities are scoped to the
+provider, model, endpoint, adapter, profile, and credential identity. The
+native `images` field remains available for existing clients.
 
 `set_model` checks the exact model ID against the selected provider's
 configured or discovered catalog before saving the selection. A missing
