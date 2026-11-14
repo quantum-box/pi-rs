@@ -1526,7 +1526,14 @@ impl Registry {
         if !revoked {
             let mut models = self.branch_models.write().expect("branch models");
             for (provider, name, client) in bindings {
-                models.insert((Some(session_id), provider, name), (client, None));
+                let guarded_binding =
+                    guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
+                let key = (Some(session_id), provider, name);
+                if guarded_binding {
+                    models.entry(key).or_insert((client, None));
+                } else {
+                    models.insert(key, (client, None));
+                }
             }
         }
         Ok((result, revoked))

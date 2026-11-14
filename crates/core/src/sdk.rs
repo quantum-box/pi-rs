@@ -4645,6 +4645,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_fallback_preserves_registered_client_limits() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let same: Arc<dyn Model> = Arc::new(ProviderBranchModel("fallback"));
+        let limits = Limits {
+            output_tokens_per_request: 1234,
+            output_tokens_per_run: 2345,
+            ..Default::default()
+        };
+        registry
+            .register_session_provider_model_with_limits(
+                id,
+                "fallback",
+                "shared",
+                same.clone(),
+                Some(limits),
+            )
+            .unwrap();
+        let returned = same.clone();
+        let resolver = Arc::new(
+            move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: returned.clone(),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        let (client, effective) = registry
+            .provider_branch_config(id, "fallback", "shared")
+            .unwrap();
+        assert!(Arc::ptr_eq(&client, &same));
+        let effective = effective.unwrap();
+        assert_eq!(effective.output_tokens_per_request, 1234);
+        assert_eq!(effective.output_tokens_per_run, 2345);
+        assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn startup_fallback_reserves_binding_and_honors_reentrant_revocation() {
         struct ReentrantStore {
             records: Vec<crate::Record>,
