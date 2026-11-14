@@ -2012,6 +2012,136 @@ impl Section for FailingSection {
         Err("section failed".into())
     }
 }
+// A hand-written implementation can panic before returning its future.
+struct SynchronousPanicSection;
+impl Section for SynchronousPanicSection {
+    fn key(&self) -> &str {
+        "panic"
+    }
+    fn render<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _: &'life1 Context<'life2>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        panic!("section failed before future construction")
+    }
+}
+
+struct PollPanicSection;
+#[async_trait]
+impl Section for PollPanicSection {
+    fn key(&self) -> &str {
+        "poll-panic"
+    }
+    async fn render(&self, _: &Context<'_>) -> Result<Option<String>, String> {
+        panic!("section failed while polling")
+    }
+}
+
+struct SynchronousPanicHook;
+impl Hook for SynchronousPanicHook {
+    fn before_tool<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        _: &'life1 HookCall,
+        _: &'life2 Context<'life3>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<BeforeTool, String>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        panic!("hook failed before future construction")
+    }
+}
+
+#[tokio::test]
+async fn synchronous_extension_panics_are_reported_and_replayed_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let first;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        h.install_extension(Extension {
+            name: "panic-extension".into(),
+            sections: vec![Arc::new(SynchronousPanicSection), Arc::new(PollPanicSection)],
+            hooks: vec![Arc::new(SynchronousPanicHook)],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["panic-extension".into()])
+            .unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        let subscription = h.subscribe_extension_reports().unwrap();
+        first = subscription.read(0, 256).unwrap();
+        for phase in ["section", "before_tool"] {
+            assert!(first.iter().any(|d| d.batch.phase == phase
+                && d.batch.reports[0].extension == "panic-extension"
+                && d.batch.reports[0].error == "extension panicked"));
+        }
+        let section = first.iter().find(|d| d.batch.phase == "section").unwrap();
+        assert_eq!(section.batch.reports.len(), 2);
+        assert!(section.batch.reports.iter().all(|r| r.error == "extension panicked"));
+        assert!(tool.0.lock().unwrap().is_empty());
+        assert_eq!(subscription.read(0, 256).unwrap(), first);
+    }
+    let h = Harness::open_paused(&path, options(model, tool)).unwrap();
+    let subscription = h.subscribe_extension_reports().unwrap();
+    assert_eq!(subscription.read(0, 256).unwrap(), first);
+    assert!(
+        subscription
+            .read(first.last().unwrap().cursor, 256)
+            .unwrap()
+            .is_empty()
+    );
+    drop(subscription);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let mut failed = h
+        .dispatch_extension_reports(0, std::time::Duration::from_millis(1), move |delivery| {
+            tx.take().unwrap().send(delivery).unwrap();
+            async { Err("retry".into()) }
+        })
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), first[0]);
+    assert!(matches!(
+        failed.close().await,
+        Err(pi_rs_durable::report::DispatchError::Listener { cursor: 0, .. })
+    ));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let mut replay = h
+        .dispatch_extension_reports(0, std::time::Duration::from_millis(1), move |delivery| {
+            if let Some(tx) = tx.take() {
+                tx.send(delivery).unwrap();
+            }
+            async { Ok(()) }
+        })
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), first[0]);
+    assert!(replay.close().await.unwrap() >= first[0].cursor);
+}
+
 struct ReportingHook;
 #[async_trait]
 impl Hook for ReportingHook {

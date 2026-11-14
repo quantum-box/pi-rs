@@ -665,6 +665,14 @@ children; those still require their respective scheduler ownership paths.
 
 ### Extension error observation
 
+Unwinding section and hook panics are contained and reported whether they occur while
+constructing the callback future or while polling it. A failing before-tool
+hook still blocks the call; other hook and section failures retain their
+existing continuation behavior. Reports use the same operation-and-phase
+identity and first-batch-wins rule as other extension failures. Panic payloads
+are not exposed; the report error is `extension panicked`. This does not cover
+panics when querying section keys or tool metadata, nor tool execution errors.
+
 `Harness::extension_reports()` and `Scheduler::extension_reports()` return all
 persisted batches. `subscribe_extension_reports()` provides a pull subscription
 on either host: `read(cursor, limit)` returns up to 256 batches (batch byte sizes are not capped), and

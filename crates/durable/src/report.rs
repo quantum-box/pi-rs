@@ -320,6 +320,29 @@ mod tests {
         )
         .into_bytes()
     }
+    #[test]
+    fn retried_panic_report_keeps_first_batch_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.db");
+        let mut first = batch(1);
+        first.phase = "before_tool".into();
+        first.reports[0].operation = "before_tool".into();
+        first.reports[0].error = "extension panicked".into();
+        {
+            let store = Store::open(&path).unwrap();
+            index(&store, key(&first), &first, false).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let mut retry = first.clone();
+        retry.reports[0].error = "different retry failure".into();
+        index(&store, key(&retry), &retry, false).unwrap();
+        let subscription = Subscription::open(&store).unwrap();
+        let page = subscription.read(0, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].batch, first);
+        assert!(subscription.read(page[0].cursor, 10).unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn dispatcher_without_runtime_returns_error_and_releases_owner() {

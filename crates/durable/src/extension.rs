@@ -324,6 +324,8 @@ fn failure(extension: &str, operation: &'static str, error: String) -> Report {
         error,
     }
 }
+// Callbacks must be invoked inside the future passed here: a hand-written
+// async-trait implementation can panic before it returns its future.
 async fn protect<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
     match AssertUnwindSafe(f).catch_unwind().await {
         Ok(result) => result,
@@ -407,7 +409,7 @@ impl Resolved {
         let mut parts = Vec::new();
         let mut reports = Vec::new();
         for (owner, s) in sections {
-            match protect(s.render(ctx)).await {
+            match protect(async { s.render(ctx).await }).await {
                 Ok(Some(text)) => parts.push(if s.tagged() {
                     format!("<{}>\n{}\n</{}>", s.key(), text, s.key())
                 } else {
@@ -431,7 +433,7 @@ impl Resolved {
         let mut reports = vec![];
         for e in &self.extensions {
             for h in &e.hooks {
-                match protect(h.before_compact(input, ctx)).await {
+                match protect(async { h.before_compact(input, ctx).await }).await {
                     Ok(BeforeCompact::Pass) => (),
                     Ok(decision) => return (decision, reports),
                     Err(err) => reports.push(failure(&e.name, "before_compact", err)),
@@ -449,7 +451,7 @@ impl Resolved {
     ) -> (ToolCall, BeforeTool, Vec<Report>) {
         for e in &self.extensions {
             for h in &e.hooks {
-                match protect(h.before_tool(&call, ctx)).await {
+                match protect(async { h.before_tool(&call, ctx).await }).await {
                     Ok(BeforeTool::Pass) => (),
                     Ok(BeforeTool::Rewrite(args)) => call.arguments = args,
                     Ok(stop @ (BeforeTool::Block(_) | BeforeTool::Sleep(_))) => {
@@ -477,7 +479,7 @@ impl Resolved {
         let mut reports = vec![];
         for e in &self.extensions {
             for h in &e.hooks {
-                match protect(h.after_tool(call, &result, ctx)).await {
+                match protect(async { h.after_tool(call, &result, ctx).await }).await {
                     Ok(Some(value)) => result = value,
                     Ok(None) => (),
                     Err(err) => reports.push(failure(&e.name, "after_tool", err)),
@@ -515,7 +517,7 @@ impl Resolved {
         let mut reports = vec![];
         for e in &self.extensions {
             for h in &e.hooks {
-                match protect(h.generation(event, &value, ctx)).await {
+                match protect(async { h.generation(event, &value, ctx).await }).await {
                     Ok(GenerationDecision::Pass) => (),
                     Ok(GenerationDecision::Replace(v))
                         if matches!(

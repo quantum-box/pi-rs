@@ -10,6 +10,8 @@
 
 Checkpoint descriptions record historical stages and can contain superseded limitations; use the current status and priority table for this revision.
 
+**Extension callback panic reporting:** Section and hook panics while constructing or polling their futures are contained and recorded in the extension report log. Before-tool panics block tool dispatch; other phases retain their existing failure handling. The first report batch per operation and phase wins, and unacknowledged deliveries replay after reopen. [Upstream](https://github.com/earendil-works/pi/blob/c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0/packages/durable/src/types.ts) reports thrown section and hook errors through `onReport`; Rust normalizes panic payloads to `extension panicked` and still does not cover the full upstream report taxonomy, including tool execution failures.
+
 **Extension report subscription:** `Harness` and `Scheduler` expose a bounded,
 pull-based subscription and opt-in asynchronous dispatcher over persisted extension
 error batches, with host-managed cursors and replay after reopening. Unlike upstream
