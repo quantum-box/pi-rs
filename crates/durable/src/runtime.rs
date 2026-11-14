@@ -1339,6 +1339,14 @@ impl Harness {
     }
     /// Start a run from the current context without appending user input.
     pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
         loop {
             let (mut c, version) = self.load(id)?;
             if let Some(key) = request_id.as_ref() {
@@ -1370,35 +1378,7 @@ impl Harness {
             for marker in std::mem::take(&mut c.pending_resets) {
                 place_reset(&mut c, marker);
             }
-            let mut steer = false;
-            let mut follow = false;
-            for s in &mut c.submissions {
-                if s.status != Status::Queued {
-                    continue;
-                }
-                let selected = match c
-                    .input_modes
-                    .get(&s.id)
-                    .copied()
-                    .unwrap_or(InputMode::FollowUp)
-                {
-                    InputMode::Steer if !steer => {
-                        steer = true;
-                        true
-                    }
-                    InputMode::FollowUp if !follow => {
-                        follow = true;
-                        true
-                    }
-                    _ => false,
-                };
-                if selected {
-                    s.status = Status::Running;
-                    c.messages.push(Message::User {
-                        content: s.content.clone(),
-                    });
-                }
-            }
+            place_queued(&mut c, true);
             let sid = Uuid::new_v4();
             c.submissions.push(Submission {
                 kind: SubmissionKind::Continue,
