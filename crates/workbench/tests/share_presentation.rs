@@ -343,6 +343,13 @@ print(json.dumps({'version':1,'response':response}))
 
 #[test]
 fn two_idle_workers_can_expose_different_contexts_for_the_same_unlocked_journal() {
+    use hmac::{Hmac, Mac};
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireContext {
+        system_prompt: String,
+        tools: Vec<pi_rs::ToolSpec>,
+    }
     let root = tempfile::tempdir().unwrap();
     let journal = root.path().join("session.jsonl");
     drop(pi_rs::Session::open(&journal).unwrap());
@@ -417,6 +424,18 @@ fn two_idle_workers_can_expose_different_contexts_for_the_same_unlocked_journal(
         first["data"]["snapshot"]["context"]["systemPrompt"],
         second["data"]["snapshot"]["context"]["systemPrompt"]
     );
+    for response in [&first, &second] {
+        let records: Vec<pi_rs::Record> =
+            serde_json::from_value(response["data"]["records"].clone()).unwrap();
+        let context: WireContext =
+            serde_json::from_value(response["data"]["snapshot"]["context"].clone()).unwrap();
+        let tag: [u8; 32] =
+            serde_json::from_value(response["data"]["snapshot"]["journalTag"].clone()).unwrap();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+        mac.update(b"pi-rs-live-share-context-v2\0");
+        mac.update(&serde_json::to_vec(&(records, context)).unwrap());
+        assert!(mac.verify_slice(&tag).is_ok());
+    }
     // A successful exclusive open does not prove that no idle worker exists.
     drop(pi_rs::Session::open(&journal).unwrap());
     writeln!(first_input, "{}", json!({"type":"shutdown"})).unwrap();
