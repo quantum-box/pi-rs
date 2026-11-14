@@ -353,6 +353,105 @@ async fn output_limit_marks_partial_tool_calls_as_truncated() {
     thread.join().unwrap();
 }
 
+struct CountingTool(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl pi_rs_core::Tool for CountingTool {
+    fn spec(&self) -> pi_rs_core::ToolSpec {
+        pi_rs_core::ToolSpec {
+            name: "read".into(),
+            description: "test tool".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        }
+    }
+
+    async fn invoke(&self, _: Value, _: pi_rs_core::ToolContext) -> pi_rs_core::Outcome {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        pi_rs_core::Outcome::Succeeded("ok".into())
+    }
+}
+
+#[tokio::test]
+async fn runtime_never_dispatches_incomplete_or_empty_calls() {
+    use pi_rs_durable::{
+        recovery::{ReplayPolicy, UncertainPolicy},
+        runtime::{Config, Harness, Options, RegisteredTool, Status},
+    };
+    use std::sync::{Arc, atomic::Ordering};
+
+    // Include valid JSON on an incomplete response: syntax alone must not authorize it.
+    for (incomplete, arguments, expected_invocations) in [
+        (true, "", 0),
+        (true, "{", 0),
+        (true, "{}", 0),
+        (false, "", 0),
+        (false, "{}", 1), // Positive control: the registered tool is reachable.
+    ] {
+        let terminal = if incomplete {
+            json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"c","name":"read","arguments":arguments}]}})
+        } else {
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c","name":"read","arguments":arguments}]}})
+        };
+        let added = json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"read"}});
+        let delta = json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":arguments});
+        let delta_event = if arguments.is_empty() {
+            String::new()
+        } else {
+            format!("data: {delta}\n\n")
+        };
+        let events = format!("data: {added}\n\n{delta_event}data: {terminal}\n\n");
+        let (url, rx, thread) = server(http(&events), false);
+        let dir = tempfile::tempdir().unwrap();
+        let tool = Arc::new(CountingTool(std::sync::atomic::AtomicUsize::new(0)));
+        let mut h = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(UnusedModel),
+                tools: vec![RegisteredTool {
+                    tool: tool.clone(),
+                    replay: ReplayPolicy::Unsafe,
+                }],
+                restart_limit: 1,
+                max_turns: 1,
+                uncertain_policy: UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        h.install_provider_adapter(Arc::new(
+            OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+        ))
+        .unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "system".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.submit_and_run(id, None, "hello".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.0.load(Ordering::SeqCst),
+            expected_invocations,
+            "incomplete={incomplete}, arguments={arguments:?}"
+        );
+        let conversation = h.conversation(id).unwrap();
+        if incomplete {
+            assert!(matches!(
+                &conversation.submissions[0].status,
+                Status::Unanswered { .. }
+            ));
+            assert!(
+                matches!(conversation.messages.last(), Some(Message::Tool { call_id, content, .. }) if call_id == "c" && content.contains("truncated"))
+            );
+        }
+        rx.recv().unwrap();
+        thread.join().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn completed_tool_items_must_be_complete_and_at_the_streamed_index() {
     for (index, status) in [(0, "incomplete"), (1, "completed")] {
