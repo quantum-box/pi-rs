@@ -3460,7 +3460,11 @@ impl Hook for YieldDecisionHook {
             {
                 Ok(D::Continue(json!("retry answer")))
             }
-            "later" if !ctx.snapshot["messages"].to_string().contains("retry answer") => {
+            "later"
+                if !ctx.snapshot["messages"]
+                    .to_string()
+                    .contains("retry answer") =>
+            {
                 Ok(D::Continue(json!("later answer")))
             }
             _ => Ok(D::Pass),
