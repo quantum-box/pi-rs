@@ -542,6 +542,7 @@ async fn standalone_share_snapshot_with_runtime(
         Ok(super::sessions::ShareSnapshot {
             session_id: source.session_id(),
             head: source.head(),
+            journal_tag: None,
             context: super::sessions::ShareContext {
                 system_prompt,
                 tools,

@@ -555,7 +555,10 @@ impl Worker {
         Ok(slot.as_mut())
     }
 
-    pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+    pub(super) fn request_share_context(
+        slot: &mut Option<Self>,
+        args: &Cli,
+    ) -> Result<(uuid::Uuid, [u8; 32])> {
         if slot
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
@@ -572,8 +575,11 @@ impl Worker {
             ));
         }
         let id = uuid::Uuid::new_v4();
-        worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session}))?;
-        Ok(id)
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session, "journal_key":key}))?;
+        Ok((id, key))
     }
 
     pub(super) fn notify_session_name(

@@ -685,6 +685,7 @@ async fn run_device_side_effect<T>(
 
 struct PendingShare {
     id: uuid::Uuid,
+    journal_key: Option<[u8; 32]>,
     destination: sessions::ShareDestination,
     path: PathBuf,
     workspace: PathBuf,
@@ -700,6 +701,7 @@ fn start_share_upload(
         destination,
         path,
         workspace,
+        journal_key,
         ..
     } = pending;
     let status = destination.status();
@@ -708,6 +710,9 @@ fn start_share_upload(
         "Share cancelled",
         move |_| async move {
             let session = Session::snapshot(path)?;
+            if let Some(snapshot) = &snapshot {
+                sessions::validate_live_share_journal(&session, snapshot, journal_key.as_ref())?;
+            }
             let shared = destination.share(session, &workspace, snapshot).await?;
             let mut lines = vec![format!("Share URL: {}", shared.url)];
             if let Some(gist) = shared.gist {
@@ -2923,7 +2928,8 @@ fn slash(
                 None
             };
             let pending = PendingShare {
-                id: id.unwrap_or_else(uuid::Uuid::nil),
+                id: id.as_ref().map_or_else(uuid::Uuid::nil, |(id, _)| *id),
+                journal_key: id.as_ref().map(|(_, key)| *key),
                 destination,
                 path: args.session.clone(),
                 workspace: args.workspace.clone(),
@@ -7820,6 +7826,7 @@ mod tests {
         let mut view = super::View {
             pending_share: Some(super::PendingShare {
                 id: share_id,
+                journal_key: None,
                 destination: super::sessions::ShareDestination::Gist,
                 path: Default::default(),
                 workspace: Default::default(),

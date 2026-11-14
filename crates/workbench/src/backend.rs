@@ -143,6 +143,7 @@ enum Request {
     GetShareContext {
         id: Option<serde_json::Value>,
         session: PathBuf,
+        journal_key: [u8; 32],
     },
     ReadSession {
         request: serde_json::Value,
@@ -233,6 +234,7 @@ impl SessionSnapshot {
             session_id: session.session_id(),
             head: session.head(),
             context,
+            journal_tag: None,
         })
     }
 
@@ -325,6 +327,7 @@ impl SessionSnapshot {
     }
 }
 
+#[cfg(test)]
 fn snapshot_for_share(
     active: &Mutex<ControlState>,
     snapshot: &Mutex<SessionSnapshot>,
@@ -333,6 +336,7 @@ fn snapshot_for_share(
     snapshot_for_share_with_hook(active, snapshot, current, || {})
 }
 
+#[cfg(test)]
 fn snapshot_for_share_with_hook(
     active: &Mutex<ControlState>,
     snapshot: &Mutex<SessionSnapshot>,
@@ -419,6 +423,7 @@ fn snapshot_and_session_for_share_with_hook(
         session_id: session.session_id(),
         head: session.head(),
         context,
+        journal_tag: None,
     };
     let state = active.lock().expect("worker control");
     let mut snapshot = snapshot.lock().expect("session snapshot");
@@ -439,12 +444,28 @@ fn snapshot_and_session_for_share_with_hook(
     Ok((result, session))
 }
 
+#[cfg(test)]
 async fn share_snapshot_background<F>(
     active: Arc<Mutex<ControlState>>,
     snapshot: Arc<Mutex<SessionSnapshot>>,
     slots: Arc<tokio::sync::Semaphore>,
     read: F,
 ) -> Result<super::sessions::ShareSnapshot>
+where
+    F: FnOnce() -> Option<Session> + Send + 'static,
+{
+    share_snapshot_and_journal_background(active, snapshot, slots, None, read)
+        .await
+        .map(|(snapshot, _)| snapshot)
+}
+
+async fn share_snapshot_and_journal_background<F>(
+    active: Arc<Mutex<ControlState>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    journal_key: Option<[u8; 32]>,
+    read: F,
+) -> Result<(super::sessions::ShareSnapshot, Session)>
 where
     F: FnOnce() -> Option<Session> + Send + 'static,
 {
@@ -461,7 +482,16 @@ where
                 state.token.is_none() && state.queued == 0
             };
             let current = if idle { read() } else { None };
-            let _ = send.send(snapshot_for_share(&active, &snapshot, current));
+            let result =
+                snapshot_and_session_for_share_with_hook(&active, &snapshot, current, || {})
+                    .and_then(|(mut snapshot, journal)| {
+                        if let Some(key) = journal_key {
+                            snapshot.journal_tag =
+                                Some(super::sessions::share_journal_tag(&journal, &key)?);
+                        }
+                        Ok((snapshot, journal))
+                    });
+            let _ = send.send(result);
         })
         .map_err(|_| Error::Config("Share context reader could not start".into()))?;
     receive
@@ -1645,7 +1675,11 @@ fn read_requests(
                         result,
                     );
                 }
-                Request::GetShareContext { id, session } => {
+                Request::GetShareContext {
+                    id,
+                    session,
+                    journal_key,
+                } => {
                     let mut ready = share_ready.clone();
                     let snapshot = snapshot.clone();
                     let active = active.clone();
@@ -1656,14 +1690,17 @@ fn read_requests(
                                 return;
                             }
                         }
-                        let result =
-                            share_snapshot_background(active, snapshot, slots, move || {
-                                Session::snapshot(session).ok()
-                            })
-                            .await
-                            .and_then(|snapshot| {
-                                serde_json::to_value(snapshot).map_err(Into::into)
-                            });
+                        let result = share_snapshot_and_journal_background(
+                            active,
+                            snapshot,
+                            slots,
+                            Some(journal_key),
+                            move || Session::snapshot(session).ok(),
+                        )
+                        .await
+                        .and_then(|(snapshot, _journal)| {
+                            serde_json::to_value(snapshot).map_err(Into::into)
+                        });
                         control_response("get_share_context", id, result);
                     });
                 }
@@ -1926,6 +1963,31 @@ mod share_context_tests {
         assert_eq!(before.head, after.head);
         assert_ne!(before.context.system_prompt, after.context.system_prompt);
         assert_ne!(before.context.tools.len(), after.context.tools.len());
+    }
+
+    #[tokio::test]
+    async fn live_worker_response_binds_context_to_exact_journal() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let key = [7; 32];
+        let (share, journal) = share_snapshot_and_journal_background(
+            Arc::new(Mutex::new(ControlState::default())),
+            Arc::new(Mutex::new(worker)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Some(key),
+            || None,
+        )
+        .await
+        .unwrap();
+        super::super::sessions::validate_live_share_journal(&journal, &share, Some(&key)).unwrap();
+        assert!(
+            super::super::sessions::validate_live_share_journal(&journal, &share, Some(&[8; 32]))
+                .is_err()
+        );
     }
 
     #[test]

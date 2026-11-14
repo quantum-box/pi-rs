@@ -906,6 +906,47 @@ pub(super) struct ShareSnapshot {
     pub session_id: uuid::Uuid,
     pub head: u64,
     pub context: ShareContext,
+    // Present only on the private live-worker response. The ephemeral key is
+    // held by the requesting frontend and is never written to the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_tag: Option<[u8; 32]>,
+}
+
+pub(super) fn share_journal_tag(session: &Session, key: &[u8; 32]) -> Result<[u8; 32]> {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
+    mac.update(b"pi-rs-live-share-journal-v1\0");
+    mac.update(&serde_json::to_vec(session.records())?);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+pub(super) fn verify_share_journal(
+    session: &Session,
+    key: &[u8; 32],
+    tag: &[u8; 32],
+) -> Result<bool> {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32 bytes");
+    mac.update(b"pi-rs-live-share-journal-v1\0");
+    mac.update(&serde_json::to_vec(session.records())?);
+    Ok(mac.verify_slice(tag).is_ok())
+}
+
+pub(super) fn validate_live_share_journal(
+    session: &Session,
+    snapshot: &ShareSnapshot,
+    key: Option<&[u8; 32]>,
+) -> Result<()> {
+    let matches = match (key, snapshot.journal_tag.as_ref()) {
+        (Some(key), Some(tag)) => verify_share_journal(session, key, tag)?,
+        _ => false,
+    };
+    if !matches || snapshot.session_id != session.session_id() || snapshot.head != session.head() {
+        return Err(Error::Config(
+            "Session changed while preparing the share; try again".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) enum ShareDestination {
@@ -1163,11 +1204,42 @@ mod tests {
                 .contains("authorization: bearer fixture-token")
         );
     }
+    #[test]
+    fn live_share_rejects_different_journal_with_same_session_and_head() {
+        let mut original = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        original
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let key = [42; 32];
+        let snapshot = ShareSnapshot {
+            session_id: original.session_id(),
+            head: original.head(),
+            context: ShareContext {
+                system_prompt: "live".into(),
+                tools: vec![],
+            },
+            journal_tag: Some(share_journal_tag(&original, &key).unwrap()),
+        };
+        validate_live_share_journal(&original, &snapshot, Some(&key)).unwrap();
+        let mut records = original.records().to_vec();
+        match &mut records.last_mut().unwrap().event {
+            Event::User { content, .. } => *content = "changed".into(),
+            _ => panic!("expected user record"),
+        }
+        let altered = Session::from_records(records).unwrap();
+        assert_eq!(original.session_id(), altered.session_id());
+        assert_eq!(original.head(), altered.head());
+        assert!(validate_live_share_journal(&altered, &snapshot, Some(&key)).is_err());
+        assert!(validate_live_share_journal(&original, &snapshot, Some(&[43; 32])).is_err());
+        assert!(validate_live_share_journal(&original, &snapshot, None).is_err());
+    }
+
     #[tokio::test]
     async fn radius_share_uploads_context_for_matching_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let session = Session::open(root.path().join("session.jsonl")).unwrap();
         let snapshot = ShareSnapshot {
+            journal_tag: None,
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1219,6 +1291,7 @@ mod tests {
         let session = Session::open(&path).unwrap();
         let provenance = serde_json::json!({"workspace":"fixture", "configuration":"v1"});
         let context = ShareSnapshot {
+            journal_tag: None,
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1273,6 +1346,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = Session::open(root.path().join("session.jsonl")).unwrap();
         let snapshot = ShareSnapshot {
+            journal_tag: None,
             session_id: session.session_id(),
             head: session.head() + 1,
             context: ShareContext {

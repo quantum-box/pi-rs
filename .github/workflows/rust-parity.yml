@@ -29,3 +29,7 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_upload_uses_reopened_journal_bound_cached_context
       - name: Test unavailable cache RPC startup
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli rpc_worker_starts_when_
+      - name: Test live journal integrity
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_rejects_different_journal
+      - name: Test pending share correlation
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs pending_share_keeps_extension_dialog_and_response_correlated
