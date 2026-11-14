@@ -939,13 +939,12 @@ mod tests {
         let child = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let statuses = scheduler.subagent_status(parent, Some("worker")).unwrap();
-                if let Some(status) = statuses.first() {
-                    if scheduler
+                if let Some(status) = statuses.first()
+                    && scheduler
                         .conversation(status.link.child)
                         .is_ok_and(|c| !c.submissions.is_empty())
-                    {
-                        break status.link.child;
-                    }
+                {
+                    break status.link.child;
                 }
                 tokio::task::yield_now().await;
             }
