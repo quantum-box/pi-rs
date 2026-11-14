@@ -436,7 +436,7 @@ fn has_trust_requiring_project_resources(workspace: &Path) -> bool {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .map(|path| path.canonicalize().unwrap_or(path));
-    workspace.ancestors().any(|directory| {
+    for directory in workspace.ancestors() {
         let is_home = home.as_deref().is_some_and(|home| {
             #[cfg(windows)]
             {
@@ -449,8 +449,14 @@ fn has_trust_requiring_project_resources(workspace: &Path) -> bool {
                 directory == home
             }
         });
-        !is_home && directory.join(".agents/skills").exists()
-    })
+        if !is_home && directory.join(".agents/skills").exists() {
+            return true;
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    false
 }
 
 pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
@@ -751,6 +757,25 @@ mod tests {
         .unwrap();
         // The home directory's user skills never cause a project trust prompt.
         assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        let above_repo = home.join("projects/.agents/skills/outside-example/SKILL.md");
+        std::fs::create_dir_all(above_repo.parent().unwrap()).unwrap();
+        std::fs::write(
+            &above_repo,
+            "---\nname: outside-example\ndescription: outside\n---\nOutside",
+        )
+        .unwrap();
+        // A repository boundary excludes unrelated ancestor skills, but without
+        // one the same ancestor is part of project discovery.
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        // Worktrees use a .git file rather than a directory.
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        let inside = workspace.join(".agents/skills");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        std::fs::remove_dir_all(workspace.join(".agents")).unwrap();
         let project = repo.join(".agents/skills/project-example/SKILL.md");
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
         std::fs::write(
@@ -784,6 +809,7 @@ mod tests {
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert!(resources.skills.contains_key("global-example"));
         assert!(resources.skills.contains_key("project-example"));
+        assert!(!resources.skills.contains_key("outside-example"));
         super::save_trust(&repo, false).unwrap();
         assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(false));
         super::save_trust(&repo, true).unwrap();
