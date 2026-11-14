@@ -435,7 +435,7 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
 // Pi excludes account and billing limits from agent retries even if a
 // provider wraps them in HTTP 429. Inspect only a bounded prefix and never
 // include provider response bodies in errors or logs.
-fn permanent_quota_error(body: &[u8], complete: bool) -> bool {
+fn permanent_quota_text(body: &[u8], complete: bool) -> bool {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     const MARKERS: &[&str] = &[
         "gousagelimiterror",
@@ -465,6 +465,43 @@ fn permanent_quota_error(body: &[u8], complete: bool) -> bool {
             (complete || !tail.is_empty()) && !tail.starts_with(|c: char| c.is_ascii_digit())
         })
     })
+}
+
+fn permanent_quota_value(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    if let Some(text) = error.as_str() {
+        return permanent_quota_text(text.as_bytes(), true);
+    }
+    let Some(object) = error.as_object() else {
+        return false;
+    };
+    ["message", "code", "type", "errorMessage"]
+        .iter()
+        .any(|key| {
+            let Some(value) = object.get(*key) else {
+                return false;
+            };
+            if *key == "code" && (value.as_u64() == Some(1308) || value.as_str() == Some("1308")) {
+                return true;
+            }
+            value
+                .as_str()
+                .is_some_and(|text| permanent_quota_text(text.as_bytes(), true))
+        })
+}
+
+fn permanent_quota_error(body: &[u8], complete: bool) -> bool {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => permanent_quota_value(&value),
+        Err(_)
+            if String::from_utf8_lossy(body)
+                .trim_start()
+                .starts_with(['{', '[']) =>
+        {
+            false
+        }
+        Err(_) => permanent_quota_text(body, complete),
+    }
 }
 
 async fn is_permanent_quota(mut response: Response) -> bool {
@@ -504,9 +541,11 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
         Ok(response)
     } else {
         let message = format!("Anthropic returned HTTP {status}");
-        if status.as_u16() == 429 && is_permanent_quota(response).await {
+        if (matches!(status.as_u16(), 408 | 429) || status.is_server_error())
+            && is_permanent_quota(response).await
+        {
             Err(Error::Model(
-                "Anthropic account quota or billing limit reached (HTTP 429)".into(),
+                "Anthropic account quota or billing limit reached".into(),
             ))
         } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
             Err(Error::RetryableModel(message))
@@ -1289,7 +1328,9 @@ impl Model for Anthropic {
                     }
                     Some("error") => {
                         let kind = value["error"]["type"].as_str().unwrap_or_default();
-                        Err(if matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error") {
+                        Err(if permanent_quota_value(&value["error"]) {
+                            Error::Model("Anthropic account quota or billing limit reached".into())
+                        } else if matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error") {
                             Error::RetryableModel("Anthropic returned a transient stream error".into())
                         } else {
                             Error::Model("Anthropic returned a stream error".into())
@@ -1324,12 +1365,24 @@ mod tests {
     #[test]
     fn rate_limit_response_classification_and_redaction() {
         use std::io::{Read, Write};
-        for (body, permanent) in [
+        for (status, body, permanent) in [
             (
+                429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
                 true,
             ),
-            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+            (503, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (408, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1337,7 +1390,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0; 2048];
                 let _ = stream.read(&mut request).unwrap();
-                write!(stream, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1355,11 +1408,11 @@ mod tests {
             );
             if permanent {
                 assert!(
-                    matches!(&error, pi_rs_core::Error::Model(message) if message == "Anthropic account quota or billing limit reached (HTTP 429)")
+                    matches!(&error, pi_rs_core::Error::Model(message) if message == "Anthropic account quota or billing limit reached")
                 );
             } else {
                 assert!(
-                    matches!(&error, pi_rs_core::Error::RetryableModel(message) if message == "Anthropic returned HTTP 429 Too Many Requests")
+                    matches!(&error, pi_rs_core::Error::RetryableModel(message) if message.starts_with(&format!("Anthropic returned HTTP {status} ")))
                 );
             }
             assert!(!error.to_string().contains("sentinel-secret"));
@@ -1382,11 +1435,68 @@ mod tests {
             );
         }
         assert!(!super::permanent_quota_error(br#"{"code":1308"#, false));
+        assert!(!super::permanent_quota_error(
+            br#"{"error":{"message":"rate limit"},"request_id":"billing"}"#,
+            true
+        ));
         for body in [r#"{"code":13080}"#, "rate limit exceeded", "server busy"] {
             assert!(
                 !super::permanent_quota_error(body.as_bytes(), true),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn stream_quota_error_precedes_transient_type_without_metadata_leaks() {
+        use futures_util::StreamExt;
+        use pi_rs_core::Model;
+        use std::io::{Read, Write};
+        for permanent in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let event = serde_json::json!({"type":"error","error":{"type":"overloaded_error", "message": if permanent {"quota exceeded"} else {"temporarily overloaded"}, "request_id":"billing-sentinel-secret"}});
+                let body = format!("event: error\ndata: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime.block_on(async {
+                let model =
+                    super::Anthropic::new(&format!("http://{address}/messages"), "token").unwrap();
+                let request = pi_rs_core::ModelRequest {
+                    model: "m".into(),
+                    messages: vec![pi_rs_core::Message::User {
+                        content: "hello".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let mut stream = match model.stream(request).await {
+                    Ok(stream) => stream,
+                    Err(error) => panic!("{error}"),
+                };
+                loop {
+                    match stream.next().await {
+                        Some(Err(error)) => break error,
+                        Some(Ok(_)) => {}
+                        None => panic!("missing error"),
+                    }
+                }
+            });
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
         }
     }
 

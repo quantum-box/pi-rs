@@ -4252,8 +4252,10 @@ available; model scope and picker selection retain their existing behavior.
 
 ### Messages quota retry classification
 
-Anthropic-compatible Messages requests inspect a bounded HTTP 429 response
-prefix for Pi's account, quota and billing exhaustion markers. Those failures
+Anthropic-compatible Messages requests inspect bounded retryable HTTP error
+responses and stream error fields for Pi's account, quota and billing markers.
+Structured JSON classification uses error message, code and type fields, excluding
+request identifiers and other metadata. Those failures
 stop agent retries; transient rate limits remain retryable. Response bodies are
 not surfaced or logged. Classification falls back to the existing retry behavior
 when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
