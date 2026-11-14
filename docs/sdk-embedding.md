@@ -23,9 +23,26 @@ app, a native server can own the session and expose an application-specific API.
 
 The [native host example](../examples/native_sdk_host.rs) demonstrates shared
 session state using an offline fixture; its tests check session reuse and that
-the state is `Send + Sync`. The following is a Tauri 2 integration sketch using the same
-pattern. It needs a Tauri project and its normal generated configuration; the
-Tauri glue itself is not built by this repository's CI. Add `pi-rs` (with the
+the state is `Send + Sync`. The standalone [Tauri SDK fixture](../fixtures/tauri-sdk/)
+compiles real Tauri 2 command macros and managed state against `pi-rs-core`.
+Its mock-runtime IPC test invokes two prompts, an idle abort, and close, checks
+session reuse, and confirms that a closed session rejects another prompt. Run
+it on a native host with Tauri's platform
+prerequisites installed:
+
+```sh
+cargo test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
+```
+
+The fixture disables Tauri's default features and does not build the Wry
+webview runtime. It uses a fake model and Tauri's mock runtime: it does not test
+a real webview, frontend, application lifecycle, network provider, or package.
+The repository workflow runs the fixture on macOS. Linux builds may require
+GTK development libraries even without Wry. The [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+describe the platform dependencies.
+
+The following is a Tauri 2 integration sketch using the same pattern. It
+needs a Tauri project and its normal generated configuration. Add `pi-rs` (with the
 default `ollama` feature) and `tokio` with the `sync` feature to `src-tauri`.
 Use a local path to your checkout or a pinned Git revision of this repository.
 
@@ -108,6 +125,7 @@ The public CI workflow includes a **non-gating diagnostic** running
 `cargo check --locked -p pi-rs-core --target wasm32-unknown-unknown`. Its log
 and job summary report the result; a successful compile would still not prove
 that a browser can run an agent, persist a session, or call a provider. The
-native example does not test WASM, Tauri, or a browser. Browser support needs
+native example and mock Tauri fixture do not test WASM, a real Tauri webview,
+or a browser. Browser support needs
 an explicit platform boundary, browser-safe randomness and transport, suitable
 storage, and browser execution tests before it can be claimed.
