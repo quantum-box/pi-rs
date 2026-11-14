@@ -1,6 +1,7 @@
 //! Standalone, deterministic task transitions. The host must atomically persist
 //! each transition and ensure only one executor acts on a committed task.
-//! This module does not execute tasks or implement wake-up, scheduler, or hook semantics.
+//! `task_store` provides durable wait evaluation; the host schedules polling
+//! and executes tasks after acquiring a reservation.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +20,8 @@ pub struct Checkpoint {
     pub data: Value,
 }
 
-/// Waiting conditions are opaque to this state machine and interpreted by the host.
+/// Conditions persisted with the task. Deadlines are absolute Unix milliseconds;
+/// Tasks waits for all listed direct children to reach any terminal state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitFor {
     DeadlineMillis(i64),
@@ -46,6 +48,8 @@ pub struct Task {
     /// Consecutive recoveries since the last changed checkpoint.
     restarts: u32,
     restart_limit: u32,
+    #[serde(default)]
+    delivered_signal: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +77,7 @@ impl Task {
             state: TaskState::Ready,
             restarts: 0,
             restart_limit,
+            delivered_signal: None,
         })
     }
 
@@ -93,6 +98,12 @@ impl Task {
     }
     pub fn restart_limit(&self) -> u32 {
         self.restart_limit
+    }
+
+    /// Signal receipt associated with the most recently completed wait. It is
+    /// retained across recovery and cleared when a new wait is registered.
+    pub fn delivered_signal(&self) -> Option<Uuid> {
+        self.delivered_signal
     }
 
     /// Reserve only ready work. Recovery at the limit stays ready but cannot run.
@@ -129,6 +140,7 @@ impl Task {
 
     pub fn wait(&mut self, condition: WaitFor) -> Result<(), TransitionError> {
         self.require_running()?;
+        self.delivered_signal = None;
         self.state = TaskState::Waiting(condition);
         Ok(())
     }
@@ -139,6 +151,12 @@ impl Task {
             return Err(TransitionError::InvalidState);
         }
         self.state = TaskState::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn wake_with_signal(&mut self, id: Uuid) -> Result<(), TransitionError> {
+        self.wake()?;
+        self.delivered_signal = Some(id);
         Ok(())
     }
 
@@ -164,6 +182,14 @@ impl Task {
         }
         self.state = TaskState::Cancelled;
         Ok(())
+    }
+
+    /// Terminal children satisfy a task wait regardless of their outcome.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
+        )
     }
 
     fn require_running(&self) -> Result<(), TransitionError> {
