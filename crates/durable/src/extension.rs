@@ -329,7 +329,49 @@ fn failure(extension: &str, operation: &'static str, error: String) -> Report {
 async fn protect<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
     match AssertUnwindSafe(f).catch_unwind().await {
         Ok(result) => result,
-        Err(_) => Err("extension panicked".into()),
+        Err(payload) => {
+            discard_panic_payload(payload);
+            Err("extension panicked".into())
+        }
+    }
+}
+
+pub(crate) fn discard_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    // A user-defined payload may panic when dropped. Its new panic payload may
+    // have the same property, so it cannot safely be dropped here.
+    if let Err(secondary) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(secondary);
+    }
+}
+
+#[cfg(test)]
+mod panic_boundary_tests {
+    use super::protect;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn cancelling_pending_callback_drops_it_without_completing() {
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(dropped.clone());
+        let future = protect(async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), String>>().await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), future)
+                .await
+                .is_err()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
 

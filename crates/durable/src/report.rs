@@ -258,7 +258,10 @@ impl Dispatcher {
                         progress.store(cursor, Ordering::Release);
                     }
                     Ok(Err(message)) => return Err(DispatchError::Listener { cursor, message }),
-                    Err(_) => return Err(DispatchError::Panic { cursor }),
+                    Err(payload) => {
+                        crate::extension::discard_panic_payload(payload);
+                        return Err(DispatchError::Panic { cursor });
+                    }
                 }
             }
         });
@@ -566,6 +569,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatcher_panic_preserves_cursor() {
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("payload destructor failed");
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let owner = Arc::new(OwnedStore::open(dir.path().join("reports.db")).unwrap());
         let b = batch(1);
@@ -575,7 +584,7 @@ mod tests {
         let mut dispatcher = Dispatcher::start(owner, 0, Duration::from_millis(1), move |_| {
             started.take().unwrap().send(()).unwrap();
             async move {
-                panic!("listener panic");
+                std::panic::panic_any(PanicOnDrop);
                 #[allow(unreachable_code)]
                 Ok(())
             }

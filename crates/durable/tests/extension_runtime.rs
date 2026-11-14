@@ -2035,13 +2035,19 @@ impl Section for SynchronousPanicSection {
 }
 
 struct PollPanicSection;
+struct PanicOnDrop;
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        panic!("panic payload destructor failed");
+    }
+}
 #[async_trait]
 impl Section for PollPanicSection {
     fn key(&self) -> &str {
         "poll-panic"
     }
     async fn render(&self, _: &Context<'_>) -> Result<Option<String>, String> {
-        panic!("section failed while polling")
+        std::panic::panic_any(PanicOnDrop)
     }
 }
 

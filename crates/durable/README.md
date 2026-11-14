@@ -672,6 +672,10 @@ existing continuation behavior. Reports use the same operation-and-phase
 identity and first-batch-wins rule as other extension failures. Panic payloads
 are not exposed; the report error is `extension panicked`. This does not cover
 panics when querying section keys or tool metadata, nor tool execution errors.
+The process panic hook still runs, and aborting panics cannot be caught. Catching
+an unwind does not roll back extension state or external effects; extensions
+must preserve their own invariants if reused after a panic. Cancelling a pending
+callback drops it without producing a panic report.
 
 `Harness::extension_reports()` and `Scheduler::extension_reports()` return all
 persisted batches. `subscribe_extension_reports()` provides a pull subscription
