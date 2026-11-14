@@ -5224,12 +5224,16 @@ mod tree_tests {
 
     #[tokio::test]
     async fn compaction_failure_keeps_original_error_when_listener_write_fails() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut registry = Registry::default();
         registry
             .register(Arc::new(FailedCompactionMigration))
             .unwrap();
         registry
             .register(Arc::new(CompactionFailureMessage))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(observed.clone())))
             .unwrap();
         let agent = Agent {
             model: &NoModel,
@@ -5254,9 +5258,24 @@ mod tree_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("migration failed"));
-        assert_eq!(reported.len(), 1);
-        assert_eq!(reported[0].1, "session_compact_failed");
-        assert!(reported[0].2.contains("fixture journal write failure"));
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "later listener must receive the event"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, message)| extension == "session host"
+                    && event == "session_compact_failed"
+                    && message.contains("fixture journal write failure"))
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, _)| extension == "failure-message"
+                    && event == "session_compact_failed")
+        );
         assert_eq!(session.records().len(), 1);
         assert!(
             session

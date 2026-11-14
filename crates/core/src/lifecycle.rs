@@ -360,6 +360,7 @@ pub(crate) async fn notify_session_with_host(
     let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
     let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
     let mut errors = Vec::new();
+    let mut host_error = None;
     let mut collect = |event: Notification<'_>| {
         if let Notification::ExtensionLifecycleError {
             extension,
@@ -382,7 +383,13 @@ pub(crate) async fn notify_session_with_host(
                     } else {
                         session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
                     };
-                    match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                    match result {
+                        Ok(()) => { let _ = reply.send(Ok(())); }
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                            if host_error.is_none() { host_error = Some(error); }
+                        }
+                    }
                 }
                 _ = &mut future => break,
             }
@@ -395,7 +402,10 @@ pub(crate) async fn notify_session_with_host(
             message,
         });
     }
-    Ok(())
+    match host_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn notify_inner(
