@@ -309,7 +309,7 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_result_value(
+                    let result = tool_event_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
                         Some(outcome.is_structured()),
@@ -539,6 +539,77 @@ pub(super) fn tool_result_value(
     result
 }
 
+/// Project native content-block results as Pi events without changing the
+/// separate model-facing native tool envelope.
+pub(super) fn tool_event_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: Option<bool>,
+) -> Value {
+    let mut result = tool_result_value(text, outcome, is_structured);
+    if !pi_rs::tool_content_is_structured(text, is_structured) {
+        return result;
+    }
+    let Ok(envelope) = serde_json::from_str::<Value>(text) else {
+        return result;
+    };
+    let Some(data) = envelope.get("data").and_then(Value::as_object) else {
+        return result;
+    };
+    let mut content = Vec::new();
+    let mut rejected = Vec::new();
+    let blocks = data.get("content").and_then(Value::as_array);
+    for (index, block) in blocks.into_iter().flatten().enumerate() {
+        let valid = match block["type"].as_str() {
+            Some("text") => block["text"].is_string(),
+            Some("image") => {
+                block["data"]
+                    .as_str()
+                    .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
+                    && block["mimeType"].is_string()
+            }
+            _ => false,
+        };
+        if valid {
+            content.push(block.clone());
+        } else {
+            rejected.push(json!({"index":index,"block":block}));
+        }
+    }
+    if let Some(blocks) = blocks
+        && (!content.is_empty() || blocks.is_empty())
+    {
+        result["content"] = json!(content);
+    }
+    if let Some(structured_content) = data.get("structuredContent") {
+        result["structuredContent"] = structured_content.clone();
+    }
+    if !rejected.is_empty() {
+        result["nativeRejectedBlocks"] = json!(rejected);
+    }
+    // Preserve native fields that used to be present in the text envelope.
+    let mut native = data.clone();
+    native.remove("content");
+    if let Some(attachments) = envelope
+        .get("attachments")
+        .filter(|value| value.as_array().is_some_and(|values| !values.is_empty()))
+    {
+        result["nativeAttachments"] = attachments.clone();
+    }
+    if !native.is_empty() {
+        result["nativeData"] = Value::Object(native);
+    }
+    if let Some(fields) = envelope.as_object() {
+        let mut extra = fields.clone();
+        extra.remove("data");
+        extra.remove("attachments");
+        if !extra.is_empty() {
+            result["nativeEnvelope"] = Value::Object(extra);
+        }
+    }
+    result
+}
+
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
@@ -573,6 +644,216 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn multimodal_tool_events_preserve_order_and_native_metadata() {
+        let blocks = json!([
+            {"type":"text","text":"before"},
+            {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+            {"type":"text","text":"after"},
+            {"type":"image","mimeType":"image/jpeg","data":"cGhvdG8="}
+        ]);
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":blocks,"structuredContent":{"answer":42},"wall_time_seconds":1.25}),
+            attachments: vec![pi_rs::AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+            details: json!({"code":42}),
+        };
+        let operation_id = Uuid::new_v4();
+        let invocation = Invocation {
+            operation_id,
+            call: ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut stream = Stream::default();
+        stream.calls.insert(operation_id, (invocation, None));
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: outcome.clone(),
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(message["message"]["content"], blocks);
+        assert_eq!(end["result"]["details"], json!({"code":42}));
+        assert_eq!(end["result"]["structuredContent"], json!({"answer":42}));
+        assert_eq!(end["result"]["nativeData"]["wall_time_seconds"], 1.25);
+        assert_eq!(end["result"]["nativeAttachments"][0]["id"], "asset");
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, Some(true))["content"],
+            blocks
+        );
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, None)["content"],
+            blocks
+        );
+        // Provider-facing native content remains the original envelope.
+        assert!(tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"][0]["text"].as_str().unwrap().contains("[image attached]"));
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_plain_and_unknown_structured_data() {
+        let plain = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        assert_eq!(
+            tool_event_result_value(plain, None, Some(false)),
+            json!({"content":[{"type":"text","text":plain}]})
+        );
+        let outcome = Outcome::Structured {
+            data: json!({"content":[{"type":"custom","value":1}]}),
+            attachments: vec![],
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(
+            result["content"],
+            tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"]
+        );
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"]["type"], "custom");
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_valid_blocks_around_rejected_images() {
+        let oversized = "A".repeat(8 * 1024 * 1024 + 1);
+        let rejected_mime = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let rejected_size = json!({"type":"image","mimeType":"image/png","data":oversized});
+        let supported = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"before"}, rejected_mime, supported, rejected_size, {"type":"text","text":"after"}], "nativeInfo":"kept"}),
+            attachments: vec![],
+            details: json!({"code":42}),
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"before"}, rejected_mime, supported, {"type":"text","text":"after"}])
+        );
+        assert_eq!(result["nativeRejectedBlocks"][0]["index"], 3);
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"], rejected_size);
+        assert_eq!(result["nativeData"]["nativeInfo"], "kept");
+        assert_eq!(result["details"]["code"], 42);
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap()["result"],
+            result
+        );
+        let message = &events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap()["message"];
+        assert_eq!(message["content"], result["content"]);
+        assert_eq!(
+            message["nativeRejectedBlocks"],
+            result["nativeRejectedBlocks"]
+        );
+    }
+
+    #[test]
+    fn multimodal_legacy_envelope_preserves_structured_content_and_extra_fields() {
+        let envelope = json!({
+            "data": {
+                "content": [
+                    {"type":"text","text":"before"},
+                    {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
+                    {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                    {"type":"text","text":"after"}
+                ],
+                "structuredContent": {"answer":42},
+                "otherData": true
+            },
+            "attachments": [],
+            "extra": {"origin":"legacy"}
+        });
+        let result = tool_event_result_value(&envelope.to_string(), None, None);
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
+        assert_eq!(
+            result["nativeData"]["structuredContent"],
+            json!({"answer":42})
+        );
+        assert_eq!(result["nativeData"]["otherData"], true);
+        assert_eq!(
+            result["nativeEnvelope"],
+            json!({"extra":{"origin":"legacy"}})
+        );
+        assert_eq!(
+            result["content"],
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
+                {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                {"type":"text","text":"after"}
+            ])
+        );
+        assert!(result.get("nativeRejectedBlocks").is_none());
+    }
+
+    #[test]
+    fn structured_content_survives_missing_or_unprojectable_content() {
+        for content in [None, Some(json!([{"type":"custom","value":1}]))] {
+            let mut data = json!({"structuredContent":{"answer":42}});
+            if let Some(content) = content {
+                data["content"] = content;
+            }
+            let outcome = Outcome::Structured {
+                data,
+                attachments: vec![],
+            };
+            let result =
+                tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+            assert_eq!(result["structuredContent"], json!({"answer":42}));
+        }
+        let image = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let outcome = Outcome::Structured {
+            data: json!({"content":[image],"structuredContent":{"answer":42}}),
+            attachments: vec![],
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(result["content"], json!([image]));
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
+    }
 
     #[test]
     fn patched_result_projects_verbatim_content_details_and_error() {

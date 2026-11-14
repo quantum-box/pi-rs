@@ -632,7 +632,7 @@ impl Projection {
                     .map_or("", |invocation| invocation.call.name.as_str());
                 let outcome = operation.map(|(_, outcome)| outcome);
                 let mut value =
-                    super::rpc_events::tool_result_value(content, outcome, *is_structured);
+                    super::rpc_events::tool_event_result_value(content, outcome, *is_structured);
                 value["role"] = json!("toolResult");
                 value["toolCallId"] = json!(call_id);
                 value["toolName"] = json!(name);
@@ -749,6 +749,44 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn reconstructed_native_tool_message_preserves_multimodal_order() {
+        let blocks = json!([
+            {"type":"text","text":"before"},
+            {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+            {"type":"text","text":"after"}
+        ]);
+        let outcome = pi_rs::Outcome::StructuredWithDetails {
+            data: json!({"content":blocks,"structuredContent":{"answer":42},"duration":3}),
+            attachments: vec![],
+            details: json!({"source":"fixture"}),
+        };
+        let record = Record {
+            timestamp: None,
+            run_id: None,
+            version: 1,
+            id: 1,
+            parent: None,
+            event: Event::ToolFinished {
+                operation_id: Uuid::new_v4(),
+                outcome: outcome.clone(),
+                states: Default::default(),
+            },
+        };
+        let message = Message::Tool {
+            call_id: "call".into(),
+            content: outcome.tool_content(),
+            is_error: false,
+            is_structured: Some(true),
+        };
+        let value =
+            Projection::default().message(std::slice::from_ref(&record), &record, &message, false);
+        assert_eq!(value["content"], blocks);
+        assert_eq!(value["nativeData"]["duration"], 3);
+        assert_eq!(value["structuredContent"], json!({"answer":42}));
+        assert_eq!(value["details"]["source"], "fixture");
+    }
 
     #[test]
     fn markerless_custom_provider_keeps_logical_identity() {
