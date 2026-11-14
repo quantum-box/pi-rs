@@ -536,6 +536,7 @@ impl Harness {
         let (mut state, _) = self.load(parent)?;
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
+            || !state.pending_resets.is_empty()
             || state
                 .submissions
                 .iter()
@@ -550,9 +551,12 @@ impl Harness {
         state.submissions.clear();
         state.aborted_generations.clear();
         state.resets.clear();
+        state.pending_resets.clear();
         state.input_modes.clear();
         state.answer_ids.clear();
         state.auto_compaction_attempted = false;
+        state.retry_state = RetryState::default();
+        state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
         Ok(state)
