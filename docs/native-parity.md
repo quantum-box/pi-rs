@@ -206,9 +206,10 @@ uses its DeepSeek-style thinking switch. Subscription OAuth supports device
 login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
 remains open.
 
-Markdown links use the reference's non-hyperlink terminal fallback: link text
-is underlined and destinations appear in parentheses only when they differ from
-the visible URL or email address. OSC 8 hyperlink capability remains open.
+On terminals without OSC 8 support, Markdown links use the reference's text
+fallback: link text is underlined and destinations appear in parentheses only
+when they differ from the visible URL or email address. Supported terminals use
+OSC 8 hyperlinks, as described in the terminal capabilities checkpoint below.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
