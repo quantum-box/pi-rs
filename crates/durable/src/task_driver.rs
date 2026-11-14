@@ -181,7 +181,9 @@ impl Driver {
     /// Persist the abort without waiting for a running handler. The handler's
     /// output is discarded when it returns; cleanup then runs on the worker.
     pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
-        let _state = self.check()?;
+        // A conversation worker can consult driver state while holding its
+        // execution gate. Do not hold driver state while fencing those gates.
+        drop(self.check()?);
         if let Some(harness) = &self.shared.harness {
             let mut harness = harness.lock().map_err(|_| Error::Poisoned)?;
             self.shared
