@@ -3031,17 +3031,18 @@ mod tests {
                     .collect()
             }
         }
-        struct DefaultInner;
+        struct DefaultInner(AtomicUsize);
         #[async_trait::async_trait]
         impl ToolHost for DefaultInner {
             fn tools(&self) -> Vec<crate::ToolSpec> {
                 vec![]
             }
             async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 crate::Outcome::Succeeded("ok".into())
             }
         }
-        let default_inner: Arc<dyn ToolHost> = Arc::new(DefaultInner);
+        let default_inner = Arc::new(DefaultInner(AtomicUsize::new(0)));
         let default_owner = OwnerBoundHost {
             inner: default_inner.clone(),
             owner_id: Uuid::new_v4(),
@@ -3059,6 +3060,18 @@ mod tests {
                 ("valid".into(), Some(serde_json::json!({}))),
             ]
         };
+        let denied =
+            vec![crate::Outcome::Skipped("host cannot account for prevalidated calls".into()); 2];
+        assert_eq!(default_inner.call_batch_prevalidated(calls()).await, denied);
+        assert_eq!(default_owner.call_batch_prevalidated(calls()).await, denied);
+        assert_eq!(default_inner.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            default_inner
+                .call_batch_prevalidated(vec![("valid".into(), Some(serde_json::json!({})))])
+                .await,
+            vec![crate::Outcome::Succeeded("ok".into())]
+        );
+        assert_eq!(default_inner.0.load(Ordering::SeqCst), 1);
         assert_eq!(
             owner.call_batch_prevalidated(calls()).await,
             vec![
@@ -3087,10 +3100,15 @@ mod tests {
         };
         assert!(scoped.supports_prevalidated_call_accounting());
         let default_scoped = ScopedIdleHost {
-            inner: default_inner,
+            inner: default_inner.clone(),
             scope: scoped.scope.clone(),
         };
         assert!(!default_scoped.supports_prevalidated_call_accounting());
+        assert_eq!(
+            default_scoped.call_batch_prevalidated(calls()).await,
+            denied
+        );
+        assert_eq!(default_inner.0.load(Ordering::SeqCst), 1);
         assert_eq!(
             scoped.call_batch_prevalidated(calls()).await,
             vec![

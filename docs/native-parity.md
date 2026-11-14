@@ -2099,7 +2099,8 @@ Shell-progress and SDK host wrappers forward prevalidated positions; the
 duplex host proxy advertises this support only when its underlying host opts in
 to charging every position against its ordered call budget. A peer or custom
 host without that capability rejects a batch containing an oversized call
-rather than bypassing its call budget.
+rather than bypassing its call budget. The default in-process `ToolHost`
+implementation applies the same fail-closed rule to direct callers.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count

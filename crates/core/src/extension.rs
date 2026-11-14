@@ -375,35 +375,27 @@ pub trait ToolHost: Send + Sync {
         false
     }
     /// Submit calls whose arguments were size-checked before decoding. `None`
-    /// marks an oversized argument and must never be dispatched.
+    /// marks an oversized argument and must never be dispatched. The default
+    /// rejects the whole batch if any position was rejected; hosts that opt in
+    /// to accounting must override it to charge and handle every position.
     #[doc(hidden)]
     async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
-        let mut positions = Vec::with_capacity(calls.len());
-        let mut valid = Vec::new();
-        for (name, arguments) in calls {
-            positions.push(arguments.is_some());
-            if let Some(arguments) = arguments {
-                valid.push((name, arguments));
-            }
+        if calls.iter().any(|(_, arguments)| arguments.is_none()) {
+            return calls
+                .into_iter()
+                .map(|_| Outcome::Skipped("host cannot account for prevalidated calls".into()))
+                .collect();
         }
-        let mut outcomes = if valid.is_empty() {
-            Vec::new()
-        } else {
-            self.call_batch(valid).await
+        if calls.is_empty() {
+            return Vec::new();
         }
-        .into_iter();
-        positions
-            .into_iter()
-            .map(|valid| {
-                if valid {
-                    outcomes
-                        .next()
-                        .unwrap_or_else(|| Outcome::Unknown("nested tool response was lost".into()))
-                } else {
-                    Outcome::Skipped("nested tool arguments exceed size limit".into())
-                }
-            })
-            .collect()
+        self.call_batch(
+            calls
+                .into_iter()
+                .map(|(name, arguments)| (name, arguments.expect("checked above")))
+                .collect(),
+        )
+        .await
     }
 }
 

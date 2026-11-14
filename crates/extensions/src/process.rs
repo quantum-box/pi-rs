@@ -5809,10 +5809,18 @@ else:
             cancellation: CancellationToken::new(),
         };
         let outcome = tool
-            .invoke_transaction(serde_json::json!({}), context, None, wrapper)
+            .invoke_transaction(serde_json::json!({}), context, None, wrapper.clone())
             .await
             .outcome;
         assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+        let calls = vec![
+            ("large".into(), None),
+            ("valid".into(), Some(serde_json::json!({}))),
+        ];
+        let denied = vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2];
+        assert_eq!(host.call_batch_prevalidated(calls.clone()).await, denied);
+        assert_eq!(wrapper.call_batch_prevalidated(calls).await, denied);
         assert_eq!(host.0.load(Ordering::SeqCst), 1);
     }
 
