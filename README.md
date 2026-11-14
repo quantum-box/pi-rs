@@ -111,6 +111,24 @@ configuration, and the Rust API for writing and registering another extension.
 [The parity checklist](docs/native-parity.md) tracks the remaining Pi v1.5.0
 features and distinguishes implemented behavior from planned work.
 
+## Embed the Rust SDK
+
+`pi-rs-core` provides owned sessions through `SessionBuilder` and
+`AgentSession`. A model adapter, such as `pi-rs-ollama`, supplies the model
+connection. The SDK starts with an empty tool registry; hosts choose which
+tools and extensions to register.
+
+For a minimal local Ollama example, start Ollama, pull a model, and run:
+
+```sh
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-ollama --example sdk_chat
+```
+
+Set `PI_RS_EXAMPLE_MODEL` to use another model. See
+[the embedding guide](docs/sdk-embedding.md) for native application and
+Tauri integration, session lifetime, and browser considerations.
+
 ## Run locally
 
 Requires Rust 1.89 or newer, Ollama, and a local model that supports tools. The
