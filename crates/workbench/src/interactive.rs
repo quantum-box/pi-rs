@@ -1962,6 +1962,7 @@ impl View {
     }
 
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
+        let _strike_budget = crate::ui::strike::frame_budget();
         self.expand_key = keys.first_binding("app.tools.expand");
         if args.tui_mode == Some(TuiMode::Regular) {
             return self.draw_regular(args, theme, busy, keys);

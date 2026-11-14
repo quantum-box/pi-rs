@@ -873,7 +873,7 @@ fn safe_hyperlink(url: &str) -> bool {
 
 // Parser formatting can split a local part across text events. Do not link a
 // trailing fragment if the original source immediately continues the address.
-fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
+pub(super) fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
     let mut has_content = false;
     for c in text[lower_bound..start].chars().rev() {
         if c.is_alphanumeric()
@@ -1780,6 +1780,74 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn marked_strike_runs_keep_safe_autolink_boundaries() {
+        let theme = Theme::system();
+        for source in [
+            "o’connor@example.com ~~x~~",
+            "user@example.com.中国 ~~x~~",
+            "www.user?tag@example.com ~~x~~",
+            "~~o’connor@example.com~~",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.hyperlink.is_none()),
+                "{source}: {lines:?}"
+            );
+        }
+        let oversized = format!("o’connor@example.com ~~{}", "x".repeat(65_536));
+        let lines = markdown_at_depth(
+            &oversized,
+            &theme,
+            160,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.hyperlink.is_none())
+        );
+        for (source, expected) in [
+            ("~~user@example.com~~", "mailto:user@example.com"),
+            ("~~https://example.com/path~~", "https://example.com/path"),
+            (
+                "[www.user?tag@example.com](https://example.com) ~~x~~",
+                "https://example.com",
+            ),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some(expected)),
+                "{source}: {lines:?}"
+            );
+        }
+    }
     #[test]
     fn strict_strike_matches_pinned_marked_delimiters_and_code_boundaries() {
         let theme = Theme::system();

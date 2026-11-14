@@ -3,7 +3,7 @@
 //! Pulldown continues to parse blocks. Runs containing double tildes use the
 //! actual pinned Marked inline lexer because its deletion precedence can end
 //! inside a code span, emphasis span, or link destination parsed by pulldown.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,36 @@ use rquickjs::{Context, Function, Runtime};
 use serde_json::{Value, json};
 
 type Spanned = (Event<'static>, Range<usize>);
+
+const FRAME_TIME: Duration = Duration::from_millis(20);
+const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+const MAX_RUN_BYTES: usize = 64 * 1024;
+const MAX_REFS: usize = 256;
+const MAX_REF_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_BYTES: usize = 512 * 1024;
+
+thread_local! {
+    static FRAME_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+pub(crate) struct FrameBudget(Option<Instant>);
+
+pub(crate) fn frame_budget() -> FrameBudget {
+    FrameBudget(FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now() + FRAME_TIME))))
+}
+
+fn frame_expired() -> bool {
+    FRAME_DEADLINE.with(|cell| {
+        cell.get()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    })
+}
+
+impl Drop for FrameBudget {
+    fn drop(&mut self) {
+        FRAME_DEADLINE.with(|cell| cell.set(self.0));
+    }
+}
 
 struct InlineLexer {
     runtime: Runtime,
@@ -32,23 +62,35 @@ impl InlineLexer {
         Ok(Self { runtime, context })
     }
     fn tokens(&self, text: &str, refs: &RefDefs<'_>) -> Option<Vec<Value>> {
-        let links: serde_json::Map<String, Value> = refs
-            .iter()
-            .map(|(name, def)| {
-                (
-                    name.split(|ch: char| {
-                        (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}'
-                    })
+        let deadline = FRAME_DEADLINE
+            .with(|cell| cell.get())
+            .unwrap_or_else(|| Instant::now() + FRAME_TIME);
+        if text.len() > MAX_RUN_BYTES || Instant::now() >= deadline {
+            return None;
+        }
+        let mut links = serde_json::Map::new();
+        let mut bytes = 0usize;
+        for (name, def) in refs.iter() {
+            bytes = bytes
+                .saturating_add(name.len())
+                .saturating_add(def.dest.len())
+                .saturating_add(def.title.as_ref().map_or(0, |title| title.len()));
+            if links.len() >= MAX_REFS || bytes > MAX_REF_BYTES || Instant::now() >= deadline {
+                return None;
+            }
+            links.insert(
+                name.split(|ch: char| (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}')
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join(" ")
                     .to_lowercase(),
-                    json!({"href": def.dest.as_ref(), "title": def.title.as_deref()}),
-                )
-            })
-            .collect();
+                json!({"href": def.dest.as_ref(), "title": def.title.as_deref()}),
+            );
+        }
         let links = serde_json::to_string(&links).ok()?;
-        let deadline = Instant::now() + Duration::from_secs(1);
+        if Instant::now() >= deadline {
+            return None;
+        }
         self.runtime
             .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
         let result = self.context.with(|ctx| {
@@ -56,7 +98,11 @@ impl InlineLexer {
             function.call::<_, String>((text, links))
         });
         self.runtime.set_interrupt_handler(None);
-        serde_json::from_str(&result.ok()?).ok()
+        let result = result.ok()?;
+        if result.len() > MAX_TOKEN_BYTES || Instant::now() >= deadline {
+            return None;
+        }
+        serde_json::from_str(&result).ok()
     }
 }
 thread_local! {
@@ -168,10 +214,19 @@ fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
     )
 }
 
-fn token_nodes(tokens: &[Value], source: &str, offsets: &[usize]) -> Option<Vec<Node>> {
+fn token_nodes(
+    tokens: &[Value],
+    source: &str,
+    offsets: &[usize],
+    whole: &str,
+    run_start: usize,
+) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
     for token in tokens {
+        if frame_expired() {
+            return None;
+        }
         let raw = token.get("raw")?.as_str()?;
         let end = cursor.checked_add(raw.len())?;
         if source.get(cursor..end)? != raw {
@@ -200,14 +255,48 @@ fn token_nodes(tokens: &[Value], source: &str, offsets: &[usize]) -> Option<Vec<
                 .iter()
                 .map(|offset| offsets.get(cursor + offset).copied())
                 .collect::<Option<Vec<_>>>()?;
-            token_nodes(children, text, &child_offsets)
+            token_nodes(children, text, &child_offsets, whole, run_start)
         };
         let group = match kind {
             "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
             "strong" => Some((Tag::Strong, TagEnd::Strong)),
             "em" => Some((Tag::Emphasis, TagEnd::Emphasis)),
             "link" => {
-                let href = token.get("href")?.as_str()?.to_owned();
+                let mut href = token.get("href")?.as_str()?.to_owned();
+                // Marked emits bare URL/email tokens as links. Route only those
+                // through the native destination guards; explicit links retain
+                // their authored destination.
+                if !raw.starts_with('[') && !raw.starts_with('<') {
+                    let absolute_start = span.start;
+                    let absolute_end = span.end;
+                    let tail = whole.get(absolute_end..)?;
+                    let extra = tail.char_indices().nth(2).map_or(tail.len(), |(i, _)| i);
+                    let candidate = whole.get(absolute_start..absolute_end + extra)?;
+                    let safe = super::render::bare_links(candidate)
+                        .into_iter()
+                        .next()
+                        .filter(|(range, _)| {
+                            range.start == 0 && range.end == absolute_end - absolute_start
+                        })
+                        .and_then(|(_, url)| url)
+                        .filter(|url| {
+                            !url.starts_with("mailto:")
+                                || !super::render::has_email_prefix(
+                                    whole,
+                                    absolute_start,
+                                    run_start,
+                                )
+                        });
+                    if let Some(url) = safe {
+                        href = url;
+                    } else {
+                        // InlineHtml is rendered as literal text and is not
+                        // passed through the bare-link detector a second time.
+                        result.push(Node::Leaf((Event::InlineHtml(raw.to_owned().into()), span)));
+                        cursor = end;
+                        continue;
+                    }
+                }
                 let title = token
                     .get("title")
                     .and_then(Value::as_str)
@@ -261,7 +350,7 @@ fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: 
     let Some(source) = original.get(start..end) else {
         return nodes;
     };
-    if !source.contains("~~") {
+    if !source.contains("~~") || source.len() > MAX_RUN_BYTES || frame_expired() {
         return nodes;
     }
     // Marked's block table lexer removes a backslash before each pipe before
@@ -279,7 +368,7 @@ fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: 
             .and_then(|lexer| lexer.tokens(&source, refs))
     });
     tokens
-        .and_then(|tokens| token_nodes(&tokens, &source, &offsets))
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start))
         .unwrap_or(nodes)
 }
 fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: bool) -> Vec<Node> {
@@ -320,7 +409,7 @@ fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: boo
 
 pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Spanned> {
     let parser = Parser::new_ext(parsed, options);
-    if !original.contains("~~") {
+    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !original.contains("~~") {
         return parser
             .into_offset_iter()
             .map(|(event, range)| (event.into_static(), range))
@@ -342,4 +431,58 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
         node.flatten(&mut output);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_frame_budget_applies_to_every_inline_run_and_is_restored() {
+        let previous = FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now())));
+        let text = "~~first~~\n\n~~second~~";
+        let result = events(text, text, Options::empty());
+        assert!(
+            !result
+                .iter()
+                .any(|(event, _)| matches!(event, Event::Start(Tag::Strikethrough)))
+        );
+        {
+            let _budget = frame_budget();
+            assert!(FRAME_DEADLINE.with(|cell| cell.get().unwrap() > Instant::now()));
+        }
+        assert!(FRAME_DEADLINE.with(|cell| cell.get().unwrap() <= Instant::now()));
+        FRAME_DEADLINE.with(|cell| cell.set(previous));
+    }
+
+    #[test]
+    fn oversized_runs_and_reference_maps_fall_back_without_lexing() {
+        let lexer = InlineLexer::new().unwrap();
+        let blank = Parser::new("");
+        assert!(
+            lexer
+                .tokens(
+                    &format!("~~{}", "x".repeat(MAX_RUN_BYTES)),
+                    blank.reference_definitions()
+                )
+                .is_none()
+        );
+        let refs = (0..=MAX_REFS)
+            .map(|i| format!("[r{i}]: https://example.com/{i}\n"))
+            .collect::<String>();
+        let parsed = Parser::new(&refs);
+        assert_eq!(parsed.reference_definitions().iter().count(), MAX_REFS + 1);
+        assert!(
+            lexer
+                .tokens("~~ok~~", parsed.reference_definitions())
+                .is_none()
+        );
+        let document = format!("~~ok~~\n\n{}", "x".repeat(MAX_DOCUMENT_BYTES));
+        let result = events(&document, &document, Options::empty());
+        assert!(
+            !result
+                .iter()
+                .any(|(event, _)| matches!(event, Event::Start(Tag::Strikethrough)))
+        );
+    }
 }

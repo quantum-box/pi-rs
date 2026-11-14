@@ -818,8 +818,12 @@ Link destinations and strikethrough formatting are rendered. Single-tilde
 pairs remain literal. Inline runs containing double tildes use the pinned Pi
 Marked lexer and its strict deletion tokenizer, including escaped delimiters,
 code-span crossings, and inline or reference link destinations. The lexer is
-resource bounded; if it cannot tokenize a run, that run is rendered without
-strikethrough. Table tests cover Japanese text and narrow terminal widths.
+resource bounded across the entire terminal frame, including reference-definition
+preparation; oversized documents, runs or reference sets fall back without
+strikethrough.
+Automatically detected links in lexer output retain native recipient and
+ambiguous-address guards; explicit links retain their chosen destinations.
+Table tests cover Japanese text and narrow terminal widths.
 
 The core Session and owned SDK also support no-overwrite JSONL export and
 persistent branch forks. Forks receive a fresh session identity and can be
