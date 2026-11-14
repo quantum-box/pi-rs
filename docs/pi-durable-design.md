@@ -20,7 +20,7 @@ on-disk compatibility with any of those adapters.
 | Concern | Upstream Durable at the reference revision | pi-rs today / proposed difference |
 | --- | --- | --- |
 | Commit | A session commit atomically updates entries, task records and documents. Stored commits publish in line order after durability; explicitly deferred document-only commits can be visible before storage and lost on crash. | `SessionStore::append` stores one journal record; `FileStore` writes newline-delimited JSON and syncs it. It is not a multi-record transaction. New Durable storage will use atomic batches and initially **no deferred visibility**. |
-| Recovery | `resume()` schedules persisted work. Tool intent precedes execution; a cut-off call reruns only when both stored and current tool registrations say `replay: "safe"`; otherwise upstream settles it as interrupted. Restart limits bound crash loops. | Existing journal distinguishes planned, started, pending, unknown and finished operations. Uncertain dispatched effects block progress until reconciliation. Preserve that conservative behavior in the new engine: do not silently turn uncertainty into a model-visible failure or automatically replay an external effect. |
+| Recovery | `resume()` schedules persisted work. Tool intent precedes execution; a cut-off call reruns only when both stored and current tool registrations say `replay: "safe"`; otherwise upstream settles it as interrupted. Restart limits bound crash loops. | Existing journal distinguishes planned, started, pending, unknown and finished operations. Uncertain dispatched effects block progress until reconciliation. Keep that conservative behavior in the existing engine. Durable defaults to upstream interruption semantics, with an explicit host policy requiring reconciliation for uncertain effects. |
 | Nested calls | Durable tasks are owned; a replay-safe parent can recover nested calls by position or explicit key. An interrupted child follows its own replay policy; external idempotency is still the adapter's responsibility. | Existing operation and nested-call journal behavior is not a general durable task graph. Add stable keyed child identities and ownership explicitly; do not claim identical nested replay until tested. |
 | Admission | Durable has submissions, request IDs, settlement, and durable waiting/sleeping tasks. | Existing conversation input is journal based, not a Durable submission API. Implement these as new APIs; translate only where semantics are established. |
 | Concurrency | One Session mutation line serializes callbacks, with ordered publication and storage batching. | Existing local journal takes an exclusive file lock. Proposed Durable store has one exclusive writer per store lifetime, including across processes; no distributed writer or multi-host failover in the initial backend. |
@@ -77,8 +77,8 @@ can be rebuilt.
 
 1. A submission is admitted atomically with its request identity and initial
    task. `(session, conversation, request_id)` identifies one logical request;
-   same ID and canonical payload returns the same receipt, different payload
-   is a conflict. IDs are not reused, including after restart. Admission and
+   the same ID and submission type returns the same receipt even when the
+   resent content differs, matching upstream. A different type is a conflict. IDs are not reused, including after restart. Admission and
    settlement are distinct; cancelling a client wait does not retract work.
 2. A task's persisted state is `ready`, `running` with phase and attempt,
    `waiting` (deadline, signals or child IDs), `succeeded`, `failed`, or
@@ -122,14 +122,14 @@ proof that a remote job stopped.
 | --- | --- |
 | Before intent commit | No dispatch is permitted. Retry admission with its original request ID. |
 | Intent committed, dispatch not known to have begun | Unless non-dispatch is durably proven, treat the operation as possibly executed; do not infer safety from absence of a result. |
-| During dispatch, or remote success before outcome commit | Mark/block as unknown and query authoritative destination by stable key or require an authorized resolution. No automatic repeat of an unsafe effect. |
+| During dispatch, or remote success before outcome commit | Unsafe effects are never automatically repeated. Upstream-compatible policy records an interruption; the optional reconciliation policy blocks until an authoritative resolution. |
 | Outcome commit durable, acknowledgement lost | Reopen, find the committed outcome by operation ID, return it; do not dispatch again. |
 | Remote job accepted, completion outstanding | Persist its stable reference and pending status; resume read-only polling with bounded backoff. A timeout or ambiguous response remains pending/unknown, not a definitive failure. |
 
 A known successful or failed outcome may be committed only with adequate
 adapter evidence. Reconciliation records evidence, actor/source, operation ID
 and resolution in an auditable atomic transition; conflicting or repeated
-resolutions must not create another effect. Resume model work only after all
+resolutions must not create another effect. Under the reconciliation policy, resume model work only after all
 blocking operations are resolved. An authoritative not-found result permits a
 new attempt only when the destination contract proves non-execution and the
 host explicitly allows it.
@@ -178,8 +178,8 @@ unsupported-path handling, migration rollback and WAL-aware backup/restore.
 
 **Phase 2 — scheduler and submissions.** Crash after admission and in every
 task transition; reopen and verify one logical submission, no lost tasks and
-one terminal settlement. Verify concurrent duplicate admissions, payload
-conflicts, idempotent `resume`, timer already due after downtime, duplicate
+one terminal settlement. Verify concurrent duplicate admissions, same-ID different-content reuse,
+different-type conflicts, idempotent `resume`, timer already due after downtime, duplicate
 signals, child wait/ownership, cancellation, missing definitions and bounded
 crash loops. Confirm provisional output is never presented as committed after
 restart.
@@ -196,7 +196,7 @@ are checked; a changed registration must not permit replay.
 
 **Phase 4 — compatibility and integration.** Run common upstream behavioral
 fixtures for submissions, forks, task ownership, waits and tool interruption;
-record the deliberate unknown/reconciliation and no-deferred-visibility
+record the optional reconciliation policy and initial no-deferred-visibility
 differences in parity docs. Exercise CLI/RPC/TUI only after their mapping to
 Durable is specified, including restart while streaming, branch selection and
 errors. Run existing journal and extension suites and verify no implicit import,

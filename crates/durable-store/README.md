@@ -26,7 +26,5 @@ the upstream durable record schema, deferred commits, or session API. The
 upstream specification's atomic visibility rule informed the design:
 https://github.com/earendil-works/pi/blob/main/packages/durable/docs/spec.md
 
-The crate contains its own `[workspace]` so it can be tested independently;
-remove that section if adding it as a member of the repository's workspace.
 The SQLite tables are `durable_store_meta(id, version)` and
 `durable_store_entries(key, value, version)`; they are implementation details.
