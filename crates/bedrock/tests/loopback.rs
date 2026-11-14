@@ -426,17 +426,18 @@ async fn service_errors_include_safe_diagnostics_and_classify_stream_validation(
 #[tokio::test]
 async fn quota_throttling_is_permanent_in_response_and_stream() {
     for streaming in [false, true] {
-        for permanent in [false, true] {
+        for case in [0, 1, 2] {
+            let permanent = case != 0;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0; 8192];
                 let _ = socket.read(&mut buffer).await.unwrap();
-                let message = if permanent {
-                    "account quota exceeded sentinel-private"
-                } else {
-                    "temporary rate limit"
+                let message = match case {
+                    1 => "account quota exceeded sentinel-private".to_owned(),
+                    2 => format!("{} quota exceeded sentinel-private", "x".repeat(520)),
+                    _ => "temporary rate limit".to_owned(),
                 };
                 let body = json!({"message":message}).to_string();
                 if streaming {

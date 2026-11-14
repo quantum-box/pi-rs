@@ -516,6 +516,42 @@ fn required_text(text: String) -> String {
         text
     }
 }
+// Inspect at most 64 KiB of source text, redacting complete secrets before
+// copying any bytes. This bounds allocations even for untrusted long errors.
+fn bounded_redacted(value: &str, secrets: &[String], max_chars: usize) -> String {
+    const MAX_SCAN_BYTES: usize = 64 * 1024;
+    let mut output = String::new();
+    let mut offset = 0;
+    let mut count = 0;
+    while offset < value.len() && offset < MAX_SCAN_BYTES && count < max_chars {
+        let tail = &value[offset..];
+        if let Some(secret) = secrets
+            .iter()
+            .find(|secret| !secret.is_empty() && tail.starts_with(secret.as_str()))
+        {
+            for c in "[REDACTED]".chars() {
+                if count == max_chars {
+                    break;
+                }
+                output.push(c);
+                count += 1;
+            }
+            offset = offset.saturating_add(secret.len());
+            continue;
+        }
+        let c = tail.chars().next().expect("nonempty tail");
+        if offset + c.len_utf8() > MAX_SCAN_BYTES {
+            break;
+        }
+        offset += c.len_utf8();
+        if !c.is_control() {
+            output.push(c);
+            count += 1;
+        }
+    }
+    output
+}
+
 fn diagnostic(
     meta: &aws_smithy_types::error::metadata::ErrorMetadata,
     fallback_id: Option<&str>,
@@ -530,12 +566,6 @@ fn diagnostic(
         }
         value
     };
-    let clean = |s: &str| {
-        s.chars()
-            .filter(|c| !c.is_control())
-            .take(512)
-            .collect::<String>()
-    };
     let mut parts = vec!["Bedrock error".to_owned()];
     if let Some(code) = meta.code().filter(|s| {
         !s.is_empty()
@@ -547,7 +577,7 @@ fn diagnostic(
     }
     if let Some(message) = meta
         .message()
-        .map(|message| clean(&redact(message)))
+        .map(|message| bounded_redacted(message, secrets, 512))
         .filter(|s| !s.trim().is_empty())
     {
         parts.push(message);
@@ -792,20 +822,7 @@ fn bedrock_service_error(
     let permanent = [meta.message(), meta.code()]
         .into_iter()
         .flatten()
-        .any(|value| {
-            let mut value = value.to_owned();
-            for secret in secrets {
-                if !secret.is_empty() {
-                    value = value.replace(secret, "[REDACTED]");
-                }
-            }
-            let bounded: String = value
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(512)
-                .collect();
-            permanent_bedrock_limit(&bounded)
-        });
+        .any(|value| permanent_bedrock_limit(&bounded_redacted(value, secrets, 64 * 1024)));
     if retryable && permanent {
         Error::Model("Bedrock account quota or billing limit reached".into())
     } else if retryable {
@@ -1401,6 +1418,27 @@ mod tests {
             bedrock_service_error("validation failed".into(), false, &meta, &[]),
             Error::Model(_)
         ));
+    }
+
+    #[test]
+    fn quota_scan_is_bounded_and_masks_secrets_before_classification() {
+        use aws_smithy_types::error::metadata::ErrorMetadata;
+        let secrets = vec!["billing-secret".to_owned()];
+        for (message, permanent) in [
+            (format!("{} quota exceeded", "x".repeat(520)), true),
+            (format!("{} quota exceeded", "x".repeat(64 * 1024)), false),
+            ("temporary billing-secret".to_owned(), false),
+            (
+                format!("{}billing-secret", "x".repeat(64 * 1024 - 3)),
+                false,
+            ),
+        ] {
+            let meta = ErrorMetadata::builder().message(message).build();
+            let display = diagnostic(&meta, Some("billing-123"), &secrets);
+            let error = bedrock_service_error(display, true, &meta, &secrets);
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert!(!error.to_string().contains("billing-secret"));
+        }
     }
 
     #[test]
