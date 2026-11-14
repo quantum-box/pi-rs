@@ -155,79 +155,102 @@ pub fn estimate_replay_tokens(blocks: &[serde_json::Value]) -> u64 {
         .div_ceil(4)
 }
 
-pub(crate) fn estimate_source_tokens(
-    session: &crate::Session,
-    source: u64,
-    message: &Message,
-) -> u64 {
-    match session
-        .records()
-        .get(source.saturating_sub(1) as usize)
-        .map(|record| &record.event)
-    {
-        Some(Event::BashExecution { execution }) => text_chars(&execution.command)
-            .saturating_add(text_chars(&execution.output))
-            .div_ceil(4),
-        Some(
-            Event::BranchSummary { summary, .. } | Event::CompactionSummaryMessage { summary, .. },
-        ) => text_chars(summary).div_ceil(4),
-        Some(Event::Assistant { request_id, .. }) => {
-            let branch = session.branch();
-            let replacement = branch.iter().rev().find_map(|record| match &record.event {
+/// Branch-local lookup table for repeated projected-message estimates.
+pub(crate) struct SourceTokenIndex<'a> {
+    session: &'a crate::Session,
+    replacements: std::collections::HashMap<u64, &'a Option<crate::ContextContent>>,
+    reasoning: std::collections::HashMap<uuid::Uuid, &'a str>,
+}
+
+impl<'a> SourceTokenIndex<'a> {
+    pub(crate) fn new(session: &'a crate::Session, branch: &[&'a crate::Record]) -> Self {
+        let mut replacements = std::collections::HashMap::new();
+        let mut reasoning = std::collections::HashMap::new();
+        for record in branch {
+            match &record.event {
                 Event::ContextEdited {
                     target,
                     replacement,
-                } if *target == source => Some(replacement),
-                _ => None,
-            });
-            if replacement.is_none()
-                && let Some(original) = session.imported_assistant_message(source)
-                && matches!(original["stopReason"].as_str(), Some("error" | "aborted"))
-                && let Some(blocks) = original["content"].as_array()
-            {
-                let chars = blocks.iter().fold(0_u64, |chars, block| {
-                    chars.saturating_add(match block["type"].as_str() {
-                        Some("text") => block["text"].as_str().map(text_chars).unwrap_or(0),
-                        Some("thinking") => block["thinking"].as_str().map(text_chars).unwrap_or(0),
-                        Some("toolCall") => block["name"]
-                            .as_str()
-                            .map(text_chars)
-                            .unwrap_or(0)
-                            .saturating_add(text_chars(&block["arguments"].to_string())),
-                        _ => 0,
-                    })
-                });
-                return chars.div_ceil(4);
-            }
-            let reasoning = match replacement {
-                Some(Some(crate::ContextContent::Blocks(blocks))) => {
-                    blocks.iter().fold(0_u64, |chars, block| match block {
-                        crate::ContentBlock::Thinking { thinking, .. } => {
-                            chars.saturating_add(text_chars(thinking))
-                        }
-                        _ => chars,
-                    })
+                } => {
+                    replacements.insert(*target, replacement);
                 }
-                Some(_) => 0,
-                None => request_id
-                    .and_then(|request_id| {
-                        branch.iter().find_map(|record| match &record.event {
-                            Event::ModelFinished {
-                                request_id: id,
-                                metadata,
-                                ..
-                            } if *id == request_id => metadata.reasoning.as_deref(),
-                            _ => None,
-                        })
-                    })
-                    .map(text_chars)
-                    .unwrap_or(0),
-            };
-            pi_message_chars(message)
-                .saturating_add(reasoning)
-                .div_ceil(4)
+                Event::ModelFinished {
+                    request_id,
+                    metadata,
+                    ..
+                } => {
+                    if let Some(text) = metadata.reasoning.as_deref() {
+                        reasoning.entry(*request_id).or_insert(text);
+                    }
+                }
+                _ => {}
+            }
         }
-        _ => pi_message_chars(message).div_ceil(4),
+        Self {
+            session,
+            replacements,
+            reasoning,
+        }
+    }
+
+    pub(crate) fn estimate(&self, source: u64, message: &Message) -> u64 {
+        match self
+            .session
+            .records()
+            .get(source.saturating_sub(1) as usize)
+            .map(|record| &record.event)
+        {
+            Some(Event::BashExecution { execution }) => text_chars(&execution.command)
+                .saturating_add(text_chars(&execution.output))
+                .div_ceil(4),
+            Some(
+                Event::BranchSummary { summary, .. }
+                | Event::CompactionSummaryMessage { summary, .. },
+            ) => text_chars(summary).div_ceil(4),
+            Some(Event::Assistant { request_id, .. }) => {
+                let replacement = self.replacements.get(&source).copied();
+                if replacement.is_none()
+                    && let Some(original) = self.session.imported_assistant_message(source)
+                    && matches!(original["stopReason"].as_str(), Some("error" | "aborted"))
+                    && let Some(blocks) = original["content"].as_array()
+                {
+                    let chars = blocks.iter().fold(0_u64, |chars, block| {
+                        chars.saturating_add(match block["type"].as_str() {
+                            Some("text") => block["text"].as_str().map(text_chars).unwrap_or(0),
+                            Some("thinking") => {
+                                block["thinking"].as_str().map(text_chars).unwrap_or(0)
+                            }
+                            Some("toolCall") => block["name"]
+                                .as_str()
+                                .map(text_chars)
+                                .unwrap_or(0)
+                                .saturating_add(text_chars(&block["arguments"].to_string())),
+                            _ => 0,
+                        })
+                    });
+                    return chars.div_ceil(4);
+                }
+                let reasoning = match replacement {
+                    Some(Some(crate::ContextContent::Blocks(blocks))) => {
+                        blocks.iter().fold(0_u64, |chars, block| match block {
+                            crate::ContentBlock::Thinking { thinking, .. } => {
+                                chars.saturating_add(text_chars(thinking))
+                            }
+                            _ => chars,
+                        })
+                    }
+                    Some(_) => 0,
+                    None => request_id
+                        .and_then(|id| self.reasoning.get(&id).copied())
+                        .map(text_chars)
+                        .unwrap_or(0),
+                };
+                pi_message_chars(message)
+                    .saturating_add(reasoning)
+                    .div_ceil(4)
+            }
+            _ => pi_message_chars(message).div_ceil(4),
+        }
     }
 }
 
