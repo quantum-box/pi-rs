@@ -229,11 +229,7 @@ fn composed_admission_advances_task_fence_and_recovers_atomically() {
             expected: Expected::Missing,
         });
         let mut mutations = prepared.mutations;
-        // Rewriting the unchanged checkpoint advances its storage version.
-        mutations.push(Mutation::Put {
-            key: task_key.clone(),
-            value: stale.value.clone(),
-        });
+        // The edge preparation itself advances the task fence.
         mutations.push(Mutation::Put {
             key: admission_key.clone(),
             value: b"admitted".to_vec(),

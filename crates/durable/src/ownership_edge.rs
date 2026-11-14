@@ -34,11 +34,10 @@ pub struct StoredEdge {
 
 /// Include all checks and mutations unchanged in one `Store::commit`. Do not
 /// add conflicting writes to these keys or replace either endpoint with a
-/// different identity or ownership in the same transaction. A caller that
-/// traverses edges for abort must also advance the task record version in this
-/// transaction: an edge write alone does not invalidate a traversal that has
-/// already read the task and not yet observed the edge. On an uncertain
-/// commit outcome, reopen and inspect the records before retrying.
+/// different identity or ownership in the same transaction. The prepared
+/// mutations advance the task record version so an abort traversal that read
+/// the task before this edge was created cannot commit using that snapshot.
+/// On an uncertain commit outcome, reopen and inspect the records before retrying.
 pub struct PreparedEdge {
     pub checks: Vec<Check>,
     pub mutations: Vec<Mutation>,
@@ -143,10 +142,16 @@ impl<'a> EdgeStore<'a> {
                     expected: Expected::Missing,
                 },
             ],
-            mutations: vec![Mutation::Put {
-                key,
-                value: serde_json::to_vec(edge)?,
-            }],
+            mutations: vec![
+                Mutation::Put {
+                    key: task_store::key(edge.task),
+                    value: serde_json::to_vec(&task.task)?,
+                },
+                Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(edge)?,
+                },
+            ],
         })
     }
 }
