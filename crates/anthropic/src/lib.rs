@@ -611,15 +611,19 @@ fn permanent_quota_error(body: &[u8], complete: bool, secrets: &[String]) -> boo
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => permanent_quota_value(&value, secrets),
         Err(_) if !complete && String::from_utf8_lossy(body).trim_start().starts_with('{') => {
-            // A JSON parser can accept an unfinished number at EOF. Appending
-            // a digit must not change the captured fields; otherwise the
-            // numeric value was not delimited within the prefix.
+            // A JSON parser can accept an unfinished number at EOF. Probe a
+            // trailing digit with another digit; otherwise preserve an already
+            // observed delimiter, including whitespace.
             let Some(value) = quota_prefix_value(body) else {
                 return false;
             };
             let mut probe = Vec::with_capacity(body.len() + 1);
             probe.extend_from_slice(body);
-            probe.push(b'0');
+            probe.push(if body.last().is_some_and(u8::is_ascii_digit) {
+                b'0'
+            } else {
+                b' '
+            });
             quota_prefix_value(&probe).is_some_and(|next| next == value)
                 && permanent_quota_value(&value, secrets)
         }
@@ -1716,12 +1720,26 @@ mod tests {
         .into_bytes();
         assert_eq!(bytes.len(), 64 * 1024);
         assert!(!super::permanent_quota_error(&bytes, false, &[]));
+        bytes.push(b' ');
+        assert!(super::permanent_quota_error(&bytes, false, &[]));
+        bytes.pop();
         let delimited = format!(
             "{{\"error\":{{\"code\":1308,\"padding\":\"{}\"}}}}",
             "x".repeat(70_000)
         );
         assert!(super::permanent_quota_error(
             &delimited.as_bytes()[..64 * 1024],
+            false,
+            &[]
+        ));
+        let string_tail = r#"","type":"insufficient_quota""#;
+        let string_boundary = format!(
+            "{head}{}{string_tail}",
+            "x".repeat(64 * 1024 - head.len() - string_tail.len())
+        );
+        assert_eq!(string_boundary.len(), 64 * 1024);
+        assert!(super::permanent_quota_error(
+            string_boundary.as_bytes(),
             false,
             &[]
         ));
