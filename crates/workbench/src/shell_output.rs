@@ -128,8 +128,8 @@ impl Accumulator {
         let script_truncated = self.bytes > SCRIPT_BYTES as u64;
         let script = if script_truncated {
             let half = SCRIPT_BYTES / 2;
-            let head = decode_head(&self.head[..half]);
-            let tail = decode_tail(&self.tail[self.tail.len() - half..]);
+            let head = decode_head(&self.head[..half], self.preserve_bom);
+            let tail = decode_tail(&self.tail[self.tail.len() - half..], self.preserve_bom);
             format!(
                 "{head}\n\n[... {} bytes omitted ...]\n\n{tail}",
                 self.bytes - SCRIPT_BYTES as u64
@@ -311,26 +311,65 @@ impl DisplayTail {
     }
 }
 
-fn decode_tail(bytes: &[u8]) -> String {
+fn decode_tail(bytes: &[u8], preserve_bom: bool) -> String {
     let start = bytes
         .iter()
         .position(|byte| byte & 0xc0 != 0x80)
         .unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
-}
-fn decode_head(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => text.to_owned(),
-        Err(error) if error.error_len().is_none() => {
-            String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned()
-        }
-        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    if preserve_bom {
+        text.into_owned()
+    } else {
+        text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
     }
+}
+fn decode_head(mut bytes: &[u8], preserve_bom: bool) -> String {
+    let mut decoder = if preserve_bom {
+        UTF_8.new_decoder_without_bom_handling()
+    } else {
+        UTF_8.new_decoder_with_bom_removal()
+    };
+    let mut output = String::with_capacity(bytes.len());
+    let mut buffer = [0; 8192];
+    loop {
+        // Do not flush: Pi's streaming TextDecoder holds an incomplete final
+        // sequence even if earlier bytes were malformed.
+        let (result, consumed, written, _) = decoder.decode_to_utf8(bytes, &mut buffer, false);
+        output.push_str(std::str::from_utf8(&buffer[..written]).expect("UTF-8 decoder output"));
+        bytes = &bytes[consumed..];
+        if result == CoderResult::InputEmpty {
+            break;
+        }
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn truncated_script_decodes_each_boundary_like_pi() {
+        let half = SCRIPT_BYTES / 2;
+        let mut bytes = vec![b'a'; SCRIPT_BYTES + 7];
+        bytes[..3].copy_from_slice(&[0xef, 0xbb, 0xbf]);
+        bytes[10] = 0xff;
+        bytes[half - 1] = 0xe2; // incomplete UTF-8 after an earlier invalid byte
+        let tail_start = bytes.len() - half;
+        bytes[tail_start..tail_start + 3].copy_from_slice(&[0xef, 0xbb, 0xbf]);
+        let mut accumulator = Accumulator::default();
+        accumulator.append(&bytes).unwrap();
+        let output = accumulator.finish().unwrap();
+        let (head, tail) = output
+            .script
+            .split_once("\n\n[... 7 bytes omitted ...]\n\n")
+            .unwrap();
+        assert!(head.starts_with(&format!("{}�", "a".repeat(7))));
+        assert!(head.ends_with('a'));
+        assert!(!tail.starts_with('\u{feff}'));
+        assert_eq!(tail.len(), half - 3);
+        assert_eq!(std::fs::read(output.path.as_ref().unwrap()).unwrap(), bytes);
+        std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
     #[test]
     fn progress_snapshot_is_bounded_and_exposes_complete_output_path() {
         let mut output = Accumulator::default();

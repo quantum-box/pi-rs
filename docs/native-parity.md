@@ -718,6 +718,11 @@ checkout and in-memory forks. Explicit asynchronous close releases shared
 extensions after the last fork closes. Managed host-bound sessions continue to
 use the existing host API.
 
+For shutdown, `SessionControl::request_shutdown` permanently cancels current and
+subsequently registered runs; the owner still awaits the operation and calls
+`close` to finish cleanup. Ordinary `abort` remains limited to the active run.
+This is a native embedding control rather than an upstream Pi API.
+
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
@@ -739,13 +744,30 @@ revocation during the write prevents the entire staged client set from being
 installed, and conflicting in-flight registrations are rejected before the
 journal write.
 The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK
-cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
+authorized registration before dispatch. The SDK cannot verify an opaque
+client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
-existing exact registrations take precedence. This resolver runs on session
-construction, after recovering interrupted handoffs, not branch navigation or
-fork. Fallback commits a single native selection record even after an imported
-Pi source, using a distinct timestamp so older projections retain the change.
+existing exact registrations take precedence. The resolver runs on session
+construction and before checkout, tree navigation and forks; forks retain the
+resolver for later navigation. It resolves before transition hooks and file
+publication. Fallback checkout and tree navigation persist the destination and
+replacement selection in one record, including for a branch summary. The
+fallback clears thinking and a competing registration cannot be overwritten.
+If a host revokes clients during a successful transition write, the SDK emits
+the committed record and reports the successful transition, while subsequent
+dispatch fails closed until an authorized client is registered. Persistent
+forks resolve pending handoffs from the complete source journal before selecting
+their branch and validate their complete snapshot before
+publishing and retain the locked published file handle.
+Failures before publication remove the temporary snapshot and do not replace a
+destination. As with existing journal export, a directory-sync failure after
+the atomic publish can leave the complete destination in place; callers should
+inspect it before retrying.
+Construction fallback commits a single native selection record even after an
+imported Pi source, using a distinct timestamp so older projections retain the
+change. Older journals remain readable; journals containing the new transition
+records use journal version 4, which version 3 readers reject rather than
+silently ignoring the fallback selection.
 Hosts can also explicitly call
 `set_model` or `set_model_with_hooks` to select another client. The hook-aware form installs the replacement after
 recovery and before startup hooks and any turns they trigger.
@@ -839,8 +861,23 @@ using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
-arrive. Color requests are serialized and coalesced. A device-attributes reply starts
-the next request, with a two-second fallback when the terminal does not reply.
+arrive. Requeries retain the last complete palette until a complete replacement
+arrives, including after an appearance notification or incomplete reply. Color
+requests are serialized and coalesced. An incomplete query holds the next
+request until its device-attributes (DA1) marker or all 18 targets reply;
+timeout alone cannot identify late OSC replies. A terminal that sends neither
+all replies nor DA1 can leave later queries pending, retaining the last complete
+palette. Completed queries allow a new request without DA1; late markers are
+counted separately. Because replies and markers have no request IDs, a missing
+old marker can be confused with a new one, and duplicate or reordered old color
+replies after completion cannot be attributed reliably. Pi also relies on ordered
+DA1 replies, but uses a shorter timeout and accepts late replies.
+On an appearance notification, native invalidates the previous foreground and
+background so configured light/dark pairs switch immediately even when the
+requery is incomplete. Pi instead continues to prefer a previously reported
+background until fresh colors arrive. The active system theme immediately
+returns to indexed colors while the background is unknown; the last complete
+palette is retained for a fresh background report.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom
@@ -1498,6 +1535,10 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
+Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
+BOM when loaded or updated. Invalid JSON and invalid implemented settings remain
+errors; settings updates preserve unknown keys.
+
 `defaultTools` follows Pi's layered selection: project modifiers extend the
 user selection, while project plain-name lists replace it. Mixed plain names
 and ordered modifiers in settings resolve before CLI tool selection.
@@ -1712,7 +1753,16 @@ and repository path, including default ports and `.git` suffixes. Revision and
 transport changes preserve per-package resource filters and scope precedence.
 Explicit non-default ports and case-sensitive repository paths remain distinct.
 Regression tests cover transport aliases, ports, revisions and missing local
-sources.
+sources. Pi treats the first `@` in a Git repository path as a ref separator.
+For compatibility with existing native declarations, pi-rs retains its prior
+last-`@` interpretation when several occur and warns during installation. Use
+the native `#ref` separator to disambiguate, for example
+`git:https://host/team/repo#feature@v2` or
+`git:https://host/org@team/repo#stable`. Both forms preserve repository identity
+and resource filters. URL userinfo is not treated as a ref, and credential-helper
+requirements remain unchanged. Package diagnostics and list output redact URL
+userinfo, including before a configured source is validated; saved declarations
+and internal identity matching are not rewritten.
 
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
@@ -3303,7 +3353,9 @@ indefinitely. Executable extensions negotiate keyed-message support.
 The journal records completion of turn-end callbacks and application of deferred
 context. Recovery reruns an unfinished callback before returning an existing
 answer or advancing the tool turn, then applies deferred context once. Journal
-version 3 identifies turns that use these boundaries. An older assistant record
+version 3 identifies turns that use these boundaries. New records appended to a
+version 1 or 2 journal use at least version 3; earlier records retain their
+original version. An older assistant record
 without a completion marker is treated as already observed: older journals
 cannot distinguish a completed callback from one interrupted before completion.
 Before a new run starts, unfinished earlier turn boundaries are resolved and
@@ -3342,6 +3394,11 @@ extensions needing longer-lived tasks should use the async API. Queue controls
 submitted reentrantly during compaction hooks are serviced by the session owner.
 Async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
+Manual preparation failures also emit `session_compact_failed`; its error
+message identifies manual versus automatic threshold compaction, and aborted
+events omit the error message. Native compaction retains its existing
+preflight, error types, and extension replacement behavior; overflow recovery
+and Pi's pre-summary extension-provided compaction remain separate gaps.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
@@ -3458,6 +3515,12 @@ select the token-limit field, message roles, streaming usage and finish
 handling, and provider-specific thinking fields. Textual assistant reasoning
 is replayed only to the model and endpoint that produced it when the receiving
 adapter requires that field.
+
+For Chat Completions, `compat.vllmPriority` supplies the numeric top-level
+`priority` request field, including zero and negative values. Model settings
+override provider settings, model overrides apply afterward, and explicit
+`samplingParams.priority` takes final precedence. Focused loopback tests cover
+these configuration paths; no live vLLM server was used.
 
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.

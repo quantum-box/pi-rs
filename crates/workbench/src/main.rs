@@ -2540,6 +2540,13 @@ fn metadata(record: &pi_rs::Record) -> Value {
             }
             value
         }
+        Event::BranchModelSelected {
+            target,
+            provider,
+            model,
+        } => {
+            json!({"event":"branch_model_selected", "target":target, "provider":provider, "model":model, "thinking":null})
+        }
         Event::ContextEdited { target, .. } => json!({"event":"context_edited","target":target}),
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),
         Event::HostBound { .. } => json!({"event": "host_bound"}),

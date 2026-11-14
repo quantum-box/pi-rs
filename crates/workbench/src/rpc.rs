@@ -40,9 +40,20 @@ pub(super) fn run(
     interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            if sender.send(line).is_err() {
-                break;
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            match read_rpc_line(&mut input) {
+                Ok(Some(line)) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
             }
         }
     });
@@ -705,6 +716,49 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
             args,
             json!({"type":"prompt","content":message,"images":images,"rpc":true,"id":request.get("id")}),
         )
+    }
+}
+
+// Pi's JSONL reader decodes malformed UTF-8 with replacement and splits only
+// on LF. A trailing CR is removed even on the final unterminated record.
+fn read_rpc_line(input: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if input.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod jsonl_framing_tests {
+    use super::read_rpc_line;
+    use std::io::BufReader;
+
+    #[test]
+    fn reads_lossy_utf8_with_lf_framing_and_final_cr() {
+        let bytes =
+            b"{\"id\":\"\xe3\x81\x82\xff\"}\r\n\n{\"id\":\"\xe2\x80\xa8\"}\n{\"id\":\"last\"}\r";
+        let mut input = BufReader::with_capacity(1, &bytes[..]);
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"あ�\"}"
+        );
+        assert_eq!(read_rpc_line(&mut input).unwrap().unwrap(), "");
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"\u{2028}\"}"
+        );
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"last\"}"
+        );
+        assert!(read_rpc_line(&mut input).unwrap().is_none());
     }
 }
 

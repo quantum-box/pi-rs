@@ -96,7 +96,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 packages.push(entry);
                 Ok(())
             })?;
-            output(json!({"type":"package_installed","source":source}));
+            output(json!({"type":"package_installed","source":display_source(&source)}));
         }
         PackageCommand::Remove { source, local } => {
             let target = normalize(&source, &args.workspace)?;
@@ -120,7 +120,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 }
                 Ok(())
             })?;
-            output(json!({"type":"package_removed","source":target}));
+            output(json!({"type":"package_removed","source":display_source(&target)}));
         }
         PackageCommand::Update { source, .. } => {
             let requested = source
@@ -144,7 +144,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .is_none_or(|requested| source_identity(requested) == source_identity(&source))
                 {
                     install(&source, args.offline).await?;
-                    output(json!({"type":"package_updated","source":source}));
+                    output(json!({"type":"package_updated","source":display_source(&source)}));
                 }
             }
         }
@@ -157,7 +157,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":declaration.source,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -172,18 +172,24 @@ pub async fn prepare(args: &Cli) -> Result<()> {
         let cached = installed.contains_key(&key(&declaration.source));
         if args.offline && remote(&declaration.source) {
             if !cached {
-                eprintln!("Package {}: skipped in offline mode", declaration.source);
+                eprintln!(
+                    "Package {}: skipped in offline mode",
+                    display_source(&declaration.source)
+                );
             }
             continue;
         }
         if declaration.transient || !cached {
-            eprintln!("Preparing native package {}", declaration.source);
+            eprintln!(
+                "Preparing native package {}",
+                display_source(&declaration.source)
+            );
             match install(&declaration.source, args.offline).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
                 Err(error) if declaration.transient && !cached => return Err(error),
-                Err(error) => eprintln!("Package {}: {error}", declaration.source),
+                Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
             }
         }
     }
@@ -735,6 +741,25 @@ fn source_field(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("source")?.as_str())
 }
 
+// Git URL userinfo is rejected before invoking Git, but declarations can
+// still contain it. Never print it while reporting or listing a package.
+fn display_source(source: &str) -> String {
+    let Some(git) = source.strip_prefix("git:") else {
+        return source.to_owned();
+    };
+    let Some(scheme_end) = git.find("://") else {
+        return source.to_owned();
+    };
+    let start = "git:".len() + scheme_end + 3;
+    let end = source[start..]
+        .find(['/', '?', '#'])
+        .map_or(source.len(), |i| start + i);
+    let Some(at) = source[start..end].rfind('@') else {
+        return source.to_owned();
+    };
+    format!("{}[redacted]{}", &source[..start], &source[start + at..])
+}
+
 // Updates reconcile each configured revision, including a user declaration
 // shadowed by a project declaration. Transient CLI packages are not persisted
 // and are refreshed by prepare instead.
@@ -968,16 +993,31 @@ fn matches_source(entry: &Value, source: &str, base: &Path) -> bool {
         .and_then(|entry| normalize(entry, base).ok())
         .is_some_and(|entry| source_identity(&entry) == source_identity(source))
 }
+fn git_path_start(source: &str) -> usize {
+    if let Some((scheme, rest)) = source.split_once("://") {
+        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
+    } else {
+        source.find(':').map_or(0, |index| index + 1)
+    }
+}
+fn ambiguous_git_reference(source: &str) -> bool {
+    !source.contains('#')
+        && source[git_path_start(source)..]
+            .bytes()
+            .filter(|byte| *byte == b'@')
+            .count()
+            > 1
+}
 fn git_reference(source: &str) -> (&str, &str) {
     if let Some(parts) = source.split_once('#') {
         return parts;
     }
-    let path_start = if let Some((scheme, rest)) = source.split_once("://") {
-        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
-    } else {
-        source.find(':').map_or(0, |index| index + 1)
-    };
-    match source.rfind('@').filter(|index| *index >= path_start) {
+    // Keep the established native interpretation for ambiguous sources.
+    // `#ref` disambiguates repositories and refs containing `@`.
+    match source
+        .rfind('@')
+        .filter(|index| *index >= git_path_start(source))
+    {
         Some(index) => (&source[..index], &source[index + 1..]),
         None => (source, "HEAD"),
     }
@@ -1001,7 +1041,8 @@ fn remote(source: &str) -> bool {
 async fn install(source: &str, offline: bool) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
-            "cannot install package in offline mode: {source}"
+            "cannot install package in offline mode: {}",
+            display_source(source)
         )));
     }
     if !remote(source) && !Path::new(source).exists() {
@@ -1052,7 +1093,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         if let Some(version) = version {
             command.args(["--version", version]);
         }
-        let artifacts = run(command).await?;
+        let artifacts = run(command, source).await?;
         root = artifacts
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
@@ -1071,6 +1112,11 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
+        if ambiguous_git_reference(specification) {
+            eprintln!(
+                "Ambiguous Git package source: using the last @ as the ref separator for compatibility; use #ref to disambiguate"
+            );
+        }
         let (url, reference) = git_reference(specification);
         if let Ok(parsed) = reqwest::Url::parse(url)
             && ((parsed.scheme() != "ssh" && !parsed.username().is_empty())
@@ -1086,20 +1132,20 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             command
                 .args(["clone", "--no-checkout", "--depth", "1", "--", url])
                 .arg(&root);
-            run(command).await?;
+            run(command, source).await?;
         }
         let mut fetch = tokio::process::Command::new("git");
         fetch
             .arg("-C")
             .arg(&root)
             .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch).await?;
+        run(fetch, source).await?;
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
             .args(["reset", "--hard", "FETCH_HEAD"]);
-        run(checkout).await?;
+        run(checkout, source).await?;
     }
     if root.is_file() {
         installed_binaries.push(root.clone());
@@ -1130,7 +1176,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 "--manifest-path",
             ])
             .arg(root.join("Cargo.toml"));
-        let metadata: Value = serde_json::from_slice(&run(metadata).await?)?;
+        let metadata: Value = serde_json::from_slice(&run(metadata, source).await?)?;
         let expected_manifest = root.join("Cargo.toml").canonicalize()?;
         if let Some(package) = metadata["packages"].as_array().and_then(|packages| {
             packages.iter().find(|package| {
@@ -1166,7 +1212,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             if offline {
                 build.arg("--offline");
             }
-            let artifacts = run(build).await?;
+            let artifacts = run(build, source).await?;
             for line in artifacts.split(|byte| *byte == b'\n') {
                 if let Ok(artifact) = serde_json::from_slice::<Value>(line)
                     && artifact["reason"] == "compiler-artifact"
@@ -1778,7 +1824,22 @@ async fn capture(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<(Ve
     }
     Ok((output, overflow))
 }
-async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
+fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
+    // Subprocesses can echo the whole URL or just part of its userinfo.
+    // Keep status but never expose their stderr for such sources.
+    if display_source(source) != source {
+        Error::Config(format!(
+            "package command failed ({status}); subprocess output redacted"
+        ))
+    } else {
+        Error::Config(format!(
+            "package command failed ({status}): {}",
+            String::from_utf8_lossy(stderr)
+        ))
+    }
+}
+
+async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1804,10 +1865,7 @@ async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
     if !status.success() {
-        return Err(Error::Config(format!(
-            "package command failed ({status}): {}",
-            String::from_utf8_lossy(&stderr)
-        )));
+        return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
     if overflow {
         return Err(Error::Config("package command output exceeds limit".into()));
@@ -2783,6 +2841,36 @@ mod tests {
             ),
             ("ssh://git@host/repo", "ssh://git@host/repo", "HEAD"),
             ("git@host:org/repo@v1", "git@host:org/repo", "v1"),
+            (
+                "git@host:org/repo@feature@v2",
+                "git@host:org/repo@feature",
+                "v2",
+            ),
+            (
+                "ssh://git@host/org/repo#feature@v2",
+                "ssh://git@host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://host/org/repo#feature@v2",
+                "https://host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://user:secret@host/org/repo#feature@v2",
+                "https://user:secret@host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://host/org@team/repo@stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
+            (
+                "https://host/org@team/repo#stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
             ("git@host:org/repo", "git@host:org/repo", "HEAD"),
             (
                 "https://user@host/repo#old",
@@ -2792,6 +2880,112 @@ mod tests {
         ] {
             assert_eq!(git_reference(source), (url, reference));
         }
+        assert_eq!(
+            source_identity("git:ssh://git@host/org/repo#feature@v2"),
+            source_identity("git:https://host/org/repo@main")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org/repo#feature@v2", "prompts":["+prompts/keep.md"]}),
+            "git:ssh://git@host/org/repo@main",
+            Path::new("."),
+        ));
+        assert!(!matches_source(
+            &json!({"source":"git:https://host/org/repo#feature@v2"}),
+            "git:https://host/org/other@main",
+            Path::new("."),
+        ));
+        assert_eq!(
+            source_identity("git:https://host/org@team/repo@stable"),
+            source_identity("git:https://host/org@team/repo#stable")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org@team/repo@stable", "prompts":["+prompts/keep.md"]}),
+            "git:https://host/org@team/repo#stable",
+            Path::new(".")
+        ));
+        assert!(ambiguous_git_reference("https://host/org@team/repo@stable"));
+        assert!(!ambiguous_git_reference(
+            "https://host/org@team/repo#stable"
+        ));
+        assert!(!ambiguous_git_reference("ssh://git@host/org/repo@stable"));
+    }
+
+    #[test]
+    fn git_source_display_redacts_url_userinfo_without_changing_identity() {
+        for source in [
+            "git:https://private-user:topsecret@example.invalid/org/repo@stable",
+            "git:ssh://private-user@example.invalid/org/repo#feature@v2",
+            "git:https://private-user:topsecret@example.invalid?query@value",
+        ] {
+            let displayed = display_source(source);
+            assert!(!displayed.contains("private-user"), "{displayed}");
+            assert!(!displayed.contains("topsecret"), "{displayed}");
+            assert!(
+                displayed.contains("[redacted]@example.invalid"),
+                "{displayed}"
+            );
+        }
+        assert_eq!(
+            display_source("git:https://example.invalid/org/repo@stable"),
+            "git:https://example.invalid/org/repo@stable"
+        );
+        assert_eq!(
+            source_identity("git:https://private-user:topsecret@example.invalid/org/repo@stable"),
+            source_identity("git:https://example.invalid/org/repo#feature")
+        );
+        let error = package_command_failed(
+            "git:ssh://private-user@example.invalid/org/repo",
+            "exit status: 1",
+            b"helper echoed private-user",
+        )
+        .to_string();
+        assert!(!error.contains("private-user"), "{error}");
+        assert!(
+            error.contains("exit status: 1") && error.contains("redacted"),
+            "{error}"
+        );
+        let error = package_command_failed(
+            "git:https://example.invalid/org/repo",
+            "exit status: 1",
+            b"useful error",
+        )
+        .to_string();
+        assert!(error.contains("useful error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_keeps_safe_offline_diagnostic() {
+        let source = "git:ssh://git@example.invalid/org/repo@stable";
+        let error = match install(source, true).await {
+            Ok(_) => panic!("offline install unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("cannot install package in offline mode"),
+            "{error}"
+        );
+        assert!(error.contains("[redacted]@example.invalid"), "{error}");
+        assert!(!error.contains("ssh://git@"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_hides_real_subprocess_stderr() {
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "echo private-user 1>&2 & exit /b 7"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "printf private-user >&2; exit 7"]);
+            command
+        };
+        command.current_dir(std::env::temp_dir());
+        let error = run(command, "git:ssh://private-user@example.invalid/org/repo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("subprocess output redacted"), "{error}");
+        assert!(!error.contains("private-user"), "{error}");
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {
