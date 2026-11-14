@@ -458,6 +458,9 @@ pub struct Conversation {
     /// Enabled tool names; None preserves the host default, Some([]) disables all.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Optional exact model-facing selection, bounded by enabled tools.
+    #[serde(default)]
+    pub model_tools: Option<Vec<String>>,
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
@@ -1084,7 +1087,7 @@ impl Harness {
     }
     fn ordered_tool_specs(&self, c: &Conversation) -> Result<Vec<ToolSpec>, Error> {
         let mut tools = self.resolved_tools(c)?;
-        if let Some(allowed) = &c.allowed_tools {
+        if let Some(allowed) = c.model_tools.as_ref().or(c.allowed_tools.as_ref()) {
             Ok(allowed
                 .iter()
                 .filter_map(|name| tools.remove(name))
@@ -1139,6 +1142,23 @@ impl Harness {
         }
         validate_allowed_tools(&names)?;
         c.allowed_tools = names;
+        self.save(&c, Expected::Version(version))
+    }
+    /// Persist an exact model-facing tool selection. None offers all enabled tools.
+    /// This does not change which enabled tools nested calls may execute.
+    pub fn select_model_tools(
+        &mut self,
+        id: Uuid,
+        names: Option<Vec<String>>,
+    ) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "model tool selection requires a settled conversation".into(),
+            ));
+        }
+        validate_allowed_tools(&names)?;
+        c.model_tools = names;
         self.save(&c, Expected::Version(version))
     }
     /// Select installed names for a settled conversation, preserving their order.
@@ -1482,6 +1502,7 @@ impl Harness {
                         &state.extensions,
                         &state.provider_adapter,
                         &state.allowed_tools,
+                        &state.model_tools,
                         &state.resets,
                         &state.application_writes,
                         &state.tool_states,
@@ -1492,6 +1513,7 @@ impl Harness {
                             &previous.extensions,
                             &previous.provider_adapter,
                             &previous.allowed_tools,
+                            &previous.model_tools,
                             &previous.resets,
                             &previous.application_writes,
                             &previous.tool_states,
@@ -1510,10 +1532,10 @@ impl Harness {
                 })
                 && matches!((serde_json::to_value((
                     &state.queue_modes, &state.after_failed_run, &state.extensions, &state.provider_adapter,
-                    &state.allowed_tools, &state.resets, &state.application_writes, &state.tool_states,
+                    &state.allowed_tools, &state.model_tools, &state.resets, &state.application_writes, &state.tool_states,
                 )), serde_json::to_value((
                     &previous.queue_modes, &previous.after_failed_run, &previous.extensions, &previous.provider_adapter,
-                    &previous.allowed_tools, &previous.resets, &previous.application_writes, &previous.tool_states,
+                    &previous.allowed_tools, &previous.model_tools, &previous.resets, &previous.application_writes, &previous.tool_states,
                 ))), (Ok(a), Ok(b)) if a == b)
         }).map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
@@ -1608,6 +1630,10 @@ impl Harness {
                 (
                     "pi-rs/runtime/allowed-tools".into(),
                     serde_json::to_value(&state.allowed_tools)?,
+                ),
+                (
+                    "pi-rs/runtime/model-tools".into(),
+                    serde_json::to_value(&state.model_tools)?,
                 ),
                 (
                     "pi-rs/runtime/resets".into(),
@@ -1900,6 +1926,7 @@ impl Harness {
             extensions: vec![],
             provider_adapter: None,
             allowed_tools: None,
+            model_tools: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
@@ -2114,6 +2141,12 @@ impl Harness {
             allowed_tools: point
                 .documents
                 .get("pi-rs/runtime/allowed-tools")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
+            model_tools: point
+                .documents
+                .get("pi-rs/runtime/model-tools")
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
@@ -5031,7 +5064,11 @@ impl Harness {
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
                     let tools = self.resolved_tools(&c)?;
-                    let Some(reg) = tools.get(&call.name) else {
+                    let Some(reg) = tools.get(&call.name).filter(|_| {
+                        c.model_tools
+                            .as_ref()
+                            .is_none_or(|names| names.contains(&call.name))
+                    }) else {
                         let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
                             .unwrap_or(serde_json::Value::Null);
                         c.phase = Phase::ToolFinished {
@@ -6001,6 +6038,14 @@ impl Scheduler {
     pub fn select_tools(&mut self, id: Uuid, names: Option<Vec<String>>) -> Result<(), Error> {
         self.harness.select_tools(id, names)
     }
+    /// Persist an exact model-facing selection for a settled conversation.
+    pub fn select_model_tools(
+        &mut self,
+        id: Uuid,
+        names: Option<Vec<String>>,
+    ) -> Result<(), Error> {
+        self.harness.select_model_tools(id, names)
+    }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
     }
@@ -6933,6 +6978,13 @@ fn place_round_handoff(c: &mut Conversation) {
             }
         }
     }
+    if let Some(allowed) = &mut c.model_tools {
+        for name in c.round_added_tools.iter().flatten() {
+            if !name.is_empty() && !allowed.contains(name) {
+                allowed.push(name.clone());
+            }
+        }
+    }
     c.round_added_tools.clear();
     if let Some(text) = c.round_handoffs.iter().rev().find_map(|text| text.clone()) {
         place_reset(c, crate::reset::Reset::new(Uuid::new_v4(), Some(text)));
@@ -7476,6 +7528,7 @@ mod scheduler_tests {
             extensions: vec![],
             provider_adapter: None,
             allowed_tools: None,
+            model_tools: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
@@ -8455,6 +8508,88 @@ mod tool_allowlist_tests {
             system_prompt: String::new(),
             max_output_tokens: 100,
         }
+    }
+
+    #[test]
+    fn additions_update_both_opt_in_lists_in_order() {
+        let mut c = Harness::empty_conversation(Uuid::new_v4(), config());
+        c.allowed_tools = Some(vec!["first".into()]);
+        c.model_tools = Some(vec!["first".into()]);
+        c.round_added_tools = vec![
+            vec!["new".into(), "".into()],
+            vec!["new".into(), "later".into()],
+        ];
+        place_round_handoff(&mut c);
+        assert_eq!(
+            c.allowed_tools,
+            Some(vec!["first".into(), "new".into(), "later".into()])
+        );
+        assert_eq!(c.model_tools, c.allowed_tools);
+        assert!(c.round_added_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_selection_filters_specs_and_model_calls_but_not_enabled_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seen = Arc::new(Mutex::new(vec![]));
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_tools(id, Some(vec!["allowed".into()])).unwrap();
+        h.select_model_tools(id, Some(vec!["blocked".into(), "allowed".into()]))
+            .unwrap();
+        assert_eq!(
+            h.ordered_tool_specs(&h.conversation(id).unwrap())
+                .unwrap()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allowed"]
+        );
+        assert!(h.select_model_tools(id, Some(vec!["".into()])).is_err());
+        assert!(
+            h.select_model_tools(id, Some(vec!["allowed".into(), "allowed".into()]))
+                .is_err()
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().model_tools,
+            Some(vec!["blocked".into(), "allowed".into()])
+        );
+        h.select_tools(id, None).unwrap();
+        h.select_model_tools(id, Some(vec!["allowed".into()]))
+            .unwrap();
+        assert_eq!(
+            h.resolved_tools(&h.conversation(id).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        h.submit_and_run(id, None, "work".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|names| names == &["allowed"])
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        h.select_model_tools(id, Some(vec![])).unwrap();
+        assert!(
+            h.ordered_tool_specs(&h.conversation(id).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        h.select_model_tools(id, None).unwrap();
+        assert_eq!(
+            h.ordered_tool_specs(&h.conversation(id).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

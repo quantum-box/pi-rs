@@ -726,3 +726,56 @@ async fn embedded_adapter_cannot_borrow_enclosing_tool_scope() {
     assert_eq!(parent.0.0.executions.load(Ordering::SeqCst), 0);
     assert_eq!(child.count.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn model_selection_survives_reopen_and_keeps_nested_tools_callable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let child = Arc::new(Child {
+        count: AtomicUsize::new(0),
+        unknown: false,
+    });
+    let options = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(Parent),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Safe,
+            },
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_tools(id, Some(vec!["parent".into(), "child".into()]))
+        .unwrap();
+    h.select_model_tools(id, Some(vec!["parent".into(), "missing".into()]))
+        .unwrap();
+    let fork = h.fork(id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().model_tools,
+        h.conversation(id).unwrap().model_tools
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().model_tools,
+        Some(vec!["parent".into(), "missing".into()])
+    );
+    h.submit_and_run(id, None, "work".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(child.count.load(Ordering::SeqCst), 1);
+}

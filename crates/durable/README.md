@@ -374,6 +374,17 @@ specs, model-issued and nested dispatch, and interrupted-tool recovery. It
 also applies to global and selected extension tools. Forks retain the captured
 selection; independently created named children start unrestricted, while
 history-seeded children inherit the parent snapshot unless explicitly restricted.
+
+`Harness::select_model_tools` and `Scheduler::select_model_tools` optionally persist
+an exact ordered model-facing selection on a settled conversation. `None` offers
+all enabled tools; an empty list offers none. The enabled allowlist remains the
+ceiling, and nested calls can still access enabled tools hidden from the model.
+Model-issued calls to hidden tools are rejected. Unknown names remain stored;
+forks retain the selection and old conversations default to `None`. Tool control
+additions append to both lists when each is set, preserving the existing behavior
+when the model selection is unset. This bounded subset does not implement upstream
+caller permissions, remove patches, or deferred tools.
+
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and
