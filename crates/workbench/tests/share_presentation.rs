@@ -438,10 +438,11 @@ fn share_context_tracks_idle_and_inflight_worker() {
     input.flush().unwrap();
     let request = receive(&rx, |event| event["type"] == "request");
     started.recv_timeout(Duration::from_secs(20)).unwrap();
+    let key = [7u8; 32];
     writeln!(
         input,
         "{}",
-        json!({"type":"get_share_context","id":"active", "session":root.path().join("session.jsonl")})
+        json!({"type":"get_share_context","id":"active", "session":root.path().join("session.jsonl"), "journal_key":key, "include_journal":true})
     )
     .unwrap();
     input.flush().unwrap();
@@ -455,11 +456,18 @@ fn share_context_tracks_idle_and_inflight_worker() {
         .iter()
         .find(|message| message["role"] == "system")
         .unwrap();
-    assert_eq!(active["data"]["context"]["systemPrompt"], system["content"]);
     assert_eq!(
-        active["data"]["context"]["tools"],
+        active["data"]["snapshot"]["context"]["systemPrompt"],
+        system["content"]
+    );
+    assert_eq!(
+        active["data"]["snapshot"]["context"]["tools"],
         request["request"]["tools"]
     );
+    let records: Vec<pi_rs::Record> =
+        serde_json::from_value(active["data"]["records"].clone()).unwrap();
+    let captured = pi_rs::Session::from_records(records).unwrap();
+    assert_eq!(active["data"]["snapshot"]["head"], captured.head());
     // An active worker owns the journal lock. The standalone CLI currently
     // cannot ask it for context and must not contact Radius in this state.
     let radius = TcpListener::bind("127.0.0.1:0").unwrap();
