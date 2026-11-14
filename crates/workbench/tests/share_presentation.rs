@@ -559,7 +559,6 @@ fn terminal_radius_share_succeeds_without_selected_model_credentials() {
 
 #[test]
 fn standalone_share_rejects_incomplete_journal_without_repair_or_upload() {
-    use std::io::Write as _;
     for incomplete in [true, false] {
         let root = tempfile::tempdir().unwrap();
         let path = if incomplete {

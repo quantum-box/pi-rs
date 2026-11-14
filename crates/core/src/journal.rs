@@ -4248,7 +4248,6 @@ mod snapshot_tests {
             Session::snapshot(&path).unwrap().name(),
             Some("explicit name")
         );
-        use std::io::Write as _;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
