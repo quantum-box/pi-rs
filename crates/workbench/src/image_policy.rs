@@ -354,6 +354,9 @@ mod tests {
                         Err(error) => panic!("fixture accept failed: {error}"),
                     }
                 };
+                // Accepted sockets can inherit the listener's nonblocking mode
+                // (notably on macOS); read_timeout requires a blocking socket.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -522,6 +525,7 @@ mod tests {
                             Err(error) => panic!("fixture accept failed: {error}"),
                         }
                     };
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                         .unwrap();
