@@ -189,7 +189,7 @@ impl Dialog {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                     && self.editor.text.len() < 1024 * 1024
                 {
-                    self.editor.insert(&character.to_string());
+                    self.editor.type_character(character);
                 }
             }
             _ => {}
@@ -377,6 +377,39 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn editor_dialog_coalesces_typed_words_but_not_paste() {
+        let keys = Keys::default();
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        for character in "hello world".chars() {
+            dialog.input(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &keys,
+            );
+        }
+        let undo = [
+            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+        ]
+        .into_iter()
+        .find(|key| keys.matches("tui.editor.undo", *key))
+        .unwrap();
+        dialog.input(undo, &keys);
+        assert_eq!(dialog.editor.text, "hello");
+        dialog.paste(" pasted");
+        dialog.input(undo, &keys);
+        assert_eq!(dialog.editor.text, "hello");
+        dialog.input(undo, &keys);
+        assert_eq!(dialog.editor.text, "");
+    }
     #[test]
     fn component_keys_reject_cancel_bindings_and_alias_collisions() {
         let request = |keys: &[&str]| UiRequest::Custom {

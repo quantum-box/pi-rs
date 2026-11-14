@@ -39,7 +39,7 @@ impl Search {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
             && self.editor.text.len() + character.len_utf8() <= 4096
         {
-            self.editor.insert(&character.to_string());
+            self.editor.type_character(character);
         }
     }
 

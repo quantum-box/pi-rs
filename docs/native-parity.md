@@ -3973,6 +3973,13 @@ test endpoint, through `Bedrock::new`.
 
 ### Editor kill ring checkpoint
 
+Typing now follows Pi's undo grouping: consecutive non-whitespace characters
+form one undo unit, and each typed whitespace starts a new unit with the word
+that follows it. Cursor movement, edits, newlines and undo break the typing
+group; paste and programmatic insertion remain atomic. This applies to the
+main editor, extension dialogs and transcript search. Focused tests cover
+Unicode, repeated spaces, navigation, multiline input and paste boundaries.
+
 Consecutive editor kill commands now combine their removed text in deletion
 order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching

@@ -5298,7 +5298,7 @@ pub(super) async fn run(
                                 KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                             )
                         {
-                            view.editor.insert(&character.to_string());
+                            view.editor.type_character(character);
                         }
                     }
                     _ => {}
