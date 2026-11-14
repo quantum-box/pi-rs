@@ -2926,6 +2926,7 @@ fn slash(
             view.share_context_may_exist |= super::process::DROPPED_SHARE_CONTEXT_POSSIBLE
                 .load(std::sync::atomic::Ordering::SeqCst);
             let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let worker_present = worker.as_ref().is_some_and(|slot| slot.is_some());
             let id = if destination.is_radius() && !args.trust_pending {
                 if let Some(worker) = worker {
                     let had_worker = worker.is_some();
@@ -2942,7 +2943,10 @@ fn slash(
             } else {
                 None
             };
-            if destination.is_radius() && id.is_none() && view.share_context_may_exist {
+            if destination.is_radius()
+                && id.is_none()
+                && (view.share_context_may_exist || worker_present)
+            {
                 return Err(Error::Config(
                     "Live share context is unavailable; try sharing again".into(),
                 ));
