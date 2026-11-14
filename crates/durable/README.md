@@ -619,6 +619,18 @@ abort work. A running driver is required, including after reopening. The wait
 polls storage every 100 ms, so it may lag a terminal commit; unlike upstream's
 registered notifications, it also polls for driver shutdown and failure.
 
+`Scheduler::wait_for_idle(conversation_id, &cancel)` waits for the conversation's
+queued and running submissions and foreground owned tasks and child conversations.
+It traverses terminal task anchors, but does not cross background boundaries.
+Cancellation or dropping the future stops only the wait. Unknown conversations
+return an error. Live generic tasks require a running task driver, including after
+reopen; a missing or stopped driver returns an error. The wait polls every 100 ms,
+does not start a driver or repair blocked work, and can remain pending for work
+that needs host intervention. This is an observation, not a barrier against new
+admissions: concurrent changes can immediately make an idle result stale. Unlike
+upstream's scheduler waiter, traversal uses separate storage reads rather than a
+single serialized scheduler snapshot. There is no background-inclusive idle option.
+
 Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal tasks,
 including their IDs, kinds, owners and current reasons; `blocked_reason` also
 inspects an individual record. The background driver's `replace_registry` waits

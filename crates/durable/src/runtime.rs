@@ -66,6 +66,8 @@ pub enum Error {
     Failed,
     #[error("execution interrupted; reopen to recover")]
     Interrupted,
+    #[error("idle wait cancelled")]
+    WaitCancelled,
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -5237,6 +5239,100 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Wait until the conversation and its foreground owned graph have no work.
+    /// Cancelling or dropping the future does not abort work. Live generic tasks
+    /// require a running task driver. State is polled every 100 ms.
+    pub async fn wait_for_idle(&self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            let (busy, tasks_pending) = self.foreground_busy(id)?;
+            if tasks_pending {
+                self.check_idle_task_driver()?;
+            }
+            if !busy {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
+    fn check_idle_task_driver(&self) -> Result<(), Error> {
+        let driver = self
+            .harness
+            .task_driver
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .as_ref()
+            .and_then(|driver| driver.upgrade())
+            .ok_or_else(|| {
+                Error::Invalid("task driver is not running; idle work remains pending".into())
+            })?;
+        driver.check_running_and_wake()
+    }
+
+    fn foreground_busy(&self, root: Uuid) -> Result<(bool, bool), Error> {
+        use crate::ownership_edge::{EdgeStore, Mode};
+        use crate::task::TaskOwner;
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let owner = &self.harness.owner;
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        let store = owner.store();
+        let records = crate::task_store::TaskStore::new(store)
+            .list()
+            .map_err(|e| Error::Invalid(format!("task list: {e}")))?;
+        let by_id: HashMap<_, _> = records.iter().map(|r| (r.task.id(), r)).collect();
+        let mut conversations = VecDeque::from([root]);
+        let mut tasks = VecDeque::new();
+        let mut seen_conversations = HashSet::new();
+        let mut seen_tasks = HashSet::new();
+        let mut busy = false;
+        let mut tasks_pending = false;
+        while !conversations.is_empty() || !tasks.is_empty() {
+            while let Some(id) = conversations.pop_front() {
+                if !seen_conversations.insert(id) {
+                    continue;
+                }
+                busy |= self.harness.load(id)?.0.is_working();
+                for record in &records {
+                    if record.task.owner() == &TaskOwner::Conversation(id)
+                        && !record.task.is_background()
+                    {
+                        tasks.push_back(record.task.id());
+                    }
+                }
+            }
+            while let Some(id) = tasks.pop_front() {
+                if !seen_tasks.insert(id) {
+                    continue;
+                }
+                let record = by_id.get(&id).ok_or(Error::NotFound)?;
+                tasks_pending |= !record.task.is_terminal();
+                for child in &records {
+                    if child.task.owner() == &TaskOwner::Task(id) && !child.task.is_background() {
+                        tasks.push_back(child.task.id());
+                    }
+                }
+                for edge in EdgeStore::new(store)
+                    .children(id)
+                    .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?
+                {
+                    if edge.edge.task_owner != *record.task.owner() {
+                        return Err(Error::Invalid("ownership edge owner mismatch".into()));
+                    }
+                    if edge.edge.mode == Mode::Foreground {
+                        conversations.push_back(edge.edge.child);
+                    }
+                }
+            }
+        }
+        Ok((busy || tasks_pending, tasks_pending))
+    }
     /// Must be called inside a Tokio runtime. Recovers and schedules all
     /// persisted conversations, including work admitted by an earlier owner.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
