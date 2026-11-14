@@ -237,7 +237,21 @@ pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> 
     if let Some(content) = message["content"].as_str().filter(|text| !text.is_empty()) {
         blocks.push(json!({"type":"text","text":content}));
     }
-    for image in message["images"].as_array().into_iter().flatten() {
+    // Pi treats a missing or null images field as empty. Strings are iterable
+    // in JavaScript, but their characters have no image_url and are ignored.
+    let images = match message.get("images") {
+        None | Some(Value::Null | Value::String(_)) => &[][..],
+        Some(Value::Array(images)) => images.as_slice(),
+        Some(_) => {
+            return Err(Error::Model(
+                "image provider returned invalid images".into(),
+            ));
+        }
+    };
+    for image in images {
+        if image.is_null() {
+            return Err(Error::Model("image provider returned a null image".into()));
+        }
         let Some((mime_type, data)) = image["image_url"]
             .as_str()
             .or_else(|| image["image_url"]["url"].as_str())

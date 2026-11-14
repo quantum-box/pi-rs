@@ -1050,6 +1050,26 @@ mod tests {
         let cases = [
             (json!({"choices":[{}]}), vec![], true),
             (
+                json!({"choices":[{"message":{"content":"caption","images":{"image_url":"data:image/png;base64,YQ=="}}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[{"image_url":"data:image/png;base64,aW1hZ2U="},null]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":null}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":"invalid"}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
                 json!({"choices":[{"message":{"content":"caption","images":[
                     {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
                     {"image_url":"data:image/png;base64,%%%"}
