@@ -76,7 +76,7 @@ pub trait KeyedTool: Send + Sync {
         host: KeyedHost,
     ) -> ToolReply;
 
-    /// Return a control with the reply to opt into durable round termination or handoff.
+    /// Return a control with the reply to opt into durable tool additions, round termination or handoff.
     /// Nested calls do not affect their caller’s model round.
     async fn invoke_controlled(
         &self,

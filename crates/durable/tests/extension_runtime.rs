@@ -2565,6 +2565,7 @@ impl Model for ControlModel {
 struct ControlledTool {
     controls: [bool; 2],
     handoffs: [Option<String>; 2],
+    additions: [Vec<String>; 2],
     calls: Arc<Mutex<Vec<usize>>>,
     fail_second: bool,
 }
@@ -2601,6 +2602,7 @@ impl pi_rs_durable::keyed_tool::KeyedTool for ControlledTool {
         (
             Outcome::Succeeded(format!("result {n}")).into(),
             pi_rs_durable::reset::ToolControl {
+                add_tools: self.additions[n].clone(),
                 terminate: self.controls[n],
                 handoff: self.handoffs[n].clone(),
             },
@@ -2646,6 +2648,7 @@ fn control_options(
         ControlledTool {
             controls,
             handoffs: [None, None],
+            additions: Default::default(),
             calls,
             fail_second,
         },
@@ -2871,6 +2874,7 @@ fn handoff_options(
         ControlledTool {
             controls: [terminate; 2],
             handoffs,
+            additions: Default::default(),
             calls,
             fail_second: false,
         },
@@ -3045,4 +3049,110 @@ async fn handoff_waits_for_after_tools_and_survives_reopen() {
     assert_eq!(snapshots[0]["resets"][0]["handoff"], "fresh");
     drop(snapshots);
     driver.shutdown().unwrap();
+}
+
+#[derive(Default)]
+struct AddToolsModel(Mutex<Vec<Vec<String>>>);
+#[async_trait]
+impl Model for AddToolsModel {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        let answered = request
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }));
+        self.0
+            .lock()
+            .unwrap()
+            .push(request.tools.iter().map(|t| t.name.clone()).collect());
+        let calls = if answered {
+            vec![]
+        } else {
+            (0..2)
+                .map(|n| ToolCall {
+                    id: format!("call{n}"),
+                    name: "controlled".into(),
+                    arguments: format!("{{\"n\":{n}}}"),
+                })
+                .collect()
+        };
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("answer".into())),
+            Ok(ModelEvent::Complete { calls, usage: None }),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn added_tools_are_persisted_in_call_order_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(AddToolsModel::default());
+    let calls = Arc::new(Mutex::new(vec![]));
+    let options = || Options {
+        model: model.clone(),
+        tools: vec![
+            Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+                ControlledTool {
+                    controls: [false, false],
+                    handoffs: [None, None],
+                    additions: [
+                        vec!["test".into(), "missing".into()],
+                        vec!["missing".into(), "later".into()],
+                    ],
+                    calls: calls.clone(),
+                    fail_second: false,
+                },
+            ))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FakeTool::default()),
+                replay: ReplayPolicy::Safe,
+            },
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let id;
+    {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        install_control_hook(&h, Some(cancel.clone()), Arc::new(Mutex::new(0)));
+        id = h.create_conversation(config()).unwrap();
+        h.select_tools(id, Some(vec!["controlled".into()])).unwrap();
+        h.select_extensions(id, vec!["control-hook".into()])
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+    }
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        install_control_hook(&h, None, Arc::new(Mutex::new(0)));
+        assert_eq!(
+            h.conversation(id).unwrap().allowed_tools,
+            Some(vec!["controlled".into()])
+        );
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().allowed_tools,
+            Some(vec![
+                "controlled".into(),
+                "test".into(),
+                "missing".into(),
+                "later".into()
+            ])
+        );
+    }
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().allowed_tools.unwrap().len(), 4);
+    assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+    let requests = model.0.lock().unwrap();
+    assert!(!requests[0].contains(&"test".into()));
+    assert!(requests[1].contains(&"test".into()));
 }

@@ -477,6 +477,8 @@ pub struct Conversation {
     #[serde(default)]
     round_handoffs: Vec<Option<String>>,
     #[serde(default)]
+    round_added_tools: Vec<Vec<String>>,
+    #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
     #[serde(default)]
     answer_ids: HashMap<Uuid, Uuid>,
@@ -1894,6 +1896,7 @@ impl Harness {
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),
             round_handoffs: Vec::new(),
+            round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -2128,6 +2131,7 @@ impl Harness {
             tool_states: point.tool_states,
             round_terminates: Vec::new(),
             round_handoffs: Vec::new(),
+            round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -4581,6 +4585,7 @@ impl Harness {
                         } else {
                             c.round_terminates = vec![false; response.calls.len()];
                             c.round_handoffs = vec![None; response.calls.len()];
+                            c.round_added_tools = vec![Vec::new(); response.calls.len()];
                             c.phase = Phase::Tools {
                                 turns: turns + 1,
                                 calls: response.calls,
@@ -5355,9 +5360,11 @@ impl Harness {
                             // Older persisted rounds may predate either control vector.
                             c.round_terminates.resize(calls.len(), false);
                             c.round_handoffs.resize(calls.len(), None);
+                            c.round_added_tools.resize(calls.len(), Vec::new());
                             let control = control.lock().expect("control mutex poisoned");
                             c.round_terminates[index] = control.terminate;
                             c.round_handoffs[index] = control.handoff.clone();
+                            c.round_added_tools[index] = control.add_tools.clone();
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -6914,6 +6921,14 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
 }
 
 fn place_round_handoff(c: &mut Conversation) {
+    if let Some(allowed) = &mut c.allowed_tools {
+        for name in c.round_added_tools.iter().flatten() {
+            if !allowed.contains(name) {
+                allowed.push(name.clone());
+            }
+        }
+    }
+    c.round_added_tools.clear();
     if let Some(text) = c.round_handoffs.iter().rev().find_map(|text| text.clone()) {
         place_reset(c, crate::reset::Reset::new(Uuid::new_v4(), Some(text)));
     }
@@ -7466,6 +7481,7 @@ mod scheduler_tests {
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),
             round_handoffs: Vec::new(),
+            round_added_tools: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,

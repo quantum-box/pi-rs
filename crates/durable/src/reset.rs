@@ -93,6 +93,8 @@ pub fn context(entries: &[Entry]) -> Vec<Message> {
 /// missing results. Completion order must not be used for this selection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolControl {
+    /// Tool names to enable at the end of this round, in call order.
+    pub add_tools: Vec<String>,
     pub handoff: Option<String>,
     pub terminate: bool,
 }
@@ -266,11 +268,13 @@ mod tests {
             ToolControl {
                 handoff: Some("first".into()),
                 terminate: true,
+                ..Default::default()
             },
             ToolControl::default(),
             ToolControl {
                 handoff: Some("".into()),
                 terminate: true,
+                ..Default::default()
             },
         ];
         let decision = tool_round(&controls, false, id);

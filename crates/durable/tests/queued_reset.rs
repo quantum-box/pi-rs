@@ -329,6 +329,7 @@ impl pi_rs_durable::keyed_tool::KeyedTool for HandoffTool {
         (
             result.into(),
             pi_rs_durable::reset::ToolControl {
+                add_tools: Vec::new(),
                 handoff: Some("tool handoff".into()),
                 terminate: false,
             },

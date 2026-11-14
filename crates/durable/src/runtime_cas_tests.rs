@@ -3163,6 +3163,7 @@ impl crate::keyed_tool::KeyedTool for LegacyHandoffTool {
         (
             pi_rs_core::Outcome::Succeeded("ok".into()).into(),
             crate::reset::ToolControl {
+                add_tools: Vec::new(),
                 handoff: Some("new context".into()),
                 terminate: true,
             },
