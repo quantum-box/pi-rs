@@ -181,9 +181,14 @@ impl Driver {
     /// Persist the abort without waiting for a running handler. The handler's
     /// output is discarded when it returns; cleanup then runs on the worker.
     pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
+        self.request_abort_after_check(id, || {})
+    }
+
+    fn request_abort_after_check(&self, id: Uuid, after_check: impl FnOnce()) -> Result<(), Error> {
         // A conversation worker can consult driver state while holding its
         // execution gate. Do not hold driver state while fencing those gates.
         drop(self.check()?);
+        after_check();
         if let Some(harness) = &self.shared.harness {
             let mut harness = harness.lock().map_err(|_| Error::Poisoned)?;
             self.shared
@@ -383,6 +388,120 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn abort_fence_does_not_hold_state_against_conversation_policy_lookup() {
+        use crate::{
+            recovery::UncertainPolicy,
+            runtime::{Config, Harness, Options},
+        };
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 1,
+                max_turns: 1,
+                uncertain_policy: UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let conversation = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            1,
+        )
+        .unwrap();
+        TaskStore::new(harness.subagent_store().unwrap())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let handler: Arc<dyn task_scheduler::Handler> =
+            Arc::new(|_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))));
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_shared("test", true, handler.clone());
+        let scheduler = harness.attach_tasks(registry).unwrap();
+        // Construct without worker threads so they cannot consume the test task.
+        let shared = Arc::new(Shared {
+            owner: scheduler.owner(),
+            policies: scheduler.policies(),
+            definitions: scheduler.definitions(),
+            scheduler: Mutex::new(scheduler),
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            harness: Some(Mutex::new(harness.worker())),
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
+        });
+        let gate = shared.owner.conversation_controls().get(conversation).gate;
+        let driver = Driver {
+            shared: shared.clone(),
+            worker: None,
+            cleanup: None,
+        };
+        let (gate_held_tx, gate_held_rx) = mpsc::channel();
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let (policy_done_tx, policy_done_rx) = mpsc::channel();
+        let lookup = thread::spawn(move || {
+            let _gate = gate.lock().unwrap();
+            gate_held_tx.send(()).unwrap();
+            lookup_rx.recv().unwrap();
+            let policy = shared.policy_for("test", &handler);
+            policy_done_tx.send(policy).unwrap();
+        });
+        gate_held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (abort_done_tx, abort_done_rx) = mpsc::channel();
+        let task_id = task.id();
+        let abort = thread::spawn(move || {
+            let result = driver.request_abort_after_check(task_id, || {
+                checked_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            });
+            abort_done_tx.send(result).unwrap();
+            driver
+        });
+        checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The lookup occurs while the abort call is paused immediately after
+        // checking state, and while the conversation poll gate is held.
+        lookup_tx.send(()).unwrap();
+        continue_tx.send(()).unwrap();
+        assert_eq!(
+            policy_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("policy lookup deadlocked with abort"),
+            Some(true)
+        );
+        abort_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("abort fence deadlocked")
+            .unwrap();
+        lookup.join().unwrap();
+        let driver = abort.join().unwrap();
+        assert!(driver.get(task_id).unwrap().unwrap().abort_requested());
+        driver.shutdown().unwrap();
+    }
 
     #[test]
     fn abort_during_handler_fences_children_and_drains() {
