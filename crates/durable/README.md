@@ -128,7 +128,10 @@ admissions. Cleanup runs child-first after restart when a task driver or
 scheduler is attached. Synchronous handlers cannot be interrupted and cleanup
 can replay after a crash; external effects require idempotency and reconciliation.
 Conversation abort skips tasks explicitly marked as background and their
-descendants; subagent conversations are not yet part of that ownership graph.
+descendants. Task-owned foreground subagent conversations are marked and
+scheduled for cleanup by the conversation scheduler; background edges are boundaries.
+Standalone task-driver aborts reject foreground conversation children because they
+cannot drive their cleanup. Task cleanup does not wait for child conversation cleanup.
 Current limits and differences from upstream Pi Durable:
 
 - Historical forks accept safe committed observation snapshots, including during runs,
@@ -144,7 +147,7 @@ Current limits and differences from upstream Pi Durable:
   Handler steps run synchronously, so an abort request waits for the active step
   and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
   cleanup. Conversation abort marks foreground conversation-owned task descendants;
-  separate subagent conversations are not included. Shutdown waits for an in-flight step.
+  foreground task-owned subagent conversations are included. Shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

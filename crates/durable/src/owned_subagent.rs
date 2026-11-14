@@ -378,6 +378,60 @@ mod tests {
         assert!(h.conversation(child).unwrap().abort_requested);
     }
 
+    #[tokio::test]
+    async fn scheduler_cancels_active_foreground_but_not_background() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Pending(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for Pending {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let child = h
+            .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let background = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
+            .unwrap()
+            .child;
+        drop(h);
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(Pending(started.clone()));
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        scheduler.submit(child, None, "child".into()).unwrap();
+        scheduler
+            .submit(background, None, "background".into())
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.abort(parent).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(child))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!scheduler.conversation(child).unwrap().abort_requested);
+        assert!(!scheduler.conversation(background).unwrap().abort_requested);
+        assert!(scheduler.conversation(parent).unwrap().abort_requested);
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[test]
     fn traversal_terminates_on_ownership_cycle() {
         let dir = tempfile::tempdir().unwrap();

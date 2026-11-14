@@ -2031,20 +2031,20 @@ impl Harness {
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort_owned_graph(Some(id), None)
+        self.abort_owned_graph(Some(id), None).map(|_| ())
     }
 
     /// Atomically persist an abort for a task and its foreground owned graph.
     /// The caller must stop executing workers before driving these marks.
     pub fn request_abort_task(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort_owned_graph(None, Some(id))
+        self.abort_owned_graph(None, Some(id)).map(|_| ())
     }
 
     fn abort_owned_graph(
         &mut self,
         conversation: Option<Uuid>,
         task: Option<Uuid>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<Uuid>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -2153,7 +2153,7 @@ impl Harness {
             batch.checks.extend(edge_checks);
             batch.mutations.extend(task_batch.mutations);
             match self.commit_conversation_save(batch) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(conversations.into_iter().collect()),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
             }
@@ -4428,21 +4428,41 @@ impl Scheduler {
         self.schedule(id);
         Ok(())
     }
-    /// Persist intent before signalling the worker, then schedule durable cleanup.
+    /// Persist intent before signalling every affected worker, then drive cleanup.
     pub fn abort(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_graph(Some(id), None)
+    }
+
+    /// Abort a task and its foreground owned conversations.
+    pub fn abort_task(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_graph(None, Some(id))
+    }
+
+    fn abort_graph(&mut self, conversation: Option<Uuid>, task: Option<Uuid>) -> Result<(), Error> {
+        // Prevent controls from being created and fence every existing poll while
+        // discovering and committing the graph. A child may be admitted right up
+        // to the transaction, so fencing a previously read graph is insufficient.
         let mut controls = self.conversations.lock().unwrap_or_else(|e| e.into_inner());
-        let control = controls.entry(id).or_insert_with(|| ConversationControl {
-            gate: Arc::new(std::sync::Mutex::new(())),
-            cancel: self.cancel.child_token(),
-        });
-        {
-            let _gate = control.gate.lock().map_err(|_| Error::Failed)?;
-            self.harness.request_abort(id)?;
-            control.cancel.cancel();
-            control.cancel = self.cancel.child_token();
+        let gates: Vec<_> = controls
+            .values()
+            .map(|control| control.gate.clone())
+            .collect();
+        let _guards: Vec<_> = gates
+            .iter()
+            .map(|gate| gate.lock().map_err(|_| Error::Failed))
+            .collect::<Result<_, _>>()?;
+        let affected = self.harness.abort_owned_graph(conversation, task)?;
+        for id in &affected {
+            if let Some(control) = controls.get_mut(id) {
+                control.cancel.cancel();
+                control.cancel = self.cancel.child_token();
+            }
         }
+        drop(_guards);
         drop(controls);
-        self.schedule(id);
+        for id in affected {
+            self.schedule(id);
+        }
         Ok(())
     }
     /// Request abort and wait until this conversation's local workers stop.
