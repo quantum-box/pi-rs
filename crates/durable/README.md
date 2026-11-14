@@ -91,10 +91,15 @@ Current limits and differences from upstream Pi Durable:
 - The scheduler retains scheduled join handles until `wait` or `shutdown`;
   callers should bound submissions and drain them. Owner locking currently
   supports cooperating Unix processes on local filesystems.
-- Each conversation is one growing JSON value. Observation reads use bounded
-  pages, but committed snapshots copy messages; the runtime is not yet suitable
-  for arbitrarily long-lived workloads. Model responses have a 1 MiB text and
-  64 tool-call bound.
+- New commits store message deltas in an immutable transcript, atomically with
+  state, observation and fork metadata; legacy conversations migrate on their
+  next successful save. Old records are retained. Context replacement during
+  reset or compaction can still copy messages; subagent reservations retain a
+  seed copy. Fork heads share immutable transcript entries.
+  History reads reconstruct complete snapshots, and submissions and other metadata
+  are still copied in each commit, so storage and memory remain unbounded. No
+  garbage collection is provided. Older binaries cannot read migrated state.
+  Model responses have a 1 MiB text and 64 tool-call bound.
 - The host must supply valid replay-safe tools, models and storage. Unknown
   effects still require destination-level idempotency or reconciliation.
 

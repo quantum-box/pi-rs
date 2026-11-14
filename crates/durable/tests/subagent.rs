@@ -421,6 +421,9 @@ async fn history_reservation_restores_snapshot_even_if_parent_changes() {
     observer.extend_from_slice(link.child.as_bytes());
     observer.push(b'/');
     prefixes.push(observer);
+    let mut transcript_head = b"durable/transcript/head/".to_vec();
+    transcript_head.extend_from_slice(link.child.as_bytes());
+    prefixes.push(transcript_head);
     let mutations: Vec<_> = prefixes
         .iter()
         .flat_map(|prefix| db.list(prefix).unwrap())

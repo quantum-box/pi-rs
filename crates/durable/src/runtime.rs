@@ -43,6 +43,8 @@ pub enum Error {
     Observer(#[from] crate::observer::Error),
     #[error("generation progress: {0}")]
     Progress(#[from] crate::progress::Error),
+    #[error("transcript: {0}")]
+    Transcript(#[from] crate::transcript::Error),
     #[error("fork: {0}")]
     Fork(#[from] crate::fork::Error),
     #[error("task scheduler: {0}")]
@@ -224,6 +226,12 @@ enum ModelFailureDecision {
     Stop,
 }
 
+#[derive(Serialize, Deserialize)]
+enum TranscriptChange {
+    Append(Vec<Message>),
+    Replace(Vec<Message>),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: Uuid,
@@ -232,6 +240,8 @@ pub struct Conversation {
     #[serde(default)]
     pub extensions: Vec<String>,
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
     #[serde(default)]
     pub aborted_generations: Vec<AbortedGeneration>,
@@ -452,12 +462,55 @@ impl Harness {
             .store()
             .get(&Self::key(id))?
             .ok_or(Error::NotFound)?;
-        let state: Conversation = serde_json::from_slice(&entry.value)?;
+        let mut state: Conversation = serde_json::from_slice(&entry.value)?;
+        self.hydrate(&mut state)?;
         self.loaded
             .lock()
             .map_err(|_| Error::Failed)?
             .insert(id, (entry.version, state.clone()));
         Ok((state, entry.version))
+    }
+    fn hydrate(&self, state: &mut Conversation) -> Result<(), Error> {
+        if let Some(cursor) = &state.transcript {
+            state.messages = self.read_transcript(state.id, cursor.clone())?;
+        }
+        Ok(())
+    }
+    fn read_transcript(
+        &self,
+        id: Uuid,
+        mut cursor: crate::transcript::Cursor,
+    ) -> Result<Vec<Message>, Error> {
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut parts = Vec::new();
+        loop {
+            let page = transcript.read(&cursor, std::num::NonZeroUsize::new(128).unwrap())?;
+            for record in page.records {
+                let change: TranscriptChange = serde_json::from_value(record.value)?;
+                match change {
+                    TranscriptChange::Append(messages) => parts.push(messages),
+                    TranscriptChange::Replace(messages) => {
+                        parts.push(messages);
+                        return Ok(parts.into_iter().rev().flatten().collect());
+                    }
+                }
+            }
+            if !page.has_more {
+                return Err(Error::Invalid("transcript has no base".into()));
+            }
+            cursor = page.next;
+        }
+    }
+    fn expand_event(&self, id: Uuid, value: &mut serde_json::Value) -> Result<(), Error> {
+        if let Some(reference) = value.get_mut("_transcript").map(std::mem::take) {
+            let cursor = serde_json::from_value(reference)?;
+            value["messages"] = serde_json::to_value(self.read_transcript(id, cursor)?)?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| Error::Invalid("invalid observation".into()))?
+                .remove("_transcript");
+        }
+        Ok(())
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
         if self.failed
@@ -470,8 +523,50 @@ impl Harness {
         let mut state = state.clone();
         let mut expected = expected;
         loop {
-            let value = serde_json::to_vec(&state)?;
-            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested});
+            let base = self
+                .loaded
+                .lock()
+                .map_err(|_| Error::Failed)?
+                .get(&state.id)
+                .cloned();
+            let old = base
+                .as_ref()
+                .filter(|(v, _)| expected == Expected::Version(*v))
+                .map(|(_, s)| s);
+            let create = old.and_then(|s| s.transcript.as_ref()).is_none();
+            let change = match old {
+                Some(previous) if !create && state.messages == previous.messages => None,
+                Some(previous) if !create && state.messages.starts_with(&previous.messages) => {
+                    Some(TranscriptChange::Append(
+                        state.messages[previous.messages.len()..].to_vec(),
+                    ))
+                }
+                _ => Some(TranscriptChange::Replace(state.messages.clone())),
+            };
+            let prepared = if expected == Expected::Missing && state.transcript.is_some() {
+                let source = state.transcript.as_ref().unwrap();
+                if self.read_transcript(source.transcript_id(), source.clone())? != state.messages {
+                    return Err(Error::Invalid("fork transcript does not match seed".into()));
+                }
+                let (batch, cursor) =
+                    crate::transcript::Transcript::new(self.owner.store(), source.transcript_id())
+                        .prepare_fork_at(source, state.id)?;
+                state.transcript = Some(cursor);
+                Some(batch)
+            } else if let Some(change) = change {
+                let (batch, cursor) =
+                    crate::transcript::Transcript::new(self.owner.store(), state.id)
+                        .prepare_write(&serde_json::to_value(change)?, create)?;
+                state.transcript = Some(cursor);
+                Some(batch)
+            } else {
+                state.transcript = old.and_then(|s| s.transcript.clone());
+                None
+            };
+            let mut persisted = state.clone();
+            persisted.messages.clear();
+            let value = serde_json::to_vec(&persisted)?;
+            let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested});
             let append = crate::observer::Observer::new(self.owner.store(), state.id)
                 .prepare_append(&event)?;
             let fork_key =
@@ -480,7 +575,7 @@ impl Harness {
                 version: 1,
                 conversation_id: state.id,
                 config: state.config.clone(),
-                messages: state.messages.clone(),
+                messages: vec![],
                 submissions: state.submissions.clone(),
                 tool_states: state.tool_states.clone(),
                 documents: if state.extensions.is_empty() {
@@ -495,10 +590,18 @@ impl Harness {
                 pending_resets: state.pending_resets.clone(),
                 phase: serde_json::to_value(&state.phase)?,
             };
+            let mut fork_value = serde_json::to_value(&fork_snapshot)?;
+            fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
             let mut checks = vec![Check {
                 key: key.clone(),
                 expected: expected.clone(),
             }];
+            let transcript_mutations = if let Some(batch) = prepared {
+                checks.extend(batch.checks);
+                batch.mutations
+            } else {
+                Vec::new()
+            };
             checks.extend(append.checks);
             checks.push(Check {
                 key: fork_key.clone(),
@@ -508,10 +611,11 @@ impl Harness {
                 key: key.clone(),
                 value,
             }];
+            mutations.extend(transcript_mutations);
             mutations.extend(append.mutations);
             mutations.push(Mutation::Put {
                 key: fork_key,
-                value: serde_json::to_vec(&fork_snapshot)?,
+                value: serde_json::to_vec(&fork_value)?,
             });
             let terminal = if state.abort_requested {
                 match &state.phase {
@@ -547,7 +651,8 @@ impl Harness {
                 Ok(()) => break,
                 Err(durable_store::Error::Conflict { .. }) if self.merge_admissions => {
                     let entry = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
-                    let latest: Conversation = serde_json::from_slice(&entry.value)?;
+                    let mut latest: Conversation = serde_json::from_slice(&entry.value)?;
+                    self.hydrate(&mut latest)?;
                     let base = self
                         .loaded
                         .lock()
@@ -601,7 +706,11 @@ impl Harness {
                     expected = Expected::Version(entry.version);
                     self.loaded.lock().map_err(|_| Error::Failed)?.insert(
                         state.id,
-                        (entry.version, serde_json::from_slice(&entry.value)?),
+                        (entry.version, {
+                            let mut c: Conversation = serde_json::from_slice(&entry.value)?;
+                            self.hydrate(&mut c)?;
+                            c
+                        }),
                     );
                 }
                 Err(e @ durable_store::Error::Conflict { .. }) => return Err(e.into()),
@@ -630,6 +739,7 @@ impl Harness {
             config,
             extensions: vec![],
             messages: vec![],
+            transcript: None,
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
@@ -725,10 +835,14 @@ impl Harness {
             .store()
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
-        let record = crate::observer::Record {
-            cursor,
-            value: serde_json::from_slice(&entry.value)?,
-        };
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+        let transcript = value
+            .get("_transcript")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        self.expand_event(id, &mut value)?;
+        let record = crate::observer::Record { cursor, value };
         let point = crate::fork::extract(id, &record)?;
         let state = Conversation {
             id: Uuid::new_v4(),
@@ -740,6 +854,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
+            transcript,
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
@@ -795,7 +910,11 @@ impl Harness {
         limit: std::num::NonZeroUsize,
     ) -> Result<crate::observer::Page, Error> {
         self.load(id)?;
-        Ok(crate::observer::Observer::new(self.owner.store(), id).read(after, limit)?)
+        let mut page = crate::observer::Observer::new(self.owner.store(), id).read(after, limit)?;
+        for record in &mut page.records {
+            self.expand_event(id, &mut record.value)?;
+        }
+        Ok(page)
     }
     /// Persist a reset; busy conversations place it at the next safe boundary.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
@@ -826,9 +945,13 @@ impl Harness {
         interval: Duration,
     ) -> Result<crate::observer::Page, Error> {
         self.load(id)?;
-        Ok(crate::observer::Observer::new(self.owner.store(), id)
+        let mut page = crate::observer::Observer::new(self.owner.store(), id)
             .watch(after, limit, interval)
-            .await?)
+            .await?;
+        for record in &mut page.records {
+            self.expand_event(id, &mut record.value)?;
+        }
+        Ok(page)
     }
     /// Admission is durable before returning. Call `resume` to drive work now;
     /// opening the database also drives all work left by a previous process.
@@ -3307,6 +3430,7 @@ mod scheduler_tests {
             config: config(),
             extensions: vec![],
             messages: vec![],
+            transcript: None,
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
@@ -3332,6 +3456,160 @@ mod scheduler_tests {
         assert!(admission_only(&base, &latest).unwrap());
         latest.phase = Phase::ModelReady { turns: 0 };
         assert!(!admission_only(&base, &latest).unwrap());
+    }
+    #[test]
+    fn transcript_observation_retains_abort_state_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages.push(Message::User {
+            content: "before abort".into(),
+        });
+        state.abort_requested = true;
+        h.save(&state, Expected::Version(version)).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert!(h.conversation(id).unwrap().abort_requested);
+        let history = h
+            .history(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(100).unwrap(),
+            )
+            .unwrap();
+        let event = &history.records.last().unwrap().value;
+        assert_eq!(event["abort_requested"], true);
+        assert_eq!(
+            event["messages"],
+            serde_json::to_value(&state.messages).unwrap()
+        );
+    }
+    #[test]
+    fn legacy_migration_is_atomic_and_snapshots_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let mut legacy = h.conversation(id).unwrap();
+        legacy.transcript = None;
+        legacy.messages.push(Message::User {
+            content: "legacy".into(),
+        });
+        let store = h.owner.store();
+        let head = store
+            .list(b"durable/transcript/head/")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .0;
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Delete { key: head },
+                    Mutation::Put {
+                        key: Harness::key(id),
+                        value: serde_json::to_vec(&legacy).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        assert_eq!(state.messages, legacy.messages);
+        state.messages.push(Message::User {
+            content: "new".into(),
+        });
+        let before = store_count(h.owner.store());
+        assert!(matches!(
+            h.save(&state, Expected::Version(version + 1)),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(store_count(h.owner.store()), before);
+        assert_eq!(h.conversation(id).unwrap().messages, legacy.messages);
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages.push(Message::User {
+            content: "new".into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        let history = h
+            .history(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(100).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            history.records.last().unwrap().value["messages"],
+            serde_json::to_value(&state.messages).unwrap()
+        );
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert_eq!(h.conversation(id).unwrap().messages, state.messages);
+    }
+    #[test]
+    fn snapshots_and_forks_share_message_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        let message = "large-message-marker".repeat(1000);
+        state.messages.push(Message::User {
+            content: message.clone(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        for _ in 0..5 {
+            let (state, version) = h.load(id).unwrap();
+            h.save(&state, Expected::Version(version)).unwrap();
+        }
+        let entries = h
+            .owner
+            .store()
+            .list(b"durable/transcript/entry/")
+            .unwrap()
+            .len();
+        let child = h.fork(id).unwrap();
+        assert_eq!(
+            h.owner
+                .store()
+                .list(b"durable/transcript/entry/")
+                .unwrap()
+                .len(),
+            entries
+        );
+        assert_eq!(h.conversation(child).unwrap().messages, state.messages);
+        for prefix in [b"runtime/fork/".as_slice(), b"durable/observer/".as_slice()] {
+            for (_, entry) in h.owner.store().list(prefix).unwrap() {
+                assert!(
+                    !entry
+                        .value
+                        .windows(message.len())
+                        .any(|w| w == message.as_bytes())
+                );
+            }
+        }
+    }
+    fn store_count(store: &durable_store::Store) -> usize {
+        store.list(b"durable/transcript/").unwrap().len()
     }
     #[tokio::test]
     async fn concurrent_conversations_and_admission_during_execution() {
