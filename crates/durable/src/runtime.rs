@@ -591,14 +591,16 @@ impl Harness {
                 messages: vec![],
                 submissions: state.submissions.clone(),
                 tool_states: state.tool_states.clone(),
-                documents: if state.extensions.is_empty() {
-                    HashMap::new()
-                } else {
-                    HashMap::from([(
+                documents: HashMap::from([
+                    (
                         "pi-rs/runtime/extensions".into(),
                         serde_json::to_value(&state.extensions)?,
-                    )])
-                },
+                    ),
+                    (
+                        "pi-rs/runtime/application-writes".into(),
+                        serde_json::to_value(&state.application_writes)?,
+                    ),
+                ]),
                 active: state.active,
                 pending_resets: state.pending_resets.clone(),
                 phase: serde_json::to_value(&state.phase)?,
@@ -808,6 +810,9 @@ impl Harness {
         state.id = child;
         state.config = config;
         state.submissions.clear();
+        for write in &mut state.application_writes {
+            write.request_id = None;
+        }
         state.aborted_generations.clear();
         state.resets.clear();
         state.pending_resets.clear();
@@ -839,6 +844,9 @@ impl Harness {
         state.active = None;
         state.abort_requested = false;
         state.submissions.clear();
+        for write in &mut state.application_writes {
+            write.request_id = None;
+        }
         state.aborted_generations.clear();
         state.input_modes.clear();
         state.answer_ids.clear();
@@ -887,7 +895,18 @@ impl Harness {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
-            application_writes: vec![],
+            application_writes: point
+                .documents
+                .get("pi-rs/runtime/application-writes")
+                .map(|value| serde_json::from_value::<Vec<ApplicationWrite>>(value.clone()))
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut write| {
+                    write.request_id = None;
+                    write
+                })
+                .collect(),
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),

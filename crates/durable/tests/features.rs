@@ -117,6 +117,53 @@ async fn fork_copies_settled_context_but_not_submissions() {
 }
 
 #[tokio::test]
+async fn forks_keep_application_entries_at_the_selected_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(dir.path().join("db"), opts(), &cancel)
+        .await
+        .unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_write(
+        parent,
+        Some("first".into()),
+        "app.note".into(),
+        Some(serde_json::json!(1)),
+    )
+    .unwrap();
+    let cursor = h
+        .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .next;
+    h.submit_write(
+        parent,
+        Some("second".into()),
+        "app.note".into(),
+        Some(serde_json::json!(2)),
+    )
+    .unwrap();
+    let historical = h.fork_at(parent, cursor).unwrap();
+    let current = h.fork(parent).unwrap();
+    let old = h.conversation(historical).unwrap();
+    assert_eq!(old.application_writes.len(), 1);
+    assert_eq!(old.application_writes[0].data, Some(serde_json::json!(1)));
+    assert!(old.application_writes[0].request_id.is_none());
+    assert_eq!(h.conversation(current).unwrap().application_writes.len(), 2);
+    h.submit_write(historical, Some("first".into()), "app.new".into(), None)
+        .unwrap();
+    assert_eq!(
+        h.conversation(historical).unwrap().application_writes.len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn historical_fork_uses_selected_settled_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
