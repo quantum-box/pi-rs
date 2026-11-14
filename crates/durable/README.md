@@ -73,10 +73,7 @@ a task driver and register the exact selected extension handler with
 `Registry::register_shared` and its replay policy; a missing driver leaves the
 hook phase pending, and a mismatched registration fails closed. Reopen with the
 extensions and driver registered to resume. Harness users explicitly resume;
-Scheduler polls waiting phases. Hook errors fail closed. An after-tools child that succeeds with exactly `{ "terminate": true }` settles
-the current inputs with the tool-calling answer and runs after-run hooks before
-placing queued inputs. Other child outcomes are ignored; invalid decisions are
-not yet reported, and invalid task requests stop the phase instead of upstream's report-and-skip behavior. Tool-result terminate controls and provider-body hooks are not integrated; onYield supports string continuations but not task decisions. Before-tool hooks may sleep on
+Scheduler polls waiting phases. Hook errors fail closed. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful nonempty string continuation in creation order; queued input or reset takes precedence. Failed or invalid child outcomes are ignored without reporting. Invalid task requests stop the phase. Provider-body hooks and tool-result terminate controls remain unsupported. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
