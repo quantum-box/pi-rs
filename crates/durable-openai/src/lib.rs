@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -115,6 +115,91 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
     body
 }
 
+fn durable_payload(durable: &DurableRequest) -> Result<Value> {
+    let request = &durable.request;
+    if durable.blocks.is_empty() {
+        return Ok(payload(request, "openai"));
+    }
+    let mut ids = std::collections::HashSet::new();
+    if durable
+        .blocks
+        .values()
+        .any(|binding| binding.message_id.is_nil() || !ids.insert(binding.message_id))
+    {
+        return Err(Error::Config("invalid durable occurrence IDs".into()));
+    }
+    let mut body = payload(request, "openai");
+    let mut input = Vec::new();
+    for (index, message) in request.messages.iter().enumerate() {
+        if let Some(binding) = durable.blocks.get(&index) {
+            if !matches!(message, Message::User { content } if content.is_empty()) {
+                return Err(Error::Config("durable block placeholder mismatch".into()));
+            }
+            let mut blocks = Vec::new();
+            for block in &binding.blocks {
+                let object = block
+                    .as_object()
+                    .ok_or_else(|| Error::Config("invalid content block".into()))?;
+                match block["type"].as_str() {
+                    Some("text") if object.len() == 2 => {
+                        let text = block["text"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid text block".into()))?;
+                        blocks.push(json!({"type":"input_text", "text":text}));
+                    }
+                    Some("image")
+                        if object.keys().all(|k| {
+                            ["type", "data", "mimeType", "detail"].contains(&k.as_str())
+                        }) =>
+                    {
+                        let image = pi_rs_core::ImageContent {
+                            data: block["data"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                            mime_type: block["mimeType"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("invalid image".into()))?
+                                .into(),
+                        };
+                        image.validate()?;
+                        let mut encoded = json!({"type":"input_image", "image_url":format!("data:{};base64,{}", image.mime_type, image.data)});
+                        if let Some(detail) = object.get("detail") {
+                            if !matches!(detail.as_str(), Some("low" | "high" | "auto")) {
+                                return Err(Error::Config("invalid image detail".into()));
+                            }
+                            encoded["detail"] = detail.clone();
+                        }
+                        blocks.push(encoded);
+                    }
+                    _ => return Err(Error::Config("unsupported durable block metadata".into())),
+                }
+            }
+            if blocks.is_empty() {
+                return Err(Error::Config(
+                    "empty user block array unsupported by Responses".into(),
+                ));
+            }
+            input.push(json!({"role":"user", "content":blocks}));
+        } else {
+            let mut one = request.clone();
+            one.messages = vec![message.clone()];
+            input.extend(
+                payload(&one, "openai")["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+        }
+    }
+    if durable.blocks.keys().any(|i| *i >= request.messages.len()) {
+        return Err(Error::Config("durable block index out of bounds".into()));
+    }
+    body["input"] = json!(input);
+    Ok(body)
+}
+
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     value[name]
         .as_str()
@@ -147,6 +232,29 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 impl ProviderAdapter for OpenAiResponsesAdapter {
     fn id(&self) -> &str {
         "openai-responses-api/v1"
+    }
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_durable(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<Value> {
+        durable_payload(request)
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request, body)?;
+        if !request.blocks.is_empty() && body.get("input") != durable_payload(request)?.get("input")
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
     }
     async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
         Ok(payload(request, "openai"))

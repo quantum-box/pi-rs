@@ -520,3 +520,260 @@ async fn completed_tool_call_with_empty_arguments_is_rejected() {
     rx.recv().unwrap();
     thread.join().unwrap();
 }
+
+struct ContinueBlocks {
+    cancel: CancellationToken,
+    yields: std::sync::atomic::AtomicUsize,
+    before: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for ContinueBlocks {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        use std::sync::atomic::Ordering;
+        match event {
+            GenerationEvent::OnYield if self.yields.fetch_add(1, Ordering::SeqCst) == 0 => {
+                Ok(GenerationDecision::Continue(json!([
+                    {"type":"text", "text":"first"},
+                    {"type":"image", "data":"aGk=", "mimeType":"image/png", "detail":"high"},
+                    {"type":"text", "text":"last"}
+                ])))
+            }
+            GenerationEvent::BeforeRequest if value.get("content_blocks").is_some() => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(value["content_blocks"].clone());
+                if self.before.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.cancel.cancel();
+                    std::future::pending::<()>().await;
+                }
+                Ok(GenerationDecision::Pass)
+            }
+            GenerationEvent::BeforeProviderRequest => {
+                let mut payload = value["payload"].clone();
+                payload["temperature"] = json!(0.25);
+                Ok(GenerationDecision::Replace(json!({"payload":payload})))
+            }
+            _ => Ok(GenerationDecision::Pass),
+        }
+    }
+}
+
+#[tokio::test]
+async fn yield_blocks_reopen_and_dispatch_in_order() {
+    use pi_rs_durable::{
+        extension::Extension,
+        recovery::UncertainPolicy,
+        runtime::{Config, Harness, Options, Status},
+    };
+    use std::sync::Arc;
+    let events = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+    let (url, first_rx, first_thread) = server(http(events), false);
+    let options = || Options {
+        model: Arc::new(UnusedModel),
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 3,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let hook = Arc::new(ContinueBlocks {
+        cancel: cancel.clone(),
+        yields: std::sync::atomic::AtomicUsize::new(0),
+        before: std::sync::atomic::AtomicUsize::new(0),
+        seen: std::sync::Mutex::new(vec![]),
+    });
+    let extension = || Extension {
+        name: "blocks".into(),
+        hooks: vec![hook.clone()],
+        ..Default::default()
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "system".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    assert!(
+        h.submit_and_run(id, None, "initial".into(), &cancel)
+            .await
+            .is_err()
+    );
+    first_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    first_thread.join().unwrap();
+    drop(h);
+    let (url, rx, thread) = server(http(events), false);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let reopened = h.conversation(id).unwrap();
+    let binding = reopened.content_blocks.values().next().unwrap().clone();
+    assert_eq!(binding.blocks[1]["detail"], json!("high"));
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let body = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let content = &body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["role"] == "user" && v["content"].is_array())
+        .unwrap()["content"];
+    assert_eq!(
+        content,
+        &json!([
+            {"type":"input_text","text":"first"},
+            {"type":"input_image","image_url":"data:image/png;base64,aGk=","detail":"high"},
+            {"type":"input_text","text":"last"}
+        ])
+    );
+    assert_eq!(body["temperature"], json!(0.25));
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .next()
+            .unwrap()
+            .message_id,
+        binding.message_id
+    );
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(hook.seen.lock().unwrap().len(), 2);
+    assert!(h.fork(id).is_err());
+    assert!(h.request_manual_compaction(id, 0, None).is_err());
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn ordered_block_encoder_rejects_unrepresentable_metadata_and_hook_rewrite() {
+    use pi_rs_durable::{model::DurableRequest, transcript::MessageContentBlocks};
+    use std::collections::BTreeMap;
+    let adapter =
+        OpenAiResponsesAdapter::new("http://127.0.0.1:1234", "fixture-secret".into()).unwrap();
+    let mut req = request();
+    req.messages[0] = Message::User {
+        content: String::new(),
+    };
+    let mut durable = DurableRequest {
+        request: req,
+        blocks: BTreeMap::from([(
+            0,
+            MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![json!({"type":"text","text":"a","textSignature":"opaque"})],
+            },
+        )]),
+    };
+    assert!(adapter.prepare_durable(&attempt(), &durable).await.is_err());
+    durable.blocks.get_mut(&0).unwrap().blocks = vec![
+        json!({"type":"text","text":"a"}),
+        json!({"type":"text","text":"b"}),
+    ];
+    let mut body = adapter.prepare_durable(&attempt(), &durable).await.unwrap();
+    adapter
+        .validate_durable(&attempt(), &durable, &body)
+        .unwrap();
+    body["input"][0]["content"][1]["text"] = json!("changed");
+    assert!(
+        adapter
+            .validate_durable(&attempt(), &durable, &body)
+            .is_err()
+    );
+}
+
+struct RewriteBlocks;
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for RewriteBlocks {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        body: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event != GenerationEvent::BeforeRequest {
+            return Ok(GenerationDecision::Pass);
+        }
+        let mut value = body.clone();
+        value["content_blocks"] = json!({});
+        Ok(GenerationDecision::Replace(value))
+    }
+}
+
+#[tokio::test]
+async fn before_request_cannot_discard_block_binding() {
+    use pi_rs_durable::{
+        extension::Extension,
+        recovery::UncertainPolicy,
+        runtime::{Config, Harness, Options},
+    };
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        Options {
+            model: Arc::new(UnusedModel),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        },
+    )
+    .unwrap();
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new("http://127.0.0.1:1", "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(Extension {
+        name: "rewrite-blocks".into(),
+        hooks: vec![Arc::new(RewriteBlocks)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["rewrite-blocks".into()])
+        .unwrap();
+    h.append_user_blocks(id, vec![json!({"type":"text","text":"preserved"})])
+        .unwrap();
+    let err = h
+        .submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot replace durable content bindings"),
+        "{err}"
+    );
+}

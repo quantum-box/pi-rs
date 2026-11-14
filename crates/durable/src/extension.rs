@@ -597,15 +597,17 @@ impl Resolved {
         value: Value,
         ctx: &Context<'_>,
     ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
-        self.generation_inner(event, value, ctx, false).await
+        self.generation_inner(event, value, ctx, false, false).await
     }
     pub(crate) async fn lifecycle_generation(
         &self,
         event: GenerationEvent,
         value: Value,
         ctx: &Context<'_>,
+        durable_blocks: bool,
     ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
-        self.generation_inner(event, value, ctx, true).await
+        self.generation_inner(event, value, ctx, true, durable_blocks)
+            .await
     }
     async fn generation_inner(
         &self,
@@ -613,6 +615,7 @@ impl Resolved {
         mut value: Value,
         ctx: &Context<'_>,
         validate_owner: bool,
+        durable_blocks: bool,
     ) -> (Value, Option<Value>, Vec<HookTask>, Vec<Report>) {
         let mut tasks = vec![];
         let mut reports = vec![];
@@ -641,7 +644,11 @@ impl Resolved {
                         }
                     }
                     Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
-                        if yield_input(&v).is_some() {
+                        if yield_input(&v).is_some()
+                            || (durable_blocks
+                                && crate::content::UserContent::from_yield(v.clone(), false)
+                                    .is_some())
+                        {
                             return (value, Some(v), tasks, reports);
                         }
                         reports.push(failure(

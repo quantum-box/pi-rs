@@ -1,4 +1,4 @@
-//! Lossless durable user content. Runtime integration is separate from this type.
+//! Lossless durable user content and continuation validation.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -79,6 +79,11 @@ mod tests {
         let content = UserContent::from_yield(multiple.clone(), true).unwrap();
         assert_eq!(serde_json::to_value(&content).unwrap(), multiple);
         assert!(content.try_core().is_none());
-        assert!(UserContent::from_yield(json!(""), true).unwrap().try_core().is_some());
+        assert!(
+            UserContent::from_yield(json!(""), true)
+                .unwrap()
+                .try_core()
+                .is_some()
+        );
     }
 }

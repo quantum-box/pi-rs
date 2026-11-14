@@ -40,11 +40,47 @@ pub struct ProviderAttempt {
     pub restarts: u32,
 }
 
+/// A model request with lossless user blocks indexed into `request.messages`.
+#[derive(Clone, Debug)]
+pub struct DurableRequest {
+    pub request: ModelRequest,
+    pub blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+}
+
 /// An opt-in host implementation for one provider. `dispatch` must send exactly
 /// the validated body and enforce its own authorization, budgets and endpoint
 /// restrictions. Preparation must not send a request. Errors fail closed.
 #[async_trait::async_trait]
 pub trait ProviderAdapter: Send + Sync {
+    /// Opt in only if durable block requests are implemented without truncation.
+    fn supports_durable_blocks(&self) -> bool {
+        false
+    }
+    async fn prepare_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<serde_json::Value> {
+        if !request.blocks.is_empty() {
+            return Err(Error::Config(
+                "durable content blocks unsupported by provider".into(),
+            ));
+        }
+        self.prepare(attempt, &request.request).await
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        if !request.blocks.is_empty() {
+            return Err(Error::Config(
+                "durable content blocks unsupported by provider".into(),
+            ));
+        }
+        self.validate(attempt, &request.request, body)
+    }
     /// Stable, versioned identity used to bind persisted conversations.
     fn id(&self) -> &str;
     async fn prepare(

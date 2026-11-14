@@ -1483,6 +1483,29 @@ impl Harness {
             Ok(specs)
         }
     }
+    fn supports_blocks(&self, c: &Conversation) -> bool {
+        c.provider_adapter
+            .as_ref()
+            .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id))
+            .is_some_and(|a| a.supports_durable_blocks())
+    }
+    fn append_yield(c: &mut Conversation, input: crate::content::UserContent, durable: bool) {
+        if durable && let crate::content::UserContent::Blocks(blocks) = &input {
+            let index = c.messages.len();
+            c.messages.push(Message::User {
+                content: String::new(),
+            });
+            c.content_blocks.insert(
+                index,
+                crate::transcript::MessageContentBlocks {
+                    message_id: Uuid::new_v4(),
+                    blocks: blocks.clone(),
+                },
+            );
+        } else if let Some(message) = input.try_core() {
+            c.messages.push(message);
+        }
+    }
     /// Install a host adapter before resuming any conversation that selected it.
     pub fn install_provider_adapter(
         &mut self,
@@ -4638,7 +4661,7 @@ impl Harness {
                 None
             };
             let (mut c, version) = self.load(id)?;
-            if !c.content_blocks.is_empty() {
+            if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
             if request_id.as_ref().is_some_and(|key| {
@@ -5142,18 +5165,14 @@ impl Harness {
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
         {
             let (mut c, version) = self.load(id)?;
-            if !c.content_blocks.is_empty() {
-                if matches!(c.phase, Phase::Idle)
-                    && c.active.is_none()
-                    && !c.abort_requested
-                    && c.pending_resets.is_empty()
-                    && !c
-                        .submissions
-                        .iter()
-                        .any(|s| matches!(s.status, Status::Queued | Status::Running))
-                {
-                    return Ok(());
-                }
+            if !c.content_blocks.is_empty()
+                && matches!(
+                    c.phase,
+                    Phase::CompactionHook { .. }
+                        | Phase::CompactionRunning { .. }
+                        | Phase::CompactionPlacement { .. }
+                )
+            {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
             self.report_blocked_tool_panic(&c)?;
@@ -5634,7 +5653,7 @@ impl Harness {
             memo: &memo,
         };
         let (_, continuation, tasks, reports) = fenced_poll(
-            selected.lifecycle_generation(event, value, &context),
+            selected.lifecycle_generation(event, value, &context, self.supports_blocks(c)),
             self.execution_gate.as_ref(),
             cancel,
         )
@@ -5922,7 +5941,7 @@ impl Harness {
                     }
                 }
                 Phase::ModelReady { turns } => {
-                    if !c.content_blocks.is_empty() {
+                    if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
                         return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
                     }
                     if !matches!(
@@ -5940,7 +5959,7 @@ impl Harness {
                     } else if turns >= self.options.max_turns {
                         finish_failure(&mut c, "turn limit".into());
                     } else {
-                        if !c.auto_compaction_attempted {
+                        if !c.auto_compaction_attempted && c.content_blocks.is_empty() {
                             let window = tokio::select! {
                                 _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
                                 window = tokio::time::timeout(Duration::from_secs(5), self.options.model.context_window(&c.config.model)) => window.ok().flatten(),
@@ -6042,6 +6061,12 @@ impl Harness {
                     let specs = self.ordered_tool_specs(&c)?;
                     let mut request =
                         model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
+                    let blocks: std::collections::BTreeMap<_, _> = c
+                        .content_blocks
+                        .iter()
+                        .map(|(index, binding)| (index + 1, binding.clone()))
+                        .collect();
+                    let original_messages = request.messages.clone();
                     if !c.extensions.is_empty() {
                         let selected = self.selected_extensions(&c)?;
                         let snapshot = serde_json::to_value(&c)?;
@@ -6050,7 +6075,10 @@ impl Harness {
                             snapshot: &snapshot,
                             memo: &memo,
                         };
-                        let value = serde_json::json!({"messages": request.messages});
+                        let mut value = serde_json::json!({"messages": request.messages});
+                        if !blocks.is_empty() {
+                            value["content_blocks"] = serde_json::to_value(&blocks)?;
+                        }
                         let (value, _, _, reports) = fenced_poll(
                             selected.generation(
                                 crate::extension::GenerationEvent::BeforeRequest,
@@ -6068,6 +6096,13 @@ impl Harness {
                             return Err(Error::Interrupted);
                         }
                         self.record_extension_reports(c.id, request_id, "before_request", reports)?;
+                        if !blocks.is_empty()
+                            && value.get("content_blocks") != Some(&serde_json::to_value(&blocks)?)
+                        {
+                            return Err(Error::Invalid(
+                                "before-request cannot replace durable content bindings".into(),
+                            ));
+                        }
                         request.messages =
                             serde_json::from_value(value.get("messages").cloned().ok_or_else(
                                 || Error::Invalid("before-request hook omitted messages".into()),
@@ -6076,6 +6111,15 @@ impl Harness {
                                 Error::Invalid(format!("invalid before-request messages: {e}"))
                             })?;
                     }
+                    if !blocks.is_empty() && request.messages != original_messages {
+                        return Err(Error::Invalid(
+                            "before-request cannot replace messages with durable blocks".into(),
+                        ));
+                    }
+                    let durable_request = crate::model::DurableRequest {
+                        request: request.clone(),
+                        blocks,
+                    };
                     let prepared = if let Some(adapter_id) = &c.provider_adapter {
                         let adapter = self
                             .provider_adapter
@@ -6095,7 +6139,7 @@ impl Harness {
                             restarts,
                         };
                         let mut body = fenced_poll(
-                            adapter.prepare(&attempt, &request),
+                            adapter.prepare_durable(&attempt, &durable_request),
                             self.execution_gate.as_ref(),
                             cancel,
                         )
@@ -6139,9 +6183,12 @@ impl Harness {
                                 "provider body must be an object within the size limit".into(),
                             ));
                         }
-                        adapter.validate(&attempt, &request, &body)?;
+                        adapter.validate_durable(&attempt, &durable_request, &body)?;
                         Some((adapter, attempt, body))
                     } else {
+                        if !durable_request.blocks.is_empty() {
+                            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                        }
                         None
                     };
                     let store = self.owner.store();
@@ -6440,14 +6487,21 @@ impl Harness {
                         )?;
                         continue;
                     }
-                    let continuation = continuation
-                        .as_ref()
-                        .and_then(crate::extension::yield_input);
+                    let continuation = continuation.and_then(|value| {
+                        if self.supports_blocks(&c) {
+                            crate::content::UserContent::from_yield(value, false)
+                        } else {
+                            crate::extension::yield_input(&value).map(|_| {
+                                crate::content::UserContent::from_yield(value, false).unwrap()
+                            })
+                        }
+                    });
                     if let Some(message) = continuation.filter(|_| {
                         c.pending_resets.is_empty()
                             && !c.submissions.iter().any(|s| s.status == Status::Queued)
                     }) {
-                        c.messages.push(message);
+                        let durable = self.supports_blocks(&c);
+                        Self::append_yield(&mut c, message, durable);
                         c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns: 0 };
                     } else {
@@ -6502,9 +6556,15 @@ impl Harness {
                         }
                         if continuation.is_none()
                             && let crate::task::TaskState::Succeeded(value) = task.state()
-                            && let Some(message) = value
-                                .get("continue")
-                                .and_then(crate::extension::yield_input)
+                            && let Some(message) = value.get("continue").and_then(|value| {
+                                if self.supports_blocks(&c) {
+                                    crate::content::UserContent::from_yield(value.clone(), true)
+                                } else {
+                                    crate::extension::yield_input(value).and_then(|_| {
+                                        crate::content::UserContent::from_yield(value.clone(), true)
+                                    })
+                                }
+                            })
                         {
                             continuation = Some(message);
                         }
@@ -6513,7 +6573,8 @@ impl Harness {
                         c.pending_resets.is_empty()
                             && !c.submissions.iter().any(|s| s.status == Status::Queued)
                     }) {
-                        c.messages.push(message);
+                        let durable = self.supports_blocks(&c);
+                        Self::append_yield(&mut c, message, durable);
                         c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns: 0 };
                     } else {
@@ -8941,6 +9002,9 @@ fn start_overflow_compaction(
     turns: u32,
     reason: String,
 ) -> Result<(), Error> {
+    if !c.content_blocks.is_empty() {
+        return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+    }
     if c.overflow_compaction_attempted {
         finish_failure(c, reason);
         return Ok(());
@@ -9352,6 +9416,19 @@ mod scheduler_tests {
         assert_eq!(c.content_blocks[&0].blocks, blocks);
         assert_eq!(c.content_blocks[&1].message_id, second);
         assert!(c.content_blocks[&1].blocks.is_empty());
+    }
+
+    #[test]
+    fn durable_yield_preserves_representable_array_shape() {
+        let mut state = Harness::empty_conversation(Uuid::new_v4(), config());
+        let blocks = vec![serde_json::json!({"type":"text", "text":"hello"})];
+        Harness::append_yield(
+            &mut state,
+            crate::content::UserContent::Blocks(blocks.clone()),
+            true,
+        );
+        assert_eq!(state.content_blocks[&0].blocks, blocks);
+        assert!(matches!(&state.messages[0], Message::User { content } if content.is_empty()));
     }
 
     #[test]

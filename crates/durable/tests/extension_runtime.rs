@@ -3798,3 +3798,124 @@ async fn yield_does_not_drop_block_metadata_from_direct_or_child_decisions() {
         }
     }
 }
+
+#[tokio::test]
+async fn yield_child_persists_ordered_blocks_for_durable_provider() {
+    use pi_rs_durable::{
+        model::{DurableRequest, ProviderAdapter, ProviderAttempt},
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+    };
+    #[derive(Default)]
+    struct DurableFake(Mutex<Vec<DurableRequest>>);
+    #[async_trait]
+    impl ProviderAdapter for DurableFake {
+        fn id(&self) -> &str {
+            "durable-fake/v1"
+        }
+        fn supports_durable_blocks(&self) -> bool {
+            true
+        }
+        async fn prepare(&self, _: &ProviderAttempt, _: &ModelRequest) -> Result<Value, Error> {
+            Ok(json!({}))
+        }
+        fn validate(&self, _: &ProviderAttempt, _: &ModelRequest, _: &Value) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn prepare_durable(
+            &self,
+            _: &ProviderAttempt,
+            request: &DurableRequest,
+        ) -> Result<Value, Error> {
+            self.0.lock().unwrap().push(request.clone());
+            Ok(json!({}))
+        }
+        fn validate_durable(
+            &self,
+            _: &ProviderAttempt,
+            _: &DurableRequest,
+            _: &Value,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn dispatch(
+            &self,
+            _: &ProviderAttempt,
+            _: &ModelRequest,
+            _: Value,
+        ) -> Result<ModelStream, Error> {
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    let input = json!([{"type":"text","text":"one","textSignature":"opaque"}, {"type":"text","text":"two"}]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    let adapter = Arc::new(DurableFake::default());
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let handler: Arc<dyn Handler> =
+        Arc::new(|task: &Task| Ok(Step::Succeed(task.checkpoint().data.clone())));
+    h.install_extension(Extension {
+        name: "once".into(),
+        hooks: vec![Arc::new(YieldOnce(
+            input.clone(),
+            true,
+            std::sync::atomic::AtomicUsize::new(0),
+        ))],
+        tasks: vec![("once-review".into(), handler.clone())],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("once-review", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["once".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        if matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(c.submissions[0].status, Status::Done { .. }));
+    let binding = c.content_blocks.values().next().unwrap();
+    assert_eq!(binding.blocks, input.as_array().unwrap().clone());
+    assert_eq!(
+        adapter
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .blocks
+            .values()
+            .next()
+            .unwrap(),
+        binding
+    );
+    driver.shutdown().unwrap();
+}
