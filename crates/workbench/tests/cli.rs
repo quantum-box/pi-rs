@@ -164,7 +164,7 @@ fn worker_returns_keyed_share_journal_tag() {
     let path = root.path().join("session.jsonl");
     let mut session = Session::open(&path).unwrap();
     session
-        .append_user_with_images("fixture".into(), Vec::new(), None)
+        .append_user_with_images("fixture 🌸\nsecond".into(), Vec::new(), None)
         .unwrap();
     drop(session);
     let stderr = tempfile::NamedTempFile::new().unwrap();
