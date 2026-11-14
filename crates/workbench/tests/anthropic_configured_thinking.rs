@@ -51,6 +51,9 @@ fn configured_thinking_controls_wire_without_models_api() {
                     }
                     Err(error) => panic!("accept model request: {error}"),
                 };
+                // Windows inherits the listener's nonblocking mode on accept.
+                // The buffered HTTP reader below relies on blocking reads.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
