@@ -7633,7 +7633,7 @@ mod scheduler_tests {
             active: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
         });
-        let mut h = Harness::open_paused(&dir.path().join("db"), options(model)).unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
         let id = h.create_conversation(config()).unwrap();
         let (mut original, version) = h.load(id).unwrap();
         original.messages = vec![Message::User {
