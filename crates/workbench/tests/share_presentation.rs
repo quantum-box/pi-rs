@@ -492,6 +492,10 @@ fn terminal_shares_idle_and_during_model_request() {
     let idle = receive_share(&mut master);
     let idle_context = idle.last().unwrap();
     assert_eq!(idle_context["customType"], "pi.share");
+    // The per-request challenge and its tag are internal to the frontend and
+    // worker; neither belongs in the uploaded presentation metadata.
+    assert!(idle_context["data"].get("journalKey").is_none());
+    assert!(idle_context["data"].get("journalTag").is_none());
     assert!(
         idle_context["data"]["systemPrompt"]
             .as_str()
@@ -511,6 +515,8 @@ fn terminal_shares_idle_and_during_model_request() {
     master.write_all(b"/share\r").unwrap();
     let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
+    assert!(active.last().unwrap()["data"].get("journalKey").is_none());
+    assert!(active.last().unwrap()["data"].get("journalTag").is_none());
     assert_eq!(active.last().unwrap()["data"], idle_context["data"]);
     release_tx.send(()).unwrap();
     wait_output(&mut master, "done");
