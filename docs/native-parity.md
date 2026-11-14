@@ -662,9 +662,14 @@ recovery and before startup hooks and any turns they trigger.
 If a startup-triggered turn fails after that replacement, the model-selection
 notifications are still delivered before the failure is returned.
 Checkout, tree navigation, and persistent fork validate the destination model
-before tree hooks, changing the journal, or creating a file. Native
-SDK branch registrations are keyed by model name, so hosts must use distinct
-names for clients from different providers.
+before tree hooks, changing the journal, or creating a file. Hosts can identify
+the initial client with `SessionBuilder::provider`, register exact historical
+identities with `provider_branch_model` or `register_provider_branch_model`,
+and select them with `set_provider_model`. A provider-qualified selection uses
+only its exact registration, even if a name-only client exists. Older selections
+without a provider use only name-only registrations, so hosts must explicitly
+resolve ambiguous legacy identities. The SDK does not discover credentials or
+endpoints; the host constructs and registers clients under its own policy.
 
 Embedded hosts can use `coding_factories::create_coding_tools` and
 `create_read_only_tools` to register Pi's ordered coding or read-only tool sets

@@ -699,14 +699,13 @@ impl SessionControl {
             observe(Notification::Committed(&record));
             self.input_hooks.lock().expect("SDK input hooks").states = journal.extension_states();
         }
-        if let Some((name, _)) = journal.model_selection() {
+        if let Some((provider, name, _)) = journal.model_identity_at(journal.head()) {
             let mut config = self.owner.config.lock().expect("run config");
             let registry = config
                 .registry
                 .upgrade()
                 .ok_or_else(|| Error::Config("session is closed".into()))?;
-            let model = registry
-                .branch_model(journal.session_id(), &name)
+            let model = branch_client(&registry, journal.session_id(), provider.as_deref(), &name)
                 .ok_or_else(|| {
                     Error::Config(format!("session branch requires registered model {name}"))
                 })?;
@@ -1043,6 +1042,20 @@ impl SessionControl {
     }
 }
 
+fn branch_client(
+    registry: &Registry,
+    session: Uuid,
+    provider: Option<&str>,
+    name: &str,
+) -> Option<Arc<dyn Model>> {
+    match provider {
+        Some(provider) => registry
+            .provider_branch_config(session, provider, name)
+            .map(|(model, _)| model),
+        None => registry.branch_model(session, name),
+    }
+}
+
 /// Builds an owned local session while retaining the provider-neutral core APIs.
 ///
 /// ```no_run
@@ -1062,22 +1075,26 @@ impl SessionControl {
 pub struct SessionBuilder {
     model: Arc<dyn Model>,
     model_name: String,
+    model_provider: Option<String>,
     system_prompt: String,
     registry: Registry,
     limits: Limits,
     tool_timeout_explicit: bool,
     branch_models: std::collections::BTreeMap<String, Arc<dyn Model>>,
+    provider_models: std::collections::BTreeMap<(String, String), Arc<dyn Model>>,
 }
 impl SessionBuilder {
     pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
         Self {
             model,
             model_name: model_name.into(),
+            model_provider: None,
             system_prompt: "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.".into(),
             registry: Registry::default(),
             limits: Limits::default(),
             tool_timeout_explicit: false,
             branch_models: Default::default(),
+            provider_models: Default::default(),
         }
     }
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -1105,6 +1122,31 @@ impl SessionBuilder {
             return Err(Error::Config("model name is empty".into()));
         }
         self.branch_models.insert(name, model);
+        Ok(self)
+    }
+    /// Identify the provider of the initial client. Without this, it can only
+    /// restore legacy selections that do not name a provider.
+    pub fn provider(mut self, provider: impl Into<String>) -> Result<Self> {
+        let provider = provider.into();
+        if provider.trim().is_empty() {
+            return Err(Error::Config("provider name is empty".into()));
+        }
+        self.model_provider = Some(provider);
+        Ok(self)
+    }
+
+    /// Register a client for an exact provider and model identity.
+    pub fn provider_branch_model(
+        mut self,
+        provider: impl Into<String>,
+        name: impl Into<String>,
+        model: Arc<dyn Model>,
+    ) -> Result<Self> {
+        let (provider, name) = (provider.into(), name.into());
+        if provider.trim().is_empty() || name.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        self.provider_models.insert((provider, name), model);
         Ok(self)
     }
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
@@ -1135,11 +1177,28 @@ impl SessionBuilder {
             self.registry
                 .register_session_branch_model(session.session_id(), name, model)?;
         }
-        self.registry.register_session_branch_model(
-            session.session_id(),
-            self.model_name.clone(),
-            self.model.clone(),
-        )?;
+        for ((provider, name), model) in self.provider_models {
+            self.registry.register_session_provider_model(
+                session.session_id(),
+                &provider,
+                &name,
+                model,
+            )?;
+        }
+        if let Some(provider) = &self.model_provider {
+            self.registry.register_session_provider_model(
+                session.session_id(),
+                provider,
+                &self.model_name,
+                self.model.clone(),
+            )?;
+        } else {
+            self.registry.register_session_branch_model(
+                session.session_id(),
+                self.model_name.clone(),
+                self.model.clone(),
+            )?;
+        }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -1215,8 +1274,8 @@ pub struct AgentSession {
 impl AgentSession {
     fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
         if let Some(target) = journal.tree_navigation_target(selected)?
-            && let Some((name, _)) = journal.model_selection_at(target)
-            && self.registry.branch_model(self.session_id, &name).is_none()
+            && let Some((provider, name, _)) = journal.model_identity_at(target)
+            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
         {
             return Err(Error::Config(format!(
                 "session branch requires registered model {name}"
@@ -1224,11 +1283,9 @@ impl AgentSession {
         }
         Ok(())
     }
-    fn restore_branch_model(&mut self, name: String) -> Result<()> {
-        let model = self
-            .registry
-            .branch_model(self.session_id, &name)
-            .ok_or_else(|| {
+    fn restore_branch_model(&mut self, provider: Option<&str>, name: String) -> Result<()> {
+        let model =
+            branch_client(&self.registry, self.session_id, provider, &name).ok_or_else(|| {
                 Error::Config(format!("session branch requires registered model {name}"))
             })?;
         self.model = model;
@@ -1278,11 +1335,12 @@ impl AgentSession {
     /// Resolve the configured or provider-reported context window within the model timeout.
     pub async fn context_usage(&self) -> Result<Option<crate::ContextUsage>> {
         self.ensure_open()?;
-        let selection = self.session.lock().await.model_selection();
-        let (name, model) = if let Some((name, _)) = selection {
-            let model = self
-                .registry
-                .branch_model(self.session_id, &name)
+        let selection = {
+            let journal = self.session.lock().await;
+            journal.model_identity_at(journal.head())
+        };
+        let (name, model) = if let Some((provider, name, _)) = selection {
+            let model = branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
                 .ok_or_else(|| {
                     Error::Config(format!("session branch requires registered model {name}"))
                 })?;
@@ -1401,17 +1459,59 @@ impl AgentSession {
         )
     }
 
-    pub fn set_model(&mut self, model: Arc<dyn Model>, name: impl Into<String>) -> Result<()> {
+    /// Register a historical client without conflating identical model IDs.
+    pub fn register_provider_branch_model(
+        &self,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn Model>,
+    ) -> Result<()> {
         self.ensure_open()?;
-        let name = name.into();
-        self.registry.register_session_branch_model(
-            self.session
-                .try_lock()
-                .map_err(|_| Error::Session("session journal is in use".into()))?
-                .session_id(),
-            name.clone(),
-            model.clone(),
-        )?;
+        self.registry
+            .register_session_provider_model(self.session_id, provider, name, model)
+    }
+
+    pub fn set_model(&mut self, model: Arc<dyn Model>, name: impl Into<String>) -> Result<()> {
+        self.set_model_identity(model, None, name.into())
+    }
+
+    /// Select and register a client under its exact provider and model identity.
+    pub fn set_provider_model(
+        &mut self,
+        model: Arc<dyn Model>,
+        provider: &str,
+        name: impl Into<String>,
+    ) -> Result<()> {
+        if provider.trim().is_empty() {
+            return Err(Error::Config("provider name is empty".into()));
+        }
+        self.set_model_identity(model, Some(provider), name.into())
+    }
+
+    fn set_model_identity(
+        &mut self,
+        model: Arc<dyn Model>,
+        provider: Option<&str>,
+        name: String,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        if let Some(provider) = provider {
+            self.registry.register_session_provider_model(
+                self.session_id,
+                provider,
+                &name,
+                model.clone(),
+            )?;
+        } else {
+            self.registry.register_session_branch_model(
+                self.session_id,
+                name.clone(),
+                model.clone(),
+            )?;
+        }
         let count = self
             .session
             .try_lock()
@@ -1421,7 +1521,7 @@ impl AgentSession {
         self.session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?
-            .select_model(&name, None)?;
+            .select_provider_model(provider, &name, None)?;
         if count
             != self
                 .session
@@ -1543,8 +1643,9 @@ impl AgentSession {
         {
             let journal = self.journal()?;
             journal.validate_checkout(record)?;
-            if let Some((name, _)) = journal.model_selection_at(record)
-                && self.registry.branch_model(self.session_id, &name).is_none()
+            if let Some((provider, name, _)) = journal.model_identity_at(record)
+                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                    .is_none()
             {
                 return Err(Error::Config(format!(
                     "session branch requires registered model {name}"
@@ -1557,9 +1658,12 @@ impl AgentSession {
             .checkout(record)?;
         self.refresh_input_hooks()?;
         self.emit_last()?;
-        let selection = self.journal()?.model_selection();
-        if let Some((model, _)) = selection {
-            self.restore_branch_model(model)?;
+        let selection = {
+            let journal = self.journal()?;
+            journal.model_identity_at(journal.head())
+        };
+        if let Some((provider, model, _)) = selection {
+            self.restore_branch_model(provider.as_deref(), model)?;
         }
         Ok(())
     }
@@ -1620,8 +1724,10 @@ impl AgentSession {
         if result.is_ok() {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
-            if let Some((model, _)) = journal.model_selection() {
-                result = self.restore_branch_model(model).map(|_| ());
+            if let Some((provider, model, _)) = journal.model_identity_at(journal.head()) {
+                result = self
+                    .restore_branch_model(provider.as_deref(), model)
+                    .map(|_| ());
             }
         }
         let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
@@ -1692,9 +1798,10 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal);
         }
         let mut replaced = None;
-        if let Some((name, level)) = journal.model_selection() {
-            if self.registry.branch_model(self.session_id, &name).is_some() {
-                self.restore_branch_model(name)?;
+        if let Some((provider, name, level)) = journal.model_identity_at(journal.head()) {
+            if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some()
+            {
+                self.restore_branch_model(provider.as_deref(), name)?;
             } else if let Some((model, replacement)) = fallback {
                 self.registry.register_session_branch_model(
                     self.session_id,
@@ -1716,7 +1823,7 @@ impl AgentSession {
                 self.refresh_run_config();
                 replaced = Some((name, level.unwrap_or_else(|| "off".into())));
             } else {
-                self.restore_branch_model(name)?;
+                self.restore_branch_model(provider.as_deref(), name)?;
             }
         }
         let startup = self.pending_start.lock().expect("session startup").take();
@@ -1919,8 +2026,8 @@ impl AgentSession {
         let journal = self.journal()?;
         let records = journal.fork_records(record)?;
         let snapshot = Session::from_records(records)?;
-        if let Some((name, _)) = snapshot.model_selection()
-            && self.registry.branch_model(self.session_id, &name).is_none()
+        if let Some((provider, name, _)) = snapshot.model_identity_at(snapshot.head())
+            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
         {
             return Err(Error::Config(format!(
                 "session branch requires registered model {name}"
@@ -1992,18 +2099,16 @@ impl AgentSession {
                 .retry_control()
                 .settings(),
         );
-        let model_name = session
-            .model_selection()
-            .map(|selection| selection.0)
-            .unwrap_or_else(|| self.model_name.clone());
-        let model = self
-            .registry
-            .branch_model(self.session_id, &model_name)
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "session branch requires registered model {model_name}"
-                ))
-            })?;
+        let selection = session.model_identity_at(session.head());
+        let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
+            let model = branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
+            (provider, name, model)
+        } else {
+            (None, self.model_name.clone(), self.model.clone())
+        };
         session
             .auto_compaction_control()
             .set_enabled(self.auto_compaction_enabled());
@@ -2014,7 +2119,11 @@ impl AgentSession {
                 .auto_compaction_control()
                 .token_settings(),
         );
-        let mut fork = SessionBuilder::new(model, model_name)
+        let mut builder = SessionBuilder::new(model, model_name);
+        if let Some(provider) = provider {
+            builder = builder.provider(provider)?;
+        }
+        let mut fork = builder
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
             .build(session)?;
@@ -3785,6 +3894,115 @@ mod tests {
     }
 
     struct NamedBranchModel(&'static str);
+    struct ProviderBranchModel(&'static str);
+    #[async_trait::async_trait]
+    impl Model for ProviderBranchModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(request.model, "shared");
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text(self.0.into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_identity_controls_reopen_checkout_and_fork() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("providers.jsonl");
+        let a = Arc::new(ProviderBranchModel("provider-a"));
+        let b = Arc::new(ProviderBranchModel("provider-b"));
+        let mut first = SessionBuilder::new(a.clone(), "shared")
+            .provider("a")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        first.set_provider_model(a.clone(), "a", "shared").unwrap();
+        assert_eq!(first.prompt("a").await.unwrap(), "provider-a");
+        let a_head = first.journal().unwrap().head();
+        first.set_provider_model(b.clone(), "b", "shared").unwrap();
+        assert_eq!(first.prompt("b").await.unwrap(), "provider-b");
+        let b_head = first.journal().unwrap().head();
+        first.close().await.unwrap();
+        drop(first);
+
+        let mut reopened = SessionBuilder::new(b.clone(), "shared")
+            .provider("b")
+            .unwrap()
+            .provider_branch_model("a", "shared", a.clone())
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("reopened").await.unwrap(), "provider-b");
+        reopened.checkout(a_head).unwrap();
+        assert_eq!(reopened.prompt("checkout").await.unwrap(), "provider-a");
+        let mut fork = reopened.fork_at(b_head).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "provider-b");
+        fork.close().await.unwrap();
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qualified_history_rejects_name_only_client_before_navigation() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("a"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session =
+            SessionBuilder::new(Arc::new(ProviderBranchModel("unqualified")), "shared")
+                .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("provider-b")))
+                .unwrap()
+                .build(journal)
+                .unwrap();
+        session.start().await.unwrap();
+        let head = session.journal().unwrap().head();
+        assert!(session.checkout(target).is_err());
+        assert!(
+            session
+                .navigate_tree(target, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(session.fork_at(target).is_err());
+        assert_eq!(session.journal().unwrap().head(), head);
+        assert_eq!(session.prompt("current").await.unwrap(), "provider-b");
+        session
+            .register_provider_branch_model(
+                "a",
+                "shared",
+                Arc::new(ProviderBranchModel("provider-a")),
+            )
+            .unwrap();
+        session.checkout(target).unwrap();
+        assert_eq!(session.prompt("registered").await.unwrap(), "provider-a");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qualified_reopen_rejects_an_unqualified_client_with_the_same_name() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("a"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("wrong")), "shared")
+            .build(journal)
+            .unwrap();
+        let head = session.journal().unwrap().head();
+        assert!(session.start().await.is_err());
+        assert_eq!(session.journal().unwrap().head(), head);
+        session
+            .register_provider_branch_model("a", "shared", Arc::new(ProviderBranchModel("right")))
+            .unwrap();
+        assert_eq!(session.prompt("after registration").await.unwrap(), "right");
+        session.close().await.unwrap();
+    }
     struct TriggerFromIdleInput;
     #[async_trait::async_trait]
     impl Extension for TriggerFromIdleInput {

@@ -374,7 +374,7 @@ impl Agent<'_> {
                         .provider_branch_config(session.session_id(), provider, name)
                 })
                 .or_else(|| {
-                    (!provider_changed)
+                    (!provider_changed && session.model_provider().is_none())
                         .then(|| {
                             self.registry
                                 .branch_model(session.session_id(), name)
@@ -482,7 +482,7 @@ impl Agent<'_> {
                             .provider_branch_config(session.session_id(), provider, name)
                     })
                     .or_else(|| {
-                        (!provider_changed)
+                        (!provider_changed && session.model_provider().is_none())
                             .then(|| {
                                 self.registry
                                     .branch_model(session.session_id(), name)
