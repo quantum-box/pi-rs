@@ -188,3 +188,50 @@ async fn setting_and_admission_during_model_call_apply_to_failure() {
         }
     );
 }
+
+struct AbortedIo;
+#[async_trait]
+impl Model for AbortedIo {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        Err(std::io::Error::other("aborted").into())
+    }
+}
+
+#[tokio::test]
+async fn provider_error_named_aborted_is_still_a_failed_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        model: Arc::new(AbortedIo),
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 5,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Withdraw)
+        .unwrap();
+    h.submit(id, None, "first".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "run_failed".into()
+        }
+    );
+}

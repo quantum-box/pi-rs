@@ -2480,3 +2480,170 @@ async fn background_abort_reports_driver_shutdown_during_foreground_cleanup() {
     stopper.join().unwrap();
     scheduler.shutdown().await.unwrap();
 }
+#[test]
+fn failed_policy_retries_with_latest_setting_and_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let existing = owner.submit(id, None, "existing".into()).unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    finish_failure(&mut stale, "failure".into());
+    owner.withdraw_submission(id, existing).unwrap();
+    let added = owner.submit(id, None, "added".into()).unwrap();
+    owner
+        .set_after_failed_run(id, AfterFailedRun::Withdraw)
+        .unwrap();
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    let c = owner.conversation(id).unwrap();
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == existing)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+    assert_eq!(
+        c.submissions.iter().find(|s| s.id == added).unwrap().status,
+        Status::Unanswered {
+            reason: "run_failed".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn continue_failure_boundary_survives_restart_and_historical_forks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let before = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let configured = h
+        .history(id, before, std::num::NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    h.submit(id, None, "active".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into());
+    h.save(&state, Expected::Version(version)).unwrap();
+    assert!(matches!(h.conversation(id).unwrap().phase, Phase::Idle));
+    let old_fork = h.fork_at(id, before).unwrap();
+    let configured_fork = h.fork_at(id, configured).unwrap();
+    assert_eq!(
+        h.conversation(old_fork).unwrap().after_failed_run,
+        AfterFailedRun::Keep
+    );
+    assert_eq!(
+        h.conversation(configured_fork).unwrap().after_failed_run,
+        AfterFailedRun::Continue
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Done { .. }
+    ));
+}
+
+#[tokio::test]
+async fn abort_wins_over_stale_failure_and_preserves_later_admissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner
+        .set_after_failed_run(id, AfterFailedRun::Withdraw)
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let queued = owner.submit(id, None, "before abort".into()).unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    finish_failure(&mut stale, "failure".into());
+    owner.request_abort(id).unwrap();
+    let later = owner.submit(id, None, "after abort".into()).unwrap();
+    assert!(worker.save(&stale, Expected::Version(version)).is_err());
+    let c = owner.conversation(id).unwrap();
+    assert!(c.abort_requested);
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+    owner
+        .resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner
+            .conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == later)
+            .unwrap()
+            .status,
+        Status::Done { .. }
+    ));
+}

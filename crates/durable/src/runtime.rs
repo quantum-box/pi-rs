@@ -1161,16 +1161,11 @@ impl Harness {
         let failed_transition = {
             let loaded = self.loaded.lock().map_err(|_| Error::Failed)?;
             loaded.get(&state.id).is_some_and(|(_, base)| {
+                // Only the persisted abort mark identifies abort cleanup: a
+                // provider failure can have the same text as an abort reason.
                 matches!(state.phase, Phase::FailedIdle)
                     && !matches!(base.phase, Phase::FailedIdle)
                     && !base.abort_requested
-                    && !state.submissions.iter().any(|s| {
-                        matches!(&s.status, Status::Unanswered { reason } if reason == "aborted")
-                            && base
-                                .submissions
-                                .iter()
-                                .any(|old| old.id == s.id && old.status == Status::Running)
-                    })
             })
         };
         let mut expected = expected;
