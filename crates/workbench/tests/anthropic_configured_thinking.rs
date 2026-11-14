@@ -102,6 +102,7 @@ fn fixture_body(
             Ok(count) => offset += count,
             Err(error) if disconnected(&error) => return false,
             Err(error) if retryable_read(&error) && Instant::now() < deadline => {}
+            Err(error) if retryable_read(&error) => return false,
             Err(error) => panic!("read request body: {error}"),
         }
     }
@@ -239,8 +240,7 @@ fn serve_fixture(
 ) {
     let deadline = Instant::now() + timeout;
     let (sender, receiver) = mpsc::channel();
-    let mut sockets = Vec::new();
-    let mut workers = Vec::new();
+    let mut workers: Vec<(TcpStream, std::thread::JoinHandle<()>)> = Vec::new();
     let mut completed = false;
     let mut failure = None;
     let mut accept_error = None;
@@ -256,18 +256,28 @@ fn serve_fixture(
         if completed || failure.is_some() || Instant::now() >= deadline {
             break;
         }
+        // Reclaim finished readers and their control sockets before accepting
+        // another connection: the limit applies to concurrent workers.
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].1.is_finished() {
+                let (_, worker) = workers.swap_remove(index);
+                worker.join().unwrap();
+            } else {
+                index += 1;
+            }
+        }
         if workers.len() < max_connections {
             match listener.accept() {
                 Ok((socket, _)) => {
                     let control = socket.try_clone().unwrap();
-                    sockets.push(control);
                     let sender = sender.clone();
                     let stopping = stopping.clone();
                     let progress = accepted.clone();
                     let finished = accepted.clone();
                     let expected = expected.to_owned();
                     let level = level.to_owned();
-                    workers.push(std::thread::spawn(move || {
+                    let worker = std::thread::spawn(move || {
                         let result = std::panic::catch_unwind(|| {
                             serve_connection(
                                 socket, discovery, &expected, &level, &stopping, progress,
@@ -277,7 +287,8 @@ fn serve_fixture(
                         if let Some(finished) = finished {
                             let _ = finished.send(FixtureEvent::Finished);
                         }
-                    }));
+                    });
+                    workers.push((control, worker));
                     if let Some(accepted) = &accepted {
                         let _ = accepted.send(FixtureEvent::Accepted);
                     }
@@ -293,10 +304,10 @@ fn serve_fixture(
     }
     // Interrupt idle readers before joining, including on timeout or assertion failure.
     stopping.store(true, Ordering::Release);
-    for socket in &sockets {
+    for (socket, _) in &workers {
         let _ = socket.shutdown(Shutdown::Both);
     }
-    for worker in workers {
+    for (_, worker) in workers {
         worker.join().unwrap();
     }
     while let Ok(result) = receiver.try_recv() {
@@ -732,4 +743,114 @@ fn fragmented_request_survives_read_poll_timeouts() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("message_stop"));
     server.join().unwrap();
+}
+
+#[test]
+fn timed_out_partial_body_does_not_stop_following_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (progress, received) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            Some(progress),
+            Duration::from_secs(25),
+            4,
+        )
+    });
+    let mut partial = TcpStream::connect(address).unwrap();
+    let start = Instant::now();
+    partial.write_all(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"partial\":").unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !matches!(
+        received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap(),
+        FixtureEvent::BodyReading
+    ) {}
+    let until = Instant::now() + REQUEST_WAIT + Duration::from_secs(5);
+    while !matches!(
+        received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap(),
+        FixtureEvent::Finished
+    ) {}
+    assert!(start.elapsed() >= REQUEST_WAIT);
+    let mut request = TcpStream::connect(address).unwrap();
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+    write!(
+        request,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    request.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("message_stop"));
+    server.join().unwrap();
+    drop(partial);
+}
+
+#[test]
+fn completed_discovery_connections_release_worker_slots() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (progress, received) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            Some(progress),
+            Duration::from_secs(15),
+            2,
+        )
+    });
+    let idle = TcpStream::connect(address).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !matches!(
+        received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap(),
+        FixtureEvent::Reading
+    ) {}
+    for _ in 0..6 {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+    }
+    let mut request = TcpStream::connect(address).unwrap();
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+    write!(
+        request,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    request.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("message_stop"));
+    server.join().unwrap();
+    drop(idle);
 }
