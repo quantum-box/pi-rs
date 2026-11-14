@@ -1,0 +1,773 @@
+//! Pinned Pi/Marked inline tokens, without rewriting source bytes or link URLs.
+//!
+//! Pulldown continues to parse blocks. Runs containing double tildes use the
+//! actual pinned Marked inline lexer because its deletion precedence can end
+//! inside a code span, emphasis span, or link destination parsed by pulldown.
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
+use std::time::{Duration, Instant};
+
+use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, RefDefs, Tag, TagEnd};
+use rquickjs::{Context, Function, Runtime};
+use serde_json::{Value, json};
+
+type Spanned = (Event<'static>, Range<usize>);
+
+const FRAME_TIME: Duration = Duration::from_millis(20);
+const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+const MAX_RUN_BYTES: usize = 64 * 1024;
+const MAX_REFS: usize = 256;
+const MAX_REF_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_BYTES: usize = 512 * 1024;
+
+thread_local! {
+    static FRAME_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+pub(crate) struct FrameBudget(Option<Instant>);
+
+pub(crate) fn frame_budget() -> FrameBudget {
+    FrameBudget(FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now() + FRAME_TIME))))
+}
+
+fn frame_expired() -> bool {
+    FRAME_DEADLINE.with(|cell| {
+        cell.get()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    })
+}
+
+impl Drop for FrameBudget {
+    fn drop(&mut self) {
+        FRAME_DEADLINE.with(|cell| cell.set(self.0));
+    }
+}
+
+struct InlineLexer {
+    runtime: Runtime,
+    context: Context,
+}
+impl InlineLexer {
+    fn new() -> rquickjs::Result<Self> {
+        let runtime = Runtime::new()?;
+        runtime.set_memory_limit(128 * 1024 * 1024);
+        runtime.set_max_stack_size(1024 * 1024);
+        let context = Context::full(&runtime)?;
+        context.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../assets/marked-inline/marked.js"))?;
+            ctx.eval::<(), _>(include_str!("../../assets/marked-inline/cjk.js"))?;
+            ctx.eval::<(), _>(include_str!("../../assets/marked-inline/pi-inline.js"))?;
+            Ok::<_, rquickjs::Error>(())
+        })?;
+        Ok(Self { runtime, context })
+    }
+    fn tokens(&self, text: &str, refs: &RefDefs<'_>) -> Option<Vec<Value>> {
+        let deadline = FRAME_DEADLINE
+            .with(|cell| cell.get())
+            .unwrap_or_else(|| Instant::now() + FRAME_TIME);
+        if text.len() > MAX_RUN_BYTES || Instant::now() >= deadline {
+            return None;
+        }
+        let mut links = serde_json::Map::new();
+        let mut bytes = 0usize;
+        for (name, def) in refs.iter() {
+            bytes = bytes
+                .saturating_add(name.len())
+                .saturating_add(def.dest.len())
+                .saturating_add(def.title.as_ref().map_or(0, |title| title.len()));
+            if links.len() >= MAX_REFS || bytes > MAX_REF_BYTES || Instant::now() >= deadline {
+                return None;
+            }
+            links.insert(
+                name.split(|ch: char| (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}')
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase(),
+                json!({"href": def.dest.as_ref(), "title": def.title.as_deref()}),
+            );
+        }
+        let links = serde_json::to_string(&links).ok()?;
+        if Instant::now() >= deadline {
+            return None;
+        }
+        self.runtime
+            .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        let result = self.context.with(|ctx| {
+            let function: Function<'_> = ctx.globals().get("piInlineTokens")?;
+            function.call::<_, String>((text, links))
+        });
+        self.runtime.set_interrupt_handler(None);
+        let result = result.ok()?;
+        if result.len() > MAX_TOKEN_BYTES || Instant::now() >= deadline {
+            return None;
+        }
+        serde_json::from_str(&result).ok()
+    }
+}
+thread_local! {
+    static LEXER: RefCell<Option<InlineLexer>> = RefCell::new(InlineLexer::new().ok());
+}
+
+#[derive(Debug)]
+enum Node {
+    Leaf(Spanned),
+    Group {
+        start: Spanned,
+        children: Vec<Node>,
+        end: Spanned,
+    },
+}
+impl Node {
+    fn range(&self) -> Range<usize> {
+        match self {
+            Self::Leaf((_, range)) => range.clone(),
+            Self::Group { start, .. } => start.1.clone(),
+        }
+    }
+    fn inline(&self) -> bool {
+        match self {
+            Self::Leaf((event, _)) => matches!(
+                event,
+                Event::Text(_)
+                    | Event::Code(_)
+                    | Event::InlineHtml(_)
+                    | Event::SoftBreak
+                    | Event::HardBreak
+                    | Event::InlineMath(_)
+            ),
+            Self::Group {
+                start: (event, _), ..
+            } => matches!(
+                event,
+                Event::Start(Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. })
+            ),
+        }
+    }
+    fn flatten(self, events: &mut Vec<Spanned>) {
+        match self {
+            Self::Leaf(event) => events.push(event),
+            Self::Group {
+                start,
+                children,
+                end,
+            } => {
+                events.push(start);
+                for child in children {
+                    child.flatten(events);
+                }
+                events.push(end);
+            }
+        }
+    }
+}
+fn tree(events: impl IntoIterator<Item = Spanned>) -> Vec<Node> {
+    let mut roots = Vec::new();
+    let mut stack: Vec<(Spanned, Vec<Node>)> = Vec::new();
+    for item in events {
+        match item.0 {
+            Event::Start(_) => stack.push((item, Vec::new())),
+            Event::End(_) => {
+                if let Some((start, children)) = stack.pop() {
+                    let node = Node::Group {
+                        start,
+                        children,
+                        end: item,
+                    };
+                    if let Some((_, children)) = stack.last_mut() {
+                        children.push(node);
+                    } else {
+                        roots.push(node);
+                    }
+                }
+            }
+            _ => {
+                if let Some((_, children)) = stack.last_mut() {
+                    children.push(Node::Leaf(item));
+                } else {
+                    roots.push(Node::Leaf(item));
+                }
+            }
+        }
+    }
+    roots
+}
+
+// Remove only the escapes Marked removes before recursively tokenizing a link
+// label or a table cell, while retaining a byte-boundary map to the input.
+fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && escaped.contains(&bytes[i + 1]) {
+            i += 1;
+        }
+        output.push(bytes[i]);
+        i += 1;
+        offsets.push(i);
+    }
+    (
+        String::from_utf8(output).expect("only ASCII escapes removed"),
+        offsets,
+    )
+}
+
+// Marked can split a mailbox into plain text plus a link to only its suffix.
+// Rejoin only native-validated mailboxes whose entire extent consists of
+// unchanged text and bare email tokens, never across formatting boundaries.
+fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
+    if frame_expired() {
+        return None;
+    }
+    if !source.contains('@') {
+        return Some(tokens.to_vec());
+    }
+    let mut tokens = tokens.to_vec();
+    for (range, href) in super::render::bare_links(source) {
+        if frame_expired() {
+            return None;
+        }
+        let Some(href) = href.filter(|href| href.starts_with("mailto:")) else {
+            continue;
+        };
+        let mut cursor = 0;
+        let mut first = None;
+        let mut last = None;
+        let mut split_link = false;
+        let mut valid = true;
+        for (index, token) in tokens.iter().enumerate() {
+            if frame_expired() {
+                return None;
+            }
+            let raw = token.get("raw")?.as_str()?;
+            let end = cursor + raw.len();
+            if cursor < range.end && end > range.start {
+                first.get_or_insert((index, cursor));
+                last = Some((index, end));
+                match token.get("type")?.as_str()? {
+                    "text" if token.get("text").and_then(Value::as_str) == Some(raw) => {}
+                    "link"
+                        if token
+                            .get("href")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| s.starts_with("mailto:"))
+                            && token.get("text").and_then(Value::as_str) == Some(raw)
+                            && cursor >= range.start
+                            && end <= range.end =>
+                    {
+                        split_link |= cursor != range.start || end != range.end;
+                    }
+                    _ => valid = false,
+                }
+            }
+            cursor = end;
+        }
+        let (Some((first, start)), Some((last, end))) = (first, last) else {
+            continue;
+        };
+        if !valid || !split_link {
+            continue;
+        }
+        let mut replacement = Vec::new();
+        if start < range.start {
+            let raw = source.get(start..range.start)?;
+            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+        }
+        let raw = source.get(range.clone())?;
+        replacement.push(json!({"type":"link", "raw":raw, "text":raw, "href":href,
+            "tokens":[{"type":"text", "raw":raw, "text":raw}]}));
+        if range.end < end {
+            let raw = source.get(range.end..end)?;
+            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+        }
+        tokens.splice(first..=last, replacement);
+    }
+    Some(tokens)
+}
+
+fn token_nodes(
+    tokens: &[Value],
+    source: &str,
+    offsets: &[usize],
+    whole: &str,
+    run_start: usize,
+    cell_end: Option<usize>,
+) -> Option<Vec<Node>> {
+    let mut result = Vec::new();
+    let mut cursor = 0usize;
+    let tokens = repair_split_mail(tokens, source)?;
+    for token in &tokens {
+        if frame_expired() {
+            return None;
+        }
+        let raw = token.get("raw")?.as_str()?;
+        let end = cursor.checked_add(raw.len())?;
+        if source.get(cursor..end)? != raw {
+            return None;
+        }
+        let span = *offsets.get(cursor)?..*offsets.get(end)?;
+        let kind = token.get("type")?.as_str()?;
+        let text = token.get("text").and_then(Value::as_str).unwrap_or(raw);
+        let make_children = || -> Option<Vec<Node>> {
+            let children = token.get("tokens")?.as_array()?;
+            // Marked unescapes brackets in link labels before running the
+            // inline lexer, so child raw text is not always a source substring.
+            let bracketed_link = kind == "link" && raw.starts_with('[');
+            let (normalized, local_offsets) = if bracketed_link {
+                unescape_with_offsets(raw, b"[]")
+            } else {
+                (raw.to_owned(), (0..=raw.len()).collect())
+            };
+            let search_start = if bracketed_link {
+                normalized.find('[')? + 1
+            } else {
+                0
+            };
+            let pos = search_start + normalized.get(search_start..)?.find(text)?;
+            let child_offsets = local_offsets
+                .get(pos..=pos + text.len())?
+                .iter()
+                .map(|offset| offsets.get(cursor + offset).copied())
+                .collect::<Option<Vec<_>>>()?;
+            token_nodes(children, text, &child_offsets, whole, run_start, cell_end)
+        };
+        let group = match kind {
+            "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
+            "strong" => Some((Tag::Strong, TagEnd::Strong)),
+            "em" => Some((Tag::Emphasis, TagEnd::Emphasis)),
+            "link" => {
+                let mut href = token.get("href")?.as_str()?.to_owned();
+                // Marked emits bare URL/email tokens as links. Route only those
+                // through the native destination guards; explicit links retain
+                // their authored destination.
+                if !raw.starts_with('[') && !raw.starts_with('<') {
+                    let absolute_start = span.start;
+                    let absolute_end = span.end;
+                    let tail = whole.get(absolute_end..cell_end.unwrap_or(whole.len()))?;
+                    let extra = tail.char_indices().nth(2).map_or(tail.len(), |(i, _)| i);
+                    let original_candidate = whole.get(absolute_start..absolute_end + extra)?;
+                    let candidate = if cell_end.is_some() {
+                        unescape_with_offsets(original_candidate, b"|").0
+                    } else {
+                        original_candidate.to_owned()
+                    };
+                    // The normalized candidate must still identify exactly the
+                    // token being validated, including after table unescaping.
+                    let safe = candidate
+                        .starts_with(raw)
+                        .then(|| super::render::bare_links(&candidate))
+                        .into_iter()
+                        .flatten()
+                        .next()
+                        .filter(|(range, _)| range.start == 0 && range.end == raw.len())
+                        .and_then(|(_, url)| url)
+                        .filter(|url| {
+                            !url.starts_with("mailto:")
+                                || !super::render::has_email_prefix(
+                                    whole,
+                                    absolute_start,
+                                    run_start,
+                                )
+                        });
+                    if let Some(url) = safe {
+                        href = url;
+                    } else {
+                        // InlineHtml is rendered as literal text and is not
+                        // passed through the bare-link detector a second time.
+                        result.push(Node::Leaf((Event::InlineHtml(raw.to_owned().into()), span)));
+                        cursor = end;
+                        continue;
+                    }
+                }
+                let title = token
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                Some((
+                    Tag::Link {
+                        link_type: LinkType::Inline,
+                        dest_url: CowStr::from(href),
+                        title: CowStr::from(title),
+                        id: CowStr::from(format!("\0pi-marked-label:{text}")),
+                    },
+                    TagEnd::Link,
+                ))
+            }
+            _ => None,
+        };
+        if let Some((tag, end_tag)) = group {
+            result.push(Node::Group {
+                start: (Event::Start(tag), span.clone()),
+                children: make_children()?,
+                end: (Event::End(end_tag), span),
+            });
+        } else {
+            let event = match kind {
+                "codespan" => Event::Code(text.to_owned().into()),
+                "escape" | "text" => Event::Text(text.to_owned().into()),
+                "br" => Event::HardBreak,
+                "html" => Event::InlineHtml(raw.to_owned().into()),
+                // Pi displays unhandled inline tokens, including images and
+                // unsupported math, from their raw source.
+                _ => Event::Text(raw.to_owned().into()),
+            };
+            result.push(Node::Leaf((event, span)));
+        }
+        cursor = end;
+    }
+    (cursor == source.len()).then_some(result)
+}
+
+#[derive(Clone, Copy)]
+enum Container {
+    Quote,
+    Item(usize),
+}
+
+// Marked normalizes CRLF and bare CR before block and inline tokenization.
+fn normalize_newlines(source: &str) -> (String, Vec<usize>) {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if byte == b'\r' {
+            if bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            output.push(b'\n');
+        } else {
+            output.push(byte);
+        }
+        offsets.push(index);
+    }
+    (
+        String::from_utf8(output).expect("only ASCII newlines changed"),
+        offsets,
+    )
+}
+
+// Marked's block lexer removes container prefixes before inline lexing. Keep
+// byte boundaries into the original document for rendering and link guards.
+fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(String, Vec<usize>)> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut position = 0;
+    for (line_number, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if frame_expired() {
+            return None;
+        }
+        let mut text = line.to_vec();
+        let mut map: Vec<usize> = (position..=position + line.len()).collect();
+        position += line.len();
+        if line_number > 0 {
+            let mut in_list = false;
+            for container in containers {
+                if frame_expired() {
+                    return None;
+                }
+                match *container {
+                    Container::Quote => {
+                        let spaces = text
+                            .iter()
+                            .take_while(|byte| **byte == b' ')
+                            .take(3)
+                            .count();
+                        if text.get(spaces) == Some(&b'>') {
+                            let mut prefix = spaces + 1;
+                            if matches!(text.get(prefix), Some(b' ' | b'\t')) {
+                                prefix += 1;
+                            }
+                            text.drain(..prefix);
+                            map.drain(..prefix);
+                        }
+                    }
+                    Container::Item(indent) => {
+                        in_list = true;
+                        // Marked expands every tab in a list continuation to four
+                        // spaces before removing the item indentation.
+                        let mut expanded = Vec::with_capacity(text.len());
+                        let mut expanded_map = vec![map[0]];
+                        for (index, byte) in text.iter().enumerate() {
+                            if *byte == b'\t' {
+                                for _ in 0..3 {
+                                    expanded.push(b' ');
+                                    expanded_map.push(map[index]);
+                                }
+                                expanded.push(b' ');
+                            } else {
+                                expanded.push(*byte);
+                            }
+                            expanded_map.push(map[index + 1]);
+                        }
+                        if expanded.len() > MAX_RUN_BYTES {
+                            return None;
+                        }
+                        text = expanded;
+                        map = expanded_map;
+                        if text.iter().take_while(|byte| **byte == b' ').count() >= indent {
+                            text.drain(..indent);
+                            map.drain(..indent);
+                        }
+                    }
+                }
+            }
+            // Marked's block text rule removes a further four-space indent.
+            if in_list && text.starts_with(b"    ") {
+                text.drain(..4);
+                map.drain(..4);
+            }
+        }
+        *offsets.last_mut().expect("line boundary") = map[0];
+        out.extend(text);
+        if out.len() > MAX_RUN_BYTES {
+            return None;
+        }
+        offsets.extend_from_slice(&map[1..]);
+    }
+    Some((
+        String::from_utf8(out).expect("only ASCII prefixes changed"),
+        offsets,
+    ))
+}
+
+fn item_indent(original: &str, start: usize) -> Option<usize> {
+    let line = original.get(start..)?.split('\n').next()?.as_bytes();
+    let leading = line.iter().take_while(|byte| **byte == b' ').count();
+    if leading > 3 {
+        return None;
+    }
+    let marker = if matches!(line.get(leading), Some(b'-' | b'+' | b'*')) {
+        leading + 1
+    } else {
+        let digits = line[leading..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || !matches!(line.get(leading + digits), Some(b'.' | b')')) {
+            return None;
+        }
+        leading + digits + 1
+    };
+    let mut column = marker;
+    for byte in &line[marker..] {
+        match byte {
+            b' ' => column += 1,
+            b'\t' => column += 4 - column % 4,
+            _ => break,
+        }
+    }
+    let spaces = column - marker;
+    (spaces > 0).then_some(marker + if spaces > 4 { 1 } else { spaces })
+}
+
+fn inline_run(
+    nodes: Vec<Node>,
+    original: &str,
+    refs: &RefDefs<'_>,
+    cell_end: Option<usize>,
+    containers: &[Container],
+) -> Vec<Node> {
+    let Some(first) = nodes.first() else {
+        return nodes;
+    };
+    let mut start = first.range().start;
+    let end = nodes.last().expect("not empty").range().end;
+    // Pulldown excludes the escape byte from the first text event.
+    while start > 0 && original.as_bytes()[start - 1] == b'\\' {
+        start -= 1;
+    }
+    let Some(source) = original.get(start..end) else {
+        return nodes;
+    };
+    if !source.contains("~~") || source.len() > MAX_RUN_BYTES || frame_expired() {
+        return nodes;
+    }
+    // Marked's block table lexer removes a backslash before each pipe before
+    // handing a cell to its inline lexer, including inside code spans.
+    let (source, newline_offsets) = normalize_newlines(source);
+    let Some((source, offsets)) = normalize_continuations(&source, containers) else {
+        return nodes;
+    };
+    let offsets: Vec<usize> = offsets.into_iter().map(|i| newline_offsets[i]).collect();
+    let (source, offsets) = if cell_end.is_some() {
+        let (source, mapped) = unescape_with_offsets(&source, b"|");
+        (source, mapped.into_iter().map(|i| offsets[i]).collect())
+    } else {
+        (source, offsets)
+    };
+    let offsets: Vec<usize> = offsets.into_iter().map(|offset| start + offset).collect();
+    let tokens = LEXER.with(|lexer| {
+        lexer
+            .borrow()
+            .as_ref()
+            .and_then(|lexer| lexer.tokens(&source, refs))
+    });
+    tokens
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end))
+        .unwrap_or(nodes)
+}
+fn rewrite(
+    nodes: Vec<Node>,
+    original: &str,
+    refs: &RefDefs<'_>,
+    cell_end: Option<usize>,
+    containers: &[Container],
+) -> Vec<Node> {
+    let mut result = Vec::new();
+    let mut inline = Vec::new();
+    for node in nodes {
+        if node.inline() {
+            inline.push(node);
+        } else {
+            result.extend(inline_run(
+                std::mem::take(&mut inline),
+                original,
+                refs,
+                cell_end,
+                containers,
+            ));
+            let node = match node {
+                Node::Group {
+                    start,
+                    children,
+                    end,
+                } if !matches!(start.0, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)) => {
+                    let child_cell_end = if matches!(start.0, Event::Start(Tag::TableCell)) {
+                        Some(start.1.end)
+                    } else {
+                        cell_end
+                    };
+                    let mut child_containers = containers.to_vec();
+                    match start.0 {
+                        Event::Start(Tag::BlockQuote(_)) => child_containers.push(Container::Quote),
+                        Event::Start(Tag::Item) => {
+                            if let Some(indent) = item_indent(original, start.1.start) {
+                                child_containers.push(Container::Item(indent));
+                            }
+                        }
+                        _ => {}
+                    }
+                    Node::Group {
+                        start,
+                        children: rewrite(
+                            children,
+                            original,
+                            refs,
+                            child_cell_end,
+                            &child_containers,
+                        ),
+                        end,
+                    }
+                }
+                other => other,
+            };
+            result.push(node);
+        }
+    }
+    result.extend(inline_run(inline, original, refs, cell_end, containers));
+    result
+}
+
+pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Spanned> {
+    let parser = Parser::new_ext(parsed, options);
+    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !original.contains("~~") {
+        return parser
+            .into_offset_iter()
+            .map(|(event, range)| (event.into_static(), range))
+            .collect();
+    }
+    let references = Parser::new_ext(original, options);
+    let nodes = rewrite(
+        tree(
+            parser
+                .into_offset_iter()
+                .map(|(event, range)| (event.into_static(), range)),
+        ),
+        original,
+        references.reference_definitions(),
+        None,
+        &[],
+    );
+    let mut output = Vec::new();
+    for node in nodes {
+        node.flatten(&mut output);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expanded_tab_offsets_remain_bounded_and_point_to_source() {
+        let (text, offsets) = normalize_continuations("a\n\tb", &[Container::Item(2)]).unwrap();
+        assert_eq!(text, "a\n  b");
+        assert_eq!(offsets, [0, 1, 2, 2, 3, 4]);
+        let large = format!("a\n{}b", "\t".repeat(MAX_RUN_BYTES / 4));
+        assert!(normalize_continuations(&large, &[Container::Item(2)]).is_none());
+    }
+
+    #[test]
+    fn normalized_newlines_preserve_original_byte_boundaries() {
+        let (text, offsets) = normalize_newlines("é\r\nx\ry");
+        assert_eq!(text, "é\nx\ny");
+        assert_eq!(offsets, [0, 1, 2, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn exhausted_frame_budget_applies_to_every_inline_run_and_is_restored() {
+        let previous = FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now())));
+        let text = "~~first~~\n\n~~second~~";
+        let result = events(text, text, Options::empty());
+        assert!(
+            !result
+                .iter()
+                .any(|(event, _)| matches!(event, Event::Start(Tag::Strikethrough)))
+        );
+        {
+            let _budget = frame_budget();
+            assert!(FRAME_DEADLINE.with(|cell| cell.get().unwrap() > Instant::now()));
+        }
+        assert!(FRAME_DEADLINE.with(|cell| cell.get().unwrap() <= Instant::now()));
+        FRAME_DEADLINE.with(|cell| cell.set(previous));
+    }
+
+    #[test]
+    fn oversized_runs_and_reference_maps_fall_back_without_lexing() {
+        let lexer = InlineLexer::new().unwrap();
+        let blank = Parser::new("");
+        assert!(
+            lexer
+                .tokens(
+                    &format!("~~{}", "x".repeat(MAX_RUN_BYTES)),
+                    blank.reference_definitions()
+                )
+                .is_none()
+        );
+        let refs = (0..=MAX_REFS)
+            .map(|i| format!("[r{i}]: https://example.com/{i}\n"))
+            .collect::<String>();
+        let parsed = Parser::new(&refs);
+        assert_eq!(parsed.reference_definitions().iter().count(), MAX_REFS + 1);
+        assert!(
+            lexer
+                .tokens("~~ok~~", parsed.reference_definitions())
+                .is_none()
+        );
+        let document = format!("~~ok~~\n\n{}", "x".repeat(MAX_DOCUMENT_BYTES));
+        let result = events(&document, &document, Options::empty());
+        assert!(
+            !result
+                .iter()
+                .any(|(event, _)| matches!(event, Event::Start(Tag::Strikethrough)))
+        );
+    }
+}
