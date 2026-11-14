@@ -184,6 +184,7 @@ struct SessionSnapshot {
     entries: Option<super::rpc_entries::Cursor>,
     share_base: Option<super::sessions::ShareContext>,
     share_active: Option<super::sessions::ShareContext>,
+    share_pending: bool,
 }
 
 impl SessionSnapshot {
@@ -197,10 +198,16 @@ impl SessionSnapshot {
             entries,
             share_base: None,
             share_active: None,
+            share_pending: false,
         }
     }
 
     fn share_snapshot(&self) -> Result<super::sessions::ShareSnapshot> {
+        if self.share_pending {
+            return Err(Error::Config(
+                "Model request context is changing; try sharing again".into(),
+            ));
+        }
         let session = Session::from_records(self.records.clone())?;
         let base = self
             .share_base
@@ -221,6 +228,51 @@ impl SessionSnapshot {
             head: session.head(),
             context,
         })
+    }
+
+    fn track_share_event(&mut self, event: &pi_rs::Notification<'_>, summary: &mut bool) {
+        match event {
+            pi_rs::Notification::ModelContext {
+                system_prompt,
+                registry,
+            } => {
+                self.share_base = Some(super::sessions::ShareContext {
+                    system_prompt: (*system_prompt).into(),
+                    tools: registry.active_tool_specs(),
+                });
+            }
+            pi_rs::Notification::SummaryRequest => *summary = true,
+            pi_rs::Notification::Committed(record)
+                if matches!(record.event, pi_rs::Event::ModelRequested { .. }) =>
+            {
+                self.share_pending = true;
+            }
+            pi_rs::Notification::Request(request) => {
+                if !*summary {
+                    let system_prompt = request
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            pi_rs::Message::System { content } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    self.share_active = Some(super::sessions::ShareContext {
+                        system_prompt,
+                        tools: request.tools.clone(),
+                    });
+                }
+                self.share_pending = false;
+                *summary = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_share_context(&mut self) {
+        self.share_active = None;
+        self.share_pending = false;
     }
 
     fn refresh(&mut self, session: &Session) {
@@ -742,29 +794,10 @@ async fn run_worker(
             let agent = runtime.agent(&args, session);
             let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
-                match &event {
-                    pi_rs::Notification::SummaryRequest => summary_request = true,
-                    pi_rs::Notification::Request(request) => {
-                        if !summary_request {
-                            let system_prompt = request
-                                .messages
-                                .iter()
-                                .filter_map(|message| match message {
-                                    pi_rs::Message::System { content } => Some(content.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            snapshot.lock().expect("session snapshot").share_active =
-                                Some(super::sessions::ShareContext {
-                                    system_prompt,
-                                    tools: request.tools.clone(),
-                                });
-                        }
-                        summary_request = false;
-                    }
-                    _ => {}
-                }
+                snapshot
+                    .lock()
+                    .expect("session snapshot")
+                    .track_share_event(&event, &mut summary_request);
                 cache_capture.observe(&event);
                 observe_snapshot(event, args.trace, &snapshot);
             };
@@ -1074,11 +1107,11 @@ async fn run_worker(
             }
         };
         drop(operation);
-        active.lock().expect("worker control").token = None;
         {
+            let mut state = active.lock().expect("worker control");
             let mut snapshot = snapshot.lock().expect("session snapshot");
-            snapshot.share_base = Some(runtime.share_base());
-            snapshot.share_active = None;
+            snapshot.settle_share_context();
+            state.token = None;
         }
         if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
             let recorded = input.apply(session, &mut |event| {
@@ -1619,6 +1652,188 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod share_context_tests {
+    use super::*;
+    use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn selected_catalog_survives_settling_and_uses_runtime_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "old prompt".into(),
+            tools: vec![],
+        });
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "refreshed prompt",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "request-specific prompt".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        assert_eq!(
+            snapshot.share_snapshot().unwrap().context.system_prompt,
+            "request-specific prompt"
+        );
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[tokio::test]
+    async fn running_agent_keeps_refreshed_catalog_after_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Refresh {
+            fired: AtomicBool,
+            workspace: PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl pi_rs::RegistryRefresher for Refresh {
+            async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
+                if self.fired.swap(true, Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                let mut registry = current.clone();
+                registry.register(Arc::new(CodingTools::local(&self.workspace)?))?;
+                Ok(Some(pi_rs::RegistryUpdate {
+                    registry,
+                    system_prompt: Some("refreshed runtime prompt".into()),
+                }))
+            }
+        }
+        struct Model;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Model {
+            async fn stream(&self, _: ModelRequest) -> Result<pi_rs::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("done".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.set_refresher(Arc::new(Refresh {
+            fired: AtomicBool::new(false),
+            workspace: root.path().into(),
+        }));
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "old".into(),
+            tools: vec![],
+        });
+        let agent = pi_rs::Agent {
+            model: &Model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "old",
+            limits: Default::default(),
+        };
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut summary = false;
+        let mut saw_boundary = false;
+        agent
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    snapshot.track_share_event(&event, &mut summary);
+                    if let Notification::Committed(record) = &event {
+                        snapshot.record(record);
+                        if matches!(record.event, Event::ModelRequested { .. }) {
+                            saw_boundary = true;
+                            assert!(snapshot.share_snapshot().is_err());
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saw_boundary);
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed runtime prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn request_commit_boundary_never_exposes_mismatched_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "base".into(),
+            tools: vec![],
+        });
+        snapshot.share_active = Some(super::super::sessions::ShareContext {
+            system_prompt: "previous".into(),
+            tools: vec![],
+        });
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: session.records()[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 1,
+                request_id: None,
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            },
+        };
+        let mut summary = false;
+        snapshot.track_share_event(&Notification::Committed(&record), &mut summary);
+        snapshot.record(&record);
+        assert!(
+            snapshot
+                .share_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("context is changing")
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "new".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot.share_snapshot().unwrap();
+        assert_eq!(result.head, 2);
+        assert_eq!(result.context.system_prompt, "new");
+    }
 }
 
 #[cfg(test)]

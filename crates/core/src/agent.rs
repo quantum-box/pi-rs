@@ -211,6 +211,11 @@ pub enum Notification<'a> {
         phase: ToolInventoryPhase,
         registry: &'a Registry,
     },
+    /// Selected runtime prompt and registry before request-specific hooks.
+    ModelContext {
+        system_prompt: &'a str,
+        registry: &'a Registry,
+    },
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
     /// Transient text. Only a fully completed response is committed.
@@ -1303,6 +1308,10 @@ impl Agent<'_> {
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
+                observer(Notification::ModelContext {
+                    system_prompt: active.system_prompt,
+                    registry: active.registry,
+                });
                 observer(Notification::ToolInventory {
                     run_id,
                     phase: ToolInventoryPhase::RequestPreparation,
