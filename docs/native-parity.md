@@ -70,7 +70,8 @@ the terminal thread, saves or clears individual overrides, and preserves other
 user and trusted-project settings. Changes for the active model update the
 session; when an agent run is in progress, they take effect after that run.
 While supported levels load, up to 1024 keyboard or paste events are retained
-for the level selector; Escape cancels loading and discards that typeahead.
+for the level selector; the configured picker cancellation key cancels loading
+and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults

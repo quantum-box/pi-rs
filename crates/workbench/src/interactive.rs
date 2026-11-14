@@ -4416,7 +4416,11 @@ pub(super) async fn run(
             && view.local_editor.is_none()
             && !view.share_blocks_input()
             && view.pending_transition.is_none()
-            && buffer_thinking_level_input(&mut thinking_level_input, &event)
+            && buffer_thinking_level_input(
+                &mut thinking_level_input,
+                &event,
+                matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && keys.matches("tui.select.cancel", *key)),
+            )
         {
             continue;
         }
@@ -7049,11 +7053,11 @@ fn select(
     Ok(())
 }
 
-// Keep typeahead in order until model-level discovery finishes. Escape cancels
-// immediately and discards input intended for the abandoned picker.
-fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event) -> bool {
+// Keep typeahead in order until model-level discovery finishes. A configured
+// picker cancellation discards input intended for the abandoned picker.
+fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event, cancel: bool) -> bool {
     match event {
-        Event::Key(key) if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release => {
+        Event::Key(_) if cancel => {
             pending.clear();
             false
         }
@@ -7961,7 +7965,11 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         ];
         for event in &typed {
-            assert!(super::buffer_thinking_level_input(&mut pending, event));
+            assert!(super::buffer_thinking_level_input(
+                &mut pending,
+                event,
+                false
+            ));
         }
         assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
         assert_eq!(
@@ -7978,13 +7986,35 @@ mod tests {
                 Some(event.clone())
             );
         }
-        assert!(super::buffer_thinking_level_input(&mut pending, &typed[0]));
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
         let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!super::buffer_thinking_level_input(&mut pending, &escape));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &escape,
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(super::Keys::default().matches("tui.select.cancel", ctrl_c));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Key(ctrl_c),
+            true
+        ));
         assert!(pending.is_empty());
         assert!(!super::buffer_thinking_level_input(
             &mut pending,
-            &Event::Resize(80, 24)
+            &Event::Resize(80, 24),
+            false
         ));
     }
 
