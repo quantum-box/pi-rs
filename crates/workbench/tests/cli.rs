@@ -171,6 +171,11 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
         format!("{}😀tail", "x".repeat(59)),
     )
     .unwrap();
+    std::fs::write(
+        prompts.join("two-boms.md"),
+        "\u{feff}\u{feff}---\ndescription: not frontmatter\n---\nbody",
+    )
+    .unwrap();
     std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
     std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
     std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
@@ -221,6 +226,7 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
         ("unicode-space", "\u{0085}".to_owned()),
         ("unicode-bom", "visible".to_owned()),
         ("unicode-cut", format!("{}�...", "x".repeat(59))),
+        ("two-boms", "\u{feff}---".to_owned()),
     ] {
         let command = commands
             .iter()

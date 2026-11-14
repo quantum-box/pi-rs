@@ -631,10 +631,12 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
 }
 
 fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
-    let normalized = text
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let text = if prompt {
+        text.strip_prefix('\u{feff}').unwrap_or(text)
+    } else {
+        text.trim_start_matches('\u{feff}')
+    };
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let Some(end) = normalized
         .strip_prefix("---")
         .and_then(|rest| rest.find("\n---"))
@@ -1686,6 +1688,32 @@ mod tests {
                 .1,
             "body"
         );
+    }
+
+    #[test]
+    fn prompt_frontmatter_strips_only_one_leading_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            ("\u{feff}\u{feff}", "\u{feff}", ""),
+            (
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "body",
+                "explicit",
+            ),
+            (
+                "\u{feff}\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        // Keep existing non-prompt callers' BOM behavior.
+        assert_eq!(frontmatter("\u{feff}\u{feff}body").unwrap().1, "body");
     }
 
     #[test]
