@@ -4292,6 +4292,21 @@ matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
 
+### Messages quota retry classification
+
+Anthropic-compatible Messages requests inspect bounded retryable HTTP error
+responses and stream error fields for Pi's account, quota and billing markers.
+Structured JSON classification uses error message, code and type fields, excluding
+request identifiers and other metadata. Those failures
+stop agent retries; transient rate limits remain retryable. Response bodies are
+not surfaced or logged. Classification falls back to the existing retry behavior
+when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Complete error fields preceding a truncated later JSON field remain classifiable;
+unrelated metadata, incomplete numeric values and undelimited numbers are ignored.
+Known credentials and configured header values are redacted before error fields
+are classified, including for stream errors.
+Other provider adapters still need equivalent quota classification.
+
 ### Bedrock quota retry classification
 
 Bedrock service and stream exceptions stop agent retries when their redacted
