@@ -242,3 +242,61 @@ fn malformed_frame_does_not_advance_commit_cursor() {
     assert_eq!(watch.cursor(), initial.revision);
     assert!(watch.poll(1).is_err());
 }
+
+#[test]
+fn operation_frames_preserve_commit_order_and_resume_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ops.db");
+    let store = Store::open(&path).unwrap();
+    put(&store, 0);
+    let docs = Documents::new(&store);
+    let (initial, mut first) = docs.watch(&address()).unwrap();
+    let mut second = docs.resume_watch(&address(), initial.revision).unwrap();
+    let writer = Store::open(&path).unwrap();
+    let thread = std::thread::spawn(move || {
+        for n in 1..=25 {
+            put(&writer, n);
+        }
+    });
+    let mut page = Vec::new();
+    while page.len() < 7 {
+        let next = first.poll_operations(7 - page.len()).unwrap();
+        assert!(
+            !next.is_empty() || !thread.is_finished(),
+            "writer stopped before seven commits"
+        );
+        page.extend(next);
+        std::thread::yield_now();
+    }
+    thread.join().unwrap();
+    assert_eq!(page.len(), 7);
+    for (index, frame) in page.iter().enumerate() {
+        assert_eq!(frame.ops, vec![json!(["r", {"n": index as i32 + 1}])]);
+        assert!(!frame.retired);
+    }
+    let saved = first.cursor();
+    let all = second.poll_operations(256).unwrap();
+    assert_eq!(all.len(), 25);
+    assert_eq!(&all[..7], page.as_slice());
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let mut resumed = docs.resume_watch(&address(), saved).unwrap();
+    let rest = resumed.poll_operations(256).unwrap();
+    assert_eq!(rest, all[7..]);
+    let version = docs.get(&address()).unwrap().unwrap().version;
+    let mut tx = Transaction::new();
+    tx.delete(&address(), version).unwrap();
+    tx.commit(&store).unwrap();
+    put(&store, 26);
+    let changes = resumed.poll_operations(256).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert!(changes[0].retired);
+    assert!(changes[0].document.is_none());
+    assert!(changes[0].ops.is_empty());
+    assert_eq!(changes[1].ops, vec![json!(["r", {"n": 26}])]);
+    assert!(!changes[1].retired);
+    let cursor = resumed.cursor();
+    assert!(resumed.poll_operations(0).is_err());
+    assert_eq!(resumed.cursor(), cursor);
+}

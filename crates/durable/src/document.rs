@@ -136,6 +136,17 @@ impl DocumentCommitWatch<'_> {
     }
 }
 
+/// One committed document operation frame. The store retains complete states,
+/// so puts are represented by a Chord root replacement, not a reconstructed diff.
+/// A deletion is a retirement with no replacement and no live document.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentOperationFrame {
+    pub revision: u64,
+    pub document: Option<Document>,
+    pub ops: Vec<Value>,
+    pub retired: bool,
+}
+
 /// Pull-based watch. Persist the cursor only after consuming its entire page.
 pub struct DocumentWatch<'a> {
     store: &'a Store,
@@ -145,6 +156,28 @@ pub struct DocumentWatch<'a> {
 impl DocumentWatch<'_> {
     pub fn cursor(&self) -> u64 {
         self.cursor
+    }
+
+    /// Return one operation frame per committed state. A put is a root replacement;
+    /// a delete is a retirement. On error the cursor is unchanged.
+    pub fn poll_operations(&mut self, limit: usize) -> Result<Vec<DocumentOperationFrame>, Error> {
+        Ok(self
+            .poll(limit)?
+            .into_iter()
+            .map(|change| {
+                let ops = change
+                    .document
+                    .as_ref()
+                    .map(|document| vec![serde_json::json!(["r", document.value])])
+                    .unwrap_or_default();
+                DocumentOperationFrame {
+                    revision: change.revision,
+                    retired: change.document.is_none(),
+                    document: change.document,
+                    ops,
+                }
+            })
+            .collect())
     }
 
     /// Return at most `limit` changes (1..=256), without waiting.

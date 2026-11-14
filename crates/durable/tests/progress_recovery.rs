@@ -256,7 +256,33 @@ async fn view_watch_coalesces_and_cancelled_wait_can_resume() {
             .await
             .is_err()
     );
+    assert_eq!(watch.end_reason(), None);
+    let mut aborted = h
+        .watch_view(id, NonZeroUsize::MIN, Duration::from_millis(2))
+        .unwrap();
+    let stop = CancellationToken::new();
+    let trigger = stop.clone();
+    let wait = aborted.next_with_cancel(&stop);
+    let cancel_wait = async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        trigger.cancel();
+    };
+    let (result, ()) = tokio::join!(wait, cancel_wait);
+    assert!(result.unwrap().is_none());
+    assert_eq!(
+        aborted.end_reason(),
+        Some(&pi_rs_durable::runtime::ViewWatchEnd::Aborted)
+    );
+    aborted.close();
+    assert_eq!(
+        aborted.end_reason(),
+        Some(&pi_rs_durable::runtime::ViewWatchEnd::Aborted)
+    );
     watch.close();
     watch.close();
+    assert_eq!(
+        watch.end_reason(),
+        Some(&pi_rs_durable::runtime::ViewWatchEnd::Stopped)
+    );
     assert!(watch.next().await.unwrap().is_none());
 }

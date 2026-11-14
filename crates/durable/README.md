@@ -202,16 +202,17 @@ paths still hydrate all messages. Store reads are synchronous and may block.
 `Harness::watch_view` and `Scheduler::watch_view` attach a pull watch with an
 initial `ConversationView`; `next().await` polls for the next changed bounded
 snapshot, including committed generation and tool progress. The interval must be nonzero.
-Cancel a wait by dropping its future; close or drop the watch to release its store
-ownership. A watch retains the store owner even after the originating handle is
+Cancel a wait by dropping its future without ending the watch. `next_with_cancel`
+ends it when its cancellation token fires; `abort` and `close` also end it and
+release store ownership. `end_reason` records the first stopped, aborted, or
+source-failure reason. A watch retains the store owner even after the originating handle is
 dropped or the scheduler shuts down, so close it before reopening the database.
 
 This is a latest-state watch, not an audit stream: it has no background queue,
 and any number of commits between reads (including progress changes that later
 revert) can be coalesced or missed. Each returned value replaces the previous
 one. Unlike upstream, it has no Chord operations, callbacks, automatic window
-adjustment, 100-frame queue, end reason, or automatic termination on harness
-close. It observes persisted state only, and synchronous reads can block the
+adjustment, 100-frame queue, or automatic termination on harness close. It observes persisted state only, and synchronous reads can block the
 executor. The view's count and record-visit bounds still apply, but metadata,
 individual batches, and the retained initial snapshot are not byte-bounded.
 For an append-only cursor stream use `watch_history` instead; it covers only
@@ -706,8 +707,15 @@ The stream records final states, not mutation order, intermediate writes, or
 non-document parts of a store transaction. It includes every document scope;
 callers must apply their own access control and filtering.
 
-This is a subset of upstream `watchDoc`: it exposes whole committed states,
-not Chord operations, callbacks, abort/lifecycle handling or live notifications.
+`DocumentWatch::poll_operations` also returns one frame per committed state:
+a put produces a Chord root replacement `["r", value]`, and a delete produces
+an empty-operation retirement frame with no live document. It shares the same
+exclusive cursor as `poll`, including after reopen; callers should not mix the
+methods unless they intend to consume the same stream. These replacements are
+synthesized from final states, not the original mutation operations. Unlike the
+upstream retired frame, deletion exposes no previous value. This is a subset of
+upstream `watchDoc`: it does not provide fine-grained operations, callbacks,
+abort/lifecycle handling or live notifications.
 Upstream attaches only to an existing address and delivers operation batches,
 folding pending operations and falling back to a root replacement above 10,000
 operations. Its retirement/incarnation and task-end semantics, listener

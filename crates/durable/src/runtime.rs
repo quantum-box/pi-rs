@@ -841,12 +841,21 @@ pub struct ConversationView {
     pub older: Option<ViewCursor>,
 }
 
+/// First terminal reason of a pull-based view watch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewWatchEnd {
+    Stopped,
+    Aborted,
+    Failed(String),
+}
+
 /// A pull-based watch of a bounded conversation view. `initial` is captured at
 /// attachment. Later calls to `next` return the latest changed snapshot; commits
 /// between polls may be coalesced. Dropping a pending `next` is cancellation-safe.
 /// Call `close` (or drop the watch) to release its store ownership.
 pub struct ViewWatch {
     pub initial: ConversationView,
+    end: Option<ViewWatchEnd>,
     reader: Option<Harness>,
     id: Uuid,
     limit: std::num::NonZeroUsize,
@@ -862,8 +871,17 @@ impl ViewWatch {
             let Some(reader) = self.reader.as_ref() else {
                 return Ok(None);
             };
-            let view = reader.view(self.id, self.limit)?;
-            let fingerprint = view_fingerprint(&view)?;
+            let result = reader
+                .view(self.id, self.limit)
+                .and_then(|view| Ok((view_fingerprint(&view)?, view)));
+            let (fingerprint, view) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.end = Some(ViewWatchEnd::Failed(error.to_string()));
+                    self.reader = None;
+                    return Err(error);
+                }
+            };
             if fingerprint != self.last {
                 self.last = fingerprint;
                 return Ok(Some(view));
@@ -872,9 +890,44 @@ impl ViewWatch {
         }
     }
 
+    /// Wait for a change or end the watch when the supplied token is cancelled.
+    /// Cancelling by dropping this future alone leaves the watch open.
+    pub async fn next_with_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ConversationView>, Error> {
+        if self.end.is_some() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.abort();
+                Ok(None)
+            }
+            result = self.next() => result,
+        }
+    }
+
+    /// The first terminal reason, if this watch has ended.
+    pub fn end_reason(&self) -> Option<&ViewWatchEnd> {
+        self.end.as_ref()
+    }
+
+    /// End with an abort reason and release store ownership. Idempotent.
+    pub fn abort(&mut self) {
+        if self.end.is_none() {
+            self.end = Some(ViewWatchEnd::Aborted);
+            self.reader = None;
+        }
+    }
+
     /// Stop watching and release the reader's store ownership. Idempotent.
     pub fn close(&mut self) {
-        self.reader = None;
+        if self.end.is_none() {
+            self.end = Some(ViewWatchEnd::Stopped);
+            self.reader = None;
+        }
     }
 }
 
@@ -4207,6 +4260,7 @@ impl Harness {
         let last = view_fingerprint(&initial)?;
         Ok(ViewWatch {
             initial,
+            end: None,
             reader: Some(self.worker()),
             id,
             limit,
