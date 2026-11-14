@@ -103,7 +103,14 @@ without `defaultProvider` are still accepted.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
-those imports receive a new native UUID. Forks receive their own UUID.
+custom IDs are preserved across native export and reopen and used for
+model request and cache warming affinity. A separate internal UUID continues to
+identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
+external ID. RPC, UI and share identity projection still uses the internal UUID.
+Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
+header bytes and whitespace normalization. Unrepresentable or invalid values
+fail before dispatch when an affinity default is needed; explicit headers win
+without validating an unused default.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
@@ -2300,6 +2307,26 @@ Tests cover trailing input, edits, compaction, model changes, checkout, reopenin
 zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
 Complete native prompt checkpointing remains open.
+
+### Tool argument token estimates
+
+Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
+after parsing them. Native estimates now count JavaScript binary64 number
+rounding and exponent formatting as well as UTF-16 string units, including in
+imported assistant messages. To retain the correct binary64 value when imported
+JSON is first read, the shared `serde_json` parser enables `float_roundtrip`.
+This also changes decimal floating-point parsing throughout binaries that use the
+core crate, including model configuration, provider responses, tool arguments,
+and reserialized provider requests. Pi likewise parses JSON decimals as
+JavaScript numbers. Native integer values retain their existing exact integer
+representation, even above 2^53, and other native consumers may observe more
+accurate decimal rounding. Previously persisted rounded values cannot recover
+their original decimal representation. Regressions cover exponent cutoffs,
+integers beyond 2^53, negative zero, nested values and escaped Unicode against
+Node 24, as well as tool execution and an Anthropic loopback request. Inputs
+that Rust's JSON parser rejects, such as non-finite numeric overflow, retain the
+existing raw-input fallback, so complete JavaScript JSON parsing and
+token-estimator parity remain open.
 
 ### Directory listing limits checkpoint
 
