@@ -407,18 +407,24 @@ mod tests {
                 .unwrap();
             let mut docs = crate::document::TaskDocuments::new(&db, &p.task).unwrap();
             assert!(matches!(
-                docs.signal_at(child.id(), &token, "a", json!(1), 0).unwrap(),
+                docs.signal_at(child.id(), &token, "a", json!(1), 0)
+                    .unwrap(),
                 SignalResult::Delivered
             ));
             docs.get(&address()).unwrap();
-            docs.put(&address(), json!({"saved":true}).as_object().unwrap().clone())
-                .unwrap();
+            docs.put(
+                &address(),
+                json!({"saved":true}).as_object().unwrap().clone(),
+            )
+            .unwrap();
             let tx = prepare_park_with_documents(&db, &p, cp("parked"), &["a"], docs).unwrap();
             if expired {
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 assert!(matches!(
                     tx.commit(&db),
-                    Err(crate::document::Error::Store(durable_store::Error::Conflict { .. }))
+                    Err(crate::document::Error::Store(
+                        durable_store::Error::Conflict { .. }
+                    ))
                 ));
                 assert_eq!(tasks.load(p.task.id()).unwrap().unwrap(), p);
                 assert!(
