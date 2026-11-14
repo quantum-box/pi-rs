@@ -2024,7 +2024,9 @@ async fn execute(
             } else {
                 None
             };
-            let shared = destination.share(session, &workspace, snapshot).await?;
+            let shared = destination
+                .share(session, &workspace, snapshot, None)
+                .await?;
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);

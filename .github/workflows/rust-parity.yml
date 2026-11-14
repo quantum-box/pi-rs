@@ -36,7 +36,7 @@ jobs:
       - name: Test live worker journal tag
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli worker_returns_keyed_share_journal_tag
       - name: Test missing live context rejection
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs requested_live_share_does_not_silently_drop_missing_context
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_share_rejects_
       - name: Test live journal key correlation
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_response_keeps_its_private_journal_key
       - name: Test live share private fields

@@ -1053,6 +1053,7 @@ impl ShareDestination {
         session: Session,
         workspace: &Path,
         snapshot: Option<ShareSnapshot>,
+        journal_key: Option<[u8; 32]>,
     ) -> Result<SharedSession> {
         match self {
             Self::Radius {
@@ -1061,6 +1062,16 @@ impl ShareDestination {
                 proxies,
                 idle_timeout,
             } => {
+                if journal_key.is_some() && snapshot.is_none() {
+                    return Err(Error::Config(
+                        "Live share context is unavailable; try sharing again".into(),
+                    ));
+                }
+                if let Some(snapshot) = &snapshot
+                    && (journal_key.is_some() || snapshot.journal_tag.is_some())
+                {
+                    validate_live_share_journal(&session, snapshot, journal_key.as_ref())?;
+                }
                 if snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.session_id != session.session_id() || snapshot.head != session.head()
                 }) {
@@ -1220,7 +1231,10 @@ mod tests {
             proxies: vec![proxy],
             idle_timeout: None,
         };
-        let shared = destination.share(session, root.path(), None).await.unwrap();
+        let shared = destination
+            .share(session, root.path(), None, None)
+            .await
+            .unwrap();
         assert_eq!(shared.url, "https://example.com/shared");
         let (request, headers, _) = server.await.unwrap();
         assert!(request.starts_with("POST http://127.0.0.1:1/v1/artifacts?"));
@@ -1264,8 +1278,9 @@ mod tests {
     async fn radius_share_uploads_context_for_matching_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let key = [19; 32];
         let snapshot = ShareSnapshot {
-            journal_tag: Some([19; 32]),
+            journal_tag: Some(share_journal_tag(&session, &key).unwrap()),
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1288,7 +1303,7 @@ mod tests {
             idle_timeout: None,
         };
         destination
-            .share(session, root.path(), Some(snapshot))
+            .share(session, root.path(), Some(snapshot), Some(key))
             .await
             .unwrap();
         let (_, _, body) = server.await.unwrap();
@@ -1353,7 +1368,7 @@ mod tests {
             idle_timeout: None,
         };
         destination
-            .share(session, root.path(), Some(snapshot))
+            .share(session, root.path(), Some(snapshot), None)
             .await
             .unwrap();
         let (_, _, body) = server.await.unwrap();
@@ -1367,6 +1382,69 @@ mod tests {
             "cached live instructions"
         );
         assert_eq!(entries.last().unwrap()["customType"], "pi.share");
+    }
+
+    #[tokio::test]
+    async fn radius_share_rejects_missing_live_context_before_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![],
+            idle_timeout: None,
+        };
+        let error = match destination
+            .share(session, root.path(), None, Some([1; 32]))
+            .await
+        {
+            Ok(_) => panic!("missing live context was shared"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Live share context is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn radius_share_rejects_live_journal_mismatch_before_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let mut original = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        original
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let key = [23; 32];
+        let snapshot = ShareSnapshot {
+            session_id: original.session_id(),
+            head: original.head(),
+            context: ShareContext {
+                system_prompt: "live".into(),
+                tools: vec![],
+            },
+            journal_tag: Some(share_journal_tag(&original, &key).unwrap()),
+        };
+        let mut records = original.records().to_vec();
+        match &mut records.last_mut().unwrap().event {
+            Event::User { content, .. } => *content = "changed".into(),
+            _ => panic!("expected user record"),
+        }
+        let altered = Session::from_records(records).unwrap();
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![],
+            idle_timeout: None,
+        };
+        let error = match destination
+            .share(altered, root.path(), Some(snapshot), Some(key))
+            .await
+        {
+            Ok(_) => panic!("changed journal was shared"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Session changed"));
     }
 
     #[tokio::test]
@@ -1389,7 +1467,7 @@ mod tests {
             idle_timeout: None,
         };
         let error = match destination
-            .share(session, root.path(), Some(snapshot))
+            .share(session, root.path(), Some(snapshot), None)
             .await
         {
             Ok(_) => panic!("stale context accepted"),
