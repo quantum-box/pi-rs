@@ -250,7 +250,7 @@ impl Driver {
         if let Some(harness) = validator {
             harness.validate_task_tool_registry(&registry)?;
         }
-        let result = scheduler.replace_registry(registry);
+        let result = scheduler.replace_registry_locked(registry);
         state.policies = scheduler.policies();
         state.definitions = scheduler.definitions();
         if let Err(error) = result {

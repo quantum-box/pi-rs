@@ -289,6 +289,7 @@ impl Drop for Attachment {
 pub struct Scheduler {
     attachment: Attachment,
     registry: Registry,
+    validator: Option<crate::runtime::Harness>,
     poisoned: bool,
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
 }
@@ -330,6 +331,7 @@ impl Scheduler {
         let mut scheduler = Self {
             attachment: Attachment::acquire(owner)?,
             registry,
+            validator: None,
             poisoned: false,
             failed_migrations: HashMap::new(),
         };
@@ -357,7 +359,20 @@ impl Scheduler {
     /// Replace registrations after a clean scheduling boundary. Failed migrations
     /// are retried only when their task definition changes.
     pub fn replace_registry(&mut self, registry: Registry) -> Result<(), Error> {
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        self.replace_registry_locked(registry)
+    }
+    pub(crate) fn bind_harness(&mut self, harness: crate::runtime::Harness) {
+        self.validator = Some(harness);
+    }
+    pub(crate) fn replace_registry_locked(&mut self, registry: Registry) -> Result<(), Error> {
         self.check()?;
+        if let Some(harness) = &self.validator {
+            harness
+                .validate_task_tool_registry(&registry)
+                .map_err(|_| Error::Registration)?;
+        }
         self.registry = registry;
         self.reconcile()
     }

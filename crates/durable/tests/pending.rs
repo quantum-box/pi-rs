@@ -1297,13 +1297,22 @@ async fn pending_task_rejects_registry_replacement_and_accepts_same_definition()
     changed.register_shared_versioned("job-task", 2, true, handler.clone());
     assert!(driver.replace_registry(changed).is_err());
     let mut same = Registry::default();
-    same.register_shared("job-task", true, handler);
+    same.register_shared("job-task", true, handler.clone());
     driver.replace_registry(same).unwrap();
     assert!(matches!(
         driver.get(task).unwrap().unwrap().state(),
         TaskState::Waiting(_)
     ));
     driver.shutdown().unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler.clone());
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let mut changed = Registry::default();
+    changed.register_shared_versioned("job-task", 2, true, handler.clone());
+    assert!(scheduler.replace_registry(changed).is_err());
+    let mut same = Registry::default();
+    same.register_shared("job-task", true, handler);
+    scheduler.replace_registry(same).unwrap();
 }
 
 #[tokio::test]

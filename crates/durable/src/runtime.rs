@@ -3813,11 +3813,15 @@ impl Harness {
         {
             return Err(Error::Failed);
         }
+        let owner = self.owner.clone();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         self.validate_task_tool_registry(&registry)?;
-        Ok(crate::task_scheduler::Scheduler::attach(
+        let mut scheduler = crate::task_scheduler::Scheduler::attach(
             self.owner.clone(),
             registry,
-        )?)
+        )?;
+        scheduler.bind_harness(self.worker());
+        Ok(scheduler)
     }
     pub(crate) fn validate_task_tool_registry(
         &self,
@@ -4677,13 +4681,15 @@ impl Harness {
             let mut generation_updates = Vec::new();
             for id in &tasks {
                 let mut record = (*by_id[id]).clone();
+                // Repeated aborts must not invalidate a running cleanup's
+                // reservation by rewriting an unchanged task record.
                 if !record.task.is_terminal() && !record.task.abort_requested() {
                     record
                         .task
                         .request_abort()
                         .map_err(|e| Error::Invalid(format!("task abort: {e:?}")))?;
+                    updates.push(record);
                 }
-                updates.push(record);
             }
             if background {
                 for (state, _) in &states {

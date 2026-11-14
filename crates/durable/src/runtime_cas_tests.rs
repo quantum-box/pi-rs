@@ -2847,6 +2847,68 @@ async fn background_abort_reaches_reused_child_through_terminal_anchor_after_reo
 }
 
 #[tokio::test]
+async fn repeated_background_abort_preserves_running_cleanup_reservation() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "initial".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap()
+    .registered("job".into(), true);
+    TaskStore::new(h.owner.store())
+        .save(&[Save::Create(&task)])
+        .unwrap();
+    h.request_abort_with_background(id).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let mut registry = crate::task_scheduler::Registry::default();
+    registry.register_with_abort(
+        "job",
+        true,
+        |_: &Task| Ok(crate::task_scheduler::Step::Succeed(serde_json::Value::Null)),
+        move |_: &Task| {
+            started_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(crate::task_scheduler::Step::Succeed(serde_json::Value::Null))
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.request_abort_with_background(id).unwrap();
+    release_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = driver.get(task.id()).unwrap().unwrap();
+        if current.is_terminal() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "cleanup did not finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn background_abort_reports_missing_driver_while_foreground_cleanup_waits() {
     use crate::task::{Checkpoint, Task, TaskOwner};
     use crate::task_store::{Save, TaskStore};
