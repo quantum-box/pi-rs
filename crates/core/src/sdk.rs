@@ -9391,6 +9391,7 @@ mod tests {
         use crate::journal::{Event, RecordedReply, RunState};
         for silent in [false, true] {
             for started in [false, true] {
+                let summary_id = Uuid::new_v4();
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("interrupted.jsonl");
                 let run_id = Uuid::new_v4();
@@ -9489,7 +9490,7 @@ mod tests {
                             messages: 1,
                             tools: 0,
                             max_output_tokens: 16,
-                            request_id: Some(Uuid::new_v4()),
+                            request_id: Some(summary_id),
                             context_head: None,
                             context_sha256: None,
                             context_transformed: None,
@@ -9515,7 +9516,11 @@ mod tests {
                         .unwrap();
                 }
                 drop(journal);
-                let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+                let model = Arc::new(ResumeSettlementModel {
+                    summary_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
                 let mut session = SessionBuilder::new(model.clone(), "fixture")
                     .limits(Limits {
                         context_window: Some(1000),
@@ -9529,10 +9534,21 @@ mod tests {
                     })
                     .open(&path)
                     .unwrap();
+                if silent && started {
+                    assert!(
+                        session
+                            .resume()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settlement unavailable")
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+                }
                 let result = session.resume().await;
                 if silent {
                     assert_eq!(result.unwrap(), "answer");
-                    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
                 } else if started {
                     assert!(
                         result
@@ -9540,16 +9556,45 @@ mod tests {
                             .to_string()
                             .contains("requires reconciliation")
                     );
-                    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
                     assert_eq!(
                         session.journal().unwrap().pending_custom_trigger(),
                         Some(trigger)
                     );
                 } else {
-                    assert_eq!(result.unwrap(), "answer 2");
-                    assert_eq!(model.0.load(Ordering::SeqCst), 2);
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
                 }
                 session.close().await.unwrap();
+                drop(session);
+                if silent {
+                    let mut reopened = SessionBuilder::new(model.clone(), "fixture")
+                        .limits(Limits {
+                            context_window: Some(1000),
+                            output_tokens_per_request: 16,
+                            model_requests: 3,
+                            compaction_tokens: Some(crate::CompactionTokens {
+                                reserve_tokens: Some(0),
+                                keep_recent_tokens: None,
+                            }),
+                            ..Limits::default()
+                        })
+                        .open(&path)
+                        .unwrap();
+                    assert_eq!(reopened.prompt("next").await.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    {
+                        let attempts = model.attempts.lock().unwrap();
+                        if started {
+                            assert_eq!(attempts.len(), 2);
+                            assert!(attempts.iter().all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed)));
+                        } else {
+                            assert!(attempts.is_empty());
+                        }
+                    }
+                    reopened.close().await.unwrap();
+                }
             }
         }
     }

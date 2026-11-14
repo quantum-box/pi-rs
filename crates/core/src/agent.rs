@@ -2040,23 +2040,67 @@ impl Agent<'_> {
                     )
             {
                 self.settle_usage(request_id, &usage, &metadata).await?;
-                let _ = self
-                    .commit_compaction_with_host(
-                        session,
-                        Compaction {
-                            summary,
-                            keep_turns: retention.keep_turns,
-                        },
-                        states,
-                        billing,
-                        Some(retention),
-                        None,
-                        cancel,
-                        observer,
-                        Some(followups),
-                    )
-                    .await;
+                self.commit_compaction_with_host(
+                    session,
+                    Compaction {
+                        summary,
+                        keep_turns: retention.keep_turns,
+                    },
+                    states,
+                    billing,
+                    Some(retention),
+                    None,
+                    cancel,
+                    observer,
+                    Some(followups),
+                )
+                .await?;
+                return Ok(());
             }
+            let marker_index = branch.iter().rposition(|record| matches!(&record.event,
+                Event::SourceEntry { format, entry } if format == "pi-rs:silent-overflow" && entry["requestId"] == request_id.to_string())).expect("marker was found");
+            let following = &branch[marker_index + 1..];
+            if following.iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")) {
+                return Ok(());
+            }
+            let summary_request = following.iter().find_map(|record| match &record.event {
+                Event::ModelRequested { request_id, .. } if record.run_id == Some(run_id) => {
+                    Some(*request_id)
+                }
+                _ => None,
+            });
+            let summary_id = match summary_request {
+                Some(Some(id)) => Some(id),
+                Some(None) => {
+                    return Err(Error::Model(
+                        "interrupted silent summary requires reconciliation".into(),
+                    ));
+                }
+                None => None,
+            };
+            if let Some(id) = summary_id {
+                let (usage, metadata) = following
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::ModelFinished {
+                            request_id,
+                            usage,
+                            metadata,
+                            ..
+                        } if *request_id == id => Some((usage.clone(), metadata.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or((UsageReport::Unconfirmed, ModelMetadata::default()));
+                self.settle_usage(id, &usage, &metadata).await?;
+            }
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:silent-overflow-skipped-v1".into(),
+                    entry: serde_json::json!({"requestId": request_id, "summaryRequestId": summary_id}),
+                },
+                observer,
+            )?;
             return Ok(());
         }
         let Ok(retention) = configured_retention(
@@ -4538,6 +4582,9 @@ pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Optio
         return Some((run_id, model, false));
     };
     let following = &epoch[marker + 1..];
+    if following.iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")) {
+        return None;
+    }
     if following.iter().any(|record| {
         matches!(
             record.event,
