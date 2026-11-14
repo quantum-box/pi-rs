@@ -503,14 +503,27 @@ shared and are not copied. Historical forks use the selected cut; current forks
 use a revision captured during the call while the parent conversation version
 remains unchanged. Copies and child creation commit atomically. A fork of a fork follows the same rule.
 
+An optional per-address `ForkPolicy` can be set with
+`Transaction::set_fork_policy`, using the policy version returned by
+`Documents::fork_policy` (or `Expected::Missing`). `Copy` selects the value at
+the fork cut; `Initial { value }` stores an object to use as the initial child
+value. The policy and initial object are persisted, independently versioned,
+and inherited by the child. Policy changes can be committed atomically with
+document writes, and historical forks use the policy at the selected cut. An
+absent policy, including for legacy documents, means copy. Policies belong to
+addresses and survive document deletion and recreation; a missing document is
+not created by a fork. Policies affect only conversation-scoped fork copies.
+Policy changes advance the document revision but do not appear in document
+watch streams.
+
 This scope convention is not enforced ownership or access control. Existing
 cuts from before this feature have no recorded boundary and historical document
 reads and forks fail closed. Interior message cuts additionally require equal
 document revisions across the surrounding commit; unrelated document writes
 can therefore conservatively prevent such a fork. Revision enumeration scans
 retained history and copying is proportional to the documents found. History is
-unbounded. This is a subset of upstream: there are no per-document current or
-initial fork policies, typed definitions, task ownership, deferred visibility,
+unbounded. This is a subset of upstream: there are no upstream-style current-at-fork policies for historical cuts,
+typed definitions, task ownership, deferred visibility,
 or general Chord transactions. Subagent history seeding is separate and does not
 copy application documents.
 

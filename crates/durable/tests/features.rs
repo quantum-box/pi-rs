@@ -1059,3 +1059,166 @@ async fn task_entries_follow_proven_fork_cuts_and_descendants() {
         old_entries
     );
 }
+
+#[tokio::test]
+async fn document_fork_policies_are_persisted_and_follow_historical_cuts() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        document::{Address, Documents, ForkPolicy, Transaction},
+        runtime::AdmissionOptions,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let parent;
+    let cut;
+    let address;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        parent = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        address = Address {
+            scope: parent.to_string(),
+            name: "policy".into(),
+            key: "one".into(),
+        };
+        let db = Store::open(&path).unwrap();
+        let mut tx = Transaction::new();
+        tx.put(
+            &address,
+            Expected::Missing,
+            &serde_json::json!({"n": 1}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        tx.set_fork_policy(
+            &address,
+            Expected::Missing,
+            &ForkPolicy::Initial {
+                value: serde_json::json!({"n": 0}).as_object().unwrap().clone(),
+            },
+        )
+        .unwrap();
+        tx.commit(&db).unwrap();
+        h.submit_with_documents(
+            parent,
+            None,
+            "first".into(),
+            AdmissionOptions::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        cut = h
+            .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .next;
+        let version = Documents::new(&db)
+            .fork_policy(&address)
+            .unwrap()
+            .unwrap()
+            .version;
+        let mut tx = Transaction::new();
+        tx.set_fork_policy(&address, Expected::Version(version), &ForkPolicy::Copy)
+            .unwrap();
+        tx.commit(&db).unwrap();
+        h.submit_with_documents(
+            parent,
+            None,
+            "second".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                docs.get(&address)?;
+                docs.put(
+                    &address,
+                    serde_json::json!({"n": 2}).as_object().unwrap().clone(),
+                )
+            },
+        )
+        .unwrap();
+    }
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.resume(&cancel).await.unwrap();
+    let old = h.fork_at(parent, cut).unwrap();
+    let current = h.fork(parent).unwrap();
+    let old_address = Address {
+        scope: old.to_string(),
+        ..address.clone()
+    };
+    let current_address = Address {
+        scope: current.to_string(),
+        ..address.clone()
+    };
+    assert_eq!(h.document(&old_address).unwrap().unwrap().value["n"], 0);
+    assert_eq!(h.document(&current_address).unwrap().unwrap().value["n"], 2);
+    let db = Store::open(&path).unwrap();
+    assert!(matches!(
+        Documents::new(&db)
+            .fork_policy(&old_address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Initial { .. }
+    ));
+    assert_eq!(
+        Documents::new(&db)
+            .fork_policy(&current_address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Copy
+    );
+    let parent_policy_version = Documents::new(&db)
+        .fork_policy(&address)
+        .unwrap()
+        .unwrap()
+        .version;
+    let mut tx = Transaction::new();
+    tx.set_fork_policy(
+        &old_address,
+        Expected::Version(
+            Documents::new(&db)
+                .fork_policy(&old_address)
+                .unwrap()
+                .unwrap()
+                .version,
+        ),
+        &ForkPolicy::Copy,
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    assert_eq!(
+        Documents::new(&db)
+            .fork_policy(&address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Copy
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .fork_policy(&address)
+            .unwrap()
+            .unwrap()
+            .version,
+        parent_policy_version
+    );
+    assert_eq!(h.document(&address).unwrap().unwrap().value["n"], 2);
+    drop(h);
+    let reopened = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        reopened.document(&old_address).unwrap().unwrap().value["n"],
+        0
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .fork_policy(&old_address)
+            .unwrap()
+            .unwrap()
+            .policy,
+        ForkPolicy::Copy
+    );
+}

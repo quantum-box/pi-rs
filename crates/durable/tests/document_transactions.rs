@@ -332,3 +332,47 @@ fn a_key(a: &Address) -> Vec<u8> {
     key.extend(serde_json::to_vec(&[&a.scope, &a.name, &a.key]).unwrap());
     key
 }
+
+#[test]
+fn policy_conflict_rolls_back_document_and_history() {
+    use pi_rs_durable::document::ForkPolicy;
+    let db = Store::memory().unwrap();
+    let address = Address {
+        scope: "conversation".into(),
+        name: "note".into(),
+        key: "1".into(),
+    };
+    let docs = Documents::new(&db);
+    let value = serde_json::json!({"n": 1}).as_object().unwrap().clone();
+    let mut first = Transaction::new();
+    first.put(&address, Expected::Missing, &value).unwrap();
+    first
+        .set_fork_policy(&address, Expected::Missing, &ForkPolicy::Copy)
+        .unwrap();
+    first.commit(&db).unwrap();
+    let revision = docs.snapshot().unwrap();
+    let mut conflict = Transaction::new();
+    conflict
+        .put(
+            &address,
+            Expected::Version(docs.get(&address).unwrap().unwrap().version),
+            &serde_json::json!({"n": 2}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+    conflict
+        .set_fork_policy(
+            &address,
+            Expected::Missing,
+            &ForkPolicy::Initial {
+                value: value.clone(),
+            },
+        )
+        .unwrap();
+    assert!(conflict.commit(&db).is_err());
+    assert_eq!(docs.snapshot().unwrap(), revision);
+    assert_eq!(docs.get(&address).unwrap().unwrap().value, value);
+    assert_eq!(
+        docs.fork_policy(&address).unwrap().unwrap().policy,
+        ForkPolicy::Copy
+    );
+}

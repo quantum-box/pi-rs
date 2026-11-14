@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 const PREFIX: &[u8] = b"durable/document/";
+const POLICY_PREFIX: &[u8] = b"durable/document-policy/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -47,6 +48,11 @@ impl Address {
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(result)
     }
+    fn policy_key(&self) -> Result<Vec<u8>, Error> {
+        let mut key = POLICY_PREFIX.to_vec();
+        key.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
+        Ok(key)
+    }
     fn from_storage_key(key: &[u8]) -> Result<Self, Error> {
         let [scope, name, key] =
             serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;
@@ -57,6 +63,22 @@ impl Address {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub value: Map<String, Value>,
+    pub version: u64,
+}
+
+/// Fork behavior for a document address. Missing policies retain legacy copy behavior.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ForkPolicy {
+    /// Copy the value at the selected boundary.
+    Copy,
+    /// Start each fork with this stored initial JSON object.
+    Initial { value: Map<String, Value> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentForkPolicy {
+    pub policy: ForkPolicy,
     pub version: u64,
 }
 
@@ -237,28 +259,64 @@ impl<'a> Documents<'a> {
             if parts[0] != parent.to_string() {
                 continue;
             }
-            // Validate the document before copying; preserve JSON, allocate a new CAS version.
+            // Policy and value are read at the same immutable cut.
             Self::decode(Some(entry.clone()))?;
+            let source_address = Address::from_storage_key(&key)?;
+            let policy_entry = self
+                .store
+                .document_at(&source_address.policy_key()?, revision)?;
+            let policy = policy_entry
+                .as_ref()
+                .map(|e| serde_json::from_slice::<ForkPolicy>(&e.value))
+                .transpose()?;
             let target = Address {
                 scope: child.to_string(),
                 name: parts[1].clone(),
                 key: parts[2].clone(),
             }
             .storage_key()?;
+            let value = match policy {
+                Some(ForkPolicy::Initial { value }) => serde_json::to_vec(&value)?,
+                _ => entry.value,
+            };
             batch.checks.push(Check {
                 key: target.clone(),
                 expected: Expected::Missing,
             });
-            batch.mutations.push(Mutation::Put {
-                key: target,
-                value: entry.value,
-            });
+            batch.mutations.push(Mutation::Put { key: target, value });
+            if let Some(policy_entry) = policy_entry {
+                let child_address = Address {
+                    scope: child.to_string(),
+                    ..source_address
+                };
+                let key = child_address.policy_key()?;
+                batch.checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: policy_entry.value,
+                });
+            }
         }
         Ok(batch)
     }
     /// Read one address at a previously captured document boundary.
     pub fn get_at(&self, address: &Address, snapshot: u64) -> Result<Option<Document>, Error> {
         Self::decode(self.store.document_at(&address.storage_key()?, snapshot)?)
+    }
+    /// Read an explicitly configured policy and its CAS version; absence means copy.
+    pub fn fork_policy(&self, address: &Address) -> Result<Option<DocumentForkPolicy>, Error> {
+        self.store
+            .get(&address.policy_key()?)?
+            .map(|entry| {
+                Ok(DocumentForkPolicy {
+                    policy: serde_json::from_slice(&entry.value)?,
+                    version: entry.version,
+                })
+            })
+            .transpose()
     }
     pub fn get(&self, address: &Address) -> Result<Option<Document>, Error> {
         Self::decode(self.store.get(&address.storage_key()?)?)
@@ -308,6 +366,25 @@ impl Transaction {
             mutations: vec![Mutation::Put {
                 key,
                 value: serde_json::to_vec(value)?,
+            }],
+        })
+    }
+    /// Set a policy using its own CAS version; can be composed atomically with document writes.
+    pub fn set_fork_policy(
+        &mut self,
+        address: &Address,
+        expected: Expected,
+        policy: &ForkPolicy,
+    ) -> Result<(), Error> {
+        let key = address.policy_key()?;
+        self.append(OwnedBatch {
+            checks: vec![Check {
+                key: key.clone(),
+                expected,
+            }],
+            mutations: vec![Mutation::Put {
+                key,
+                value: serde_json::to_vec(policy)?,
             }],
         })
     }

@@ -236,7 +236,7 @@ impl Store {
     /// Read a document as of a captured history boundary. This does not accept
     /// arbitrary store keys and does not promise history from before migration.
     pub fn document_at(&self, key: &[u8], revision: u64) -> Result<Option<Entry>, Error> {
-        if !key.starts_with(b"durable/document/") {
+        if !key.starts_with(b"durable/document/") && !key.starts_with(b"durable/document-policy/") {
             return Err(Error::InvalidSnapshot);
         }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -452,6 +452,7 @@ impl Store {
         let document_changed = mutations.iter().any(|mutation| match mutation {
             Mutation::Put { key, .. } | Mutation::Delete { key } => {
                 key.starts_with(b"durable/document/")
+                    || key.starts_with(b"durable/document-policy/")
                     || key.starts_with(b"durable/application-entries/")
             }
         });
@@ -493,6 +494,7 @@ impl Store {
                 Mutation::Put { key, .. } | Mutation::Delete { key } => key,
             };
             if key.starts_with(b"durable/document/")
+                || key.starts_with(b"durable/document-policy/")
                 || key.starts_with(b"durable/application-entries/")
             {
                 // Upsert accommodates raw batches that mutate the same key more
