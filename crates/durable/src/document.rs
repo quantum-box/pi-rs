@@ -582,6 +582,8 @@ pub struct TaskDocuments<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     task: crate::task::Task,
     entries: Option<PendingEntries>,
+    entry_initial_len: usize,
+    runtime_cut: Option<usize>,
     signal: OwnedBatch,
     signal_keys: HashSet<(uuid::Uuid, String, String)>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -596,6 +598,8 @@ impl<'a> TaskDocuments<'a> {
             store,
             task: task.clone(),
             entries: None,
+            entry_initial_len: 0,
+            runtime_cut: None,
             signal: OwnedBatch {
                 checks: Vec::new(),
                 mutations: Vec::new(),
@@ -747,6 +751,21 @@ impl<'a> TaskDocuments<'a> {
         self.append_entry_inner(None, kind, data)
     }
 
+    /// Stage one unchanged runtime checkpoint after the entries already staged.
+    /// At least one entry must precede it. Further entries may be appended; all
+    /// effects commit with the task step. The runtime version and observer head
+    /// are fenced, so a concurrent runtime change causes the whole step to retry.
+    pub fn checkpoint_runtime(&mut self) -> Result<(), Error> {
+        let Some((_, _, entries, _, true)) = &self.entries else {
+            return Err(Error::InvalidApplicationEntry);
+        };
+        if self.runtime_cut.is_some() {
+            return Err(Error::InvalidApplicationEntry);
+        }
+        self.runtime_cut = Some(entries.len());
+        Ok(())
+    }
+
     /// Append only if the application log's last entry matches `expected`.
     /// `None` expects an empty log. Earlier entries staged in this invocation
     /// are included. Even a mismatch retains a read dependency on the observed
@@ -823,6 +842,7 @@ impl<'a> TaskDocuments<'a> {
                 .transpose()?
                 .unwrap_or_default();
             let entries: Vec<crate::application_entry::ApplicationEntry> = entries;
+            self.entry_initial_len = entries.len();
             self.entries = Some((conversation, version, entries, checks, false));
         }
         if expected.is_some_and(|head| {
@@ -880,6 +900,18 @@ impl<'a> TaskDocuments<'a> {
         batch.checks.extend(self.signal.checks);
         batch.mutations.extend(self.signal.mutations);
         if let Some((conversation, version, entries, checks, dirty)) = self.entries {
+            if let Some(index) = self.runtime_cut {
+                let cut = crate::runtime::prepare_ordered_task_checkpoint(
+                    self.store,
+                    conversation,
+                    &checks,
+                    self.entry_initial_len,
+                    index,
+                    &entries,
+                )?;
+                batch.checks.extend(cut.checks);
+                batch.mutations.extend(cut.mutations);
+            }
             batch.checks.extend(checks);
             let key = crate::application_entry::key(conversation);
             batch.checks.push(Check {

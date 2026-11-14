@@ -952,6 +952,102 @@ impl PreparedConversationSave {
         Ok(())
     }
 }
+/// Prepare an unchanged runtime snapshot and an ordered task-entry proof.
+/// The caller composes this batch with the task's ancestry and entry checks.
+pub(crate) fn prepare_ordered_task_checkpoint(
+    store: &durable_store::Store,
+    id: Uuid,
+    ancestry_checks: &[Check],
+    first: usize,
+    checkpoint: usize,
+    entries: &[crate::application_entry::ApplicationEntry],
+) -> Result<crate::task_store::OwnedBatch, crate::document::Error> {
+    use crate::document::Error as DError;
+    let invalid = || DError::InvalidApplicationEntry;
+    if first >= checkpoint || checkpoint > entries.len() {
+        return Err(invalid());
+    }
+    let key = Harness::key(id);
+    let root = store.get(&key)?.ok_or_else(invalid)?;
+    if !ancestry_checks
+        .iter()
+        .any(|check| check.key == key && check.expected == Expected::Version(root.version))
+    {
+        return Err(durable_store::Error::Conflict { key }.into());
+    }
+    let seq = store
+        .commit_for_version(&key, root.version)?
+        .ok_or_else(invalid)?;
+    let prefix = format!("runtime/fork/{id}/");
+    let (_, old_key) = store
+        .runtime_snapshot_at(&key, prefix.as_bytes(), seq)?
+        .filter(|(s, _)| *s == seq)
+        .ok_or_else(invalid)?;
+    let old = store.get(&old_key)?.ok_or_else(invalid)?;
+    let observer = crate::observer::Observer::new(store, id);
+    let head = observer.head().map_err(|_| invalid())?;
+    if head.0 == 0 {
+        return Err(invalid());
+    }
+    if old_key != format!("{prefix}{:020}", head.0).into_bytes() {
+        return Err(durable_store::Error::Conflict { key }.into());
+    }
+    let old_event = observer
+        .read(
+            crate::observer::Cursor(head.0 - 1),
+            std::num::NonZeroUsize::MIN,
+        )
+        .map_err(|_| invalid())?;
+    let event = old_event
+        .records
+        .first()
+        .filter(|r| r.cursor == head)
+        .ok_or_else(invalid)?;
+    let append = observer
+        .prepare_append(&event.value)
+        .map_err(|_| invalid())?;
+    let snapshot_key = format!("{prefix}{:020}", append.cursor.0).into_bytes();
+    let order_key = crate::application_entry::ordered_cut_key(id, append.cursor.0);
+    let proof = crate::application_entry::OrderedCut {
+        version: 1,
+        previous_runtime_version: root.version,
+        first_index: first,
+        checkpoint_index: checkpoint,
+        entry_ids: entries[first..].iter().map(|e| e.id).collect(),
+    };
+    let mut checks = append.checks;
+    checks.extend([
+        Check {
+            key: old_key,
+            expected: Expected::Version(old.version),
+        },
+        Check {
+            key: snapshot_key.clone(),
+            expected: Expected::Missing,
+        },
+        Check {
+            key: order_key.clone(),
+            expected: Expected::Missing,
+        },
+    ]);
+    let mut mutations = append.mutations;
+    mutations.extend([
+        Mutation::Put {
+            key,
+            value: root.value,
+        },
+        Mutation::Put {
+            key: snapshot_key,
+            value: old.value,
+        },
+        Mutation::Put {
+            key: order_key,
+            value: serde_json::to_vec(&proof)?,
+        },
+    ]);
+    Ok(crate::task_store::OwnedBatch { checks, mutations })
+}
+
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
     complete: bool,
@@ -2552,7 +2648,7 @@ impl Harness {
             .store()
             .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), sequence)?
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        if runtime_sequence >= sequence {
+        if runtime_sequence > sequence {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
         let suffix = snapshot_key
@@ -2562,6 +2658,64 @@ impl Harness {
             .ok()
             .and_then(|s| s.parse().ok())
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if runtime_sequence == sequence {
+            let proof_key = crate::application_entry::ordered_cut_key(origin, cursor);
+            let proof_record = self
+                .owner
+                .store()
+                .get(&proof_key)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if self
+                .owner
+                .store()
+                .commit_for_version(&proof_key, proof_record.version)?
+                != Some(sequence)
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            let proof: crate::application_entry::OrderedCut =
+                serde_json::from_slice(&proof_record.value)?;
+            let full = self
+                .owner
+                .store()
+                .application_entries_at(&crate::application_entry::key(origin), revision)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let full: Vec<crate::application_entry::ApplicationEntry> =
+                serde_json::from_slice(&full.value)?;
+            let previous_seq = self
+                .owner
+                .store()
+                .commit_for_version(runtime_key.as_bytes(), proof.previous_runtime_version)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let (_, prior_key) = self
+                .owner
+                .store()
+                .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), previous_seq)?
+                .filter(|(s, _)| *s == previous_seq)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let prior = self
+                .owner
+                .store()
+                .get(&prior_key)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let current = self
+                .owner
+                .store()
+                .get(&snapshot_key)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if proof.version != 1
+                || previous_seq >= sequence
+                || prior.value != current.value
+                || proof.first_index >= proof.checkpoint_index
+                || proof.checkpoint_index > full.len()
+                || full.get(proof.first_index..).is_none_or(|tail| {
+                    tail.iter().map(|e| e.id).collect::<Vec<_>>() != proof.entry_ids
+                })
+                || !proof.entry_ids.contains(&entry_id)
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+        }
         self.fork_at_selected(
             origin,
             crate::observer::Cursor(cursor),

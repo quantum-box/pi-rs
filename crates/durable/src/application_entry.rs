@@ -29,6 +29,21 @@ pub(crate) fn lineage_key(conversation: Uuid) -> Vec<u8> {
     format!("durable/application-lineage/{conversation}").into_bytes()
 }
 
+// Atomic proof emitted only by the task runtime-checkpoint writer.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrderedCut {
+    pub version: u8,
+    pub previous_runtime_version: u64,
+    pub first_index: usize,
+    pub checkpoint_index: usize,
+    pub entry_ids: Vec<Uuid>,
+}
+
+pub(crate) fn ordered_cut_key(conversation: Uuid, cursor: u64) -> Vec<u8> {
+    format!("durable/application-ordered-cut/{conversation}/{cursor:020}").into_bytes()
+}
+
 /// Read the committed records in append order. The result is a snapshot.
 pub fn list(
     store: &Store,

@@ -3083,3 +3083,162 @@ async fn inherited_entries_require_atomic_parent_lineage() {
     // Original local entries are still usable in the absence of lineage.
     assert!(h.fork_at_application_entry(origin, entries[0].id).is_ok());
 }
+
+#[tokio::test]
+async fn task_ordered_runtime_checkpoint_forks_reopen_and_retries_races() {
+    use pi_rs_durable::{
+        application_entry,
+        document::{Address, TaskDocuments},
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Writer {
+        address: Address,
+        ready: Option<std::sync::mpsc::Sender<()>>,
+        resume: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&self.address).unwrap();
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.checkpoint_runtime().unwrap();
+            docs.append_entry("app.after", json!(2)).unwrap();
+            docs.put(&self.address, json!({"n": 7}).as_object().unwrap().clone())
+                .unwrap();
+            if let Some(rx) = self.resume.lock().unwrap().take() {
+                self.ready.as_ref().unwrap().send(()).unwrap();
+                rx.recv().unwrap();
+            }
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "original".into(), &cancel)
+        .await
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "cut".into(),
+        key: "".into(),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "ordered",
+        true,
+        Writer {
+            address: address.clone(),
+            ready: Some(ready_tx),
+            resume: std::sync::Mutex::new(Some(resume_rx)),
+        },
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("ordered".into(), true);
+    scheduler.submit(&task).unwrap();
+    let writer = std::thread::spawn(move || {
+        scheduler.tick(0).unwrap();
+        scheduler
+    });
+    ready_rx.recv().unwrap();
+    h.submit_write(id, None, "app.race".into(), None).unwrap();
+    resume_tx.send(()).unwrap();
+    let mut scheduler = writer.join().unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(application_entry::list(&db, id).unwrap().is_empty());
+    assert!(
+        db.list(format!("durable/application-ordered-cut/{id}/").as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.document(&address).unwrap().is_none());
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let entries = application_entry::list(&db, id).unwrap();
+    assert_eq!(entries.len(), 2);
+    let first = h.fork_at_application_entry(id, entries[0].id).unwrap();
+    let second = h.fork_at_application_entry(id, entries[1].id).unwrap();
+    assert_eq!(application_entry::list(&db, first).unwrap(), entries[..1]);
+    assert_eq!(application_entry::list(&db, second).unwrap(), entries);
+    for child in [first, second] {
+        assert_eq!(
+            h.document(&Address {
+                scope: child.to_string(),
+                ..address.clone()
+            })
+            .unwrap()
+            .unwrap()
+            .value["n"],
+            7
+        );
+        assert_eq!(
+            h.conversation(child).unwrap().messages,
+            h.conversation(id).unwrap().messages
+        );
+    }
+    drop(h);
+    drop(db);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    let grandchild = h.fork_at_application_entry(first, entries[0].id).unwrap();
+    assert_eq!(
+        application_entry::list(&db, grandchild).unwrap(),
+        entries[..1]
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: grandchild.to_string(),
+            ..address
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
+    // An untracked or missing proof cannot authorize a same-commit cut.
+    let prefix = format!("durable/application-ordered-cut/{id}/");
+    let proofs = db.list(prefix.as_bytes()).unwrap();
+    assert_eq!(proofs.len(), 1);
+    db.commit(
+        &[],
+        &[durable_store::Mutation::Delete {
+            key: proofs[0].0.clone(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(id, entries[0].id).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.fork_at_application_entry(id, entries[1].id).is_err());
+}

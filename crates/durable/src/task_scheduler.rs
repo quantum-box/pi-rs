@@ -859,7 +859,24 @@ impl Scheduler {
             (!prepared.mutations.is_empty()).then_some(Save::Create(child))
         }));
         let mut transaction = crate::document::Transaction::new();
-        let document_batch = documents.into_batch()?;
+        let document_batch = match documents.into_batch() {
+            Ok(batch) => batch,
+            Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {
+                // A staged runtime checkpoint observed a newer root while
+                // preparing; no effects committed. Follow normal replay policy.
+                if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                    self.ts().update(&current, |task| task.yield_ready())?;
+                } else {
+                    self.finish_failed(
+                        &current,
+                        "document conflict: execution outcome requires reconciliation".into(),
+                    )?;
+                }
+                self.poisoned = false;
+                return Ok(true);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut document_keys: HashSet<_> = document_batch
             .checks
             .iter()
