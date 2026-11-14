@@ -9,6 +9,20 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+enum FixtureEvent {
+    Accepted,
+    RequestLine,
+}
+
+fn fixture_write(result: std::io::Result<()>, stopping: &AtomicBool) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(_) if stopping.load(Ordering::Acquire) => false,
+        Err(error) => panic!("write fixture response: {error}"),
+    }
+}
+
 // Handle each accepted connection independently so an idle connection cannot
 // prevent the actual HTTP request from reaching its assertions.
 fn serve_connection(
@@ -17,6 +31,7 @@ fn serve_connection(
     expected: &str,
     level: &str,
     stopping: &AtomicBool,
+    progress: Option<mpsc::Sender<FixtureEvent>>,
 ) -> bool {
     // Windows inherits the listener's nonblocking mode on accept.
     // The buffered HTTP reader below relies on blocking reads.
@@ -46,13 +61,28 @@ fn serve_connection(
     if !line.ends_with('\n') {
         return false;
     }
+    if let Some(progress) = progress {
+        let _ = progress.send(FixtureEvent::RequestLine);
+    }
     let request = line.clone();
     let mut length = 0;
     loop {
         line.clear();
-        reader.read_line(&mut line).unwrap();
-        if line == "\r\n" || line.is_empty() {
+        match reader.read_line(&mut line) {
+            Ok(0) if stopping.load(Ordering::Acquire) => return false,
+            Ok(0) => panic!("unexpected EOF in request headers"),
+            Ok(_) => {}
+            Err(_) if stopping.load(Ordering::Acquire) => return false,
+            Err(error) => panic!("read request headers: {error}"),
+        }
+        if line == "\r\n" {
             break;
+        }
+        if !line.ends_with('\n') {
+            if stopping.load(Ordering::Acquire) {
+                return false;
+            }
+            panic!("incomplete request header");
         }
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -75,19 +105,35 @@ fn serve_connection(
             } else {
                 model.to_string()
             };
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            if !fixture_write(
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                stopping,
+            ) {
+                return false;
+            }
         } else {
-            socket
-                .write_all(
+            if !fixture_write(
+                socket.write_all(
                     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
+                ),
+                stopping,
+            ) {
+                return false;
+            }
         }
         return false;
     }
     assert!(request.starts_with("POST /v1/messages "), "{request}");
     let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes).unwrap();
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(_) if stopping.load(Ordering::Acquire) => return false,
+        Err(error) => panic!("read request body: {error}"),
+    }
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     if discovery != 0 {
         assert_eq!(body["max_tokens"], 4096);
@@ -116,8 +162,14 @@ fn serve_connection(
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
         "data: {\"type\":\"message_stop\"}\n\n"
     );
-    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
-    true
+    fixture_write(
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+            events.len()
+        ),
+        stopping,
+    )
 }
 
 fn serve_fixture(
@@ -125,7 +177,7 @@ fn serve_fixture(
     discovery: i32,
     expected: &str,
     level: &str,
-    accepted: Option<mpsc::Sender<()>>,
+    accepted: Option<mpsc::Sender<FixtureEvent>>,
     timeout: Duration,
     max_connections: usize,
 ) {
@@ -155,16 +207,19 @@ fn serve_fixture(
                     sockets.push(control);
                     let sender = sender.clone();
                     let stopping = stopping.clone();
+                    let progress = accepted.clone();
                     let expected = expected.to_owned();
                     let level = level.to_owned();
                     workers.push(std::thread::spawn(move || {
                         let result = std::panic::catch_unwind(|| {
-                            serve_connection(socket, discovery, &expected, &level, &stopping)
+                            serve_connection(
+                                socket, discovery, &expected, &level, &stopping, progress,
+                            )
                         });
                         let _ = sender.send(result);
                     }));
                     if let Some(accepted) = &accepted {
-                        let _ = accepted.send(());
+                        let _ = accepted.send(FixtureEvent::Accepted);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -315,6 +370,20 @@ fn idle_connection_does_not_block_following_model_request() {
     let mut partial = TcpStream::connect(address).unwrap();
     partial.write_all(b"GET /v1/").unwrap();
     received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut incomplete_headers = TcpStream::connect(address).unwrap();
+    incomplete_headers
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match received
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            FixtureEvent::RequestLine => break,
+            FixtureEvent::Accepted => {}
+        }
+    }
     let mut request = TcpStream::connect(address).unwrap();
     request
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -331,7 +400,7 @@ fn idle_connection_does_not_block_following_model_request() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("message_stop"));
     server.join().unwrap();
-    drop((idle, partial));
+    drop((idle, partial, incomplete_headers));
 }
 
 #[test]
@@ -365,4 +434,34 @@ fn fixture_limits_connections_and_finishes_at_deadline() {
     );
     assert!(start.elapsed() < Duration::from_secs(10));
     drop(idle);
+}
+
+#[test]
+fn fixture_rejects_complete_invalid_model_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            None,
+            Duration::from_secs(5),
+            4,
+        )
+    });
+    let mut request = TcpStream::connect(address).unwrap();
+    let body = r#"{"thinking":{"type":"disabled"}}"#;
+    write!(
+        request,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    assert!(
+        server.join().is_err(),
+        "a complete request with invalid thinking must fail its assertion"
+    );
 }
