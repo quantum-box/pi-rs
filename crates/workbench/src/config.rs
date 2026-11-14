@@ -60,12 +60,20 @@ impl Settings {
     }
     pub fn load(workspace: &Path, trusted: bool) -> Result<Self> {
         let user_path = agent_dir().join("settings.json");
-        let mut value = read_object(&user_path)?;
-        validate_settings(&value, &user_path)?;
-        let mut resource_layers = vec![(agent_dir(), value.clone())];
+        Self::load_from_paths(workspace, trusted, &user_path)
+    }
+    fn load_from_paths(workspace: &Path, trusted: bool, user_path: &Path) -> Result<Self> {
+        let mut value = read_object(user_path)?;
+        migrate_legacy_settings(&mut value);
+        validate_settings(&value, user_path)?;
+        let mut resource_layers = vec![(
+            user_path.parent().unwrap_or(Path::new(".")).to_owned(),
+            value.clone(),
+        )];
         if trusted {
             let project_path = workspace.join(".pi/settings.json");
             let mut project = read_object(&project_path)?;
+            migrate_legacy_settings(&mut project);
             let user_only = project.as_object_mut().expect("object");
             user_only.remove("defaultProjectTrust");
             user_only.remove("cacheWarming");
@@ -380,7 +388,9 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
             .expect("bundled settings schema");
         jsonschema::validator_for(&schema).expect("valid settings schema")
     });
-    if let Some(error) = SCHEMA.iter_errors(value).next() {
+    let mut normalized = value.clone();
+    migrate_legacy_settings(&mut normalized);
+    if let Some(error) = SCHEMA.iter_errors(&normalized).next() {
         return Err(Error::Config(format!(
             "{}{}: {}",
             path.display(),
@@ -389,6 +399,34 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+// Pi migrates each settings layer before merging it, without requiring the
+// user to rewrite their existing settings file.
+fn migrate_legacy_settings(value: &mut Value) {
+    let Some(settings) = value.as_object_mut() else {
+        return;
+    };
+    if !settings.contains_key("steeringMode")
+        && let Some(mode) = settings.remove("queueMode")
+    {
+        settings.insert("steeringMode".into(), mode);
+    }
+    if let Some(legacy) = settings.get("skills").and_then(Value::as_object).cloned() {
+        if !settings.contains_key("enableSkillCommands")
+            && let Some(enabled) = legacy.get("enableSkillCommands")
+        {
+            settings.insert("enableSkillCommands".into(), enabled.clone());
+        }
+        match legacy.get("customDirectories").and_then(Value::as_array) {
+            Some(paths) if !paths.is_empty() => {
+                settings.insert("skills".into(), Value::Array(paths.clone()));
+            }
+            _ => {
+                settings.remove("skills");
+            }
+        }
+    }
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
@@ -718,6 +756,107 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_settings_migrate_per_layer_without_rewriting_files() {
+        use clap::Parser;
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global/settings.json");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let global_value = json!({"queueMode":"all", "skills":{"enableSkillCommands":false,"customDirectories":["global-skills"]}});
+        let project_value = json!({"queueMode":"one-at-a-time", "skills":{"enableSkillCommands":true,"customDirectories":["project-skills"]}});
+        std::fs::write(&global, global_value.to_string()).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            project_value.to_string(),
+        )
+        .unwrap();
+        for (base, name) in [
+            (global.parent().unwrap(), "global-skills"),
+            (workspace.join(".pi").as_path(), "project-skills"),
+        ] {
+            let path = base.join(name).join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: fixture\n---\nInstructions\n"),
+            )
+            .unwrap();
+        }
+
+        let trusted = super::Settings::load_from_paths(&workspace, true, &global).unwrap();
+        assert_eq!(trusted.string("steeringMode"), Some("one-at-a-time"));
+        assert_eq!(trusted.boolean("enableSkillCommands"), Some(true));
+        let layers = trusted.resource_layers("skills").unwrap();
+        assert_eq!(
+            layers[0],
+            (
+                global.parent().unwrap().to_owned(),
+                vec!["global-skills".into()]
+            )
+        );
+        assert_eq!(
+            layers[1],
+            (workspace.join(".pi"), vec!["project-skills".into()])
+        );
+        let mut args = super::super::Cli::try_parse_from([
+            "pi",
+            "--offline",
+            "--no-extensions",
+            "--no-prompt-templates",
+            "--no-themes",
+        ])
+        .unwrap();
+        args.workspace = workspace.clone();
+        args.trusted = true;
+        args.settings = trusted;
+        assert_eq!(
+            super::super::backend::configured_queue_mode(&args, "steeringMode").unwrap(),
+            pi_rs::QueueMode::OneAtATime
+        );
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("global-skills"));
+        assert!(resources.skills.contains_key("project-skills"));
+
+        let untrusted = super::Settings::load_from_paths(&workspace, false, &global).unwrap();
+        assert_eq!(untrusted.string("steeringMode"), Some("all"));
+        assert_eq!(untrusted.boolean("enableSkillCommands"), Some(false));
+        assert_eq!(untrusted.resource_layers("skills").unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&global).unwrap()).unwrap(),
+            global_value
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(workspace.join(".pi/settings.json")).unwrap()
+            )
+            .unwrap(),
+            project_value
+        );
+        let mut untrusted = untrusted;
+        untrusted
+            .set_user_values_at(&global, &[("hideThinkingBlock".into(), json!(true))])
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&global).unwrap()).unwrap();
+        assert_eq!(saved["skills"], global_value["skills"]);
+        assert_eq!(saved["queueMode"], "all");
+        assert_eq!(saved["hideThinkingBlock"], true);
+    }
+
+    #[test]
+    fn legacy_settings_respect_modern_fields_and_empty_skill_paths() {
+        use serde_json::json;
+        let mut value = json!({"queueMode":"all","steeringMode":"one-at-a-time", "enableSkillCommands":true, "skills":{"enableSkillCommands":false,"customDirectories":[]}});
+        super::migrate_legacy_settings(&mut value);
+        assert_eq!(value["steeringMode"], "one-at-a-time");
+        assert_eq!(value["enableSkillCommands"], true);
+        assert!(value.get("skills").is_none());
+        super::validate_settings(&value, std::path::Path::new("settings.json")).unwrap();
+    }
+
     #[test]
     fn ancestor_agents_skills_require_project_trust_without_blocking_user_skills() {
         const CHILD: &str = "PI_RS_TEST_AGENTS_TRUST_CHILD";

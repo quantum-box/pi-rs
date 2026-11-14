@@ -881,6 +881,16 @@ the `-a` and `-na` aliases; flags after `--` remain prompt text.
 These selections propagate to persistent CLI workers. The settings editor,
 remaining CLI aliases still require parity work.
 
+### Legacy settings migration
+
+User and trusted-project settings independently migrate Pi's legacy
+`queueMode` to `steeringMode` and the legacy `skills` object to skill paths
+and `enableSkillCommands` before merging. Explicit modern keys win within
+their layer; project settings retain their usual precedence and untrusted
+project settings are ignored. Configured skill paths remain relative to their
+own settings file. Loading does not rewrite the original files. Regression
+tests exercise actual skill discovery, queue selection, precedence and trust.
+
 ### Upstream session import checkpoint
 
 The import command reads native journals and Pi v1–v3 JSONL snapshots without
