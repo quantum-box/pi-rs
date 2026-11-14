@@ -67,7 +67,7 @@ struct Entry {
 
 /// An opaque in-process position in a captured transcript snapshot.
 /// Serialized cursors are intended for trusted, durable host records.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     transcript: Uuid,
     next: Option<Link>,

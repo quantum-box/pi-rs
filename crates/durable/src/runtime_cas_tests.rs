@@ -1028,3 +1028,112 @@ fn positioned_view_splits_a_single_immutable_batch() {
     bad.remaining = Some(6);
     assert!(h.view_positioned_page(id, bad, limit).is_err());
 }
+
+#[test]
+fn position_fork_uses_first_complete_snapshot_and_survives_reset_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "original".into(),
+            system_prompt: "old".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let other = h
+        .create_conversation(Config {
+            model: "other".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages = (0..3)
+        .map(|n| Message::User {
+            content: n.to_string(),
+        })
+        .collect();
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let position = entries[0].position.clone();
+    assert!(h.fork_at_position(id, entries[1].position.clone()).is_err());
+    assert!(h.fork_at_position(other, position.clone()).is_err());
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "later".into();
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.reset(id, Some("replacement".into())).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let child = h.fork_at_position(id, position).unwrap();
+    let result = h.conversation(child).unwrap();
+    assert_eq!(result.config.model, "original");
+    assert_eq!(result.messages.len(), 3);
+    assert!(result.resets.is_empty());
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(child).unwrap().messages, result.messages);
+}
+
+#[test]
+fn position_fork_rejects_missing_or_mismatched_historical_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "one".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let position = h
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0)
+        .position;
+    let key = format!("runtime/fork/{id}/{:020}", 2).into_bytes();
+    let original = h.owner.store().get(&key).unwrap().unwrap().value;
+    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    value["documents"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pi-rs/runtime/extensions");
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_at_position(id, position.clone()).is_err());
+    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    value["_transcript"] = serde_json::Value::Null;
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_at_position(id, position.clone()).is_err());
+    h.owner
+        .store()
+        .commit(&[], &[Mutation::Delete { key }])
+        .unwrap();
+    assert!(h.fork_at_position(id, position).is_err());
+}

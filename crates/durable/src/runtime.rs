@@ -1399,6 +1399,74 @@ impl Harness {
         self.save(&state, Expected::Missing)?;
         Ok(state.id)
     }
+    /// Fork at the commit that first exposed this complete message batch.
+    /// Positions inside a batch, or without matching complete historical metadata,
+    /// cannot identify the state at that message and are rejected.
+    pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
+        self.load(id)?;
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let page = transcript.read(&position.cursor, std::num::NonZeroUsize::MIN)?;
+        let record = page
+            .records
+            .first()
+            .ok_or(crate::fork::Error::InvalidCursor)?;
+        let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        let messages = match change {
+            TranscriptChange::Append(messages) | TranscriptChange::Replace(messages) => messages,
+        };
+        if messages.is_empty() || position.remaining != Some(messages.len()) {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let observer = crate::observer::Observer::new(self.owner.store(), id);
+        let mut cursor = crate::observer::Cursor(0);
+        loop {
+            let page = observer.read(cursor, std::num::NonZeroUsize::new(128).unwrap())?;
+            for record in &page.records {
+                let reference = record.value.get("_transcript").cloned();
+                let Some(reference) = reference else { continue };
+                let reference: Option<crate::transcript::Cursor> =
+                    serde_json::from_value(reference)?;
+                if reference.as_ref() == Some(&position.cursor) {
+                    let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
+                    let entry = self
+                        .owner
+                        .store()
+                        .get(key.as_bytes())?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                    let captured: Option<crate::transcript::Cursor> = serde_json::from_value(
+                        value
+                            .get("_transcript")
+                            .cloned()
+                            .ok_or(crate::fork::Error::InvalidSnapshot)?,
+                    )?;
+                    if captured.as_ref() != Some(&position.cursor) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    let documents = value
+                        .get("documents")
+                        .and_then(serde_json::Value::as_object)
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    for name in [
+                        "pi-rs/runtime/queue-modes",
+                        "pi-rs/runtime/extensions",
+                        "pi-rs/runtime/resets",
+                        "pi-rs/runtime/application-writes",
+                    ] {
+                        if !documents.contains_key(name) {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                    }
+                    return self.fork_at(id, record.cursor);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        Err(crate::fork::Error::InvalidSnapshot.into())
+    }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
     }
@@ -4283,6 +4351,9 @@ impl Scheduler {
     }
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
         self.harness.fork_at(id, cursor)
+    }
+    pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
+        self.harness.fork_at_position(id, position)
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)

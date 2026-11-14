@@ -39,6 +39,10 @@ idempotency remains the tool's and destination's responsibility.
 
 The runtime can fork a settled conversation at its current state or a supported
 historical snapshot cursor, and performs explicit idle compaction. It also
+supports `fork_at_position` for a message at a complete batch boundary with
+matching complete historical fork metadata; other positions fail closed. The
+first matching observation determines the configuration. This does not recover
+per-message state within a batch or pre-migration legacy history. It also
 attempts compaction when a provider reports a context window and the estimated
 request approaches it. Older committed snapshots remain in the observation
 log. `history` and `watch_history` read or poll from an exclusive cursor; slow
