@@ -780,6 +780,22 @@ impl Harness {
         result
     }
 
+    /// Start an opt-in host-owned asynchronous report listener.
+    pub fn dispatch_extension_reports<F, Fut>(
+        &self,
+        cursor: u64,
+        poll: Duration,
+        listener: F,
+    ) -> Result<crate::report::Dispatcher, Error>
+    where
+        F: FnMut(crate::report::Delivery) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let result = crate::report::Dispatcher::start(self.owner.clone(), cursor, poll, listener);
+        self.poison_on_report_storage_error(&result);
+        result
+    }
+
     fn poison_on_report_storage_error<T>(&self, result: &Result<T, Error>) {
         if matches!(
             result,
@@ -5545,6 +5561,20 @@ impl Scheduler {
     /// Subscribe to the durable extension report log.
     pub fn subscribe_extension_reports(&self) -> Result<crate::report::Subscription<'_>, Error> {
         self.harness.subscribe_extension_reports()
+    }
+    /// Start an opt-in host-owned asynchronous report listener.
+    pub fn dispatch_extension_reports<F, Fut>(
+        &self,
+        cursor: u64,
+        poll: Duration,
+        listener: F,
+    ) -> Result<crate::report::Dispatcher, Error>
+    where
+        F: FnMut(crate::report::Delivery) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.harness
+            .dispatch_extension_reports(cursor, poll, listener)
     }
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
         self.harness.install_extension(extension)

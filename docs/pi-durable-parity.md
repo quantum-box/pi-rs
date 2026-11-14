@@ -1,9 +1,11 @@
 # Pi Durable compatibility inventory
 
 **Extension report subscription:** `Harness` and `Scheduler` expose a bounded,
-pull-based subscription over persisted extension error batches, with explicit
-consumer cursors and replay after reopening. This is an increment toward upstream
-`onReport`, not its callback or complete report taxonomy; see the
+pull-based subscription and opt-in asynchronous dispatcher over persisted extension
+error batches, with host-managed cursors and replay after reopening. Unlike upstream
+`onReport`, the dispatcher delivers batches after commit, stops on listener failure,
+and requires explicit awaited shutdown and checkpointing; it does not cover the
+complete upstream report taxonomy; see the
 [delivery guarantees](../crates/durable/README.md#extension-error-observation).
 
 

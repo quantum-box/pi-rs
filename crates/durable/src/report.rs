@@ -4,8 +4,18 @@ use crate::{
     observer::{Cursor, Observer},
     runtime::{Error, ExtensionReportBatch},
 };
-use durable_store::{Check, Expected, Mutation, Store};
-use std::{num::NonZeroUsize, time::Duration};
+use durable_store::{Check, Expected, Mutation, Store, owner::OwnedStore};
+use futures_util::FutureExt;
+use std::{
+    future::Future,
+    num::NonZeroUsize,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use uuid::Uuid;
 
 const REPORTS: &[u8] = b"runtime/extension-report/";
@@ -171,6 +181,110 @@ impl<'a> Subscription<'a> {
     }
 }
 
+/// Terminal delivery failure. `cursor` is the last successfully processed batch.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("report read failed after cursor {cursor}: {source}")]
+    Read { cursor: u64, source: Error },
+    #[error("report listener failed after cursor {cursor}: {message}")]
+    Listener { cursor: u64, message: String },
+    #[error("report listener panicked after cursor {cursor}")]
+    Panic { cursor: u64 },
+    #[error("report worker failed after cursor {cursor}: {message}")]
+    Worker { cursor: u64, message: String },
+}
+
+/// Host-owned worker. Call `close` and await it before shutting down the host.
+/// Dropping without closing aborts the task; this is not an awaited shutdown.
+#[must_use]
+pub struct Dispatcher {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<u64, DispatchError>>,
+    cursor: Arc<AtomicU64>,
+}
+
+impl Dispatcher {
+    pub(crate) fn start<F, Fut>(
+        owner: Arc<OwnedStore>,
+        cursor: u64,
+        poll: Duration,
+        mut listener: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(Delivery) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        if poll.is_zero() {
+            return Err(Error::Invalid(
+                "report poll interval must be nonzero".into(),
+            ));
+        }
+        // Setup and cursor validation happen before the worker can call user code.
+        let sub = Subscription::open(owner.store())?;
+        sub.read(cursor, 1)?;
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let acknowledged = Arc::new(AtomicU64::new(cursor));
+        let progress = acknowledged.clone();
+        let task = tokio::spawn(async move {
+            let sub = Subscription {
+                store: owner.store(),
+            };
+            let mut cursor = cursor;
+            loop {
+                let page = tokio::select! {
+                    biased;
+                    _ = stopped.changed() => return Ok(cursor),
+                    result = sub.next(cursor, 1, poll) => result.map_err(|source| DispatchError::Read { cursor, source })?,
+                };
+                if *stopped.borrow() {
+                    return Ok(cursor);
+                }
+                let delivery = page
+                    .into_iter()
+                    .next()
+                    .expect("next returns a nonempty page");
+                let next = delivery.cursor;
+                // Catch both construction and polling panics. No store or runtime lock
+                // is held here; listener completion is the acknowledgment boundary.
+                match AssertUnwindSafe(async { listener(delivery).await })
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        cursor = next;
+                        progress.store(cursor, Ordering::Release);
+                    }
+                    Ok(Err(message)) => return Err(DispatchError::Listener { cursor, message }),
+                    Err(_) => return Err(DispatchError::Panic { cursor }),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            task,
+            cursor: acknowledged,
+        })
+    }
+
+    /// Stop starting callbacks, wait for any in-flight callback, and return its
+    /// last acknowledged cursor or terminal failure. Safe to cancel and await again.
+    pub async fn close(&mut self) -> Result<u64, DispatchError> {
+        let _ = self.stop.send(true);
+        match (&mut self.task).await {
+            Ok(result) => result,
+            Err(error) => Err(DispatchError::Worker {
+                cursor: self.cursor.load(Ordering::Acquire),
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +309,204 @@ mod tests {
         )
         .into_bytes()
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatcher_reentrant_failure_and_restart_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.db");
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let first = batch(1);
+        index(owner.store(), key(&first), &first, false).unwrap();
+        let callback_owner = owner.clone();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut dispatcher = Dispatcher::start(
+            owner.clone(),
+            0,
+            Duration::from_millis(1),
+            move |delivery| {
+                let owner = callback_owner.clone();
+                let sent = sent.clone();
+                async move {
+                    let extra = batch(2);
+                    index(owner.store(), key(&extra), &extra, false).unwrap();
+                    sent.send(delivery.cursor).unwrap();
+                    Err("retry me".to_string())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(matches!(
+            dispatcher.close().await,
+            Err(DispatchError::Listener { cursor: 0, .. })
+        ));
+        drop(dispatcher);
+        drop(owner);
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut dispatcher = Dispatcher::start(
+            owner.clone(),
+            0,
+            Duration::from_millis(1),
+            move |delivery| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(delivery.cursor).unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(dispatcher.close().await.unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatcher_close_waits_for_callback_and_leaves_later_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("reports.db")).unwrap());
+        let b = batch(1);
+        index(owner.store(), key(&b), &b, false).unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let mut release_rx = Some(release_rx);
+        let mut dispatcher =
+            Dispatcher::start(owner.clone(), 0, Duration::from_millis(1), move |_| {
+                let started = started.take().unwrap();
+                let release_rx = release_rx.take().unwrap();
+                async move {
+                    started.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(())
+                }
+            })
+            .unwrap();
+        started_rx.await.unwrap();
+        let later = batch(2);
+        index(owner.store(), key(&later), &later, false).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), dispatcher.close())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        assert_eq!(dispatcher.close().await.unwrap(), 1);
+        assert_eq!(
+            Subscription::open(owner.store())
+                .unwrap()
+                .read(1, 1)
+                .unwrap()[0]
+                .batch,
+            later
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatcher_checkpoint_resume_and_idle_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.db");
+        let checkpoint = dir.path().join("cursor");
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let first = batch(1);
+        index(owner.store(), key(&first), &first, false).unwrap();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let checkpoint_path = checkpoint.clone();
+        let mut dispatcher = Dispatcher::start(
+            owner.clone(),
+            0,
+            Duration::from_millis(1),
+            move |delivery| {
+                let sent = sent.clone();
+                let checkpoint_path = checkpoint_path.clone();
+                async move {
+                    std::fs::write(checkpoint_path, delivery.cursor.to_string()).unwrap();
+                    sent.send(delivery.cursor).unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(received.recv().await, Some(1));
+        assert_eq!(dispatcher.close().await.unwrap(), 1);
+        drop(dispatcher);
+        drop(owner);
+        let cursor = std::fs::read_to_string(checkpoint)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut dispatcher = Dispatcher::start(
+            owner.clone(),
+            cursor,
+            Duration::from_millis(1),
+            move |delivery| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(delivery.cursor).unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        let second = batch(2);
+        index(owner.store(), key(&second), &second, false).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(dispatcher.close().await.unwrap(), 2);
+        let third = batch(3);
+        index(owner.store(), key(&third), &third, false).unwrap();
+        assert!(received.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatcher_panic_preserves_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("reports.db")).unwrap());
+        let b = batch(1);
+        index(owner.store(), key(&b), &b, false).unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let mut dispatcher = Dispatcher::start(owner, 0, Duration::from_millis(1), move |_| {
+            started.take().unwrap().send(()).unwrap();
+            async move {
+                panic!("listener panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        })
+        .unwrap();
+        started_rx.await.unwrap();
+        assert!(matches!(
+            dispatcher.close().await,
+            Err(DispatchError::Panic { cursor: 0 })
+        ));
+    }
+
     #[test]
     fn concurrent_commits_reentrancy_and_failed_consumer() {
         let store = Arc::new(Store::memory().unwrap());

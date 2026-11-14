@@ -430,7 +430,7 @@ This is a partial upstream durable hook: the host selects message ranges rather
 than upstream entry records, so it exposes messages and a message index rather
 than entry IDs or head markers. Manual compaction currently has no instructions
 argument. Hook errors are retained in the extension report log and available through the
-pull subscription described below; upstream's `onReport` callback is not exposed. Empty hook
+pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
 still subject to the host's existing idle/manual and context-selection limits.
 
@@ -582,6 +582,31 @@ The report index and reserved observer stream are internal namespaces; modifying
 them externally invalidates delivery guarantees. Malformed records are reported
 as errors, and an orphaned next observer record is rejected instead of retried.
 There is no deletion or retention policy, and the persistent log and index grow without bound.
+
+An opt-in `Harness::dispatch_extension_reports(cursor, poll, listener)` (also
+on `Scheduler`) starts one host-owned Tokio task. The asynchronous listener gets
+one `Delivery` at a time in cursor order, outside storage and runtime locks, and
+may reenter the host. Return `Ok(())` only after processing and durably saving the
+cursor in the host's own checkpoint. The dispatcher's cursor advances in memory
+only after success; it does not persist checkpoints. A crash between side effects
+and checkpointing can replay a batch, so make effects idempotent or atomically
+checkpoint them. Each dispatcher has an independent cursor; it does not delete
+reports. Listener `Err(String)`, panic, or a read error stops that dispatcher;
+`close().await` returns the error and last successful cursor, and the host can
+restart from its durable checkpoint. Failures are not emitted as new reports.
+
+`close().await` requests stop, waits for an already running listener to finish,
+and returns its last successful cursor. It does not drain the log: later or
+unstarted reports remain for replay. A listener that never completes can prevent
+close from completing; it must not await its own dispatcher's close. Cancelling
+the close future and awaiting it again is supported. Dropping the dispatcher
+aborts the worker without waiting and cannot establish the awaited-close
+guarantee; close explicitly before releasing the host. A callback must not spawn
+untracked work if that work must finish before close. The dispatcher retains the
+store owner until its worker ends, and synchronous polling can block the Tokio
+thread during storage access. Start it inside a running Tokio runtime. Listener
+errors do not poison the host; setup storage errors follow subscription setup's
+poisoning rules and later read errors stop only the dispatcher.
 
 This is an increment toward upstream's [`onReport(report)`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md#errors), not callback parity:
 it exposes batches of extension errors rather than individual reports and does
