@@ -1221,11 +1221,15 @@ fn remember_model_images(
     model: &str,
     details: Option<&pi_rs::ollama::ModelDetails>,
 ) {
-    if let Some(images) = details.and_then(|details| details.images) {
-        args.rpc_model_images
-            .lock()
-            .unwrap()
-            .insert(model_cache_key(args, provider, model), images);
+    let key = model_cache_key(args, provider, model);
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    match details.and_then(|details| details.images) {
+        Some(images) => {
+            cache.insert(key, images);
+        }
+        None => {
+            cache.remove(&key);
+        }
     }
 }
 
@@ -1636,6 +1640,37 @@ mod tests {
         assert_eq!(
             model_with_input_details(configured, Some(&details))["input"],
             json!(["image"])
+        );
+    }
+
+    #[test]
+    fn rpc_rediscovery_clears_previously_known_dynamic_image_support() {
+        let args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(&args, &provider, "dynamic", Some(&known));
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+
+        let unknown = pi_rs::ollama::ModelDetails::default();
+        remember_model_images(&args, &provider, "dynamic", Some(&unknown));
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+
+        remember_model_images(&args, &provider, "dynamic", Some(&known));
+        remember_model_images(&args, &provider, "dynamic", None);
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
         );
     }
 
