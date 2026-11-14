@@ -73,5 +73,7 @@ the complete native SDK surface. The browser Fetch adapter enforces an 8 MiB
 request body and a 16 MiB response limit. Chrome integration tests include an
 in-flight page reload followed by `resume()`. They use a local
 mock gateway; they do not establish compatibility with a live model provider or
-other browsers. Build flags select browser randomness explicitly; the same
-unknown WASM target name alone does not establish browser support.
+other browsers. The browser runtime supports single-threaded WASM only;
+threaded WASM has not been validated. Build flags select browser randomness
+explicitly; the same unknown WASM target name alone does not establish browser
+support.
