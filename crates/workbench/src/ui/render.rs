@@ -912,13 +912,13 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
             (Some(web), Some(mail)) if web.start() < mail.start() => (web, false),
             (Some(web), Some(mail)) if mail.start() < web.start() => (mail, true),
             (Some(web), Some(mail)) => {
-                // A www URL with a path containing @ is a URL, not a mailbox.
+                // A www URL with a path, query or fragment containing @ is a URL.
                 let is_web_path = web.as_str().starts_with("www.")
                     && mail
                         .as_str()
                         .split('@')
                         .next()
-                        .is_some_and(|local| local.contains('/'));
+                        .is_some_and(|local| local.contains(['/', '?', '#']));
                 if is_web_path {
                     (web, false)
                 } else {
@@ -2567,40 +2567,62 @@ mod tests {
     }
 
     #[test]
-    fn www_path_with_at_sign_is_a_url_not_an_email() {
-        let source = "www.example.com/a@other.example";
-        for hyperlinks in [false, true] {
-            let lines = markdown_at_depth(
-                source,
-                &Theme::system(),
-                100,
-                0,
-                super::super::mermaid::Mermaid::Off,
-                hyperlinks,
-                false,
-            );
-            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
-            if hyperlinks {
-                assert!(
-                    spans.iter().any(|span| span.hyperlink.as_deref()
-                        == Some("http://www.example.com/a@other.example")),
-                    "{spans:?}"
+    fn www_path_query_and_fragment_with_at_sign_are_urls() {
+        for source in [
+            "www.example.com/a@other.example",
+            "www.example.com?to=user@other.example",
+            "www.example.com#user@other.example",
+        ] {
+            let expected = format!("http://{source}");
+            for hyperlinks in [false, true] {
+                let lines = markdown_at_depth(
+                    source,
+                    &Theme::system(),
+                    100,
+                    0,
+                    super::super::mermaid::Mermaid::Off,
+                    hyperlinks,
+                    false,
                 );
-            } else {
-                assert_eq!(
-                    spans
-                        .iter()
-                        .map(|span| span.text.as_str())
-                        .collect::<String>(),
-                    "www.example.com/a@other.example (http://www.example.com/a@other.example)"
-                );
+                let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+                if hyperlinks {
+                    assert!(
+                        spans
+                            .iter()
+                            .any(|span| span.hyperlink.as_deref() == Some(expected.as_str())),
+                        "{source}: {spans:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        spans
+                            .iter()
+                            .map(|span| span.text.as_str())
+                            .collect::<String>(),
+                        format!("{source} ({expected})")
+                    );
+                }
+                assert!(spans.iter().all(|span| {
+                    span.hyperlink
+                        .as_deref()
+                        .is_none_or(|url| !url.starts_with("mailto:"))
+                }));
             }
-            assert!(spans.iter().all(|span| {
-                span.hyperlink
-                    .as_deref()
-                    .is_none_or(|url| !url.starts_with("mailto:"))
-            }));
         }
+        let lines = markdown_at_depth(
+            "www.foo@example.com",
+            &Theme::system(),
+            100,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.hyperlink.as_deref() == Some("mailto:www.foo@example.com"))
+        );
     }
 
     #[test]
