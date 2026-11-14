@@ -251,6 +251,27 @@ impl crate::ToolHost for ScopedIdleHost {
         }
         self.inner.call(name, arguments).await
     }
+    async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<crate::Outcome> {
+        if self.scope.lifetime.is_cancelled() {
+            return calls
+                .into_iter()
+                .map(|_| crate::Outcome::Skipped("idle input callback has finished".into()))
+                .collect();
+        }
+        self.inner.call_batch(calls).await
+    }
+    async fn call_batch_prevalidated(
+        &self,
+        calls: Vec<(String, Option<serde_json::Value>)>,
+    ) -> Vec<crate::Outcome> {
+        if self.scope.lifetime.is_cancelled() {
+            return calls
+                .into_iter()
+                .map(|_| crate::Outcome::Skipped("idle input callback has finished".into()))
+                .collect();
+        }
+        self.inner.call_batch_prevalidated(calls).await
+    }
     async fn report_progress(&self, partial: serde_json::Value) -> crate::ExtensionResult<()> {
         if self.scope.lifetime.is_cancelled() {
             return Err("idle input callback has finished".into());
@@ -333,6 +354,15 @@ impl crate::ToolHost for OwnerBoundHost {
     }
     async fn call(&self, name: &str, args: serde_json::Value) -> crate::Outcome {
         self.inner.call(name, args).await
+    }
+    async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<crate::Outcome> {
+        self.inner.call_batch(calls).await
+    }
+    async fn call_batch_prevalidated(
+        &self,
+        calls: Vec<(String, Option<serde_json::Value>)>,
+    ) -> Vec<crate::Outcome> {
+        self.inner.call_batch_prevalidated(calls).await
     }
     async fn report_progress(&self, partial: serde_json::Value) -> crate::ExtensionResult<()> {
         self.inner.report_progress(partial).await
@@ -2961,8 +2991,88 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModelEvent, ModelStream};
+    use crate::{ModelEvent, ModelStream, ToolHost};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn sdk_host_wrappers_forward_prevalidated_batches_and_honor_scope() {
+        struct Inner(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Inner {
+            fn tools(&self) -> Vec<crate::ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+                panic!("batch should be forwarded")
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<serde_json::Value>)>,
+            ) -> Vec<crate::Outcome> {
+                self.0.fetch_add(calls.len(), Ordering::SeqCst);
+                calls
+                    .into_iter()
+                    .map(|(name, value)| {
+                        if value.is_some() {
+                            crate::Outcome::Succeeded(name)
+                        } else {
+                            crate::Outcome::Skipped("oversized".into())
+                        }
+                    })
+                    .collect()
+            }
+        }
+        let inner = Arc::new(Inner(AtomicUsize::new(0)));
+        let owner = OwnerBoundHost {
+            inner: inner.clone(),
+            owner_id: Uuid::new_v4(),
+        };
+        let calls = || {
+            vec![
+                ("big".into(), None),
+                ("valid".into(), Some(serde_json::json!({}))),
+            ]
+        };
+        assert_eq!(
+            owner.call_batch_prevalidated(calls()).await,
+            vec![
+                crate::Outcome::Skipped("oversized".into()),
+                crate::Outcome::Succeeded("valid".into())
+            ]
+        );
+        let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        let (children, _) = mpsc::unbounded_channel();
+        let lifetime = CancellationToken::new();
+        let scope = IdleInputScope {
+            owner: session.controls().owner.clone(),
+            children,
+            host: inner.clone(),
+            states: Default::default(),
+            cancellation: CancellationToken::new(),
+            lifetime: lifetime.clone(),
+            gate: Arc::new(Mutex::new(())),
+            depth: 0,
+        };
+        let scoped = ScopedIdleHost {
+            inner: inner.clone(),
+            scope,
+        };
+        assert_eq!(
+            scoped.call_batch_prevalidated(calls()).await,
+            vec![
+                crate::Outcome::Skipped("oversized".into()),
+                crate::Outcome::Succeeded("valid".into())
+            ]
+        );
+        lifetime.cancel();
+        assert_eq!(
+            scoped.call_batch_prevalidated(calls()).await,
+            vec![crate::Outcome::Skipped("idle input callback has finished".into()); 2]
+        );
+        assert_eq!(inner.0.load(Ordering::SeqCst), 4);
+    }
 
     #[test]
     fn default_and_explicit_sdk_limits_preserve_public_values() {

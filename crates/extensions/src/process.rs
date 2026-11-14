@@ -1978,6 +1978,12 @@ impl ToolHost for ShellProgressHost {
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.inner.call(name, arguments).await
     }
+    async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
+        self.inner.call_batch(calls).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        self.inner.call_batch_prevalidated(calls).await
+    }
     async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
         let data: Vec<u8> = serde_json::from_value(
             value
@@ -2016,6 +2022,8 @@ struct DuplexRequest {
     has_custom_messages: bool,
     #[serde(default)]
     has_keyed_messages: bool,
+    #[serde(default)]
+    has_prevalidated_calls: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2034,6 +2042,8 @@ enum DuplexFrame {
     },
     Call {
         calls: Vec<(String, Value)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<usize>,
     },
     #[serde(skip)]
     CheckedCall {
@@ -2137,6 +2147,8 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
         kind: std::borrow::Cow<'a, str>,
         #[serde(borrow)]
         calls: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        rejected: Option<&'a serde_json::value::RawValue>,
     }
     struct BoundedCalls<'a>(
         Vec<(
@@ -2187,11 +2199,60 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
     {
         let BoundedCalls(calls) = serde_json::from_str::<BoundedCalls<'_>>(calls.get())
             .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        let rejected = if let Some(raw) = prefix.rejected {
+            struct Indices(Vec<usize>);
+            impl<'de> Deserialize<'de> for Indices {
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> std::result::Result<Self, D::Error> {
+                    struct V;
+                    impl<'de> serde::de::Visitor<'de> for V {
+                        type Value = Indices;
+                        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str("at most 4096 ordered indices")
+                        }
+                        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                            self,
+                            mut seq: A,
+                        ) -> std::result::Result<Self::Value, A::Error> {
+                            let mut indices = Vec::new();
+                            while let Some(index) = seq.next_element::<usize>()? {
+                                if indices.len() == 4096
+                                    || indices.last().is_some_and(|prior| *prior >= index)
+                                {
+                                    return Err(serde::de::Error::custom(
+                                        "invalid prevalidated call indices",
+                                    ));
+                                }
+                                indices.push(index);
+                            }
+                            Ok(Indices(indices))
+                        }
+                    }
+                    deserializer.deserialize_seq(V)
+                }
+            }
+            serde_json::from_str::<Indices>(raw.get())
+                .map_err(|error| format!("invalid native extension frame: {error}"))?
+                .0
+        } else {
+            Vec::new()
+        };
+        if rejected.last().is_some_and(|index| *index >= calls.len()) {
+            return Err("invalid prevalidated call indices".into());
+        }
+        let mut rejected = rejected.into_iter().peekable();
         let calls = calls
             .into_iter()
-            .map(|(name, arguments)| {
+            .enumerate()
+            .map(|(index, (name, arguments))| {
                 let name = serde_json::from_str::<String>(name.get())?;
-                let value = super::json_size::compact_value(arguments.get())?;
+                let value = if rejected.peek() == Some(&index) {
+                    rejected.next();
+                    None
+                } else {
+                    super::json_size::compact_value(arguments.get())?
+                };
                 Ok::<_, serde_json::Error>((name, value))
             })
             .collect::<serde_json::Result<Vec<_>>>()
@@ -2359,6 +2420,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
                 has_keyed_messages: host.supports_keyed_messages(),
+                has_prevalidated_calls: true,
             })
             .map_err(|error| error.to_string())?,
         )
@@ -2448,7 +2510,45 @@ struct RemoteHost {
     has_progress: bool,
     has_custom_messages: bool,
     has_keyed_messages: bool,
+    has_prevalidated_calls: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
+}
+impl RemoteHost {
+    async fn send_calls(&self, calls: Vec<(String, Value)>, rejected: Vec<usize>) -> Vec<Outcome> {
+        let count = calls.len();
+        let io = self.io.clone();
+        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            duplex_write_line(&mut io.1, &DuplexFrame::Call { calls, rejected })?;
+            let outcomes: Vec<Outcome> = duplex_read_line(&mut io.0)?;
+            if outcomes.len() != count {
+                return Err("native extension received an invalid batch size".into());
+            }
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
+    }
+}
+fn wire_prevalidated_calls(
+    calls: Vec<(String, Option<Value>)>,
+) -> (Vec<(String, Value)>, Vec<usize>) {
+    let mut rejected = Vec::new();
+    let calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, value))| {
+            if value.is_none() {
+                rejected.push(index);
+            }
+            (name, value.unwrap_or(Value::Null))
+        })
+        .collect();
+    (calls, rejected)
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
@@ -2558,23 +2658,28 @@ impl ToolHost for RemoteHost {
             .remove(0)
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
-        let count = calls.len();
-        let io = self.io.clone();
-        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
-            let mut io = io
-                .lock()
-                .map_err(|_| "native extension connection lock failed")?;
-            duplex_write_line(&mut io.1, &DuplexFrame::Call { calls })?;
-            let outcomes: Vec<Outcome> = duplex_read_line(&mut io.0)?;
-            if outcomes.len() != count {
-                return Err("native extension received an invalid batch size".into());
-            }
-            Ok(outcomes)
-        })
+        self.send_calls(calls, Vec::new()).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        if self.has_prevalidated_calls {
+            let (calls, rejected) = wire_prevalidated_calls(calls);
+            return self.send_calls(calls, rejected).await;
+        }
+        // An older peer cannot charge rejected positions. Fail the batch closed
+        // rather than silently letting invalid attempts bypass its call budget.
+        if calls.iter().any(|(_, value)| value.is_none()) {
+            return calls
+                .into_iter()
+                .map(|_| Outcome::Skipped("host cannot account for prevalidated calls".into()))
+                .collect();
+        }
+        self.call_batch(
+            calls
+                .into_iter()
+                .map(|(name, value)| (name, value.expect("checked above")))
+                .collect(),
+        )
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
     }
 }
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
@@ -2586,6 +2691,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         has_progress: request.has_progress,
         has_custom_messages: request.has_custom_messages,
         has_keyed_messages: request.has_keyed_messages,
+        has_prevalidated_calls: request.has_prevalidated_calls,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5517,6 +5623,52 @@ else:
         );
     }
 
+    #[test]
+    fn duplex_prevalidated_positions_keep_null_arguments_distinct() {
+        let (calls, rejected) = wire_prevalidated_calls(vec![
+            ("null".into(), Some(Value::Null)),
+            ("oversized".into(), None),
+            ("after".into(), Some(serde_json::json!({}))),
+        ]);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &DuplexFrame::Call { calls, rejected }).unwrap();
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(Value::Null) && calls[1].1.is_none() && calls[2].1 == Some(serde_json::json!({})))
+        );
+        for rejected in ["[1,1]", "[2,1]", "[3]"] {
+            let frame = format!(
+                "{{\"type\":\"call\",\"calls\":[[\"a\",null],[\"b\",null],[\"c\",null]],\"rejected\":{rejected}}}"
+            );
+            assert!(read_duplex_frame(&mut std::io::Cursor::new(frame)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn old_duplex_peer_fails_mixed_prevalidated_batch_closed() {
+        let host = RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        };
+        let results = host
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(Value::Null)),
+            ])
+            .await;
+        assert_eq!(
+            results,
+            vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn duplex_batch_skips_only_oversized_call_and_preserves_order() {
@@ -5564,6 +5716,68 @@ else:
             .outcome;
         assert_eq!(outcome, Outcome::Succeeded("done".into()));
         assert_eq!(*host.0.lock().unwrap(), vec!["first", "last"]);
+    }
+
+    #[tokio::test]
+    async fn shell_progress_wrapper_forwards_prevalidated_calls_and_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Budgeted {
+            attempts: AtomicUsize,
+            dispatched: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for Budgeted {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("batch must be forwarded")
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                calls
+                    .into_iter()
+                    .map(|(name, args)| {
+                        if self.attempts.fetch_add(1, Ordering::Relaxed) >= 4096 {
+                            Outcome::Skipped("nested tool execution limit reached".into())
+                        } else if args.is_none() {
+                            Outcome::Skipped("nested tool arguments exceed size limit".into())
+                        } else {
+                            self.dispatched.lock().unwrap().push(name.clone());
+                            Outcome::Succeeded(name)
+                        }
+                    })
+                    .collect()
+            }
+        }
+        let inner = Arc::new(Budgeted {
+            attempts: AtomicUsize::new(4094),
+            dispatched: std::sync::Mutex::new(Vec::new()),
+        });
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = ShellProgressHost {
+            inner: inner.clone(),
+            output,
+        };
+        let result = wrapper
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(serde_json::json!({}))),
+                ("over-budget".into(), Some(serde_json::json!({}))),
+            ])
+            .await;
+        assert_eq!(
+            result,
+            vec![
+                Outcome::Skipped("nested tool arguments exceed size limit".into()),
+                Outcome::Succeeded("valid".into()),
+                Outcome::Skipped("nested tool execution limit reached".into())
+            ]
+        );
+        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["valid"]);
+        assert_eq!(inner.attempts.load(Ordering::Relaxed), 4097);
     }
 
     #[cfg(unix)]
