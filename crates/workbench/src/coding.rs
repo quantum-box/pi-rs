@@ -2681,7 +2681,17 @@ impl CodingTool {
                 })
                 .sort_by_file_path(std::path::Path::cmp);
         } else if let Some(glob) = args["glob"].as_str() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(&self.root);
+            // Pi invokes ripgrep with an absolute search path. Ripgrep builds
+            // command-line glob overrides against ".", so path-containing
+            // globs match that absolute path rather than a workspace-relative
+            // path. Basename globs and explicit file roots still work as usual.
+            // Scoped hosts retain their existing workspace-relative globs.
+            let glob_root = if self.unrestricted {
+                Path::new(".")
+            } else {
+                &self.root
+            };
+            let mut overrides = ignore::overrides::OverrideBuilder::new(glob_root);
             let overrides = overrides
                 .add(glob)
                 .and_then(|builder| builder.build())
@@ -2723,9 +2733,17 @@ impl CodingTool {
                 continue;
             }
             if let Some(grep) = &mut grep {
-                let display = grep_file_name
-                    .as_deref()
-                    .map_or_else(|| relative.to_string_lossy(), std::borrow::Cow::from);
+                let display = grep_file_name.as_deref().map_or_else(
+                    || {
+                        let relative = relative.to_string_lossy();
+                        if self.unrestricted && relative.starts_with("..") {
+                            entry.file_name().to_string_lossy().into_owned().into()
+                        } else {
+                            std::borrow::Cow::Owned(relative.replace('\\', "/"))
+                        }
+                    },
+                    std::borrow::Cow::from,
+                );
                 if !grep.search(entry.path(), &display, cancellation)? {
                     break;
                 }
@@ -5275,6 +5293,128 @@ mod tests {
             .unwrap()
             .tool_content(),
             "main.rs:1: fn main() {}"
+        );
+    }
+
+    #[test]
+    fn grep_globs_match_pi_absolute_search_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "project/src/main.rs",
+            "project/src/nested/sub.rs",
+            "project/other/no.rs",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle\n").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        for (glob, expected) in [
+            ("project/src/**", vec![]),
+            (
+                "!project/src/**",
+                vec![
+                    "other/no.rs:1: needle",
+                    "src/main.rs:1: needle",
+                    "src/nested/sub.rs:1: needle",
+                ],
+            ),
+            (
+                "**/src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            ("!**/src/**", vec!["other/no.rs:1: needle"]),
+            (
+                "*.rs",
+                vec![
+                    "other/no.rs:1: needle",
+                    "src/main.rs:1: needle",
+                    "src/nested/sub.rs:1: needle",
+                ],
+            ),
+            ("!*.rs", vec![]),
+        ] {
+            let output = tool
+                .search(
+                    &json!({"pattern":"needle","path":"project","glob":glob}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap()
+                .tool_content();
+            let mut actual: Vec<_> = if output == "No matches found" {
+                vec![]
+            } else {
+                output.lines().collect()
+            };
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "glob {glob}");
+        }
+        for glob in ["*.txt", "!*.rs"] {
+            assert_eq!(
+                tool.search(
+                    &json!({"pattern":"needle","path":"project/src/main.rs","glob":glob}),
+                    &pi_rs::CancellationToken::new()
+                )
+                .unwrap()
+                .tool_content(),
+                "main.rs:1: needle"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_normalizes_backslashes_only_for_directory_results() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("name\\part.txt"), "needle\n").unwrap();
+        let tool = CodingTool {
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"needle"}), &token)
+                .unwrap()
+                .tool_content(),
+            "name/part.txt:1: needle"
+        );
+        assert_eq!(
+            tool.search(
+                &json!({"pattern":"needle", "path":"name\\part.txt"}),
+                &token
+            )
+            .unwrap()
+            .tool_content(),
+            "name\\part.txt:1: needle"
+        );
+    }
+
+    #[test]
+    fn grep_uses_pi_basename_for_relative_paths_starting_with_dot_dot() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("..reports")).unwrap();
+        std::fs::write(root.path().join("..reports/file.txt"), "needle\n").unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        assert_eq!(
+            tool.search(
+                &json!({"pattern":"needle"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
+            "file.txt:1: needle"
         );
     }
 

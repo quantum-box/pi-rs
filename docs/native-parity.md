@@ -1227,6 +1227,15 @@ path is a symbolic link, while workspace boundary checks still use the resolved
 target. Focused checks compare the output with Pi v1.5.0 for both linked and
 ordinary files, including context lines.
 
+Unrestricted `grep` applies path-containing glob overrides to the absolute
+search paths passed to ripgrep by Pi. Basename globs, negated globs, and
+explicit file arguments retain ripgrep's matching behavior. Directory results
+use Pi's slash-normalized relative paths and its basename fallback for paths
+starting with `..`; a single-file result retains the requested basename.
+The scoped native profile intentionally keeps its workspace-relative glob
+interpretation. Offline fixtures compare these cases with Pi's pinned ripgrep
+invocation, including filenames containing a literal backslash on Unix.
+
 ### Published native package checkpoint
 
 Cargo registry installs discover the compiled package source from Cargo's JSON
