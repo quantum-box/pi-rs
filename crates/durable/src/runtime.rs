@@ -2,6 +2,7 @@
 //!
 //! A committed phase is the authority for recovery. External calls never run
 //! inside storage transactions. Independent conversations can run concurrently.
+pub use crate::state::InputMode;
 use crate::{
     model::{CompletedGeneration, collect_generation, model_request},
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
@@ -127,6 +128,10 @@ enum Phase {
         request_id: Uuid,
         response: Box<CompletedGeneration>,
     },
+    Boundary {
+        turns: u32,
+        answer: Option<String>,
+    },
     Tools {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -166,6 +171,8 @@ pub struct Conversation {
     pub submissions: Vec<Submission>,
     #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
+    #[serde(default)]
+    input_modes: HashMap<Uuid, InputMode>,
     active: Option<Uuid>,
     phase: Phase,
 }
@@ -321,6 +328,9 @@ impl Harness {
                     }
                     for submission in latest.submissions {
                         if !state.submissions.iter().any(|s| s.id == submission.id) {
+                            if let Some(mode) = latest.input_modes.get(&submission.id) {
+                                state.input_modes.insert(submission.id, *mode);
+                            }
                             state.submissions.push(submission);
                         }
                     }
@@ -351,6 +361,7 @@ impl Harness {
             messages: vec![],
             submissions: vec![],
             tool_states: HashMap::new(),
+            input_modes: HashMap::new(),
             active: None,
             phase: Phase::Idle,
         };
@@ -369,6 +380,7 @@ impl Harness {
         state.id = Uuid::new_v4();
         state.active = None;
         state.submissions.clear();
+        state.input_modes.clear();
         state.phase = Phase::Idle;
         self.save(&state, Expected::Missing)?;
         Ok(state.id)
@@ -436,6 +448,16 @@ impl Harness {
         request_id: Option<String>,
         content: String,
     ) -> Result<Uuid, Error> {
+        self.submit_with_mode(id, request_id, content, InputMode::FollowUp)
+    }
+    /// Persist an input; steering joins the active run at its next safe boundary.
+    pub fn submit_with_mode(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        mode: InputMode,
+    ) -> Result<Uuid, Error> {
         if content.trim().is_empty() {
             return Err(Error::Invalid("empty input".into()));
         }
@@ -456,6 +478,7 @@ impl Harness {
                 content: content.clone(),
                 status: Status::Queued,
             });
+            c.input_modes.insert(sid, mode);
             if matches!(c.phase, Phase::FailedIdle) {
                 c.phase = Phase::Idle;
             }
@@ -667,7 +690,10 @@ impl Harness {
                     c.messages.push(Message::User {
                         content: s.content.clone(),
                     });
-                    c.phase = Phase::ModelReady { turns: 0 };
+                    c.phase = Phase::Boundary {
+                        turns: 0,
+                        answer: None,
+                    };
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::CompactionReady {
@@ -853,7 +879,10 @@ impl Harness {
                     } else {
                         c.messages.push(response.assistant_message());
                         if response.calls.is_empty() {
-                            finish_answer(&mut c, response.content);
+                            c.phase = Phase::Boundary {
+                                turns: turns + 1,
+                                answer: Some(response.content),
+                            };
                         } else {
                             c.phase = Phase::Tools {
                                 turns: turns + 1,
@@ -864,13 +893,43 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::Boundary { turns, answer } => {
+                    if let Some(i) = c.submissions.iter().position(|s| {
+                        s.status == Status::Queued
+                            && c.input_modes.get(&s.id) == Some(&InputMode::Steer)
+                    }) {
+                        let submission = &mut c.submissions[i];
+                        submission.status = Status::Running;
+                        c.messages.push(Message::User {
+                            content: submission.content.clone(),
+                        });
+                        c.phase = Phase::ModelReady { turns };
+                    } else if let Some(answer) = answer {
+                        finish_answer(&mut c, answer);
+                    } else {
+                        c.phase = Phase::ModelReady { turns };
+                    }
+                    // A concurrent admission can change this decision. Reload and decide
+                    // again instead of merging it after the boundary has passed.
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let result = self.save(&c, Expected::Version(version));
+                    self.merge_admissions = merge;
+                    match result {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
+                }
                 Phase::Tools {
                     turns,
                     calls,
                     index,
                 } => {
                     if index >= calls.len() {
-                        c.phase = Phase::ModelReady { turns };
+                        c.phase = Phase::Boundary {
+                            turns,
+                            answer: None,
+                        };
                     } else if let Some(reg) = self.tools.get(&calls[index].name) {
                         let operation_id = Uuid::new_v4();
                         let invocation = Invocation {
@@ -1235,6 +1294,20 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Commit a steering or follow-up input and schedule the conversation.
+    pub fn submit_with_mode(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        mode: InputMode,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_with_mode(id, request_id, content, mode)?;
+        self.schedule(id);
+        Ok(submission)
+    }
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
     }
@@ -1345,12 +1418,20 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .as_object_mut()
         .and_then(|v| v.remove("submissions"))
         .ok_or_else(|| Error::Invalid("invalid snapshot".into()))?;
+    let old_modes = old.as_object_mut().and_then(|v| v.remove("input_modes"));
+    let new_modes = new.as_object_mut().and_then(|v| v.remove("input_modes"));
+    let modes_unchanged = match (old_modes, new_modes) {
+        (Some(serde_json::Value::Object(old)), Some(serde_json::Value::Object(new))) => {
+            old.iter().all(|(key, value)| new.get(key) == Some(value))
+        }
+        _ => false,
+    };
     let (Some(old_submissions), Some(new_submissions)) =
         (old_submissions.as_array(), new_submissions.as_array())
     else {
         return Err(Error::Invalid("invalid submissions".into()));
     };
-    Ok(old == new && new_submissions.starts_with(old_submissions))
+    Ok(old == new && modes_unchanged && new_submissions.starts_with(old_submissions))
 }
 
 fn append_tool(
@@ -1369,10 +1450,13 @@ fn append_tool(
     Ok(())
 }
 fn finish_answer(c: &mut Conversation, answer: String) {
-    if let Some(id) = c.active.take()
-        && let Some(s) = c.submissions.iter_mut().find(|s| s.id == id)
-    {
-        s.status = Status::Done { answer };
+    c.active = None;
+    for s in &mut c.submissions {
+        if s.status == Status::Running {
+            s.status = Status::Done {
+                answer: answer.clone(),
+            };
+        }
     }
     c.phase = Phase::Idle;
 }
@@ -1387,10 +1471,13 @@ fn finish_failure(c: &mut Conversation, reason: String) {
             replay: None,
         });
     }
-    if let Some(id) = c.active.take()
-        && let Some(s) = c.submissions.iter_mut().find(|s| s.id == id)
-    {
-        s.status = Status::Unanswered { reason };
+    c.active = None;
+    for s in &mut c.submissions {
+        if s.status == Status::Running {
+            s.status = Status::Unanswered {
+                reason: reason.clone(),
+            };
+        }
     }
     c.phase = Phase::FailedIdle;
 }
@@ -1455,6 +1542,7 @@ mod scheduler_tests {
             messages: vec![],
             submissions: vec![],
             tool_states: HashMap::new(),
+            input_modes: HashMap::new(),
             active: None,
             phase: Phase::Idle,
         };
@@ -1586,3 +1674,7 @@ mod scheduler_tests {
         assert!(Harness::open_paused(&path, options(model)).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_cas_tests.rs"]
+mod runtime_cas_tests;
