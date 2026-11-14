@@ -1449,3 +1449,90 @@ async fn image_read_metadata_only_patches_preserve_content_and_structured_value(
         }
     }
 }
+
+struct ImageErrorPatch;
+#[async_trait::async_trait]
+impl Extension for ImageErrorPatch {
+    fn id(&self) -> &str {
+        "image-error-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        assert!(
+            matches!(outcome, Outcome::StructuredWithDetails { data, details, .. } if data["content"][1]["type"] == "image" && details["patched"] == true)
+        );
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: None,
+            details: None,
+            is_error: Some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn chained_image_metadata_and_error_patches_keep_the_original_image() {
+    let root = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+        .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+        .unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+        .unwrap();
+    registry.register(Arc::new(ImageMetadataPatch(0))).unwrap();
+    registry.register(Arc::new(ImageErrorPatch)).unwrap();
+    let model = Script::default();
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut observed = Vec::new();
+    agent
+        .run(
+            &mut session,
+            Some("read image".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs::Notification::Committed(record) = event
+                    && let pi_rs::Event::ToolFinished {
+                        operation_id,
+                        outcome,
+                        ..
+                    } = &record.event
+                {
+                    observed.push((
+                        outcome.clone(),
+                        pi_rs::tool_result_event_metadata(*operation_id),
+                    ));
+                }
+            },
+        )
+        .await
+        .unwrap();
+    let [(Outcome::StructuredWithDetails { data, details, .. }, Some(structured))] =
+        observed.as_slice()
+    else {
+        panic!("structured result lost")
+    };
+    assert_eq!(data["isError"], true);
+    assert_eq!(details["patched"], true);
+    assert_eq!(structured["data"], data["content"][1]["data"]);
+    assert_eq!(structured["note"], data["content"][0]["text"]);
+}
