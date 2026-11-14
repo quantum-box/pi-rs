@@ -1489,3 +1489,377 @@ async fn task_backed_tool_process_death_unsafe_requires_reconciliation() {
     );
     driver.shutdown().unwrap();
 }
+
+struct ChildWaitingParent;
+impl pi_rs_durable::task_scheduler::Handler for ChildWaitingParent {
+    fn run(
+        &self,
+        _: &pi_rs_durable::task::Task,
+    ) -> Result<pi_rs_durable::task_scheduler::Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &pi_rs_durable::task::Task,
+        docs: &mut pi_rs_durable::document::TaskDocuments<'_>,
+    ) -> Result<pi_rs_durable::task_scheduler::Step, String> {
+        let input = json!({"query":"one"});
+        let candidate = pi_rs_durable::task::Task::new(
+            uuid::Uuid::new_v4(),
+            pi_rs_durable::task::TaskOwner::Task(task.id()),
+            pi_rs_durable::task::Checkpoint {
+                phase: "initial".into(),
+                data: input.clone(),
+            },
+            5,
+        )
+        .unwrap()
+        .registered_versioned("child".into(), true, 1, input.clone())
+        .unwrap();
+        let child = docs.stage_keyed_child("lookup", "child-tool", &input, candidate)?;
+        if task.checkpoint().phase == "initial" {
+            Ok(pi_rs_durable::task_scheduler::Step::Wait {
+                checkpoint: pi_rs_durable::task::Checkpoint {
+                    phase: "waiting".into(),
+                    data: json!({"saved":"checkpoint"}),
+                },
+                condition: pi_rs_durable::task::WaitFor::TasksAny(vec![child]),
+                children: vec![],
+            })
+        } else {
+            assert_eq!(task.checkpoint().data, json!({"saved":"checkpoint"}));
+            assert_eq!(task.ended_children(), Some(&[child][..]));
+            let child = docs.get_owned_child(child)?;
+            match child.state() {
+                pi_rs_durable::task::TaskState::Succeeded(value) => {
+                    Ok(pi_rs_durable::task_scheduler::Step::Succeed(value.clone()))
+                }
+                other => Err(format!("unexpected child state {other:?}")),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn task_tool_parks_on_keyed_child_and_reads_its_wake_result() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let parent: Arc<dyn Handler> = Arc::new(ChildWaitingParent);
+    let child: Arc<dyn Handler> = Arc::new(|task: &Task| {
+        assert_eq!(task.input(), &json!({"query":"one"}));
+        Ok(Step::Succeed(json!("child result")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "parent",
+        false,
+        1,
+        parent.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), opts).unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("parent", false, parent);
+    registry.register_shared("child", true, child);
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert_eq!(
+        conversation.submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    assert!(
+        conversation.messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content.contains("child result"))
+        )
+    );
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_tool_child_crash_worker() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_TASK_CHILD_KILL_DB") else {
+        return;
+    };
+    let parent: Arc<dyn Handler> = Arc::new(ChildWaitingParent);
+    let child: Arc<dyn Handler> = Arc::new(|_: &Task| -> Result<Step, String> {
+        println!("TASK_CHILD_HANDLER_RUNNING");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "parent",
+        false,
+        1,
+        parent.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(path, opts, &cancel).await.unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("parent", false, parent);
+    registry.register_shared("child", true, child);
+    let _driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    println!("TASK_CHILD_CONVERSATION={id}");
+    std::io::stdout().flush().unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_tool_child_wait_survives_process_death_and_replay() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+        sync::mpsc,
+    };
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut process = Kill(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "task_tool_child_crash_worker", "--nocapture"])
+            .env("PI_TASK_CHILD_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = process.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut id = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, value)) = line.split_once("TASK_CHILD_CONVERSATION=") {
+                id = Some(value.parse::<uuid::Uuid>().unwrap());
+            }
+            if line.contains("TASK_CHILD_HANDLER_RUNNING") {
+                let _ = tx.send(id.unwrap());
+                break;
+            }
+        }
+    });
+    let id = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    process.0.kill().unwrap();
+    assert!(!process.0.wait().unwrap().success());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let parent: Arc<dyn Handler> = Arc::new(ChildWaitingParent);
+    let child: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(Step::Succeed(json!("recovered child")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "parent",
+        false,
+        1,
+        parent.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts, &cancel).await.unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("parent", false, parent);
+    registry.register_shared("child", true, child);
+    let driver = h.start_tasks(registry).unwrap();
+    for _ in 0..100 {
+        h.resume_conversation(id, &cancel).await.unwrap();
+        if matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    assert!(h.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content.contains("recovered child"))
+    ));
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn task_tool_abort_drains_parked_keyed_child_before_parent() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::sync::{Mutex, mpsc};
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let parent: Arc<dyn Handler> = Arc::new(ChildWaitingParent);
+    let child: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        started_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!("discarded")))
+    });
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "parent",
+        false,
+        1,
+        parent.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("parent", false, parent);
+    registry.register_shared("child", true, child);
+    let seen = order.clone();
+    registry.set_abort("parent", move |_: &Task| {
+        seen.lock().unwrap().push("parent");
+        Ok(Step::Succeed(json!(null)))
+    });
+    let seen = order.clone();
+    registry.set_abort("child", move |_: &Task| {
+        seen.lock().unwrap().push("child");
+        Ok(Step::Succeed(json!(null)))
+    });
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let parent_id = h
+        .conversation(id)
+        .unwrap()
+        .tool_attempt()
+        .unwrap()
+        .operation_id;
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    h.request_abort(id).unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.conversation(id).unwrap().abort_requested);
+    release_tx.send(()).unwrap();
+    for _ in 0..100 {
+        if driver.get(parent_id).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(driver.get(parent_id).unwrap().unwrap().is_terminal());
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(!h.conversation(id).unwrap().abort_requested);
+    assert_eq!(*order.lock().unwrap(), vec!["child", "parent"]);
+    assert!(
+        !h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("discarded")))
+    );
+    driver.shutdown().unwrap();
+}

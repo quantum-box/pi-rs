@@ -587,6 +587,7 @@ pub struct TaskDocuments<'a> {
     runtime_config: Option<crate::runtime::Config>,
     signal: OwnedBatch,
     signal_keys: HashSet<(uuid::Uuid, String, String)>,
+    child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
 }
 impl<'a> TaskDocuments<'a> {
@@ -607,6 +608,7 @@ impl<'a> TaskDocuments<'a> {
                 mutations: Vec::new(),
             },
             signal_keys: HashSet::new(),
+            child_reads: HashMap::new(),
             keyed_children: Vec::new(),
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
@@ -644,6 +646,42 @@ impl<'a> TaskDocuments<'a> {
         let id = prepared.child;
         self.keyed_children.push((key.into(), child, prepared));
         Ok(id)
+    }
+
+    /// Read a direct owned child and fence the handler's whole transition on
+    /// that version. Repeated reads use the same snapshot. This does not read
+    /// children staged for creation in the current uncommitted invocation.
+    pub fn get_owned_child(&mut self, id: uuid::Uuid) -> Result<crate::task::Task, String> {
+        if !self.child_reads.contains_key(&id) {
+            let child = crate::task_store::TaskStore::new(self.store)
+                .load(id)
+                .map_err(|e| e.to_string())?;
+            let expected = child
+                .as_ref()
+                .map_or(Expected::Missing, |child| Expected::Version(child.version));
+            let key = crate::task_store::key(id);
+            if let Some(check) = self.signal.checks.iter_mut().find(|c| c.key == key) {
+                let compatible = match (&check.expected, &expected) {
+                    (Expected::Version(a), Expected::Version(b))
+                    | (Expected::VersionBefore(a, _), Expected::Version(b)) => a == b,
+                    (Expected::Missing, Expected::Missing) => true,
+                    _ => false,
+                };
+                if !compatible {
+                    check.expected = Expected::VersionBefore(0, std::time::Instant::now());
+                }
+            } else {
+                self.signal.checks.push(Check { key, expected });
+            }
+            self.child_reads.insert(id, child);
+        }
+        let child = self.child_reads[&id]
+            .as_ref()
+            .ok_or("owned child missing")?;
+        if child.task.owner() != &crate::task::TaskOwner::Task(self.task.id()) {
+            return Err("task is not a direct child".into());
+        }
+        Ok(child.task.clone())
     }
 
     pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
@@ -1022,6 +1060,67 @@ mod nested_entry_tests {
     use crate::task_store::{Save, TaskStore};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn owned_child_read_is_cached_fenced_and_rejects_foreign_tasks() {
+        let db = Store::memory().unwrap();
+        let store = TaskStore::new(&db);
+        let parent = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let child = task(2, TaskOwner::Task(parent.id()));
+        let foreign = task(3, TaskOwner::Conversation(Uuid::from_u128(9)));
+        store
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&foreign),
+            ])
+            .unwrap();
+        let mut docs = TaskDocuments::new(&db, &parent).unwrap();
+        assert!(docs.get_owned_child(foreign.id()).is_err());
+        assert!(docs.get_owned_child(Uuid::from_u128(99)).is_err());
+        let first = docs.get_owned_child(child.id()).unwrap();
+        let address = Address {
+            scope: "test".into(),
+            name: "result".into(),
+            key: "".into(),
+        };
+        docs.get(&address).unwrap();
+        docs.put(
+            &address,
+            json!({"committed": true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        let stored = store.load(child.id()).unwrap().unwrap();
+        store.update(&stored, |t| t.start()).unwrap();
+        assert_eq!(docs.get_owned_child(child.id()).unwrap(), first);
+        let mut transaction = Transaction::new();
+        transaction.append(docs.into_batch().unwrap()).unwrap();
+        assert!(matches!(
+            transaction.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(Documents::new(&db).get(&address).unwrap().is_none());
+    }
+
+    #[test]
+    fn handled_missing_child_read_is_fenced_against_creation() {
+        let db = Store::memory().unwrap();
+        let store = TaskStore::new(&db);
+        let parent = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        store.save(&[Save::Create(&parent)]).unwrap();
+        let mut docs = TaskDocuments::new(&db, &parent).unwrap();
+        let id = Uuid::from_u128(2);
+        assert!(docs.get_owned_child(id).is_err());
+        let child = task(2, TaskOwner::Task(parent.id()));
+        store.save(&[Save::Create(&child)]).unwrap();
+        assert!(docs.get_owned_child(id).is_err());
+        let mut tx = Transaction::new();
+        tx.append(docs.into_batch().unwrap()).unwrap();
+        assert!(matches!(
+            tx.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+    }
 
     #[test]
     fn transaction_coalesces_identical_checks_but_rejects_conflicts() {

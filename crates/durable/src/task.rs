@@ -262,8 +262,9 @@ impl Task {
         self.typed_wake = Some(wake);
     }
 
-    #[allow(dead_code)] // Private until the tool wake API is integrated.
-    pub(crate) fn ended_children(&self) -> Option<&[Uuid]> {
+    /// Terminal direct-child IDs frozen at reservation after a child wait.
+    /// The same snapshot is retained if this invocation is replayed after a crash.
+    pub fn ended_children(&self) -> Option<&[Uuid]> {
         self.ended_children.as_deref()
     }
 
