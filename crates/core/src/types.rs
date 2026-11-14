@@ -714,6 +714,18 @@ pub trait Model: Send + Sync {
         self.stream_with_id(request_id, request).await
     }
 
+    /// Provide a Pi-compatible external identity without breaking existing models.
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        _external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_in_session(request_id, session_id, request)
+            .await
+    }
+
     /// Summaries use their own prompt and should bypass reusable conversation caches.
     async fn stream_for_summary(
         &self,

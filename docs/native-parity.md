@@ -103,7 +103,13 @@ without `defaultProvider` are still accepted.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
-those imports receive a new native UUID. Forks receive their own UUID.
+custom IDs are preserved across native export and reopen and used for
+model request and cache warming affinity. A separate internal UUID continues to
+identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
+external ID. RPC, UI and share identity projection still uses the internal UUID.
+Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
+header bytes and whitespace normalization; unrepresentable or invalid values
+fail before dispatch when affinity is enabled.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and

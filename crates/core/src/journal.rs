@@ -639,6 +639,24 @@ impl Session {
         }
     }
 
+    /// Pi-compatible externally visible identity; the native UUID remains the
+    /// stable key for existing SDKs, stores, and host isolation.
+    pub fn external_session_id(&self) -> String {
+        let native = self.session_id().to_string();
+        self.records
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi-rs:external-session-id"
+                        && entry["native_id"].as_str() == Some(native.as_str()) =>
+                {
+                    entry["id"].as_str().map(str::to_owned)
+                }
+                _ => None,
+            })
+            .unwrap_or(native)
+    }
+
     pub fn head(&self) -> u64 {
         self.head
     }

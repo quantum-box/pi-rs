@@ -89,9 +89,45 @@ impl Model for WorkbenchModel {
         session_id: Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
+        self.stream_in_session_with_identity(
+            _request_id,
+            session_id,
+            &session_id.to_string(),
+            request,
+        )
+        .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
         let mut headers = HeaderMap::new();
-        if !self.session_affinity.is_empty() {
-            let value = HeaderValue::from_str(&session_id.to_string()).expect("UUID header value");
+        if !self.session_affinity.is_empty() && !external_id.is_empty() {
+            // Fetch's Headers converts JS strings to ByteString (Latin-1),
+            // then strips HTTP whitespace at the edges before validation.
+            // Reject unrepresentable or invalid bytes rather than dispatching
+            // a request with a different or missing affinity identity.
+            let bytes = external_id
+                .chars()
+                .map(|ch| u8::try_from(u32::from(ch)))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+            let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+            let start = bytes
+                .iter()
+                .position(|byte| !whitespace(byte))
+                .unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .rposition(|byte| !whitespace(byte))
+                .map_or(start, |index| index + 1);
+            let trimmed = &bytes[start..end];
+            let value = HeaderValue::from_bytes(trimmed)
+                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
             for &name in self.session_affinity {
                 headers.insert(name, value.clone());
             }
@@ -146,6 +182,17 @@ impl Model for PreparedWorkbenchModel {
     ) -> Result<ModelStream> {
         self.inner
             .stream_in_session(request_id, session_id, request)
+            .await
+    }
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
             .await
     }
     async fn stream_for_summary(
@@ -252,6 +299,163 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_identity_is_used_for_affinity_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for (identity, affinity, expected_header) in [
+            ("custom-id.1", true, Some(&b"custom-id.1"[..])),
+            ("", true, None),
+            ("café", true, Some(&b"caf\xe9"[..])),
+            ("\u{80}ÿ", true, Some(&b"\x80\xff"[..])),
+            (" \tcafé\r\n", true, Some(&b"caf\xe9"[..])),
+            ("a\tb", true, Some(&b"a\tb"[..])),
+            (" \t ", true, Some(&b""[..])),
+            ("日本", false, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("import.jsonl");
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session", "version":3, "id": identity})
+                ),
+            )
+            .unwrap();
+            let session = crate::session_import::read(&path).unwrap();
+            assert_eq!(session.external_session_id(), identity);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut block = [0; 1024];
+                    let count = socket.read(&mut block).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                bytes
+            });
+            let model = WorkbenchModel {
+                client: Client::Ollama(
+                    pi_rs::ollama::Ollama::new(
+                        &format!("http://{address}"),
+                        Some("fixture-key".into()),
+                    )
+                    .unwrap()
+                    .with_native_probes(false),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: if affinity { &["x-session-id"] } else { &[] },
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            let _ = model
+                .stream_in_session_with_identity(
+                    Uuid::new_v4(),
+                    session.session_id(),
+                    &session.external_session_id(),
+                    request,
+                )
+                .await;
+            let headers = server.join().unwrap();
+            let value = headers.split(|byte| *byte == b'\n').find_map(|line| {
+                let colon = line.iter().position(|byte| *byte == b':')?;
+                if !line[..colon].eq_ignore_ascii_case(b"x-session-id") {
+                    return None;
+                }
+                let value = line[colon + 1..]
+                    .strip_suffix(b"\r")
+                    .unwrap_or(&line[colon + 1..]);
+                Some(value.strip_prefix(b" ").unwrap_or(value).to_vec())
+            });
+            assert_eq!(value.as_deref(), expected_header, "identity {identity:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_affinity_identity_fails_before_dispatch() {
+        use std::net::TcpListener;
+        for identity in [
+            "日本",
+            "\u{100}",
+            "🤖",
+            "unsafe\r\nx-injected: yes",
+            "invalid\0id",
+            "bad\x7fid",
+            "\x0cid",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let model = WorkbenchModel {
+                client: Client::Ollama(
+                    pi_rs::ollama::Ollama::new(
+                        &format!("http://{address}"),
+                        Some("fixture-key".into()),
+                    )
+                    .unwrap()
+                    .with_native_probes(false),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["x-session-id"],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                model.stream_in_session_with_identity(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    identity,
+                    request,
+                ),
+            )
+            .await
+            .expect("invalid ID must fail before network access");
+            assert!(matches!(result, Err(pi_rs::Error::Config(_))));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[cfg(any(unix, windows))]
     #[test]
