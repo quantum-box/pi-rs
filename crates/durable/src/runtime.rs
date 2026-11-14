@@ -740,7 +740,7 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
             match result {
                 Ok(true) => return Ok(()),
                 Ok(false) => continue,
-                Err(error) => return Err(error.to_string().into()),
+                Err(error) => return Err(error.to_string()),
             }
         }
     }
