@@ -7381,8 +7381,16 @@ impl EditorJobSupervisor {
                             break;
                         }
                         if libc::tcgetpgrp(tty) != group {
-                            shell_owned_terminal = true;
+                            if !shell_owned_terminal {
+                                shell_owned_terminal = true;
+                                let stopped = 1u8;
+                                libc::write(response[1], (&stopped as *const u8).cast(), 1);
+                            }
                         } else if shell_owned_terminal || attempt >= 99 {
+                            if !shell_owned_terminal {
+                                let stopped = 1u8;
+                                libc::write(response[1], (&stopped as *const u8).cast(), 1);
+                            }
                             libc::kill(-group, libc::SIGCONT);
                             let done = 1u8;
                             libc::write(response[1], (&done as *const u8).cast(), 1);
@@ -7416,9 +7424,17 @@ impl EditorJobSupervisor {
         })
     }
 
-    fn stop_and_wait(&self) -> std::io::Result<()> {
+    fn stop_and_wait(&self, editor_group: libc::pid_t) -> std::io::Result<()> {
         let command = 1u8;
         if unsafe { libc::write(self.control, (&command as *const u8).cast(), 1) } != 1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if read_editor_supervisor_byte(self.response)? != 1 {
+            return Err(std::io::Error::other("editor job supervisor stopped"));
+        }
+        // `bg` continues Pi's job without handing it the terminal. Resume the
+        // separate editor group too; terminal reads naturally stop it again.
+        if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         if read_editor_supervisor_byte(self.response)? != 1 {
@@ -7553,7 +7569,7 @@ impl EditorForeground {
         };
         // The helper stops the whole Pi group. Blocking for its response keeps
         // this thread from running past an asynchronously delivered SIGSTOP.
-        watchdog.stop_and_wait()?;
+        watchdog.stop_and_wait(editor_group)?;
         drop(watchdog);
         // Restore the editor's terminal state before handing input back.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
@@ -8087,6 +8103,7 @@ mod tests {
         let managed = suspend && !shared_group && !test_name.contains("without_supervisor");
         let plain_launcher = test_name.contains("without_job_control_launcher");
         let background_case = test_name.contains("background_job_continues_workers");
+        let background_editor = test_name.contains("background_editor_finishes");
         let worker_case = test_name.contains("pauses_owned_worker") || background_case;
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
@@ -8135,6 +8152,33 @@ mod tests {
                     "worker did not continue while backgrounded"
                 );
                 assert_eq!(unsafe { libc::tcgetpgrp(0) }, shell_group);
+            }
+            if background_editor {
+                let shell_group = unsafe { libc::getpgrp() };
+                super::set_foreground(0, shell_group).unwrap();
+                std::fs::write(
+                    std::path::PathBuf::from(&program).with_extension("finish"),
+                    "go",
+                )
+                .unwrap();
+                assert_eq!(
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT) },
+                    0
+                );
+                let finished = std::path::PathBuf::from(&program).with_extension("finished");
+                let until = Instant::now() + Duration::from_secs(5);
+                while !finished.exists() {
+                    assert!(
+                        Instant::now() < until,
+                        "editor did not finish in background"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(
+                    unsafe { libc::tcgetpgrp(0) },
+                    shell_group,
+                    "editor stole shell terminal"
+                );
             }
             if test_name.contains("supervisor_retains_terminal") {
                 let shell_group = unsafe { libc::getpgrp() };
@@ -8296,7 +8340,12 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("editor");
-        std::fs::write(&program, "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n").unwrap();
+        let script = if background_editor {
+            "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nwhile [ ! -f \"${0}.finish\" ]; do sleep 0.05; done\nprintf finished > \"${0}.finished\"\n"
+        } else {
+            "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n"
+        };
+        std::fs::write(&program, script).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut master = -1;
         let mut slave = -1;
@@ -8388,7 +8437,9 @@ mod tests {
                     // shared-group cases must resume without external SIGCONT.
                     // Wait for the child to confirm it restored editor foreground.
                     let until = Instant::now() + Duration::from_secs(8);
-                    let expected = if test_name.contains("editor_exits_while_suspended") {
+                    let expected = if test_name.contains("editor_exits_while_suspended")
+                        || background_editor
+                    {
                         b"PARENT_FINISHED".as_slice()
                     } else {
                         b"EDITOR_RESUMED".as_slice()
@@ -8405,7 +8456,7 @@ mod tests {
                         );
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    if !test_name.contains("editor_exits_while_suspended") {
+                    if !test_name.contains("editor_exits_while_suspended") && !background_editor {
                         master.write_all(&[3]).unwrap();
                     }
                     resumed = true;
@@ -8495,6 +8546,16 @@ mod tests {
     fn editor_background_job_continues_workers_until_foreground() {
         editor_pty_regression(
             "interactive::tests::editor_background_job_continues_workers_until_foreground",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_editor_finishes_without_stealing_terminal() {
+        editor_pty_regression(
+            "interactive::tests::background_editor_finishes_without_stealing_terminal",
             true,
             false,
         );
