@@ -338,6 +338,41 @@ async fn reload_keeps_inflight_hook_snapshot_and_updates_next_phase() {
 }
 
 #[tokio::test]
+async fn scheduler_restores_extensions_before_automatic_resume() {
+    use pi_rs_durable::{extension::Registry, runtime::Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        h.install_extension(ext("policy", "restored", Arc::new(Rewrite(2))))
+            .unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["policy".into()]).unwrap();
+        h.submit(id, None, "go".into()).unwrap();
+    }
+    let mut registry = Registry::default();
+    registry
+        .install(ext("policy", "restored", Arc::new(Rewrite(2))))
+        .unwrap();
+    let mut scheduler =
+        Scheduler::open_with_extensions(&path, options(model.clone(), tool.clone()), registry)
+            .unwrap();
+    scheduler.wait(id).await.unwrap();
+    assert!(matches!(
+        scheduler.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(*tool.0.lock().unwrap(), vec![json!({"n": 12})]);
+    assert!(
+        matches!(&model.0.lock().unwrap()[0].messages[0], Message::System { content } if content.contains("restored"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_selection_fails_closed_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
