@@ -51,6 +51,8 @@ pub struct Google {
     probe_context: bool,
     thinking: Option<String>,
     thinking_budgets: Option<Value>,
+    disabled_thinking_fallback: Option<String>,
+    reasoning_supported: Option<bool>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -95,6 +97,8 @@ impl Google {
             probe_context: true,
             thinking: None,
             thinking_budgets: None,
+            disabled_thinking_fallback: None,
+            reasoning_supported: None,
             progress: None,
             reasoning: None,
         })
@@ -157,6 +161,16 @@ impl Google {
     /// Configure optional Pi thinking budgets for token-budget Gemini models.
     pub fn with_thinking_budget_settings(mut self, budgets: Option<Value>) -> Self {
         self.thinking_budgets = budgets;
+        self
+    }
+    /// Select the mapped fallback for a discrete model that cannot disable thinking.
+    pub fn with_disabled_thinking_fallback(mut self, fallback: Option<&str>) -> Self {
+        self.disabled_thinking_fallback = fallback.map(str::to_owned);
+        self
+    }
+    /// Apply configured reasoning capability when model discovery is unavailable.
+    pub fn with_reasoning_support(mut self, supported: Option<bool>) -> Self {
+        self.reasoning_supported = supported;
         self
     }
     pub fn with_progress(mut self, observer: impl Fn(Progress) + Send + Sync + 'static) -> Self {
@@ -398,31 +412,33 @@ fn available_thinking(id: &str, enabled: bool) -> Vec<&'static str> {
     }
 }
 
+/// Whether the model uses discrete Google thinking levels.
+pub fn uses_discrete_thinking(id: &str) -> bool {
+    matches!(
+        family(model_id(id)),
+        Some(ThinkingFamily::LevelPro | ThinkingFamily::LevelFlash)
+    )
+}
+
 fn thinking_config(id: &str, level: Option<&str>) -> Option<Value> {
-    let level = level?;
     let normalized = id.to_ascii_lowercase();
     let id = normalized.as_str();
     let family = family(id)?;
+    let level = level.unwrap_or("off");
+    if level == "off" {
+        return Some(json!({"thinkingBudget":0}));
+    }
     match family {
         ThinkingFamily::LevelPro | ThinkingFamily::LevelFlash => {
-            let high = matches!(level, "high" | "xhigh" | "max");
-            let native = if high {
-                "HIGH"
-            } else if family == ThinkingFamily::LevelPro {
-                if level == "medium" { "MEDIUM" } else { "LOW" }
-            } else {
-                match level {
-                    "off" | "minimal" => "MINIMAL",
-                    "medium" => "MEDIUM",
-                    _ => "LOW",
-                }
+            let native = match level {
+                "minimal" => "MINIMAL",
+                "low" => "LOW",
+                "medium" => "MEDIUM",
+                _ => "HIGH",
             };
-            Some(json!({"thinkingLevel":native,"includeThoughts":level!="off"}))
+            Some(json!({"thinkingLevel":native,"includeThoughts":true}))
         }
         ThinkingFamily::BudgetPro | ThinkingFamily::BudgetFlash => {
-            if level == "off" {
-                return Some(json!({"thinkingBudget":0}));
-            }
             let requested = match level {
                 "minimal" if id.contains("flash-lite") => 512,
                 "minimal" => 128,
@@ -705,6 +721,8 @@ impl Model for Google {
             self.api_key.as_bytes(),
             &self.thinking,
             &self.thinking_budgets,
+            &self.disabled_thinking_fallback,
+            &self.reasoning_supported,
         ))
     }
 
@@ -753,15 +771,24 @@ impl Model for Google {
         if let Some(limit) = catalog.as_ref().and_then(|entry| entry.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);
         }
-        let thinking = if catalog.as_ref().is_some_and(|entry| !entry.reasoning) {
-            None
-        } else {
-            self.thinking.as_deref()
-        };
+        let supports_thinking = self.reasoning_supported != Some(false)
+            && catalog.as_ref().is_none_or(|entry| entry.reasoning);
+        let thinking = self.thinking.as_deref();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         let mut body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
-        if let Some(config) = body["generationConfig"].get_mut("thinkingConfig") {
+        if !supports_thinking {
+            body["generationConfig"]
+                .as_object_mut()
+                .expect("generation config")
+                .remove("thinkingConfig");
+        } else if thinking.is_none()
+            && uses_discrete_thinking(&model)
+            && let Some(fallback) = &self.disabled_thinking_fallback
+        {
+            body["generationConfig"]["thinkingConfig"] =
+                json!({"thinkingLevel":fallback.to_ascii_uppercase()});
+        } else if let Some(config) = body["generationConfig"].get_mut("thinkingConfig") {
             apply_thinking_budget(config, thinking, self.thinking_budgets.as_ref())?;
         }
         let mut url = self.url(Some(&format!("{model}:streamGenerateContent")));
@@ -1507,6 +1534,18 @@ mod tests {
             Some(json!({"thinkingLevel":"LOW","includeThoughts":true}))
         );
         assert_eq!(
+            thinking_config("gemini-3.1-pro", Some("minimal")),
+            Some(json!({"thinkingLevel":"MINIMAL","includeThoughts":true}))
+        );
+        assert_eq!(
+            thinking_config("gemini-3.1-pro", Some("off")),
+            Some(json!({"thinkingBudget":0}))
+        );
+        assert_eq!(
+            thinking_config("gemini-2.5-flash", None),
+            Some(json!({"thinkingBudget":0}))
+        );
+        assert_eq!(
             thinking_config("gemini-3.1-pro", Some("medium")),
             Some(json!({"thinkingLevel":"MEDIUM","includeThoughts":true}))
         );
@@ -1518,6 +1557,92 @@ mod tests {
             thinking_config("gemini-2.5-pro", Some("high")),
             Some(json!({"thinkingBudget":32768,"includeThoughts":true}))
         );
+    }
+
+    #[tokio::test]
+    async fn discrete_and_disabled_thinking_options_reach_the_wire() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        for (model, level, fallback, supported, expected) in [
+            (
+                "gemini-3.1-pro",
+                Some("minimal"),
+                None,
+                None,
+                Some(json!({"thinkingLevel":"MINIMAL","includeThoughts":true})),
+            ),
+            (
+                "gemini-2.5-flash",
+                None,
+                None,
+                None,
+                Some(json!({"thinkingBudget":0})),
+            ),
+            (
+                "gemini-3.1-pro",
+                None,
+                Some("low"),
+                None,
+                Some(json!({"thinkingLevel":"LOW"})),
+            ),
+            (
+                "gemini-3.1-pro",
+                Some("off"),
+                None,
+                None,
+                Some(json!({"thinkingBudget":0})),
+            ),
+            ("gemini-3.1-pro", None, None, Some(false), None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                let response = "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n";
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            });
+            let client = Google::new(&endpoint, "fixture")
+                .unwrap()
+                .with_context_probe(false)
+                .with_thinking(level)
+                .with_disabled_thinking_fallback(fallback)
+                .with_reasoning_support(supported);
+            let request = ModelRequest {
+                model: model.into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 256,
+            };
+            let mut stream = client.stream(request).await.unwrap();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            let body = server.join().unwrap();
+            assert_eq!(
+                body["generationConfig"].get("thinkingConfig"),
+                expected.as_ref()
+            );
+        }
     }
 
     #[tokio::test]

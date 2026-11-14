@@ -2537,9 +2537,11 @@ Workspace tests and all-target Clippy pass.
 
 Gemini 2.5 token-budget thinking uses Pi's model-specific defaults or the
 selected `thinkingBudgets` setting, independently of `maxOutputTokens`.
-Turning thinking off sends a zero budget. Gemini's discrete thinking-level
-models do not consume these token budgets. Model thinking-level mappings are
-resolved before selecting a budget or discrete Google effort. The configured budgets also enter
+Turning thinking off sends a zero budget when the model supports it. For a
+discrete-level model that cannot disable thinking, an omitted level uses its
+lowest supported mapped level without requesting thought output. Model
+thinking-level mappings are resolved before selecting a budget or discrete
+Google effort, including MINIMAL for Pro models. The configured budgets also enter
 the protected request identity, so changing them invalidates a prior context
 estimate. A loopback fixture checks the configured budget on the actual request;
 live Google service limits and acceptance have not been verified.
