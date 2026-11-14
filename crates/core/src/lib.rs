@@ -1,12 +1,15 @@
 //! Model, session, and tool execution primitives for an embeddable agent.
 mod agent;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod context;
 mod context_fingerprint;
 mod context_replay;
 mod extension;
 mod journal;
 mod lifecycle;
+mod resource;
 mod retry;
+mod runtime;
 mod sdk;
 mod statistics;
 mod tokens;
@@ -14,6 +17,7 @@ mod types;
 mod ui;
 
 pub use agent::*;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
 pub use context_replay::endpoint_replay_scope;
@@ -26,6 +30,7 @@ pub use lifecycle::{
     notify as notify_extension_lifecycle,
 };
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};
