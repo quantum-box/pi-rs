@@ -191,6 +191,12 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    CompactionLifecycleV1 {
+        event: LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<Value>,
+        state: Option<ExtensionState>,
+    },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
         state: Option<ExtensionState>,
@@ -373,6 +379,8 @@ struct Description {
     before_summary_compaction_v1: bool,
     #[serde(default)]
     compaction_overflow_reason_v1: bool,
+    #[serde(default)]
+    compaction_lifecycle_v1: bool,
     #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
@@ -1058,6 +1066,36 @@ impl Extension for ExecutableExtension {
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             call_duplex(&path, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.compaction_lifecycle_v1 {
+            return self.lifecycle_with_host(event, state, host).await;
+        }
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: event.clone(),
+            trigger,
+            metadata: metadata.cloned(),
+            state: state.cloned(),
+        };
+        if !self.description.lifecycle_host_calls {
+            return self.request_async(request).await;
+        }
+        let endpoint = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&endpoint, request, host, &cancellation, &runtime)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -3371,6 +3409,7 @@ async fn dispatch_inner(
             compaction_hook_host_calls: true,
             before_summary_compaction_v1: extension.handles_before_summary_compaction(),
             compaction_overflow_reason_v1: true,
+            compaction_lifecycle_v1: true,
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -3519,6 +3558,22 @@ async fn dispatch_inner(
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
         }
+        ProtocolRequest::CompactionLifecycleV1 {
+            event,
+            trigger,
+            metadata,
+            state,
+        } => encode(
+            extension
+                .compaction_lifecycle_with_host(
+                    &event,
+                    trigger,
+                    metadata.as_ref(),
+                    state.as_ref(),
+                    host,
+                )
+                .await,
+        ),
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages() {
                 encode(
@@ -4016,6 +4071,56 @@ mod tests {
         assert!(!description.pi_lifecycle_fields);
         assert!(!description.before_summary_compaction_v1);
         assert!(!description.compaction_overflow_reason_v1);
+        assert!(!description.compaction_lifecycle_v1);
+    }
+
+    #[tokio::test]
+    async fn detailed_compaction_protocol_preserves_trigger_and_metadata() {
+        use std::sync::Mutex;
+        struct Hook(Arc<Mutex<Option<Value>>>);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "detailed"
+            }
+            async fn compaction_lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                trigger: pi_rs_core::CompactionTrigger,
+                metadata: Option<&Value>,
+                _: Option<&ExtensionState>,
+                _: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<()> {
+                *self.0.lock().unwrap() =
+                    Some(serde_json::json!({"trigger":trigger,"metadata":metadata}));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let extension: Arc<dyn Extension> = Arc::new(Hook(seen.clone()));
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: LifecycleEvent::SessionCompactFailed {
+                reason: pi_rs_core::CompactionReason::Threshold,
+                error_message: None,
+                aborted: false,
+                will_retry: false,
+                from_extension: true,
+            },
+            trigger: pi_rs_core::CompactionTrigger::Overflow,
+            metadata: Some(serde_json::json!({"details":{"source":"hook"}})),
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        dispatch_with_host(extension, decoded, Arc::new(DetachedHost))
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(
+                serde_json::json!({"trigger":"overflow","metadata":{"details":{"source":"hook"}}})
+            )
+        );
     }
 
     #[test]
