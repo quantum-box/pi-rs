@@ -229,6 +229,7 @@ fn worker_returns_keyed_share_journal_tag() {
         }
     };
     assert_eq!(response["success"], true, "{response}");
+    assert!(response["data"].get("journalKey").is_none());
     let tag: [u8; 32] = serde_json::from_value(response["data"]["journalTag"].clone()).unwrap();
     let journal = Session::snapshot(&path).unwrap();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();

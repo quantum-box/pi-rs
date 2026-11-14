@@ -39,3 +39,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs requested_live_share_does_not_silently_drop_missing_context
       - name: Test live journal key correlation
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_response_keeps_its_private_journal_key
+      - name: Test live share private fields
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_share_uploads_context_for_matching_snapshot

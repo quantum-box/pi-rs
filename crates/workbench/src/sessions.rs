@@ -1265,7 +1265,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = Session::open(root.path().join("session.jsonl")).unwrap();
         let snapshot = ShareSnapshot {
-            journal_tag: None,
+            journal_tag: Some([19; 32]),
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1302,6 +1302,8 @@ mod tests {
         assert_eq!(entries[1]["customType"], "pi.share");
         assert!(entries[1]["parentId"].is_null());
         assert_eq!(entries[1]["data"]["systemPrompt"], "live instructions");
+        assert!(entries[1]["data"].get("journalTag").is_none());
+        assert!(entries[1]["data"].get("journalKey").is_none());
         assert_eq!(
             entries[1]["data"]["tools"][0],
             serde_json::json!({"name":"read","description":"Read a file","parameters":{"type":"object"}})
