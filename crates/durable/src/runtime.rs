@@ -1961,6 +1961,16 @@ impl Harness {
         loop {
             let (mut c, version) = self.load(id)?;
             let live = self.conversation_tasks(id)?;
+            if crate::ownership_edge::reject_foreground_children(
+                self.owner.store(),
+                live.iter().map(|record| record.task.id()),
+            )
+            .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?
+            {
+                return Err(Error::Invalid(
+                    "foreground owned conversation abort is not supported".into(),
+                ));
+            }
             let mut tasks = Vec::new();
             for mut record in live
                 .iter()

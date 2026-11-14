@@ -103,6 +103,10 @@ impl<'a> TaskStore<'a> {
         Self { store }
     }
 
+    pub(crate) fn store(&self) -> &Store {
+        self.store
+    }
+
     pub fn load(&self, id: Uuid) -> Result<Option<StoredTask>, Error> {
         let key = key(id);
         self.store

@@ -129,6 +129,8 @@ pub enum Error {
     Registration,
     #[error("invalid ownership or child creation")]
     Ownership,
+    #[error("foreground owned conversation abort is not supported")]
+    ForegroundAbortUnsupported,
     #[error("task has live owned children")]
     LiveChildren,
     #[error("handler failed with an uncertain outcome: {0}")]
@@ -670,6 +672,17 @@ pub(crate) fn request_abort_subtree(ts: &TaskStore<'_>, id: Uuid) -> Result<(), 
             if ids.len() == before {
                 break;
             }
+        }
+        if crate::ownership_edge::reject_foreground_children(
+            ts.store(),
+            records
+                .iter()
+                .filter(|record| ids.contains(&record.task.id()) && !record.task.is_terminal())
+                .map(|record| record.task.id()),
+        )
+        .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+        {
+            return Err(Error::ForegroundAbortUnsupported);
         }
         let mut updates = Vec::new();
         for record in &records {

@@ -307,6 +307,30 @@ mod tests {
     }
 
     #[test]
+    fn foreground_abort_fails_without_partial_marks_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        h.ensure_task_owned_subagent(task, owner, "child", config(), Mode::Foreground)
+            .unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert!(h.request_abort(parent).is_err());
+        assert!(!h.conversation(parent).unwrap().abort_requested);
+        let ts = TaskStore::new(h.subagent_store().unwrap());
+        assert!(matches!(
+            crate::task_scheduler::request_abort_subtree(&ts, task),
+            Err(crate::task_scheduler::Error::ForegroundAbortUnsupported)
+        ));
+        assert!(!ts.load(task).unwrap().unwrap().task.abort_requested());
+    }
+
+    #[test]
     fn admission_races_abort_and_retry_after_reopen() {
         for _ in 0..20 {
             let dir = tempfile::tempdir().unwrap();
@@ -322,21 +346,20 @@ mod tests {
                 worker.ensure_task_owned_subagent(task, o, "child", config(), Mode::Foreground)
             });
             barrier.wait();
-            crate::task_scheduler::request_abort_subtree(
+            let abort = crate::task_scheduler::request_abort_subtree(
                 &TaskStore::new(h.subagent_store().unwrap()),
                 task,
-            )
-            .unwrap();
+            );
             let result = admission.join().unwrap();
             let store = h.subagent_store().unwrap();
-            assert!(
-                TaskStore::new(store)
-                    .load(task)
-                    .unwrap()
-                    .unwrap()
-                    .task
-                    .abort_requested()
-            );
+            let marked = TaskStore::new(store)
+                .load(task)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested();
+            assert_eq!(marked, abort.is_ok());
+            assert_eq!(result.is_ok(), !marked);
             let edges = EdgeStore::new(store).children(task).unwrap();
             assert_eq!(edges.len(), usize::from(result.is_ok()));
             drop(h);

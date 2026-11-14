@@ -155,3 +155,21 @@ impl<'a> EdgeStore<'a> {
         })
     }
 }
+
+/// Fail closed until foreground conversation cleanup can be joined by its owner.
+pub(crate) fn reject_foreground_children(
+    store: &Store,
+    tasks: impl IntoIterator<Item = Uuid>,
+) -> Result<bool, Error> {
+    let edges = EdgeStore::new(store);
+    for task in tasks {
+        if edges
+            .children(task)?
+            .iter()
+            .any(|edge| edge.edge.mode == Mode::Foreground)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
