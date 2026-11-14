@@ -487,6 +487,70 @@ mod tests {
     }
 
     #[test]
+    fn settled_child_before_park_wakes_any_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let db = Store::open(&path).unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, b) = admit_pair(&db, &p);
+        let tasks = TaskStore::new(&db);
+        tasks
+            .update(&tasks.load(a.id()).unwrap().unwrap(), |t| t.cancel())
+            .unwrap();
+        park_any(&db, &p, cp("parked"), &["a", "b"]).unwrap();
+        drop(db);
+
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        let waiting = tasks.load(p.task.id()).unwrap().unwrap();
+        assert_eq!(waiting.task.checkpoint(), &cp("parked"));
+        assert!(matches!(
+            tasks.poll_wait(&waiting, 0).unwrap(),
+            crate::task_store::WakeResult::Woken { .. }
+        ));
+        assert_eq!(
+            tasks.load(p.task.id()).unwrap().unwrap().task.state(),
+            &TaskState::Ready
+        );
+        assert_eq!(
+            tasks.load(b.id()).unwrap().unwrap().task.state(),
+            &TaskState::Ready
+        );
+    }
+
+    #[test]
+    fn retry_park_after_child_settles_preserves_checkpoint_and_wakes() {
+        let db = Store::memory().unwrap();
+        let p = registered_parent(&db, true);
+        let (p, a, _) = admit_pair(&db, &p);
+        let pending = prepare_park_any(&db, &p, cp("parked"), &["a"]).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks
+            .update(&tasks.load(a.id()).unwrap().unwrap(), |t| t.cancel())
+            .unwrap();
+        assert!(matches!(
+            db.commit(&pending.checks, &pending.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert_eq!(tasks.load(p.task.id()).unwrap().unwrap(), p);
+        park_any(&db, &p, cp("parked"), &["a"]).unwrap();
+        let waiting = tasks.load(p.task.id()).unwrap().unwrap();
+        assert_eq!(waiting.task.checkpoint(), &cp("parked"));
+        assert!(matches!(
+            tasks.poll_wait(&waiting, 0).unwrap(),
+            crate::task_store::WakeResult::Woken { .. }
+        ));
+        assert!(matches!(
+            park_any(&db, &p, cp("stale"), &["a"]),
+            Err(Error::ParentClosed)
+        ));
+        assert_eq!(
+            tasks.load(p.task.id()).unwrap().unwrap().task.checkpoint(),
+            &cp("parked")
+        );
+    }
+
+    #[test]
     fn park_rejects_missing_duplicate_and_foreign_keys() {
         let db = Store::memory().unwrap();
         let p = registered_parent(&db, true);
