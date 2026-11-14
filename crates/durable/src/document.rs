@@ -524,6 +524,7 @@ type PendingEntries = (
     Option<u64>,
     Vec<crate::application_entry::ApplicationEntry>,
     Vec<Check>,
+    bool, // whether an entry was staged
 );
 
 /// Checked document operations at one invocation-wide immutable revision.
@@ -595,7 +596,7 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
-        if !self.writes.is_empty() || self.entries.is_some() {
+        if !self.writes.is_empty() || self.entries.as_ref().is_some_and(|entries| entries.4) {
             return Err(Error::ReadAfterWrite);
         }
         let identity = (task_id, token.name().to_owned(), key.to_owned());
@@ -664,8 +665,9 @@ impl<'a> TaskDocuments<'a> {
 
     /// Append only if the application log's last entry matches `expected`.
     /// `None` expects an empty log. Earlier entries staged in this invocation
-    /// are included. The check is fenced by the log version at commit; IDs are
-    /// provisional and may change when a replay-safe handler is retried.
+    /// are included. Even a mismatch retains a read dependency on the observed
+    /// log and subsequent checks use that observation. The log version is fenced
+    /// at commit; IDs are provisional and may change on replay.
     pub fn append_entry_if_head(
         &mut self,
         expected: Option<uuid::Uuid>,
@@ -737,17 +739,16 @@ impl<'a> TaskDocuments<'a> {
                 .transpose()?
                 .unwrap_or_default();
             let entries: Vec<crate::application_entry::ApplicationEntry> = entries;
-            if expected.is_some_and(|head| entries.last().map(|entry| entry.id) != head) {
-                return Err(Error::ApplicationEntryHeadMismatch);
-            }
-            self.entries = Some((conversation, version, entries, checks));
-        } else if expected.is_some_and(|head| {
+            self.entries = Some((conversation, version, entries, checks, false));
+        }
+        if expected.is_some_and(|head| {
             self.entries.as_ref().unwrap().2.last().map(|entry| entry.id) != head
         }) {
             return Err(Error::ApplicationEntryHeadMismatch);
         }
         let id = uuid::Uuid::new_v4();
         let conversation = self.entries.as_ref().unwrap().0;
+        self.entries.as_mut().unwrap().4 = true;
         self.entries
             .as_mut()
             .unwrap()
@@ -784,17 +785,19 @@ impl<'a> TaskDocuments<'a> {
         }
         batch.checks.extend(self.signal.checks);
         batch.mutations.extend(self.signal.mutations);
-        if let Some((conversation, version, entries, checks)) = self.entries {
+        if let Some((conversation, version, entries, checks, dirty)) = self.entries {
             batch.checks.extend(checks);
             let key = crate::application_entry::key(conversation);
             batch.checks.push(Check {
                 key: key.clone(),
                 expected: version.map_or(Expected::Missing, Expected::Version),
             });
-            batch.mutations.push(Mutation::Put {
-                key,
-                value: serde_json::to_vec(&entries)?,
-            });
+            if dirty {
+                batch.mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&entries)?,
+                });
+            }
         }
         Ok(batch)
     }
@@ -1078,6 +1081,107 @@ mod nested_entry_tests {
                 assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), expected);
             }
         }
+    }
+
+    #[test]
+    fn handled_head_mismatch_fences_document_writes_and_keeps_snapshot() {
+        for sqlite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = if sqlite {
+                Store::open(dir.path().join("db")).unwrap()
+            } else {
+                Store::memory().unwrap()
+            };
+            let id = Uuid::from_u128(124);
+            conversation(&db, id);
+            let author = task(1, TaskOwner::Conversation(id));
+            let address = Address {
+                scope: "test".into(),
+                name: "decision".into(),
+                key: "".into(),
+            };
+            let mut decision = TaskDocuments::new(&db, &author).unwrap();
+            decision.get(&address).unwrap();
+            assert!(matches!(
+                decision.append_entry_if_head(Some(Uuid::from_u128(99)), "app.x", json!(0)),
+                Err(Error::ApplicationEntryHeadMismatch)
+            ));
+            let mut concurrent = TaskDocuments::new(&db, &author).unwrap();
+            concurrent
+                .append_entry_if_head(None, "app.concurrent", json!(1))
+                .unwrap();
+            let batch = concurrent.into_batch().unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            // A second check sees the same transaction-local observation.
+            assert!(matches!(
+                decision.append_entry_if_head(Some(Uuid::from_u128(99)), "app.x", json!(0)),
+                Err(Error::ApplicationEntryHeadMismatch)
+            ));
+            decision
+                .put(&address, json!({"decision": true}).as_object().unwrap().clone())
+                .unwrap();
+            let batch = decision.into_batch().unwrap();
+            assert!(matches!(
+                db.commit(&batch.checks, &batch.mutations),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(Documents::new(&db).get(&address).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn inherited_head_is_checked_independently_on_each_fork() {
+        let db = Store::memory().unwrap();
+        let parent = Uuid::from_u128(125);
+        let child = Uuid::from_u128(126);
+        conversation(&db, parent);
+        conversation(&db, child);
+        let mut parent_tx =
+            TaskDocuments::new(&db, &task(1, TaskOwner::Conversation(parent))).unwrap();
+        let inherited = parent_tx
+            .append_entry_if_head(None, "app.parent", json!(1))
+            .unwrap();
+        let batch = parent_tx.into_batch().unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let docs = Documents::new(&db);
+        let batch = docs.fork_scope(parent, child, docs.snapshot().unwrap()).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let mut parent_tx =
+            TaskDocuments::new(&db, &task(1, TaskOwner::Conversation(parent))).unwrap();
+        parent_tx
+            .append_entry_if_head(Some(inherited), "app.parent2", json!(2))
+            .unwrap();
+        let batch = parent_tx.into_batch().unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let mut child_tx =
+            TaskDocuments::new(&db, &task(2, TaskOwner::Conversation(child))).unwrap();
+        child_tx
+            .append_entry_if_head(Some(inherited), "app.child", json!(3))
+            .unwrap();
+        let batch = child_tx.into_batch().unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        assert_eq!(crate::application_entry::list(&db, parent).unwrap().len(), 2);
+        assert_eq!(crate::application_entry::list(&db, child).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn handled_mismatch_fences_root_deletion() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::from_u128(127);
+        conversation(&db, id);
+        let mut tx = TaskDocuments::new(&db, &task(1, TaskOwner::Conversation(id))).unwrap();
+        assert!(matches!(
+            tx.append_entry_if_head(Some(Uuid::from_u128(99)), "app.x", json!(0)),
+            Err(Error::ApplicationEntryHeadMismatch)
+        ));
+        db.commit(&[], &[Mutation::Delete {
+            key: format!("runtime/conversation/{id}").into_bytes(),
+        }]).unwrap();
+        let batch = tx.into_batch().unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
     }
 
     #[test]
