@@ -113,10 +113,15 @@ fn merge_project_servers(
             let mut candidate = base.clone();
             candidate.extend(overlay.clone());
             for key in OVERRIDE_KEYS {
-                // Existing global OAuth configuration historically treats
-                // optional nulls as absent. Project-provided values are strict.
-                if *key == "oauth" && !overlay.contains_key("oauth") {
-                    continue;
+                if !overlay.contains_key(*key) {
+                    // Preserve serde's existing global Option semantics while
+                    // validating non-null inherited values before enabling.
+                    if *key == "oauth"
+                        || (matches!(*key, "enabled" | "exposure")
+                            && candidate.get(*key).is_some_and(Value::is_null))
+                    {
+                        continue;
+                    }
                 }
                 if candidate
                     .get(*key)
@@ -677,7 +682,6 @@ mod tests {
         assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
         assert_eq!(Value::Object(servers), original);
         for (key, value) in [
-            ("exposure", json!(null)),
             ("exposure", json!("bad")),
             ("toolExposure", json!(null)),
             ("toolExposure", json!({"read": null})),
@@ -698,5 +702,36 @@ mod tests {
             .to_string();
         assert!(!error.contains("sensitive-id"));
         assert_eq!(Value::Object(servers), original);
+    }
+
+    #[test]
+    fn inherited_optional_nulls_preserve_native_defaults() {
+        for (global, project) in [
+            (json!({"enabled":null}), json!({"exposure":"hidden"})),
+            (
+                json!({"enabled":false,"exposure":null}),
+                json!({"enabled":true}),
+            ),
+            (
+                json!({"enabled":false,"exposure":null,"oauth":null}),
+                json!({"enabled":true}),
+            ),
+        ] {
+            let mut base = json!({"url":"https://example.invalid/mcp"});
+            base.as_object_mut()
+                .unwrap()
+                .extend(global.as_object().unwrap().clone());
+            let mut servers = json!({"service":base}).as_object().unwrap().clone();
+            let overlay = json!({"service":project});
+            merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap();
+            let config: ServerConfig = serde_json::from_value(servers["service"].clone()).unwrap();
+            if global["enabled"].is_null() {
+                assert_eq!(config.enabled, None);
+            }
+            if global.get("exposure").is_some_and(Value::is_null) {
+                assert_eq!(config.exposure, None);
+                assert_eq!(config.exposure.as_deref().unwrap_or("codemode"), "codemode");
+            }
+        }
     }
 }

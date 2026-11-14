@@ -64,10 +64,13 @@ fn malformed_project_override_never_starts_disabled_server() {
         home.join("mcp.json"),
         serde_json::json!({"mcpServers":{"fixture":{"command":script,"enabled":false,"exposure":null}}}).to_string(),
     ).unwrap();
-    std::fs::write(&project, r#"{"mcpServers":{"fixture":{"enabled":true}}}"#).unwrap();
+    std::fs::write(&project, r#"{"mcpServers":{"fixture":{"enabled":false}}}"#).unwrap();
     let inherited = run("--trust");
-    assert!(!inherited.status.success());
-    assert!(String::from_utf8_lossy(&inherited.stderr).contains("exposure"));
+    assert!(
+        inherited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
     assert!(!sentinel.exists());
     let untrusted = run("--no-trust");
     assert!(
