@@ -5718,12 +5718,10 @@ fn interrupt_remote_task(view: &mut View) {
         view.remote_task = None;
         clear_openrouter_editor(view);
         view.append(message);
+    } else if task.meta_login_control.is_some() {
+        view.append("Meta sign-in is completing; waiting for the result");
     } else {
-        if task.meta_login_control.is_some() {
-            view.append("Meta sign-in is completing; waiting for the result");
-        } else {
-            view.append("ChatGPT sign-out is completing; waiting for the result");
-        }
+        view.append("ChatGPT sign-out is completing; waiting for the result");
     }
 }
 
