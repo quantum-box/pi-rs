@@ -18,11 +18,37 @@ pub struct ChatCompatibility {
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
     zai_tool_stream: Option<bool>,
+    vllm_priority: Option<serde_json::Number>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vllm_priority_is_optional_numeric_and_overlaid_per_model() {
+        let default = ChatCompatibility::default();
+        let mut body = json!({});
+        default.request_options(&mut body, 16, false);
+        assert!(body.get("priority").is_none());
+        let provider: ChatCompatibility =
+            serde_json::from_value(json!({"vllmPriority": 5})).unwrap();
+        for (model, expected) in [
+            (json!({}), json!(5)),
+            (json!({"vllmPriority": 0}), json!(0)),
+            (json!({"vllmPriority": -2.5}), json!(-2.5)),
+        ] {
+            let compat = provider
+                .clone()
+                .overlay(serde_json::from_value(model).unwrap());
+            let mut body = json!({});
+            compat.request_options(&mut body, 16, false);
+            assert_eq!(body["priority"], expected);
+        }
+        assert!(
+            serde_json::from_value::<ChatCompatibility>(json!({"vllmPriority":"high"})).is_err()
+        );
+    }
 
     #[test]
     fn ant_ling_sends_only_explicit_reasoning_effort() {
@@ -117,6 +143,7 @@ impl ChatCompatibility {
             thinking_format: model.thinking_format.or(self.thinking_format),
             chat_template_args: model.chat_template_args.or(self.chat_template_args),
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
+            vllm_priority: model.vllm_priority.or(self.vllm_priority),
         }
     }
 
@@ -138,6 +165,9 @@ impl ChatCompatibility {
         }
         if has_tools && self.zai_tool_stream == Some(true) {
             body["tool_stream"] = json!(true);
+        }
+        if let Some(priority) = &self.vllm_priority {
+            body["priority"] = Value::Number(priority.clone());
         }
     }
 
