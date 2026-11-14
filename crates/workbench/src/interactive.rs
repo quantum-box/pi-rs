@@ -8082,6 +8082,7 @@ mod tests {
                 println!("READY_FOR_CTRL_Z");
                 let go = std::path::PathBuf::from(&program).with_extension("go");
                 while !go.exists() {
+                    assert!(Instant::now() < deadline, "controller did not send Ctrl+Z");
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 let mut announced = false;
