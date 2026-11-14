@@ -292,6 +292,18 @@ impl DisplayTail {
             tail = &tail[index + 1..];
             skipped_partial_line = true;
         }
+        // Pi's truncateTail returns the input verbatim when the retained
+        // snapshot itself fits, including its final newline. The overall
+        // result can still be truncated because earlier output was discarded.
+        let retained_lines = tail.split_terminator('\n').count();
+        if tail.len() <= DISPLAY_BYTES && retained_lines <= DISPLAY_LINES {
+            let limit = if self.bytes > DISPLAY_BYTES as u64 {
+                Limit::Bytes
+            } else {
+                Limit::Lines
+            };
+            return (tail.to_owned(), Some(limit), retained_lines, false);
+        }
         let mut selected = Vec::new();
         let mut bytes = 0;
         let mut partial = false;
@@ -418,7 +430,7 @@ mod tests {
         let output = accumulator.finish().unwrap();
         assert!(output.script.starts_with(&"a".repeat(20)));
         assert!(output.script.ends_with("\nlast line\n"));
-        assert!(output.display_without_notice.ends_with("last line"));
+        assert!(output.display_without_notice.ends_with("last line\n"));
         assert!(output.script_truncated);
         assert_eq!(
             output.details.as_ref().unwrap()["truncation"]["truncated"],
@@ -477,13 +489,35 @@ mod tests {
         let output = accumulator.finish().unwrap();
         let truncation = &output.details.as_ref().unwrap()["truncation"];
         assert_eq!(truncation["truncatedBy"], "bytes");
-        assert_eq!(output.display_without_notice, "last");
+        assert_eq!(output.display_without_notice, "last\n");
+        assert_eq!(truncation["outputBytes"], 5);
+        assert_eq!(truncation["outputLines"], 1);
         assert!(
             output
                 .display
                 .contains("Showing lines 2-2 of 2 (50.0KB limit)")
         );
         std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn retained_tail_preserves_newlines_and_counts() {
+        for (tail, lines) in [("last\n", 1), ("last", 1), ("\n", 1), ("last\n\n", 2)] {
+            let input = format!("{}\n{tail}", "x".repeat(300_000));
+            let mut accumulator = Accumulator::default();
+            for chunk in input.as_bytes().chunks(8192) {
+                accumulator.append(chunk).unwrap();
+            }
+            let progress = accumulator.partial_result();
+            assert_eq!(progress["content"][0]["text"], tail);
+            let output = accumulator.finish().unwrap();
+            assert_eq!(output.display_without_notice, tail);
+            let truncation = &output.details.as_ref().unwrap()["truncation"];
+            assert_eq!(truncation["outputBytes"], tail.len());
+            assert_eq!(truncation["outputLines"], lines);
+            assert_eq!(truncation["truncatedBy"], "bytes");
+            std::fs::remove_file(output.path.unwrap()).unwrap();
+        }
     }
 
     #[test]

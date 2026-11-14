@@ -12,3 +12,5 @@ This differs from the case where the retained tail has no newline: an oversized
 unterminated final line displays its UTF-8-safe suffix. Output below the rolling
 buffer threshold can also retain the suffix of a newline-terminated long line,
 matching the upstream streaming accumulator's buffer-boundary behavior.
+When the retained snapshot fits both limits, its contents are preserved
+verbatim, including trailing newlines and their byte counts.
