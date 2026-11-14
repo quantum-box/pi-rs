@@ -95,10 +95,21 @@ pub enum Status {
     Done { answer: String },
     Unanswered { reason: String },
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionKind {
+    #[default]
+    Input,
+    Continue,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Submission {
+    #[serde(default)]
+    pub kind: SubmissionKind,
     pub id: Uuid,
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub status: Status,
 }
@@ -1264,6 +1275,11 @@ impl Harness {
                     .iter()
                     .find(|s| s.request_id.as_ref() == Some(key))
             {
+                if s.kind != SubmissionKind::Input {
+                    return Err(Error::Invalid(
+                        "request ID identifies a continue submission".into(),
+                    ));
+                }
                 return Ok(s.id);
             }
             if content.trim().is_empty() {
@@ -1285,6 +1301,7 @@ impl Harness {
                     .iter()
                     .any(|item| item.status == Status::Queued);
             c.submissions.push(Submission {
+                kind: SubmissionKind::Input,
                 id: sid,
                 request_id: request_id.clone(),
                 content: content.clone(),
@@ -1317,6 +1334,92 @@ impl Harness {
                 Ok(()) => return Ok(sid),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
+            }
+        }
+    }
+    /// Start a run from the current context without appending user input.
+    pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
+        loop {
+            let (mut c, version) = self.load(id)?;
+            if let Some(key) = request_id.as_ref() {
+                if c.application_writes
+                    .iter()
+                    .any(|w| w.request_id.as_ref() == Some(key))
+                {
+                    return Err(Error::Invalid(
+                        "request ID identifies a write submission".into(),
+                    ));
+                }
+                if let Some(s) = c
+                    .submissions
+                    .iter()
+                    .find(|s| s.request_id.as_ref() == Some(key))
+                {
+                    return if s.kind == SubmissionKind::Continue {
+                        Ok(s.id)
+                    } else {
+                        Err(Error::Invalid(
+                            "request ID identifies an input submission".into(),
+                        ))
+                    };
+                }
+            }
+            if c.active.is_some() || !matches!(c.phase, Phase::Idle | Phase::FailedIdle) {
+                return Err(AdmissionError::Busy.into());
+            }
+            for marker in std::mem::take(&mut c.pending_resets) {
+                place_reset(&mut c, marker);
+            }
+            let mut steer = false;
+            let mut follow = false;
+            for s in &mut c.submissions {
+                if s.status != Status::Queued {
+                    continue;
+                }
+                let selected = match c
+                    .input_modes
+                    .get(&s.id)
+                    .copied()
+                    .unwrap_or(InputMode::FollowUp)
+                {
+                    InputMode::Steer if !steer => {
+                        steer = true;
+                        true
+                    }
+                    InputMode::FollowUp if !follow => {
+                        follow = true;
+                        true
+                    }
+                    _ => false,
+                };
+                if selected {
+                    s.status = Status::Running;
+                    c.messages.push(Message::User {
+                        content: s.content.clone(),
+                    });
+                }
+            }
+            let sid = Uuid::new_v4();
+            c.submissions.push(Submission {
+                kind: SubmissionKind::Continue,
+                id: sid,
+                request_id: request_id.clone(),
+                content: String::new(),
+                status: Status::Running,
+            });
+            c.active = Some(sid);
+            c.auto_compaction_attempted = false;
+            c.retry_state = RetryState::default();
+            c.overflow_compaction_attempted = false;
+            c.phase = Phase::ModelReady { turns: 0 };
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&c, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Ok(()) => return Ok(sid),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1913,7 +2016,19 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelReady { turns } => {
-                    if turns >= self.options.max_turns {
+                    if !matches!(
+                        c.messages
+                            .iter()
+                            .rev()
+                            .find(|m| !matches!(m, Message::System { .. })),
+                        Some(
+                            Message::User { .. }
+                                | Message::UserWithImages { .. }
+                                | Message::Tool { .. }
+                        )
+                    ) {
+                        finish_failure(&mut c, "nothing_to_answer".into());
+                    } else if turns >= self.options.max_turns {
                         finish_failure(&mut c, "turn limit".into());
                     } else {
                         if !c.auto_compaction_attempted {
@@ -2291,6 +2406,16 @@ impl Harness {
                     c.retry_state = RetryState::default();
                     c.overflow_compaction_attempted = false;
                     if response.is_truncated() && !response.calls.is_empty() {
+                        c.messages.push(response.assistant_message());
+                        for index in 0..response.calls.len() {
+                            append_tool(
+                                &mut c,
+                                &response.calls,
+                                index,
+                                Outcome::Skipped("tool call truncated before dispatch".into())
+                                    .tool_content(),
+                            )?;
+                        }
                         finish_failure(&mut c, "truncated tool calls".into());
                     } else {
                         c.messages.push(response.assistant_message());
@@ -3208,6 +3333,12 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Admit a continuation and schedule its persisted run.
+    pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
+        let submission = self.harness.submit_continue(id, request_id)?;
+        self.schedule(id);
+        Ok(submission)
+    }
     pub fn withdraw_submission(
         &mut self,
         id: Uuid,
@@ -3706,16 +3837,6 @@ fn finish_abort(c: &mut Conversation) {
     }
 }
 fn finish_failure(c: &mut Conversation, reason: String) {
-    if matches!(
-        c.messages.last(),
-        Some(Message::User { .. } | Message::UserWithImages { .. } | Message::Tool { .. })
-    ) {
-        c.messages.push(Message::Assistant {
-            content: format!("[Run ended: {reason}]"),
-            calls: Vec::new(),
-            replay: None,
-        });
-    }
     c.active = None;
     for s in &mut c.submissions {
         if s.status == Status::Running {
@@ -3849,6 +3970,7 @@ mod scheduler_tests {
         };
         let mut latest = base.clone();
         latest.submissions.push(Submission {
+            kind: SubmissionKind::Input,
             id: Uuid::new_v4(),
             request_id: None,
             content: "queued".into(),

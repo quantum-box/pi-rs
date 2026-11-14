@@ -638,3 +638,55 @@ async fn background_scheduler_retries_interrupted_model_without_reopen() {
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn continue_after_turn_limit_does_not_repeat_tool_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let cancel = CancellationToken::new();
+    let mut opts = options(model.clone(), tool.clone(), ReplayPolicy::Unsafe);
+    opts.max_turns = 1;
+    let mut h = Harness::open_paused(&path, opts).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    let continuation = h.submit_continue(id, Some("resume".into())).unwrap();
+    drop(h);
+    let mut h = Harness::open(
+        &path,
+        options(model.clone(), tool.clone(), ReplayPolicy::Unsafe),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        h.submit_continue(id, Some("resume".into())).unwrap(),
+        continuation
+    );
+    h.resume(&cancel).await.unwrap();
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == continuation)
+            .unwrap()
+            .status,
+        Status::Done {
+            answer: "finished".into()
+        }
+    );
+}

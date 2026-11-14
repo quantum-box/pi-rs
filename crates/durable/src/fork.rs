@@ -278,6 +278,7 @@ mod tests {
         assert!(matches!(extract(id, &record(&s)), Err(Error::Unsettled)));
         s.active = None;
         s.submissions.push(Submission {
+            kind: crate::runtime::SubmissionKind::Input,
             id: Uuid::new_v4(),
             request_id: None,
             content: "q".into(),
