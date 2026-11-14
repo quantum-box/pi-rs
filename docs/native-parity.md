@@ -3577,9 +3577,12 @@ both display modes, as well as the correlated RPC responses.
 
 ### Radius share presentation metadata
 
-Terminal `/share` appends Pi's `pi.share` entry with the active system prompt
-and tool schemas to Radius uploads. Idle shares use the worker's current
-runtime and branch; shares during a model request use the actual request context.
+Terminal `/share` appends Pi's `pi.share` entry with the session's system prompt
+and active tool schemas to Radius uploads. Idle and in-flight shares use the
+worker's session state; request-only `context_with_system` transformations do
+not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
+exposes interactive `/share`; the standalone `pi share` command is a pi-rs
+extension.
 The snapshot is matched to the session and head before upload, and a changed
 session requires a retry. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
@@ -4345,13 +4348,14 @@ empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
 
-### RPC truncated JSON diagnostics
+### RPC JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
-escapes, and missing values. Offsets and columns count UTF-16 units; CR, LF and
-CRLF are counted as line breaks. Incomplete escapes following lone surrogate
+escapes, invalid escape characters or Unicode digits, and missing values. Offsets
+and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+Escapes following lone surrogate
 escapes and other malformed JSON retain the native parser's diagnostics; full
 malformed-input parity remains open.
 

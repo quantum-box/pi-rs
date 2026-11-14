@@ -5752,6 +5752,52 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shell_timeout_can_advance_after_process_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let mut task = tokio::spawn(async move {
+            tool.shell(
+                &json!({"command":"printf ready > ready; sleep 300", "timeout":120}),
+                &cancellation,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::select! {
+                    result = &mut task => panic!("shell ended before readiness: {}", match result {
+                        Ok(Ok(_)) => "unexpected success".into(),
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                    }),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+        })
+        .await
+        .expect("shell readiness timed out");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect("shell did not finish after advancing the clock")
+            .expect("shell task panicked");
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("timed out after 120 seconds"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_does_not_wait_for_inherited_background_pipes() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
@@ -5881,8 +5927,10 @@ mod tests {
         let ready = root.path().join("ready.txt");
         let pid_file = root.path().join("child.pid");
         let leaked = root.path().join("leaked.txt");
+        let child_stderr = root.path().join("child-stderr.txt");
+        let parent_stage = root.path().join("parent-stage.txt");
         let script = format!(
-            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 60; [IO.File]::WriteAllText('{}','leaked')",
+            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 300; [IO.File]::WriteAllText('{}','leaked')",
             quote(&pid_file),
             quote(&ready),
             quote(&leaked),
@@ -5893,17 +5941,20 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         let command = format!(
-            "$ErrorActionPreference='Stop'; Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' | Out-Null; Start-Sleep -Seconds 60"
+            "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText('{}','starting child'); Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' -RedirectStandardError '{}' | Out-Null; [IO.File]::WriteAllText('{}','child started'); Start-Sleep -Seconds 300",
+            quote(&parent_stage),
+            quote(&child_stderr),
+            quote(&parent_stage),
         );
         let cancellation = pi_rs::CancellationToken::new();
         let _cleanup = cancellation.clone().drop_guard();
         let task_cancel = cancellation.clone();
         let mut shell = tokio::spawn(async move {
-            tool.shell(&json!({"command":command,"timeout":20}), &task_cancel)
+            tool.shell(&json!({"command":command,"timeout":120}), &task_cancel)
                 .await
         });
         let readiness = async {
-            tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 while !ready.exists() {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -5916,7 +5967,10 @@ mod tests {
                 Ok(Err(error)) => error.to_string(),
                 Err(error) => error.to_string(),
             }),
-            result = readiness => result.expect("child did not report readiness before deadline"),
+            result = readiness => if result.is_err() {
+                panic!("child did not report readiness before deadline; parent stage: {:?}; child stderr: {:?}; child pid: {:?}",
+                    std::fs::read_to_string(&parent_stage), std::fs::read_to_string(&child_stderr), std::fs::read_to_string(&pid_file));
+            },
         }
         let pid: u32 = std::fs::read_to_string(&pid_file)
             .unwrap()
@@ -5937,6 +5991,12 @@ mod tests {
             WAIT_TIMEOUT,
             "child must be running before timeout"
         );
+        // Expire the running timeout only after observing the live descendant.
+        // Advancing Tokio's clock avoids waiting two minutes or racing
+        // PowerShell startup on a loaded Windows runner.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
         let result = match tokio::time::timeout(Duration::from_secs(35), &mut shell).await {
             Ok(result) => result.expect("shell task panicked"),
             Err(_) => {
@@ -5950,7 +6010,7 @@ mod tests {
             }
         };
         assert!(
-            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 20 seconds")),
+            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 120 seconds")),
             "expected the configured timeout"
         );
         // SAFETY: the process handle remains owned by the guard during the wait.

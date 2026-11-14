@@ -186,7 +186,6 @@ struct SessionSnapshot {
     revision: u64,
     entries: Option<super::rpc_entries::Cursor>,
     share_base: Option<Arc<super::sessions::ShareContext>>,
-    share_active: Option<Arc<super::sessions::ShareContext>>,
     share_pending: bool,
 }
 
@@ -204,7 +203,6 @@ impl SessionSnapshot {
             revision: 0,
             entries,
             share_base: None,
-            share_active: None,
             share_pending: false,
         }
     }
@@ -238,15 +236,11 @@ impl SessionSnapshot {
             .share_base
             .as_ref()
             .ok_or_else(|| Error::Config("share context is not ready".into()))?;
-        let context = if let Some(active) = &self.share_active {
-            active.as_ref().clone()
-        } else {
-            let (system_prompt, tools) =
-                session.effective_system_context(&base.system_prompt, base.tools.clone());
-            super::sessions::ShareContext {
-                system_prompt,
-                tools,
-            }
+        let (system_prompt, _) =
+            session.effective_system_context(&base.system_prompt, base.tools.clone());
+        let context = super::sessions::ShareContext {
+            system_prompt,
+            tools: base.tools.clone(),
         };
         Ok(super::sessions::ShareSnapshot {
             session_id: session.session_id(),
@@ -274,23 +268,9 @@ impl SessionSnapshot {
                 self.revision = self.revision.wrapping_add(1);
                 self.share_pending = true;
             }
-            pi_rs::Notification::Request(request) => {
+            pi_rs::Notification::Request(_) => {
                 self.revision = self.revision.wrapping_add(1);
-                if !*summary {
-                    let system_prompt = request
-                        .messages
-                        .iter()
-                        .filter_map(|message| match message {
-                            pi_rs::Message::System { content } => Some(content.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    self.share_active = Some(Arc::new(super::sessions::ShareContext {
-                        system_prompt,
-                        tools: request.tools.clone(),
-                    }));
-                }
+                // Pi shares agent state, not request-only context transforms.
                 self.share_pending = false;
                 *summary = false;
             }
@@ -300,7 +280,6 @@ impl SessionSnapshot {
 
     fn settle_share_context(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.share_active = None;
         self.share_pending = false;
     }
 
@@ -372,14 +351,13 @@ fn snapshot_for_share_with_hook(
     hook: impl FnOnce(),
 ) -> Result<super::sessions::ShareSnapshot> {
     let changed = || Error::Config("Share context changed; try sharing again".into());
-    let (revision, count, base, selected, pending, emit_entries, idle, record_metadata) = {
+    let (revision, count, base, pending, emit_entries, idle, record_metadata) = {
         let state = active.lock().expect("worker control");
         let snapshot = snapshot.lock().expect("session snapshot");
         (
             snapshot.revision,
             snapshot.share_records.len(),
             snapshot.share_base.clone(),
-            snapshot.share_active.clone(),
             snapshot.share_pending,
             snapshot.entries.is_some(),
             state.token.is_none() && state.queued == 0,
@@ -427,16 +405,12 @@ fn snapshot_for_share_with_hook(
         )?
     };
     let base = base.ok_or_else(|| Error::Config("share context is not ready".into()))?;
-    let context = selected
-        .map(|selected| selected.as_ref().clone())
-        .unwrap_or_else(|| {
-            let (system_prompt, tools) =
-                session.effective_system_context(&base.system_prompt, base.tools.clone());
-            super::sessions::ShareContext {
-                system_prompt,
-                tools,
-            }
-        });
+    let (system_prompt, _) =
+        session.effective_system_context(&base.system_prompt, base.tools.clone());
+    let context = super::sessions::ShareContext {
+        system_prompt,
+        tools: base.tools.clone(),
+    };
     let result = super::sessions::ShareSnapshot {
         session_id: session.session_id(),
         head: session.head(),
@@ -887,7 +861,6 @@ async fn run_worker(
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.share_base = Some(Arc::new(runtime.share_base()));
-                snapshot.share_active = None;
                 snapshot.revision = snapshot.revision.wrapping_add(1);
             }
             share_ready.send_replace(true);
@@ -993,7 +966,6 @@ async fn run_worker(
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.refresh(session);
                 snapshot.share_base = Some(Arc::new(runtime.share_base()));
-                snapshot.share_active = None;
             }
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
@@ -2012,7 +1984,6 @@ mod share_context_tests {
         });
         let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
         initial.share_base = Some(context.clone());
-        initial.share_active = Some(context.clone());
         let snapshot = Arc::new(Mutex::new(initial));
         let active = Arc::new(Mutex::new(ControlState {
             token: Some(CancellationToken::new()),
@@ -2036,7 +2007,7 @@ mod share_context_tests {
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
         assert!(
-            Arc::strong_count(&context) >= 5,
+            Arc::strong_count(&context) >= 3,
             "share capture must retain references, not clone the context"
         );
         let _state = active
@@ -2267,12 +2238,66 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         assert_eq!(
             snapshot.share_snapshot().unwrap().context.system_prompt,
-            "request-specific prompt"
+            "refreshed prompt"
         );
         snapshot.settle_share_context();
         let context = snapshot.share_snapshot().unwrap().context;
         assert_eq!(context.system_prompt, "refreshed prompt");
         assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn live_share_uses_current_tools_not_transcript_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::SystemCheckpoint {
+                content: "session prompt".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "fallback",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "transformed request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot_for_share(
+            &Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            }),
+            &Mutex::new(snapshot),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "session prompt");
+        assert!(result.context.tools.iter().any(|tool| tool.name == "read"));
     }
 
     #[tokio::test]
@@ -2365,10 +2390,6 @@ mod share_context_tests {
             system_prompt: "base".into(),
             tools: vec![],
         }));
-        snapshot.share_active = Some(Arc::new(super::super::sessions::ShareContext {
-            system_prompt: "previous".into(),
-            tools: vec![],
-        }));
         let record = pi_rs::Record {
             timestamp: None,
             run_id: None,
@@ -2408,7 +2429,7 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         let result = snapshot.share_snapshot().unwrap();
         assert_eq!(result.head, 2);
-        assert_eq!(result.context.system_prompt, "new");
+        assert_eq!(result.context.system_prompt, "base");
     }
 }
 
