@@ -178,6 +178,11 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+`KeyedTool::invoke_controlled` can return a termination control with its reply.
+The runtime persists it with the outcome and ends the run without another model
+request only when every result in the nonempty tool round requests termination.
+Nested calls cannot end their caller’s round; handoff controls are unsupported.
+
 Selected extensions may provide tools and before/after-tool hooks. The runtime
 commits terminal tool output and state before invoking after-tool hooks; a crash
 replays the hook with the same operation memo, not the completed tool. Hook
@@ -195,7 +200,7 @@ a task driver and register the exact selected extension handler with
 `Registry::register_shared` and its replay policy; a missing driver leaves the
 hook phase pending, and a mismatched registration fails closed. Reopen with the
 extensions and driver registered to resume. Harness users explicitly resume;
-Scheduler polls waiting phases. Ordinary hook and section errors are reported and skipped; before-tool errors block dispatch. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful nonempty string continuation in creation order; queued input or reset takes precedence. Failed hook children are reported when observed; invalid child outcomes are ignored without reporting. Unregistered or foreign task requests are reported and skipped. Provider-body hooks require an explicitly configured adapter; tool-result terminate controls remain unsupported. Before-tool hooks may sleep on
+Scheduler polls waiting phases. Ordinary hook and section errors are reported and skipped; before-tool errors block dispatch. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful nonempty string continuation in creation order; queued input or reset takes precedence. Failed hook children are reported when observed; invalid child outcomes are ignored without reporting. Unregistered or foreign task requests are reported and skipped. Provider-body hooks require an explicitly configured adapter; tool-result termination is supported by opt-in `KeyedTool` implementations; handoff controls remain unsupported. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
