@@ -153,6 +153,12 @@ async fn invalid_requests_and_endpoints_are_rejected() {
         ("max_tokens", json!(101)),
         ("tools", json!([])),
         ("metadata", json!({})),
+        ("messages", json!([{"role":"system","content":"bad"}])),
+        ("messages", json!([{"role":"user","content":123}])),
+        ("temperature", json!(2)),
+        ("top_p", json!("bad")),
+        ("top_k", json!(-1)),
+        ("stop_sequences", json!([7])),
     ] {
         let mut b = ad.prepare(&a, &r).await.unwrap();
         b[key] = value;
@@ -273,4 +279,59 @@ async fn cancellation_during_stream() {
     ));
     rx.recv().unwrap();
     t.join().unwrap();
+}
+
+#[tokio::test]
+async fn rejects_mixed_initial_and_streamed_tool_input() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{\"path\":\"a\"}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    assert!(
+        collect_generation(
+            adapter.dispatch(&a, &r, body),
+            &CancellationToken::new(),
+            |_| {}
+        )
+        .await
+        .is_err()
+    );
+    rx.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn truncated_tool_call_is_marked_for_runtime_to_skip() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{\"path\":\"a\"}}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (url, rx, thread) = server(http(events), false);
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let r = request();
+    let body = adapter.prepare(&a, &r).await.unwrap();
+    let result = collect_generation(
+        adapter.dispatch(&a, &r, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(result.is_truncated());
+    assert_eq!(result.calls.len(), 1);
+    rx.recv().unwrap();
+    thread.join().unwrap();
 }

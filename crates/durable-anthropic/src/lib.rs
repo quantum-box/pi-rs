@@ -84,7 +84,26 @@ impl ProviderAdapter for AnthropicAdapter {
         }) || body["model"] != request.model
             || body["stream"] != true
             || !body["messages"].is_array()
-            || body["messages"].as_array().is_none_or(Vec::is_empty)
+            || body["messages"].as_array().is_none_or(|messages| {
+                messages.is_empty()
+                    || messages.iter().any(|message| {
+                        !matches!(message["role"].as_str(), Some("user" | "assistant"))
+                            || !(message["content"].is_string()
+                                || message["content"].as_array().is_some_and(|blocks| {
+                                    !blocks.is_empty() && blocks.iter().all(Value::is_object)
+                                }))
+                    })
+            })
+            || obj
+                .get("temperature")
+                .is_some_and(|v| v.as_f64().is_none_or(|n| !(0.0..=1.0).contains(&n)))
+            || obj
+                .get("top_p")
+                .is_some_and(|v| v.as_f64().is_none_or(|n| !(0.0..=1.0).contains(&n)))
+            || obj.get("top_k").is_some_and(|v| v.as_u64().is_none())
+            || obj
+                .get("stop_sequences")
+                .is_some_and(|v| v.as_array().is_none_or(|a| !a.iter().all(Value::is_string)))
             || body["max_tokens"]
                 .as_u64()
                 .is_none_or(|n| n == 0 || n > u64::from(request.max_output_tokens))
@@ -142,7 +161,7 @@ impl ProviderAdapter for AnthropicAdapter {
                 match v["type"].as_str() {
                     Some("message_start") if !started => { started = true; let m=&v["message"]; input=m["usage"]["input_tokens"].as_u64(); cached=m["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0); written=m["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0); metadata.cached_input_tokens=Some(cached); metadata.cache_creation_input_tokens=Some(written); metadata.provider_request_id=m["id"].as_str().filter(|id| id.len()<=128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))).map(str::to_owned); }
                     Some("content_block_start") if started && stop.is_none() => { let i=index(&v)?; if blocks.len()>=256 || blocks.contains_key(&i) { Err(invalid())?; } let b=&v["content_block"]; let block=match b["type"].as_str() { Some("text") => { let t=b["text"].as_str().ok_or_else(invalid)?.to_owned(); if !t.is_empty() { yield ModelEvent::Text(t.clone()); } Block::Text { done:false } }, Some("tool_use") => { let id=field(b,"id")?.to_owned(); let name=field(b,"name")?.to_owned(); if id.is_empty() || name.is_empty() { Err(invalid())?; } let initial=b["input"].as_object().ok_or_else(invalid)?.clone(); yield ModelEvent::ToolCallDelta(ToolCallDelta { index:i,id:id.clone(),name:name.clone(),arguments: if initial.is_empty() { String::new() } else { Value::Object(initial.clone()).to_string() } }); Block::Tool { id,name,initial:Value::Object(initial), fragments:String::new(),done:false } }, _ => Err(Error::Model("unsupported Anthropic content block".into()))? }; blocks.insert(i,block); }
-                    Some("content_block_delta") if started && stop.is_none() => { let i=index(&v)?; let d=&v["delta"]; match (blocks.get_mut(&i), d["type"].as_str()) { (Some(Block::Text { done:false }), Some("text_delta")) => { let t=field(d,"text")?; yield ModelEvent::Text(t.into()); }, (Some(Block::Tool { fragments, done:false,.. }), Some("input_json_delta")) => { let t=field(d,"partial_json")?; fragments.push_str(t); yield ModelEvent::ToolCallDelta(ToolCallDelta { index:i,id:String::new(),name:String::new(),arguments:t.into() }); }, _ => Err(invalid())? } }
+                    Some("content_block_delta") if started && stop.is_none() => { let i=index(&v)?; let d=&v["delta"]; match (blocks.get_mut(&i), d["type"].as_str()) { (Some(Block::Text { done:false }), Some("text_delta")) => { let t=field(d,"text")?; yield ModelEvent::Text(t.into()); }, (Some(Block::Tool { initial, fragments, done:false,.. }), Some("input_json_delta")) => { let t=field(d,"partial_json")?; if !t.is_empty() && initial.as_object().is_some_and(|v| !v.is_empty()) { Err(invalid())?; } fragments.push_str(t); yield ModelEvent::ToolCallDelta(ToolCallDelta { index:i,id:String::new(),name:String::new(),arguments:t.into() }); }, _ => Err(invalid())? } }
                     Some("content_block_stop") if started && stop.is_none() => { let b=blocks.get_mut(&index(&v)?).ok_or_else(invalid)?; match b { Block::Text {done} | Block::Tool {done,..} if !*done => *done=true, _ => Err(invalid())? } }
                     Some("message_delta") if started && stop.is_none() => { output=v["usage"]["output_tokens"].as_u64().or(output); if let Some(s)=v["delta"]["stop_reason"].as_str() { stop=Some(s.to_owned()); } }
                     Some("message_stop") if started => { let reason=match stop.as_deref() { Some("end_turn"|"stop_sequence")=>"stop", Some("max_tokens")=>"length", Some("tool_use")=>"tool_calls", _=>Err(invalid())? }; let mut calls=Vec::new(); for (_,b) in blocks { match b { Block::Text {done:true} => {}, Block::Tool {id,name,initial,fragments,done:true} => { let value=if fragments.is_empty(){ initial }else{ serde_json::from_str(&fragments).map_err(|_| invalid())? }; if !value.is_object() || calls.iter().any(|c: &ToolCall| c.id==id) || calls.len()>=64 { Err(invalid())?; } calls.push(ToolCall { id,name,arguments:value.to_string() }); }, _=>Err(invalid())? } } if (reason=="tool_calls") != !calls.is_empty() && reason!="length" { Err(invalid())?; } metadata.finish_reason=Some(reason.into()); metadata.provider_prompt_tokens=input.map(|n| n.saturating_add(cached).saturating_add(written)); yield ModelEvent::Metadata(metadata.clone()); yield ModelEvent::Complete { calls, usage:metadata.provider_prompt_tokens.zip(output).map(|(input_tokens,output_tokens)| Usage {input_tokens,output_tokens}) }; return; }
