@@ -136,6 +136,11 @@ pub(super) fn branch_selection(
         .rev()
         .find_map(|record| match &record.event {
             Event::ModelSelected { thinking, .. } => Some(thinking.clone()),
+            Event::BranchModelSelected { .. }
+            | Event::BranchSummary {
+                fallback_model: Some(_),
+                ..
+            } => Some(None),
             Event::SourceEntry { format, entry }
                 if format == "pi" && entry["type"] == "thinking_level_change" =>
             {
@@ -146,6 +151,28 @@ pub(super) fn branch_selection(
         .flatten();
     let mut saw_pi = false;
     for (index, record) in branch.iter().enumerate().rev() {
+        match &record.event {
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => {
+                return BranchSelection::Selected {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    thinking,
+                };
+            }
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => {
+                return BranchSelection::Selected {
+                    provider: selection.provider.clone(),
+                    model: selection.model.clone(),
+                    thinking,
+                };
+            }
+            _ => {}
+        }
         if let Event::Assistant {
             request_id: Some(request_id),
             ..
@@ -161,6 +188,11 @@ pub(super) fn branch_selection(
             if !imported && branch[..index].iter().any(|prior| matches!(&prior.event, Event::ModelRequested { request_id: Some(id), .. } if id == request_id)) {
                 let mut change = None;
                 for (i, prior) in branch[..index].iter().enumerate().rev() {
+                    match &prior.event {
+                        Event::BranchModelSelected { provider, model, .. } => return BranchSelection::Selected { provider: provider.clone(), model: model.clone(), thinking },
+                        Event::BranchSummary { fallback_model: Some(selection), .. } => return BranchSelection::Selected { provider: selection.provider.clone(), model: selection.model.clone(), thinking },
+                        _ => {}
+                    }
                     if matches!(prior.event, Event::ModelSelected { .. }) {
                         let derived = i.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection" || (format == "pi" && parent.timestamp == prior.timestamp && prior.run_id.is_none())));
                         if !derived {
@@ -823,6 +855,7 @@ fn convert(
                     execution: serde_json::from_value(message.clone())?,
                 }),
                 "branchSummary" => events.push(Event::BranchSummary {
+                    fallback_model: None,
                     summary: required(message, "summary")?.into(),
                     extension_summary: None,
                     from: message["fromId"]
@@ -950,6 +983,7 @@ fn convert(
                     .collect()
             };
             events.push(Event::BranchSummary {
+                fallback_model: None,
                 summary: required(entry, "summary")?.into(),
                 extension_summary: (entry["fromHook"] == true).then(|| {
                     pi_rs::ExtensionTreeSummary {
