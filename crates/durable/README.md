@@ -110,8 +110,10 @@ saved by the runtime. Cursors are in-process handles, not a wire format.
 Tool progress is display-only: it is not a tool result or evidence that an effect
 is safe to replay. Each invocation uses a fresh attempt identity. Completion, abort and interruption retain the last committed partial in the
 sealed attempt snapshot and event. Older completed snapshots without a partial
-remain readable. Read it with `Snapshot::retained_partial()` or the terminal
-event’s `retained_partial` field. Retention does not turn progress into
+remain readable. Read completed partials with `Snapshot::retained_partial()` or
+the terminal event’s `retained_partial` field; aborted partials are in the state.
+Events set `partial_is_null` when the last partial is JSON null, distinguishing
+it from the absence of a partial. Retention does not turn progress into
 authoritative output.
 Callbacks are fenced by the conversation phase and attempt identity, and progress
 is sealed atomically with the corresponding transition. Legacy running attempts
@@ -134,7 +136,7 @@ progress events exist. Legacy running attempts without IDs remain undiscoverable
 a subsequent replay is recorded. Discovery and progress cursors are independent;
 process every discovered attempt and retain its progress cursor. Discovery orders
 claims, while progress ordering is only per attempt. Both logs grow without retention;
-progress records store whole replacement partials (running and aborted snapshots up to 1 MiB; completed envelopes up to 1 MiB plus 32 bytes). Pages bound record
+progress records store whole replacement partials (running and aborted snapshots up to 1 MiB). Completed snapshots that would exceed 1 MiB store the partial in an atomically written sidecar; versions before this change can read the completed state but cannot see sidecar partials. Versions before null markers also cannot distinguish JSON null from an absent partial. Pages bound record
 count, not total bytes; polling is synchronous and has no notification or automatic
 operation filter. This is not upstream's Chord operation stream.
 

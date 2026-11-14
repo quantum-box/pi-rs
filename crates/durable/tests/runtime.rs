@@ -1024,6 +1024,7 @@ struct ProgressTool {
     started: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     host: std::sync::Mutex<Option<Arc<dyn pi_rs_core::ToolHost>>>,
+    fail: bool,
 }
 #[async_trait]
 impl Tool for ProgressTool {
@@ -1050,7 +1051,11 @@ impl Tool for ProgressTool {
         *self.host.lock().unwrap() = Some(host);
         self.started.add_permits(1);
         self.release.acquire().await.unwrap().forget();
-        Outcome::Succeeded("ok".into())
+        if self.fail {
+            Outcome::Failed("failed".into())
+        } else {
+            Outcome::Succeeded("ok".into())
+        }
     }
 }
 
@@ -1063,6 +1068,7 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         host: std::sync::Mutex::new(None),
+        fail: false,
     });
     let opts = || Options {
         model: Arc::new(FakeModel {
@@ -1199,6 +1205,7 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         host: std::sync::Mutex::new(None),
+        fail: false,
     });
     let opts = || Options {
         model: Arc::new(FakeModel {
@@ -1281,10 +1288,7 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         .tool_progress_events(second.attempt_id, fresh.next, limit)
         .unwrap();
     assert_eq!(done.records.len(), 1);
-    assert_eq!(
-        done.records[0].value["state"],
-        json!({"state":"completed"})
-    );
+    assert_eq!(done.records[0].value["state"], json!({"state":"completed"}));
     assert_eq!(
         done.records[0].value["retained_partial"],
         json!({"text":"working"})
@@ -1308,4 +1312,69 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         completed.retained_partial(),
         Some(&json!({"text":"working"}))
     );
+}
+
+#[tokio::test]
+async fn failed_tool_retains_null_partial_in_snapshot_and_ordered_events() {
+    use pi_rs_durable::{
+        observer::Cursor,
+        runtime::Scheduler,
+        tool_progress::{Snapshot, State},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = Arc::new(ProgressTool {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        host: std::sync::Mutex::new(None),
+        fail: true,
+    });
+    let opts = Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![RegisteredTool {
+            tool: tool.clone(),
+            replay: ReplayPolicy::Safe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, opts).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let host = tool.host.lock().unwrap().as_ref().unwrap().clone();
+    host.report_progress(serde_json::Value::Null).await.unwrap();
+    tool.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    host.report_progress(json!("late")).await.unwrap();
+    drop(host);
+    drop(tool.host.lock().unwrap().take());
+    let events = scheduler
+        .tool_progress_events(
+            attempt.attempt_id,
+            Cursor(0),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(events.records.len(), 3);
+    assert_eq!(events.records[1].value["partial_is_null"], true);
+    assert_eq!(events.records[2].value["state"]["state"], "completed");
+    assert_eq!(events.records[2].value["partial_is_null"], true);
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let snapshot = Snapshot::load(&store, attempt.attempt_id).unwrap();
+    assert_eq!(snapshot.state(), &State::Completed);
+    assert_eq!(snapshot.retained_partial(), Some(&serde_json::Value::Null));
 }

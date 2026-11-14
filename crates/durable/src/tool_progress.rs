@@ -57,15 +57,35 @@ impl Snapshot {
                     return Err(Error::TooLarge);
                 }
                 let value: Value = serde_json::from_slice(&entry.value)?;
-                let state: State = serde_json::from_value(value.clone())?;
+                let mut state: State = serde_json::from_value(value.clone())?;
+                if value.get("partial_is_null") == Some(&Value::Bool(true)) {
+                    match &mut state {
+                        State::Running(partial) | State::Aborted(partial) => {
+                            *partial = Some(Value::Null)
+                        }
+                        State::Completed => {}
+                    }
+                }
                 if entry.value.len() > MAX_PROGRESS_BYTES && state != State::Completed {
                     return Err(Error::TooLarge);
                 }
                 let retained = if state == State::Completed {
-                    value
+                    let inline = value
                         .get("retained_partial")
-                        .filter(|v| !v.is_null())
-                        .cloned()
+                        .filter(|v| {
+                            !v.is_null() || value.get("partial_is_null") == Some(&Value::Bool(true))
+                        })
+                        .cloned();
+                    if inline.is_some() {
+                        inline
+                    } else if let Some(sidecar) = store.get(&retained_key(id))? {
+                        if sidecar.value.len() > MAX_COMPLETED_BYTES {
+                            return Err(Error::TooLarge);
+                        }
+                        Some(serde_json::from_slice(&sidecar.value)?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -122,7 +142,22 @@ impl Snapshot {
         let State::Running(partial) = &self.state else {
             return Err(Error::Finished);
         };
-        self.prepare_bytes(encode_completed(partial)?)
+        let encoded = encode_completed(partial)?;
+        if encoded.len() <= MAX_PROGRESS_BYTES {
+            self.prepare_bytes(encoded)
+        } else {
+            let mut prepared = self.prepare(&State::Completed)?;
+            let key = retained_key(self.id);
+            prepared.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            prepared.mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(partial.as_ref().expect("oversized partial"))?,
+            });
+            Ok(prepared)
+        }
     }
     fn prepare(&self, state: &State) -> Result<Prepared, Error> {
         self.prepare_bytes(encode(state)?)
@@ -134,18 +169,25 @@ impl Snapshot {
                 key: key.clone(),
                 expected: self.version.map_or(Expected::Missing, Expected::Version),
             }],
-            mutations: vec![Mutation::Put {
-                key,
-                value,
-            }],
+            mutations: vec![Mutation::Put { key, value }],
         })
     }
 }
 fn key(id: Uuid) -> Vec<u8> {
     format!("durable/tool-progress/{id}").into_bytes()
 }
+fn retained_key(id: Uuid) -> Vec<u8> {
+    format!("durable/tool-progress-retained/{id}").into_bytes()
+}
 fn encode(state: &State) -> Result<Vec<u8>, Error> {
-    let bytes = serde_json::to_vec(state)?;
+    let mut value = serde_json::to_value(state)?;
+    if matches!(
+        state,
+        State::Running(Some(Value::Null)) | State::Aborted(Some(Value::Null))
+    ) {
+        value["partial_is_null"] = Value::Bool(true);
+    }
+    let bytes = serde_json::to_vec(&value)?;
     if bytes.len() > MAX_PROGRESS_BYTES {
         return Err(Error::TooLarge);
     }
@@ -153,10 +195,14 @@ fn encode(state: &State) -> Result<Vec<u8>, Error> {
 }
 
 fn encode_completed(partial: &Option<Value>) -> Result<Vec<u8>, Error> {
-    let bytes = serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "state": "completed",
         "retained_partial": partial,
-    }))?;
+    });
+    if matches!(partial, Some(Value::Null)) {
+        value["partial_is_null"] = Value::Bool(true);
+    }
+    let bytes = serde_json::to_vec(&value)?;
     if bytes.len() > MAX_COMPLETED_BYTES {
         return Err(Error::TooLarge);
     }
@@ -427,6 +473,45 @@ mod tests {
         let completed = Snapshot::load(&store, id).unwrap();
         assert_eq!(completed.state(), &State::Completed);
         assert_eq!(completed.retained_partial(), Some(&partial));
+        let primary = store.get(&key(id)).unwrap().unwrap();
+        assert!(primary.value.len() <= MAX_PROGRESS_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<State>(&primary.value).unwrap(),
+            State::Completed
+        );
+    }
+    #[test]
+    fn null_partial_survives_checkpoint_completion_and_abort() {
+        let store = Store::memory().unwrap();
+        for complete in [false, true] {
+            let id = Uuid::new_v4();
+            let mut snapshot = Snapshot::load(&store, id).unwrap();
+            snapshot.update(Value::Null).unwrap();
+            let p = snapshot.prepare_checkpoint().unwrap();
+            store.commit(&p.checks, &p.mutations).unwrap();
+            let snapshot = Snapshot::load(&store, id).unwrap();
+            assert_eq!(snapshot.state(), &State::Running(Some(Value::Null)));
+            let p = if complete {
+                snapshot.prepare_complete()
+            } else {
+                snapshot.prepare_abort()
+            }
+            .unwrap();
+            store.commit(&p.checks, &p.mutations).unwrap();
+            let snapshot = Snapshot::load(&store, id).unwrap();
+            if complete {
+                assert_eq!(snapshot.retained_partial(), Some(&Value::Null));
+            } else {
+                assert_eq!(snapshot.state(), &State::Aborted(Some(Value::Null)));
+            }
+        }
+        let id = Uuid::new_v4();
+        let p = Snapshot::load(&store, id)
+            .unwrap()
+            .prepare_complete()
+            .unwrap();
+        store.commit(&p.checks, &p.mutations).unwrap();
+        assert_eq!(Snapshot::load(&store, id).unwrap().retained_partial(), None);
     }
     #[test]
     fn stale_commit_and_oversize_are_rejected() {

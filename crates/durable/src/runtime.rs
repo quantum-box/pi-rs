@@ -718,6 +718,7 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
                             "conversation_id": self.conversation,
                             "attempt": self.attempt,
                             "state": snapshot.state(),
+                            "partial_is_null": matches!(snapshot.state(), crate::tool_progress::State::Running(Some(serde_json::Value::Null))),
                         }))?;
                 batch.checks.extend(event.checks);
                 batch.mutations.extend(event.mutations);
@@ -1783,6 +1784,7 @@ impl Harness {
                         "attempt": attempt,
                         "state": terminal,
                         "retained_partial": retained_partial,
+                        "partial_is_null": matches!(snapshot.state(), crate::tool_progress::State::Running(Some(serde_json::Value::Null))),
                     }))?;
                     checks.extend(event.checks);
                     mutations.extend(event.mutations);
