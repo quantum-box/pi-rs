@@ -391,6 +391,23 @@ still subject to the host's existing idle/manual and context-selection limits.
 
 ### Experimental custom documents and checked composition
 
+`Documents::watch` returns an initial document (including absence) at an
+immutable database-local revision and a pull-based `DocumentWatch`. `poll`
+returns up to 256 subsequent committed states in revision order, including
+deletes; an empty page means caught up at the time of the query. Save the
+cursor after processing the whole page and use `resume_watch` with the same
+database and address after reopening. Replaying from an older cursor can
+repeat states. A cursor is not an acknowledgement or a portable database ID;
+callers must retain its database and address and schedule their own polling.
+
+This is a subset of upstream `watchDoc`: it exposes whole committed states,
+not Chord operations, callbacks, abort/lifecycle handling or live notifications.
+Multiple mutations of one key in a single raw batch collapse to the final
+state, and raw deletes of missing keys still appear. Pages bound the number of
+states, not their bytes, and history has no garbage collection. Legacy databases
+start with their live documents at revision zero; earlier changes cannot be
+replayed. Only writes through this storage implementation are recorded.
+
 `document::Documents` reads application-addressed JSON objects with store
 versions. `document::Transaction` stages version-checked puts and deletes for
 atomic commit, and can append `TaskStore::prepare_save` or

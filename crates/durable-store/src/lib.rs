@@ -222,6 +222,47 @@ impl Store {
         }
     }
 
+    /// Ordered committed states for one document after a database-local revision.
+    /// A delete is represented by None. The page contains at most 256 states.
+    pub fn document_changes(
+        &self,
+        key: &[u8],
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Option<Entry>)>, Error> {
+        if !key.starts_with(b"durable/document/") || limit == 0 || limit > 256 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if after > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let mut stmt = conn.prepare("SELECT revision,value,version FROM durable_document_history WHERE key=?1 AND revision>?2 ORDER BY revision LIMIT ?3")?;
+        let rows = stmt.query_map(params![key, after, limit as i64], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get::<_, Option<u64>>(2)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (revision, value, version) = row?;
+            let entry = match (value, version) {
+                (Some(value), Some(version)) => Some(Entry { value, version }),
+                (None, None) => None,
+                _ => return Err(Error::Storage(rusqlite::Error::InvalidQuery)),
+            };
+            result.push((revision, entry));
+        }
+        Ok(result)
+    }
+
     /// Document revision recorded atomically with a conversation fork record.
     pub fn document_cut(&self, key: &[u8]) -> Result<Option<u64>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;

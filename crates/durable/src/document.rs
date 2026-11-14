@@ -51,12 +51,77 @@ pub struct Document {
     pub version: u64,
 }
 
+/// A database-local committed document state, including deletion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentRevision {
+    pub revision: u64,
+    pub document: Option<Document>,
+}
+
+/// Pull-based watch. Persist the cursor only after consuming its entire page.
+pub struct DocumentWatch<'a> {
+    store: &'a Store,
+    key: Vec<u8>,
+    cursor: u64,
+}
+impl DocumentWatch<'_> {
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Return at most `limit` changes (1..=256), without waiting.
+    /// On error the cursor is unchanged.
+    pub fn poll(&mut self, limit: usize) -> Result<Vec<DocumentRevision>, Error> {
+        let changes = self.store.document_changes(&self.key, self.cursor, limit)?;
+        let result = changes
+            .into_iter()
+            .map(|(revision, entry)| {
+                Ok(DocumentRevision {
+                    revision,
+                    document: Documents::decode(entry)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        if let Some(last) = result.last() {
+            self.cursor = last.revision;
+        }
+        Ok(result)
+    }
+}
+
 pub struct Documents<'a> {
     store: &'a Store,
 }
 impl<'a> Documents<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self { store }
+    }
+    /// Attach at a consistent immutable boundary, even if a writer commits
+    /// between capturing the boundary and reading the initial document.
+    pub fn watch(&self, address: &Address) -> Result<(DocumentRevision, DocumentWatch<'a>), Error> {
+        let key = address.storage_key()?;
+        let revision = self.store.document_snapshot()?;
+        let document = Self::decode(self.store.document_at(&key, revision)?)?;
+        Ok((
+            DocumentRevision { revision, document },
+            DocumentWatch {
+                store: self.store,
+                key,
+                cursor: revision,
+            },
+        ))
+    }
+
+    /// Resume after a previously consumed cursor in the same database.
+    pub fn resume_watch(&self, address: &Address, cursor: u64) -> Result<DocumentWatch<'a>, Error> {
+        let key = address.storage_key()?;
+        // Validate the boundary without consuming changes.
+        self.store.document_at(&key, cursor)?;
+        Ok(DocumentWatch {
+            store: self.store,
+            key,
+            cursor,
+        })
     }
     /// Capture a store-wide document boundary, reusable after reopen.
     pub fn snapshot(&self) -> Result<u64, Error> {
