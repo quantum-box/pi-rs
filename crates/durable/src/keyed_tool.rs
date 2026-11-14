@@ -184,6 +184,12 @@ impl StreamOutput {
     }
 }
 struct StreamGuard(Arc<StreamInner>);
+impl StreamGuard {
+    async fn finish(&self) -> tokio::sync::MutexGuard<'_, StreamState> {
+        self.0.open.store(false, Ordering::Release);
+        self.0.state.lock().await
+    }
+}
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         self.0.open.store(false, Ordering::Release);
@@ -224,8 +230,9 @@ impl<T: StreamedTool> KeyedTool for StreamedToolAdapter<T> {
             .0
             .invoke(arguments, context, state, host, StreamOutput(inner.clone()))
             .await;
-        let state = inner.state.lock().await;
-        drop(guard);
+        // Close before waiting for an in-flight append, so queued or detached
+        // writers cannot start recording after the tool has returned.
+        let state = guard.finish().await;
         if state.failed {
             return Outcome::Unknown(
                 "streamed output recording failed; reconciliation required".into(),
@@ -440,6 +447,26 @@ mod tests {
         assert!(output.append("never committed").await.is_err());
         assert!(output.0.state.lock().await.failed);
         assert!(output.0.state.lock().await.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finishing_revokes_queued_writers_before_waiting_for_active_append() {
+        let sink = Arc::new(RecordingSink {
+            fail: false,
+            values: Mutex::new(Vec::new()),
+        });
+        let (output, guard) = test_output(sink.clone());
+        let active = output.0.state.lock().await;
+        let queued = output.append("late");
+        tokio::pin!(queued);
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        let finishing = guard.finish();
+        tokio::pin!(finishing);
+        assert!(futures_util::poll!(finishing.as_mut()).is_pending());
+        drop(active);
+        assert!(queued.await.is_err());
+        assert!(finishing.await.text.is_empty());
+        assert!(sink.values.lock().unwrap().is_empty());
     }
 
     #[test]
