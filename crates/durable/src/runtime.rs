@@ -7642,6 +7642,7 @@ pub(crate) async fn drive_scheduled<'a>(
     guard: &mut Option<tokio::sync::MutexGuard<'a, ()>>,
     errors: Option<&std::sync::Mutex<HashMap<Uuid, String>>>,
 ) -> Result<(), Error> {
+    let next_poll = worker.owner.conversation_controls().get(id).next_poll;
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -7711,17 +7712,37 @@ pub(crate) async fn drive_scheduled<'a>(
         if !should_poll {
             return Ok(());
         }
-        // `drive` has returned at a persisted wait boundary. No dispatch future
-        // remains live, so another worker can safely inspect and drive it.
-        drop(guard.take());
-        tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(1)) => () }
-        *guard = Some(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            guard = lock.lock() => guard,
-        });
-        if cancel.is_cancelled() {
-            return Ok(());
+        // Every successful drive moves the shared periodic deadline. Explicit
+        // scheduling still drives immediately, while existing parked drivers
+        // share one poll per interval instead of each starting its own timer.
+        *next_poll.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        loop {
+            let deadline = next_poll
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("deadline set while holding worker lock");
+            // No dispatch future remains live at this persisted wait boundary.
+            drop(guard.take());
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep_until(deadline) => (),
+            }
+            *guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                guard = lock.lock() => guard,
+            });
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let deadline = next_poll
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("deadline set while holding worker lock");
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
         }
         // This driver has taken over from any owner that failed while it was
         // parked. Publish that takeover before attempting recovery, just as a
@@ -8115,6 +8136,81 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+
+    #[tokio::test]
+    async fn parked_driver_takes_over_after_another_driver_is_cancelled() {
+        struct PendingTool(Arc<Semaphore>);
+        #[async_trait::async_trait]
+        impl Tool for PendingTool {
+            fn spec(&self) -> pi_rs_core::ToolSpec {
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn can_poll(&self) -> bool {
+                true
+            }
+            async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+                panic!("pending operation must not be dispatched again")
+            }
+            async fn poll(&self, _: &str, _: pi_rs_core::ToolContext) -> Option<Outcome> {
+                self.0.add_permits(1);
+                Some(Outcome::Pending {
+                    reference: "job".into(),
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let polls = Arc::new(Semaphore::new(0));
+        let mut opts = options(placement_model());
+        opts.tools.push(RegisteredTool {
+            tool: Arc::new(PendingTool(polls.clone())),
+            replay: ReplayPolicy::Unsafe,
+        });
+        let mut harness = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        let (mut state, version) = harness.load(id).unwrap();
+        state.phase = Phase::Pending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: Uuid::new_v4(),
+            reference: "job".into(),
+            arguments: None,
+        };
+        harness.save(&state, Expected::Version(version)).unwrap();
+        let control = harness.owner.conversation_controls().get(id);
+        let start = |mut worker: Harness, cancel: CancellationToken| {
+            let control = control.clone();
+            tokio::spawn(async move {
+                worker.execution_gate = Some(control.gate);
+                let lock = control.worker;
+                let mut guard = Some(lock.lock().await);
+                drive_scheduled(&mut worker, id, &cancel, &lock, &mut guard, None).await
+            })
+        };
+        let first_cancel = CancellationToken::new();
+        let first = start(harness.worker(), first_cancel.clone());
+        polls.acquire().await.unwrap().forget();
+        let second_cancel = CancellationToken::new();
+        let second = start(harness.worker(), second_cancel.clone());
+        polls.acquire().await.unwrap().forget();
+        second_cancel.cancel();
+        second.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), polls.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        first_cancel.cancel();
+        first.await.unwrap().unwrap();
     }
     fn placement_model() -> Arc<GatedModel> {
         Arc::new(GatedModel {

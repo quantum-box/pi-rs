@@ -293,7 +293,9 @@ async fn abort_with_retry_queued_at_sleeping_gate() {
         .unwrap()
         .forget();
     // Abort fences both the parked worker and the newly admitted retry.
-    scheduler.schedule(id);
+    for _ in 0..8 {
+        scheduler.schedule(id);
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         scheduler.abort_and_wait(id),
@@ -334,6 +336,10 @@ async fn scheduled_retry_wakes_a_parked_hook() {
         .unwrap()
         .unwrap()
         .forget();
+    for _ in 0..8 {
+        scheduler.schedule(id);
+    }
+    tokio::task::yield_now().await;
     scheduler
         .send_signal(&Signal::new(
             Uuid::new_v4(),

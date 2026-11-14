@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -16,6 +17,9 @@ use uuid::Uuid;
 pub struct Control {
     pub gate: Arc<Mutex<()>>,
     pub worker: Arc<tokio::sync::Mutex<()>>,
+    /// Next periodic drive, shared by all owners of this conversation.
+    /// Read or update only while holding `worker`.
+    pub next_poll: Arc<Mutex<Option<Instant>>>,
     pub cancel: CancellationToken,
     /// Cleanup survives scheduler shutdown but is fenced by later aborts.
     pub cleanup_cancel: CancellationToken,
@@ -46,6 +50,7 @@ impl ConversationControls {
             .or_insert_with(|| Control {
                 gate: Arc::new(Mutex::new(())),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
+                next_poll: Arc::new(Mutex::new(None)),
                 cancel: self.root.child_token(),
                 cleanup_cancel: CancellationToken::new(),
             })

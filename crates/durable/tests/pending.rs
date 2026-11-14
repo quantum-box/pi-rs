@@ -350,6 +350,61 @@ async fn next_poll(job: &ParkedJob) {
 }
 
 #[tokio::test]
+async fn retries_share_one_periodic_poller_and_shutdown_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = Arc::new(ParkedJob {
+        calls: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+        seen: tokio::sync::Semaphore::new(0),
+        finish: std::sync::atomic::AtomicBool::new(false),
+        panic_next: std::sync::atomic::AtomicBool::new(false),
+    });
+    let path = dir.path().join("db");
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(&path, parked_options(job.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    next_poll(&job).await;
+    for _ in 0..8 {
+        scheduler.schedule(id);
+    }
+    for _ in 0..8 {
+        next_poll(&job).await;
+    }
+    // All retries are parked. Only one periodic poll should occur in the
+    // next interval, even though every retry remains a potential takeover.
+    tokio::time::timeout(std::time::Duration::from_secs(3), job.seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), job.seen.acquire())
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    job.finish.store(true, Ordering::SeqCst);
+    let mut reopened =
+        pi_rs_durable::runtime::Scheduler::open(&path, parked_options(job.clone())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), reopened.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.calls.load(Ordering::SeqCst), 1);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn scheduled_retry_can_drive_a_parked_worker_without_redispatch() {
     let dir = tempfile::tempdir().unwrap();
     let job = Arc::new(ParkedJob {
