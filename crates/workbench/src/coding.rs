@@ -1824,11 +1824,7 @@ impl RemoteShellTool {
             .map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?
             .ok_or_else(|| {
                 Error::Config(shell_status(
-                    if output.display.is_empty() {
-                        "(no output)"
-                    } else {
-                        &output.display
-                    },
+                    &output.result_display(),
                     "Command terminated without an exit code",
                 ))
             })?;
@@ -1896,17 +1892,13 @@ impl Tool for RemoteShellTool {
 }
 
 fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
+    let text = output.result_display();
     let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
     if output.script_truncated
         && let Some(path) = &output.path
     {
         structured_content["full_output_path"] = json!(path);
     }
-    let text = if output.display.is_empty() {
-        "(no output)".into()
-    } else {
-        output.display
-    };
     Outcome::TextResultWithStructuredContent {
         output: if code == 0 {
             text
@@ -2715,7 +2707,12 @@ impl CodingTool {
         let mut grep = if is_find {
             None
         } else {
-            Some(crate::file_search::Grep::new(args, limit)?)
+            let grep = crate::file_search::Grep::new(args, limit)?;
+            Some(if base.is_file() {
+                grep.with_explicit_file()
+            } else {
+                grep
+            })
         };
         let mut results = Vec::new();
         let mut walker = ignore::WalkBuilder::new(&base);
@@ -2907,13 +2904,8 @@ impl CodingTool {
             )));
         }
         if self.unrestricted && result.status.code().is_none() {
-            let text = if result.output.display.is_empty() {
-                "(no output)"
-            } else {
-                &result.output.display
-            };
             return Err(Error::Config(shell_status(
-                text,
+                &result.output.result_display(),
                 "Command terminated without an exit code",
             )));
         }
@@ -3576,6 +3568,38 @@ mod tests {
         );
         assert!(details.is_some());
         std::fs::remove_file(structured_content["full_output_path"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+        for code in [0, 2] {
+            let input = format!("{}\n", "x".repeat(300_000));
+            let mut output = super::super::shell_output::Accumulator::default();
+            for chunk in input.as_bytes().chunks(313) {
+                output.append(chunk).unwrap();
+            }
+            let output = output.finish().unwrap();
+            let path = output.path.clone().unwrap();
+            let outcome = super::shell_outcome(output, code, 0.0);
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                details,
+                structured_content,
+                is_error,
+            } = outcome
+            else {
+                panic!("missing structured result")
+            };
+            assert!(output.starts_with(
+                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
+            ));
+            assert_eq!(is_error, code != 0);
+            assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(structured_content["output"], input);
+            assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
+            std::fs::remove_file(path).unwrap();
+        }
     }
     use super::*;
 
@@ -5435,6 +5459,35 @@ mod tests {
                 "main.rs:1: needle"
             );
         }
+    }
+
+    #[test]
+    fn grep_explicit_binary_file_and_directory_use_distinct_binary_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("binary.dat"),
+            b"match first\nnext line\n\0remaining match\n",
+        )
+        .unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"match", "path":"binary.dat"}), &token)
+                .unwrap()
+                .tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"match"}), &token)
+                .unwrap()
+                .tool_content(),
+            "No matches found"
+        );
     }
 
     #[cfg(unix)]
