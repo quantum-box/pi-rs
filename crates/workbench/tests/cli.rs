@@ -2456,6 +2456,159 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
 }
 
 #[test]
+fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[{"id":"configured"}]}}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let server = std::thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line.is_empty() {
+                continue;
+            }
+            let request = line.clone();
+            let mut length = 0;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; length];
+            reader.read_exact(&mut request_body).unwrap();
+            let body = if request.starts_with("GET /v1/models ") {
+                r#"{"data":[{"id":"dynamic"}]}"#
+            } else if request.starts_with("GET /api/ps ") {
+                r#"{"models":[]}"#
+            } else if request.starts_with("POST /api/show ") {
+                r#"{"capabilities":["vision"]}"#
+            } else {
+                panic!("unexpected request {request}")
+            };
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--workspace",
+            root.path().to_str().unwrap(),
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--model",
+            "dynamic",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut request = |value: Value| -> Value {
+        let id = value["id"].clone();
+        writeln!(input, "{value}").unwrap();
+        loop {
+            let response = receiver
+                .recv_timeout(Duration::from_secs(20))
+                .expect("RPC response");
+            if response["id"] == id {
+                assert_eq!(response["success"], true, "{response}");
+                break response["data"].clone();
+            }
+        }
+    };
+    let models = request(json!({"type":"get_available_models", "id":"models"}));
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+    );
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "configured" && m["input"] == json!(["text"]))
+    );
+    let selected = request(
+        json!({"type":"set_model", "id":"dynamic", "provider":"ollama", "modelId":"dynamic"}),
+    );
+    assert_eq!(selected["input"], json!(["text", "image"]));
+    let state = request(json!({"type":"get_state", "id":"state"}));
+    assert_eq!(state["model"]["input"], json!(["text", "image"]));
+    let selected = request(
+        json!({"type":"set_model", "id":"configured", "provider":"ollama", "modelId":"configured"}),
+    );
+    assert_eq!(selected["input"], json!(["text"]));
+    let state = request(json!({"type":"get_state", "id":"state2"}));
+    assert_eq!(state["model"]["input"], json!(["text"]));
+    drop(input);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn rpc_model_discovery_does_not_block_other_commands() {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
