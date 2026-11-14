@@ -1512,7 +1512,10 @@ fn slice_tree_spans(
     start: usize,
     width: usize,
 ) -> Vec<super::render::Span> {
-    let end = start.saturating_add(width);
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut end = start.saturating_add(width);
     let mut column = 0usize;
     let mut result = Vec::new();
     for span in spans {
@@ -1520,14 +1523,12 @@ fn slice_tree_spans(
         piece.text.clear();
         for grapheme in span.text.graphemes(true) {
             let next = column.saturating_add(grapheme.width());
-            if next > start && column < end {
-                if column >= start && next <= end {
-                    piece.text.push_str(grapheme);
-                } else {
-                    piece
-                        .text
-                        .push_str(&" ".repeat(next.min(end).saturating_sub(column.max(start))));
-                }
+            if column < start && next > start {
+                // Start at the next complete grapheme and use the freed
+                // column for content rather than emitting half a character.
+                end = end.saturating_add(next - start);
+            } else if column >= start && column < end && next <= end {
+                piece.text.push_str(grapheme);
             }
             column = next;
             if column >= end {
@@ -2187,7 +2188,7 @@ mod tests {
         let sliced = slice_tree_spans(&[span], 2, 4);
         assert_eq!(
             sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
-            " 本e\u{301}"
+            "本e\u{301}z"
         );
         assert!(
             sliced
@@ -2195,6 +2196,27 @@ mod tests {
                 .all(|s| s.bold && s.color == crossterm::style::Color::Red)
         );
         assert!(slice_tree_spans(&sliced, 0, 0).is_empty());
+        let first = super::super::render::Span::new("日", crossterm::style::Color::Blue);
+        let mut second = super::super::render::Span::new("本abc", crossterm::style::Color::Green);
+        second.bold = true;
+        let sliced = slice_tree_spans(&[first, second], 1, 4);
+        assert_eq!(
+            sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "本ab"
+        );
+        assert!(
+            sliced
+                .iter()
+                .all(|s| s.bold && s.color == crossterm::style::Color::Green)
+        );
+        let span = super::super::render::Span::new("a日b", crossterm::style::Color::Red);
+        assert_eq!(
+            slice_tree_spans(&[span], 0, 2)
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "a"
+        );
     }
 
     #[test]

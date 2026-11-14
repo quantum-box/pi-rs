@@ -1474,7 +1474,9 @@ The active branch is listed first at each fork and marked along its path.
 Branch connectors and gutters are rebuilt from the visible tree after filtering,
 so descendants attach to their nearest visible ancestor. Deep trees pan
 horizontally to keep the selected entry visible while retaining the selection
-gutter; clipping preserves wide characters and theme styling.
+gutter; clipping preserves wide characters and theme styling. When the left
+edge crosses a wide character, it skips that character and fills the freed
+column with following content; Pi keeps the original right boundary instead.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label without changing its identity. Direct `/checkout` releases its
 journal lock before restoring the view.
