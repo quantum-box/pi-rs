@@ -388,9 +388,9 @@ impl<'a> Documents<'a> {
     }
 }
 
-/// An all-or-nothing collection of checked writes. Duplicate keys are rejected
-/// across components, including duplicate checks; this prevents silently
-/// overriding a participant's write or condition. Read-only checks are allowed.
+/// An all-or-nothing collection of checked writes. Identical checks may be
+/// shared, but writes must be unique and ownership insertions must not
+/// invalidate another component's view of the graph.
 #[derive(Default)]
 pub struct Transaction {
     checks: Vec<Check>,
@@ -472,6 +472,22 @@ impl Transaction {
             if !local_checks.contains(key) || !writes.insert(key.clone()) {
                 return Err(Error::InvalidBatch);
             }
+        }
+        // Independently prepared graph changes can each observe a missing
+        // owner and together introduce a cycle. Checks see the pre-commit
+        // state, so identical checks alone cannot detect this composition.
+        let graph_key = |key: &[u8]| {
+            key.starts_with(crate::task_store::PREFIX)
+                || key.starts_with(crate::ownership_edge::PREFIX)
+        };
+        if batch.checks.iter().any(|check| {
+            graph_key(&check.key)
+                && check.expected == Expected::Missing
+                && ((self.checked.contains(&check.key) && writes.contains(&check.key)
+                    && !self.written.contains(&check.key))
+                    || self.written.contains(&check.key))
+        }) {
+            return Err(Error::InvalidBatch);
         }
         self.checked = checks;
         self.written = writes;
@@ -833,6 +849,55 @@ mod nested_entry_tests {
         tx.append(batch(Expected::Missing)).unwrap();
         assert!(matches!(tx.append(batch(Expected::Version(1))), Err(Error::InvalidBatch)));
         tx.commit(&Store::memory().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn transaction_rejects_independently_prepared_ownership_cycles() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let a = task(1, TaskOwner::Task(Uuid::from_u128(2)));
+        let b = task(2, TaskOwner::Task(a.id()));
+        for reverse in [false, true] {
+            let first = ts.prepare_save(&[Save::Create(if reverse { &b } else { &a })]).unwrap();
+            let second = ts.prepare_save(&[Save::Create(if reverse { &a } else { &b })]).unwrap();
+            let mut tx = Transaction::new();
+            tx.append(first).unwrap();
+            assert!(matches!(tx.append(second), Err(Error::InvalidBatch)));
+            tx.commit(&db).unwrap();
+            assert!(ts.load(if reverse { b.id() } else { a.id() }).unwrap().is_some());
+            // Start the next ordering against the same empty graph.
+            let id = if reverse { b.id() } else { a.id() };
+            db.commit(&[], &[Mutation::Delete { key: crate::task_store::key(id) }]).unwrap();
+        }
+    }
+
+    #[test]
+    fn transaction_allows_shared_missing_ownership_roots() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let a = task(1, TaskOwner::Task(Uuid::from_u128(3)));
+        let b = task(2, TaskOwner::Task(Uuid::from_u128(3)));
+        let mut tx = Transaction::new();
+        tx.append(ts.prepare_save(&[Save::Create(&a)]).unwrap()).unwrap();
+        tx.append(ts.prepare_save(&[Save::Create(&b)]).unwrap()).unwrap();
+        tx.commit(&db).unwrap();
+        assert_eq!(ts.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn transaction_rejects_cross_component_missing_edge_in_both_orders() {
+        let key = crate::ownership_edge::edge_key(Uuid::from_u128(7));
+        for write_first in [false, true] {
+            let check = Check { key: key.clone(), expected: Expected::Missing };
+            let read = || OwnedBatch { checks: vec![check.clone()], mutations: vec![] };
+            let write = || OwnedBatch {
+                checks: vec![check.clone()],
+                mutations: vec![Mutation::Put { key: key.clone(), value: vec![] }],
+            };
+            let mut tx = Transaction::new();
+            tx.append(if write_first { write() } else { read() }).unwrap();
+            assert!(matches!(tx.append(if write_first { read() } else { write() }), Err(Error::InvalidBatch)));
+        }
     }
 
     fn task(id: u128, owner: TaskOwner) -> Task {
