@@ -282,6 +282,21 @@ impl SessionSnapshot {
         }
     }
 
+    // The disk read may have completed before an in-flight run settled.
+    // Only advance this append-only snapshot when every retained record agrees.
+    fn refresh_if_extends(&mut self, session: &Session) {
+        let current = session.records();
+        if self.records.is_empty() || current.len() < self.records.len() {
+            return;
+        }
+        let extends = self.records.iter().zip(current).all(|(previous, next)| {
+            matches!((serde_json::to_vec(previous), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+        });
+        if extends {
+            self.refresh(session);
+        }
+    }
+
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
         if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
             *existing = record.clone();
@@ -292,6 +307,22 @@ impl SessionSnapshot {
             .as_mut()
             .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
     }
+}
+
+fn snapshot_for_share(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+) -> Result<super::sessions::ShareSnapshot> {
+    let state = active.lock().expect("worker control");
+    let mut snapshot = snapshot.lock().expect("session snapshot");
+    if state.token.is_none()
+        && state.queued == 0
+        && let Some(current) = current
+    {
+        snapshot.refresh_if_extends(&current);
+    }
+    snapshot.share_snapshot()
 }
 
 struct ShellRunner {
@@ -1412,22 +1443,10 @@ fn read_requests(
                         }
                         // Refresh frontend edits to the same journal only while idle.
                         let current = Session::snapshot(&session).ok();
-                        let result = {
-                            let state = active.lock().expect("worker control");
-                            let mut snapshot = snapshot.lock().expect("session snapshot");
-                            if state.token.is_none()
-                                && state.queued == 0
-                                && let Some(current) = current
-                                && Session::from_records(snapshot.records.clone()).is_ok_and(
-                                    |previous| previous.session_id() == current.session_id(),
-                                )
-                            {
-                                snapshot.refresh(&current);
-                            }
-                            snapshot.share_snapshot().and_then(|snapshot| {
+                        let result =
+                            snapshot_for_share(&active, &snapshot, current).and_then(|snapshot| {
                                 serde_json::to_value(snapshot).map_err(Into::into)
-                            })
-                        };
+                            });
                         control_response("get_share_context", id, result);
                     });
                 }
@@ -1658,6 +1677,85 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn delayed_share_disk_read_cannot_rewind_settled_worker_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        });
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState {
+            token: Some(CancellationToken::new()),
+            ..Default::default()
+        }));
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            let active = active.clone();
+            let path = path.clone();
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                read_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                snapshot_for_share(&active, &snapshot, Some(stale)).unwrap()
+            }
+        });
+        read_rx.recv().unwrap();
+        session
+            .append_user_with_images("committed while reading".into(), vec![], None)
+            .unwrap();
+        {
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        }
+        let committed_head = session.head();
+        resume_tx.send(()).unwrap();
+        let result = reader.join().unwrap();
+        assert_eq!(result.head, committed_head);
+        assert_eq!(result.context.system_prompt, "live");
+        session
+            .append_user_with_images("later event".into(), vec![], None)
+            .unwrap();
+        let mut worker = snapshot.lock().unwrap();
+        let entries = worker.record(session.records().last().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], session.head().to_string());
+        assert_eq!(entries[0]["message"]["content"], "later event");
+        assert_eq!(worker.share_snapshot().unwrap().head, session.head());
+    }
+
+    #[test]
+    fn idle_share_rejects_divergent_journal_prefix() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), vec![], None)
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut records = session.records().to_vec();
+        if let Event::User { content, .. } = &mut records[1].event {
+            *content = "changed".into();
+        } else {
+            panic!("expected user record");
+        }
+        let mut replacement = Session::from_records(records).unwrap();
+        replacement
+            .append_user_with_images("new".into(), vec![], None)
+            .unwrap();
+        snapshot.refresh_if_extends(&replacement);
+        assert_eq!(snapshot.records.len(), session.records().len());
+        assert!(
+            matches!(&snapshot.records[1].event, Event::User { content, .. } if content == "original")
+        );
+    }
 
     #[test]
     fn selected_catalog_survives_settling_and_uses_runtime_prompt() {

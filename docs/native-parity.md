@@ -3124,8 +3124,10 @@ Terminal `/share` appends Pi's `pi.share` entry with the active system prompt
 and tool schemas to Radius uploads. Idle shares use the worker's current
 runtime and branch; shares during a model request use the actual request context.
 The snapshot is matched to the session and head before upload, and a changed
-session requires a retry. If a request's journal entry and context are not
-yet paired, the upload proceeds without metadata. Refreshed runtime prompts and
+session requires a retry. Idle refreshes accept a disk snapshot only when it
+extends the worker's retained journal, preventing a delayed read from rewinding
+its entry projection. If a request's journal entry and context are not yet
+paired, the upload proceeds without metadata. Refreshed runtime prompts and
 tool catalogs remain selected after the run settles; summary requests do not replace
 the active context. The metadata is not written to the journal, and the 128 MiB share limit includes
 it. Gist sharing continues to export HTML. When runtime metadata is unavailable, including missing model credentials,
