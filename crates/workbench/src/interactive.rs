@@ -40,7 +40,9 @@ use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
 
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
-    let mut output = execution.output.clone();
+    // Finish stripping the untrusted output before adding host-generated
+    // status, so an unfinished escape cannot consume the status or path.
+    let mut output = crate::ui::render::strip_shell_ansi(&execution.output);
     let status = if execution.cancelled {
         Some("(cancelled)".to_owned())
     } else {
@@ -8382,6 +8384,79 @@ mod tests {
             TranscriptOptions::default(),
         );
         assert!(rendered.iter().flat_map(|line| &line.spans).any(|span| span.text.contains("STREAM") && span.color == theme.color("toolOutput")));
+    }
+
+    #[test]
+    fn incomplete_shell_escapes_cannot_hide_completion_status() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let imported_output = "imported\u{1b}]8;;unterminated";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":imported_output,"exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/imported-output"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let extension_output = "extension\u{1b}[31";
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: extension_output.into(),
+                exit_code: None,
+                cancelled: true,
+                truncated: true,
+                full_output_path: Some("/tmp/extension-output".into()),
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let text = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        for expected in [
+            "imported",
+            "(exit 1)",
+            "/tmp/imported-output",
+            "extension",
+            "(cancelled)",
+            "/tmp/extension-output",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(!text.contains("unterminated") && !text.contains("[31"));
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(executions[0].output, imported_output);
+        assert_eq!(executions[1].output, extension_output);
+        assert!(executions[0].context_text().contains(imported_output));
+        assert!(executions[1].context_text().contains(extension_output));
     }
 
     #[test]

@@ -526,7 +526,7 @@ pub fn clean(text: &str) -> String {
         .replace('\t', "    ")
 }
 
-fn strip_shell_ansi(text: &str) -> String {
+pub(crate) fn strip_shell_ansi(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut result = String::with_capacity(text.len());
     while let Some(ch) = chars.next() {
