@@ -8,8 +8,20 @@ pub(super) const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", 
 pub(super) fn reported(args: &Cli) -> Option<&[String]> {
     args.thinking_profile
         .as_ref()
-        .filter(|(model, _)| model == &args.model)
-        .map(|(_, levels)| levels.as_slice())
+        .filter(|(model, _, _)| model == &args.model)
+        .map(|(_, levels, _)| levels.as_slice())
+}
+
+pub(super) fn adopted_reasoning(args: &Cli) -> Option<bool> {
+    args.thinking_profile
+        .as_ref()
+        .filter(|(model, _, _)| model == &args.model)
+        .and_then(|(_, _, reasoning)| *reasoning)
+        .or_else(|| {
+            args.model_profiles
+                .model(&args.provider, &args.model)
+                .and_then(|model| model.reasoning)
+        })
 }
 
 pub(super) fn available(args: &mut Cli) -> Vec<String> {
@@ -45,7 +57,11 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         });
     if let Some(levels) = configured.as_ref().filter(|_| !discover_first) {
         let levels = filter_levels(levels.clone());
-        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+        args.thinking_profile = Some((
+            args.model.clone(),
+            levels.clone(),
+            metadata.as_ref().and_then(|model| model.reasoning),
+        ));
         return levels;
     }
     let fallback = || match adapter {
@@ -100,9 +116,9 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     .join()
     .ok()
     .flatten();
-    if let Some(levels) = discovered {
+    if let Some((levels, reasoning)) = discovered {
         let levels = filter_levels(levels);
-        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+        args.thinking_profile = Some((args.model.clone(), levels.clone(), reasoning));
         levels
     } else {
         filter_levels(configured.unwrap_or_else(fallback))
@@ -146,11 +162,8 @@ pub(super) fn set(args: &mut Cli, requested: &str) -> Result<()> {
 }
 
 pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
-    let reasoning = args
-        .model_profiles
-        .model(&args.provider, &args.model)
-        .and_then(|model| model.reasoning);
     let levels = available(args);
+    let reasoning = adopted_reasoning(args);
     if levels.is_empty() || (reasoning != Some(true) && levels.iter().all(|level| level == "off")) {
         return Ok(None);
     }
@@ -270,6 +283,9 @@ mod tests {
                 "fixture",
             ])
             .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            args.session = directory.path().join("session.jsonl");
+            args.thinking = None;
             args.model_profiles =
                 super::super::model_profiles::Profiles::parse(&serde_json::json!({
                     "providers":{"anthropic":{"models":[{"id":"fixture-model","reasoning":true}]}}
@@ -281,6 +297,12 @@ mod tests {
                 assert_eq!(reported(&args).unwrap(), expected);
             } else {
                 assert!(reported(&args).is_none());
+            }
+            if expected == ["off"] {
+                assert_eq!(adopted_reasoning(&args), Some(false));
+                assert_eq!(cycle(&mut args).unwrap(), None);
+                assert!(!args.session.exists());
+                assert!(args.selection_events.is_empty());
             }
             server.join().unwrap();
         }

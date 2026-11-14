@@ -533,8 +533,9 @@ struct ThinkingSettings {
     overrides: serde_json::Map<String, Value>,
     model_picker: Option<Picker>,
     selected: Option<String>,
-    levels: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    levels: Option<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>>,
     available_levels: Vec<String>,
+    available_reasoning: Option<bool>,
 }
 
 struct PendingThinking {
@@ -3983,12 +3984,13 @@ pub(super) async fn run(
             && let Some(receiver) = &state.levels
         {
             match receiver.try_recv() {
-                Ok(mut levels) => {
+                Ok((mut levels, reasoning)) => {
                     if levels.is_empty() {
                         levels.push("off".into());
                     }
                     levels.dedup();
                     state.available_levels = levels;
+                    state.available_reasoning = reasoning;
                     state.levels = None;
                     view.picker = Some(thinking_level_picker(state));
                     dirty = true;
@@ -4793,6 +4795,7 @@ pub(super) async fn run(
                                         selected: None,
                                         levels: None,
                                         available_levels: Vec::new(),
+                                        available_reasoning: None,
                                     });
                                     start_model_picker(
                                         &args,
@@ -4871,6 +4874,7 @@ pub(super) async fn run(
                                             args.thinking_profile = Some((
                                                 args.model.clone(),
                                                 state.available_levels.clone(),
+                                                state.available_reasoning,
                                             ));
                                             let previous_level = view
                                                 .pending_thinking
@@ -6235,7 +6239,7 @@ fn thinking_level_picker(state: &ThinkingSettings) -> Picker {
 fn start_thinking_levels(
     args: &Cli,
     model: &str,
-) -> Result<std::sync::mpsc::Receiver<Vec<String>>> {
+) -> Result<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>> {
     let (provider, id) = super::model_selection::qualified_model(model, &args.model_profiles)
         .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
     let mut selected = args.clone();
@@ -6248,7 +6252,8 @@ fn start_thinking_levels(
             .into_iter()
             .filter(|level| super::thinking::LEVELS.contains(&level.as_str()))
             .collect();
-        let _ = sender.send(levels);
+        let reasoning = super::thinking::adopted_reasoning(&selected);
+        let _ = sender.send((levels, reasoning));
     });
     Ok(receiver)
 }
