@@ -31,7 +31,7 @@ pub(super) struct Stream {
 
 struct PendingTool {
     content_index: usize,
-    arguments: super::streaming_json::StreamingJson,
+    arguments: super::StreamingJson,
 }
 
 impl Stream {
@@ -452,7 +452,7 @@ impl Stream {
             blocks.push(json!({"type":"toolCall","id":"","name":"","arguments":{}}));
             PendingTool {
                 content_index: next,
-                arguments: super::streaming_json::StreamingJson::default(),
+                arguments: super::StreamingJson::default(),
             }
         });
         let index = pending.content_index;

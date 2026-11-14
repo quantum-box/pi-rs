@@ -109,35 +109,24 @@ See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 
 ## Browser WASM status
 
-**Browser WASM is not currently supported or tested.** The target name
-`wasm32-unknown-unknown` alone does not imply a browser host. The native core
-has unconditional dependencies on `cap-std` and `tempfile`, uses filesystem
-journals and workspace access, and uses OS-backed context fingerprinting.
-`SessionBuilder::in_memory()` changes journal storage but does not remove these
-dependencies from the crate. The default root feature also includes the Ollama
-HTTP adapter, whose native HTTP configuration needs separate browser review.
-The [initial public CI diagnostic](https://github.com/quantum-box/pi-rs/actions/runs/43569708117/job/132371210751)
-failed with exit code 101: `errno` 0.3.14 rejects the unknown target OS. The
-locked target tree reaches it through `cap-std` / `cap-primitives` → `rustix`
-→ `errno`. This is the first reported failure, not an exhaustive blocker list.
+The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument
+parsing and incremental JSON previews from the native agent and its filesystem,
+process, network, and randomness dependencies. Rust embeddings can depend on
+this crate directly to build those values without depending on `pi-rs-core`.
+The existing `pi_rs::parse_tool_arguments` export remains available, and
+`pi_rs::StreamingJson` exposes the same preview parser used by the terminal
+and RPC frontends. Preview values are not final tool validation: call
+`parse_tool_arguments` on the complete input before executing a tool.
 
-For the locked dependency graph, `cargo tree -p pi-rs-core --target
-wasm32-unknown-unknown -i getrandom@0.3.4` shows the `jsonschema`/`ahash`
-path to `getrandom`. Its browser backend requires explicit feature and target
-configuration; see [getrandom 0.3's WebAssembly documentation](https://docs.rs/crate/getrandom/0.3.4/source/README.md).
-The locked `uuid` 1.29.2 enables `v4` but none of its browser randomness
-backends; its [target-specific implementation](https://docs.rs/crate/uuid/1.29.2/source/src/rng.rs)
-requires an explicit `js`, `rng-getrandom`, or `rng-rand` feature on this
-target. These are separate dependency paths. Other resolved randomness
-dependencies need their own target-specific audit. Enabling randomness alone
-does not provide browser implementations of the filesystem, process,
-networking, or storage contracts.
+CI checks this isolated crate with `cargo check --locked -p
+pi-rs-tool-arguments --target wasm32-unknown-unknown`, and its parser tests run
+on native targets. This is a compile check for a library component; it does not
+run the component in a browser or establish browser support for the SDK.
 
-The public CI workflow includes a **non-gating diagnostic** running
-`cargo check --locked -p pi-rs-core --target wasm32-unknown-unknown`. Its log
-and job summary report the result; a successful compile would still not prove
-that a browser can run an agent, persist a session, or call a provider. The
-native example and mock Tauri fixture do not test WASM, a real Tauri webview,
-or a browser. Browser support needs
-an explicit platform boundary, browser-safe randomness and transport, suitable
-storage, and browser execution tests before it can be claimed.
+An experimental text-only browser host uses the same Rust `AgentSession`, a
+Fetch gateway, and localStorage guarded by Web Locks. Its Chrome integration
+checks execution, communication, cancellation, timeout, lock exclusion and
+journal restoration and resumption of an interrupted run after page reload.
+See [Browser SDK](browser-sdk.md) for build instructions, the gateway contract, storage semantics and limitations.
+It does not yet provide native tools, extensions, provider adapters or the
+complete SDK surface. The native Tauri fixture does not test this browser host.
