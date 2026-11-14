@@ -17,6 +17,7 @@ pub struct Prompt {
     pub body: String,
     pub description: String,
     pub argument_hint: Option<String>,
+    pub(super) fallback_surrogate: Option<u16>,
 }
 #[derive(Clone, Default)]
 pub struct Resources {
@@ -599,6 +600,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
     let (metadata, body) = frontmatter_with_trim(&read(path)?, true)?;
+    let mut fallback_surrogate = None;
     let description = metadata
         .description
         .filter(|description| !description.is_empty())
@@ -614,6 +616,10 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
             let prefix: Vec<_> = units.by_ref().take(60).collect();
             let mut description = String::from_utf16_lossy(&prefix);
             if units.next().is_some() {
+                fallback_surrogate = prefix
+                    .last()
+                    .copied()
+                    .filter(|unit| (0xd800..=0xdbff).contains(unit));
                 description.push_str("...");
             }
             description
@@ -621,6 +627,7 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
     Ok(Prompt {
         path: path.to_owned(),
         description,
+        fallback_surrogate,
         argument_hint: metadata.argument_hint.filter(|hint| !hint.is_empty()),
         body,
     })
@@ -1646,6 +1653,25 @@ mod tests {
         assert_eq!(prompt.body, body);
         std::fs::write(&path, format!("---\ndescription: explicit\n---\n{body}")).unwrap();
         assert_eq!(parse_prompt(&path).unwrap().description, "explicit");
+    }
+
+    #[test]
+    fn prompt_fallback_preserves_only_actually_split_surrogates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (body, expected) in [
+            (format!("{}😀tail", "x".repeat(59)), Some(0xd83d)),
+            (format!("{}𠀀tail", "x".repeat(59)), Some(0xd840)),
+            (format!("{}�tail", "x".repeat(59)), None),
+            (format!("{}tail", "😀".repeat(30)), None),
+            (
+                format!("---\ndescription: explicit �...\n---\n{}😀", "x".repeat(59)),
+                None,
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(parse_prompt(&path).unwrap().fallback_surrogate, expected);
+        }
     }
 
     #[test]
