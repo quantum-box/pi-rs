@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result,
     ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,6 +51,32 @@ impl OllamaAdapter {
 }
 #[async_trait::async_trait]
 impl ProviderAdapter for OllamaAdapter {
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+    ) -> Result<Value> {
+        let mut body = self.prepare(attempt, &request.request).await?;
+        body["messages"] = json!(durable_messages(request)?);
+        Ok(body)
+    }
+    fn validate_durable(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request, body)?;
+        if !request.blocks.is_empty()
+            && body.get("messages") != Some(&json!(durable_messages(request)?))
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn id(&self) -> &str {
         "ollama-local-openai/v1"
     }
@@ -184,6 +210,68 @@ impl ProviderAdapter for OllamaAdapter {
         }))
     }
 }
+fn durable_messages(durable: &DurableRequest) -> Result<Vec<Value>> {
+    let mut ids = std::collections::BTreeSet::new();
+    if durable.blocks.iter().any(|(index, binding)| {
+        *index >= durable.request.messages.len()
+            || binding.message_id.is_nil()
+            || !ids.insert(binding.message_id)
+    }) {
+        return Err(Error::Config("invalid durable content bindings".into()));
+    }
+    let mut messages = Vec::new();
+    for (index, message) in durable.request.messages.iter().enumerate() {
+        let Some(binding) = durable.blocks.get(&index) else {
+            messages.extend(encode_message(message.clone()));
+            continue;
+        };
+        if !matches!(message, Message::User { content } if content.is_empty()) {
+            return Err(Error::Config("durable block placeholder mismatch".into()));
+        }
+        let mut blocks = Vec::new();
+        for block in &binding.blocks {
+            let object = block
+                .as_object()
+                .ok_or_else(|| Error::Config("invalid content block".into()))?;
+            match block["type"].as_str() {
+                Some("text") if object.len() == 2 => {
+                    let text = block["text"]
+                        .as_str()
+                        .ok_or_else(|| Error::Config("invalid text block".into()))?;
+                    blocks.push(json!({"type":"text","text":text}));
+                }
+                Some("image")
+                    if object.len() == 3
+                        && object
+                            .keys()
+                            .all(|k| ["type", "data", "mimeType"].contains(&k.as_str())) =>
+                {
+                    let image = pi_rs_core::ImageContent {
+                        data: block["data"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid image".into()))?
+                            .into(),
+                        mime_type: block["mimeType"]
+                            .as_str()
+                            .ok_or_else(|| Error::Config("invalid image".into()))?
+                            .into(),
+                    };
+                    image.validate()?;
+                    blocks.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.mime_type,image.data)}}));
+                }
+                _ => return Err(Error::Config("unsupported durable block metadata".into())),
+            }
+        }
+        if blocks.is_empty() {
+            return Err(Error::Config(
+                "empty user block array unsupported by Ollama".into(),
+            ));
+        }
+        messages.push(json!({"role":"user","content":blocks}));
+    }
+    Ok(messages)
+}
+
 fn encode_message(message: Message) -> Vec<Value> {
     match message {
         Message::System { content } => vec![json!({"role": "system", "content": content})],
