@@ -104,20 +104,15 @@ fn merge_project_servers(
                 )));
             }
             for (key, value) in overlay {
-                let valid =
-                    match key.as_str() {
-                        "enabled" => value.is_boolean(),
-                        "exposure" => valid_exposure(value),
-                        "toolExposure" => value
-                            .as_object()
-                            .is_some_and(|tools| tools.values().all(valid_exposure)),
-                        "oauth" => !value.is_null()
-                            && serde_json::from_value::<pi_rs_workbench::mcp_auth::OAuthSetting>(
-                                value.clone(),
-                            )
-                            .is_ok(),
-                        _ => false,
-                    };
+                let valid = match key.as_str() {
+                    "enabled" => value.is_boolean(),
+                    "exposure" => valid_exposure(value),
+                    "toolExposure" => value
+                        .as_object()
+                        .is_some_and(|tools| tools.values().all(valid_exposure)),
+                    "oauth" => valid_oauth(value),
+                    _ => false,
+                };
                 if !valid {
                     return Err(Error::Config(format!(
                         "project MCP server {name} override has invalid field {key}"
@@ -141,6 +136,28 @@ fn valid_exposure(value: &Value) -> bool {
             "direct" | "deferred" | "codemode" | "codemode-deferred" | "hidden" | "off"
         )
     })
+}
+
+fn valid_oauth(value: &Value) -> bool {
+    use pi_rs_workbench::mcp_auth::{ClientRegistrationMode, OAuthSetting};
+
+    match serde_json::from_value::<OAuthSetting>(value.clone()) {
+        Ok(OAuthSetting::Enabled(_)) => true,
+        Ok(OAuthSetting::Client(client)) => {
+            !(client.client_secret.is_some() && client.client_id.is_none())
+                && !client
+                    .client_id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty())
+                && !client
+                    .client_name
+                    .as_deref()
+                    .is_some_and(|name| name.trim().is_empty())
+                && !(client.client_registration == ClientRegistrationMode::Cimd
+                    && (client.client_id.is_some() || client.client_name.is_some()))
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
@@ -576,6 +593,10 @@ mod tests {
             json!({"enabled": true, "toolExposure": {"read": "unknown"}}),
             json!({"enabled": true, "oauth": null}),
             json!({"enabled": true, "oauth": {"clientRegistration": "unknown"}}),
+            json!({"enabled": true, "oauth": {"clientSecret": "secret"}}),
+            json!({"enabled": true, "oauth": {"clientId": " "}}),
+            json!({"enabled": true, "oauth": {"clientName": ""}}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "cimd", "clientId": "id"}}),
         ] {
             let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
             let mut servers = original.as_object().unwrap().clone();
