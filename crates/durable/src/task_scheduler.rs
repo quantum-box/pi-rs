@@ -195,7 +195,10 @@ impl Scheduler {
             if item.task.state() != &TaskState::Running {
                 continue;
             }
-            let reg = self.registered(&item.task)?;
+            let Ok(reg) = self.registered(&item.task) else {
+                // Leave a task blocked until its definition is restored.
+                continue;
+            };
             if item.task.replay_safe() && reg.replay_safe {
                 let exhausted = item.task.restarts().saturating_add(1) >= item.task.restart_limit();
                 if exhausted {
@@ -267,7 +270,7 @@ impl Scheduler {
             .ts()
             .list()?
             .into_iter()
-            .find(|s| s.task.state() == &TaskState::Ready)
+            .find(|s| s.task.state() == &TaskState::Ready && self.registered(&s.task).is_ok())
         else {
             return Ok(progress);
         };
@@ -367,6 +370,53 @@ mod tests {
         Task::new(Uuid::from_u128(id), owner, cp("start"), limit)
             .unwrap()
             .registered(kind.into(), safe)
+    }
+    #[test]
+    fn missing_task_definition_does_not_block_other_ready_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut original = Registry::default();
+        original.register("missing", true, |_: &Task| {
+            Ok(Step::Succeed(json!("unused")))
+        });
+        original.register("available", true, |_: &Task| {
+            Ok(Step::Succeed(json!("done")))
+        });
+        {
+            let scheduler = Scheduler::open(&path, original).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "missing",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            scheduler
+                .submit(&task(
+                    2,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "available",
+                    true,
+                    5,
+                ))
+                .unwrap();
+        }
+        let mut partial = Registry::default();
+        partial.register("available", true, |_: &Task| {
+            Ok(Step::Succeed(json!("done")))
+        });
+        let mut scheduler = Scheduler::open(&path, partial).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        assert!(matches!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
     }
     #[test]
     fn signal_timer_children_survive_reopen() {
