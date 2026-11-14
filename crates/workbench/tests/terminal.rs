@@ -1612,11 +1612,8 @@ fn check_per_model_thinking_settings(project_override: bool, model_fallback: boo
     let home = root.path().join("home");
     let session_path = root.path().join("session.jsonl");
     std::fs::create_dir_all(&home).unwrap();
-    let listener = delayed.then(|| {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        listener
-    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let extension = root.path().join("selection.py");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
 import json, os, socket, sys
@@ -1634,7 +1631,7 @@ elif request['type'] == 'lifecycle':
                 raise RuntimeError('startup gate was not released')
         print(json.dumps({'version':1, 'response':{'Ok':None}}))
         sys.exit(0)
-    if address and event.get('type') == 'thinking_level_select' and event.get('level') == 'high':
+    if address and os.environ.get('PI_RS_TEST_DELAY_SELECTION') and event.get('type') == 'thinking_level_select' and event.get('level') == 'high':
         host, port = address.rsplit(':', 1)
         with socket.create_connection((host, int(port)), timeout=10) as gate:
             gate.sendall(b'S')
@@ -1691,11 +1688,14 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         0
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-    if let Some(listener) = &listener {
-        command.env(
-            "PI_RS_TEST_SELECTION_GATE",
-            listener.local_addr().unwrap().to_string(),
-        );
+    command.env(
+        "PI_RS_TEST_SELECTION_GATE",
+        listener.local_addr().unwrap().to_string(),
+    );
+    if delayed {
+        command.env("PI_RS_TEST_DELAY_SELECTION", "1");
+    } else {
+        command.env_remove("PI_RS_TEST_DELAY_SELECTION");
     }
     let _process = Process(
         command
@@ -1725,7 +1725,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
-    if let Some(listener) = &listener {
+    {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut output = Vec::new();
         let mut startup = loop {
@@ -1799,10 +1799,13 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     );
     let wait_notifications = |master: &mut File, count: usize| {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut terminal = Vec::new();
         loop {
             // A full PTY output buffer can prevent the UI dispatching events.
             let mut output = [0; 8192];
-            let _ = master.read(&mut output);
+            if let Ok(count) = master.read(&mut output) {
+                terminal.extend_from_slice(&output[..count]);
+            }
             let entries: Vec<serde_json::Value> =
                 std::fs::read_to_string(home.join("events.jsonl"))
                     .unwrap_or_default()
@@ -1814,12 +1817,13 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             }
             assert!(
                 Instant::now() < deadline,
-                "selection events were not delivered: {entries:?}"
+                "selection events were not delivered: {entries:?}; terminal: {}",
+                String::from_utf8_lossy(&terminal)
             );
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    if let Some(listener) = listener {
+    if delayed {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut observed_output = Vec::new();
         let mut gate = loop {
