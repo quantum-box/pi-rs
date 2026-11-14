@@ -18,6 +18,17 @@ pub(crate) fn key(conversation: Uuid) -> Vec<u8> {
     format!("durable/application-entries/{conversation}").into_bytes()
 }
 
+// This runtime-owned record is written in the same commit as fork creation.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Lineage {
+    pub parent: Uuid,
+    pub parent_revision: u64,
+}
+
+pub(crate) fn lineage_key(conversation: Uuid) -> Vec<u8> {
+    format!("durable/application-lineage/{conversation}").into_bytes()
+}
+
 /// Read the committed records in append order. The result is a snapshot.
 pub fn list(
     store: &Store,

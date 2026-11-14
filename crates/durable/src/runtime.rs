@@ -2400,7 +2400,7 @@ impl Harness {
             u64,
             u64,
             Vec<crate::application_entry::ApplicationEntry>,
-            Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
+            Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
         ),
         Error,
     > {
@@ -2436,7 +2436,40 @@ impl Harness {
                 if first != Some(sequence) || snapshot.as_ref().map(|s| s.0) != Some(sequence) {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
-                inherited = Some((sequence, entries.clone()));
+                let lineage_key = crate::application_entry::lineage_key(id);
+                let lineage_entry = self
+                    .owner
+                    .store()
+                    .get(&lineage_key)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if self
+                    .owner
+                    .store()
+                    .commit_for_version(&lineage_key, lineage_entry.version)?
+                    != Some(sequence)
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let lineage: crate::application_entry::Lineage =
+                    serde_json::from_slice(&lineage_entry.value)?;
+                if lineage.parent.is_nil()
+                    || lineage.parent == id
+                    || lineage.parent_revision >= revision
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let parent_key = crate::application_entry::key(lineage.parent);
+                let parent_entry = self
+                    .owner
+                    .store()
+                    .application_entries_at(&parent_key, lineage.parent_revision)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let parent_entries: Vec<crate::application_entry::ApplicationEntry> =
+                    serde_json::from_slice(&parent_entry.value)?;
+                if !parent_entries.starts_with(&entries) {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                inherited = Some((sequence, lineage.parent, entries.clone()));
             }
             for entry in added {
                 if entry.id.is_nil() || entry.conversation_id.is_nil() || !seen.insert(entry.id) {
@@ -2446,7 +2479,7 @@ impl Harness {
             if let Some(index) = added.iter().position(|entry| entry.id == entry_id) {
                 let index = previous.len() + index;
                 let visible = entries[..=index].to_vec();
-                if let Some((_, prefix)) = &mut inherited {
+                if let Some((_, _, prefix)) = &mut inherited {
                     prefix.truncate(visible.len());
                 }
                 return Ok((revision, sequence, visible, inherited));
@@ -2457,7 +2490,7 @@ impl Harness {
     }
 
     // Every inherited prefix, including one preceding a local selection, must
-    // match an older origin history. Strictly decreasing commit sequences also
+    // match its recorded immediate parent. Strictly decreasing commit sequences also
     // make forged cycles fail closed.
     fn application_entry_cut(
         &self,
@@ -2467,12 +2500,12 @@ impl Harness {
         let (revision, sequence, visible, mut inherited) =
             self.application_entry_cut_unverified(id, entry_id)?;
         for _ in 0..256 {
-            let Some((installed, prefix)) = inherited else {
+            let Some((installed, parent, prefix)) = inherited else {
                 return Ok((revision, sequence, visible));
             };
             let last = prefix.last().ok_or(crate::fork::Error::InvalidSnapshot)?;
             let (_, origin_sequence, origin_prefix, origin_inherited) =
-                self.application_entry_cut_unverified(last.conversation_id, last.id)?;
+                self.application_entry_cut_unverified(parent, last.id)?;
             if origin_sequence >= installed || origin_prefix != prefix {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }

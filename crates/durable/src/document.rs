@@ -274,6 +274,18 @@ impl<'a> Documents<'a> {
         // A global revision fence also detects addresses created or deleted while
         // preparing the copy. The caller retries this batch on a fence conflict.
         let current = self.store.document_snapshot()?;
+        let lineage_key = crate::application_entry::lineage_key(child);
+        batch.checks.push(Check {
+            key: lineage_key.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: lineage_key,
+            value: serde_json::to_vec(&crate::application_entry::Lineage {
+                parent: current_parent,
+                parent_revision: current,
+            })?,
+        });
         batch.checks.push(Check {
             key: b"durable/document-fork-revision".to_vec(),
             expected: Expected::DocumentRevision(current),

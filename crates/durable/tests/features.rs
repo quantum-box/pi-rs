@@ -2864,3 +2864,170 @@ async fn local_entry_cannot_hide_an_unproven_inherited_prefix() {
     let mut h = Harness::open_paused(&path, opts()).unwrap();
     assert!(h.fork_at_application_entry(child, entries[1].id).is_err());
 }
+
+#[tokio::test]
+async fn inherited_entries_require_atomic_parent_lineage() {
+    use durable_store::{Mutation, Store};
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Append;
+    impl Handler for Append {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.local", json!(1)).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let config = Config {
+        model: "origin".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 128,
+    };
+    let origin = h.create_conversation(config.clone()).unwrap();
+    let unrelated = h.create_conversation(config).unwrap();
+    let db = Store::open(&path).unwrap();
+    let mut registry = Registry::default();
+    registry.register("app", true, Append);
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(origin),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("app".into(), true);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    tasks.submit(&task).unwrap();
+    tasks.tick(0).unwrap();
+    drop(tasks);
+    let entries = application_entry::list(&db, origin).unwrap();
+    let child = h.fork_at_application_entry(origin, entries[0].id).unwrap();
+    let grandchild = h.fork_at_application_entry(child, entries[0].id).unwrap();
+    assert_eq!(application_entry::list(&db, grandchild).unwrap(), entries);
+    // Simulate an unrelated conversation created atomically with a copied,
+    // origin-matching prefix and a lineage record claiming the unrelated parent.
+    let forged = Uuid::new_v4();
+    let runtime_key = format!("runtime/conversation/{child}");
+    let mut runtime: serde_json::Value =
+        serde_json::from_slice(&db.get(runtime_key.as_bytes()).unwrap().unwrap().value).unwrap();
+    runtime["id"] = json!(forged);
+    runtime["transcript"] = json!(null);
+    let first = db
+        .first_commit_for_key(runtime_key.as_bytes())
+        .unwrap()
+        .unwrap();
+    let (_, snapshot_key) = db
+        .runtime_snapshot_at(
+            runtime_key.as_bytes(),
+            format!("runtime/fork/{child}/").as_bytes(),
+            first,
+        )
+        .unwrap()
+        .unwrap();
+    let snapshot = db.get(&snapshot_key).unwrap().unwrap().value;
+    let suffix = std::str::from_utf8(&snapshot_key)
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap();
+    let revision = db.document_snapshot().unwrap();
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: format!("runtime/conversation/{forged}").into_bytes(),
+                value: serde_json::to_vec(&runtime).unwrap(),
+            },
+            Mutation::Put {
+                key: format!("runtime/fork/{forged}/{suffix}").into_bytes(),
+                value: snapshot,
+            },
+            Mutation::Put {
+                key: format!("durable/application-entries/{forged}").into_bytes(),
+                value: serde_json::to_vec(&entries).unwrap(),
+            },
+            Mutation::Put {
+                key: format!("durable/application-lineage/{forged}").into_bytes(),
+                value: serde_json::to_vec(
+                    &json!({"parent": unrelated, "parent_revision": revision}),
+                )
+                .unwrap(),
+            },
+        ],
+    )
+    .unwrap();
+    assert!(h.conversation(forged).is_ok());
+    assert!(matches!(
+        h.fork_at_application_entry(forged, entries[0].id),
+        Err(pi_rs_durable::runtime::Error::Fork(
+            pi_rs_durable::fork::Error::InvalidSnapshot
+        ))
+    ));
+    // A missing record or one written later cannot authenticate creation,
+    // even if the late record names the real origin and its prefix matches.
+    let forged_lineage = format!("durable/application-lineage/{forged}").into_bytes();
+    db.commit(
+        &[],
+        &[Mutation::Delete {
+            key: forged_lineage.clone(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(forged, entries[0].id).is_err());
+    db.commit(
+        &[],
+        &[Mutation::Put {
+            key: forged_lineage,
+            value: serde_json::to_vec(&json!({"parent": origin, "parent_revision": revision}))
+                .unwrap(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(forged, entries[0].id).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let after_reopen = h
+        .fork_at_application_entry(grandchild, entries[0].id)
+        .unwrap();
+    assert_eq!(application_entry::list(&db, after_reopen).unwrap(), entries);
+    // Legacy forks have an atomically installed prefix but no lineage record.
+    db.commit(
+        &[],
+        &[Mutation::Delete {
+            key: format!("durable/application-lineage/{child}").into_bytes(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(child, entries[0].id).is_err());
+    assert!(
+        h.fork_at_application_entry(grandchild, entries[0].id)
+            .is_err()
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.fork_at_application_entry(forged, entries[0].id).is_err());
+    assert!(h.fork_at_application_entry(child, entries[0].id).is_err());
+    // Original local entries are still usable in the absence of lineage.
+    assert!(h.fork_at_application_entry(origin, entries[0].id).is_ok());
+}
