@@ -784,7 +784,54 @@ impl Client {
                 }
                 Self::Anthropic(client)
             }
-            Self::Google(client) => Self::Google(client.with_thinking(thinking)),
+            Self::Google(client) => {
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let levels = metadata
+                    .as_ref()
+                    .and_then(|model| model.levels(Adapter::Google));
+                let resolve = |level: &str| -> Result<String> {
+                    let mapped = metadata
+                        .as_ref()
+                        .and_then(|model| model.mapped_effort(level))
+                        .flatten()
+                        .unwrap_or(level)
+                        .to_ascii_lowercase();
+                    if !matches!(mapped.as_str(), "minimal" | "low" | "medium" | "high") {
+                        return Err(Error::Config(format!(
+                            "unsupported Google thinking level mapping {mapped:?}"
+                        )));
+                    }
+                    Ok(mapped)
+                };
+                let selected = thinking.map(|level| {
+                    levels
+                        .as_ref()
+                        .map_or(level, |levels| super::thinking::clamp(level, levels))
+                });
+                let mapped = selected
+                    .filter(|level| *level != "off")
+                    .map(resolve)
+                    .transpose()?;
+                let fallback =
+                    if thinking.is_none() && pi_rs::google::uses_discrete_thinking(&args.model) {
+                        levels
+                            .as_ref()
+                            .filter(|levels| !levels.iter().any(|level| level == "off"))
+                            .map(|levels| resolve(super::thinking::clamp("off", levels)))
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                Self::Google(
+                    client
+                        .with_thinking(mapped.as_deref().or(selected))
+                        .with_disabled_thinking_fallback(fallback.as_deref())
+                        .with_reasoning_support(metadata.as_ref().and_then(|model| model.reasoning))
+                        .with_thinking_budget_settings(
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        ),
+                )
+            }
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -1025,6 +1072,277 @@ mod contention_tests {
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn google_thinking_budget_settings_follow_model_options() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".pi")).unwrap();
+        std::fs::write(
+            workspace.path().join(".pi/settings.json"),
+            r#"{"thinkingBudgets":{"high":9000}}"#,
+        )
+        .unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        args.thinking = Some("high".into());
+        let base =
+            Client::Google(pi_rs::google::Google::new("https://example.com", "key").unwrap());
+        let configured = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("high"))
+                .with_thinking_budget_settings(
+                    args.settings.value().get("thinkingBudgets").cloned(),
+                ),
+        );
+        assert_eq!(configured.context_identity(), expected.context_identity());
+        args.settings = super::super::config::Settings::default();
+        let reset = configured.with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("high")),
+        );
+        assert_eq!(reset.context_identity(), expected.context_identity());
+    }
+
+    #[tokio::test]
+    async fn google_mapped_levels_select_the_resolved_budget_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".pi")).unwrap();
+        std::fs::write(
+            workspace.path().join(".pi/settings.json"),
+            r#"{"thinkingBudgets":{"high":9000,"low":1234}}"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = position + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[end..end + length]).unwrap();
+            let response = "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            body
+        });
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = Provider::Google;
+        args.model = "gemini-2.5-flash".into();
+        args.thinking = Some("high".into());
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-2.5-flash":{"thinkingLevelMap":{"high":"LOW","max":"high"}}}}}})).unwrap();
+        let metadata = args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .unwrap();
+        assert!(
+            metadata
+                .levels(Adapter::Google)
+                .unwrap()
+                .contains(&"max".to_owned())
+        );
+        let base = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "fixture")
+                .unwrap()
+                .with_context_probe(false),
+        );
+        let mapped = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "fixture")
+                .unwrap()
+                .with_context_probe(false)
+                .with_thinking(Some("low"))
+                .with_reasoning_support(Some(true))
+                .with_thinking_budget_settings(Some(json!({"high":9000,"low":1234}))),
+        );
+        assert_eq!(mapped.context_identity(), expected.context_identity());
+        let request = ModelRequest {
+            model: args.model.clone(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 256,
+        };
+        let _stream = mapped.stream(request).await.unwrap();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget":1234,"includeThoughts":true})
+        );
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-2.5-flash":{"thinkingLevelMap":{"high":"extreme"}}}}}})).unwrap();
+        assert!(base.with_model_options(&args, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn google_discrete_mappings_and_disabled_fallback_reach_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (selected, profile, expected) in [
+            (
+                Some("high"),
+                1,
+                json!({"thinkingLevel":"MINIMAL","includeThoughts":true}),
+            ),
+            (None, 1, json!({"thinkingLevel":"HIGH"})),
+            (None, 0, json!({"thinkingLevel":"LOW"})),
+            (None, 3, json!({"thinkingLevel":"LOW"})),
+            (None, 2, json!({"thinkingBudget":0})),
+            (
+                Some("high"),
+                2,
+                json!({"thinkingBudget":-1,"includeThoughts":true}),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (end, size) = loop {
+                    let mut chunk = [0; 2048];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let size = std::str::from_utf8(&bytes[..end])
+                            .unwrap()
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, size);
+                    }
+                };
+                while bytes.len() < end + size {
+                    let mut chunk = [0; 2048];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                let response = "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                body
+            });
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.provider = Provider::Google;
+            args.model = match profile {
+                2 => "custom-reasoner",
+                3 => "gemini-4-argon",
+                _ => "gemini-3.1-pro-preview",
+            }
+            .into();
+            args.thinking = selected.map(str::to_owned);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&if profile == 1 {
+                json!({"providers":{"google":{"modelOverrides":{"gemini-3.1-pro-preview":{"thinkingLevelMap":{"off":null,"minimal":null,"low":"HIGH","high":"MINIMAL"}}}}}})
+            } else if profile == 2 {
+                json!({"providers":{"google":{"models":[{"id":"custom-reasoner","reasoning":true,"thinkingLevelMap":{"high":"low"}}]}}})
+            } else { json!({}) }).unwrap();
+            if profile == 0 || profile == 3 {
+                let model = args
+                    .model_profiles
+                    .model(&args.provider, &args.model)
+                    .unwrap();
+                assert_eq!(
+                    model.levels(Adapter::Google).unwrap(),
+                    vec!["low", "medium", "high"]
+                );
+            }
+            let client = Client::Google(
+                pi_rs::google::Google::new(&endpoint, "fixture")
+                    .unwrap()
+                    .with_context_probe(false),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let _stream = client
+                .stream(ModelRequest {
+                    model: args.model.clone(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 256,
+                })
+                .await
+                .unwrap();
+            let body = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body["generationConfig"]["thinkingConfig"], expected);
+        }
+    }
+
+    #[test]
+    fn google_discrete_mappings_and_disabled_fallback_propagate() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = Provider::Google;
+        args.model = "gemini-3.1-pro-preview".into();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-3.1-pro-preview":{"thinkingLevelMap":{"off":null,"minimal":null,"low":"HIGH","high":"MINIMAL"}}}}}})).unwrap();
+        let base =
+            Client::Google(pi_rs::google::Google::new("https://example.com", "key").unwrap());
+        args.thinking = Some("high".into());
+        let selected = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("minimal"))
+                .with_reasoning_support(Some(true)),
+        );
+        assert_eq!(selected.context_identity(), expected.context_identity());
+        args.thinking = None;
+        let disabled = base.clone().with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_disabled_thinking_fallback(Some("high"))
+                .with_reasoning_support(Some(true)),
+        );
+        assert_eq!(disabled.context_identity(), expected.context_identity());
+        args.thinking = Some("off".into());
+        let clamped = base.with_model_options(&args, false).unwrap();
+        let expected = Client::Google(
+            pi_rs::google::Google::new("https://example.com", "key")
+                .unwrap()
+                .with_thinking(Some("high"))
+                .with_reasoning_support(Some(true)),
+        );
+        assert_eq!(clamped.context_identity(), expected.context_identity());
+    }
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
