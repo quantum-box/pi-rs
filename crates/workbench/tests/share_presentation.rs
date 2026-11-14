@@ -556,3 +556,91 @@ fn terminal_radius_share_succeeds_without_selected_model_credentials() {
     );
     server.join().unwrap();
 }
+
+#[test]
+fn standalone_share_rejects_incomplete_journal_without_repair_or_upload() {
+    use std::io::Write as _;
+    for incomplete in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = if incomplete {
+            root.path().join("session.jsonl")
+        } else {
+            root.path().join("missing/session.jsonl")
+        };
+        let original = if incomplete {
+            drop(pi_rs::Session::open(&path).unwrap());
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"{\"incomplete\":")
+                .unwrap();
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            None
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "ollama",
+                "--model",
+                "fixture",
+                "--endpoint",
+                "http://127.0.0.1:9",
+            ])
+            .arg("--session")
+            .arg(&path)
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.0.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                panic!("standalone share did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.0.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!status.success(), "incomplete journal was shared");
+        if let Some(original) = original {
+            assert!(stderr.contains("journal is incomplete"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        } else {
+            assert!(
+                !path.parent().unwrap().exists(),
+                "missing session directory was created"
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Radius was contacted"
+        );
+    }
+}

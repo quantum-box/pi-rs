@@ -3573,7 +3573,9 @@ and active tool schemas to Radius uploads. Idle and in-flight shares use the
 worker's session state; request-only `context_with_system` transformations do
 not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
 exposes interactive `/share`; the standalone `pi share` command is a pi-rs
-extension.
+extension. Standalone share keeps the journal lock without implicitly repairing
+or creating the journal. An incomplete journal or pending handoff recovery is
+reported before upload; an explicit `--name` still updates the session name.
 The snapshot is matched to the session and head before upload, and a changed
 session requires a retry. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
