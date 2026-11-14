@@ -48,7 +48,9 @@ jobs:
           RUST_TEST_THREADS: 1
         run: cargo +1.89.0 test --locked --workspace --all-features
       - name: Test native SDK host example
-        run: cargo +1.89.0 test --locked --example native_sdk_host
+        run: |
+          cargo +1.89.0 test --locked --example native_sdk_host
+          cargo +1.89.0 test --locked -p pi-rs-ollama --example sdk_chat
 
   wasm-diagnostic:
     name: Browser WASM core diagnostic (non-gating)

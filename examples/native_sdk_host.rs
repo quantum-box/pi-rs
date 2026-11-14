@@ -1,12 +1,30 @@
 //! The native state pattern used by the Tauri guide; no Tauri runtime required.
 use std::sync::Arc;
 
-use pi_rs::{AgentSession, Model, Result, SessionBuilder, SessionControl, ollama::Ollama};
+use pi_rs::{
+    AgentSession, Model, ModelEvent, ModelRequest, ModelStream, Result, SessionBuilder,
+    SessionControl,
+};
 use tokio::sync::Mutex;
 
 struct AppState {
     session: Mutex<AgentSession>,
     control: SessionControl,
+}
+
+// A deterministic stand-in; use a real provider client in an application.
+struct Fixture;
+#[async_trait::async_trait]
+impl Model for Fixture {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        Ok(Box::pin(futures_util::stream::iter([
+            Ok(ModelEvent::Text("fixture answer".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])))
+    }
 }
 
 impl AppState {
@@ -34,11 +52,7 @@ impl AppState {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let model = Arc::new(Ollama::new(
-        "http://127.0.0.1:11434/v1/chat/completions",
-        None,
-    )?);
-    let state = AppState::new(model, "qwen2.5:7b")?;
+    let state = AppState::new(Arc::new(Fixture), "fixture")?;
     println!("{}", state.prompt("Say hello.".into()).await?);
     state.abort();
     state.close().await
@@ -47,22 +61,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rs::{ModelEvent, ModelRequest, ModelStream};
-
-    struct Fixture;
-    #[async_trait::async_trait]
-    impl Model for Fixture {
-        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
-            Ok(Box::pin(futures_util::stream::iter([
-                Ok(ModelEvent::Text("fixture answer".into())),
-                Ok(ModelEvent::Complete {
-                    calls: vec![],
-                    usage: None,
-                }),
-            ])))
-        }
-    }
-
     #[tokio::test]
     async fn host_state_is_shareable_and_preserves_session_across_prompts() {
         fn assert_send_sync<T: Send + Sync>() {}

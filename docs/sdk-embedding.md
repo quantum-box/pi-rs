@@ -6,18 +6,24 @@ the webview does not need to compile pi-rs to WebAssembly. The SDK does not
 automatically install the workbench's tools, load its configuration, or manage
 credentials for an embedding host.
 
-## Native state and Tauri
+## Native quickstart
 
-The [native host example](../examples/native_sdk_host.rs) uses an in-memory
-session and a local Ollama endpoint. Run it with a local Ollama server and the
-`qwen2.5:7b` model installed:
+The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
+in-memory session, sends a prompt to the local server, and closes the session:
 
 ```sh
-cargo run --locked --example native_sdk_host
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-ollama --example sdk_chat
 ```
 
-The example's offline fixture tests session reuse and that the state is
-`Send + Sync`. The following is a Tauri 2 integration sketch using the same
+Set `PI_RS_EXAMPLE_MODEL` to use another installed model. For a browser-only
+app, a native server can own the session and expose an application-specific API.
+
+## Native state and Tauri
+
+The [native host example](../examples/native_sdk_host.rs) demonstrates shared
+session state using an offline fixture; its tests check session reuse and that
+the state is `Send + Sync`. The following is a Tauri 2 integration sketch using the same
 pattern. It needs a Tauri project and its normal generated configuration; the
 Tauri glue itself is not built by this repository's CI. Add `pi-rs` (with the
 default `ollama` feature) and `tokio` with the `sync` feature to `src-tauri`.
@@ -62,8 +68,9 @@ For streaming, subscribe before starting a prompt with `session.subscribe()`
 and forward only the events the frontend needs; slow receivers can lag, and
 request/record events may contain private context. Call `close().await` when
 the host can arrange asynchronous shutdown. For a durable session, replace
-`in_memory()` with `open()` and a private application-owned path, and manage
-the session lifecycle and reopen errors in the host.
+`in_memory()` with `open()` and a private application-owned path outside the
+workspace exposed to tools, and manage session lifecycle and reopen errors in
+the host.
 
 This example registers no tools. If a host enables tools or extensions, it must
 choose which frontend callers may invoke them and enforce its own workspace,
