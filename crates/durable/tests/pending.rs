@@ -1164,8 +1164,12 @@ async fn task_backed_tool_abort_preserves_already_completed_result() {
     };
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
-    let handler: Arc<dyn Handler> =
-        Arc::new(|_: &Task| Ok(Step::Succeed(json!("completed before abort"))));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!("completed before abort")))
+    });
     let adapter = Arc::new(TaskTool::new(
         ToolSpec {
             name: "job".into(),
@@ -1206,6 +1210,7 @@ async fn task_backed_tool_abort_preserves_already_completed_result() {
         .tool_attempt()
         .unwrap()
         .operation_id;
+    release_tx.send(()).unwrap();
     for _ in 0..100 {
         if driver.get(task_id).unwrap().unwrap().is_terminal() {
             break;
