@@ -1630,7 +1630,11 @@ fn entry_id_fork_uses_exact_snapshot_across_reset_and_reopen() {
         serde_json::to_value(before).unwrap(),
         serde_json::to_value(after).unwrap()
     );
-    assert!(h.fork_by_entry_id(child, boundary).is_err());
+    let descendant = h.fork_by_entry_id(child, boundary).unwrap();
+    assert_eq!(
+        h.conversation(descendant).unwrap().messages,
+        result.messages
+    );
     drop(h);
     let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(h.conversation(child).unwrap().messages, result.messages);
@@ -1941,4 +1945,187 @@ fn config_change_does_not_authorize_interior_tool_batch_cut() {
         h.fork_by_entry_id(id, entries[0].history.as_ref().unwrap().id)
             .is_ok()
     );
+}
+
+#[test]
+fn inherited_entry_forks_use_visible_origin_commit_and_documents() {
+    use crate::document::Address;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "origin".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let address = Address {
+        scope: parent.to_string(),
+        name: "note".into(),
+        key: "x".into(),
+    };
+    let mut doc_key = b"durable/document/".to_vec();
+    doc_key.extend(serde_json::to_vec(&[&address.scope, &address.name, &address.key]).unwrap());
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "same".into(),
+    });
+    let mut prepared = h
+        .prepare_saves(&[(&state, Expected::Version(version))])
+        .unwrap();
+    prepared.mutations.push(Mutation::Put {
+        key: doc_key.clone(),
+        value: br#"{"n":1}"#.to_vec(),
+    });
+    h.commit_conversation_save(prepared).unwrap();
+    let first = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "same".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let second = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let child = h.fork(parent).unwrap();
+    let grandchild = h.fork(child).unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.config.model = "later".into();
+    let mut prepared = h
+        .prepare_saves(&[(&state, Expected::Version(version))])
+        .unwrap();
+    prepared.mutations.push(Mutation::Put {
+        key: doc_key,
+        value: br#"{"n":2}"#.to_vec(),
+    });
+    h.commit_conversation_save(prepared).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    for (id, expected_len) in [(first, 1), (second, 2)] {
+        let fork = h.fork_by_entry_id(grandchild, id).unwrap();
+        let result = h.conversation(fork).unwrap();
+        assert_eq!(result.messages.len(), expected_len);
+        assert_eq!(result.config.model, "origin");
+        let copied = Address {
+            scope: fork.to_string(),
+            ..address.clone()
+        };
+        assert_eq!(h.document(&copied).unwrap().unwrap().value["n"], 1);
+    }
+    h.reset(grandchild, Some("replacement".into())).unwrap();
+    assert!(h.fork_by_entry_id(grandchild, first).is_err());
+    assert!(h.fork_by_entry_id(grandchild, second).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.fork_by_entry_id(grandchild, first).is_err());
+}
+
+#[test]
+fn inherited_entry_rejects_materialized_interior_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "x".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.extend((0..3).map(|_| Message::User {
+        content: "same".into(),
+    }));
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(parent, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let original_id = entries[2].history.as_ref().unwrap().id;
+    let child = h
+        .fork_at_position(parent, entries[1].position.clone())
+        .unwrap();
+    assert!(h.fork_by_entry_id(child, original_id).is_err());
+}
+
+#[test]
+fn inherited_entry_rejects_ambiguous_and_unannotated_visible_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "x".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "first".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let id = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "second".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let child = h.fork(parent).unwrap();
+    let cursor = serde_json::to_value(h.conversation(child).unwrap().transcript.unwrap()).unwrap();
+    let link: Uuid = serde_json::from_value(cursor["next"]["id"].clone()).unwrap();
+    let mut key = b"durable/transcript/entry/".to_vec();
+    key.extend_from_slice(link.as_bytes());
+    let original = h.owner.store().get(&key).unwrap().unwrap().value;
+    let mut entry: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let batch = entry["value"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    batch["ids"][0] = serde_json::to_value(id).unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_by_entry_id(child, id).is_err());
+    let mut entry: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let messages = entry["value"].as_object().unwrap().values().next().unwrap()["messages"].clone();
+    entry["value"] = serde_json::json!({"Append": messages});
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_by_entry_id(child, id).is_err());
 }

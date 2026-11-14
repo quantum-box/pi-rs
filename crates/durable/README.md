@@ -57,8 +57,8 @@ result, legacy batches without the required proof, and interior replacement
 batches fail closed. The document revision must also be unchanged across the
 commit, even if an unrelated scope caused the change.
 Replacement batches assign fresh occurrence IDs, and an interior fork currently
-materializes a new transcript with fresh IDs. Inherited foreign occurrences are
-not selectable in the child. See the parity document for remaining limitations.
+materializes a new transcript with fresh IDs. Annotated append occurrences in a
+shared immutable chain may be selected by ID using their origin’s historical cut. See the parity document for remaining limitations.
 
 The runtime can also fork a settled conversation at its current state or a
 supported historical snapshot cursor, and performs explicit idle compaction. It also
@@ -603,3 +603,5 @@ outcome and reason. Existing replay-safety and interrupted-execution recovery
 policies remain pi-rs extensions and can differ from upstream, including leaving
 some interrupted tasks running until a missing definition returns. Generic tasks
 are not yet fully integrated into upstream's registry, task graph, or lifecycle.
+
+Inherited entry-ID forks are supported for annotated append batches visible in the captured shared transcript chain. They use the original conversation’s recorded observation and document cut; replacement boundaries, unannotated or ambiguous chains, and materialized interior forks are rejected.

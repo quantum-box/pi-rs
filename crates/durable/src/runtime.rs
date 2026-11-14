@@ -2013,9 +2013,9 @@ impl Harness {
         Err(crate::fork::Error::InvalidSnapshot.into())
     }
     /// Fork at the exact committed boundary of a message occurrence.
-    /// Interior messages require a proven safe append; legacy entries and
-    /// entries originating in another conversation are rejected. Retained
-    /// observations are scanned in bounded pages, including across resets.
+    /// Interior messages require a proven safe append. Inherited entries must
+    /// be visible in the captured shared chain and have an origin snapshot.
+    /// Local retained observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         self.load(id)?;
         if entry_id.is_nil() {
@@ -2048,7 +2048,10 @@ impl Harness {
                     continue;
                 };
                 if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
-                    if origin != id || commit != record.cursor.0 {
+                    if origin != id {
+                        continue;
+                    }
+                    if commit != record.cursor.0 {
                         return Err(crate::fork::Error::InvalidSnapshot.into());
                     }
                     return self.fork_at_position(
@@ -2065,7 +2068,52 @@ impl Harness {
             }
             cursor = page.next;
         }
-        Err(crate::fork::Error::InvalidCursor.into())
+        // Inherited identities are valid only while their immutable batch is
+        // reachable from the child's captured head, up to its replacement base.
+        let (state, _) = self.load(id)?;
+        let Some(mut position) = state.transcript else {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        };
+        let mut found = None;
+        loop {
+            let page = transcript.read(&position, std::num::NonZeroUsize::MIN)?;
+            let Some(batch) = page.records.first() else {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            };
+            let change: TranscriptChange = serde_json::from_value(batch.value.clone())?;
+            let (_, base, metadata) = change.parts()?;
+            let Some((ids, _commit, origin)) = metadata else {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            };
+            if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
+                if base || origin == id || found.is_some() {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                // Rebind only the cursor's owner; fork_at_position independently
+                // proves that this exact immutable link belongs to the origin's
+                // recorded observation at the metadata commit.
+                let mut cursor = serde_json::to_value(&position)?;
+                cursor["transcript"] = serde_json::to_value(origin)?;
+                found = Some((
+                    origin,
+                    ViewCursor {
+                        cursor: serde_json::from_value(cursor)?,
+                        remaining: Some(index + 1),
+                    },
+                ));
+            }
+            if base {
+                break;
+            }
+            if !page.has_more {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            position = page.next;
+        }
+        match found {
+            Some((origin, position)) => self.fork_at_position(origin, position),
+            None => Err(crate::fork::Error::InvalidCursor.into()),
+        }
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
