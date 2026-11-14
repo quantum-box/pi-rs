@@ -3,7 +3,8 @@ use super::{
     render::{Line, Span, wrap},
     theme::Theme,
 };
-use similar::{ChangeTag, TextDiff};
+mod word_diff;
+use word_diff::Tag;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -80,11 +81,15 @@ fn rows(text: &str) -> Vec<Row> {
         })
         .collect()
 }
-fn changed_span(text: &str, row: &Row, theme: &Theme, changed: bool) -> Vec<Span> {
+fn changed_span(text: &str, row: &Row, theme: &Theme, changed: bool, first: bool) -> Vec<Span> {
     if !changed {
         return vec![Span::themed(text, theme, row.color())];
     }
-    let trimmed = text.trim_start();
+    let trimmed = if first {
+        text.trim_start_matches(word_diff::ws)
+    } else {
+        text
+    };
     let mut spans = vec![Span::themed(
         &text[..text.len() - trimmed.len()],
         theme,
@@ -157,30 +162,38 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
             && rows
                 .get(index + 2)
                 .is_none_or(|row| row.kind != Kind::Added);
-        if paired {
+        let changes = paired
+            .then(|| word_diff::diff(&row.text, &rows[index + 1].text, deadline))
+            .flatten();
+        if let Some(changes) = changes {
             let added = &rows[index + 1];
             let mut removed_spans = vec![Span::themed(row.prefix(digits), theme, row.color())];
             let mut added_spans = vec![Span::themed(added.prefix(digits), theme, added.color())];
-            for change in TextDiff::configure()
-                .deadline(deadline)
-                .diff_words(&row.text, &added.text)
-                .iter_all_changes()
-            {
-                if change.tag() != ChangeTag::Insert {
+            let (mut first_removed, mut first_added) = (true, true);
+            for change in changes {
+                if change.tag != Tag::Insert {
                     removed_spans.extend(changed_span(
-                        change.value(),
+                        &change.text,
                         row,
                         theme,
-                        change.tag() == ChangeTag::Delete,
+                        change.tag == Tag::Delete,
+                        first_removed,
                     ));
+                    if change.tag == Tag::Delete {
+                        first_removed = false;
+                    }
                 }
-                if change.tag() != ChangeTag::Delete {
+                if change.tag != Tag::Delete {
                     added_spans.extend(changed_span(
-                        change.value(),
+                        &change.text,
                         added,
                         theme,
-                        change.tag() == ChangeTag::Insert,
+                        change.tag == Tag::Insert,
+                        first_added,
                     ));
+                    if change.tag == Tag::Insert {
+                        first_added = false;
+                    }
                 }
             }
             lines.extend(wrap(&removed_spans, width));
@@ -204,6 +217,31 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grouped_changes_match_pi_whitespace_highlighting() {
+        let lines = render_numbered("-1 A x B y\n+1 A  c B  d", &Theme::system(), 80);
+        let highlighted = |line: &Line| {
+            line.spans
+                .iter()
+                .filter(|s| s.inverse)
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(highlighted(&lines[0]), "xy");
+        assert_eq!(highlighted(&lines[1]), "c d");
+        assert_eq!(
+            lines[1]
+                .spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "+1 A  c B  d"
+        );
+
+        let lines = render_numbered("-1 abc def\n+1 xyz ghi", &Theme::system(), 80);
+        assert_eq!(highlighted(&lines[0]), "abc def");
+        assert_eq!(highlighted(&lines[1]), "xyz ghi");
+    }
     #[test]
     fn numbered_edits_keep_explicit_padding_and_word_highlighting() {
         let theme = Theme::system();

@@ -1242,8 +1242,12 @@ terminal modes, heading decoration, code fences, nested quotes and clean exit.
 Edit tool panels retain unified hunk information, show original and updated line
 numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
-and word comparison has a shared 100 ms budget per render. Large comparisons
-retain line-level highlighting when that budget is exhausted.
+and word comparison follows Pi's `diffWords` token grouping and whitespace
+deduplication, including the first changed fragment's indentation treatment.
+Comparison has a shared 100 ms budget per render; oversized or unfinished
+comparisons retain line-level highlighting. The Rust word-diff implementation
+derives from jsdiff 8.0.4; its BSD license is in
+`crates/workbench/src/ui/diff/JSDIFF-LICENSE.txt`.
 
 A PTY fixture runs an actual file edit and verifies numbered output and inverse
 word highlighting in fullscreen and regular mode.
