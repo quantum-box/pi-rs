@@ -2343,3 +2343,139 @@ async fn background_abort_reaches_reused_child_through_terminal_anchor_after_reo
     assert!(h.conversation(child).unwrap().abort_requested);
     assert!(!h.conversation(unrelated).unwrap().abort_requested);
 }
+
+#[tokio::test]
+async fn background_abort_reports_missing_driver_while_foreground_cleanup_waits() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "initial".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap()
+    .registered("job".into(), true);
+    TaskStore::new(scheduler.harness.owner.store())
+        .save(&[Save::Create(&task)])
+        .unwrap();
+    for _ in 0..2 {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.abort_and_wait_with_background(id),
+        )
+        .await
+        .expect("abort must not hang");
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message.contains("task driver is not running"))
+        );
+        assert!(
+            TaskStore::new(scheduler.harness.owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(scheduler.conversation(id).unwrap().abort_requested);
+    }
+    let mut registry = crate::task_scheduler::Registry::default();
+    registry.register_with_abort(
+        "job",
+        true,
+        |_: &Task| {
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
+        },
+        |_: &Task| {
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
+        },
+    );
+    let driver = scheduler.start_tasks(registry).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.abort_and_wait_with_background(id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(driver.get(task.id()).unwrap().unwrap().is_terminal());
+    assert!(!scheduler.conversation(id).unwrap().abort_requested);
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn background_abort_reports_driver_shutdown_during_foreground_cleanup() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::{Registry, Step};
+    let dir = tempfile::tempdir().unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "initial".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap()
+    .registered("job".into(), true);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let mut registry = Registry::default();
+    registry.register_with_abort(
+        "job",
+        true,
+        move |_: &Task| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(serde_json::Value::Null))
+        },
+        |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+    );
+    let driver = scheduler.start_tasks(registry).unwrap();
+    driver.submit(&task).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        drop(driver);
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        scheduler.abort_and_wait_with_background(id),
+    )
+    .await
+    .expect("abort must notice shutdown");
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message.contains("task driver stopped") || message.contains("task driver is not running"))
+    );
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    release_tx.send(()).unwrap();
+    stopper.join().unwrap();
+    scheduler.shutdown().await.unwrap();
+}

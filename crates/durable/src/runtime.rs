@@ -5627,8 +5627,19 @@ impl Scheduler {
         let (conversations, tasks) = self.abort_background_graph(id)?;
         let mut first_error = None;
         for conversation in &conversations {
-            if let Err(error) = self.wait(*conversation).await {
-                first_error.get_or_insert(error);
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), self.wait(*conversation))
+                    .await
+                {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                        break;
+                    }
+                    Err(_) => {
+                        self.check_abort_task_progress(&tasks)?;
+                    }
+                }
             }
         }
         if let Some(error) = first_error {
@@ -5642,18 +5653,24 @@ impl Scheduler {
             }
         }
         loop {
-            let store = crate::task_store::TaskStore::new(self.harness.owner.store());
-            let mut pending = false;
-            for id in &tasks {
-                let task = store
-                    .load(*id)
-                    .map_err(|e| Error::Invalid(format!("task lookup: {e}")))?
-                    .ok_or(Error::NotFound)?;
-                pending |= !task.task.is_terminal();
-            }
-            if !pending {
+            if !self.check_abort_task_progress(&tasks)? {
                 return Ok(());
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn check_abort_task_progress(&self, tasks: &[Uuid]) -> Result<bool, Error> {
+        let store = crate::task_store::TaskStore::new(self.harness.owner.store());
+        let mut pending = false;
+        for id in tasks {
+            let task = store
+                .load(*id)
+                .map_err(|e| Error::Invalid(format!("task lookup: {e}")))?
+                .ok_or(Error::NotFound)?;
+            pending |= !task.task.is_terminal();
+        }
+        if pending {
             let driver = self
                 .harness
                 .task_driver
@@ -5667,8 +5684,8 @@ impl Scheduler {
                 ));
             };
             driver.check_running_and_wake()?;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        Ok(pending)
     }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {
