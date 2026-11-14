@@ -1347,6 +1347,82 @@ mod tests {
     }
 
     #[test]
+    fn meta_catalog_and_credential_are_endpoint_bound() {
+        const CHILD: &str = "PI_RS_TEST_META_AUTH_CHILD_932B";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_profiles::tests::meta_catalog_and_credential_are_endpoint_bound",
+                ])
+                .env(CHILD, "1")
+                .env("META_API_KEY", "meta-environment-key")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = args.model_profiles.provider("meta").unwrap();
+        assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
+        let endpoint = args.model_profiles.endpoint(&provider);
+        assert_eq!(endpoint, "https://api.meta.ai/v1/responses");
+        assert_eq!(args.model_profiles.model_ids(&provider).len(), 6);
+        let model = args
+            .model_profiles
+            .model(&provider, "muse-spark-1.3")
+            .unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(131_072));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.mapped_effort("max"), Some(Some("max")));
+        assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+        let mut metadata = json!({});
+        model.apply_catalog_metadata(&mut metadata);
+        assert_eq!(metadata["cost"]["input"], 1.25);
+        assert_eq!(metadata["cost"]["cacheRead"], 0.15);
+        let old = args
+            .model_profiles
+            .model(&provider, "muse-spark-1.2")
+            .unwrap();
+        assert_eq!(old.mapped_effort("max"), Some(None));
+        assert_eq!(
+            args.configured_model_credential(&provider, endpoint)
+                .unwrap()
+                .literal(),
+            Some("meta-environment-key")
+        );
+        assert!(
+            args.configured_model_credential(&provider, "https://api.meta.ai:444/v1/responses")
+                .is_none()
+        );
+        assert!(
+            args.configured_model_credential(&provider, "https://other.example/v1/responses")
+                .is_none()
+        );
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"meta":{"type":"api_key","key":"stored-key"}}),
+        );
+        assert_eq!(
+            args.configured_model_credential(&provider, endpoint)
+                .unwrap()
+                .literal(),
+            Some("stored-key")
+        );
+        assert!(
+            args.configured_model_credential(&provider, "https://other.example/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn xai_catalog_uses_responses_and_model_specific_thinking_levels() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("xai").unwrap();
