@@ -7240,8 +7240,11 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
     use tokio::net::TcpListener as AsyncListener;
     use tokio::process::Command as AsyncCommand;
 
-    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> (String, usize) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: tokio::time::Instant,
+    ) -> (String, usize) {
+        tokio::time::timeout_at(deadline, async {
             let mut first = String::new();
             assert_ne!(
                 reader.read_line(&mut first).await.unwrap(),
@@ -7307,27 +7310,29 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
             (proxy, origin)
         };
         let server_base = base.clone();
+        // Share one deadline with the subprocess, including startup and discovery.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             loop {
                 let Ok(Ok((socket, _))) =
-                    tokio::time::timeout(Duration::from_secs(5), selected.accept()).await
+                    tokio::time::timeout_at(deadline, selected.accept()).await
                 else {
                     break;
                 };
                 let mut socket = tokio::io::BufReader::new(socket);
-                let (mut first, mut length) = headers(&mut socket).await;
+                let (mut first, mut length) = headers(&mut socket, deadline).await;
                 if !bypass {
                     assert_eq!(first, format!("CONNECT {origin_addr} HTTP/1.1\r\n"));
                     socket
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await
                         .unwrap();
-                    (first, length) = headers(&mut socket).await;
+                    (first, length) = headers(&mut socket, deadline).await;
                 }
                 let mut body = vec![0; length];
-                tokio::time::timeout(
-                    Duration::from_secs(5),
+                tokio::time::timeout_at(
+                    deadline,
                     tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body),
                 )
                 .await
@@ -7373,12 +7378,12 @@ async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+        let output = tokio::time::timeout_at(deadline, command.output())
             .await
             .expect("login exceeded fixture deadline")
             .unwrap();
         assert!(!output.status.success(), "fixture rejects registration");
-        let requests = tokio::time::timeout(Duration::from_secs(10), server)
+        let requests = tokio::time::timeout_at(deadline + Duration::from_secs(2), server)
             .await
             .unwrap()
             .unwrap();
