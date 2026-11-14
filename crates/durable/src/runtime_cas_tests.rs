@@ -1541,3 +1541,129 @@ fn admission_task_racing_conversation_abort_rolls_back() {
     assert!(driver.get(task_id).unwrap().is_none());
     driver.shutdown().unwrap();
 }
+
+#[test]
+fn entry_id_fork_uses_exact_snapshot_across_reset_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "old".into(),
+            system_prompt: "prompt".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let other = h
+        .create_conversation(Config {
+            model: "other".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    // Cross an observation page boundary before the message is committed.
+    for _ in 0..130 {
+        let (state, version) = h.load(id).unwrap();
+        h.save(&state, Expected::Version(version)).unwrap();
+    }
+    let (mut state, version) = h.load(id).unwrap();
+    state.provider_adapter = Some("adapter-old".into());
+    state.allowed_tools = Some(vec!["tool-old".into()]);
+    state.messages = vec![
+        Message::User {
+            content: "same".into(),
+        },
+        Message::User {
+            content: "same".into(),
+        },
+    ];
+    state.aborted_generations.push(AbortedGeneration {
+        request_id: Uuid::new_v4(),
+        text: "partial".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let page = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    let boundary = page.entries[0].history.as_ref().unwrap().id;
+    let interior = page.entries[1].history.as_ref().unwrap().id;
+    assert_ne!(boundary, interior);
+    assert!(h.fork_by_entry_id(id, interior).is_err());
+    assert!(h.fork_by_entry_id(other, boundary).is_err());
+    assert!(h.fork_by_entry_id(id, Uuid::new_v4()).is_err());
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "new".into();
+    state.provider_adapter = None;
+    state.allowed_tools = None;
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.reset(id, Some("replacement".into())).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.abort_requested = true;
+    h.save(&state, Expected::Version(version)).unwrap();
+    let before = h.conversation(id).unwrap();
+    let child = h.fork_by_entry_id(id, boundary).unwrap();
+    let result = h.conversation(child).unwrap();
+    assert_eq!(result.config.model, "old");
+    assert_eq!(result.provider_adapter.as_deref(), Some("adapter-old"));
+    assert_eq!(result.allowed_tools, Some(vec!["tool-old".into()]));
+    assert_eq!(result.messages.len(), 2);
+    assert!(result.aborted_generations.is_empty());
+    let after = h.conversation(id).unwrap();
+    assert!(after.abort_requested);
+    assert!(!result.abort_requested);
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+    assert!(h.fork_by_entry_id(child, boundary).is_err());
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(child).unwrap().messages, result.messages);
+}
+
+#[test]
+fn entry_id_fork_rejects_incomplete_snapshot_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "one".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entry = h
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0)
+        .history
+        .unwrap();
+    let key = format!("runtime/fork/{id}/{:020}", entry.commit).into_bytes();
+    let original = h.owner.store().get(&key).unwrap().unwrap().value;
+    for name in [
+        "pi-rs/runtime/provider-adapter",
+        "pi-rs/runtime/allowed-tools",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        value["documents"].as_object_mut().unwrap().remove(name);
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(h.fork_by_entry_id(id, entry.id).is_err());
+    }
+}

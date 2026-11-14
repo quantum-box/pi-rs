@@ -1791,6 +1791,8 @@ impl Harness {
                     for name in [
                         "pi-rs/runtime/queue-modes",
                         "pi-rs/runtime/extensions",
+                        "pi-rs/runtime/provider-adapter",
+                        "pi-rs/runtime/allowed-tools",
                         "pi-rs/runtime/resets",
                         "pi-rs/runtime/application-writes",
                     ] {
@@ -1807,6 +1809,61 @@ impl Harness {
             cursor = page.next;
         }
         Err(crate::fork::Error::InvalidSnapshot.into())
+    }
+    /// Fork at the exact committed boundary of a message occurrence.
+    /// Interior batch messages, legacy entries and entries originating in another
+    /// conversation cannot prove such a boundary and are rejected. Retained
+    /// observations are scanned in bounded pages, including across resets.
+    pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.load(id)?;
+        if entry_id.is_nil() {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let observer = crate::observer::Observer::new(self.owner.store(), id);
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut cursor = crate::observer::Cursor(0);
+        let mut last_reference = None;
+        loop {
+            let page = observer.read(cursor, std::num::NonZeroUsize::new(128).unwrap())?;
+            for record in &page.records {
+                let Some(value) = record.value.get("_transcript") else {
+                    continue;
+                };
+                let reference: Option<crate::transcript::Cursor> =
+                    serde_json::from_value(value.clone())?;
+                let Some(reference) = reference else { continue };
+                if last_reference.as_ref() == Some(&reference) {
+                    continue;
+                }
+                last_reference = Some(reference.clone());
+                let batch = transcript.read(&reference, std::num::NonZeroUsize::MIN)?;
+                let Some(batch) = batch.records.first() else {
+                    continue;
+                };
+                let (messages, _, metadata) =
+                    serde_json::from_value::<TranscriptChange>(batch.value.clone())?.parts()?;
+                let Some((ids, commit, origin)) = metadata else {
+                    continue;
+                };
+                if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
+                    if origin != id || commit != record.cursor.0 || index + 1 != messages.len() {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    return self.fork_at_position(
+                        id,
+                        ViewCursor {
+                            cursor: reference,
+                            remaining: Some(index + 1),
+                        },
+                    );
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        Err(crate::fork::Error::InvalidCursor.into())
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
@@ -4899,6 +4956,9 @@ impl Scheduler {
     }
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
         self.harness.fork_at_position(id, position)
+    }
+    pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.harness.fork_by_entry_id(id, entry_id)
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)

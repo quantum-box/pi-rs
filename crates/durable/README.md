@@ -50,12 +50,13 @@ originating atomic observation commit through positioned views. Only the last
 message of a batch corresponds to a separately captured state boundary; legacy
 batches have no entry metadata and fail closed for position forks. Reset and
 compaction replacement batches assign fresh IDs to their replacement occurrences.
-This is groundwork, not entry-ID lookup or arbitrary entry-ID forking. See the
-parity document for historical-state and storage limitations.
+`fork_by_entry_id` resolves these IDs at complete, proven batch boundaries. It
+rejects interior, legacy, and other-conversation occurrences. See the parity
+document for historical-state and storage limitations.
 
 The runtime can fork a settled conversation at its current state or a supported
 historical snapshot cursor, and performs explicit idle compaction. It also
-supports `fork_at_position` for a message at a complete batch boundary with
+supports `fork_at_position` and `fork_by_entry_id` for a message at a complete batch boundary with
 matching complete historical fork metadata; other positions fail closed. The
 first matching observation determines the configuration. This does not recover
 per-message state within a batch or pre-migration legacy history. It also
