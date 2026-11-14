@@ -50,7 +50,9 @@ impl Search {
             end -= 1;
         }
         let text = &text[..end];
-        self.editor.insert(&normalize_whitespace(text));
+        // Match the single-line input's paste behavior; normalize the complete
+        // query during search so pasted boundary spaces are not discarded.
+        self.editor.insert(&text.replace(['\r', '\n'], ""));
     }
 
     pub fn overlay(&self, theme: &Theme, keys: &Keys, width: usize) -> (Vec<Line>, usize, usize) {
@@ -336,7 +338,24 @@ mod tests {
         assert!(matches[0].iter().all(|segment| segment.row == 1));
         let mut search = Search::default();
         search.paste("a\u{feff}b\u{85}c");
-        assert_eq!(search.editor.text, "a b\u{85}c");
+        // Editor and terminal spans deliberately remove C1 controls before
+        // searching; test this public path instead of assuming U+0085 survives.
+        assert_eq!(search.editor.text, "a\u{feff}bc");
+        let rendered = Line::plain("a\u{85}b", Color::Reset);
+        assert_eq!(rendered.spans[0].text, "ab");
+    }
+
+    #[test]
+    fn pasted_separator_is_preserved_between_existing_query_text() {
+        let mut search = Search::default();
+        search.editor.replace("ab".into());
+        search.editor.cursor = 1;
+        search.paste("\u{feff}");
+        assert_eq!(search.editor.text, "a\u{feff}b");
+        let lines = [Line::plain("a b", Color::Reset)];
+        assert_eq!(search.update(&lines, 0), Some(0..1));
+        assert_eq!(search.query, "a b");
+        assert_eq!(search.result(), "1/1");
     }
 
     #[test]
