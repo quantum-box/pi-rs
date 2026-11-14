@@ -1843,6 +1843,58 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn marked_table_autolink_normalizes_escaped_pipe_in_destination() {
+        let theme = Theme::system();
+        let source = "| a | b |\n|---|---|\n|https://example.com/a\\|b ~~x~~|keep|";
+        let lines = markdown_at_depth(
+            source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.hyperlink.as_deref() == Some("https://example.com/a|b")),
+            "{lines:?}"
+        );
+        assert!(
+            spans.iter().all(|span| !span
+                .hyperlink
+                .as_deref()
+                .is_some_and(|url| url.contains("\\|"))),
+            "{lines:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "x" && span.strikethrough),
+            "{lines:?}"
+        );
+        let unsafe_source = "| a | b |\n|---|---|\n|o’connor@example.com ~~x\\|y~~|keep|";
+        let lines = markdown_at_depth(
+            unsafe_source,
+            &theme,
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.hyperlink.is_none()),
+            "{lines:?}"
+        );
+    }
     #[test]
     fn marked_strike_keeps_bare_and_angle_autolinks() {
         let theme = Theme::system();

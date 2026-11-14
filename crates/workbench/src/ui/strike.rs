@@ -273,13 +273,21 @@ fn token_nodes(
                     let absolute_end = span.end;
                     let tail = whole.get(absolute_end..cell_end.unwrap_or(whole.len()))?;
                     let extra = tail.char_indices().nth(2).map_or(tail.len(), |(i, _)| i);
-                    let candidate = whole.get(absolute_start..absolute_end + extra)?;
-                    let safe = super::render::bare_links(candidate)
+                    let original_candidate = whole.get(absolute_start..absolute_end + extra)?;
+                    let candidate = if cell_end.is_some() {
+                        unescape_with_offsets(original_candidate, b"|").0
+                    } else {
+                        original_candidate.to_owned()
+                    };
+                    // The normalized candidate must still identify exactly the
+                    // token being validated, including after table unescaping.
+                    let safe = candidate
+                        .starts_with(raw)
+                        .then(|| super::render::bare_links(&candidate))
                         .into_iter()
+                        .flatten()
                         .next()
-                        .filter(|(range, _)| {
-                            range.start == 0 && range.end == absolute_end - absolute_start
-                        })
+                        .filter(|(range, _)| range.start == 0 && range.end == raw.len())
                         .and_then(|(_, url)| url)
                         .filter(|url| {
                             !url.starts_with("mailto:")
