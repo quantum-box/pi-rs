@@ -339,6 +339,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         return Err(Error::Session("Pi import entry exceeds 8 MiB".into()));
     }
     let header = &entries[0];
+    let external_id = header["id"].as_str();
     let version = header["version"].as_u64().unwrap_or(1);
     if !(1..=3).contains(&version) {
         return Err(Error::Session(format!(
@@ -350,15 +351,24 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         timestamp: header["timestamp"].as_str().map(str::to_owned),
     };
     let mut root = Branch::default();
+    let native_id = external_id
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .unwrap_or_else(Uuid::new_v4);
     importer.append(
         &mut root,
         Event::Created {
-            session_id: header["id"]
-                .as_str()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .unwrap_or_else(Uuid::new_v4),
+            session_id: native_id,
         },
     );
+    if let Some(id) = external_id.filter(|id| *id != native_id.to_string()) {
+        importer.append(
+            &mut root,
+            Event::SourceEntry {
+                format: "pi-rs:external-session-id".into(),
+                entry: serde_json::json!({"native_id": native_id, "id": id}),
+            },
+        );
+    }
     importer.append(
         &mut root,
         Event::SessionInfo {
@@ -2233,6 +2243,40 @@ mod tests {
         let session =
             import_pi(vec![json!({"type":"session","version":3,"id":"custom-id"})]).unwrap();
         assert_ne!(session.session_id(), Uuid::nil());
+        assert_eq!(session.external_session_id(), "custom-id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert_eq!(reopened.external_session_id(), "custom-id");
+        assert_eq!(reopened.session_id(), session.session_id());
+        let fork = Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+        assert_ne!(fork.session_id(), reopened.session_id());
+        assert_eq!(fork.external_session_id(), fork.session_id().to_string());
+        for valid in [
+            "",
+            "-invalid",
+            "invalid.",
+            "a/b",
+            "a b",
+            "a\r\nb",
+            "é",
+            "a",
+            "test.id_1-2",
+            "A0",
+        ] {
+            let imported =
+                import_pi(vec![json!({"type":"session","version":3,"id":valid})]).unwrap();
+            assert_eq!(imported.external_session_id(), valid);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.jsonl");
+            imported.export_jsonl(&path).unwrap();
+            let reopened = read(&path).unwrap();
+            assert_eq!(reopened.external_session_id(), valid);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_eq!(fork.external_session_id(), fork.session_id().to_string());
+        }
     }
     #[test]
     fn imported_tool_details_remain_in_history_outside_model_context() {
