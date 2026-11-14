@@ -350,8 +350,10 @@ child and reporter; a new operation ID is a new send. `stop` addresses only a
 named child of the bound parent, atomically persists the abort and a receipt for
 the tool operation, then cancels and schedules cleanup of its foreground owned
 graph. Replaying the operation, including after reopening, does not stop later
-work. The child and transcript remain available for new sends. Existing reporters
-remain active and report aborted submissions as failures. Errors after admission
+work. The child and transcript remain available for new sends. After a child-only
+stop, existing reporters can report aborted submissions as failures. A parent
+background-inclusive abort instead retires pending reporters from earlier generations.
+Errors after admission
 starts are uncertain and require reconciliation. The reporter runs while the
 scheduler is open. Extension tools are currently marked unsafe for automatic
 replay, so an interrupted invocation may require manual reconciliation even
@@ -371,9 +373,10 @@ the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is
 provided. Lower-level named links are independent by default. The managed `subagent` send atomically creates a named reservation, child and completed background anchor on first use; existing explicit links are anchored before managed delivery. `Harness::anchor_subagent` can explicitly attach an immediately succeeded, conversation-owned background task and a foreground ownership edge to an existing named child. Attachment is atomic and idempotent across reopen; an ordinary parent abort does not reach the child, while background-inclusive parent abort marks the child for abort. The caller must drive cleanup. The management stop action still aborts only the child's current work and leaves the anchor in place. Reporter intent and input admission remain separate recoverable commits after creation, unlike upstream’s single spawn transaction. `request_abort_with_background`, `abort_with_background`, and `abort_and_wait_with_background` explicitly cross background boundaries, including terminal anchors; the waiting form requires a running task driver for live tasks.
 
-This is not the complete upstream background-subagent extension. Named links do
-do not automatically form an ownership tree, and named children do not inherit parent management extensions.
-A parent cancellation does not cancel child work. Scheduler shutdown requests
+This is not the complete upstream background-subagent extension. Lower-level
+named links do not automatically form an ownership tree, and named children do
+not inherit parent management extensions. Ordinary parent cancellation does not
+cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.
 Dropping a scheduler stops its reporter poller; reopening resumes unfinished
