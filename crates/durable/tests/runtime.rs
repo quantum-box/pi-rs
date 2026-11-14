@@ -1746,6 +1746,25 @@ fn runtime_block_commit_survives_process_exit() {
         c.content_blocks[&0].blocks,
         vec![json!({"type":"text","text":"saved","textSignature":"opaque"})]
     );
-    assert!(h.fork(id).is_err());
+    let fork = h.fork(id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks,
+        c.content_blocks
+    );
     assert!(h.request_manual_compaction(id, 0, None).is_err());
+    drop(h);
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let h = Harness::open_paused(&path, options(model, tool, ReplayPolicy::Unsafe)).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks,
+        c.content_blocks
+    );
 }

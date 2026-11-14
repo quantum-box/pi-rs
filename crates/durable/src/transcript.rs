@@ -245,13 +245,13 @@ impl<'a> Transcript<'a> {
 
     /// Fork the current head. A simultaneous source append makes this batch
     /// conflict, so the caller can choose the new head explicitly on retry.
-    /// Scans the captured chain and rejects unsupported block-bearing records.
+    /// Scans and validates the captured immutable chain, including block bindings.
     pub fn prepare_fork(&self, child: Uuid) -> Result<Batch, Error> {
         if child == self.id {
             return Err(Error::SelfFork);
         }
         let (head, version) = self.load_head()?;
-        self.reject_blocks_in_chain(head.tip)?;
+        self.validate_chain(head.tip)?;
         let child_key = head_key(child);
         Ok(Batch {
             checks: vec![
@@ -283,7 +283,7 @@ impl<'a> Transcript<'a> {
         if child == self.id {
             return Err(Error::SelfFork);
         }
-        self.reject_blocks_in_chain(cursor.next)?;
+        self.validate_chain(cursor.next)?;
         let key = head_key(child);
         Ok((
             Batch {
@@ -357,13 +357,9 @@ impl<'a> Transcript<'a> {
         })
     }
 
-    fn reject_blocks_in_chain(&self, mut link: Option<Link>) -> Result<(), Error> {
+    fn validate_chain(&self, mut link: Option<Link>) -> Result<(), Error> {
         while let Some(current) = link {
-            let entry = self.load_entry(current)?;
-            if entry.content_blocks.is_some() {
-                return Err(Error::UnsupportedContentBlocks);
-            }
-            link = entry.previous;
+            link = self.load_entry(current)?.previous;
         }
         Ok(())
     }
@@ -494,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_blocks_survive_append_and_reopen_and_forks_fail_closed() {
+    fn versioned_blocks_survive_append_fork_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let id = Uuid::new_v4();
@@ -520,17 +516,29 @@ mod tests {
         );
         let blocked_snapshot = transcript.snapshot().unwrap();
         append(&db, id, json!({"later": true}));
-        assert!(matches!(
-            transcript.prepare_fork(Uuid::new_v4()),
-            Err(Error::UnsupportedContentBlocks)
-        ));
-        assert!(matches!(
-            transcript.prepare_fork_at(&blocked_snapshot, Uuid::new_v4()),
-            Err(Error::UnsupportedContentBlocks)
-        ));
+        let full_child = Uuid::new_v4();
+        let historical_child = Uuid::new_v4();
+        commit(&db, transcript.prepare_fork(full_child).unwrap());
+        let (batch, _) = transcript
+            .prepare_fork_at(&blocked_snapshot, historical_child)
+            .unwrap();
+        commit(&db, batch);
         drop(db);
 
         let db = Store::open(&path).unwrap();
+        let child = Transcript::new(&db, historical_child);
+        let inherited = child
+            .read_with_blocks(&child.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(inherited.records[0].content_blocks, Some(content.clone()));
+        let full = Transcript::new(&db, full_child);
+        assert_eq!(
+            full.read_with_blocks(&full.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+                .unwrap()
+                .records[1]
+                .content_blocks,
+            Some(content.clone())
+        );
         let transcript = Transcript::new(&db, id);
         let page = transcript
             .read_with_blocks(
@@ -636,6 +644,8 @@ mod tests {
             transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
             Err(Error::Corrupt)
         ));
+        assert!(matches!(transcript.prepare_fork(Uuid::new_v4()), Err(Error::Corrupt)));
+        assert!(matches!(transcript.prepare_fork_at(&cursor, Uuid::new_v4()), Err(Error::Corrupt)));
     }
 
     #[test]

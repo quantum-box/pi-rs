@@ -4534,3 +4534,88 @@ fn ordered_config_task_abort_discards_staged_effects() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn application_entry_fork_preserves_ordered_block_history_after_reopen() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Append;
+    impl Handler for Append {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("block-cut", json!("entry")).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let blocks = vec![
+        json!({"type":"text", "text":"before"}),
+        json!({"type":"image", "data":"aGk=", "mimeType":"image/png"}),
+        json!({"type":"text", "text":"after"}),
+    ];
+    let occurrence = h.append_user_blocks(parent, blocks.clone()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("append", true, Append);
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(parent),
+        Checkpoint {
+            phase: "initial".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("append".into(), true);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    tasks.submit(&task).unwrap();
+    tasks.tick(0).unwrap();
+    drop(tasks);
+    let db = Store::open(&path).unwrap();
+    let entry = application_entry::list(&db, parent).unwrap().pop().unwrap();
+    let child = h.fork_at_application_entry(parent, entry.id).unwrap();
+    assert_eq!(
+        h.conversation(child).unwrap().content_blocks[&0].message_id,
+        occurrence
+    );
+    assert_eq!(
+        h.conversation(child).unwrap().content_blocks[&0].blocks,
+        blocks
+    );
+    drop(db);
+    drop(h);
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.conversation(child).unwrap().content_blocks[&0].message_id,
+        occurrence
+    );
+    assert_eq!(
+        h.conversation(child).unwrap().content_blocks[&0].blocks,
+        blocks
+    );
+}

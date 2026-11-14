@@ -160,7 +160,7 @@ fn validate_transcript(messages: &[Message]) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_context(messages: &[Message]) -> Result<(), Error> {
+pub(crate) fn validate_context(messages: &[Message]) -> Result<(), Error> {
     let mut pending = HashSet::new();
     let mut seen = HashSet::new();
     let mut non_system = false;
