@@ -56,6 +56,7 @@ fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
     }
     let host = host.to_ascii_lowercase();
     let mut invalid_ace = false;
+    let mut sanitized = Vec::new();
     let decoded = host
         .split('.')
         .map(|label| {
@@ -65,8 +66,10 @@ fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
                     return None;
                 }
                 invalid_ace = true;
+                sanitized.push("invalid-ace".to_owned());
                 Some(label.to_owned())
             } else {
+                sanitized.push(label.to_owned());
                 Some(decoded)
             }
         })
@@ -75,7 +78,7 @@ fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
     if !invalid_ace {
         return None;
     }
-    let replacement = format!("file://pi-invalid-host.invalid{}", &rest[end..]);
+    let replacement = format!("file://{}{}", sanitized.join("."), &rest[end..]);
     Some((url::Url::parse(&replacement).ok()?, decoded))
 }
 
@@ -193,6 +196,8 @@ mod tests {
             "file://user@xn--bad-/share",
             "file://xn--bad-:99/share",
             "file://xn--bad-%2f/share",
+            "file://xn--bad-.127/share",
+            "file://xn--bad-.0x7f/share",
             "file://xn--n3h/share",
             "https://xn--bad-/share",
         ] {
