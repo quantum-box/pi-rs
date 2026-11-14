@@ -401,6 +401,7 @@ pub struct SessionControl {
     owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
+    shutdown: CancellationToken,
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
@@ -1055,6 +1056,18 @@ impl SessionControl {
         }
     }
 
+    /// Permanently cancel active and subsequently registered runs while the
+    /// owner waits to close the session. This does not itself close the session.
+    pub fn request_shutdown(&self) {
+        let Ok(_guard) = self.scoped_guard() else {
+            return;
+        };
+        self.shutdown.cancel();
+        if let Some(active) = self.active.lock().expect("session control").as_ref() {
+            active.cancel();
+        }
+    }
+
     fn observe(&self, event: &Notification<'_>) {
         if let Notification::BranchState(states) = event {
             self.input_hooks.lock().expect("SDK input hooks").states = (*states).clone();
@@ -1378,6 +1391,7 @@ impl SessionBuilder {
                 owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
+                shutdown: CancellationToken::new(),
                 auto_compaction,
                 retry,
                 input_hooks,
@@ -2723,7 +2737,7 @@ impl AgentSession {
         }
     }
     fn begin_run(&self) -> ActiveRun {
-        let token = CancellationToken::new();
+        let token = self.control.shutdown.child_token();
         *self.control.active.lock().expect("session control") = Some(token.clone());
         ActiveRun {
             token,
@@ -3142,6 +3156,28 @@ mod tests {
             explicit.limits.tool_timeout,
             std::time::Duration::from_secs(30)
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancellation_is_inherited_by_new_runs() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let active = session.begin_run();
+        control.abort();
+        assert!(active.token.is_cancelled());
+        drop(active);
+        let next = session.begin_run();
+        assert!(!next.token.is_cancelled(), "ordinary abort is not sticky");
+        control.request_shutdown();
+        assert!(next.token.is_cancelled());
+        drop(next);
+        let after_shutdown = session.begin_run();
+        assert!(after_shutdown.token.is_cancelled());
+        drop(after_shutdown);
+        assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

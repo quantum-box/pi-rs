@@ -60,15 +60,9 @@ pub mod commands {
                 }
                 #[cfg(test)]
                 state.startup_release.notify_one();
-                state.control.abort();
-                // Startup can yield before the SDK registers its active run.
-                // Keep signalling until it does, and let the SDK finish cleanup.
-                loop {
-                    tokio::select! {
-                        _ = &mut run => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => state.control.abort(),
-                    }
-                }
+                // Shutdown is inherited by runs registered during startup.
+                // Await the prompt so its SDK cleanup still runs.
+                let _ = run.await;
                 Err(closed())
             }
             result = &mut run => result.map_err(|error| error.to_string()),
@@ -82,8 +76,8 @@ pub mod commands {
 
     #[tauri::command]
     pub async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
+        state.control.request_shutdown();
         state.closing.send_replace(true);
-        state.control.abort();
         state
             .session
             .lock()
@@ -136,6 +130,14 @@ mod tests {
     use tauri::Manager;
 
     struct Fixture;
+    struct ImmediateModel(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for ImmediateModel {
+        async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Fixture.stream(request).await
+        }
+    }
     struct StalledModel(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
     #[async_trait::async_trait]
     impl Model for StalledModel {
@@ -310,15 +312,11 @@ mod tests {
     #[test]
     fn mock_ipc_close_cancels_prompt_before_run_registration() {
         use std::time::Duration;
-        let (model_entered, model_started) = std::sync::mpsc::channel();
-        let app = configure(
-            tauri::test::mock_builder(),
-            Arc::new(StalledModel(std::sync::Mutex::new(Some(model_entered)))),
-            "fixture",
-        )
-        .unwrap()
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .unwrap();
+        let model = Arc::new(ImmediateModel(std::sync::atomic::AtomicUsize::new(0)));
+        let app = configure(tauri::test::mock_builder(), model.clone(), "fixture")
+            .unwrap()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
         let (entered, started) = std::sync::mpsc::channel();
         *app.state::<AppState>().startup_gate.lock().unwrap() = Some(entered);
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -343,9 +341,6 @@ mod tests {
                 tauri::test::get_ipc_response(&close_view, request("close", serde_json::json!({})));
             sender.send(response.is_ok()).unwrap();
         });
-        model_started
-            .recv_timeout(Duration::from_secs(5))
-            .expect("run did not register after startup");
         assert!(
             close_result
                 .recv_timeout(Duration::from_secs(5))
@@ -356,6 +351,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("startup was not cancelled")
         );
+        assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         prompt_thread.join().unwrap();
         close_thread.join().unwrap();
     }
