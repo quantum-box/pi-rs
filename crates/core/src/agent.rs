@@ -1290,8 +1290,12 @@ impl Agent<'_> {
                     // to replay. A validated completed summary can be committed
                     // without a second billable provider request.
                     if active.registry.extensions.is_empty()
-                        && let Some((summary, spent, billing)) =
-                            completed_overflow_summary(session, run_id, "pi-rs:overflow-recovery")
+                        && let Some((summary, spent, billing)) = completed_overflow_summary(
+                            session,
+                            run_id,
+                            "pi-rs:overflow-recovery",
+                            active.model_name,
+                        )
                         && spent <= budget
                     {
                         let retention = configured_retention(
@@ -1699,6 +1703,12 @@ impl Agent<'_> {
                 && session.auto_compaction_control().enabled()
                 && request_index + 1 < active.limits.model_requests
                 && !overflow_recovery_attempted(session, run_id)
+                && configured_retention(
+                    session,
+                    active.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )
+                .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
             {
                 // The completed attempt is durable in ModelFinished but never
                 // becomes a model-visible assistant/tool message.
@@ -1972,8 +1982,12 @@ impl Agent<'_> {
             // A completed summary is safe to reuse only when no external
             // hooks could have run before the interruption.
             if self.registry.extensions.is_empty()
-                && let Some((summary, _, billing)) =
-                    completed_overflow_summary(session, run_id, "pi-rs:silent-overflow")
+                && let Some((summary, _, billing)) = completed_overflow_summary(
+                    session,
+                    run_id,
+                    "pi-rs:silent-overflow",
+                    self.model_name,
+                )
                 && let Ok(retention) = configured_retention(
                     session,
                     self.compaction_tokens(session).keep_recent_tokens,
@@ -4412,6 +4426,7 @@ fn completed_overflow_summary(
     session: &Session,
     run_id: Uuid,
     marker_format: &str,
+    model_name: &str,
 ) -> Option<RecoveredSummary> {
     let branch = session.branch();
     let marker = branch.iter().rposition(|record| {
@@ -4425,21 +4440,36 @@ fn completed_overflow_summary(
     let Event::ModelRequested {
         request_id: Some(request_id),
         max_output_tokens,
+        model,
         ..
     } = &branch[request_index].event
     else {
         return None;
     };
+    if model != model_name {
+        return None;
+    }
     let following = &branch[request_index + 1..];
     if following.iter().any(|record| {
         matches!(
             record.event,
             Event::User { .. }
                 | Event::UserWithImages { .. }
+                | Event::UserImages { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
                 | Event::Assistant { .. }
+                | Event::ToolFinished { .. }
+                | Event::ToolReconciled { .. }
+                | Event::BashExecution { .. }
+                | Event::BranchSummary { .. }
+                | Event::CompactionSummaryMessage { .. }
                 | Event::ContextEdited { .. }
                 | Event::Compacted { .. }
                 | Event::SystemCheckpoint { .. }
+                | Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::Checkout { .. }
                 | Event::ModelRequested { .. }
         )
     }) {
@@ -7101,6 +7131,62 @@ mod tree_tests {
             .unwrap();
         assert!(overflow_recovery_state(&session, run_id).is_none());
         assert!(overflow_recovery_attempted(&session, run_id));
+    }
+
+    #[test]
+    fn saved_summary_is_not_reused_after_context_or_model_change() {
+        for changed_model in [false, true] {
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let run_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            session.set_run_id(Some(run_id));
+            session
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            session
+                .append(Event::ModelRequested {
+                    model: if changed_model { "other" } else { "fixture" }.into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: Default::default(),
+                    usage: UsageReport::Measured {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                    },
+                    failure: None,
+                    partial: "summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            if !changed_model {
+                session
+                    .append(Event::User {
+                        content: "new context".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+            }
+            assert!(
+                completed_overflow_summary(&session, run_id, "pi-rs:overflow-recovery", "fixture")
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
