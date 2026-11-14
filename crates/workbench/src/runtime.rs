@@ -496,6 +496,80 @@ impl Runtime {
     }
 }
 
+/// Prepare an idle share context in the calling task, using an in-memory copy
+/// so lifecycle and discovery cannot write to the source journal. This waits
+/// for preparation: a detached timeout could leave side effects running after
+/// the share has moved on, including credential refresh and MCP startup.
+pub(super) async fn standalone_share_snapshot(
+    args: &Cli,
+    source: &Session,
+) -> Result<super::sessions::ShareSnapshot> {
+    standalone_share_snapshot_after(args, source, std::future::ready(())).await
+}
+
+async fn standalone_share_snapshot_after(
+    args: &Cli,
+    source: &Session,
+    before_configure: impl std::future::Future<Output = ()>,
+) -> Result<super::sessions::ShareSnapshot> {
+    if args.trust_pending {
+        return Err(pi_rs::Error::Config("project trust is pending".into()));
+    }
+    let mut args = args.clone();
+    args.restore_session_model(source);
+    super::thinking::adjust(&mut args);
+    let session = Session::from_records(source.records().to_vec())?;
+    let runtime = configure_after(&args, false, before_configure).await?;
+    standalone_share_snapshot_with_runtime(&args, source, session, runtime).await
+}
+
+async fn standalone_share_snapshot_with_runtime(
+    args: &Cli,
+    source: &Session,
+    mut session: Session,
+    mut runtime: Runtime,
+) -> Result<super::sessions::ShareSnapshot> {
+    let result = async {
+        runtime
+            .session_lifecycle(
+                args,
+                &session,
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+            )
+            .await;
+        runtime
+            .discover_resources(args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
+            .await?;
+        let base = runtime.share_base();
+        let (system_prompt, tools) =
+            source.effective_system_context(&base.system_prompt, base.tools);
+        Ok(super::sessions::ShareSnapshot {
+            session_id: source.session_id(),
+            head: source.head(),
+            context: super::sessions::ShareContext {
+                system_prompt,
+                tools,
+            },
+        })
+    }
+    .await;
+    runtime
+        .session_lifecycle(
+            args,
+            &session,
+            pi_rs::LifecycleEvent::SessionShutdown {
+                reason: pi_rs::SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+        )
+        .await;
+    let closed = runtime.close().await;
+    result.and_then(|snapshot| closed.map(|()| snapshot))
+}
+
 fn resolve_discovered_path(
     path: &std::path::Path,
     cwd: &std::path::Path,
@@ -588,6 +662,15 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 }
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
+    configure_after(args, interactive_mcp, std::future::ready(())).await
+}
+
+async fn configure_after(
+    args: &Cli,
+    interactive_mcp: bool,
+    before_preparation: impl std::future::Future<Output = ()>,
+) -> Result<Runtime> {
+    before_preparation.await;
     super::packages::prepare(args).await?;
     let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {
@@ -955,6 +1038,170 @@ impl pi_rs::Extension for LocalCommandPolicy {
         } else {
             self.0.before_tool(name, arguments, context, state).await
         }
+    }
+}
+
+#[cfg(test)]
+mod standalone_share_tests {
+    use super::*;
+    use clap::Parser;
+
+    struct LifecycleRecorder {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        invalid_prompt: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for LifecycleRecorder {
+        fn id(&self) -> &str {
+            "share-lifecycle-recorder"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &pi_rs::LifecycleEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<()> {
+            let event = match event {
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                } => "start",
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                } => "shutdown",
+                _ => "unexpected",
+            };
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn discover_resources(
+            &self,
+            _: &pi_rs::ResourceDiscoveryEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::DiscoveredResources> {
+            self.events.lock().unwrap().push("discover");
+            if let Some(path) = &self.invalid_prompt {
+                std::fs::write(path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+            }
+            Ok(pi_rs::DiscoveredResources::default())
+        }
+        async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+            self.events.lock().unwrap().push("close");
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_share_pairs_session_start_and_shutdown_on_success_and_failure() {
+        for fail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let prompt = directory.path().join("prompt.md");
+            std::fs::write(&prompt, "test prompt").unwrap();
+            let source = Session::open(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .unwrap();
+            args.workspace = directory.path().to_owned();
+            args.session = path.clone();
+            args.system_prompt = Some(prompt.clone());
+            let mut runtime = configure(&args, false).await.unwrap();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            runtime
+                .registry
+                .register(Arc::new(LifecycleRecorder {
+                    events: events.clone(),
+                    invalid_prompt: fail.then_some(prompt),
+                }))
+                .unwrap();
+            let session = Session::from_records(source.records().to_vec()).unwrap();
+            let result =
+                standalone_share_snapshot_with_runtime(&args, &source, session, runtime).await;
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["start", "discover", "shutdown", "close"]
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_preparation_waits_for_metadata_without_detaching() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+        ])
+        .unwrap();
+        args.workspace = directory.path().to_owned();
+        args.session = path.clone();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(&args, &session, async {
+            let _ = gate.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(11), &mut preparation)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let snapshot = preparation.await.unwrap();
+        assert_eq!(snapshot.session_id, session.session_id());
+        assert_eq!(snapshot.head, session.head());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_preparation_drops_it_without_starting_configure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline", "--no-trust"]).unwrap();
+        args.session = path.clone();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(&args, &session, async {
+            let _ = gate.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut preparation)
+                .await
+                .is_err()
+        );
+        drop(preparation);
+        assert!(release.send(()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }
 
