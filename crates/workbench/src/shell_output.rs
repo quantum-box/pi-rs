@@ -31,6 +31,19 @@ pub(super) struct Output {
     pub details: Option<Value>,
 }
 
+impl Output {
+    // Successful results use Pi's empty-output placeholder even when a
+    // truncation notice follows an empty snapshot. Errors use `display`
+    // directly, since their empty-output placeholder is intentionally empty.
+    pub fn result_display(&self) -> String {
+        if self.display_without_notice.is_empty() {
+            format!("(no output){}", self.display)
+        } else {
+            self.display.clone()
+        }
+    }
+}
+
 impl Accumulator {
     pub fn for_user_shell() -> Self {
         Self {
@@ -275,7 +288,6 @@ impl DisplayTail {
         let mut skipped_partial_line = false;
         if !self.starts_at_boundary
             && let Some(index) = tail.find('\n')
-            && index + 1 < tail.len()
         {
             tail = &tail[index + 1..];
             skipped_partial_line = true;
@@ -475,28 +487,76 @@ mod tests {
     }
 
     #[test]
-    fn oversized_last_line_reports_reference_size_with_and_without_newline() {
+    fn oversized_unterminated_last_line_reports_reference_size() {
         let text = "界".repeat(100_000);
-        for (suffix, expected_size) in [("", "293.0KB"), ("\n", "0B")] {
-            let mut accumulator = Accumulator::default();
-            for chunk in text.as_bytes().chunks(313) {
-                accumulator.append(chunk).unwrap();
-            }
-            accumulator.append(suffix.as_bytes()).unwrap();
-            let output = accumulator.finish().unwrap();
-            let details = output.details.unwrap();
-            let truncation = &details["truncation"];
-            assert_eq!(truncation["truncatedBy"], "bytes");
-            assert_eq!(truncation["lastLinePartial"], true);
-            assert_eq!(truncation["totalLines"], 1);
-            assert_eq!(truncation["totalBytes"], 300000 + suffix.len());
-            assert_eq!(truncation["outputBytes"], 51198);
-            assert!(output.display.contains(&format!(
-                "Showing last 50.0KB of line 1 (line is {expected_size})"
-            )));
-            assert!(!output.display.contains('�'));
-            std::fs::remove_file(output.path.unwrap()).unwrap();
+        let mut accumulator = Accumulator::default();
+        for chunk in text.as_bytes().chunks(313) {
+            accumulator.append(chunk).unwrap();
         }
+        let output = accumulator.finish().unwrap();
+        let details = output.details.unwrap();
+        let truncation = &details["truncation"];
+        assert_eq!(truncation["truncatedBy"], "bytes");
+        assert_eq!(truncation["lastLinePartial"], true);
+        assert_eq!(truncation["totalLines"], 1);
+        assert_eq!(truncation["totalBytes"], 300000);
+        assert_eq!(truncation["outputBytes"], 51198);
+        assert!(
+            output
+                .display
+                .contains("Showing last 50.0KB of line 1 (line is 293.0KB)")
+        );
+        assert!(!output.display.contains('�'));
+        std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_discarded_last_line_ending_in_newline_has_empty_snapshot() {
+        let input = format!("{}\n", "界".repeat(100_000));
+        let mut accumulator = Accumulator::default();
+        for chunk in input.as_bytes().chunks(313) {
+            accumulator.append(chunk).unwrap();
+        }
+        let progress = accumulator.partial_result();
+        assert_eq!(progress["content"][0]["text"], "");
+        assert_eq!(progress["details"]["truncation"]["outputLines"], 0);
+        let output = accumulator.finish().unwrap();
+        let details = &output.details.as_ref().unwrap()["truncation"];
+        assert_eq!(details["truncatedBy"], "bytes");
+        assert_eq!(details["totalLines"], 1);
+        assert_eq!(details["totalBytes"], 300001);
+        assert_eq!(details["outputLines"], 0);
+        assert_eq!(details["outputBytes"], 0);
+        assert_eq!(details["lastLinePartial"], false);
+        assert!(
+            output.result_display().starts_with(
+                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
+            )
+        );
+        let path = output.path.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_retained_last_line_ending_in_newline_keeps_suffix() {
+        let input = format!("{}\n", "x".repeat(120_000));
+        let mut accumulator = Accumulator::default();
+        for chunk in input.as_bytes().chunks(313) {
+            accumulator.append(chunk).unwrap();
+        }
+        let output = accumulator.finish().unwrap();
+        let details = &output.details.as_ref().unwrap()["truncation"];
+        assert_eq!(output.display_without_notice, "x".repeat(DISPLAY_BYTES));
+        assert_eq!(details["outputLines"], 1);
+        assert_eq!(details["outputBytes"], DISPLAY_BYTES);
+        assert_eq!(details["lastLinePartial"], true);
+        assert!(
+            output
+                .display
+                .contains("Showing last 50.0KB of line 1 (line is 0B)")
+        );
+        std::fs::remove_file(output.path.unwrap()).unwrap();
     }
 
     #[test]
