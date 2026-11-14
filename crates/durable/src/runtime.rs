@@ -2746,10 +2746,10 @@ impl Harness {
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
             let store = owner.store();
-            if let Some((key, _)) = &receipt {
-                if store.get(key)?.is_some() {
-                    return Ok(Vec::new());
-                }
+            if let Some((key, _)) = &receipt
+                && store.get(key)?.is_some()
+            {
+                return Ok(Vec::new());
             }
             let records = crate::task_store::TaskStore::new(store)
                 .list()
