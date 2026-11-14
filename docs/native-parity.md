@@ -4140,6 +4140,9 @@ Multiline extension editor dialogs and local multiline editors use the same
 external-editor action and configured keybinding. Editor failures remain
 visible in the dialog without submitting or losing its draft; Escape cancels
 the dialog, and extension cancellation still removes the correlated request.
+If the extension worker exits during editing, its editor is stopped and the
+terminal is restored. Interrupts received while an editor is active do not
+disable subsequent terminal interrupt handling.
 The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint
