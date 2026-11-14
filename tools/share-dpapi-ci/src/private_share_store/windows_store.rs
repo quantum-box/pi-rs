@@ -431,4 +431,64 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn separate_process_cannot_read_generation_until_published() {
+        const CHILD_ROOT: &str = "PI_RS_SHARE_LOCK_TEST_ROOT";
+        const CHILD_EXPECT: &str = "PI_RS_SHARE_LOCK_TEST_EXPECT";
+        let binding = Binding {
+            session_id: uuid::Uuid::from_u128(42),
+            head: 1,
+            journal_digest: [5; 32],
+            provenance_digest: [6; 32],
+        };
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let store = Store::open_existing(&root).unwrap().unwrap();
+            let actual = store.read(&root.join("session.jsonl"), &binding).unwrap();
+            let expected = if std::env::var_os(CHILD_EXPECT).is_some() {
+                Some(json!({"prompt":"published"}))
+            } else {
+                None
+            };
+            assert_eq!(actual, expected);
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pi-share-process-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let generation = store.begin(&path, binding.clone()).unwrap();
+        let run_child = |published: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "private_share_store::windows_store::tests::separate_process_cannot_read_generation_until_published", "--nocapture"])
+                .env(CHILD_ROOT, &root);
+            if published {
+                command.env(CHILD_EXPECT, "1");
+            } else {
+                command.env_remove(CHILD_EXPECT);
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not exit");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        run_child(false);
+        generation
+            .publish(binding.clone(), json!({"prompt":"published"}))
+            .unwrap();
+        run_child(true);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
