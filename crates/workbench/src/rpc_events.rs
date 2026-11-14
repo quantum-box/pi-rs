@@ -309,7 +309,7 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_result_value(
+                    let result = tool_event_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
                         Some(outcome.is_structured()),
@@ -539,6 +539,58 @@ pub(super) fn tool_result_value(
     result
 }
 
+/// Project native content-block results as Pi events without changing the
+/// separate model-facing native tool envelope.
+pub(super) fn tool_event_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: Option<bool>,
+) -> Value {
+    let mut result = tool_result_value(text, outcome, is_structured);
+    if !pi_rs::tool_content_is_structured(text, is_structured) {
+        return result;
+    }
+    let Ok(envelope) = serde_json::from_str::<Value>(text) else {
+        return result;
+    };
+    let Some(data) = envelope.get("data").and_then(Value::as_object) else {
+        return result;
+    };
+    let Some(blocks) = data.get("content").and_then(Value::as_array) else {
+        return result;
+    };
+    let valid = blocks.iter().all(|block| match block["type"].as_str() {
+        Some("text") => block["text"].is_string(),
+        Some("image") => {
+            block["data"]
+                .as_str()
+                .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
+                && matches!(
+                    block["mimeType"].as_str(),
+                    Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                )
+        }
+        _ => false,
+    });
+    if !valid {
+        return result;
+    }
+    result["content"] = json!(blocks);
+    // Preserve native fields that used to be present in the text envelope.
+    let mut native = data.clone();
+    native.remove("content");
+    if let Some(attachments) = envelope
+        .get("attachments")
+        .filter(|value| value.as_array().is_some_and(|values| !values.is_empty()))
+    {
+        result["nativeAttachments"] = attachments.clone();
+    }
+    if !native.is_empty() {
+        result["nativeData"] = Value::Object(native);
+    }
+    result
+}
+
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
@@ -573,6 +625,85 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn multimodal_tool_events_preserve_order_and_native_metadata() {
+        let blocks = json!([
+            {"type":"text","text":"before"},
+            {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+            {"type":"text","text":"after"},
+            {"type":"image","mimeType":"image/jpeg","data":"cGhvdG8="}
+        ]);
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":blocks,"wall_time_seconds":1.25}),
+            attachments: vec![pi_rs::AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+            details: json!({"code":42}),
+        };
+        let operation_id = Uuid::new_v4();
+        let invocation = Invocation {
+            operation_id,
+            call: ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut stream = Stream::default();
+        stream.calls.insert(operation_id, (invocation, None));
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: outcome.clone(),
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(message["message"]["content"], blocks);
+        assert_eq!(end["result"]["details"], json!({"code":42}));
+        assert_eq!(end["result"]["nativeData"]["wall_time_seconds"], 1.25);
+        assert_eq!(end["result"]["nativeAttachments"][0]["id"], "asset");
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, Some(true))["content"],
+            blocks
+        );
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, None)["content"],
+            blocks
+        );
+        // Provider-facing native content remains the original envelope.
+        assert!(tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"][0]["text"].as_str().unwrap().contains("[image attached]"));
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_plain_and_unknown_structured_data() {
+        let plain = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        assert_eq!(
+            tool_event_result_value(plain, None, Some(false)),
+            json!({"content":[{"type":"text","text":plain}]})
+        );
+        let outcome = Outcome::Structured {
+            data: json!({"content":[{"type":"custom","value":1}]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true)),
+            tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))
+        );
+    }
 
     #[test]
     fn patched_result_projects_verbatim_content_details_and_error() {
