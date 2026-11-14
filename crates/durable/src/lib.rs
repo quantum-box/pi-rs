@@ -5,6 +5,7 @@
 
 pub mod conversation;
 pub mod model;
+pub mod poll;
 pub mod recovery;
 pub mod runtime;
 pub mod state;
