@@ -34,6 +34,13 @@ pub struct CatalogEntry {
     effort_levels: bool,
 }
 
+impl CatalogEntry {
+    /// Whether discovery explicitly identified a usable mode or disabled thinking.
+    pub fn has_known_thinking(&self) -> bool {
+        self.reasoning == Some(false) || self.thinking.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ThinkingMode {
     Adaptive,
@@ -377,7 +384,9 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
     };
     let capabilities = &model["capabilities"];
     let types = &capabilities["thinking"]["types"];
-    let thinking = if types["adaptive"]["supported"] == true {
+    let thinking = if capabilities["thinking"]["supported"] == false {
+        None
+    } else if types["adaptive"]["supported"] == true {
         Some(ThinkingMode::Adaptive)
     } else if types["enabled"]["supported"] == true {
         Some(ThinkingMode::Budgeted)
@@ -938,7 +947,11 @@ impl Model for Anthropic {
         } else {
             self.cached_model(&request.model)
         };
-        let details = if self.configured_thinking_is_fallback && discovered.is_some() {
+        let details = if self.configured_thinking_is_fallback
+            && discovered
+                .as_ref()
+                .is_some_and(CatalogEntry::has_known_thinking)
+        {
             discovered
         } else if let Some(mut configured) = self.configured_thinking.clone() {
             if let Some(discovered) = discovered {

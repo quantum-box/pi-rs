@@ -948,7 +948,11 @@ impl Client {
                     .remove(model)?
                     .thinking_levels
             }
-            Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+            Self::Anthropic(client) => client
+                .model(model)
+                .await
+                .filter(|entry| entry.has_known_thinking())
+                .map(|entry| entry.thinking_levels),
             Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
             Self::PiMessages(client) => {
                 client

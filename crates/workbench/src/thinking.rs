@@ -187,14 +187,21 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
-        for (capabilities, expected) in [
+        for (capabilities, expected, discovered) in [
+            (
+                serde_json::json!({}),
+                vec!["off", "minimal", "low", "medium", "high"],
+                false,
+            ),
             (
                 serde_json::json!({"thinking":{"supported":false}}),
                 vec!["off"],
+                true,
             ),
             (
                 serde_json::json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}}),
                 vec!["off", "low", "high"],
+                true,
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -236,7 +243,11 @@ mod tests {
                 .unwrap();
             args.provider = args.model_profiles.provider("anthropic").unwrap();
             assert_eq!(available(&mut args), expected);
-            assert_eq!(reported(&args).unwrap(), expected);
+            if discovered {
+                assert_eq!(reported(&args).unwrap(), expected);
+            } else {
+                assert!(reported(&args).is_none());
+            }
             server.join().unwrap();
         }
     }

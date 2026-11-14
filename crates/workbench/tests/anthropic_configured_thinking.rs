@@ -12,6 +12,7 @@ fn configured_thinking_controls_wire_without_models_api() {
         (true, false, true, "low", "budgeted", 0),
         (false, false, true, "low", "budgeted", 1),
         (false, false, false, "high", "disabled", 2),
+        (false, false, false, "low", "budgeted", 4),
         (false, false, false, "minimal", "low", 3),
         (true, true, false, "minimal", "low", 0),
         (true, true, true, "minimal", "medium", 0),
@@ -74,6 +75,8 @@ fn configured_thinking_controls_wire_without_models_api() {
                     if discovery != 0 {
                         let capabilities = if discovery == 3 {
                             json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}})
+                        } else if discovery == 4 {
+                            json!({})
                         } else {
                             json!({"thinking":{"supported":false}})
                         };

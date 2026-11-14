@@ -3821,7 +3821,7 @@ markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
 
 A configured Anthropic `reasoning: true` declaration supplies fallback thinking
-levels when model discovery is unavailable. When the Models API returns a
+levels when model discovery is unavailable or omits thinking capability. When the Models API returns a
 capability, its supported modes and levels drive both selection and requests;
 explicit adaptive or thinking-level-map overrides remain authoritative. Other
 discovered model metadata, including output limits, is retained with overrides.
