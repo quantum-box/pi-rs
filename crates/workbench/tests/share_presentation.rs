@@ -284,6 +284,12 @@ fn standalone_share_rejects_incomplete_journal_without_repair_or_upload() {
             "--no-extensions",
             "--no-skills",
             "--no-context-files",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
         ])
         .arg("--session")
         .arg(&path)
