@@ -2819,6 +2819,7 @@ dependencies = [
  "hmac",
  "jsonschema",
  "libc",
+ "pi-rs-tool-arguments",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2976,6 +2977,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pi-rs-tool-arguments"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

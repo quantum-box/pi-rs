@@ -239,6 +239,13 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
+Completed tool-call JSON parsing and incremental argument previews live in the
+portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
+frontends. The standalone crate is compile-checked for
+`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
+on that target. Preview behavior retains the existing native parser's documented
+differences from Pi's streaming parser.
+
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
 alongside the native `extension` and `message` fields. `extensionPath` is the
 executable's resolved source path when available; embedded extensions without
