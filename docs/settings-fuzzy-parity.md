@@ -8,4 +8,6 @@ name rather than its displayed current value.
 
 The separator set follows ECMAScript whitespace, including U+FEFF and excluding
 U+0085. This checkpoint covers the settings list; other selectors have their
-own search behavior.
+own search behavior. Settings paste expands tabs to four spaces and removes
+CR/LF, as Pi's single-line input does. Other pasted characters remain in the
+search query; terminal rendering removes control characters.

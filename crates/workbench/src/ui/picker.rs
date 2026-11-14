@@ -231,8 +231,20 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
-        self.query
-            .extend(text.chars().filter(|character| !character.is_control()));
+        if self.title == "Settings" {
+            // Pi's single-line input removes CR/LF, expands tabs, and keeps
+            // other characters for filtering. Rendering sanitizes controls.
+            for character in text.chars() {
+                match character {
+                    '\r' | '\n' => {}
+                    '\t' => self.query.push_str("    "),
+                    character => self.query.push(character),
+                }
+            }
+        } else {
+            self.query
+                .extend(text.chars().filter(|character| !character.is_control()));
+        }
         self.selected = 0;
         self.unfold_tree_for_search();
     }
@@ -2163,6 +2175,34 @@ mod tests {
         assert!(picker.matches().is_empty());
         picker.query = "//".into();
         assert_eq!(picker.matches().len(), 4);
+    }
+
+    #[test]
+    fn settings_paste_preserves_filter_semantics_and_sanitizes_display() {
+        let mut picker = Picker::new(
+            "Settings",
+            vec![Item {
+                label: "HTTP timeout · 30".into(),
+                selection: Selection::Setting("HTTP timeout".into(), serde_json::json!(30)),
+            }],
+        );
+        picker.paste("time\r\nout\thttp");
+        assert_eq!(picker.query, "timeout    http");
+        assert_eq!(picker.matches().len(), 1);
+
+        picker.query.clear();
+        picker.paste("http\u{85}timeout");
+        assert_eq!(picker.query, "http\u{85}timeout");
+        assert!(picker.matches().is_empty());
+
+        picker.paste("\u{1b}]8;;https://example.invalid\u{7}");
+        let lines = picker.render(&Theme::system(), 80, 8, &Keys::default());
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| { span.text.chars().all(|character| !character.is_control()) })
+        );
     }
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
