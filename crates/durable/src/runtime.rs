@@ -1,8 +1,7 @@
 //! Durable conversation execution with a single local scheduler owner.
 //!
 //! A committed phase is the authority for recovery. External calls never run
-//! inside storage transactions. This first runtime executes one conversation at
-//! a time; it does not implement upstream's parallel task graph or watch API.
+//! inside storage transactions. Independent conversations can run concurrently.
 use crate::{
     model::{CompletedGeneration, collect_generation, model_request},
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
@@ -53,6 +52,7 @@ pub struct RegisteredTool {
     pub replay: ReplayPolicy,
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub model: Arc<dyn Model>,
     pub tools: Vec<RegisteredTool>,
@@ -143,11 +143,13 @@ pub struct Conversation {
 }
 
 pub struct Harness {
-    owner: OwnedStore,
+    owner: Arc<OwnedStore>,
     options: Options,
     tools: HashMap<String, RegisteredTool>,
     failed: bool,
     dirty: Arc<AtomicBool>,
+    merge_admissions: bool,
+    storage_failed: Arc<AtomicBool>,
 }
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
@@ -193,20 +195,36 @@ impl Harness {
             }
         }
         let mut harness = Self {
-            owner: OwnedStore::open(path)?,
+            owner: Arc::new(OwnedStore::open(path)?),
             options,
             tools,
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
+            merge_admissions: false,
+            storage_failed: Arc::new(AtomicBool::new(false)),
         };
         harness.recover()?;
         Ok(harness)
+    }
+    fn worker(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            options: self.options.clone(),
+            tools: self.tools.clone(),
+            failed: false,
+            dirty: Arc::new(AtomicBool::new(false)),
+            merge_admissions: true,
+            storage_failed: self.storage_failed.clone(),
+        }
     }
     fn key(id: Uuid) -> Vec<u8> {
         format!("runtime/conversation/{id}").into_bytes()
     }
     fn load(&self, id: Uuid) -> Result<(Conversation, u64), Error> {
-        if self.failed || self.dirty.load(Ordering::Acquire) {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
             return Err(Error::Failed);
         }
         let entry = self
@@ -217,20 +235,45 @@ impl Harness {
         Ok((serde_json::from_slice(&entry.value)?, entry.version))
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
-        if self.failed || self.dirty.load(Ordering::Acquire) {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
             return Err(Error::Failed);
         }
         let key = Self::key(state.id);
-        let value = serde_json::to_vec(state)?;
-        if let Err(e) = self.owner.store().commit(
-            &[Check {
-                key: key.clone(),
-                expected,
-            }],
-            &[Mutation::Put { key, value }],
-        ) {
-            self.failed = true;
-            return Err(e.into());
+        let mut state = state.clone();
+        let mut expected = expected;
+        loop {
+            let value = serde_json::to_vec(&state)?;
+            match self.owner.store().commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: expected.clone(),
+                }],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value,
+                }],
+            ) {
+                Ok(()) => break,
+                Err(durable_store::Error::Conflict { .. }) if self.merge_admissions => {
+                    let entry = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
+                    let latest: Conversation = serde_json::from_slice(&entry.value)?;
+                    for submission in latest.submissions {
+                        if !state.submissions.iter().any(|s| s.id == submission.id) {
+                            state.submissions.push(submission);
+                        }
+                    }
+                    expected = Expected::Version(entry.version);
+                }
+                Err(e @ durable_store::Error::Conflict { .. }) => return Err(e.into()),
+                Err(e) => {
+                    self.failed = true;
+                    self.storage_failed.store(true, Ordering::Release);
+                    return Err(e.into());
+                }
+            }
         }
         Ok(())
     }
@@ -265,27 +308,32 @@ impl Harness {
         if content.trim().is_empty() {
             return Err(Error::Invalid("empty input".into()));
         }
-        let (mut c, version) = self.load(id)?;
-        if let Some(key) = request_id.as_ref()
-            && let Some(s) = c
-                .submissions
-                .iter()
-                .find(|s| s.request_id.as_ref() == Some(key))
-        {
-            return Ok(s.id);
+        loop {
+            let (mut c, version) = self.load(id)?;
+            if let Some(key) = request_id.as_ref()
+                && let Some(s) = c
+                    .submissions
+                    .iter()
+                    .find(|s| s.request_id.as_ref() == Some(key))
+            {
+                return Ok(s.id);
+            }
+            let sid = Uuid::new_v4();
+            c.submissions.push(Submission {
+                id: sid,
+                request_id: request_id.clone(),
+                content: content.clone(),
+                status: Status::Queued,
+            });
+            if matches!(c.phase, Phase::FailedIdle) {
+                c.phase = Phase::Idle;
+            }
+            match self.save(&c, Expected::Version(version)) {
+                Ok(()) => return Ok(sid),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(e) => return Err(e),
+            }
         }
-        let sid = Uuid::new_v4();
-        c.submissions.push(Submission {
-            id: sid,
-            request_id,
-            content,
-            status: Status::Queued,
-        });
-        if matches!(c.phase, Phase::FailedIdle) {
-            c.phase = Phase::Idle;
-        }
-        self.save(&c, Expected::Version(version))?;
-        Ok(sid)
     }
     /// Admit and run pending work immediately. Repeating a request ID returns
     /// the original submission, even when its answer was committed earlier.
@@ -301,7 +349,10 @@ impl Harness {
         Ok(submission)
     }
     fn conversations(&self) -> Result<Vec<Uuid>, Error> {
-        if self.failed || self.dirty.load(Ordering::Acquire) {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
             return Err(Error::Failed);
         }
         let mut ids = Vec::new();
@@ -313,6 +364,12 @@ impl Harness {
     }
     fn recover(&mut self) -> Result<(), Error> {
         for id in self.conversations()? {
+            self.recover_conversation(id)?;
+        }
+        Ok(())
+    }
+    fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
+        {
             let (mut c, version) = self.load(id)?;
             match c.phase.clone() {
                 Phase::ModelRunning {
@@ -390,7 +447,7 @@ impl Harness {
                         }
                     }
                 }
-                _ => continue,
+                _ => return Ok(()),
             }
             self.save(&c, Expected::Version(version))?;
         }
@@ -403,8 +460,20 @@ impl Harness {
             dirty: self.dirty.clone(),
             complete: false,
         };
-        for id in self.conversations()? {
-            self.drive(id, cancel).await?;
+        let ids = self.conversations()?;
+        let results = futures_util::future::join_all(ids.into_iter().map(|id| {
+            let mut worker = self.worker();
+            async move { worker.drive(id, cancel).await }
+        }))
+        .await;
+        let mut first_error = None;
+        for result in results {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         guard.complete = true;
         Ok(())
@@ -766,6 +835,118 @@ impl Harness {
         })
     }
 }
+/// A background scheduler. Dropping it does not cancel already spawned work;
+/// those tasks retain scheduler ownership until they stop. Call `shutdown` to
+/// wait for all admitted work and release ownership deterministically.
+pub struct Scheduler {
+    harness: Harness,
+    tasks: std::collections::HashMap<Uuid, Vec<tokio::task::JoinHandle<Result<(), Error>>>>,
+    locks: std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>,
+    cancel: CancellationToken,
+}
+
+impl Scheduler {
+    /// Must be called inside a Tokio runtime. Recovers and schedules all
+    /// persisted conversations, including work admitted by an earlier owner.
+    pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
+        let harness = Harness::open_paused(path, options)?;
+        let ids = harness.conversations()?;
+        let mut scheduler = Self {
+            harness,
+            tasks: HashMap::new(),
+            locks: HashMap::new(),
+            cancel: CancellationToken::new(),
+        };
+        for id in ids {
+            scheduler.schedule(id);
+        }
+        Ok(scheduler)
+    }
+    pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
+        self.harness.create_conversation(config)
+    }
+    pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
+        self.harness.conversation(id)
+    }
+    /// Commits the admission before scheduling, including duplicate request IDs.
+    pub fn submit(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+    ) -> Result<Uuid, Error> {
+        let submission = self.harness.submit(id, request_id, content)?;
+        self.schedule(id);
+        Ok(submission)
+    }
+    pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
+        self.harness.blocked(id)
+    }
+    /// Record a known tool outcome and resume the conversation.
+    pub fn reconcile(
+        &mut self,
+        id: Uuid,
+        operation_id: Uuid,
+        outcome: Outcome,
+    ) -> Result<(), Error> {
+        self.harness.reconcile(id, operation_id, outcome)?;
+        self.schedule(id);
+        Ok(())
+    }
+    /// Release inputs held by the failed-run policy and schedule them.
+    pub fn continue_queued(&mut self, id: Uuid) -> Result<(), Error> {
+        self.harness.continue_queued(id)?;
+        self.schedule(id);
+        Ok(())
+    }
+    /// Schedule a retry after an execution error or a dropped worker.
+    pub fn schedule(&mut self, id: Uuid) {
+        let lock = self.locks.entry(id).or_default().clone();
+        let mut worker = self.harness.worker();
+        let cancel = self.cancel.clone();
+        let task = tokio::spawn(async move {
+            let _lock = lock.lock().await;
+            worker.recover_conversation(id)?;
+            worker.drive(id, &cancel).await
+        });
+        self.tasks.entry(id).or_default().push(task);
+    }
+    /// Wait for the most recently scheduled execution of a conversation.
+    pub async fn wait(&mut self, id: Uuid) -> Result<(), Error> {
+        if let Some(tasks) = self.tasks.get_mut(&id) {
+            while !tasks.is_empty() {
+                let result = (&mut tasks[0])
+                    .await
+                    .map_err(|e| Error::Invalid(format!("scheduler task failed: {e}")))?;
+                tasks.remove(0);
+                result?;
+            }
+        }
+        self.tasks.remove(&id);
+        Ok(())
+    }
+    /// Stop workers at cancellation points and wait for them before returning.
+    pub async fn shutdown(mut self) -> Result<(), Error> {
+        self.cancel.cancel();
+        let tasks = std::mem::take(&mut self.tasks);
+        let mut error = None;
+        for task in tasks.into_values().flatten() {
+            match task.await {
+                Ok(Ok(())) | Ok(Err(Error::Interrupted)) => (),
+                Ok(Err(e)) => {
+                    error.get_or_insert(e);
+                }
+                Err(e) => {
+                    error.get_or_insert(Error::Invalid(format!("scheduler task failed: {e}")));
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
 fn append_tool(
     c: &mut Conversation,
     calls: &[ToolCall],
@@ -820,4 +1001,166 @@ impl ToolHost for NoNestedTools {
 }
 fn valid_schema(schema: &serde_json::Value, arguments: &serde_json::Value) -> bool {
     jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(arguments))
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use pi_rs_core::{ModelEvent, ModelRequest, ModelStream};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Semaphore;
+
+    struct GatedModel {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for GatedModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("ok".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    fn options(model: Arc<GatedModel>) -> Options {
+        Options {
+            model,
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        }
+    }
+    fn config() -> Config {
+        Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        }
+    }
+    #[tokio::test]
+    async fn concurrent_conversations_and_admission_during_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut s = Scheduler::open(&path, options(model.clone())).unwrap();
+        let a = s.create_conversation(config()).unwrap();
+        let b = s.create_conversation(config()).unwrap();
+        s.submit(a, None, "one".into()).unwrap();
+        s.submit(b, None, "two".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), model.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        s.submit(a, Some("second".into()), "three".into()).unwrap();
+        assert_eq!(model.maximum.load(Ordering::SeqCst), 2);
+        model.release.add_permits(3);
+        s.wait(a).await.unwrap();
+        s.wait(b).await.unwrap();
+        assert_eq!(s.conversation(a).unwrap().submissions.len(), 2);
+        assert!(
+            s.conversation(a)
+                .unwrap()
+                .submissions
+                .iter()
+                .all(|x| matches!(x.status, Status::Done { .. }))
+        );
+        assert_eq!(model.maximum.load(Ordering::SeqCst), 2);
+        s.shutdown().await.unwrap();
+    }
+    struct FailingModel;
+    #[async_trait::async_trait]
+    impl Model for FailingModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::User { content } if content == "fail"))
+            {
+                return Err(pi_rs_core::Error::Model("deliberate failure".into()));
+            }
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("ok".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    #[tokio::test]
+    async fn errors_do_not_stop_other_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            model: Arc::new(FailingModel),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let mut s = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let a = s.create_conversation(config()).unwrap();
+        let b = s.create_conversation(config()).unwrap();
+        s.submit(a, None, "fail".into()).unwrap();
+        s.submit(b, None, "ok".into()).unwrap();
+        assert!(s.wait(a).await.is_err());
+        s.wait(b).await.unwrap();
+        assert!(matches!(
+            s.conversation(b).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        s.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn dropped_wait_keeps_worker_and_owner_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut s = Scheduler::open(&path, options(model.clone())).unwrap();
+        let id = s.create_conversation(config()).unwrap();
+        s.submit(id, None, "one".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), s.wait(id))
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            Harness::open_paused(&path, options(model.clone())),
+            Err(Error::Owner(OwnerError::Busy))
+        ));
+        model.release.add_permits(1);
+        s.wait(id).await.unwrap();
+        assert!(matches!(
+            s.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        s.shutdown().await.unwrap();
+        assert!(Harness::open_paused(&path, options(model)).is_ok());
+    }
 }
