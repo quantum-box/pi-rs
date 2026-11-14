@@ -7301,7 +7301,12 @@ mod tree_tests {
                     } else {
                         String::new()
                     },
-                    reply: None,
+                    reply: (id == turn_id).then(|| RecordedReply {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: tokens,
+                    }),
                 })
                 .unwrap();
         }
