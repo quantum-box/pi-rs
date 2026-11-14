@@ -107,8 +107,6 @@ struct Terminal {
     color_queries: std::collections::VecDeque<ColorQuery>,
     #[cfg(any(unix, windows))]
     color_requery: bool,
-    #[cfg(any(unix, windows))]
-    expired_color_markers: usize,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -126,6 +124,7 @@ enum KeyboardProtocol {
 struct ColorQuery {
     started: Instant,
     replied: u32,
+    quarantined: bool,
 }
 
 impl Terminal {
@@ -139,8 +138,6 @@ impl Terminal {
             color_queries: std::collections::VecDeque::new(),
             #[cfg(any(unix, windows))]
             color_requery: false,
-            #[cfg(any(unix, windows))]
-            expired_color_markers: 0,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -196,18 +193,15 @@ impl Terminal {
     #[cfg(any(unix, windows))]
     fn query_terminal_colors(&mut self) -> Result<()> {
         // Serialize queries so that replies remain attributable when DA1 is absent.
-        if let Some(query) = self.color_queries.front() {
+        if !self.color_queries.is_empty() {
             self.color_requery = true;
-            if query.replied == (1 << 18) - 1 {
-                self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-                return self.finish_color_query();
-            }
             return Ok(());
         }
         crate::ui::theme::begin_terminal_palette_query();
         self.color_queries.push_back(ColorQuery {
             started: Instant::now(),
             replied: 0,
+            quarantined: false,
         });
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
@@ -220,17 +214,13 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn accepts_color_reply(&mut self, target: u8) -> Result<bool> {
-        let is_latest = !self.color_requery;
         let Some(query) = self.color_queries.front_mut() else {
             return Ok(false);
         };
+        let is_latest = !self.color_requery && !query.quarantined;
         let flag = 1_u32 << target;
         let fresh = query.replied & flag == 0;
         query.replied |= flag;
-        if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-            self.finish_color_query()?;
-        }
         Ok(is_latest && fresh)
     }
 
@@ -245,24 +235,19 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn receive_color_marker(&mut self) -> Result<()> {
-        if self.expired_color_markers > 0 {
-            self.expired_color_markers -= 1;
-            Ok(())
-        } else {
-            self.finish_color_query()
-        }
+        self.finish_color_query()
     }
 
     #[cfg(any(unix, windows))]
     fn poll_color_timeout(&mut self) -> Result<()> {
         if self.color_requery
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| query.started.elapsed() >= Duration::from_secs(2))
+            && let Some(query) = self.color_queries.front_mut()
+            && !query.quarantined
+            && query.started.elapsed() >= Duration::from_secs(2)
         {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-            self.finish_color_query()?;
+            // OSC replies have no query identifier. Do not issue the next
+            // request until DA1 delimits this one, even after a timeout.
+            query.quarantined = true;
         }
         Ok(())
     }
@@ -9213,47 +9198,46 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_replies_release_queued_query_before_marker() {
+    fn timed_out_color_query_quarantines_old_replies_until_marker() {
         let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
             alternate: false,
             images: Default::default(),
             progress: None,
             color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: ((1 << 18) - 1) & !1,
+                started: std::time::Instant::now() - std::time::Duration::from_secs(3),
+                replied: 1 << 1,
+                quarantined: false,
             }]),
             color_requery: true,
-            expired_color_markers: 0,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Kitty,
         });
-        assert!(!terminal.accepts_color_reply(0).unwrap());
+        terminal.poll_color_timeout().unwrap();
         assert_eq!(terminal.color_queries.len(), 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        assert_eq!(terminal.expired_color_markers, 1);
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.accepts_color_reply(0).unwrap());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn late_color_marker_does_not_complete_the_new_query() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: 0,
-            }]),
-            color_requery: false,
-            expired_color_markers: 1,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
+        assert!(terminal.color_queries[0].quarantined);
+        // Late replies from the old request are never accepted into a new palette.
+        let mut accepted = Vec::new();
+        for index in 0..16 {
+            if terminal.accepts_color_reply(index).unwrap() {
+                accepted.push((index, "old"));
+            }
+        }
+        assert!(accepted.is_empty());
+        assert!(!terminal.accepts_color_reply(16).unwrap());
+        assert!(!terminal.accepts_color_reply(17).unwrap());
+        assert!(terminal.color_requery);
+        // Even all old replies cannot start the queued query without its marker.
+        assert!(terminal.color_queries[0].quarantined);
         terminal.receive_color_marker().unwrap();
         assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.accepts_color_reply(5).unwrap());
+        assert!(!terminal.color_requery);
+        for index in 0..18 {
+            assert!(terminal.accepts_color_reply(index).unwrap());
+            accepted.push((index, "new"));
+            assert!(!terminal.accepts_color_reply(index).unwrap());
+        }
+        assert_eq!(accepted.len(), 18);
+        assert!(accepted.iter().all(|(_, source)| *source == "new"));
         terminal.receive_color_marker().unwrap();
         assert!(terminal.color_queries.is_empty());
     }
