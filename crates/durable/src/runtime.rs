@@ -169,6 +169,13 @@ enum Phase {
         calls: Vec<ToolCall>,
         index: usize,
     },
+    /// The operation identity is committed before extension code runs.
+    ToolPreparing {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        index: usize,
+        operation_id: Uuid,
+    },
     ToolRunning {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -206,6 +213,9 @@ enum ModelFailureDecision {
 pub struct Conversation {
     pub id: Uuid,
     pub config: Config,
+    /// Installed extension names in execution order. Older conversations select none.
+    #[serde(default)]
+    pub extensions: Vec<String>,
     pub messages: Vec<Message>,
     pub submissions: Vec<Submission>,
     #[serde(default)]
@@ -244,6 +254,7 @@ pub struct Harness {
     owner: Arc<OwnedStore>,
     options: Options,
     tools: HashMap<String, RegisteredTool>,
+    extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     failed: bool,
     dirty: Arc<AtomicBool>,
     merge_admissions: bool,
@@ -299,6 +310,7 @@ impl Harness {
             owner: Arc::new(OwnedStore::open(path)?),
             options,
             tools,
+            extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: false,
@@ -313,6 +325,7 @@ impl Harness {
             owner: self.owner.clone(),
             options: self.options.clone(),
             tools: self.tools.clone(),
+            extensions: self.extensions.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: true,
@@ -337,6 +350,55 @@ impl Harness {
             task,
             self.storage_failed.clone(),
         ))
+    }
+    /// Atomically publish a new registry snapshot to subsequent execution phases.
+    pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
+        self.extensions
+            .write()
+            .map_err(|_| Error::Failed)?
+            .install(extension)
+            .map_err(|e| Error::Invalid(format!("extension registry: {e}")))
+    }
+    pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
+        self.extensions
+            .write()
+            .map_err(|_| Error::Failed)?
+            .uninstall(name);
+        Ok(())
+    }
+    fn selected_extensions(&self, c: &Conversation) -> Result<crate::extension::Resolved, Error> {
+        let snapshot = self
+            .extensions
+            .read()
+            .map_err(|_| Error::Failed)?
+            .snapshot();
+        let available = snapshot.names();
+        if let Some(missing) = c
+            .extensions
+            .iter()
+            .find(|name| !available.contains(&name.as_str()))
+        {
+            return Err(Error::Invalid(format!(
+                "selected extension unavailable: {missing}"
+            )));
+        }
+        Ok(snapshot.resolve(Some(&c.extensions)))
+    }
+    /// Select installed names for a settled conversation, preserving their order.
+    pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "extension selection requires a settled conversation".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if names.iter().any(|name| !seen.insert(name.clone())) {
+            return Err(Error::Invalid("duplicate selected extension".into()));
+        }
+        c.extensions = names;
+        self.selected_extensions(&c)?;
+        self.save(&c, Expected::Version(version))
     }
     pub(crate) fn subagent_storage_failed(&mut self) {
         self.failed = true;
@@ -388,7 +450,14 @@ impl Harness {
                 messages: state.messages.clone(),
                 submissions: state.submissions.clone(),
                 tool_states: state.tool_states.clone(),
-                documents: HashMap::new(),
+                documents: if state.extensions.is_empty() {
+                    HashMap::new()
+                } else {
+                    HashMap::from([(
+                        "pi-rs/runtime/extensions".into(),
+                        serde_json::to_value(&state.extensions)?,
+                    )])
+                },
                 active: state.active,
                 pending_resets: state.pending_resets.clone(),
                 phase: serde_json::to_value(&state.phase)?,
@@ -509,6 +578,7 @@ impl Harness {
         let state = Conversation {
             id,
             config,
+            extensions: vec![],
             messages: vec![],
             submissions: vec![],
             aborted_generations: vec![],
@@ -611,6 +681,12 @@ impl Harness {
         let state = Conversation {
             id: Uuid::new_v4(),
             config: point.config,
+            extensions: point
+                .documents
+                .get("pi-rs/runtime/extensions")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
             messages: point.messages,
             submissions: vec![],
             aborted_generations: vec![],
@@ -1259,8 +1335,33 @@ impl Harness {
                 Phase::ModelRunning {
                     turns, request_id, ..
                 } => {
+                    let mut system_prompt = c.config.system_prompt.clone();
+                    if !c.extensions.is_empty() {
+                        let selected = self.selected_extensions(&c)?;
+                        let snapshot = serde_json::to_value(&c)?;
+                        let memo = self.extension_memo(request_id)?;
+                        let context = crate::extension::Context {
+                            snapshot: &snapshot,
+                            memo: &memo,
+                        };
+                        let (sections, reports) = selected.prompt(&context, None).await;
+                        // A callback may swallow a memo error. Never dispatch after
+                        // an indeterminate store failure, even in that case.
+                        self.subagent_store()?;
+                        if !reports.is_empty() {
+                            return Err(Error::Invalid(format!(
+                                "extension prompt failed: {reports:?}"
+                            )));
+                        }
+                        if !sections.is_empty() {
+                            if !system_prompt.is_empty() {
+                                system_prompt.push_str("\n\n");
+                            }
+                            system_prompt.push_str(&sections);
+                        }
+                    }
                     let mut messages = vec![Message::System {
-                        content: c.config.system_prompt.clone(),
+                        content: system_prompt,
                     }];
                     messages.extend(c.messages.clone());
                     let mut specs: Vec<ToolSpec> =
@@ -1572,6 +1673,13 @@ impl Harness {
                             turns,
                             answer: None,
                         };
+                    } else if !c.extensions.is_empty() {
+                        c.phase = Phase::ToolPreparing {
+                            turns,
+                            calls,
+                            index,
+                            operation_id: Uuid::new_v4(),
+                        };
                     } else if let Some(reg) = self.tools.get(&calls[index].name) {
                         let operation_id = Uuid::new_v4();
                         let invocation = Invocation {
@@ -1619,6 +1727,125 @@ impl Harness {
                             calls,
                             index: index + 1,
                         };
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::ToolPreparing {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                } => {
+                    let selected = self.selected_extensions(&c)?;
+                    let call = calls
+                        .get(index)
+                        .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
+                    let Some(reg) = self.tools.get(&call.name) else {
+                        append_tool(&mut c, &calls, index, "tool unavailable".into())?;
+                        c.phase = Phase::Tools {
+                            turns,
+                            calls,
+                            index: index + 1,
+                        };
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    };
+                    let invocation = Invocation {
+                        operation_id,
+                        call: call.clone(),
+                    };
+                    let prepared = crate::tool::prepare(
+                        reg.tool.as_ref(),
+                        &invocation,
+                        cancel,
+                        Duration::from_secs(120),
+                        valid_schema,
+                    )
+                    .await;
+                    if cancel.is_cancelled() {
+                        self.failed = true;
+                        return Err(Error::Interrupted);
+                    }
+                    let prepared = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(outcome) => {
+                            append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                            c.phase = Phase::Tools {
+                                turns,
+                                calls,
+                                index: index + 1,
+                            };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
+                        }
+                    };
+                    let snapshot = serde_json::to_value(&c)?;
+                    let memo = self.extension_memo(operation_id)?;
+                    let context = crate::extension::Context {
+                        snapshot: &snapshot,
+                        memo: &memo,
+                    };
+                    let hook_call = crate::extension::ToolCall {
+                        name: call.name.clone(),
+                        arguments: prepared.arguments().clone(),
+                    };
+                    let (rewritten, decision, reports) =
+                        selected.before_tool(hook_call, &context).await;
+                    if cancel.is_cancelled() {
+                        self.failed = true;
+                        return Err(Error::Interrupted);
+                    }
+                    let rejection = match decision {
+                        crate::extension::BeforeTool::Pass => None,
+                        crate::extension::BeforeTool::Block(reason) => {
+                            Some(if reports.is_empty() {
+                                reason
+                            } else {
+                                format!("{reason}: {reports:?}")
+                            })
+                        }
+                        crate::extension::BeforeTool::Sleep(_) => {
+                            Some("extension sleep is unsupported; tool blocked".into())
+                        }
+                        crate::extension::BeforeTool::Rewrite(_) => {
+                            Some("invalid before-tool decision".into())
+                        }
+                    };
+                    if let Some(reason) = rejection {
+                        append_tool(&mut c, &calls, index, reason)?;
+                        c.phase = Phase::Tools {
+                            turns,
+                            calls,
+                            index: index + 1,
+                        };
+                    } else {
+                        match crate::tool::restore(
+                            reg.tool.as_ref(),
+                            &invocation,
+                            rewritten.arguments,
+                            valid_schema,
+                        ) {
+                            Ok(prepared) => {
+                                c.phase = Phase::ToolRunning {
+                                    turns,
+                                    calls,
+                                    index,
+                                    operation_id,
+                                    replay: reg.replay,
+                                    arguments: prepared.arguments().clone(),
+                                    restarts: 0,
+                                    replay_ready: false,
+                                }
+                            }
+                            Err(outcome) => {
+                                append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                                c.phase = Phase::Tools {
+                                    turns,
+                                    calls,
+                                    index: index + 1,
+                                };
+                            }
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -1883,9 +2110,18 @@ impl Scheduler {
     /// Must be called inside a Tokio runtime. Recovers and schedules all
     /// persisted conversations, including work admitted by an earlier owner.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
+        Self::open_with_extensions(path, options, crate::extension::Registry::default())
+    }
+    /// Install the initial registry before recovered conversations are scheduled.
+    pub fn open_with_extensions(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+    ) -> Result<Self, Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
         let harness = Harness::open_paused(path, options)?;
+        *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
         let ids = harness.conversations()?;
         let mut scheduler = Self {
             harness,
@@ -1901,6 +2137,15 @@ impl Scheduler {
         }
         scheduler.start_reporter();
         Ok(scheduler)
+    }
+    pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
+        self.harness.install_extension(extension)
+    }
+    pub fn uninstall_extension(&self, name: &str) -> Result<(), Error> {
+        self.harness.uninstall_extension(name)
+    }
+    pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        self.harness.select_extensions(id, names)
     }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.harness.create_conversation(config)
@@ -2394,6 +2639,7 @@ mod scheduler_tests {
         let base = Conversation {
             id: Uuid::new_v4(),
             config: config(),
+            extensions: vec![],
             messages: vec![],
             submissions: vec![],
             aborted_generations: vec![],
