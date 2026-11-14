@@ -276,6 +276,13 @@ snapshot even if the parent has changed. Queued or running parents cannot be
 forked. Existing links retain their original configuration and history mode.
 Children do not inherit submissions, active work, or ownership.
 
+Background-inclusive aborts advance a persisted generation for each affected
+parent atomically with graph marks. Reporter intents are bound to that generation;
+stale intents are retired on replay, and child and report admissions check it in
+their storage commit. Normal aborts do not advance it. Reporter operation IDs are
+unique per parent, including across named children and after an abort; use a new
+ID for a new request.
+
 `Scheduler::submit_subagent_reported` persists a reporter intent before child
 admission. The background scheduler resumes pending intents after reopening,
 submits the child input idempotently, and admits an answer or failure as a parent

@@ -1037,7 +1037,7 @@ impl Harness {
         self.failed = true;
         self.storage_failed.store(true, Ordering::Release);
     }
-    fn key(id: Uuid) -> Vec<u8> {
+    pub(crate) fn key(id: Uuid) -> Vec<u8> {
         format!("runtime/conversation/{id}").into_bytes()
     }
     fn load(&self, id: Uuid) -> Result<(Conversation, u64), Error> {
@@ -2650,7 +2650,7 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options, &mut |_| Ok(()))
+        self.submit_internal_with_options(id, request_id, content, options, &mut |_| Ok(()), None)
     }
     /// Atomically admit a new input with checked documents and registered tasks.
     /// The callback may run again after a conflict and must have no external
@@ -2673,7 +2673,7 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options, &mut change)
+        self.submit_internal_with_options(id, request_id, content, options, &mut change, None)
     }
     pub(crate) fn submit_internal(
         &mut self,
@@ -2691,6 +2691,28 @@ impl Harness {
                 ..Default::default()
             },
             &mut |_| Ok(()),
+            None,
+        )
+    }
+    pub(crate) fn submit_reporter_input(
+        &mut self,
+        id: Uuid,
+        request_id: String,
+        content: String,
+        mode: InputMode,
+        parent: Uuid,
+        generation: u64,
+    ) -> Result<Uuid, Error> {
+        self.submit_internal_with_options(
+            id,
+            Some(request_id),
+            content,
+            AdmissionOptions {
+                mode,
+                ..Default::default()
+            },
+            &mut |_| Ok(()),
+            Some((parent, generation)),
         )
     }
     fn submit_internal_with_options(
@@ -2702,8 +2724,19 @@ impl Harness {
         change: &mut impl FnMut(
             &mut crate::document::AdmissionDocuments<'_>,
         ) -> Result<(), crate::document::Error>,
+        fence: Option<(Uuid, u64)>,
     ) -> Result<Uuid, Error> {
         loop {
+            let fence_check = if let Some((parent, generation)) = fence {
+                let (current, check) =
+                    crate::subagent::generation_check(self.owner.store(), parent)?;
+                if current != generation {
+                    return Err(Error::Invalid("stale reporter intent".into()));
+                }
+                Some(check)
+            } else {
+                None
+            };
             let (mut c, version) = self.load(id)?;
             if request_id.as_ref().is_some_and(|key| {
                 c.application_writes
@@ -2724,6 +2757,13 @@ impl Harness {
                     return Err(Error::Invalid(
                         "request ID identifies a continue submission".into(),
                     ));
+                }
+                if let Some(check) = fence_check {
+                    match self.owner.store().commit(&[check], &[]) {
+                        Ok(()) => (),
+                        Err(durable_store::Error::Conflict { .. }) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 return Ok(s.id);
             }
@@ -2783,7 +2823,12 @@ impl Harness {
                 return Err(error.into());
             }
             let tasks = documents.take_tasks();
-            let batch = documents.into_batch();
+            let batch = documents.into_batch().map(|mut batch| {
+                if let Some(check) = fence_check {
+                    batch.checks.push(check);
+                }
+                batch
+            });
             let result = match batch {
                 Ok(batch) if tasks.is_empty() => self.save_composed_locked(
                     &c,
@@ -3039,6 +3084,7 @@ impl Harness {
                 }
             }
             let mut updates = Vec::new();
+            let mut generation_updates = Vec::new();
             for id in &tasks {
                 let mut record = (*by_id[id]).clone();
                 if !record.task.is_terminal() && !record.task.abort_requested() {
@@ -3048,6 +3094,17 @@ impl Harness {
                         .map_err(|e| Error::Invalid(format!("task abort: {e:?}")))?;
                 }
                 updates.push(record);
+            }
+            if background {
+                for (state, _) in &states {
+                    let (generation, check) = crate::subagent::generation_check(store, state.id)?;
+                    edge_checks.push(check);
+                    let next = generation
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Invalid("reporter generation exhausted".into()))?;
+                    /* composed with graph marks below */
+                    generation_updates.push((state.id, next));
+                }
             }
             for (state, _) in &mut states {
                 for submission in &mut state.submissions {
@@ -3084,6 +3141,12 @@ impl Harness {
                 });
             }
             batch.checks.extend(edge_checks);
+            for (id, generation) in generation_updates {
+                batch.mutations.push(Mutation::Put {
+                    key: crate::subagent::generation_key(id),
+                    value: serde_json::to_vec(&generation)?,
+                });
+            }
             batch.mutations.extend(task_batch.mutations);
             match self.commit_conversation_save(batch) {
                 Ok(()) => {
@@ -5940,7 +6003,9 @@ impl Scheduler {
                             active.insert(
                                 key,
                                 tokio::spawn(async move {
-                                    let child = worker.reporter_child(&reporter)?;
+                                    let Some(child) = worker.reporter_child(&reporter)? else {
+                                        return Ok(());
+                                    };
                                     let lock =
                                         worker.owner.conversation_controls().get(child).worker;
                                     {

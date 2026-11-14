@@ -81,14 +81,33 @@ pub(crate) struct Reporter {
     content: String,
     mode: InputMode,
     delivered: bool,
+    #[serde(default)]
+    generation: u64,
+}
+pub(crate) fn generation_key(parent: Uuid) -> Vec<u8> {
+    format!("runtime/subagent-generation/{parent}").into_bytes()
+}
+pub(crate) fn generation_check(
+    store: &durable_store::Store,
+    parent: Uuid,
+) -> Result<(u64, Check), Error> {
+    let key = generation_key(parent);
+    let entry = store.get(&key)?;
+    let generation = entry
+        .as_ref()
+        .map(|e| serde_json::from_slice(&e.value))
+        .transpose()?
+        .unwrap_or(0);
+    let expected = entry.map_or(Expected::Missing, |e| Expected::Version(e.version));
+    Ok((generation, Check { key, expected }))
 }
 fn key(parent: Uuid, name: &str) -> Vec<u8> {
     let mut key = format!("runtime/subagent/{parent}/").into_bytes();
     key.extend_from_slice(name.as_bytes());
     key
 }
-fn reporter_key(child: Uuid, request_id: &str) -> Vec<u8> {
-    let mut key = format!("runtime/subagent-report/{child}/").into_bytes();
+fn reporter_key(parent: Uuid, request_id: &str) -> Vec<u8> {
+    let mut key = format!("runtime/subagent-report/{parent}/").into_bytes();
     key.extend_from_slice(request_id.as_bytes());
     key
 }
@@ -612,7 +631,29 @@ impl Harness {
             ));
         }
         let link = self.ensure_subagent_restricted(parent, name, config, history, allowed_tools)?;
-        let k = reporter_key(link.child, &request_id);
+        let k = reporter_key(parent, &request_id);
+        // Older databases keyed intents by child. Preserve their parent-wide
+        // identity when upgrading, including retired and delivered records.
+        for (old_key, entry) in self.subagent_store()?.list(REPORTS)? {
+            let old: Reporter = serde_json::from_slice(&entry.value)?;
+            if old.link.parent == parent && old.request_id == request_id && old_key != k {
+                if old.link != link {
+                    return Err(Error::Invalid(
+                        "reporter operation ID already belongs to another child".into(),
+                    ));
+                }
+                return self
+                    .submit_reporter_input(
+                        link.child,
+                        old.request_id,
+                        old.content,
+                        old.mode,
+                        parent,
+                        old.generation,
+                    )
+                    .map(|id| (link, id));
+            }
+        }
         let reporter = loop {
             if let Some(entry) = self.subagent_store()?.get(&k)? {
                 let reporter: Reporter = serde_json::from_slice(&entry.value)?;
@@ -621,7 +662,17 @@ impl Harness {
                 }
                 break reporter;
             }
+            let parent_entry = self
+                .subagent_store()?
+                .get(&Harness::key(parent))?
+                .ok_or(Error::NotFound)?;
+            let parent_state: Conversation = serde_json::from_slice(&parent_entry.value)?;
+            if parent_state.abort_requested {
+                return Err(Error::Invalid("parent conversation is aborting".into()));
+            }
+            let (generation, generation_check) = generation_check(self.subagent_store()?, parent)?;
             let reporter = Reporter {
+                generation,
                 link: link.clone(),
                 request_id: request_id.clone(),
                 content: content.clone(),
@@ -629,10 +680,17 @@ impl Harness {
                 delivered: false,
             };
             match self.subagent_store()?.commit(
-                &[Check {
-                    key: k.clone(),
-                    expected: Expected::Missing,
-                }],
+                &[
+                    Check {
+                        key: k.clone(),
+                        expected: Expected::Missing,
+                    },
+                    Check {
+                        key: Harness::key(parent),
+                        expected: Expected::Version(parent_entry.version),
+                    },
+                    generation_check,
+                ],
                 &[Mutation::Put {
                     key: k.clone(),
                     value: serde_json::to_vec(&reporter)?,
@@ -646,11 +704,13 @@ impl Harness {
                 }
             }
         };
-        let id = self.submit_with_mode(
+        let id = self.submit_reporter_input(
             link.child,
-            Some(reporter.request_id),
+            reporter.request_id,
             reporter.content,
             reporter.mode,
+            parent,
+            reporter.generation,
         )?;
         Ok((link, id))
     }
@@ -658,16 +718,45 @@ impl Harness {
         let mut result = Vec::new();
         for (key, entry) in self.subagent_store()?.list(REPORTS)? {
             let reporter: Reporter = serde_json::from_slice(&entry.value)?;
-            if key != reporter_key(reporter.link.child, &reporter.request_id) {
+            if key != reporter_key(reporter.link.parent, &reporter.request_id)
+                && key != reporter_key(reporter.link.child, &reporter.request_id)
+            {
                 return Err(Error::Invalid("invalid reporter key".into()));
             }
             if !reporter.delivered {
-                result.push((key, reporter));
+                let (generation, check) =
+                    generation_check(self.subagent_store()?, reporter.link.parent)?;
+                if generation != reporter.generation {
+                    let mut retired = reporter;
+                    retired.delivered = true;
+                    match self.subagent_store()?.commit(
+                        &[
+                            check,
+                            Check {
+                                key: key.clone(),
+                                expected: Expected::Version(entry.version),
+                            },
+                        ],
+                        &[Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&retired)?,
+                        }],
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => (),
+                        Err(e) => return Err(e.into()),
+                    }
+                } else {
+                    result.push((key, reporter));
+                }
             }
         }
         Ok(result)
     }
-    pub(crate) fn reporter_child(&mut self, reporter: &Reporter) -> Result<Uuid, Error> {
+    pub(crate) fn reporter_child(&mut self, reporter: &Reporter) -> Result<Option<Uuid>, Error> {
+        if generation_check(self.subagent_store()?, reporter.link.parent)?.0 != reporter.generation
+        {
+            return Ok(None);
+        }
         let link = self
             .reservation(reporter.link.parent, &reporter.link.key)?
             .ok_or(Error::NotFound)?;
@@ -681,13 +770,18 @@ impl Harness {
             link.history,
             link.allowed_tools,
         )?;
-        self.submit_with_mode(
+        match self.submit_reporter_input(
             reporter.link.child,
-            Some(reporter.request_id.clone()),
+            reporter.request_id.clone(),
             reporter.content.clone(),
             reporter.mode,
-        )?;
-        Ok(reporter.link.child)
+            reporter.link.parent,
+            reporter.generation,
+        ) {
+            Ok(_) => Ok(Some(reporter.link.child)),
+            Err(Error::Invalid(message)) if message == "stale reporter intent" => Ok(None),
+            Err(e) => Err(e),
+        }
     }
     /// Admission is idempotent even if interrupted before the receipt is saved.
     pub(crate) fn deliver_report(
@@ -721,12 +815,18 @@ impl Harness {
             "{REPORT_REQUEST_PREFIX}{}/{}",
             reporter.link.child, identity
         );
-        self.submit_internal(
+        match self.submit_reporter_input(
             reporter.link.parent,
-            Some(request),
+            request,
             text,
             InputMode::FollowUp,
-        )?;
+            reporter.link.parent,
+            reporter.generation,
+        ) {
+            Ok(_) => (),
+            Err(Error::Invalid(message)) if message == "stale reporter intent" => return Ok(None),
+            Err(e) => return Err(e),
+        }
         let entry = self.subagent_store()?.get(key)?.ok_or(Error::NotFound)?;
         let mut current: Reporter = serde_json::from_slice(&entry.value)?;
         if !current.delivered {

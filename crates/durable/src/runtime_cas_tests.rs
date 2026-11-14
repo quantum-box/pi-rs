@@ -2870,3 +2870,130 @@ fn managed_anchor_survives_process_kill_before_delivery() {
     assert_eq!(h.anchor_subagent(ids[0], "worker").unwrap(), ids[2]);
     assert!(h.conversation(ids[1]).unwrap().submissions.is_empty());
 }
+
+#[test]
+fn reporter_generation_fences_prepared_admission_and_survives_reopen() {
+    use crate::subagent::generation_check;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let link = h.ensure_subagent(parent, "worker", config.clone()).unwrap();
+    let (generation, check) = generation_check(h.owner.store(), parent).unwrap();
+    let (mut child, version) = h.load(link.child).unwrap();
+    child.admit_initial_input(Uuid::new_v4(), "stale".into());
+    let mut batch = h.prepare_save(&child, Expected::Version(version)).unwrap();
+    batch.checks.push(check);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let mut abort = h.worker();
+    let thread = std::thread::spawn(move || {
+        other.wait();
+        abort.request_abort_with_background(parent).unwrap();
+    });
+    barrier.wait();
+    thread.join().unwrap();
+    assert_eq!(h.load(link.child).unwrap().1, version);
+    assert!(matches!(
+        h.commit_conversation_save(batch),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(
+        h.submit_reporter_input(
+            link.child,
+            "stale".into(),
+            "stale".into(),
+            InputMode::FollowUp,
+            parent,
+            generation
+        )
+        .is_err()
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        generation_check(h.owner.store(), parent).unwrap().0,
+        generation + 1
+    );
+    assert!(h.conversation(link.child).unwrap().submissions.is_empty());
+    assert!(h.pending_reporters().unwrap().is_empty());
+}
+
+#[test]
+fn reporter_operation_ids_are_unique_per_parent() {
+    use crate::subagent::ReportedInput;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let input = || ReportedInput {
+        history: false,
+        request_id: "same".into(),
+        content: "hello".into(),
+        mode: InputMode::FollowUp,
+    };
+    h.submit_subagent_reported(parent, "one", config.clone(), input())
+        .unwrap();
+    assert!(
+        h.submit_subagent_reported(parent, "two", config, input())
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn stale_reporter_retires_on_reopen_and_later_requests_work() {
+    use crate::subagent::{ReportedInput, generation_check};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let input = |id: &str| ReportedInput {
+        history: false,
+        request_id: id.into(),
+        content: "hello".into(),
+        mode: InputMode::FollowUp,
+    };
+    let (link, _) = h
+        .submit_subagent_reported(parent, "worker", config.clone(), input("old"))
+        .unwrap();
+    let pending = h.pending_reporters().unwrap();
+    assert_eq!(pending.len(), 1);
+    h.request_abort(parent).unwrap();
+    assert_eq!(generation_check(h.owner.store(), parent).unwrap().0, 0);
+    h.request_abort_with_background(parent).unwrap();
+    assert!(h.reporter_child(&pending[0].1).unwrap().is_none());
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.pending_reporters().unwrap().is_empty());
+    h.resume_conversation(parent, &CancellationToken::new())
+        .await
+        .unwrap();
+    h.resume_conversation(link.child, &CancellationToken::new())
+        .await
+        .unwrap();
+    let (_, new_id) = h
+        .submit_subagent_reported(parent, "worker", config, input("new"))
+        .unwrap();
+    assert!(
+        h.conversation(link.child)
+            .unwrap()
+            .submissions
+            .iter()
+            .any(|s| s.id == new_id)
+    );
+    assert_eq!(h.pending_reporters().unwrap().len(), 1);
+}
