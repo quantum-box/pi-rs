@@ -337,6 +337,16 @@ impl Resolved {
             .find(|t| t.spec().name == name)
             .cloned()
     }
+    /// Effective tools, with later selected extensions replacing earlier ones.
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut tools = std::collections::BTreeMap::new();
+        for extension in &self.extensions {
+            for tool in &extension.tools {
+                tools.insert(tool.spec().name, tool.clone());
+            }
+        }
+        tools.into_values().collect()
+    }
     pub fn task(&self, name: &str) -> Option<Arc<dyn crate::task_scheduler::Handler>> {
         self.extensions
             .iter()

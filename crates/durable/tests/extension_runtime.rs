@@ -431,3 +431,126 @@ fn forks_preserve_historical_extension_selection() {
         vec!["first"]
     );
 }
+
+struct ResultHook;
+#[async_trait]
+impl Hook for ResultHook {
+    async fn after_tool(
+        &self,
+        _: &HookCall,
+        result: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        let saved = ctx.memo.get_or_insert("result", result.clone()).await?;
+        if std::env::var_os("PI_AFTER_TOOL_CRASH_DB").is_some() {
+            std::process::abort();
+        }
+        Ok(Some(json!(format!("hooked: {}", saved.as_str().unwrap()))))
+    }
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::BeforeRequest {
+            let mut v = value.clone();
+            v["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user", "content":"from hook"}));
+            Ok(GenerationDecision::Replace(v))
+        } else {
+            Ok(GenerationDecision::Pass)
+        }
+    }
+}
+fn extension_only_options(model: Arc<FakeModel>) -> Options {
+    Options {
+        model,
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    }
+}
+fn tool_extension(tool: Arc<FakeTool>) -> Extension {
+    Extension {
+        name: "provider".into(),
+        tools: vec![tool],
+        hooks: vec![Arc::new(ResultHook)],
+        ..Default::default()
+    }
+}
+#[tokio::test]
+async fn extension_tool_and_generation_hooks_are_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let mut h =
+        Harness::open_paused(dir.path().join("db"), extension_only_options(model.clone())).unwrap();
+    h.install_extension(tool_extension(tool.clone())).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["provider".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*tool.0.lock().unwrap(), vec![json!({"n":1})]);
+    assert_eq!(tool_message(&h.conversation(id).unwrap()), "hooked: ok");
+    let requests = model.0.lock().unwrap();
+    assert_eq!(requests[0].tools[0].name, "test");
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "from hook"))
+    );
+}
+#[tokio::test]
+async fn after_tool_crash_child() {
+    let Ok(path) = std::env::var("PI_AFTER_TOOL_CRASH_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(
+        &path,
+        extension_only_options(Arc::new(FakeModel::default())),
+    )
+    .unwrap();
+    h.install_extension(tool_extension(Arc::new(FakeTool::default())))
+        .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["provider".into()]).unwrap();
+    std::fs::write(format!("{path}.id"), id.to_string()).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    panic!("hook did not crash");
+}
+#[tokio::test]
+async fn after_tool_recovery_does_not_execute_tool_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "after_tool_crash_child"])
+        .env("PI_AFTER_TOOL_CRASH_DB", &path)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    let id = std::fs::read_to_string(format!("{}.id", path.display()))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let mut h = Harness::open_paused(
+        &path,
+        extension_only_options(Arc::new(FakeModel::default())),
+    )
+    .unwrap();
+    h.install_extension(tool_extension(tool.clone())).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    assert_eq!(tool_message(&h.conversation(id).unwrap()), "hooked: ok");
+}

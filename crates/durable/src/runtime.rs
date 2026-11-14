@@ -189,6 +189,15 @@ enum Phase {
         #[serde(default)]
         replay_ready: bool,
     },
+    /// The tool outcome and its state are committed before after-tool hooks run.
+    ToolFinished {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        index: usize,
+        operation_id: Uuid,
+        arguments: serde_json::Value,
+        content: String,
+    },
     Blocked {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -390,6 +399,19 @@ impl Harness {
             )));
         }
         Ok(snapshot.resolve(Some(&c.extensions)))
+    }
+    fn resolved_tools(&self, c: &Conversation) -> Result<HashMap<String, RegisteredTool>, Error> {
+        let mut tools = self.tools.clone();
+        for tool in self.selected_extensions(c)?.tools() {
+            tools.insert(
+                tool.spec().name,
+                RegisteredTool {
+                    tool,
+                    replay: ReplayPolicy::Unsafe,
+                },
+            );
+        }
+        Ok(tools)
     }
     /// Select installed names for a settled conversation, preserving their order.
     pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
@@ -1108,10 +1130,16 @@ impl Harness {
                     } else {
                         restarts.saturating_add(1)
                     };
-                    let current = calls
-                        .get(index)
-                        .and_then(|x| self.tools.get(&x.name))
-                        .map(|x| x.replay);
+                    // Extensions are installed after opening the store. Their selection
+                    // could override a host tool, so never replay against a guessed registration.
+                    let current = if c.extensions.is_empty() {
+                        calls
+                            .get(index)
+                            .and_then(|x| self.tools.get(&x.name))
+                            .map(|x| x.replay)
+                    } else {
+                        None
+                    };
                     match recover_tool(
                         replay,
                         current,
@@ -1147,11 +1175,13 @@ impl Harness {
                             } else {
                                 "tool interrupted and may have partially run"
                             };
-                            append_tool(&mut c, &calls, index, reason.to_owned())?;
-                            c.phase = Phase::Tools {
+                            c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
-                                index: index + 1,
+                                index,
+                                operation_id,
+                                arguments,
+                                content: reason.to_owned(),
                             };
                         }
                     }
@@ -1532,8 +1562,11 @@ impl Harness {
                                     content: c.config.system_prompt.clone(),
                                 }];
                                 messages.extend(c.messages.clone());
-                                let specs: Vec<_> =
-                                    self.tools.values().map(|tool| tool.tool.spec()).collect();
+                                let specs: Vec<_> = self
+                                    .resolved_tools(&c)?
+                                    .values()
+                                    .map(|tool| tool.tool.spec())
+                                    .collect();
                                 let request = model_request(
                                     &c.config.model,
                                     messages,
@@ -1613,11 +1646,48 @@ impl Harness {
                         content: system_prompt,
                     }];
                     messages.extend(c.messages.clone());
-                    let mut specs: Vec<ToolSpec> =
-                        self.tools.values().map(|t| t.tool.spec()).collect();
+                    let mut specs: Vec<ToolSpec> = self
+                        .resolved_tools(&c)?
+                        .values()
+                        .map(|t| t.tool.spec())
+                        .collect();
                     specs.sort_by(|a, b| a.name.cmp(&b.name));
-                    let request =
+                    let mut request =
                         model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
+                    if !c.extensions.is_empty() {
+                        let selected = self.selected_extensions(&c)?;
+                        let snapshot = serde_json::to_value(&c)?;
+                        let memo = self.extension_memo(request_id)?;
+                        let context = crate::extension::Context {
+                            snapshot: &snapshot,
+                            memo: &memo,
+                        };
+                        let value = serde_json::json!({"messages": request.messages});
+                        let (value, _, _, reports) = selected
+                            .generation(
+                                crate::extension::GenerationEvent::BeforeRequest,
+                                value,
+                                &context,
+                            )
+                            .await;
+                        self.subagent_store()?;
+                        if cancel.is_cancelled() {
+                            self.failed = true;
+                            return Err(Error::Interrupted);
+                        }
+                        if !reports.is_empty() {
+                            return Err(Error::Invalid(format!(
+                                "before-request hook failed: {reports:?}"
+                            )));
+                        }
+                        request.messages =
+                            serde_json::from_value(value.get("messages").cloned().ok_or_else(
+                                || Error::Invalid("before-request hook omitted messages".into()),
+                            )?)
+                            .map_err(|e| {
+                                Error::Invalid(format!("invalid before-request messages: {e}"))
+                            })?;
+                    }
                     let store = self.owner.store();
                     let mut snapshot = crate::progress::Snapshot::load(store, request_id)?;
                     let mut last_flush: Option<Instant> = None;
@@ -1778,6 +1848,27 @@ impl Harness {
                     request_id,
                     response,
                 } => {
+                    if !c.extensions.is_empty() {
+                        let selected = self.selected_extensions(&c)?;
+                        let snapshot = serde_json::to_value(&c)?;
+                        let memo = self.extension_memo(request_id)?;
+                        let context = crate::extension::Context {
+                            snapshot: &snapshot,
+                            memo: &memo,
+                        };
+                        let (_, _, _, _reports) = selected
+                            .generation(
+                                crate::extension::GenerationEvent::AfterResponse,
+                                serde_json::to_value(&*response)?,
+                                &context,
+                            )
+                            .await;
+                        self.subagent_store()?;
+                        if cancel.is_cancelled() {
+                            self.failed = true;
+                            return Err(Error::Interrupted);
+                        }
+                    }
                     let usage = response.usage.map_or(UsageReport::Unconfirmed, |usage| {
                         UsageReport::Measured { usage }
                     });
@@ -1994,12 +2085,17 @@ impl Harness {
                     let call = calls
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
-                    let Some(reg) = self.tools.get(&call.name) else {
-                        append_tool(&mut c, &calls, index, "tool unavailable".into())?;
-                        c.phase = Phase::Tools {
+                    let tools = self.resolved_tools(&c)?;
+                    let Some(reg) = tools.get(&call.name) else {
+                        let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        c.phase = Phase::ToolFinished {
                             turns,
                             calls,
-                            index: index + 1,
+                            index,
+                            operation_id,
+                            arguments,
+                            content: "tool unavailable".into(),
                         };
                         self.save(&c, Expected::Version(version))?;
                         continue;
@@ -2023,11 +2119,16 @@ impl Harness {
                     let prepared = match prepared {
                         Ok(prepared) => prepared,
                         Err(outcome) => {
-                            append_tool(&mut c, &calls, index, outcome.tool_content())?;
-                            c.phase = Phase::Tools {
+                            let arguments =
+                                pi_rs_core::parse_tool_arguments(&calls[index].arguments)
+                                    .unwrap_or(serde_json::Value::Null);
+                            c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
-                                index: index + 1,
+                                index,
+                                operation_id,
+                                arguments,
+                                content: outcome.tool_content(),
                             };
                             self.save(&c, Expected::Version(version))?;
                             continue;
@@ -2045,6 +2146,7 @@ impl Harness {
                     };
                     let (rewritten, decision, reports) =
                         selected.before_tool(hook_call, &context).await;
+                    self.subagent_store()?;
                     if cancel.is_cancelled() {
                         self.failed = true;
                         return Err(Error::Interrupted);
@@ -2066,17 +2168,19 @@ impl Harness {
                         }
                     };
                     if let Some(reason) = rejection {
-                        append_tool(&mut c, &calls, index, reason)?;
-                        c.phase = Phase::Tools {
+                        c.phase = Phase::ToolFinished {
                             turns,
                             calls,
-                            index: index + 1,
+                            index,
+                            operation_id,
+                            arguments: rewritten.arguments,
+                            content: reason,
                         };
                     } else {
                         match crate::tool::restore(
                             reg.tool.as_ref(),
                             &invocation,
-                            rewritten.arguments,
+                            rewritten.arguments.clone(),
                             valid_schema,
                         ) {
                             Ok(prepared) => {
@@ -2092,11 +2196,13 @@ impl Harness {
                                 }
                             }
                             Err(outcome) => {
-                                append_tool(&mut c, &calls, index, outcome.tool_content())?;
-                                c.phase = Phase::Tools {
+                                c.phase = Phase::ToolFinished {
                                     turns,
                                     calls,
-                                    index: index + 1,
+                                    index,
+                                    operation_id,
+                                    arguments: rewritten.arguments,
+                                    content: outcome.tool_content(),
                                 };
                             }
                         }
@@ -2122,7 +2228,8 @@ impl Harness {
                     let call = calls
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
-                    let reply = if let Some(reg) = self.tools.get(&call.name) {
+                    let tools = self.resolved_tools(&c)?;
+                    let reply = if let Some(reg) = tools.get(&call.name) {
                         let invocation = Invocation {
                             operation_id,
                             call: call.clone(),
@@ -2130,14 +2237,14 @@ impl Harness {
                         match crate::tool::restore(
                             reg.tool.as_ref(),
                             &invocation,
-                            arguments,
+                            arguments.clone(),
                             valid_schema,
                         ) {
                             Ok(prepared) => {
                                 match crate::nested::NestedHost::new(
                                     self.owner.clone(),
                                     operation_id,
-                                    self.tools.values().cloned().collect(),
+                                    tools.values().cloned().collect(),
                                     cancel.child_token(),
                                     Duration::from_secs(120),
                                     8,
@@ -2214,14 +2321,59 @@ impl Harness {
                             }
                         }
                         other => {
-                            append_tool(&mut c, &calls, index, other.tool_content())?;
-                            c.phase = Phase::Tools {
+                            c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
-                                index: index + 1,
+                                index,
+                                operation_id,
+                                arguments,
+                                content: other.tool_content(),
                             };
                         }
                     }
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::ToolFinished {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    arguments,
+                    content,
+                } => {
+                    let selected = self.selected_extensions(&c)?;
+                    let snapshot = serde_json::to_value(&c)?;
+                    let memo = self.extension_memo(operation_id)?;
+                    let context = crate::extension::Context {
+                        snapshot: &snapshot,
+                        memo: &memo,
+                    };
+                    let call = calls
+                        .get(index)
+                        .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
+                    let hook_call = crate::extension::ToolCall {
+                        name: call.name.clone(),
+                        arguments,
+                    };
+                    let (result, _reports) = selected
+                        .after_tool(
+                            &hook_call,
+                            serde_json::Value::String(content.clone()),
+                            &context,
+                        )
+                        .await;
+                    self.subagent_store()?;
+                    if cancel.is_cancelled() {
+                        self.failed = true;
+                        return Err(Error::Interrupted);
+                    }
+                    let content = result.as_str().unwrap_or(&content).to_owned();
+                    append_tool(&mut c, &calls, index, content)?;
+                    c.phase = Phase::Tools {
+                        turns,
+                        calls,
+                        index: index + 1,
+                    };
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Pending {
@@ -2234,7 +2386,8 @@ impl Harness {
                     let call = calls
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
-                    let Some(tool) = self.tools.get(&call.name) else {
+                    let tools = self.resolved_tools(&c)?;
+                    let Some(tool) = tools.get(&call.name) else {
                         return Ok(());
                     };
                     let result = fenced_poll(
@@ -2274,11 +2427,16 @@ impl Harness {
                             };
                         }
                         crate::poll::PollResult::Outcome(outcome) => {
-                            append_tool(&mut c, &calls, index, outcome.tool_content())?;
-                            c.phase = Phase::Tools {
+                            let arguments =
+                                pi_rs_core::parse_tool_arguments(&calls[index].arguments)
+                                    .unwrap_or(serde_json::Value::Null);
+                            c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
-                                index: index + 1,
+                                index,
+                                operation_id,
+                                arguments,
+                                content: outcome.tool_content(),
                             };
                         }
                         crate::poll::PollResult::Cancelled => return Err(Error::Interrupted),
@@ -2357,8 +2515,8 @@ impl Harness {
                 }
             }
         }
-        append_tool(&mut c, &calls, index, outcome.tool_content())?;
         if c.abort_requested {
+            append_tool(&mut c, &calls, index, outcome.tool_content())?;
             for i in index + 1..calls.len() {
                 append_tool(
                     &mut c,
@@ -2369,11 +2527,23 @@ impl Harness {
             }
             c.abort_requested = false;
             finish_abort(&mut c);
-        } else {
+        } else if c.extensions.is_empty() {
+            append_tool(&mut c, &calls, index, outcome.tool_content())?;
             c.phase = Phase::Tools {
                 turns,
                 calls,
                 index: index + 1,
+            };
+        } else {
+            let arguments = pi_rs_core::parse_tool_arguments(&calls[index].arguments)
+                .unwrap_or(serde_json::Value::Null);
+            c.phase = Phase::ToolFinished {
+                turns,
+                calls,
+                index,
+                operation_id,
+                arguments,
+                content: outcome.tool_content(),
             };
         }
         self.save(&c, Expected::Version(version))

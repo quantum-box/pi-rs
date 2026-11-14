@@ -55,6 +55,17 @@ parent reuses completed child results, while unsafe interrupted children block
 the parent for reconciliation even when it ignores the child's result. Nested
 calls are serialized, bounded in depth, and cannot update extension state.
 
+Selected extensions may provide tools and before/after-tool hooks. The runtime
+commits terminal tool output and state before invoking after-tool hooks; a crash
+replays the hook with the same operation memo, not the completed tool. Hook
+callbacks can run more than once and must memoize or make external effects
+idempotent. Extension tools are conservatively unsafe to replay, and recovery
+with selected extensions also avoids replaying potentially overridden host tools.
+The runtime supports before-request message replacement and observes completed
+responses; hook errors and non-string after-tool replacements have limited
+reporting. Provider-body hooks, on-yield, after-tools and after-run hooks and
+their durable child tasks are not integrated. Tool sleep gates remain unsupported.
+
 Current limits and differences from upstream Pi Durable:
 
 - Historical fork currently accepts settled snapshots, not every upstream entry.
