@@ -1241,6 +1241,57 @@ fn position_fork_rejects_missing_or_mismatched_historical_metadata() {
 }
 
 #[test]
+fn position_fork_uses_the_occurrence_commit_not_an_earlier_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    // Reserve an earlier public observer record, then simulate it referring to
+    // the later cursor. Observer payloads are not runtime authorization.
+    let observer = crate::observer::Observer::new(h.owner.store(), id);
+    let extra = observer.prepare_append(&serde_json::json!({})).unwrap();
+    let earlier = extra.cursor.0;
+    h.owner
+        .store()
+        .commit(&extra.checks, &extra.mutations)
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "one".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entry = h
+        .view_positioned(id, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries
+        .remove(0);
+    let mut key = b"durable/observer/".to_vec();
+    key.extend_from_slice(id.as_bytes());
+    key.extend_from_slice(b"/r");
+    key.extend_from_slice(&earlier.to_be_bytes());
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&serde_json::json!({
+                    "_transcript": entry.position.cursor,
+                }))
+                .unwrap(),
+            }],
+        )
+        .unwrap();
+    let fork = h.fork_at_position(id, entry.position).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages, vec![entry.message]);
+}
+
+#[test]
 fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

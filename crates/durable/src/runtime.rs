@@ -3007,82 +3007,82 @@ impl Harness {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
         let observer = crate::observer::Observer::new(self.owner.store(), id);
-        let mut cursor = crate::observer::Cursor(0);
-        loop {
-            let page = observer.read(cursor, std::num::NonZeroUsize::new(128).unwrap())?;
-            for record in &page.records {
-                let reference = record.value.get("_transcript").cloned();
-                let Some(reference) = reference else { continue };
-                let reference: Option<crate::transcript::Cursor> =
-                    serde_json::from_value(reference)?;
-                if reference.as_ref() == Some(&position.cursor) {
-                    if record.cursor.0 != commit {
-                        return Err(crate::fork::Error::InvalidSnapshot.into());
-                    }
-                    let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
-                    let entry = self
-                        .owner
-                        .store()
-                        .get(key.as_bytes())?
-                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                    let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
-                    let captured: Option<crate::transcript::Cursor> = serde_json::from_value(
-                        value
-                            .get("_transcript")
-                            .cloned()
-                            .ok_or(crate::fork::Error::InvalidSnapshot)?,
-                    )?;
-                    if captured.as_ref() != Some(&position.cursor) {
-                        return Err(crate::fork::Error::InvalidSnapshot.into());
-                    }
-                    let documents = value
-                        .get("documents")
-                        .and_then(serde_json::Value::as_object)
-                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                    for name in [
-                        "pi-rs/runtime/queue-modes",
-                        "pi-rs/runtime/extensions",
-                        "pi-rs/runtime/provider-adapter",
-                        "pi-rs/runtime/allowed-tools",
-                        "pi-rs/runtime/resets",
-                        "pi-rs/runtime/application-writes",
-                    ] {
-                        if !documents.contains_key(name) {
-                            return Err(crate::fork::Error::InvalidSnapshot.into());
-                        }
-                    }
-                    if let Some((_, _, summary_index, occurrences)) = &compacted_metadata {
-                        if count - 1 != *summary_index {
-                            let (message, history) = occurrences
-                                .get(count - 1)
-                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                            let history = history
-                                .as_ref()
-                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                            let original = self.original_occurrence_position(history, message)?;
-                            return self.fork_at_position(history.origin, original);
-                        }
-                    }
-                    if count == messages.len() {
-                        return self.fork_at(id, record.cursor);
-                    }
-                    let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
-                    let total = prefix
-                        .checked_add(count)
-                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                    let expected_len = prefix
-                        .checked_add(messages.len())
-                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
-                    return self.fork_at_cut(id, record.cursor, Some((total, expected_len)));
-                }
-            }
-            if !page.has_more {
-                break;
-            }
-            cursor = page.next;
+        let after = commit
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let page = observer.read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let record = page
+            .records
+            .first()
+            .filter(|record| record.cursor.0 == commit)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let reference: Option<crate::transcript::Cursor> = serde_json::from_value(
+            record
+                .value
+                .get("_transcript")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        if reference.as_ref() != Some(&position.cursor) {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        Err(crate::fork::Error::InvalidSnapshot.into())
+        let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
+        let entry = self
+            .owner
+            .store()
+            .get(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+        let captured: Option<crate::transcript::Cursor> = serde_json::from_value(
+            value
+                .get("_transcript")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        if captured.as_ref() != Some(&position.cursor) {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let documents = value
+            .get("documents")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        for name in [
+            "pi-rs/runtime/queue-modes",
+            "pi-rs/runtime/extensions",
+            "pi-rs/runtime/provider-adapter",
+            "pi-rs/runtime/allowed-tools",
+            "pi-rs/runtime/resets",
+            "pi-rs/runtime/application-writes",
+        ] {
+            if !documents.contains_key(name) {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+        }
+        if let Some((_, _, summary_index, occurrences)) = &compacted_metadata {
+            if count - 1 != *summary_index {
+                let (message, history) = occurrences
+                    .get(count - 1)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let history = history
+                    .as_ref()
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let original = self.original_occurrence_position(history, message)?;
+                return self.fork_at_position(history.origin, original);
+            }
+        }
+        if count == messages.len() {
+            return self.fork_at(id, record.cursor);
+        }
+        let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let total = prefix
+            .checked_add(count)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let expected_len = prefix
+            .checked_add(messages.len())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        self.fork_at_cut(id, record.cursor, Some((total, expected_len)))
     }
+
     fn original_occurrence_position(
         &self,
         history: &MessageHistory,
