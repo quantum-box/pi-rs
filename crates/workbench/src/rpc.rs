@@ -1334,6 +1334,22 @@ fn busy(worker: &Option<Worker>) -> bool {
         .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
+// Native extensions identify themselves by ID, whereas Pi identifies a
+// JavaScript extension by path. Keep the native fields for existing clients.
+fn extension_error_for_rpc(mut event: Value) -> Value {
+    if event["type"] == "extension_error" {
+        if event.get("extensionPath").is_none()
+            && let Some(extension) = event.get("extension").cloned()
+        {
+            event["extensionPath"] = extension;
+        }
+        if let Some(message) = event.get("message").cloned() {
+            event["error"] = message;
+        }
+    }
+    event
+}
+
 fn forward_event(
     event: Value,
     busy: &mut bool,
@@ -1343,6 +1359,7 @@ fn forward_event(
     stream: &mut super::rpc_events::Stream,
     args: &Cli,
 ) -> Result<()> {
+    let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
         Some("response")
             if matches!(
@@ -1492,6 +1509,24 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn cache_warming_extension_errors_use_rpc_field_names() {
+        let event = json!({"type":"extension_error", "extension":"cache-hook",
+            "event":"cache_warming_decision", "message":"failed"});
+        let projected = extension_error_for_rpc(event);
+        assert_eq!(projected["extensionPath"], "cache-hook");
+        assert_eq!(projected["error"], "failed");
+        assert_eq!(projected["event"], "cache_warming_decision");
+        let with_source = json!({"type":"extension_error", "extension":"cache-hook",
+            "extensionPath":"/extensions/cache", "message":"failed"});
+        assert_eq!(
+            extension_error_for_rpc(with_source)["extensionPath"],
+            "/extensions/cache"
+        );
+        let other = json!({"type":"error", "message":"failed"});
+        assert_eq!(extension_error_for_rpc(other.clone()), other);
+    }
 
     #[test]
     fn rpc_html_export_uses_the_requested_format_and_protects_the_session() {

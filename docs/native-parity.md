@@ -198,6 +198,12 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
+RPC `extension_error` events include Pi's `extensionPath` and `error` fields
+alongside the native `extension` and `message` fields. `extensionPath` is the
+executable's resolved source path when available; embedded extensions without
+a source path use their registered ID. This also applies to cache warming and
+resource-discovery hook errors, including startup discovery.
+
 The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_state`, `get_messages`, `new_session`, `set_model`, `compact`,
 `get_session_stats`, `set_session_name`, `export_html`, `get_available_models`,

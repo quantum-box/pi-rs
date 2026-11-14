@@ -1414,6 +1414,112 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[cfg(unix)]
 #[test]
+fn rpc_reports_native_extension_failures_with_pi_fields() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("error.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    response = {'Ok':{'id':'failure-fixture', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'session_lifecycle_hook':True, 'resource_discovery_hook':True, 'input_hook':True}}
+elif request['type'] == 'lifecycle' and request['event']['type'] == 'session_start':
+    response = {'Err':'fixture start failure'}
+elif request['type'] == 'discover_resources':
+    response = {'Err':'fixture discovery failure'}
+elif request['type'] == 'input':
+    response = {'Ok':{'action':'handled'}}
+else:
+    response = {'Ok':None}
+print(json.dumps({'version':1, 'response':response}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"prompt", "id":"run", "message":"hello"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut failures = Vec::new();
+    let mut responded = false;
+    loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("RPC event timed out: {error}");
+            });
+        if event["type"] == "extension_error" {
+            failures.push(event.clone());
+        }
+        assert_ne!(event["type"], "error", "unexpected generic error: {event}");
+        if event["type"] == "response" && event["id"] == "run" {
+            assert_eq!(event["success"], true);
+            responded = true;
+        }
+        if responded && failures.len() >= 2 {
+            break;
+        }
+    }
+    for (kind, message) in [
+        ("session_start", "fixture start failure"),
+        ("resources_discover", "fixture discovery failure"),
+    ] {
+        let matching: Vec<_> = failures
+            .iter()
+            .filter(|failure| failure["event"] == kind)
+            .collect();
+        assert_eq!(matching.len(), 1, "expected one {kind} error: {failures:?}");
+        let failure = matching[0];
+        assert_eq!(
+            failure["extensionPath"],
+            extension.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(failure["extension"], "failure-fixture");
+        assert!(failure["error"].as_str().unwrap().contains(message));
+        assert_eq!(failure["message"], failure["error"]);
+    }
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn rpc_streaming_shell_operations_deliver_output_and_cancel() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();

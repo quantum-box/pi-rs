@@ -15,6 +15,7 @@ pub struct Runtime {
     pub retry: pi_rs::RetryControl,
     provider: super::image_policy::WorkbenchModel,
     pub registry: Registry,
+    pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
     system_prompt: String,
     pub resources: resources::Resources,
@@ -93,7 +94,14 @@ impl Runtime {
                     &session.extension_states(),
                     args.tool_timeout(),
                     |extension, error| {
-                        eprintln!("Extension {extension} (resources_discover): {error}")
+                        super::observe(
+                            pi_rs::Notification::ExtensionLifecycleError {
+                                extension,
+                                event: "resources_discover",
+                                message: error,
+                            },
+                            args.trace,
+                        )
                     },
                 )
                 .await
@@ -105,7 +113,14 @@ impl Runtime {
                     args.tool_timeout(),
                     &mut |event| super::observe(event, args.trace),
                     |extension, error| {
-                        eprintln!("Extension {extension} (resources_discover): {error}")
+                        super::observe(
+                            pi_rs::Notification::ExtensionLifecycleError {
+                                extension,
+                                event: "resources_discover",
+                                message: error,
+                            },
+                            args.trace,
+                        )
                     },
                 )
                 .await?
@@ -684,6 +699,14 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             extensions.push(connection.clone());
         }
 
+        let extension_sources = extensions
+            .iter()
+            .filter_map(|extension| {
+                extension
+                    .command_source()
+                    .map(|path| (extension.id().to_owned(), path.to_owned()))
+            })
+            .collect();
         let mut registry = Registry::compose(
             extensions,
             &args.disable_extension.iter().cloned().collect(),
@@ -751,6 +774,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             ),
             provider,
             registry,
+            extension_sources,
             shell,
             system_prompt,
             resources: local_resources,
