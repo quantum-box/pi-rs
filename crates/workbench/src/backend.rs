@@ -2116,6 +2116,44 @@ mod share_context_tests {
         drop((first_lease, second_lease));
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replacing_journal_after_invalidation_can_leave_another_identity_clean() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let replacement_path = directory.path().join("replacement.jsonl");
+        let original = Session::open(&path).unwrap();
+        let replacement = Session::open(&replacement_path).unwrap();
+        let replacement_binding = store.binding_for_session(&replacement, &()).unwrap();
+        drop(original);
+        drop(replacement);
+        // The replacement identity has an independently clean historical entry
+        // for this pathname. This setup exposes the remaining race; it is not a
+        // claim that a standalone reader is safe to enable.
+        store
+            .begin(&path, replacement_binding.clone())
+            .unwrap()
+            .publish(replacement_binding.clone(), json!({"stale":true}))
+            .unwrap();
+        let lease = invalidate_existing_share_generation(Some(&store), &path)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&path, directory.path().join("old.jsonl")).unwrap();
+        std::fs::rename(&replacement_path, &path).unwrap();
+        let now = Session::snapshot(&path).unwrap();
+        assert_eq!(
+            store.binding_for_session(&now, &()).unwrap(),
+            replacement_binding
+        );
+        assert_eq!(
+            store.read(&path, &replacement_binding).unwrap(),
+            Some(json!({"stale":true}))
+        );
+        drop(lease);
+    }
+
     #[test]
     fn equal_session_id_and_head_do_not_identify_journal_content() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
