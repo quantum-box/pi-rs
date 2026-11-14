@@ -188,6 +188,8 @@ pub struct Conversation {
     #[serde(default)]
     pub resets: Vec<crate::reset::Reset>,
     #[serde(default)]
+    pending_resets: Vec<crate::reset::Reset>,
+    #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
     #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
@@ -387,6 +389,9 @@ impl Harness {
                             "conversation changed during execution; reopen before retry".into(),
                         ));
                     }
+                    for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
+                        state.pending_resets.push(marker.clone());
+                    }
                     for submission in latest.submissions {
                         if !state.submissions.iter().any(|s| s.id == submission.id) {
                             if let Some(mode) = latest.input_modes.get(&submission.id) {
@@ -423,6 +428,7 @@ impl Harness {
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
+            pending_resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
@@ -478,6 +484,7 @@ impl Harness {
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
+            pending_resets: vec![],
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
@@ -527,27 +534,26 @@ impl Harness {
         self.load(id)?;
         Ok(crate::observer::Observer::new(self.owner.store(), id).read(after, limit)?)
     }
-    /// Reset model context without deleting prior committed snapshots. The
-    /// current implementation accepts resets only while no work is queued.
+    /// Persist a reset; busy conversations place it at the next safe boundary.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
-        let (mut state, version) = self.load(id)?;
-        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
-            || state.active.is_some()
-            || state.submissions.iter().any(|s| s.status == Status::Queued)
-        {
-            return Err(Error::Invalid(
-                "reset requires an idle conversation with no queued input".into(),
-            ));
-        }
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
-        state.messages.clear();
-        if let Some(message) = marker.message() {
-            state.messages.push(message);
+        loop {
+            let (mut state, version) = self.load(id)?;
+            if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+                && state.active.is_none()
+                && !state.submissions.iter().any(|s| s.status == Status::Queued)
+            {
+                place_reset(&mut state, marker.clone());
+                state.phase = Phase::Idle;
+            } else {
+                state.pending_resets.push(marker.clone());
+            }
+            match self.save(&state, Expected::Version(version)) {
+                Ok(()) => return Ok(marker.id),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(e) => return Err(e),
+            }
         }
-        state.resets.push(marker.clone());
-        state.phase = Phase::Idle;
-        self.save(&state, Expected::Version(version))?;
-        Ok(marker.id)
     }
     pub async fn watch_history(
         &self,
@@ -841,6 +847,13 @@ impl Harness {
             let (mut c, version) = self.load(id)?;
             match c.phase.clone() {
                 Phase::Idle => {
+                    if !c.pending_resets.is_empty() {
+                        for marker in std::mem::take(&mut c.pending_resets) {
+                            place_reset(&mut c, marker);
+                        }
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    }
                     let Some(i) = c
                         .submissions
                         .iter()
@@ -1146,7 +1159,51 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Boundary { turns, answer } => {
-                    if let Some(i) = c.submissions.iter().position(|s| {
+                    if !c.pending_resets.is_empty() {
+                        if let Some(answer) = answer {
+                            finish_answer(&mut c, answer);
+                        } else {
+                            finish_failure(&mut c, "reset".into());
+                            c.phase = Phase::Idle;
+                        }
+                        for marker in std::mem::take(&mut c.pending_resets) {
+                            place_reset(&mut c, marker);
+                        }
+                        // Select one steer and one follow-up, in admission order.
+                        let mut steer = false;
+                        let mut follow = false;
+                        for submission in &mut c.submissions {
+                            if submission.status != Status::Queued {
+                                continue;
+                            }
+                            let selected = match c
+                                .input_modes
+                                .get(&submission.id)
+                                .copied()
+                                .unwrap_or(InputMode::FollowUp)
+                            {
+                                InputMode::Steer if !steer => {
+                                    steer = true;
+                                    true
+                                }
+                                InputMode::FollowUp if !follow => {
+                                    follow = true;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if selected {
+                                submission.status = Status::Running;
+                                c.active.get_or_insert(submission.id);
+                                c.messages.push(Message::User {
+                                    content: submission.content.clone(),
+                                });
+                            }
+                        }
+                        if c.active.is_some() {
+                            c.phase = Phase::ModelReady { turns: 0 };
+                        }
+                    } else if let Some(i) = c.submissions.iter().position(|s| {
                         s.status == Status::Queued
                             && c.input_modes.get(&s.id) == Some(&InputMode::Steer)
                     }) {
@@ -1405,6 +1462,13 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::FailedIdle if !c.pending_resets.is_empty() => {
+                    for marker in std::mem::take(&mut c.pending_resets) {
+                        place_reset(&mut c, marker);
+                    }
+                    c.phase = Phase::Idle;
+                    self.save(&c, Expected::Version(version))?;
+                }
                 Phase::Blocked { .. } | Phase::FailedIdle => return Ok(()),
             }
         }
@@ -1532,7 +1596,9 @@ impl Scheduler {
         self.harness.history(id, after, limit)
     }
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
-        self.harness.reset(id, handoff)
+        let marker = self.harness.reset(id, handoff)?;
+        self.schedule(id);
+        Ok(marker)
     }
     pub async fn watch_history(
         &self,
@@ -1689,6 +1755,14 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .as_object_mut()
         .and_then(|v| v.remove("submissions"))
         .ok_or_else(|| Error::Invalid("invalid snapshot".into()))?;
+    let old_resets = old.as_object_mut().and_then(|v| v.remove("pending_resets"));
+    let new_resets = new.as_object_mut().and_then(|v| v.remove("pending_resets"));
+    let resets_unchanged = match (old_resets, new_resets) {
+        (Some(serde_json::Value::Array(old)), Some(serde_json::Value::Array(new))) => {
+            new.starts_with(&old)
+        }
+        _ => false,
+    };
     let old_modes = old.as_object_mut().and_then(|v| v.remove("input_modes"));
     let new_modes = new.as_object_mut().and_then(|v| v.remove("input_modes"));
     let modes_unchanged = match (old_modes, new_modes) {
@@ -1702,7 +1776,19 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
     else {
         return Err(Error::Invalid("invalid submissions".into()));
     };
-    Ok(old == new && modes_unchanged && new_submissions.starts_with(old_submissions))
+    Ok(old == new
+        && modes_unchanged
+        && resets_unchanged
+        && new_submissions.starts_with(old_submissions))
+}
+
+fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
+    c.messages.clear();
+    if let Some(message) = marker.message() {
+        c.messages.push(message);
+    }
+    c.resets.push(marker);
+    c.auto_compaction_attempted = false;
 }
 
 fn append_tool(
@@ -1815,6 +1901,7 @@ mod scheduler_tests {
             submissions: vec![],
             aborted_generations: vec![],
             resets: vec![],
+            pending_resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
             auto_compaction_attempted: false,
