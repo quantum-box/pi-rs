@@ -458,7 +458,7 @@ impl Harness {
         harness.recover()?;
         Ok(harness)
     }
-    fn worker(&self) -> Self {
+    pub(crate) fn worker(&self) -> Self {
         Self {
             owner: self.owner.clone(),
             options: self.options.clone(),
@@ -954,7 +954,12 @@ impl Harness {
         if config.model.is_empty() || config.max_output_tokens == 0 {
             return Err(Error::Invalid("model and output limit required".into()));
         }
-        let state = Conversation {
+        let state = Self::empty_conversation(id, config);
+        self.save(&state, Expected::Missing)?;
+        Ok(id)
+    }
+    pub(crate) fn empty_conversation(id: Uuid, config: Config) -> Conversation {
+        Conversation {
             id,
             config,
             queue_modes: QueueModes::default(),
@@ -976,9 +981,7 @@ impl Harness {
             active: None,
             abort_requested: false,
             phase: Phase::Idle,
-        };
-        self.save(&state, Expected::Missing)?;
-        Ok(id)
+        }
     }
     pub(crate) fn subagent_seed(
         &self,

@@ -56,7 +56,7 @@ pub enum Error {
     Invalid,
 }
 
-fn edge_key(child: Uuid) -> Vec<u8> {
+pub(crate) fn edge_key(child: Uuid) -> Vec<u8> {
     let mut key = PREFIX.to_vec();
     key.extend_from_slice(child.as_bytes());
     key

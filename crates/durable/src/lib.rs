@@ -13,6 +13,7 @@ pub mod fork;
 pub mod model;
 pub mod nested;
 pub mod observer;
+pub mod owned_subagent;
 pub mod ownership_edge;
 pub mod poll;
 pub mod progress;
