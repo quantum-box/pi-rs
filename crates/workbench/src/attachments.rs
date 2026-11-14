@@ -133,6 +133,33 @@ mod tests {
     }
 
     #[test]
+    fn image_extensions_do_not_make_text_or_partial_png_an_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let signature = b"\x89PNG\r\n\x1a\n";
+        for size in 1..signature.len() {
+            let name = format!("partial-{size}.png");
+            let bytes = &signature[..size];
+            std::fs::write(directory.path().join(&name), bytes).unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+        for name in ["note.png", "note.jpg", "note.webp"] {
+            std::fs::write(directory.path().join(name), "ordinary text").unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(text.contains("ordinary text"));
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
     fn malformed_text_still_obeys_aggregate_input_limit() {
         let directory = tempfile::tempdir().unwrap();
         let mut bytes = vec![b'a'; 8 * 1024 * 1024];

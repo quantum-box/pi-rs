@@ -1106,9 +1106,10 @@ The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
 prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
 malformed UTF-8 in text attachments is decoded with replacement characters.
-For CLI attachments, malformed PNG headers and animated PNGs detected within
-the first 4,100 bytes are treated as text, matching Pi's PNG sniffing; other
-format classification continues to use the native reader.
+For CLI attachments, image detection does not infer a format from the file
+extension. Malformed PNG headers and animated PNGs detected within the first
+4,100 bytes are treated as text, matching Pi's PNG sniffing; other format
+classification continues to use the native reader.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.

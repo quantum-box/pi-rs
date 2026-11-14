@@ -457,6 +457,8 @@ impl CodingTools {
         let path = tool.path(name)?;
         let image = if lossy && png_attachment_is_text(&path)? {
             Ok(None)
+        } else if lossy {
+            tool.read_image_inner(&path, false)
         } else {
             tool.read_image(&path)
         };
@@ -2289,10 +2291,19 @@ impl CodingTool {
     }
 
     fn read_image(&self, path: &Path) -> Result<Option<Value>> {
+        self.read_image_inner(path, true)
+    }
+
+    fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+        let reader = if infer_extension {
+            image::ImageReader::open(path)?
+        } else {
+            image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
+        .with_guessed_format()?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
