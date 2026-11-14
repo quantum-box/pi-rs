@@ -264,6 +264,13 @@ pub struct TreeNavigationOptions<'a> {
     pub label: Option<&'a str>,
 }
 
+pub(crate) struct TreeModelResolution {
+    pub provider: String,
+    pub model: String,
+    pub client: Arc<dyn Model>,
+    pub fallback: bool,
+}
+
 impl Agent<'_> {
     fn compaction_tokens(&self, session: &Session) -> CompactionTokens {
         self.limits
@@ -2862,6 +2869,19 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.navigate_tree_with_resolution(session, selected, options, cancel, observer, None)
+            .await
+    }
+
+    pub(crate) async fn navigate_tree_with_resolution(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: TreeNavigationOptions<'_>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        resolution: Option<TreeModelResolution>,
+    ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -2964,6 +2984,7 @@ impl Agent<'_> {
                 }
                 from_extension = Some(true);
                 Some(Event::BranchSummary {
+                    fallback_model: None,
                     summary: summary.summary,
                     extension_summary: Some(crate::ExtensionTreeSummary {
                         details: summary.details,
@@ -3005,11 +3026,36 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let summary_id = summary.as_ref().map(|_| session.records().len() as u64 + 1);
-        commit(
-            session,
-            summary.unwrap_or(Event::Checkout { target }),
-            observer,
-        )?;
+        let mut transition = summary.unwrap_or(Event::Checkout { target });
+        if let Some(resolved) = resolution.as_ref().filter(|value| value.fallback) {
+            match &mut transition {
+                Event::BranchSummary { fallback_model, .. } => {
+                    *fallback_model = Some(crate::BranchFallbackModel {
+                        provider: resolved.provider.clone(),
+                        model: resolved.model.clone(),
+                    });
+                }
+                _ => {
+                    transition = Event::BranchModelSelected {
+                        target,
+                        provider: resolved.provider.clone(),
+                        model: resolved.model.clone(),
+                    }
+                }
+            }
+        }
+        if let Some(resolved) = resolution {
+            let record = self.registry.commit_resolved_session_model(
+                session.session_id(),
+                &resolved.provider,
+                &resolved.model,
+                resolved.client,
+                || session.append(transition).cloned(),
+            )?;
+            observer(Notification::Committed(&record));
+        } else {
+            commit(session, transition, observer)?;
+        }
         if let Some(label) = decision
             .label
             .as_deref()
@@ -3182,6 +3228,7 @@ impl Agent<'_> {
             }
         }
         Ok(Some(Event::BranchSummary {
+            fallback_model: None,
             summary,
             extension_summary: None,
             from: Some(from),

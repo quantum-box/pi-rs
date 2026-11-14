@@ -1099,6 +1099,8 @@ pub enum HistoricalModelResolution {
     /// Use a client for the exact requested provider and model.
     Historical(Arc<dyn Model>),
     /// Use a different host-selected provider and model.
+    /// If that identity is already registered, return the same `Arc` to avoid
+    /// replacing a potentially different endpoint or credential binding.
     Fallback {
         provider: String,
         model: String,
@@ -1118,7 +1120,7 @@ pub struct HistoricalModelFallback {
 }
 
 /// Resolves from host-owned catalog, endpoint and credential policy. The
-/// callback runs synchronously during session construction and must not block.
+/// callback runs synchronously during construction and branch transitions and must not block.
 pub trait HistoricalModelResolver: Send + Sync {
     fn resolve(&self, provider: &str, model: &str) -> Result<HistoricalModelResolution>;
 }
@@ -1229,7 +1231,7 @@ impl SessionBuilder {
     }
 
     /// Opt in to host-controlled restoration or fallback for unavailable,
-    /// provider-qualified historical models during session construction.
+    /// provider-qualified historical models during construction and branch transitions.
     pub fn historical_model_resolver(mut self, resolver: Arc<dyn HistoricalModelResolver>) -> Self {
         self.historical_model_resolver = Some(resolver);
         self
@@ -1401,6 +1403,7 @@ impl SessionBuilder {
             pending_start,
             session_file: None,
             model_fallback,
+            historical_model_resolver: self.historical_model_resolver,
         })
     }
 }
@@ -1422,23 +1425,72 @@ pub struct AgentSession {
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
     model_fallback: Option<HistoricalModelFallback>,
+    historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
+}
+
+#[derive(Clone)]
+enum BranchResolution {
+    Registered,
+    Historical {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    Fallback {
+        requested_provider: String,
+        requested_model: String,
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
 }
 impl AgentSession {
-    /// The fallback chosen while opening this session, if any.
+    /// The fallback chosen for the most recent construction or branch transition, if any.
     pub fn model_fallback(&self) -> Option<&HistoricalModelFallback> {
         self.model_fallback.as_ref()
     }
-    fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
-        if let Some(target) = journal.tree_navigation_target(selected)?
-            && let Some((provider, name, _)) = journal.model_identity_at(target)
-            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
-        {
-            return Err(Error::Config(format!(
-                "session branch requires registered model {name}"
-            )));
+    fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
+        let Some((provider, name, _)) = journal.model_identity_at(target) else {
+            return Ok(BranchResolution::Registered);
+        };
+        if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some() {
+            return Ok(BranchResolution::Registered);
         }
-        Ok(())
+        if let (Some(provider), Some(resolver)) = (provider, &self.historical_model_resolver) {
+            return match resolver.resolve(&provider, &name)? {
+                HistoricalModelResolution::Historical(client) => Ok(BranchResolution::Historical {
+                    provider,
+                    model: name,
+                    client,
+                }),
+                HistoricalModelResolution::Fallback {
+                    provider: replacement,
+                    model,
+                    client,
+                } => {
+                    if replacement.trim().is_empty() || model.trim().is_empty() {
+                        return Err(Error::Config(
+                            "fallback provider or model name is empty".into(),
+                        ));
+                    }
+                    Ok(BranchResolution::Fallback {
+                        requested_provider: provider,
+                        requested_model: name,
+                        provider: replacement,
+                        model,
+                        client,
+                    })
+                }
+                HistoricalModelResolution::Unavailable => Err(Error::Config(format!(
+                    "session branch requires registered model {name}"
+                ))),
+            };
+        }
+        Err(Error::Config(format!(
+            "session branch requires registered model {name}"
+        )))
     }
+
     fn restore_branch_model(&mut self, provider: Option<&str>, name: String) -> Result<()> {
         let model =
             branch_client(&self.registry, self.session_id, provider, &name).ok_or_else(|| {
@@ -1800,22 +1852,63 @@ impl AgentSession {
     /// Check out a branch after validating that its selected model is registered.
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
-        {
+        let resolution = {
             let journal = self.journal()?;
             journal.validate_checkout(record)?;
-            if let Some((provider, name, _)) = journal.model_identity_at(record)
-                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
-                    .is_none()
-            {
-                return Err(Error::Config(format!(
-                    "session branch requires registered model {name}"
-                )));
+            self.resolve_branch_model(&journal, record)?
+        };
+        {
+            let mut journal = self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?;
+            match &resolution {
+                BranchResolution::Fallback {
+                    provider,
+                    model,
+                    client,
+                    ..
+                } => self.registry.commit_resolved_session_model(
+                    self.session_id,
+                    provider,
+                    model,
+                    client.clone(),
+                    || journal.checkout_provider_model_atomic(record, provider, model),
+                )?,
+                BranchResolution::Historical {
+                    provider,
+                    model,
+                    client,
+                } => self.registry.commit_resolved_session_model(
+                    self.session_id,
+                    provider,
+                    model,
+                    client.clone(),
+                    || journal.checkout(record),
+                )?,
+                BranchResolution::Registered => journal.checkout(record)?,
             }
         }
-        self.session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .checkout(record)?;
+        match resolution {
+            BranchResolution::Historical { .. } => {
+                self.model_fallback = None;
+            }
+            BranchResolution::Fallback {
+                requested_provider,
+                requested_model,
+                provider,
+                model,
+                client: _,
+            } => {
+                self.model_fallback = Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                });
+            }
+            BranchResolution::Registered => self.model_fallback = None,
+        }
         self.refresh_input_hooks()?;
         self.emit_last()?;
         let selection = {
@@ -1836,14 +1929,25 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.ensure_open()?;
-        {
+        let (initial_target, mut resolution) = {
             let journal = self.session.lock().await;
-            self.validate_tree_model(&journal, selected)?;
-        }
+            let target = journal.tree_navigation_target(selected)?;
+            let resolution = match target {
+                Some(target) => self.resolve_branch_model(&journal, target)?,
+                None => BranchResolution::Registered,
+            };
+            (target, resolution)
+        };
         self.start().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
-        self.validate_tree_model(&journal, selected)?;
+        let target = journal.tree_navigation_target(selected)?;
+        if target != initial_target {
+            resolution = match target {
+                Some(target) => self.resolve_branch_model(&journal, target)?,
+                None => BranchResolution::Registered,
+            };
+        }
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -1872,23 +1976,76 @@ impl AgentSession {
             control.observe(&event);
             emit(&events, &event);
         };
+        let tree_resolution = match &resolution {
+            BranchResolution::Registered => None,
+            BranchResolution::Historical {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: false,
+            }),
+            BranchResolution::Fallback {
+                provider,
+                model,
+                client,
+                ..
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: true,
+            }),
+        };
         let mut result = agent
-            .navigate_tree_with_options(
+            .navigate_tree_with_resolution(
                 &mut journal,
                 selected,
                 options,
                 &active.token,
                 &mut observer,
+                tree_resolution,
             )
             .await;
-        if result.is_ok() {
+        if result.is_ok()
+            || journal.records()[first_record..].iter().any(|record| {
+                matches!(
+                    &record.event,
+                    crate::Event::BranchModelSelected { .. }
+                        | crate::Event::BranchSummary {
+                            target: Some(_),
+                            ..
+                        }
+                        | crate::Event::Checkout { .. }
+                )
+            })
+        {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
             if let Some((provider, model, _)) = journal.model_identity_at(journal.head()) {
-                result = self
-                    .restore_branch_model(provider.as_deref(), model)
-                    .map(|_| ());
+                let restored = self.restore_branch_model(provider.as_deref(), model);
+                if result.is_ok() {
+                    result = restored;
+                }
             }
+            self.model_fallback = match resolution {
+                BranchResolution::Fallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                    ..
+                } => Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                }),
+                _ => None,
+            };
         }
         let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
         let result = result.and(final_inputs);
@@ -2191,7 +2348,18 @@ impl AgentSession {
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
         let session = Session::from_records(self.journal()?.fork_records(record)?)?;
-        self.fork_session(session)
+        let resolution = self.resolve_branch_model(&session, session.head())?;
+        self.fork_snapshot(session, resolution)
+    }
+
+    fn fork_snapshot(&self, mut session: Session, resolution: BranchResolution) -> Result<Self> {
+        if let BranchResolution::Fallback {
+            provider, model, ..
+        } = &resolution
+        {
+            session.select_provider_model_atomic(provider, model)?;
+        }
+        self.fork_session(session, resolution)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
@@ -2199,17 +2367,37 @@ impl AgentSession {
         let journal = self.journal()?;
         let records = journal.fork_records(record)?;
         let snapshot = Session::from_records(records)?;
-        if let Some((provider, name, _)) = snapshot.model_identity_at(snapshot.head())
-            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
-        {
-            return Err(Error::Config(format!(
-                "session branch requires registered model {name}"
-            )));
-        }
-        let forked = journal.fork_to(record, &destination)?;
+        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
-        let mut fork = self.fork_session(forked)?;
-        fork.session_file = Some(destination);
+        self.fork_snapshot_to(snapshot, resolution, &destination)
+    }
+
+    fn fork_snapshot_to(
+        &self,
+        snapshot: Session,
+        resolution: BranchResolution,
+        destination: &Path,
+    ) -> Result<Self> {
+        // Resolve, register and initialize the complete fork before publishing
+        // its journal. A failed resolver or client conflict leaves no file.
+        let mut fork = self.fork_snapshot(snapshot, resolution)?;
+        {
+            let mut journal = fork.journal()?;
+            journal.export_jsonl(destination)?;
+            let mut persisted = Session::open(destination)?;
+            if persisted.head() != journal.head()
+                || serde_json::to_vec(persisted.records())?
+                    != serde_json::to_vec(journal.records())?
+            {
+                return Err(Error::Session(
+                    "published fork changed before opening".into(),
+                ));
+            }
+            persisted.set_auto_compaction_control(journal.auto_compaction_control());
+            persisted.set_retry_control(journal.retry_control());
+            *journal = persisted;
+        }
+        fork.session_file = Some(destination.to_owned());
         Ok(fork)
     }
     /// Fork before or at an entry after consulting the source session's extensions.
@@ -2230,6 +2418,8 @@ impl AgentSession {
             crate::ForkPosition::Before => record.parent.unwrap_or(1),
             crate::ForkPosition::At => record.id,
         };
+        let snapshot = Session::from_records(journal.fork_records(target)?)?;
+        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
@@ -2252,9 +2442,10 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
+        let snapshot = Session::from_records(self.journal()?.fork_records(target)?)?;
         match destination {
-            Some(path) => self.fork_to(target, path),
-            None => self.fork_at(target),
+            Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
+            None => self.fork_snapshot(snapshot, resolution),
         }
     }
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
@@ -2264,7 +2455,7 @@ impl AgentSession {
             .map_err(|_| Error::Session("session journal is in use".into()))?
             .export_jsonl(destination)
     }
-    fn fork_session(&self, session: Session) -> Result<Self> {
+    fn fork_session(&self, session: Session, resolution: BranchResolution) -> Result<Self> {
         session.retry_control().configure(
             self.session
                 .try_lock()
@@ -2274,10 +2465,16 @@ impl AgentSession {
         );
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
-            let model = branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
-                .ok_or_else(|| {
-                    Error::Config(format!("session branch requires registered model {name}"))
-                })?;
+            let model = match &resolution {
+                BranchResolution::Historical { client, .. }
+                | BranchResolution::Fallback { client, .. } => Some(client.clone()),
+                BranchResolution::Registered => {
+                    branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                }
+            }
+            .ok_or_else(|| {
+                Error::Config(format!("session branch requires registered model {name}"))
+            })?;
             (provider, name, model)
         } else {
             (None, self.model_name.clone(), self.model.clone())
@@ -2311,6 +2508,42 @@ impl AgentSession {
                 .session_id(),
         );
         fork.registry = self.registry.clone();
+        match resolution {
+            BranchResolution::Historical {
+                provider,
+                model,
+                client,
+            } => fork.registry.commit_resolved_session_model(
+                fork.session_id,
+                &provider,
+                &model,
+                client,
+                || Ok(()),
+            )?,
+            BranchResolution::Fallback {
+                requested_provider,
+                requested_model,
+                provider,
+                model,
+                client,
+            } => {
+                fork.registry.commit_resolved_session_model(
+                    fork.session_id,
+                    &provider,
+                    &model,
+                    client,
+                    || Ok(()),
+                )?;
+                fork.model_fallback = Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                });
+            }
+            BranchResolution::Registered => {}
+        }
+        fork.historical_model_resolver = self.historical_model_resolver.clone();
         fork.refresh_run_config();
         *fork.pending_start.lock().expect("session startup") =
             Some((crate::SessionStartReason::Fork, self.session_file.clone()));
@@ -4377,6 +4610,730 @@ mod tests {
         assert_eq!(session.journal().unwrap().head(), head);
         assert!(session.model_fallback().is_none());
         assert_eq!(session.prompt("test").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_resolver_restores_checkout_navigation_and_forks() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let current = journal.head();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("historical"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        let mut fork = session.fork_at(historical).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "historical");
+        fork.close().await.unwrap();
+        session.checkout(historical).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "historical");
+        session
+            .navigate_tree(current, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("current").await.unwrap(), "current");
+        session
+            .navigate_tree(historical, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_checkout_can_be_forked_again() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session.checkout(target).unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.prompt("re-fork").await.unwrap(), "replacement");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_resolver_direct_tree_navigation_uses_exact_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let resolver = Arc::new(
+            move |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("historical"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(historical, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session
+                .journal()
+                .unwrap()
+                .model_selection()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(session.prompt("tree").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn historical_fallback_checkout_is_one_atomic_write() {
+        for fail_on in [1, 2] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("historical"), "shared", Some("high"))
+                .unwrap();
+            let historical = original.head();
+            original
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let current = original.head();
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            });
+            let mut session =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                    .provider("current")
+                    .unwrap()
+                    .historical_model_resolver(resolver)
+                    .build(journal)
+                    .unwrap();
+            let result = session.checkout(historical);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), current);
+                assert_eq!(restored.model_provider(), Some("current"));
+            } else {
+                result.unwrap();
+                assert_eq!(restored.model_provider(), Some("replacement"));
+                assert_eq!(restored.model_selection().unwrap().1, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_summary_and_persistent_fork_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            },
+        );
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver.clone())
+            .extension(Arc::new(TreePreflightHook(hooks.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session.fork_to(historical, &fork_path).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "replacement");
+        fork.close().await.unwrap();
+        drop(fork);
+        let result = session
+            .navigate_tree(
+                historical,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: None,
+                        reserve_tokens: 1024,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.summary_entry.unwrap().event,
+            crate::Event::BranchSummary {
+                fallback_model: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(session.prompt("tree").await.unwrap(), "replacement");
+        assert_eq!(&*hooks.lock().unwrap(), &["before", "after"]);
+        session.close().await.unwrap();
+        drop(session);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .provider_branch_model(
+                "replacement",
+                "shared",
+                Arc::new(ProviderBranchModel("replacement")),
+            )
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("reopened").await.unwrap(), "replacement");
+        reopened.close().await.unwrap();
+        let mut reopened_fork =
+            SessionBuilder::new(Arc::new(ProviderBranchModel("replacement")), "shared")
+                .provider("replacement")
+                .unwrap()
+                .open(&fork_path)
+                .unwrap();
+        assert_eq!(
+            reopened_fork.prompt("reopened fork").await.unwrap(),
+            "replacement"
+        );
+        reopened_fork.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_failed_transition_never_publishes_client() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let historical = original.head();
+        original
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = original.head();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records: records.clone(),
+            writes,
+            fail_on: 1,
+        })
+        .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(
+            session
+                .navigate_tree(historical, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            branch_client(
+                &session.registry,
+                session.session_id,
+                Some("replacement"),
+                "shared"
+            )
+            .is_none()
+        );
+        assert!(session.model_fallback().is_none());
+        let reopened = Session::from_records(records.lock().unwrap().clone()).unwrap();
+        assert_eq!(reopened.head(), head);
+        assert_eq!(reopened.model_provider(), Some("current"));
+    }
+
+    #[test]
+    fn historical_fallback_does_not_replace_concurrent_registration() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let session_id = journal.session_id();
+        let registry = Registry::default();
+        let concurrent = Arc::new(ProviderBranchModel("concurrent"));
+        let captured_registry = registry.clone();
+        let captured = concurrent.clone();
+        let resolver = Arc::new(
+            move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                captured_registry.register_session_provider_model(
+                    session_id,
+                    "replacement",
+                    "shared",
+                    captured.clone(),
+                )?;
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("resolver")),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(target).is_err());
+        assert_eq!(session.journal().unwrap().head(), head);
+        let stored = branch_client(&registry, session_id, Some("replacement"), "shared").unwrap();
+        let concurrent: Arc<dyn Model> = concurrent;
+        assert!(Arc::ptr_eq(&stored, &concurrent));
+    }
+
+    #[test]
+    fn historical_fallback_store_can_reenter_registry_without_deadlock() {
+        struct ReentrantStore {
+            records: Vec<crate::Record>,
+            registry: Registry,
+            session_id: Uuid,
+        }
+        impl crate::SessionStore for ReentrantStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                Ok(self.records.clone())
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                assert!(
+                    self.registry
+                        .register_session_provider_model(
+                            self.session_id,
+                            "replacement",
+                            "shared",
+                            Arc::new(ProviderBranchModel("wrong"))
+                        )
+                        .is_err()
+                );
+                self.registry.register_session_provider_model(
+                    self.session_id,
+                    "other",
+                    "shared",
+                    Arc::new(ProviderBranchModel("other")),
+                )?;
+                self.records.push(record.clone());
+                Ok(())
+            }
+        }
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = original.head();
+        original
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let registry = Registry::default();
+        let journal = Session::with_store(ReentrantStore {
+            records: original.records().to_vec(),
+            registry: registry.clone(),
+            session_id: original.session_id(),
+        })
+        .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry)
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session.checkout(target).unwrap();
+        assert_eq!(
+            session.journal().unwrap().model_provider(),
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_revocation_during_write_fails_closed() {
+        struct RevokingStore {
+            records: Vec<crate::Record>,
+            registry: Registry,
+            session_id: Uuid,
+        }
+        impl crate::SessionStore for RevokingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                Ok(self.records.clone())
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                self.registry.remove_session_branch_models(self.session_id);
+                self.records.push(record.clone());
+                Ok(())
+            }
+        }
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = original.head();
+        original
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let registry = Registry::default();
+        let journal = Session::with_store(RevokingStore {
+            records: original.records().to_vec(),
+            registry: registry.clone(),
+            session_id: original.session_id(),
+        })
+        .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry)
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(target).is_err());
+        assert_eq!(
+            session.journal().unwrap().model_provider(),
+            Some("replacement")
+        );
+        assert!(
+            branch_client(
+                &session.registry,
+                session.session_id,
+                Some("replacement"),
+                "shared"
+            )
+            .is_none()
+        );
+        assert!(session.prompt("must not dispatch").await.is_err());
+    }
+
+    #[test]
+    fn historical_fallback_fork_conflict_does_not_publish_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("resolver")),
+            })
+        });
+        let session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .provider_branch_model(
+                "replacement",
+                "shared",
+                Arc::new(ProviderBranchModel("registered")),
+            )
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.fork_to(target, &path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn historical_fallback_partial_record_recovers_previous_branch() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let record = crate::Record {
+            version: journal.records()[0].version,
+            id: journal.records().len() as u64 + 1,
+            parent: Some(target),
+            run_id: None,
+            timestamp: None,
+            event: crate::Event::BranchModelSelected {
+                target,
+                provider: "replacement".into(),
+                model: "shared".into(),
+            },
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        drop(journal);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes[..bytes.len() / 2]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.head(), head);
+        assert_eq!(reopened.model_provider(), Some("current"));
+        drop(reopened);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.model_provider(), Some("replacement"));
+        assert_eq!(reopened.records().last().unwrap().parent, Some(target));
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_fork_preflights_before_hooks_and_publication() {
+        struct CountingForkHook(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Extension for CountingForkHook {
+            fn id(&self) -> &str {
+                "count-fork"
+            }
+            fn handles_session_transitions(&self) -> bool {
+                true
+            }
+            async fn before_session_transition(
+                &self,
+                _: &crate::BeforeSessionTransition,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<bool> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Unavailable)
+        });
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(CountingForkHook(hooks.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(
+            session
+                .fork_with_hooks(target, crate::ForkPosition::At, Some(&path))
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        assert_eq!(hooks.load(Ordering::SeqCst), 0);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_cancelled_tree_does_not_publish_client() {
+        struct CancelTree;
+        #[async_trait::async_trait]
+        impl Extension for CancelTree {
+            fn id(&self) -> &str {
+                "cancel-tree"
+            }
+            fn handles_tree_navigation(&self) -> bool {
+                true
+            }
+            async fn before_tree(
+                &self,
+                _: &crate::TreePreparation,
+                _: Option<&crate::ExtensionState>,
+                _: &CancellationToken,
+            ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+                Ok(Some(crate::TreeDecision {
+                    cancel: true,
+                    ..Default::default()
+                }))
+            }
+        }
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(CancelTree))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(matches!(
+            session
+                .navigate_tree(historical, crate::TreeNavigationOptions::default())
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(session.journal().unwrap().head(), head);
+        assert!(
+            branch_client(
+                &session.registry,
+                session.session_id,
+                Some("replacement"),
+                "shared"
+            )
+            .is_none()
+        );
+        assert!(session.model_fallback().is_none());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_hook_trigger_uses_replacement_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(TreeLifecycleMessage))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(target, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::Assistant { content, .. } if content == "replacement")));
         session.close().await.unwrap();
     }
 

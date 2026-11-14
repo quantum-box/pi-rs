@@ -446,6 +446,30 @@ impl Cursor {
                 }
                 None
             }
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => {
+                let model_id = format!("{}-model", record.id);
+                entries.push(with_identity(
+                    json!({"type":"model_change","provider":provider,"modelId":model}),
+                    &model_id,
+                    wire_id(parent.visible),
+                    record,
+                ));
+                entries.push(with_identity(
+                    json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                    &record.id.to_string(),
+                    Some(model_id),
+                    record,
+                ));
+                position.visible = Some(record.id);
+                position.model = Some(record.id);
+                position.response_model = None;
+                position.explicit_model_seen = true;
+                position.imported = None;
+                self.positions.push(position);
+                return entries;
+            }
             Event::ModelSelected {
                 model,
                 provider,
@@ -468,17 +492,23 @@ impl Cursor {
                 }
                 position.response_model = None;
                 position.explicit_model_seen = true;
-                let previous = parent.model.and_then(|id| {
-                    let Event::ModelSelected {
-                        model,
-                        provider,
-                        thinking,
-                    } = &records[id as usize - 1].event
-                    else {
-                        return None;
-                    };
-                    Some(selection(model, provider.as_deref(), thinking.as_deref()))
-                });
+                let previous = parent
+                    .model
+                    .and_then(|id| match &records[id as usize - 1].event {
+                        Event::ModelSelected {
+                            model,
+                            provider,
+                            thinking,
+                        } => Some(selection(model, provider.as_deref(), thinking.as_deref())),
+                        Event::BranchModelSelected {
+                            model, provider, ..
+                        } => Some(selection(model, Some(provider), None)),
+                        Event::BranchSummary {
+                            fallback_model: Some(model),
+                            ..
+                        } => Some(selection(&model.model, Some(&model.provider), None)),
+                        _ => None,
+                    });
                 // A response may have been routed by a virtual selection. An
                 // explicit native selection must override that selection even
                 // when it names the same physical model as the response.
@@ -517,12 +547,24 @@ impl Cursor {
                 }
             }
             Event::Label { target, label } => {
-                let target = self
-                    .positions
-                    .get(*target as usize)
-                    .and_then(|target| target.visible);
+                let target = if matches!(
+                    records
+                        .get(target.saturating_sub(1) as usize)
+                        .map(|record| &record.event),
+                    Some(Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    })
+                ) {
+                    Some(format!("{target}-summary"))
+                } else {
+                    self.positions
+                        .get(*target as usize)
+                        .and_then(|target| target.visible)
+                        .map(|id| id.to_string())
+                };
                 target.map(|target| {
-                    let mut entry = json!({"type":"label","targetId":target.to_string()});
+                    let mut entry = json!({"type":"label","targetId":target});
                     if let Some(label) = label {
                         entry["label"] = json!(label);
                     }
@@ -560,6 +602,7 @@ impl Cursor {
                 extension_summary,
                 read_files,
                 modified_files,
+                fallback_model,
                 ..
             } => {
                 let from = from.and_then(|id| self.positions.get(id as usize)?.visible);
@@ -579,6 +622,30 @@ impl Cursor {
                     }
                 }
                 add_summary_usage(&mut entry, records, record);
+                if let Some(model) = fallback_model {
+                    let summary_id = format!("{}-summary", record.id);
+                    let model_id = format!("{}-model", record.id);
+                    entries.push(with_identity(
+                        entry,
+                        &summary_id,
+                        wire_id(parent.visible),
+                        record,
+                    ));
+                    entries.push(with_identity(json!({"type":"model_change","provider":model.provider,"modelId":model.model}), &model_id, Some(summary_id), record));
+                    entries.push(with_identity(
+                        json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                        &record.id.to_string(),
+                        Some(model_id),
+                        record,
+                    ));
+                    position.visible = Some(record.id);
+                    position.model = Some(record.id);
+                    position.response_model = None;
+                    position.explicit_model_seen = true;
+                    position.imported = None;
+                    self.positions.push(position);
+                    return entries;
+                }
                 Some(entry)
             }
             Event::ExtensionStates { states } => Some(json!({
@@ -752,6 +819,84 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_fallback_projects_selection_and_summary() {
+        use super::*;
+        for summary in [false, true] {
+            let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            session
+                .select_provider_model(Some("old"), "shared", Some("high"))
+                .unwrap();
+            let mut records = session.records().to_vec();
+            let version = records[0].version;
+            let event = if summary {
+                Event::BranchSummary {
+                    summary: "summary".into(),
+                    fallback_model: Some(pi_rs::BranchFallbackModel {
+                        provider: "new".into(),
+                        model: "shared".into(),
+                    }),
+                    extension_summary: None,
+                    from: Some(2),
+                    target: Some(2),
+                    usage: None,
+                    usage_metadata: None,
+                    read_files: vec![],
+                    modified_files: vec![],
+                }
+            } else {
+                Event::BranchModelSelected {
+                    target: 2,
+                    provider: "new".into(),
+                    model: "shared".into(),
+                }
+            };
+            records.push(Record {
+                version,
+                id: 3,
+                parent: Some(2),
+                run_id: None,
+                timestamp: None,
+                event,
+            });
+            let restored = Session::from_records(records).unwrap();
+            assert_eq!(
+                super::super::session_import::branch_selection(&restored, |_, _| None),
+                super::super::session_import::BranchSelection::Selected {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                    thinking: None
+                }
+            );
+            let entries = Entries::new(&restored);
+            let last = &entries.values[entries.values.len() - 1];
+            let model = &entries.values[entries.values.len() - 2];
+            assert_eq!(model["type"], "model_change");
+            assert_eq!(model["provider"], "new");
+            assert_eq!(last["type"], "thinking_level_change");
+            assert_eq!(last["thinkingLevel"], "off");
+            assert_eq!(last["parentId"], model["id"]);
+            if summary {
+                let branch = &entries.values[entries.values.len() - 3];
+                assert_eq!(branch["type"], "branch_summary");
+                assert_eq!(model["parentId"], branch["id"]);
+                let mut labeled = restored.records().to_vec();
+                labeled.push(Record {
+                    version,
+                    id: 4,
+                    parent: Some(3),
+                    run_id: None,
+                    timestamp: None,
+                    event: Event::Label {
+                        target: 3,
+                        label: Some("saved".into()),
+                    },
+                });
+                let labeled = Entries::new(&Session::from_records(labeled).unwrap());
+                assert_eq!(labeled.values.last().unwrap()["targetId"], "3-summary");
+            }
+        }
+    }
     #[test]
     fn share_context_is_trailing_bounded_and_not_journaled() {
         let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();

@@ -742,10 +742,23 @@ The durable selection can then exist without a client and requires a new
 authorized registration before dispatch. The SDK
 cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
-existing exact registrations take precedence. This resolver runs on session
-construction, after recovering interrupted handoffs, not branch navigation or
-fork. Fallback commits a single native selection record even after an imported
-Pi source, using a distinct timestamp so older projections retain the change.
+existing exact registrations take precedence. The resolver runs on session
+construction and before checkout, tree navigation and forks; forks retain the
+resolver for later navigation. It resolves before transition hooks and file
+publication. Fallback checkout and tree navigation persist the destination and
+replacement selection in one record, including for a branch summary. The
+fallback clears thinking and a competing registration cannot be overwritten.
+If the chosen fallback identity already has a client, the resolver must return
+that same `Arc`; a different client for the same identity is rejected before the
+transition commits.
+If the host revokes session clients during the durable write, the selection may
+already be committed but no resolved client is installed; the operation fails
+closed until the host registers an authorized client.
+Persistent forks initialize and validate the fork before publishing its file.
+Construction fallback commits a single native selection record even after an
+imported Pi source, using a distinct timestamp so older projections retain the
+change. Older journals remain readable; journals containing the new transition
+records require a version that understands them.
 Hosts can also explicitly call
 `set_model` or `set_model_with_hooks` to select another client. The hook-aware form installs the replacement after
 recovery and before startup hooks and any turns they trigger.

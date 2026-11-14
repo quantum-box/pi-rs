@@ -227,6 +227,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Atomically switch branches and select a host-resolved fallback model.
+    BranchModelSelected {
+        target: u64,
+        provider: String,
+        model: String,
+    },
     HostBound {
         scope_digest: String,
     },
@@ -360,6 +366,8 @@ pub enum Event {
     BranchSummary {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_model: Option<BranchFallbackModel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         extension_summary: Option<crate::ExtensionTreeSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<u64>,
@@ -377,6 +385,12 @@ pub enum Event {
     ExtensionStates {
         states: ExtensionStates,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BranchFallbackModel {
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Default)]
@@ -863,6 +877,11 @@ impl Session {
                         | Event::Compacted { .. }
                         | Event::SystemCheckpoint { .. }
                         | Event::ModelSelected { .. }
+                        | Event::BranchModelSelected { .. }
+                        | Event::BranchSummary {
+                            fallback_model: Some(_),
+                            ..
+                        }
                 )
                 .then_some(record.id)
             })
@@ -1024,6 +1043,17 @@ impl Session {
                     thinking,
                     provider,
                 } => Some((provider.clone(), model.clone(), thinking.clone())),
+                Event::BranchModelSelected {
+                    provider, model, ..
+                } => Some((Some(provider.clone()), model.clone(), None)),
+                Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => Some((
+                    Some(selection.provider.clone()),
+                    selection.model.clone(),
+                    None,
+                )),
                 _ => None,
             })
             .or_else(|| {
@@ -1040,6 +1070,11 @@ impl Session {
             .rev()
             .find_map(|record| match &record.event {
                 Event::ModelSelected { provider, .. } => Some(provider.as_deref()),
+                Event::BranchModelSelected { provider, .. } => Some(Some(provider.as_str())),
+                Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => Some(Some(selection.provider.as_str())),
                 _ => None,
             })
             .flatten()
@@ -1101,12 +1136,45 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn checkout_provider_model_atomic(
+        &mut self,
+        target: u64,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.validate_checkout(target)?;
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(Error::Config(
+                "fallback provider or model name is empty".into(),
+            ));
+        }
+        self.append_inner(
+            Event::BranchModelSelected {
+                target,
+                provider: provider.into(),
+                model: model.into(),
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
     // Older journals may contain only a thinking marker and its synthetic
     // ModelSelected record. An explicit model choice must establish a model.
     fn has_only_thinking_selection(&self) -> bool {
         let branch = self.branch();
         let mut saw_thinking = false;
         for (index, record) in branch.iter().enumerate().rev() {
+            if matches!(
+                record.event,
+                Event::BranchModelSelected { .. }
+                    | Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+            ) {
+                return false;
+            }
             if matches!(record.event, Event::ModelSelected { .. }) {
                 let thinking_only = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
                     matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
@@ -1158,6 +1226,7 @@ impl Session {
                 || (entry["type"] == "message" && entry["message"]["role"] == "assistant"),
             Event::ModelSelected { .. } => !index.checked_sub(1).and_then(|i| branch.get(i))
                 .is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")),
+            Event::BranchModelSelected { .. } | Event::BranchSummary { fallback_model: Some(_), .. } => true,
             Event::Assistant { request_id: Some(_), .. } => true,
             _ => false,
         })
@@ -1194,6 +1263,11 @@ impl Session {
         let branch = self.branch();
         for (index, record) in branch.iter().enumerate().rev() {
             match &record.event {
+                Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                } => return false,
                 Event::SourceEntry { format, entry } if format == "pi" => {
                     if entry["type"] == "model_change" {
                         return false;
@@ -1816,6 +1890,11 @@ impl Session {
                         .get(return_to)
                         .ok_or_else(|| Error::Session("missing tree handoff branch".into()))?;
                 }
+                Event::BranchModelSelected { target, .. } => {
+                    *target = *ids
+                        .get(target)
+                        .ok_or_else(|| Error::Session("missing branch model target".into()))?;
+                }
                 Event::TurnFinished { assistant_record }
                 | Event::TurnEndCallbacksCompleted { assistant_record }
                 | Event::TurnEndBoundaryApplied { assistant_record } => {
@@ -2019,6 +2098,7 @@ impl Session {
             _ => id,
         };
         let parent = match &event {
+            Event::BranchModelSelected { target, .. } => Some(*target),
             Event::BranchSummary {
                 target: Some(target),
                 ..
@@ -2185,9 +2265,30 @@ fn validated_head(records: &[Record]) -> Result<u64> {
                 && !matches!(records[target as usize - 1].event, Event::Checkout { .. })
         };
         let expected_parent = match &record.event {
-            Event::BranchSummary { target, from, .. } => {
+            Event::BranchModelSelected {
+                target,
+                provider,
+                model,
+            } => {
+                if !is_prior_position(*target)
+                    || provider.trim().is_empty()
+                    || model.trim().is_empty()
+                {
+                    return Err(Error::Session("invalid branch model selection".into()));
+                }
+                Some(*target)
+            }
+            Event::BranchSummary {
+                target,
+                from,
+                fallback_model,
+                ..
+            } => {
                 if target.is_some_and(|target| !is_prior_position(target))
                     || from.is_some_and(|from| !is_prior_position(from))
+                    || fallback_model.as_ref().is_some_and(|model| {
+                        model.provider.trim().is_empty() || model.model.trim().is_empty()
+                    })
                 {
                     return Err(Error::Session("invalid branch summary position".into()));
                 }
@@ -3341,6 +3442,7 @@ mod session_metadata_tests {
             .unwrap();
         session
             .append(Event::BranchSummary {
+                fallback_model: None,
                 summary: "decision from the old branch".into(),
                 extension_summary: None,
                 from: Some(3),
