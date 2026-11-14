@@ -2037,6 +2037,9 @@ mod tests {
     #[test]
     fn frozen_transport_is_released_during_panic_unwind() {
         let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // Install the cleanup guard before any fallible handshake so a failed
+        // assertion also releases the worker.
+        let release = ReleaseTestLatch(latch.clone());
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn({
@@ -2045,15 +2048,16 @@ mod tests {
                 let (lock, wake) = &*latch;
                 let held = lock.lock().unwrap();
                 waiting_tx.send(()).unwrap();
-                let (_guard, result) = wake
-                    .wait_timeout_while(held, Duration::from_secs(5), |released| !*released)
-                    .unwrap();
-                finished_tx.send(!result.timed_out()).unwrap();
+                let guard = wake.wait_while(held, |released| !*released).unwrap();
+                finished_tx.send(*guard).unwrap();
             }
         });
         waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let result = std::panic::catch_unwind(|| {
-            let _release = ReleaseTestLatch(latch);
+        let result = std::panic::catch_unwind(move || {
+            let _release = release;
+            // Reproduce slow work (such as a panic hook or delayed scheduling)
+            // before unwind without expiring the worker before it is released.
+            std::thread::sleep(Duration::from_millis(100));
             panic!("fixture early failure");
         });
         assert!(result.is_err());
