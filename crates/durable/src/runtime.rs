@@ -5966,6 +5966,7 @@ impl RuntimeOwner {
     }
 
     /// Install the adapter and parent-bound management with an explicit child tool policy.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_provider_and_subagent_management(
         path: impl AsRef<Path>,
         options: Options,
