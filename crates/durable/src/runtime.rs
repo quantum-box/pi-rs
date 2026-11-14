@@ -1274,7 +1274,7 @@ impl Harness {
         self.execution_gate = Some(control.gate);
         let mut guard = Some(guard);
         tokio::select! {
-            result = drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard) => result,
+            result = drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard, None) => result,
             _ = stop.cancelled() => Ok(()),
         }
     }
@@ -7302,14 +7302,13 @@ impl Scheduler {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            // A queued retry has not yet superseded the previous execution.
-            errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             let result = std::panic::AssertUnwindSafe(drive_scheduled(
                 &mut worker,
                 id,
                 &cancel,
                 &lock,
                 &mut guard,
+                Some(&errors),
             ))
             .catch_unwind()
             .await;
@@ -7342,6 +7341,7 @@ impl Scheduler {
         let source = self.harness.worker();
         let cancel = self.reporter_cancel.clone();
         let errors = self.reporter_error.clone();
+        let worker_errors = self.worker_errors.clone();
         self.reporter = Some(tokio::spawn(async move {
             let mut active: HashMap<Vec<u8>, tokio::task::JoinHandle<Result<(), Error>>> =
                 HashMap::new();
@@ -7378,6 +7378,7 @@ impl Scheduler {
                             }
                             let mut worker = source.worker();
                             let task_key = key.clone();
+                            let worker_errors = worker_errors.clone();
                             active.insert(
                                 key,
                                 tokio::spawn(async move {
@@ -7397,6 +7398,7 @@ impl Scheduler {
                                             &control.cancel,
                                             &lock,
                                             &mut guard,
+                                            Some(&worker_errors),
                                         )
                                         .await?;
                                     }
@@ -7415,6 +7417,7 @@ impl Scheduler {
                                             &control.cancel,
                                             &lock,
                                             &mut guard,
+                                            Some(&worker_errors),
                                         )
                                         .await?;
                                     }
@@ -7637,9 +7640,15 @@ pub(crate) async fn drive_scheduled<'a>(
     cancel: &CancellationToken,
     lock: &'a tokio::sync::Mutex<()>,
     guard: &mut Option<tokio::sync::MutexGuard<'a, ()>>,
+    errors: Option<&std::sync::Mutex<HashMap<Uuid, String>>>,
 ) -> Result<(), Error> {
     if cancel.is_cancelled() {
         return Ok(());
+    }
+    // Only an owner that has actually acquired the worker lock supersedes a
+    // previously reported failure. Queued and cancelled retries do not.
+    if let Some(errors) = errors {
+        errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
     loop {
         if cancel.is_cancelled() {
@@ -7711,6 +7720,15 @@ pub(crate) async fn drive_scheduled<'a>(
             _ = cancel.cancelled() => return Ok(()),
             guard = lock.lock() => guard,
         });
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        // This driver has taken over from any owner that failed while it was
+        // parked. Publish that takeover before attempting recovery, just as a
+        // newly scheduled driver does after acquiring the worker lock.
+        if let Some(errors) = errors {
+            errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        }
     }
 }
 
@@ -7729,7 +7747,16 @@ async fn fenced_poll<F: std::future::Future>(
             if cancel.is_cancelled() {
                 return std::task::Poll::Ready(None);
             }
-            future.as_mut().poll(cx).map(Some)
+            // Drop the fence before propagating a panic: an effectful future
+            // may panic while polled, but that must not poison the shared gate
+            // and prevent a later owner from recovering the conversation.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
+            drop(_guard);
+            match result {
+                Ok(result) => result.map(Some),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }) => result,
     }
 }

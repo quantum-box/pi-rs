@@ -290,6 +290,7 @@ struct ParkedJob {
     polls: AtomicUsize,
     seen: tokio::sync::Semaphore,
     finish: std::sync::atomic::AtomicBool,
+    panic_next: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -313,6 +314,10 @@ impl Tool for ParkedJob {
     async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         self.seen.add_permits(1);
+        assert!(
+            !self.panic_next.swap(false, Ordering::SeqCst),
+            "poll failed"
+        );
         Some(if self.finish.load(Ordering::SeqCst) {
             Outcome::Succeeded("finished".into())
         } else {
@@ -352,6 +357,7 @@ async fn scheduled_retry_can_drive_a_parked_worker_without_redispatch() {
         polls: AtomicUsize::new(0),
         seen: tokio::sync::Semaphore::new(0),
         finish: std::sync::atomic::AtomicBool::new(false),
+        panic_next: std::sync::atomic::AtomicBool::new(false),
     });
     let mut scheduler =
         pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), parked_options(job.clone()))
@@ -392,6 +398,7 @@ async fn parked_worker_shutdown_and_reopen_preserves_pending_operation() {
         polls: AtomicUsize::new(0),
         seen: tokio::sync::Semaphore::new(0),
         finish: std::sync::atomic::AtomicBool::new(false),
+        panic_next: std::sync::atomic::AtomicBool::new(false),
     });
     let mut scheduler =
         pi_rs_durable::runtime::Scheduler::open(&path, parked_options(job.clone())).unwrap();
@@ -419,4 +426,54 @@ async fn parked_worker_shutdown_and_reopen_preserves_pending_operation() {
         Status::Done { .. }
     ));
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn parked_driver_clears_failure_when_it_takes_over_a_failed_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = Arc::new(ParkedJob {
+        calls: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+        seen: tokio::sync::Semaphore::new(0),
+        finish: std::sync::atomic::AtomicBool::new(false),
+        panic_next: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), parked_options(job.clone()))
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let submission = scheduler.submit(id, None, "work".into()).unwrap();
+    next_poll(&job).await;
+    job.panic_next.store(true, Ordering::SeqCst);
+    scheduler.schedule(id);
+    next_poll(&job).await;
+    // The original parked driver wakes and takes over the failed retry.
+    tokio::time::timeout(std::time::Duration::from_secs(3), job.seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let cancel = CancellationToken::new();
+    let wait = scheduler.wait_for_submission(id, submission, &cancel);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), wait)
+            .await
+            .is_err()
+    );
+    job.finish.store(true, Ordering::SeqCst);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        scheduler.wait_for_submission(id, submission, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(job.calls.load(Ordering::SeqCst), 1);
+    assert!(scheduler.shutdown().await.is_err()); // The retry panic is still joinable.
 }
