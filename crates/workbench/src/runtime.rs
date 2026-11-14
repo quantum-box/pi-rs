@@ -489,6 +489,51 @@ impl Runtime {
     }
 }
 
+/// Prepare the same idle share context as the interactive worker without
+/// writing lifecycle or resource-discovery records to the source journal.
+pub(super) async fn standalone_share_snapshot(
+    args: &Cli,
+    source: &Session,
+) -> Result<super::sessions::ShareSnapshot> {
+    if args.trust_pending {
+        return Err(pi_rs::Error::Config("project trust is pending".into()));
+    }
+    let mut args = args.clone();
+    args.restore_session_model(source);
+    super::thinking::adjust(&mut args);
+    let mut session = Session::from_records(source.records().to_vec())?;
+    let mut runtime = configure(&args, false).await?;
+    let result = async {
+        runtime
+            .session_lifecycle(
+                &args,
+                &session,
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+            )
+            .await;
+        runtime
+            .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
+            .await?;
+        let base = runtime.share_base();
+        let (system_prompt, tools) =
+            source.effective_system_context(&base.system_prompt, base.tools);
+        Ok(super::sessions::ShareSnapshot {
+            session_id: source.session_id(),
+            head: source.head(),
+            context: super::sessions::ShareContext {
+                system_prompt,
+                tools,
+            },
+        })
+    }
+    .await;
+    let closed = runtime.close().await;
+    result.and_then(|snapshot| closed.map(|()| snapshot))
+}
+
 fn resolve_discovered_path(
     path: &std::path::Path,
     cwd: &std::path::Path,
