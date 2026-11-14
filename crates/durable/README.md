@@ -50,6 +50,25 @@ direct-child waits use persistent task state. Hosts must register definitions
 again after reopening. `reset` preserves older observation records and can
 carry handoff text; busy resets are queued until a safe boundary.
 
+`Harness::view` and `Scheduler::view` capture conversation metadata, the
+committed running model/compaction progress checkpoint, and a newest-first
+message page. Pass 50 for a window comparable to upstream's initial window.
+`view_page` follows `older` through the same immutable snapshot even after
+later commits or resets. Each call visits at most the requested number of
+transcript records and returns at most that many messages; an empty page can
+still have an older cursor. Submission, abort and other persisted conversation
+fields remain visible. Legacy conversations without a transcript must first be
+saved by the runtime. Cursors are in-process handles, not a wire format.
+
+This pull API does not provide upstream's watch operations, `from`, automatic
+min/max window maintenance, or transcript entries for reset and compaction
+markers. Progress updates alone do not appear in observation history; poll the
+view for them. Message count and record reads are bounded, but a stored batch
+(especially a replacement), message, and conversation metadata can each be
+arbitrarily large and are decoded in full. Bytes, metadata copying and peak
+memory are therefore not independently bounded. Existing history and execution
+paths still hydrate all messages. Store reads are synchronous and may block.
+
 Nested tool calls are journaled by parent operation and call order. A replayed
 parent reuses completed child results, while unsafe interrupted children block
 the parent for reconciliation even when it ignores the child's result. Nested

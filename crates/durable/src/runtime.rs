@@ -355,6 +355,28 @@ impl Conversation {
     }
 }
 
+/// A committed conversation snapshot. `state.messages` is empty; use `entries`
+/// and `older` to read the captured transcript, newest first.
+pub struct ConversationView {
+    pub state: Conversation,
+    pub live: Option<crate::progress::State>,
+    pub entries: Vec<Message>,
+    pub older: Option<ViewCursor>,
+}
+
+/// Opaque position in one immutable conversation transcript snapshot.
+#[derive(Clone, Debug)]
+pub struct ViewCursor {
+    cursor: crate::transcript::Cursor,
+    remaining: Option<usize>,
+}
+
+pub struct ViewPage {
+    /// Newest first, including within a transcript batch.
+    pub entries: Vec<Message>,
+    pub older: Option<ViewCursor>,
+}
+
 pub struct Harness {
     owner: Arc<OwnedStore>,
     options: Options,
@@ -1101,6 +1123,107 @@ impl Harness {
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
+    }
+    /// Capture current state and at most `limit` newest messages. The live
+    /// checkpoint and conversation record are read consistently by retrying if
+    /// the latter changes while the checkpoint is read.
+    pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
+        self.subagent_store()?;
+        let store = self.owner.store();
+        let (mut state, live) = loop {
+            let entry = store.get(&Self::key(id))?.ok_or(Error::NotFound)?;
+            let state: Conversation = serde_json::from_slice(&entry.value)?;
+            let request = match &state.phase {
+                Phase::ModelRunning { request_id, .. }
+                | Phase::CompactionRunning { request_id, .. } => Some(*request_id),
+                _ => None,
+            };
+            let live = request
+                .map(|request| crate::progress::Snapshot::load(store, request))
+                .transpose()?
+                .and_then(|snapshot| snapshot.is_persisted().then(|| snapshot.state().clone()));
+            if store
+                .get(&Self::key(id))?
+                .is_some_and(|current| current.version == entry.version)
+            {
+                break (state, live);
+            }
+        };
+        let cursor = state.transcript.clone().ok_or_else(|| {
+            Error::Invalid(
+                "legacy conversation has no immutable transcript; save it before viewing".into(),
+            )
+        })?;
+        state.messages.clear();
+        let page = self.view_page(
+            id,
+            ViewCursor {
+                cursor,
+                remaining: None,
+            },
+            limit,
+        )?;
+        Ok(ConversationView {
+            state,
+            live,
+            entries: page.entries,
+            older: page.older,
+        })
+    }
+
+    /// Read an older portion of the captured active transcript. At most `limit`
+    /// messages and `limit` transcript records are visited per call. Empty
+    /// pages can have an `older` cursor when batches contain no messages.
+    pub fn view_page(
+        &self,
+        id: Uuid,
+        mut position: ViewCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ViewPage, Error> {
+        self.subagent_store()?;
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut entries = Vec::new();
+        let mut older = None;
+        for _ in 0..limit.get() {
+            let mut page = transcript.read(&position.cursor, std::num::NonZeroUsize::MIN)?;
+            let Some(record) = page.records.pop() else {
+                older = None;
+                break;
+            };
+            let change: TranscriptChange = serde_json::from_value(record.value)?;
+            let (messages, base) = match change {
+                TranscriptChange::Append(messages) => (messages, false),
+                TranscriptChange::Replace(messages) => (messages, true),
+            };
+            let end = position.remaining.unwrap_or(messages.len());
+            if end > messages.len() {
+                return Err(Error::Invalid("invalid view cursor".into()));
+            }
+            let start = end.saturating_sub(limit.get() - entries.len());
+            entries.extend(messages.into_iter().take(end).skip(start).rev());
+            if start > 0 {
+                position.remaining = Some(start);
+                older = Some(position);
+                break;
+            }
+            if base {
+                older = None;
+                break;
+            }
+            if !page.has_more {
+                return Err(Error::Invalid("transcript has no base".into()));
+            }
+            position = ViewCursor {
+                cursor: page.next,
+                remaining: None,
+            };
+            if entries.len() == limit.get() {
+                older = Some(position);
+                break;
+            }
+            older = Some(position.clone());
+        }
+        Ok(ViewPage { entries, older })
     }
     /// Override wall time for durable gate deadlines. Set before driving work.
     pub fn set_signal_clock(&mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
@@ -3569,6 +3692,17 @@ impl Scheduler {
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
+    }
+    pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
+        self.harness.view(id, limit)
+    }
+    pub fn view_page(
+        &self,
+        id: Uuid,
+        cursor: ViewCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ViewPage, Error> {
+        self.harness.view_page(id, cursor, limit)
     }
     pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
         self.harness.send_signal(signal)

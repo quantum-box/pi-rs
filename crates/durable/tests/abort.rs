@@ -80,8 +80,20 @@ async fn abort_only_one_conversation_and_withdraw_existing_queue() {
     s.submit_with_mode(a, None, "steer".into(), InputMode::Steer)
         .unwrap();
     s.submit(a, None, "follow".into()).unwrap();
+    let view = s.view(a, std::num::NonZeroUsize::new(50).unwrap()).unwrap();
+    assert_eq!(view.state.submissions.len(), 3);
+    assert_eq!(
+        view.state
+            .submissions
+            .iter()
+            .filter(|s| s.status == Status::Queued)
+            .count(),
+        2
+    );
     s.submit(b, None, "other".into()).unwrap();
     s.abort(a).unwrap();
+    let view = s.view(a, std::num::NonZeroUsize::new(50).unwrap()).unwrap();
+    assert!(view.state.abort_requested);
     tokio::time::timeout(Duration::from_secs(5), s.wait(a))
         .await
         .unwrap()
@@ -91,6 +103,19 @@ async fn abort_only_one_conversation_and_withdraw_existing_queue() {
         .unwrap()
         .unwrap();
     let a_state = s.conversation(a).unwrap();
+    let view = s.view(a, std::num::NonZeroUsize::new(50).unwrap()).unwrap();
+    assert_eq!(
+        view.state
+            .submissions
+            .iter()
+            .map(|s| &s.status)
+            .collect::<Vec<_>>(),
+        a_state
+            .submissions
+            .iter()
+            .map(|s| &s.status)
+            .collect::<Vec<_>>()
+    );
     assert!(a_state.submissions.iter().all(|x| x.status
         == Status::Unanswered {
             reason: "aborted".into()

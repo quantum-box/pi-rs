@@ -91,6 +91,54 @@ fn config() -> Config {
 }
 
 #[tokio::test]
+async fn view_pages_stay_on_captured_transcript_and_show_submission_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(
+        dir.path().join("db"),
+        options(model, tool, ReplayPolicy::Unsafe),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "one".into(), &cancel)
+        .await
+        .unwrap();
+    let expected = h.conversation(id).unwrap().messages;
+    assert!(expected.len() > 1);
+    let limit = std::num::NonZeroUsize::new(1).unwrap();
+    let view = h.view(id, limit).unwrap();
+    assert!(view.state.messages.is_empty());
+    assert_eq!(view.state.submissions.len(), 1);
+    let mut actual = view.entries;
+    let mut older = view.older;
+    h.reset(id, Some("new context".into())).unwrap();
+    while let Some(cursor) = older {
+        let page = h.view_page(id, cursor, limit).unwrap();
+        assert!(page.entries.len() <= 1);
+        actual.extend(page.entries);
+        older = page.older;
+    }
+    actual.reverse();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    let fresh = h.view(id, limit).unwrap();
+    assert_eq!(fresh.state.resets.len(), 1);
+}
+
+#[tokio::test]
 async fn executes_model_tool_and_final_answer_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.sqlite");

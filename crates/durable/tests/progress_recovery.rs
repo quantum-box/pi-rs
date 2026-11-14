@@ -86,6 +86,13 @@ async fn committed_partial_becomes_aborted_display_entry_after_reopen() {
         .await
         .unwrap();
     let c = h.conversation(id).unwrap();
+    let view = h
+        .view(id, std::num::NonZeroUsize::new(50).unwrap())
+        .unwrap();
+    assert_eq!(
+        view.state.aborted_generations[0].text,
+        "uncommitted partial"
+    );
     assert_eq!(c.aborted_generations.len(), 1);
     assert_eq!(c.aborted_generations[0].text, "uncommitted partial");
     assert_eq!(
@@ -95,6 +102,36 @@ async fn committed_partial_becomes_aborted_display_entry_after_reopen() {
         }
     );
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn view_shows_committed_live_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    let view = scheduler
+        .view(id, std::num::NonZeroUsize::new(50).unwrap())
+        .unwrap();
+    assert!(
+        matches!(view.live, Some(pi_rs_durable::progress::State::Running(ref partial)) if partial.text == "uncommitted partial")
+    );
+    scheduler.abort_and_wait(id).await.unwrap();
+    scheduler.shutdown().await.unwrap();
 }
 struct EscapedModel;
 #[async_trait]
