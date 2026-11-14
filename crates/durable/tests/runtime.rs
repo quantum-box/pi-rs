@@ -959,7 +959,8 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         scheduler.view(id, limit).unwrap().tool_progress,
         Some(State::Running(Some(json!({"text":"working"}))))
     );
-    scheduler.abort_and_wait(id).await.unwrap();
+    let error = scheduler.abort_and_wait(id).await.unwrap_err();
+    assert!(error.to_string().contains("abort cleanup remains pending"));
     let host = tool.host.lock().unwrap().take().unwrap();
     host.report_progress(json!("late")).await.unwrap();
     drop(host);
