@@ -1907,6 +1907,7 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
             Checkpoint, Task, TaskOwner,
             scheduler::{Handler, Registry, Step},
         },
+        task_store::TaskStore,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1988,6 +1989,13 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     assert_eq!(application_entry::list(&db, child).unwrap(), entries[..1]);
     assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 7);
     assert_eq!(h.conversation(child).unwrap().messages, expected_messages);
+    assert!(
+        TaskStore::new(&db)
+            .list()
+            .unwrap()
+            .iter()
+            .all(|record| { record.task.owner() != &TaskOwner::Conversation(child) })
+    );
     assert!(h.fork_at_application_entry(child, entries[0].id).is_err());
     drop(h);
     drop(db);
@@ -1995,6 +2003,11 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     let db = Store::open(&path).unwrap();
     assert_eq!(application_entry::list(&db, child).unwrap(), entries[..1]);
     assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 7);
+    h.submit_and_run(child, None, "continue child".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(application_entry::list(&db, child).unwrap(), entries[..1]);
+    assert_eq!(application_entry::list(&db, parent).unwrap(), entries);
     let second = h.fork_at_application_entry(parent, entries[1].id).unwrap();
     assert_eq!(application_entry::list(&db, second).unwrap(), entries);
     assert_eq!(
@@ -2095,4 +2108,37 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     )
     .unwrap();
     assert!(h.fork_at_application_entry(parent, extra.id).is_err());
+
+    // Even a matching runtime snapshot cannot establish the order of a
+    // runtime write and application entry in the same atomic commit.
+    let runtime_key = format!("runtime/conversation/{parent}").into_bytes();
+    let app_key = format!("durable/application-entries/{parent}").into_bytes();
+    let runtime = db.get(&runtime_key).unwrap().unwrap();
+    let prefix = format!("runtime/fork/{parent}/");
+    let snapshots = db.list(prefix.as_bytes()).unwrap();
+    let snapshot = &snapshots.last().unwrap().1;
+    let snapshot_key = format!("{prefix}{:020}", u64::MAX).into_bytes();
+    let mut simultaneous = corrupted;
+    let mut last = extra;
+    last.id = Uuid::new_v4();
+    simultaneous.push(last.clone());
+    db.commit(
+        &[],
+        &[
+            durable_store::Mutation::Put {
+                key: runtime_key,
+                value: runtime.value,
+            },
+            durable_store::Mutation::Put {
+                key: snapshot_key,
+                value: snapshot.value.clone(),
+            },
+            durable_store::Mutation::Put {
+                key: app_key,
+                value: serde_json::to_vec(&simultaneous).unwrap(),
+            },
+        ],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(parent, last.id).is_err());
 }
