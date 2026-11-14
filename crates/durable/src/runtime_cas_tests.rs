@@ -149,3 +149,57 @@ fn withdrawal_is_durable_and_merges_with_worker_progress() {
         WithdrawResult::Settled
     );
 }
+
+#[test]
+fn submissions_racing_abort_are_neither_lost_nor_duplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let mut workers = Vec::new();
+    for index in 0..8 {
+        let mut worker = owner.worker();
+        worker.merge_admissions = false;
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            worker
+                .submit(id, Some(format!("key-{index}")), format!("input-{index}"))
+                .unwrap()
+        }));
+    }
+    let mut aborter = owner.worker();
+    aborter.merge_admissions = false;
+    let start = barrier.clone();
+    let abort = std::thread::spawn(move || {
+        start.wait();
+        aborter.request_abort(id).unwrap();
+    });
+    let ids: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    abort.join().unwrap();
+    let state = owner.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 8);
+    for sid in ids {
+        let item = state
+            .submissions
+            .iter()
+            .find(|item| item.id == sid)
+            .unwrap();
+        assert!(
+            matches!(item.status, Status::Queued | Status::Running)
+                || item.status
+                    == Status::Unanswered {
+                        reason: "aborted".into()
+                    }
+        );
+    }
+}

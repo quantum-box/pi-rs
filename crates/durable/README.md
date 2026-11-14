@@ -13,6 +13,12 @@ conversation executes one operation at a time. Follow-ups wait for the run;
 API with `submit_and_run`, `resume`, and `open_paused`. Request IDs deduplicate
 within a conversation.
 
+`Scheduler::abort` durably withdraws queued inputs and fences further local
+dispatch for that conversation; `abort_and_wait` also waits for its workers.
+Queued resets remain. Uncertain dispatched effects require reconciliation, even
+for replay-safe tools; cancellation cannot undo an external effect. Reporter
+workers use the same conversation fence as ordinary scheduled work.
+
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before
 retry. Tools rerun only if recorded and current replay policies are both safe;
@@ -94,7 +100,7 @@ driven `Harness` persists intents but does not run the reporter; open a
 reported and require reconciliation.
 
 This is not the complete upstream background-subagent extension. There is no
-child-tool restriction, status command, parent ownership tree, or targeted abort.
+child-tool restriction, status command, or parent ownership tree.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.
@@ -102,5 +108,5 @@ Dropping a scheduler stops its reporter poller; reopening resumes unfinished
 intents. Report delivery can be delayed by other work in the same child
 conversation. Reporter receipts and answer IDs are retained and scanned without
 a retention policy.
-Full upstream semantics require ownership/background boundaries, targeted abort
-with executor fencing, and corresponding tool and reporting integration.
+Full upstream semantics require ownership/background boundaries and corresponding
+task, tool and reporting integration.

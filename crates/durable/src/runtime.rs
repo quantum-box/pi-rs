@@ -239,6 +239,8 @@ pub struct Conversation {
     #[serde(default)]
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
+    #[serde(default)]
+    pub abort_requested: bool,
     phase: Phase,
 }
 
@@ -262,6 +264,7 @@ pub struct Harness {
     /// Snapshots loaded by this worker, used to distinguish admission-only
     /// conflicts from changes to execution state.
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
+    execution_gate: Option<Arc<std::sync::Mutex<()>>>,
 }
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
@@ -316,6 +319,7 @@ impl Harness {
             merge_admissions: false,
             storage_failed: Arc::new(AtomicBool::new(false)),
             loaded: std::sync::Mutex::new(HashMap::new()),
+            execution_gate: None,
         };
         harness.recover()?;
         Ok(harness)
@@ -331,6 +335,7 @@ impl Harness {
             merge_admissions: true,
             storage_failed: self.storage_failed.clone(),
             loaded: std::sync::Mutex::new(HashMap::new()),
+            execution_gate: None,
         }
     }
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
@@ -438,7 +443,7 @@ impl Harness {
         let mut expected = expected;
         loop {
             let value = serde_json::to_vec(&state)?;
-            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets});
+            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested});
             let append = crate::observer::Observer::new(self.owner.store(), state.id)
                 .prepare_append(&event)?;
             let fork_key =
@@ -480,12 +485,22 @@ impl Harness {
                 key: fork_key,
                 value: serde_json::to_vec(&fork_snapshot)?,
             });
-            let terminal = match &state.phase {
+            let terminal = if state.abort_requested {
+                match &state.phase {
+                    Phase::ModelRunning { request_id, .. }
+                    | Phase::AbandonedModel { request_id, .. }
+                    | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+            .or(match &state.phase {
                 Phase::Accounting { request_id, .. } => Some((*request_id, true)),
                 Phase::AbandonedModel { request_id, .. }
                 | Phase::FailedModel { request_id, .. } => Some((*request_id, false)),
                 _ => None,
-            };
+            });
             if let Some((request_id, complete)) = terminal {
                 let snapshot = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
                 if snapshot.is_persisted()
@@ -548,6 +563,13 @@ impl Harness {
                             state.submissions.push(submission);
                         }
                     }
+                    if base.abort_requested
+                        && !state.abort_requested
+                        && matches!(state.phase, Phase::FailedIdle)
+                        && state.submissions.iter().any(|s| s.status == Status::Queued)
+                    {
+                        state.phase = Phase::Idle;
+                    }
                     expected = Expected::Version(entry.version);
                     self.loaded.lock().map_err(|_| Error::Failed)?.insert(
                         state.id,
@@ -592,6 +614,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            abort_requested: false,
             phase: Phase::Idle,
         };
         self.save(&state, Expected::Missing)?;
@@ -648,6 +671,7 @@ impl Harness {
         }
         state.id = Uuid::new_v4();
         state.active = None;
+        state.abort_requested = false;
         state.submissions.clear();
         state.aborted_generations.clear();
         state.input_modes.clear();
@@ -700,6 +724,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            abort_requested: false,
             phase: Phase::Idle,
         };
         self.save(&state, Expected::Missing)?;
@@ -926,6 +951,28 @@ impl Harness {
             }
         }
     }
+    /// Persist the abort mark and withdraw the inputs queued at this commit.
+    /// The caller must stop any executing worker before driving the mark.
+    pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
+        loop {
+            let (mut c, version) = self.load(id)?;
+            for submission in &mut c.submissions {
+                if submission.status == Status::Queued {
+                    submission.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                }
+            }
+            if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+                c.abort_requested = true;
+            }
+            match self.save(&c, Expected::Version(version)) {
+                Ok(()) => return Ok(()),
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
     /// Admit and run pending work immediately. Repeating a request ID returns
     /// the original submission, even when its answer was committed earlier.
     pub async fn submit_and_run(
@@ -962,6 +1009,9 @@ impl Harness {
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
         {
             let (mut c, version) = self.load(id)?;
+            if c.abort_requested {
+                return Ok(());
+            }
             match c.phase.clone() {
                 Phase::ModelRunning {
                     turns,
@@ -1118,6 +1168,146 @@ impl Harness {
         }
         Ok(())
     }
+    async fn settle_abort(
+        &mut self,
+        mut c: Conversation,
+        version: u64,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
+        // A blocked operation remains a barrier until an authoritative result arrives.
+        if matches!(c.phase, Phase::Blocked { .. }) && c.active.is_none() {
+            return Ok(false);
+        }
+        let usage =
+            match &c.phase {
+                Phase::ModelRunning { request_id, .. }
+                | Phase::AbandonedModel { request_id, .. }
+                | Phase::FailedModel { request_id, .. } => {
+                    Some((*request_id, UsageReport::Unconfirmed, None))
+                }
+                Phase::CompactionRunning { request_id, .. }
+                | Phase::CompactionAbandoned { request_id, .. } => {
+                    Some((*request_id, UsageReport::Unconfirmed, None))
+                }
+                Phase::Accounting {
+                    request_id,
+                    response,
+                    ..
+                } => Some((
+                    *request_id,
+                    response.usage.map_or(UsageReport::Unconfirmed, |usage| {
+                        UsageReport::Measured { usage }
+                    }),
+                    Some(response.metadata.clone()),
+                )),
+                Phase::CompactionAccounting { request_id, result } => Some((
+                    *request_id,
+                    result
+                        .generation
+                        .usage
+                        .map_or(UsageReport::Unconfirmed, |usage| UsageReport::Measured {
+                            usage,
+                        }),
+                    Some(result.generation.metadata.clone()),
+                )),
+                _ => None,
+            };
+        if let Some((request_id, report, metadata)) = usage {
+            let snapshot = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
+            if let crate::progress::State::Running(partial)
+            | crate::progress::State::Aborted(partial) = snapshot.state()
+                && !partial.text.is_empty()
+                && !c
+                    .aborted_generations
+                    .iter()
+                    .any(|p| p.request_id == request_id)
+            {
+                c.aborted_generations.push(AbortedGeneration {
+                    request_id,
+                    text: partial.text.clone(),
+                });
+            }
+            let settlement = async {
+                match metadata {
+                    Some(metadata) => {
+                        self.options
+                            .model
+                            .record_usage_with_metadata(request_id, &report, &metadata)
+                            .await
+                    }
+                    None => self.options.model.record_usage(request_id, &report).await,
+                }
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Interrupted),
+                result = tokio::time::timeout(Duration::from_secs(120), settlement) => match result {
+                    Ok(Ok(())) => (), Ok(Err(error)) => return Err(error.into()), Err(_) => return Err(Error::Interrupted),
+                }
+            }
+        }
+        match c.phase.clone() {
+            Phase::ToolRunning {
+                turns,
+                calls,
+                index,
+                operation_id,
+                ..
+            } => {
+                c.phase = Phase::Blocked {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    reason: "local abort after dispatch; external outcome requires reconciliation"
+                        .into(),
+                };
+            }
+            Phase::Pending {
+                turns,
+                calls,
+                index,
+                operation_id,
+                reference,
+            } => {
+                c.phase = Phase::Blocked {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    reason: format!(
+                        "local abort; external operation pending ({reference}); reconciliation required"
+                    ),
+                };
+            }
+            Phase::Blocked { .. } => (),
+            Phase::Tools { calls, index, .. } => {
+                for i in index..calls.len() {
+                    append_tool(
+                        &mut c,
+                        &calls,
+                        i,
+                        Outcome::Skipped("aborted before dispatch".into()).tool_content(),
+                    )?;
+                }
+            }
+            _ => (),
+        }
+        if matches!(c.phase, Phase::Blocked { .. }) {
+            c.active = None;
+            for s in &mut c.submissions {
+                if s.status == Status::Running {
+                    s.status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                }
+            }
+        } else {
+            c.abort_requested = false;
+            finish_abort(&mut c);
+        }
+        self.save(&c, Expected::Version(version))?;
+        Ok(true)
+    }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
             if cancel.is_cancelled() {
@@ -1125,6 +1315,12 @@ impl Harness {
                 return Err(Error::Interrupted);
             }
             let (mut c, version) = self.load(id)?;
+            if c.abort_requested {
+                if self.settle_abort(c, version, cancel).await? {
+                    continue;
+                }
+                return Ok(());
+            }
             match c.phase.clone() {
                 Phase::Idle => {
                     if !c.pending_resets.is_empty() {
@@ -1198,9 +1394,18 @@ impl Harness {
                     request_id,
                     ..
                 } => {
-                    let result = match (*preparation)
-                        .summarize(self.options.model.as_ref(), request_id, id, cancel)
-                        .await
+                    let result = match fenced_poll(
+                        (*preparation).summarize(
+                            self.options.model.as_ref(),
+                            request_id,
+                            id,
+                            cancel,
+                        ),
+                        self.execution_gate.as_ref(),
+                        cancel,
+                    )
+                    .await
+                    .ok_or(Error::Interrupted)?
                     {
                         Ok(value) => value,
                         Err(error) => {
@@ -1376,7 +1581,7 @@ impl Harness {
                     let mut progress_failure = None;
                     let mut progress_full = false;
                     let request_cancel = cancel.child_token();
-                    let response = collect_generation_with_metadata(
+                    let response = fenced_poll(collect_generation_with_metadata(
                         self.options
                             .model
                             .stream_in_session(request_id, id, request),
@@ -1399,8 +1604,8 @@ impl Harness {
                                 }
                             }
                         },
-                    )
-                    .await;
+                    ), self.execution_gate.as_ref(), cancel)
+                    .await.ok_or(Error::Interrupted)?;
                     if let Some(error) = progress_failure {
                         self.failed = true;
                         return Err(Error::Invalid(format!(
@@ -1686,14 +1891,19 @@ impl Harness {
                             operation_id,
                             call: calls[index].clone(),
                         };
-                        let prepared = crate::tool::prepare(
-                            reg.tool.as_ref(),
-                            &invocation,
+                        let prepared = fenced_poll(
+                            crate::tool::prepare(
+                                reg.tool.as_ref(),
+                                &invocation,
+                                cancel,
+                                Duration::from_secs(120),
+                                valid_schema,
+                            ),
+                            self.execution_gate.as_ref(),
                             cancel,
-                            Duration::from_secs(120),
-                            valid_schema,
                         )
-                        .await;
+                        .await
+                        .ok_or(Error::Interrupted)?;
                         if cancel.is_cancelled() {
                             self.failed = true;
                             return Err(Error::Interrupted);
@@ -1889,7 +2099,7 @@ impl Harness {
                                     8,
                                 ) {
                                     Ok(host) => {
-                                        let reply =
+                                        let reply = fenced_poll(
                                             std::panic::AssertUnwindSafe(crate::tool::execute(
                                                 reg.tool.as_ref(),
                                                 &invocation,
@@ -1899,12 +2109,19 @@ impl Harness {
                                                 cancel,
                                                 Duration::from_secs(120),
                                             ))
-                                            .catch_unwind()
-                                            .await;
+                                            .catch_unwind(),
+                                            self.execution_gate.as_ref(),
+                                            cancel,
+                                        )
+                                        .await;
                                         match host.seal_and_wait().await {
                                             Ok(()) => match reply {
-                                                Ok(reply) => reply,
-                                                Err(_) => Outcome::Unknown(
+                                                Some(Ok(reply)) => reply,
+                                                None => Outcome::Unknown(
+                                                    "local cancellation after dispatch".into(),
+                                                )
+                                                .into(),
+                                                Some(Err(_)) => Outcome::Unknown(
                                                     "parent tool panicked after dispatch".into(),
                                                 )
                                                 .into(),
@@ -1976,14 +2193,19 @@ impl Harness {
                     let Some(tool) = self.tools.get(&call.name) else {
                         return Ok(());
                     };
-                    let result = crate::poll::poll_once(
-                        tool.tool.as_ref(),
-                        operation_id,
-                        &reference,
+                    let result = fenced_poll(
+                        crate::poll::poll_once(
+                            tool.tool.as_ref(),
+                            operation_id,
+                            &reference,
+                            cancel,
+                            Duration::from_secs(120),
+                        ),
+                        self.execution_gate.as_ref(),
                         cancel,
-                        Duration::from_secs(120),
                     )
-                    .await;
+                    .await
+                    .ok_or(Error::Interrupted)?;
                     match result {
                         crate::poll::PollResult::Outcome(Outcome::Pending { reference: next }) => {
                             if next != reference {
@@ -2068,12 +2290,48 @@ impl Harness {
         if operation_id != expected {
             return Err(Error::Invalid("operation ID mismatch".into()));
         }
+        if c.abort_requested {
+            let prefix = format!("nested/{operation_id}/");
+            for (_, entry) in self.owner.store().list(prefix.as_bytes())? {
+                let record: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                let nested = record.get("outcome").filter(|v| !v.is_null());
+                let status = nested
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_str());
+                if !matches!(
+                    status,
+                    Some(
+                        "succeeded"
+                            | "succeeded_with_details"
+                            | "failed"
+                            | "skipped"
+                            | "truncated"
+                            | "structured"
+                    )
+                ) {
+                    return Err(Error::Invalid("nested operation remains unresolved; parent reconciliation cannot establish its outcome".into()));
+                }
+            }
+        }
         append_tool(&mut c, &calls, index, outcome.tool_content())?;
-        c.phase = Phase::Tools {
-            turns,
-            calls,
-            index: index + 1,
-        };
+        if c.abort_requested {
+            for i in index + 1..calls.len() {
+                append_tool(
+                    &mut c,
+                    &calls,
+                    i,
+                    Outcome::Skipped("aborted before dispatch".into()).tool_content(),
+                )?;
+            }
+            c.abort_requested = false;
+            finish_abort(&mut c);
+        } else {
+            c.phase = Phase::Tools {
+                turns,
+                calls,
+                index: index + 1,
+            };
+        }
         self.save(&c, Expected::Version(version))
     }
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
@@ -2104,6 +2362,12 @@ pub struct Scheduler {
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
+    conversations: Arc<std::sync::Mutex<HashMap<Uuid, ConversationControl>>>,
+}
+
+struct ConversationControl {
+    gate: Arc<std::sync::Mutex<()>>,
+    cancel: CancellationToken,
 }
 
 impl Scheduler {
@@ -2131,6 +2395,7 @@ impl Scheduler {
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
+            conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         for id in ids {
             scheduler.schedule(id);
@@ -2259,11 +2524,40 @@ impl Scheduler {
         self.schedule(id);
         Ok(())
     }
+    /// Persist intent before signalling the worker, then schedule durable cleanup.
+    pub fn abort(&mut self, id: Uuid) -> Result<(), Error> {
+        let mut controls = self.conversations.lock().unwrap_or_else(|e| e.into_inner());
+        let control = controls.entry(id).or_insert_with(|| ConversationControl {
+            gate: Arc::new(std::sync::Mutex::new(())),
+            cancel: self.cancel.child_token(),
+        });
+        {
+            let _gate = control.gate.lock().map_err(|_| Error::Failed)?;
+            self.harness.request_abort(id)?;
+            control.cancel.cancel();
+            control.cancel = self.cancel.child_token();
+        }
+        drop(controls);
+        self.schedule(id);
+        Ok(())
+    }
+    /// Request abort and wait until this conversation's local workers stop.
+    pub async fn abort_and_wait(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort(id)?;
+        self.wait(id).await
+    }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {
         let lock = conversation_lock(&self.locks, id);
         let mut worker = self.harness.worker();
-        let cancel = self.cancel.clone();
+        let mut controls = self.conversations.lock().unwrap_or_else(|e| e.into_inner());
+        let control = controls.entry(id).or_insert_with(|| ConversationControl {
+            gate: Arc::new(std::sync::Mutex::new(())),
+            cancel: self.cancel.child_token(),
+        });
+        let cancel = control.cancel.clone();
+        worker.execution_gate = Some(control.gate.clone());
+        drop(controls);
         let task = tokio::spawn(async move {
             let _lock = lock.lock().await;
             drive_scheduled(&mut worker, id, &cancel).await
@@ -2280,6 +2574,8 @@ impl Scheduler {
     fn start_reporter(&mut self) {
         let source = self.harness.worker();
         let locks = self.locks.clone();
+        let controls = self.conversations.clone();
+        let root_cancel = self.cancel.clone();
         let cancel = self.reporter_cancel.clone();
         let errors = self.reporter_error.clone();
         self.reporter = Some(tokio::spawn(async move {
@@ -2318,7 +2614,8 @@ impl Scheduler {
                             }
                             let mut worker = source.worker();
                             let locks = locks.clone();
-                            let cancel = cancel.clone();
+                            let controls = controls.clone();
+                            let root_cancel = root_cancel.clone();
                             let task_key = key.clone();
                             active.insert(
                                 key,
@@ -2327,14 +2624,20 @@ impl Scheduler {
                                     let lock = conversation_lock(&locks, child);
                                     {
                                         let _guard = lock.lock().await;
-                                        drive_scheduled(&mut worker, child, &cancel).await?;
+                                        let (gate, token) =
+                                            reporter_control(&controls, &root_cancel, child);
+                                        worker.execution_gate = Some(gate);
+                                        drive_scheduled(&mut worker, child, &token).await?;
                                     }
                                     if let Some(parent) =
                                         worker.deliver_report(&task_key, &reporter)?
                                     {
                                         let lock = conversation_lock(&locks, parent);
                                         let _guard = lock.lock().await;
-                                        drive_scheduled(&mut worker, parent, &cancel).await?;
+                                        let (gate, token) =
+                                            reporter_control(&controls, &root_cancel, parent);
+                                        worker.execution_gate = Some(gate);
+                                        drive_scheduled(&mut worker, parent, &token).await?;
                                     }
                                     Ok(())
                                 }),
@@ -2395,16 +2698,42 @@ impl Scheduler {
     }
 }
 
-/// Shared scheduling path for ordinary submissions and subagent reporters.
-/// The caller must hold this conversation's scheduler lock.
+/// Drive a conversation under its scheduler lock and cancellation fence.
 async fn drive_scheduled(
     worker: &mut Harness,
     id: Uuid,
     cancel: &CancellationToken,
 ) -> Result<(), Error> {
-    worker.recover_conversation(id)?;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    if let Err(error) = worker.recover_conversation(id) {
+        let _gate = worker
+            .execution_gate
+            .as_ref()
+            .unwrap()
+            .lock()
+            .map_err(|_| Error::Failed)?;
+        return if cancel.is_cancelled() {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
     loop {
-        worker.drive(id, cancel).await?;
+        if let Err(error) = worker.drive(id, cancel).await {
+            let _gate = worker
+                .execution_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .map_err(|_| Error::Failed)?;
+            return if cancel.is_cancelled() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
         let state = worker.conversation(id)?;
         let should_poll = match &state.phase {
             Phase::Pending { calls, index, .. } => calls
@@ -2416,11 +2745,39 @@ async fn drive_scheduled(
         if !should_poll {
             return Ok(());
         }
-        tokio::select! {
-            _ = cancel.cancelled() => return Err(Error::Interrupted),
-            _ = tokio::time::sleep(Duration::from_secs(1)) => (),
-        }
+        tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(1)) => () }
     }
+}
+
+fn reporter_control(
+    controls: &std::sync::Mutex<HashMap<Uuid, ConversationControl>>,
+    root: &CancellationToken,
+    id: Uuid,
+) -> (Arc<std::sync::Mutex<()>>, CancellationToken) {
+    let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
+    let control = controls.entry(id).or_insert_with(|| ConversationControl {
+        gate: Arc::new(std::sync::Mutex::new(())),
+        cancel: root.child_token(),
+    });
+    (control.gate.clone(), control.cancel.clone())
+}
+
+// Serialize polling of effectful futures with the durable abort commit. Once
+// the commit wins, no subsequent poll can initiate or resume dispatch.
+async fn fenced_poll<F: std::future::Future>(
+    future: F,
+    gate: Option<&Arc<std::sync::Mutex<()>>>,
+    cancel: &CancellationToken,
+) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let _guard = gate.map(|gate| gate.lock().expect("conversation gate poisoned"));
+        if cancel.is_cancelled() {
+            return std::task::Poll::Ready(None);
+        }
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await
 }
 
 fn unix_ms() -> u64 {
@@ -2568,6 +2925,12 @@ fn finish_answer(c: &mut Conversation, answer: String) {
     }
     c.phase = Phase::Idle;
 }
+fn finish_abort(c: &mut Conversation) {
+    finish_failure(c, "aborted".into());
+    if c.submissions.iter().any(|s| s.status == Status::Queued) {
+        c.phase = Phase::Idle;
+    }
+}
 fn finish_failure(c: &mut Conversation, reason: String) {
     if matches!(
         c.messages.last(),
@@ -2661,6 +3024,7 @@ mod scheduler_tests {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            abort_requested: false,
             phase: Phase::Idle,
         };
         let mut latest = base.clone();
@@ -2749,6 +3113,116 @@ mod scheduler_tests {
                 .any(|m| matches!(m, Message::User { content } if content == "withdraw me"))
         );
         scheduler.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn restart_processes_abort_mark_before_recovery_can_redispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut s = Scheduler::open(&path, options(model.clone())).unwrap();
+        let id = s.create_conversation(config()).unwrap();
+        s.submit(id, None, "first".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        {
+            let controls = s.conversations.lock().unwrap();
+            let control = controls.get(&id).unwrap();
+            let _guard = control.gate.lock().unwrap();
+            s.harness.request_abort(id).unwrap();
+            s.cancel.cancel();
+        }
+        s.shutdown().await.unwrap();
+        let h = Harness::open(&path, options(model.clone()), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+        assert!(model.started.try_acquire().is_err());
+    }
+    struct ToolModel;
+    #[async_trait::async_trait]
+    impl Model for ToolModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "barrier".into(),
+                    arguments: "{}".into(),
+                }],
+                usage: None,
+            })])
+            .boxed())
+        }
+    }
+    struct BarrierTool {
+        started: Arc<Semaphore>,
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for BarrierTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "barrier".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn restart_with_abort_mark_never_replays_dispatched_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let started = Arc::new(Semaphore::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        let opts = || Options {
+            model: Arc::new(ToolModel),
+            tools: vec![RegisteredTool {
+                tool: Arc::new(BarrierTool {
+                    started: started.clone(),
+                    count: count.clone(),
+                }),
+                replay: ReplayPolicy::Safe,
+            }],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let mut s = Scheduler::open(&path, opts()).unwrap();
+        let id = s.create_conversation(config()).unwrap();
+        s.submit(id, None, "work".into()).unwrap();
+        started.acquire().await.unwrap().forget();
+        {
+            let controls = s.conversations.lock().unwrap();
+            let control = controls.get(&id).unwrap();
+            let _guard = control.gate.lock().unwrap();
+            s.harness.request_abort(id).unwrap();
+            s.cancel.cancel();
+        }
+        s.shutdown().await.unwrap();
+        let h = Harness::open(&path, opts(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(h.blocked(id).unwrap().is_some());
+        assert_eq!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
     }
     struct FailingModel;
     #[async_trait::async_trait]
