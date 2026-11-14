@@ -19,6 +19,8 @@ pub struct Entry {
 }
 pub type KeyedEntry = (Vec<u8>, Entry);
 pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
+pub type DocumentChange = (Vec<u8>, Option<Entry>);
+pub type DocumentCommit = (u64, Vec<DocumentChange>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     pub key: Vec<u8>,
@@ -97,6 +99,7 @@ impl Store {
         conn.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS durable_document_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
             CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS durable_document_history_by_revision ON durable_document_history(revision, key);
             CREATE TABLE IF NOT EXISTS durable_document_cuts (key BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
             INSERT INTO durable_document_history(key, revision, value, version)
                 SELECT key, 0, value, version FROM durable_store_entries
@@ -261,6 +264,43 @@ impl Store {
             result.push((revision, entry));
         }
         Ok(result)
+    }
+
+    /// Complete document commits after a revision, bounded by commit count.
+    /// Each frame contains every changed document, ordered by storage key.
+    pub fn document_commits(&self, after: u64, limit: usize) -> Result<Vec<DocumentCommit>, Error> {
+        if limit == 0 || limit > 256 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if after > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let mut stmt = conn.prepare("SELECT revision,key,value,version FROM durable_document_history WHERE revision IN (SELECT DISTINCT revision FROM durable_document_history WHERE revision>?1 ORDER BY revision LIMIT ?2) ORDER BY revision,key")?;
+        let mut rows = stmt.query(params![after, limit as i64])?;
+        let mut commits: Vec<DocumentCommit> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let revision: u64 = row.get(0)?;
+            let key = row.get(1)?;
+            let entry = match (
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+            ) {
+                (Some(value), Some(version)) => Some(Entry { value, version }),
+                (None, None) => None,
+                _ => return Err(Error::Storage(rusqlite::Error::InvalidQuery)),
+            };
+            if commits.last().is_none_or(|frame| frame.0 != revision) {
+                commits.push((revision, Vec::new()));
+            }
+            commits.last_mut().unwrap().1.push((key, entry));
+        }
+        Ok(commits)
     }
 
     /// Document revision recorded atomically with a conversation fork record.

@@ -43,6 +43,11 @@ impl Address {
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(result)
     }
+    fn from_storage_key(key: &[u8]) -> Result<Self, Error> {
+        let [scope, name, key] =
+            serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;
+        Ok(Self { scope, name, key })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +61,47 @@ pub struct Document {
 pub struct DocumentRevision {
     pub revision: u64,
     pub document: Option<Document>,
+}
+
+/// Final document states written by one atomic store commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentCommit {
+    pub revision: u64,
+    pub changes: Vec<(Address, Option<Document>)>,
+}
+
+/// Pull-based stream of complete document commits across the database.
+pub struct DocumentCommitWatch<'a> {
+    store: &'a Store,
+    cursor: u64,
+}
+impl DocumentCommitWatch<'_> {
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Return up to `limit` complete commits (1..=256). Errors do not advance the cursor.
+    pub fn poll(&mut self, limit: usize) -> Result<Vec<DocumentCommit>, Error> {
+        let frames = self.store.document_commits(self.cursor, limit)?;
+        let result = frames
+            .into_iter()
+            .map(|(revision, changes)| {
+                Ok(DocumentCommit {
+                    revision,
+                    changes: changes
+                        .into_iter()
+                        .map(|(key, entry)| {
+                            Ok((Address::from_storage_key(&key)?, Documents::decode(entry)?))
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        if let Some(last) = result.last() {
+            self.cursor = last.revision;
+        }
+        Ok(result)
+    }
 }
 
 /// Pull-based watch. Persist the cursor only after consuming its entire page.
@@ -95,6 +141,34 @@ pub struct Documents<'a> {
 impl<'a> Documents<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self { store }
+    }
+    /// Capture all live documents and attach a commit stream at the same boundary.
+    pub fn watch_commits(&self) -> Result<(DocumentCommit, DocumentCommitWatch<'a>), Error> {
+        let revision = self.store.document_snapshot()?;
+        let changes = self
+            .store
+            .documents_at(revision)?
+            .into_iter()
+            .map(|(key, entry)| Ok((Address::from_storage_key(&key)?, Self::decode(Some(entry))?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok((
+            DocumentCommit { revision, changes },
+            DocumentCommitWatch {
+                store: self.store,
+                cursor: revision,
+            },
+        ))
+    }
+
+    /// Resume after a fully consumed commit in the same database.
+    pub fn resume_commit_watch(&self, cursor: u64) -> Result<DocumentCommitWatch<'a>, Error> {
+        if cursor > self.store.document_snapshot()? {
+            return Err(durable_store::Error::InvalidSnapshot.into());
+        }
+        Ok(DocumentCommitWatch {
+            store: self.store,
+            cursor,
+        })
     }
     /// Attach at a consistent immutable boundary, even if a writer commits
     /// between capturing the boundary and reading the initial document.

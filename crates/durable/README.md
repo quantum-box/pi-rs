@@ -415,8 +415,28 @@ database and address after reopening. Replaying from an older cursor can
 repeat states. A cursor is not an acknowledgement or a portable database ID;
 callers must retain its database and address and schedule their own polling.
 
+`Documents::watch_commits` captures all live documents at one immutable
+revision and returns a database-wide `DocumentCommitWatch`. Its `poll` returns
+up to 256 document commits in revision order, each containing all document
+states changed by that store transaction, ordered by encoded address; deletes
+are `None`. A page never splits a commit. Persist the cursor only after the
+entire page is processed; `resume_commit_watch` resumes exclusively from that
+database-local revision after reopen. The initial snapshot and each individual
+commit can contain arbitrarily many documents and bytes: the limit bounds only
+the number of commits. A commit without document mutations is not emitted.
+The stream records final states, not mutation order, intermediate writes, or
+non-document parts of a store transaction. It includes every document scope;
+callers must apply their own access control and filtering.
+
 This is a subset of upstream `watchDoc`: it exposes whole committed states,
 not Chord operations, callbacks, abort/lifecycle handling or live notifications.
+Upstream attaches only to an existing address and delivers operation batches,
+folding pending operations and falling back to a root replacement above 10,000
+operations. Its retirement/incarnation and task-end semantics, listener
+lifecycle, delivery context, and operation-level ordering are not implemented.
+The database-wide stream is a pi-rs extension, not an upstream Chord frame or
+an implementation of its convergent callback queue. See upstream
+`packages/durable/docs/spec.md` section 9.2 (compared at c1d4b0ac).
 Multiple mutations of one key in a single raw batch collapse to the final
 state, and raw deletes of missing keys still appear. Pages bound the number of
 states, not their bytes, and history has no garbage collection. Legacy databases

@@ -103,3 +103,144 @@ fn attach_racing_commits_never_misses_a_revision() {
     }
     assert_eq!(numbers, (numbers[0]..=100).collect::<Vec<_>>());
 }
+
+#[test]
+fn complete_commit_pages_survive_deletion_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.db");
+    let store = Store::open(&path).unwrap();
+    let a = address();
+    let mut b = a.clone();
+    b.key = "second".into();
+    let docs = Documents::new(&store);
+    let (initial, mut watch) = docs.watch_commits().unwrap();
+    assert!(initial.changes.is_empty());
+    let mut tx = Transaction::new();
+    for item in [&a, &b] {
+        tx.put(
+            item,
+            Expected::Missing,
+            json!({"n": 1}).as_object().unwrap(),
+        )
+        .unwrap();
+    }
+    tx.commit(&store).unwrap();
+    let mut tx = Transaction::new();
+    tx.delete(&a, docs.get(&a).unwrap().unwrap().version)
+        .unwrap();
+    tx.put(
+        &b,
+        Expected::Version(docs.get(&b).unwrap().unwrap().version),
+        json!({"n": 2}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    assert!(watch.poll(0).is_err());
+    assert_eq!(watch.cursor(), initial.revision);
+    let page = watch.poll(1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].changes.len(), 2);
+    assert!(
+        page[0]
+            .changes
+            .iter()
+            .all(|(_, value)| value.as_ref().unwrap().value["n"] == 1)
+    );
+    let cursor = watch.cursor();
+    drop(watch);
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let mut watch = docs.resume_commit_watch(cursor).unwrap();
+    let page = watch.poll(1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(page[0].revision > cursor);
+    assert_eq!(page[0].changes.len(), 2);
+    assert!(
+        page[0]
+            .changes
+            .iter()
+            .any(|(key, value)| key == &a && value.is_none())
+    );
+    assert!(
+        page[0]
+            .changes
+            .iter()
+            .any(|(key, value)| key == &b && value.as_ref().unwrap().value["n"] == 2)
+    );
+    assert!(watch.poll(1).unwrap().is_empty());
+    assert!(docs.resume_commit_watch(u64::MAX).is_err());
+}
+
+#[test]
+fn commit_watch_attachment_is_consistent_during_batched_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("race.db");
+    let store = Store::open(&path).unwrap();
+    let writer = Store::open(&path).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let other = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        let a = address();
+        let mut b = a.clone();
+        b.key = "second".into();
+        other.wait();
+        for n in 0..50 {
+            let docs = Documents::new(&writer);
+            let mut tx = Transaction::new();
+            for item in [&a, &b] {
+                let expected = docs
+                    .get(item)
+                    .unwrap()
+                    .map_or(Expected::Missing, |d| Expected::Version(d.version));
+                tx.put(item, expected, json!({"n": n}).as_object().unwrap())
+                    .unwrap();
+            }
+            tx.commit(&writer).unwrap();
+        }
+    });
+    barrier.wait();
+    let (initial, mut watch) = Documents::new(&store).watch_commits().unwrap();
+    let initial_n = if initial.changes.is_empty() {
+        -1
+    } else {
+        assert_eq!(initial.changes.len(), 2);
+        let n = initial.changes[0].1.as_ref().unwrap().value["n"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(initial.changes[1].1.as_ref().unwrap().value["n"], n);
+        n
+    };
+    thread.join().unwrap();
+    let frames = watch.poll(256).unwrap();
+    let mut numbers = Vec::new();
+    for frame in frames {
+        assert_eq!(frame.changes.len(), 2);
+        let n = frame.changes[0].1.as_ref().unwrap().value["n"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(frame.changes[1].1.as_ref().unwrap().value["n"], n);
+        numbers.push(n);
+    }
+    assert_eq!(numbers, ((initial_n + 1)..50).collect::<Vec<_>>());
+}
+
+#[test]
+fn malformed_frame_does_not_advance_commit_cursor() {
+    use durable_store::Mutation;
+    let store = Store::memory().unwrap();
+    let docs = Documents::new(&store);
+    let (_, mut watch) = docs.watch_commits().unwrap();
+    store
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: b"durable/document/not-json".to_vec(),
+                value: b"{}".to_vec(),
+            }],
+        )
+        .unwrap();
+    assert!(watch.poll(1).is_err());
+    assert_eq!(watch.cursor(), 0);
+    assert!(watch.poll(1).is_err());
+}
