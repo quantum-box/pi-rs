@@ -61,6 +61,15 @@ pub enum BlockedReason {
     MigrationFailed(String),
 }
 
+/// A live task whose stored definition cannot currently execute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedTask {
+    pub id: Uuid,
+    pub kind: Option<String>,
+    pub owner: TaskOwner,
+    pub reason: BlockedReason,
+}
+
 struct Registration {
     version: u32,
     migrate: Option<Arc<Migration>>,
@@ -306,6 +315,28 @@ impl Scheduler {
             }
         }
         None
+    }
+    /// Poll the current blocked state. Terminal tasks are excluded; this does
+    /// not execute migrations or record a durable event history.
+    pub fn blocked_tasks(&self) -> Result<Vec<BlockedTask>, Error> {
+        self.check()?;
+        Ok(self
+            .ts()
+            .list()?
+            .into_iter()
+            .filter_map(|snapshot| {
+                let task = snapshot.task;
+                if task.is_terminal() {
+                    return None;
+                }
+                self.blocked_reason(&task).map(|reason| BlockedTask {
+                    id: task.id(),
+                    kind: task.kind().map(str::to_owned),
+                    owner: task.owner().clone(),
+                    reason,
+                })
+            })
+            .collect())
     }
     // Compute migration on a detached record; persist it together with reservation.
     fn reserve_resolved(&mut self, snapshot: &task_store::StoredTask) -> Result<bool, Error> {
@@ -899,6 +930,15 @@ mod tests {
         s.submit(&t).unwrap();
         s.replace_registry(Registry::default()).unwrap();
         assert_eq!(s.blocked_reason(&t), Some(BlockedReason::MissingTask));
+        assert_eq!(
+            s.blocked_tasks().unwrap(),
+            vec![BlockedTask {
+                id: t.id(),
+                kind: Some("job".into()),
+                owner: t.owner().clone(),
+                reason: BlockedReason::MissingTask,
+            }]
+        );
         assert!(!s.tick(0).unwrap());
         let mut r = Registry::default();
         r.register_versioned(
@@ -954,6 +994,7 @@ mod tests {
         r.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
         let s = Scheduler::open(&path, r).unwrap();
         assert_eq!(s.blocked_reason(&finished), Some(BlockedReason::TaskTooOld));
+        assert!(s.blocked_tasks().unwrap().is_empty());
     }
 
     #[test]

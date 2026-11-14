@@ -425,12 +425,19 @@ changing the record. `blocked_reason` inspects this state without running code;
 `replace_registry` reconsiders blocked work at a scheduling boundary, and reopen
 also retries failures. New submissions must match the registered version.
 
-Parity limitations: the standalone scheduler uses host-driven ticks and an
-explicit whole-registry replacement; the background driver cannot replace its
-registry or report blocked changes. Replacement clears all cached migration
-failures, even for unchanged definitions, and reopening retries them. Migration
-failures are exposed by `blocked_reason` rather than upstream report/graph/wake
-notifications. The synchronous callback uses Rust `Result` and a structured
+Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal tasks,
+including their IDs, kinds, owners and current reasons; `blocked_reason` also
+inspects an individual record. The background driver's `replace_registry` waits
+for the current synchronous handler to finish, updates admission policies at the
+same boundary, and wakes its worker. Calling it or `blocked_tasks` from a handler
+on that driver would deadlock. Replacement clears all cached migration failures,
+even for unchanged definitions, and reopening retries them. Snapshots are not a
+durable change log: short-lived changes can be missed and missing-migration and
+migration callback failures share `MigrationFailed` (with diagnostic text).
+
+Parity limitations: the standalone scheduler uses host-driven ticks and both
+schedulers replace the whole registry. Unlike upstream, there is no report callback,
+task-graph integration, or host wake notification for blocked changes. The synchronous callback uses Rust `Result` and a structured
 `Checkpoint` rather than upstream's JavaScript task types and JSON checkpoint;
 panics are not converted into migration failure reports. Blocked aborts use the
 existing generic failed/orphan message rather than upstream's typed orphaned

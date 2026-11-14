@@ -29,8 +29,6 @@ pub enum Error {
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     owner: Arc<OwnedStore>,
-    policies: HashMap<String, (bool, u32)>,
-    definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
     state: Mutex<State>,
     wake: Condvar,
     harness: Option<Mutex<crate::runtime::Harness>>,
@@ -40,6 +38,8 @@ pub(crate) struct Shared {
 struct State {
     stop: bool,
     failure: Option<String>,
+    policies: HashMap<String, (bool, u32)>,
+    definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
 }
 /// Drop asks the thread to stop; `shutdown` additionally waits for it. The
 /// thread retains storage ownership until its current handler returns.
@@ -68,9 +68,11 @@ impl Driver {
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
             owner,
-            policies,
-            definitions,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                policies,
+                definitions,
+                ..State::default()
+            }),
             wake: Condvar::new(),
             harness: harness.map(Mutex::new),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -136,10 +138,10 @@ impl Driver {
         Ok(state)
     }
     pub fn submit(&self, task: &Task) -> Result<(), Error> {
-        let _state = self.check()?;
+        let state = self.check()?;
         let registered = task
             .kind()
-            .and_then(|kind| self.shared.policies.get(kind))
+            .and_then(|kind| state.policies.get(kind))
             .copied();
         if registered != Some((task.replay_safe(), task.definition_version()))
             || !matches!(task.owner(), TaskOwner::Conversation(_))
@@ -178,6 +180,31 @@ impl Driver {
         self.shared.wake.notify_one();
         Ok(())
     }
+    /// Replace the complete registry at a scheduling boundary. This waits for
+    /// an in-flight handler and wakes the worker to reconsider blocked tasks.
+    pub fn replace_registry(&self, registry: task_scheduler::Registry) -> Result<(), Error> {
+        let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
+        let mut state = self.check()?;
+        let result = scheduler.replace_registry(registry);
+        state.policies = scheduler.policies();
+        state.definitions = scheduler.definitions();
+        if let Err(error) = result {
+            state.failure = Some(error.to_string());
+            state.stop = true;
+            self.shared.wake.notify_all();
+            return Err(error.into());
+        }
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    /// Snapshot nonterminal tasks currently blocked by their definitions.
+    pub fn blocked_tasks(&self) -> Result<Vec<task_scheduler::BlockedTask>, Error> {
+        let scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
+        let _state = self.check()?;
+        Ok(scheduler.blocked_tasks()?)
+    }
+
     /// Persist the abort without waiting for a running handler. The handler's
     /// output is discarded when it returns; cleanup then runs on the worker.
     pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
@@ -379,7 +406,7 @@ impl Shared {
         if state.stop
             || tasks.iter().any(|task| {
                 task.kind()
-                    .and_then(|kind| self.policies.get(kind))
+                    .and_then(|kind| state.policies.get(kind))
                     .copied()
                     != Some((task.replay_safe(), task.definition_version()))
                     || task.owner() != &TaskOwner::Conversation(conversation)
@@ -419,11 +446,12 @@ impl Shared {
         name: &str,
         handler: &Arc<dyn task_scheduler::Handler>,
     ) -> Option<bool> {
-        if self.state.lock().ok()?.stop {
+        let state = self.state.lock().ok()?;
+        if state.stop {
             return None;
         }
-        let (policy, registered) = self.definitions.get(name)?;
-        if self.policies.get(name)?.1 != 1 {
+        let (policy, registered) = state.definitions.get(name)?;
+        if state.policies.get(name)?.1 != 1 {
             return None;
         }
         Arc::ptr_eq(handler, registered).then_some(*policy)
@@ -436,6 +464,90 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn replacement_exposes_failures_and_restarts_blocked_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), Default::default()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "old".into(),
+                data: json!(null),
+            },
+            5,
+        )
+        .unwrap()
+        .registered("job".into(), true);
+        TaskStore::new(scheduler.owner().store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        assert_eq!(
+            driver.blocked_tasks().unwrap()[0].reason,
+            task_scheduler::BlockedReason::MissingTask
+        );
+        let mut bad = task_scheduler::Registry::default();
+        bad.register_versioned(
+            "job",
+            2,
+            true,
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+            Some(Arc::new(|_, _, _| Err("bad checkpoint".into()))),
+        );
+        driver.replace_registry(bad).unwrap();
+        assert_eq!(
+            driver.shared.state.lock().unwrap().policies.get("job"),
+            Some(&(true, 2))
+        );
+        assert!(driver.submit(&task).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocked = driver.blocked_tasks().unwrap();
+            if blocked.iter().any(|item| matches!(&item.reason, task_scheduler::BlockedReason::MigrationFailed(e) if e == "bad checkpoint"))
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(driver.get(task.id()).unwrap().unwrap(), task);
+        let mut good = task_scheduler::Registry::default();
+        good.register_versioned(
+            "job",
+            2,
+            true,
+            |t: &Task| {
+                assert_eq!(t.checkpoint().phase, "new");
+                Ok(task_scheduler::Step::Succeed(json!(true)))
+            },
+            Some(Arc::new(|_, _, _| {
+                Ok((
+                    json!(null),
+                    Checkpoint {
+                        phase: "new".into(),
+                        data: json!(null),
+                    },
+                ))
+            })),
+        );
+        driver.replace_registry(good).unwrap();
+        loop {
+            if driver.get(task.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(driver.blocked_tasks().unwrap().is_empty());
+        assert_eq!(
+            driver.get(task.id()).unwrap().unwrap().definition_version(),
+            2
+        );
+        driver.shutdown().unwrap();
+    }
 
     #[test]
     fn abort_fence_does_not_hold_state_against_conversation_policy_lookup() {
@@ -493,10 +605,12 @@ mod tests {
         // Construct without worker threads so they cannot consume the test task.
         let shared = Arc::new(Shared {
             owner: scheduler.owner(),
-            policies: scheduler.policies(),
-            definitions: scheduler.definitions(),
+            state: Mutex::new(State {
+                policies: scheduler.policies(),
+                definitions: scheduler.definitions(),
+                ..State::default()
+            }),
             scheduler: Mutex::new(scheduler),
-            state: Mutex::new(State::default()),
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
