@@ -206,10 +206,28 @@ fn share_context_tracks_idle_and_inflight_worker() {
 #[test]
 fn terminal_shares_idle_and_during_model_request() {
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
     let root = tempfile::tempdir().unwrap();
     let prompt = root.path().join("system.txt");
     std::fs::write(&prompt, "Terminal share prompt").unwrap();
+    let extension = root.path().join("context.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+r = json.load(sys.stdin)
+if r['type'] == 'describe':
+    result = {'id':'share-context-fixture','dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True}
+elif r['type'] == 'context_with_system':
+    result = r['messages']
+    for message in result:
+        if message['role'] == 'system': message['content'] += ' fixture-context-hook'
+elif r['type'] == 'before_request':
+    result = r['request']
+else:
+    result = None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
     let model_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let model_endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -256,8 +274,8 @@ fn terminal_shares_idle_and_during_model_request() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let model = std::thread::spawn(move || {
-        let (mut socket, _request) = accept_model_request(model_listener);
-        started_tx.send(()).unwrap();
+        let (mut socket, request) = accept_model_request(model_listener);
+        started_tx.send(request).unwrap();
         release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
         let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -299,7 +317,6 @@ fn terminal_shares_idle_and_during_model_request() {
             "--offline",
             "--no-mcp",
             "--no-trust",
-            "--no-extensions",
             "--no-skills",
             "--no-context-files",
             "--tui-mode",
@@ -311,6 +328,8 @@ fn terminal_shares_idle_and_during_model_request() {
             "--system-prompt",
         ])
         .arg(&prompt)
+        .arg("--extension")
+        .arg(&extension)
         .arg("--session")
         .arg(root.path().join("session.jsonl"))
         .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -378,7 +397,17 @@ fn terminal_shares_idle_and_during_model_request() {
     );
     wait_output(&mut master, "Share URL:");
     master.write_all(b"hello\r").unwrap();
-    started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let request = started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("fixture-context-hook")))
+    );
     master.write_all(b"/share\r").unwrap();
     let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
