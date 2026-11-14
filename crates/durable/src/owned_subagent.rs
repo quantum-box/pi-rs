@@ -846,6 +846,104 @@ mod tests {
         assert!(!h.conversation(background).unwrap().abort_requested);
     }
 
+    #[tokio::test]
+    async fn owner_shutdown_drains_cleanup_before_joining_handler() {
+        use crate::{
+            extension,
+            runtime::RuntimeOwner,
+            task_scheduler::{Registry, Step},
+        };
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, task_owner) = setup(&mut h);
+        let child = h
+            .ensure_task_owned_subagent(task, task_owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let waiting = Task::new(
+            Uuid::new_v4(),
+            task_owner,
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap()
+        .registered("wait-cleanup".into(), true);
+        TaskStore::new(h.subagent_store().unwrap())
+            .save(&[Save::Create(&waiting)])
+            .unwrap();
+        drop(h);
+
+        // Publish a worker to the handler only after opening the owner. Hold the
+        // child's worker lock so cleanup cannot win the shutdown race early.
+        let worker_slot = Arc::new(std::sync::Mutex::new(None::<Harness>));
+        let slot = worker_slot.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut registry = Registry::default();
+        registry.register("wait-cleanup", true, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|h| !h.conversation(child).unwrap().abort_requested)
+                {
+                    return Ok(Step::Succeed(serde_json::Value::Null));
+                }
+                if Instant::now() >= deadline {
+                    return Err("cleanup did not complete".into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut owner =
+            RuntimeOwner::open(&path, options(), extension::Registry::default(), registry).unwrap();
+        let h = owner.scheduler_mut().subagent_harness();
+        let root = h.owner.conversation_controls().root();
+        let guard = h
+            .owner
+            .conversation_controls()
+            .get(child)
+            .worker
+            .clone()
+            .lock_owned()
+            .await;
+        h.request_abort_task(task).unwrap();
+        *worker_slot.lock().unwrap() = Some(h.worker());
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        let shutdown = tokio::spawn(owner.shutdown());
+        tokio::time::timeout(Duration::from_secs(5), root.cancelled())
+            .await
+            .unwrap();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(8), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(worker_slot.lock().unwrap().take());
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        assert!(matches!(
+            TaskStore::new(reopened.subagent_store().unwrap())
+                .load(waiting.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            crate::task::TaskState::Succeeded(_)
+        ));
+    }
+
     #[test]
     fn standalone_driver_abort_races_foreground_admission_atomically() {
         for _ in 0..20 {

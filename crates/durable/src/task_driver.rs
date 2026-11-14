@@ -298,11 +298,12 @@ impl Driver {
         }
     }
     pub fn shutdown(mut self) -> Result<(), Error> {
-        self.stop();
+        self.stop_worker();
         let worker_panicked = self
             .worker
             .take()
             .is_some_and(|worker| worker.join().is_err());
+        self.shared.cleanup_stop.cancel();
         let cleanup_panicked = self
             .cleanup
             .take()
@@ -320,6 +321,9 @@ impl Driver {
     }
     fn stop(&self) {
         self.shared.cleanup_stop.cancel();
+        self.stop_worker();
+    }
+    fn stop_worker(&self) {
         if let Ok(mut state) = self.shared.state.lock() {
             state.stop = true;
             self.shared.wake.notify_all();

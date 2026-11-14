@@ -875,7 +875,7 @@ impl Harness {
         let control = self.owner.conversation_controls().get(id);
         self.execution_gate = Some(control.gate);
         tokio::select! {
-            result = drive_scheduled(self, id, &control.cancel) => result,
+            result = drive_scheduled(self, id, &control.cleanup_cancel) => result,
             _ = stop.cancelled() => Ok(()),
         }
     }

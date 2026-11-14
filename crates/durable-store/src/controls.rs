@@ -17,6 +17,8 @@ pub struct Control {
     pub gate: Arc<Mutex<()>>,
     pub worker: Arc<tokio::sync::Mutex<()>>,
     pub cancel: CancellationToken,
+    /// Cleanup survives scheduler shutdown but is fenced by later aborts.
+    pub cleanup_cancel: CancellationToken,
 }
 
 /// A poisoned poll gate or a failed durable commit.
@@ -45,6 +47,7 @@ impl ConversationControls {
                 gate: Arc::new(Mutex::new(())),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
                 cancel: self.root.child_token(),
+                cleanup_cancel: CancellationToken::new(),
             })
             .clone()
     }
@@ -66,7 +69,9 @@ impl ConversationControls {
         for id in &affected {
             if let Some(control) = entries.get_mut(id) {
                 control.cancel.cancel();
+                control.cleanup_cancel.cancel();
                 control.cancel = self.root.child_token();
+                control.cleanup_cancel = CancellationToken::new();
             }
         }
         Ok(affected)
@@ -131,6 +136,16 @@ mod tests {
             .fence(|| Ok::<_, ()>(vec![id]))
             .unwrap();
         assert!(first.cancel.is_cancelled());
+        assert!(first.cleanup_cancel.is_cancelled());
+        assert!(!attached
+            .conversation_controls()
+            .get(id)
+            .cleanup_cancel
+            .is_cancelled());
+        attached.conversation_controls().root().cancel();
+        let cleanup = attached.conversation_controls().get(id);
+        assert!(cleanup.cancel.is_cancelled());
+        assert!(!cleanup.cleanup_cancel.is_cancelled());
         drop(attached);
         drop(owner);
         let reopened = OwnedStore::open(&path).unwrap();
