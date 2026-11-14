@@ -259,7 +259,7 @@
 +    pub struct Unnameable(pub(super) Uri, pub(super) Option<Option<Intercepted>>);
 --- a/src/async_impl/client.rs
 +++ b/src/async_impl/client.rs
-@@ -141,0 +142,64 @@
+@@ -141,0 +142,71 @@
 +    routing: Option<Arc<RouteRouting>>,
 +}
 +
@@ -269,6 +269,8 @@
 +struct RouteKey {
 +    proxy: Option<String>,
 +    auth: Option<Vec<u8>>,
++    #[cfg(feature = "socks")]
++    socks_auth: Option<(Vec<u8>, Vec<u8>)>,
 +    headers: Vec<(String, Vec<u8>)>,
 +    tunnel: bool,
 +}
@@ -297,6 +299,11 @@
 +                .as_ref()
 +                .and_then(|p| p.basic_auth())
 +                .map(|h| h.as_bytes().to_vec()),
++            #[cfg(feature = "socks")]
++            socks_auth: route
++                .as_ref()
++                .and_then(|p| p.raw_auth())
++                .map(|(user, pass)| (user.as_bytes().to_vec(), pass.as_bytes().to_vec())),
 +            headers,
 +            tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
 +        };
@@ -324,7 +331,7 @@
 +        }
 +        client
 +    }
-@@ -153 +217,32 @@
+@@ -153 +224,32 @@
 -    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +        if let Some(routing) = &self.routing {
@@ -358,7 +365,7 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -1008 +1103,12 @@
+@@ -1008 +1110,12 @@
 -        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
 +        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
 +            && !connector_builder.uses_local_transport();
@@ -372,18 +379,18 @@
 +            })
 +        });
 +        let hyper_client = builder.build(connector);
-@@ -1010,0 +1117 @@
+@@ -1010,0 +1124 @@
 +            routing,
-@@ -1097,0 +1205 @@
+@@ -1097,0 +1212 @@
 +                dynamic_routing,
-@@ -2605,2 +2713,4 @@
+@@ -2605,2 +2720,4 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
 +        if !self.inner.dynamic_routing {
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2676,3 +2786,8 @@
+@@ -2676,3 +2793,8 @@
 -            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
 -                headers.insert(PROXY_AUTHORIZATION, header);
 -                break;
@@ -395,7 +402,7 @@
 +                    headers.insert(PROXY_AUTHORIZATION, header);
 +                    break;
 +                }
-@@ -2693,5 +2808,10 @@
+@@ -2693,5 +2815,10 @@
 -            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
 -                iter.iter().for_each(|(key, value)| {
 -                    headers.insert(key, value.clone());
@@ -411,5 +418,5 @@
 +                    });
 +                    break;
 +                }
-@@ -2925,0 +3046 @@
+@@ -2925,0 +3053 @@
 +    dynamic_routing: bool,

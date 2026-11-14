@@ -148,6 +148,8 @@ struct HyperService {
 struct RouteKey {
     proxy: Option<String>,
     auth: Option<Vec<u8>>,
+    #[cfg(feature = "socks")]
+    socks_auth: Option<(Vec<u8>, Vec<u8>)>,
     headers: Vec<(String, Vec<u8>)>,
     tunnel: bool,
 }
@@ -176,6 +178,11 @@ impl RouteRouting {
                 .as_ref()
                 .and_then(|p| p.basic_auth())
                 .map(|h| h.as_bytes().to_vec()),
+            #[cfg(feature = "socks")]
+            socks_auth: route
+                .as_ref()
+                .and_then(|p| p.raw_auth())
+                .map(|(user, pass)| (user.as_bytes().to_vec(), pass.as_bytes().to_vec())),
             headers,
             tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
         };

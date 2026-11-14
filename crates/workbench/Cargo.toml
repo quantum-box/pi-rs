@@ -79,6 +79,8 @@ uuid = { version = "1", features = ["serde"] }
 filetime = "0.2.29"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["socks"] }
+reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
