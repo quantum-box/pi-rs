@@ -373,3 +373,113 @@ async fn rejects_rooted_home_tail_before_backend_calls() {
         Outcome::Failed(_)
     ));
 }
+
+#[tokio::test]
+async fn file_urls_are_validated_before_any_grep_backend_call() {
+    #[derive(Default)]
+    struct Spy(Mutex<Vec<PathBuf>>);
+    #[async_trait::async_trait]
+    impl GrepOperations for Spy {
+        async fn is_directory(&self, path: &Path) -> Result<bool> {
+            self.0.lock().unwrap().push(path.to_owned());
+            Ok(true)
+        }
+        async fn search(
+            &self,
+            request: GrepRequest,
+            _: CancellationToken,
+            _: tokio::sync::mpsc::Sender<GrepMatch>,
+        ) -> Result<()> {
+            self.0.lock().unwrap().push(request.path);
+            Ok(())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Spy::default());
+    let tool = create_grep_tool(root.path(), backend.clone()).unwrap();
+    let base = url::Url::from_directory_path(root.path())
+        .unwrap()
+        .to_string();
+    for (suffix, expected) in [
+        ("bad%2Fchild", "encoded"),
+        ("bad%2fchild", "encoded"),
+        ("bad%zz", "URI malformed"),
+        ("bad%ff", "URI malformed"),
+        ("bad%ed%a0%80", "URI malformed"),
+        ("bad%zz%2f", "encoded"),
+    ] {
+        let result = tool
+            .invoke(
+                json!({"pattern":"needle", "path":format!("{base}{suffix}")}),
+                context(),
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(ref message) if message.contains(expected)),
+            "{suffix}: {result:?}"
+        );
+    }
+    assert!(backend.0.lock().unwrap().is_empty());
+    for suffix in ["with%20space", "plain?ignored=%2F#%FF"] {
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"needle", "path":format!("{base}{suffix}")}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+    }
+    #[cfg(unix)]
+    assert!(matches!(
+        tool.invoke(
+            json!({"pattern":"needle", "path":format!("{base}literal%5Cname")}),
+            context()
+        )
+        .await,
+        Outcome::Succeeded(_)
+    ));
+    #[cfg(windows)]
+    {
+        assert!(
+            matches!(tool.invoke(json!({"pattern":"needle", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))
+        );
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"needle", "path":"file://xn--n3h/share/a%20b"}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+    }
+    let calls = backend.0.lock().unwrap();
+    assert_eq!(
+        &calls[0..2],
+        &[
+            root.path().join("with space"),
+            root.path().join("with space")
+        ]
+    );
+    assert_eq!(
+        &calls[2..4],
+        &[root.path().join("plain"), root.path().join("plain")]
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        &calls[4..6],
+        &[
+            root.path().join("literal\\name"),
+            root.path().join("literal\\name")
+        ]
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        &calls[4..6],
+        &[
+            PathBuf::from(r"\\☃\share\a b"),
+            PathBuf::from(r"\\☃\share\a b")
+        ]
+    );
+    assert_eq!(calls.len(), 6);
+}

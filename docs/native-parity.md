@@ -886,7 +886,14 @@ custom read operations because grep, find and ls still access the local filesyst
 To use all four tools on one remote workspace, `create_remote_read_only_tools`
 accepts one `Arc` whose backend implements read, grep, find, and ls operations.
 Its working directory and optional backend home are absolute paths in that
-backend's namespace. The backend enforces access controls and search semantics,
+backend's namespace. Local tools and injected `find`, `grep`, and `ls` share
+file URL validation: malformed UTF-8, percent escapes and encoded path separators
+are rejected before backend calls; query and fragment escapes are not path
+escapes. On Unix encoded backslashes remain literal filename characters. On
+Windows valid IDN UNC hostnames are decoded to Unicode before backend dispatch,
+matching Node's `fileURLToPath`. The URL parser still rejects some malformed
+punycode hosts that Node accepts; this stricter existing behavior remains a
+compatibility difference. Backends enforce access controls and search semantics,
 including matching, ignore rules, and ordering. A set is an `Extension` and can
 be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
