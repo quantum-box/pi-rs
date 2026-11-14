@@ -4800,15 +4800,19 @@ mod tests {
                     .historical_model_resolver(resolver)
                     .build(journal)
                     .unwrap();
+            let mut events = session.subscribe();
             let result = session.checkout(historical);
+            let observed = std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. })));
             assert_eq!(writes.load(Ordering::SeqCst), 1);
             let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
             if fail_on == 1 {
                 assert!(result.is_err());
+                assert!(!observed);
                 assert_eq!(restored.head(), current);
                 assert_eq!(restored.model_provider(), Some("current"));
             } else {
                 result.unwrap();
+                assert!(observed);
                 assert_eq!(restored.model_provider(), Some("replacement"));
                 assert_eq!(restored.model_selection().unwrap().1, None);
             }
@@ -4933,12 +4937,14 @@ mod tests {
             .historical_model_resolver(resolver)
             .build(journal)
             .unwrap();
+        let mut events = session.subscribe();
         assert!(
             session
                 .navigate_tree(historical, crate::TreeNavigationOptions::default())
                 .await
                 .is_err()
         );
+        assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
         assert!(
             branch_client(
                 &session.registry,
@@ -5084,57 +5090,76 @@ mod tests {
                 Ok(())
             }
         }
-        for navigation in [false, true] {
-        let mut original = Session::with_store(MemoryStore::default()).unwrap();
-        original
-            .select_provider_model(Some("historical"), "shared", None)
-            .unwrap();
-        let target = original.head();
-        original
-            .select_provider_model(Some("current"), "shared", None)
-            .unwrap();
-        let registry = Registry::default();
-        let journal = Session::with_store(RevokingStore {
-            records: original.records().to_vec(),
-            registry: registry.clone(),
-            session_id: original.session_id(),
-        })
-        .unwrap();
-        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
-            Ok(HistoricalModelResolution::Fallback {
-                provider: "replacement".into(),
-                model: "shared".into(),
-                client: Arc::new(ProviderBranchModel("replacement")),
+        for mode in 0..3 {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("historical"), "shared", None)
+                .unwrap();
+            let target = original.head();
+            original
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let registry = Registry::default();
+            let journal = Session::with_store(RevokingStore {
+                records: original.records().to_vec(),
+                registry: registry.clone(),
+                session_id: original.session_id(),
             })
-        });
-        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
-            .provider("current")
-            .unwrap()
-            .registry(registry)
-            .historical_model_resolver(resolver)
-            .build(journal)
             .unwrap();
-        let mut events = session.subscribe();
-        if navigation {
-            session.navigate_tree(target, crate::TreeNavigationOptions::default()).await.unwrap();
-        } else {
-            session.checkout(target).unwrap();
-        }
-        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
-        assert_eq!(
-            session.journal().unwrap().model_provider(),
-            Some("replacement")
-        );
-        assert!(
-            branch_client(
-                &session.registry,
-                session.session_id,
-                Some("replacement"),
-                "shared"
-            )
-            .is_none()
-        );
-        assert!(session.prompt("must not dispatch").await.is_err());
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            });
+            let mut builder =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                    .provider("current")
+                    .unwrap()
+                    .registry(registry)
+                    .historical_model_resolver(resolver);
+            if mode == 2 {
+                builder = builder
+                    .extension(Arc::new(TreePreflightHook(Arc::new(
+                        Mutex::new(Vec::new()),
+                    ))))
+                    .unwrap();
+            }
+            let mut session = builder.build(journal).unwrap();
+            let mut events = session.subscribe();
+            if mode != 0 {
+                session
+                    .navigate_tree(
+                        target,
+                        crate::TreeNavigationOptions {
+                            summary: (mode == 2).then_some(crate::BranchSummaryOptions {
+                                instructions: None,
+                                reserve_tokens: 1024,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                session.checkout(target).unwrap();
+            }
+            assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. } | crate::Event::BranchSummary { fallback_model: Some(_), .. }))));
+            assert_eq!(
+                session.journal().unwrap().model_provider(),
+                Some("replacement")
+            );
+            assert!(
+                branch_client(
+                    &session.registry,
+                    session.session_id,
+                    Some("replacement"),
+                    "shared"
+                )
+                .is_none()
+            );
+            assert!(session.prompt("must not dispatch").await.is_err());
         }
     }
 
@@ -5233,6 +5258,8 @@ mod tests {
         #[allow(dead_code)]
         struct V3Record {
             version: u32,
+            id: u64,
+            parent: Option<u64>,
             event: V3Event,
         }
         #[derive(serde::Deserialize)]
@@ -5249,8 +5276,18 @@ mod tests {
             },
             BranchSummary {
                 summary: String,
+                #[serde(default)]
+                extension_summary: Option<crate::ExtensionTreeSummary>,
                 from: Option<u64>,
                 target: Option<u64>,
+                #[serde(default)]
+                usage: Option<crate::Usage>,
+                #[serde(default)]
+                usage_metadata: Option<Box<crate::SummaryUsageMetadata>>,
+                #[serde(default)]
+                read_files: Vec<String>,
+                #[serde(default)]
+                modified_files: Vec<String>,
             },
             SessionInfo {
                 name: Option<String>,
@@ -5259,16 +5296,25 @@ mod tests {
         }
         fn read_v3(records: &[crate::Record]) -> bool {
             let mut version = 1;
-            for record in records {
+            let mut head = 0;
+            for (index, record) in records.iter().enumerate() {
                 let Ok(old) =
                     serde_json::from_value::<V3Record>(serde_json::to_value(record).unwrap())
                 else {
                     return false;
                 };
-                if !(version..=3).contains(&old.version) {
+                let expected_parent = match &old.event {
+                    V3Event::BranchSummary { target, .. } => target.or((head != 0).then_some(head)),
+                    _ => (head != 0).then_some(head),
+                };
+                if !(version..=3).contains(&old.version)
+                    || old.id != index as u64 + 1
+                    || old.parent != expected_parent
+                {
                     return false;
                 }
                 version = old.version;
+                head = old.id;
             }
             true
         }
@@ -5344,6 +5390,25 @@ mod tests {
         assert!(reopened.recover_tree_trigger_handoff().unwrap().is_none());
         drop(reopened);
         session.close().await.unwrap();
+    }
+
+    #[test]
+    fn historical_fork_publish_failure_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        std::fs::write(&path, b"existing user data").unwrap();
+        let session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let target = session.journal().unwrap().head();
+        assert!(session.fork_to(target, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing user data");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            name == "fork.jsonl" || name == "fork.jsonl.lock"
+        }));
     }
 
     #[tokio::test]
