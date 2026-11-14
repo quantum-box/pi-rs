@@ -8,7 +8,7 @@ and pi-rs commit `a642cef`. Recheck upstream before implementing each phase.
 
 ## Implementation checkpoint
 
-The experimental `pi-rs-durable::runtime::Harness` now provides a sequential
+The experimental `pi-rs-durable::runtime::Harness` now provides a
 local scheduler, durable input admission, model and tool calls, and recovery on
 open. Interrupted model requests are settled unconfirmed before retry. Tool
 replay requires both recorded and current safe policies; unsafe tools use the
@@ -17,12 +17,14 @@ reconciliation. Model responses, tool intents, and tool results are saved
 before the next effect. Cancellation or a dropped scheduling future poisons
 the open harness until it is reopened.
 
-This is a subset of the design below, not complete upstream parity. In
-particular, scheduling is sequential and explicitly driven after admission,
-task-store is not wired into the runtime, and there is no live progress
-checkpoint, background scheduler, task graph, nested tool execution, fork,
-watch, or built-in polling. Runtime state still stores a whole conversation as
-one JSON value. See `crates/durable/README.md` for operational limits.
+`Scheduler` drives conversations concurrently in the background. Current-state
+fork, explicit compaction, durable snapshot observation, and one-pass polling
+of accepted external jobs are supported. Background workers repoll pending jobs,
+and nested calls are journaled with parent-owned identities. This is a subset of the design below,
+not complete upstream parity: task-store is not wired into the scheduler, and
+there is no durable streaming progress, historical-entry fork, automatic
+compaction, or durable timers for polling. Runtime state still stores a whole
+conversation as one JSON value. See `crates/durable/README.md` for limits.
 
 ## Scope and compatibility
 

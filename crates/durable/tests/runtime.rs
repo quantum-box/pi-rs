@@ -592,3 +592,36 @@ async fn paused_owner_can_run_another_conversation_after_failure() {
         Status::Running
     );
 }
+
+#[tokio::test]
+async fn background_scheduler_retries_interrupted_model_without_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: true,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let mut s = pi_rs_durable::runtime::Scheduler::open(
+        dir.path().join("db"),
+        options(model.clone(), tool.clone(), ReplayPolicy::Unsafe),
+    )
+    .unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(8), s.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "finished".into()
+        }
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    s.shutdown().await.unwrap();
+}

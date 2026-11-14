@@ -60,6 +60,7 @@ struct Shared {
     // Protects sealing, active calls, and the visited call counts together.
     lifecycle: Mutex<Lifecycle>,
     failed: AtomicBool,
+    idle: tokio::sync::Notify,
 }
 #[derive(Default)]
 struct Lifecycle {
@@ -83,6 +84,7 @@ impl Drop for Active {
     fn drop(&mut self) {
         if let Ok(mut state) = self.0.lifecycle.lock() {
             state.active -= 1;
+            self.0.idle.notify_one();
         } else {
             self.0.failed.store(true, Ordering::Release);
         }
@@ -119,6 +121,7 @@ impl NestedHost {
                 max_depth,
                 lifecycle: Mutex::new(lifecycle),
                 failed: AtomicBool::new(false),
+                idle: tokio::sync::Notify::new(),
             }),
             parent,
             depth: 0,
@@ -152,6 +155,44 @@ impl NestedHost {
     /// uncertain records, and no omitted previously recorded calls in any scope
     /// that was re-executed. Once sealed, later calls cannot dispatch.
     pub fn seal_and_inspect(&self) -> Result<(), InspectionError> {
+        self.inspect(false)
+    }
+    /// Prevent new nested dispatch, cancel outstanding calls and wait for
+    /// their futures to stop before the parent can be settled or reconciled.
+    pub async fn seal_and_wait(&self) -> Result<(), InspectionError> {
+        if self.parent != self.shared.root {
+            return Err(InspectionError::Uncertain("only root can inspect".into()));
+        }
+        {
+            let mut state = self
+                .shared
+                .lifecycle
+                .lock()
+                .map_err(|_| InspectionError::Uncertain("lifecycle lock poisoned".into()))?;
+            if state.sealed {
+                return Err(InspectionError::ActiveOrSealed);
+            }
+            state.sealed = true;
+            if state.active > 0 {
+                self.shared.cancellation.cancel();
+            }
+        }
+        loop {
+            let notified = self.shared.idle.notified();
+            let active = self
+                .shared
+                .lifecycle
+                .lock()
+                .map_err(|_| InspectionError::Uncertain("lifecycle lock poisoned".into()))?
+                .active;
+            if active == 0 {
+                break;
+            }
+            notified.await;
+        }
+        self.inspect(true)
+    }
+    fn inspect(&self, sealed_by_wait: bool) -> Result<(), InspectionError> {
         if self.parent != self.shared.root {
             return Err(InspectionError::Uncertain("only root can inspect".into()));
         }
@@ -160,7 +201,7 @@ impl NestedHost {
             .lifecycle
             .lock()
             .map_err(|_| InspectionError::Uncertain("lifecycle lock poisoned".into()))?;
-        if l.sealed || l.active != 0 {
+        if (l.sealed && !sealed_by_wait) || l.active != 0 {
             return Err(InspectionError::ActiveOrSealed);
         }
         l.sealed = true;

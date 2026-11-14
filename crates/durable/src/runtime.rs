@@ -10,9 +10,10 @@ use durable_store::{
     Check, Expected, Mutation,
     owner::{OwnedStore, OwnerError},
 };
+use futures_util::FutureExt;
 use pi_rs_core::{
     CancellationToken, ExtensionState, Invocation, Message, Model, Outcome, Tool, ToolCall,
-    ToolHost, ToolSpec, UsageReport,
+    ToolSpec, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +35,8 @@ pub enum Error {
     Storage(#[from] durable_store::Error),
     #[error("serialization: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("observation: {0}")]
+    Observer(#[from] crate::observer::Error),
     #[error("model: {0}")]
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
@@ -101,6 +104,24 @@ enum Phase {
         request_id: Uuid,
         restarts: u32,
     },
+    CompactionReady {
+        preparation: Box<crate::compact::Preparation>,
+        restarts: u32,
+    },
+    CompactionRunning {
+        preparation: Box<crate::compact::Preparation>,
+        request_id: Uuid,
+        restarts: u32,
+    },
+    CompactionAbandoned {
+        preparation: Box<crate::compact::Preparation>,
+        request_id: Uuid,
+        restarts: u32,
+    },
+    CompactionAccounting {
+        result: Box<crate::compact::CompactionResult>,
+        request_id: Uuid,
+    },
     Accounting {
         turns: u32,
         request_id: Uuid,
@@ -129,6 +150,13 @@ enum Phase {
         operation_id: Uuid,
         reason: String,
     },
+    Pending {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        index: usize,
+        operation_id: Uuid,
+        reference: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
@@ -150,6 +178,9 @@ pub struct Harness {
     dirty: Arc<AtomicBool>,
     merge_admissions: bool,
     storage_failed: Arc<AtomicBool>,
+    /// Snapshots loaded by this worker, used to distinguish admission-only
+    /// conflicts from changes to execution state.
+    loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
 }
 struct ResumeGuard {
     dirty: Arc<AtomicBool>,
@@ -202,6 +233,7 @@ impl Harness {
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: false,
             storage_failed: Arc::new(AtomicBool::new(false)),
+            loaded: std::sync::Mutex::new(HashMap::new()),
         };
         harness.recover()?;
         Ok(harness)
@@ -215,6 +247,7 @@ impl Harness {
             dirty: Arc::new(AtomicBool::new(false)),
             merge_admissions: true,
             storage_failed: self.storage_failed.clone(),
+            loaded: std::sync::Mutex::new(HashMap::new()),
         }
     }
     fn key(id: Uuid) -> Vec<u8> {
@@ -232,7 +265,12 @@ impl Harness {
             .store()
             .get(&Self::key(id))?
             .ok_or(Error::NotFound)?;
-        Ok((serde_json::from_slice(&entry.value)?, entry.version))
+        let state: Conversation = serde_json::from_slice(&entry.value)?;
+        self.loaded
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .insert(id, (entry.version, state.clone()));
+        Ok((state, entry.version))
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
         if self.failed
@@ -246,26 +284,51 @@ impl Harness {
         let mut expected = expected;
         loop {
             let value = serde_json::to_vec(&state)?;
-            match self.owner.store().commit(
-                &[Check {
-                    key: key.clone(),
-                    expected: expected.clone(),
-                }],
-                &[Mutation::Put {
-                    key: key.clone(),
-                    value,
-                }],
-            ) {
+            let event =
+                serde_json::json!({"messages": state.messages, "submissions": state.submissions});
+            let append = crate::observer::Observer::new(self.owner.store(), state.id)
+                .prepare_append(&event)?;
+            let mut checks = vec![Check {
+                key: key.clone(),
+                expected: expected.clone(),
+            }];
+            checks.extend(append.checks);
+            let mut mutations = vec![Mutation::Put {
+                key: key.clone(),
+                value,
+            }];
+            mutations.extend(append.mutations);
+            match self.owner.store().commit(&checks, &mutations) {
                 Ok(()) => break,
                 Err(durable_store::Error::Conflict { .. }) if self.merge_admissions => {
                     let entry = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
                     let latest: Conversation = serde_json::from_slice(&entry.value)?;
+                    let base = self
+                        .loaded
+                        .lock()
+                        .map_err(|_| Error::Failed)?
+                        .get(&state.id)
+                        .cloned();
+                    let Some((base_version, base)) = base else {
+                        return Err(Error::Invalid("missing conflict baseline".into()));
+                    };
+                    if expected != Expected::Version(base_version)
+                        || !admission_only(&base, &latest)?
+                    {
+                        return Err(Error::Invalid(
+                            "conversation changed during execution; reopen before retry".into(),
+                        ));
+                    }
                     for submission in latest.submissions {
                         if !state.submissions.iter().any(|s| s.id == submission.id) {
                             state.submissions.push(submission);
                         }
                     }
                     expected = Expected::Version(entry.version);
+                    self.loaded.lock().map_err(|_| Error::Failed)?.insert(
+                        state.id,
+                        (entry.version, serde_json::from_slice(&entry.value)?),
+                    );
                 }
                 Err(e @ durable_store::Error::Conflict { .. }) => return Err(e.into()),
                 Err(e) => {
@@ -294,11 +357,79 @@ impl Harness {
         self.save(&state, Expected::Missing)?;
         Ok(id)
     }
+    /// Fork the current settled conversation. Queued inputs and request IDs
+    /// are not inherited. Historical entry-point forking is not yet supported.
+    pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
+        let (mut state, _) = self.load(id)?;
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle) || state.active.is_some() {
+            return Err(Error::Invalid(
+                "fork requires a settled conversation".into(),
+            ));
+        }
+        state.id = Uuid::new_v4();
+        state.active = None;
+        state.submissions.clear();
+        state.phase = Phase::Idle;
+        self.save(&state, Expected::Missing)?;
+        Ok(state.id)
+    }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
     }
+    /// Read committed snapshots after a cursor. Earlier cursors may be
+    /// resumed; snapshots are retained independently of model context.
+    pub fn history(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.load(id)?;
+        Ok(crate::observer::Observer::new(self.owner.store(), id).read(after, limit)?)
+    }
+    pub async fn watch_history(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<crate::observer::Page, Error> {
+        self.load(id)?;
+        Ok(crate::observer::Observer::new(self.owner.store(), id)
+            .watch(after, limit, interval)
+            .await?)
+    }
     /// Admission is durable before returning. Call `resume` to drive work now;
     /// opening the database also drives all work left by a previous process.
+    /// Commit a summary intent while idle. Previous snapshots remain in history.
+    pub fn request_compaction(
+        &mut self,
+        id: Uuid,
+        keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "compaction requires an idle conversation".into(),
+            ));
+        }
+        let Some(preparation) = crate::compact::prepare(
+            &c.messages,
+            c.config.model.clone(),
+            c.config.max_output_tokens,
+            keep_recent_tokens,
+            None,
+        )?
+        else {
+            return Ok(false);
+        };
+        c.phase = Phase::CompactionReady {
+            preparation: Box::new(preparation),
+            restarts: 0,
+        };
+        self.save(&c, Expected::Version(version))?;
+        Ok(true)
+    }
     pub fn submit(
         &mut self,
         id: Uuid,
@@ -382,6 +513,17 @@ impl Harness {
                         turns,
                         request_id,
                         restarts: n,
+                    };
+                }
+                Phase::CompactionRunning {
+                    preparation,
+                    request_id,
+                    restarts,
+                } => {
+                    c.phase = Phase::CompactionAbandoned {
+                        preparation,
+                        request_id,
+                        restarts: restarts.saturating_add(1),
                     };
                 }
                 Phase::ToolRunning {
@@ -526,6 +668,87 @@ impl Harness {
                         content: s.content.clone(),
                     });
                     c.phase = Phase::ModelReady { turns: 0 };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::CompactionReady {
+                    preparation,
+                    restarts,
+                } => {
+                    c.phase = Phase::CompactionRunning {
+                        preparation,
+                        request_id: Uuid::new_v4(),
+                        restarts,
+                    };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::CompactionRunning {
+                    preparation,
+                    request_id,
+                    ..
+                } => {
+                    let result = match (*preparation)
+                        .summarize(self.options.model.as_ref(), request_id, id, cancel)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.failed = true;
+                            return Err(error.into());
+                        }
+                    };
+                    c.phase = Phase::CompactionAccounting {
+                        result: Box::new(result),
+                        request_id,
+                    };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::CompactionAbandoned {
+                    preparation,
+                    request_id,
+                    restarts,
+                } => {
+                    let settlement = self
+                        .options
+                        .model
+                        .record_usage(request_id, &UsageReport::Unconfirmed);
+                    tokio::select! { biased;
+                        _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                        result = tokio::time::timeout(Duration::from_secs(120), settlement) => match result {
+                            Ok(Ok(())) => (), Ok(Err(error)) => { self.failed = true; return Err(error.into()); },
+                            Err(_) => { self.failed = true; return Err(Error::Interrupted); }
+                        }
+                    }
+                    if restarts >= self.options.restart_limit {
+                        c.phase = Phase::Idle;
+                    } else {
+                        c.phase = Phase::CompactionReady {
+                            preparation,
+                            restarts,
+                        };
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::CompactionAccounting { result, request_id } => {
+                    let usage = result
+                        .generation
+                        .usage
+                        .map_or(UsageReport::Unconfirmed, |usage| UsageReport::Measured {
+                            usage,
+                        });
+                    let settlement = self.options.model.record_usage_with_metadata(
+                        request_id,
+                        &usage,
+                        &result.generation.metadata,
+                    );
+                    tokio::select! { biased;
+                        _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                        value = tokio::time::timeout(Duration::from_secs(120), settlement) => match value {
+                            Ok(Ok(())) => (), Ok(Err(error)) => { self.failed = true; return Err(error.into()); },
+                            Err(_) => { self.failed = true; return Err(Error::Interrupted); }
+                        }
+                    }
+                    c.messages = result.apply(&c.messages)?;
+                    c.phase = Phase::Idle;
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelReady { turns } => {
@@ -729,16 +952,46 @@ impl Harness {
                             valid_schema,
                         ) {
                             Ok(prepared) => {
-                                crate::tool::execute(
-                                    reg.tool.as_ref(),
-                                    &invocation,
-                                    prepared,
-                                    c.tool_states.get(&call.name),
-                                    Arc::new(NoNestedTools),
-                                    cancel,
+                                match crate::nested::NestedHost::new(
+                                    self.owner.clone(),
+                                    operation_id,
+                                    self.tools.values().cloned().collect(),
+                                    cancel.child_token(),
                                     Duration::from_secs(120),
-                                )
-                                .await
+                                    8,
+                                ) {
+                                    Ok(host) => {
+                                        let reply =
+                                            std::panic::AssertUnwindSafe(crate::tool::execute(
+                                                reg.tool.as_ref(),
+                                                &invocation,
+                                                prepared,
+                                                c.tool_states.get(&call.name),
+                                                host.clone(),
+                                                cancel,
+                                                Duration::from_secs(120),
+                                            ))
+                                            .catch_unwind()
+                                            .await;
+                                        match host.seal_and_wait().await {
+                                            Ok(()) => match reply {
+                                                Ok(reply) => reply,
+                                                Err(_) => Outcome::Unknown(
+                                                    "parent tool panicked after dispatch".into(),
+                                                )
+                                                .into(),
+                                            },
+                                            Err(error) => Outcome::Unknown(format!(
+                                                "nested tool requires reconciliation: {error}"
+                                            ))
+                                            .into(),
+                                        }
+                                    }
+                                    Err(error) => {
+                                        Outcome::Unknown(format!("nested tool host: {error}"))
+                                            .into()
+                                    }
+                                }
                             }
                             Err(outcome) => outcome.into(),
                         }
@@ -763,12 +1016,12 @@ impl Harness {
                             }
                         }
                         Outcome::Pending { reference } => {
-                            c.phase = Phase::Blocked {
+                            c.phase = Phase::Pending {
                                 turns,
                                 calls,
                                 index,
                                 operation_id,
-                                reason: format!("pending: {reference}"),
+                                reference,
                             }
                         }
                         other => {
@@ -779,6 +1032,64 @@ impl Harness {
                                 index: index + 1,
                             };
                         }
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::Pending {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    reference,
+                } => {
+                    let call = calls
+                        .get(index)
+                        .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
+                    let Some(tool) = self.tools.get(&call.name) else {
+                        return Ok(());
+                    };
+                    let result = crate::poll::poll_once(
+                        tool.tool.as_ref(),
+                        operation_id,
+                        &reference,
+                        cancel,
+                        Duration::from_secs(120),
+                    )
+                    .await;
+                    match result {
+                        crate::poll::PollResult::Outcome(Outcome::Pending { reference: next }) => {
+                            if next != reference {
+                                c.phase = Phase::Pending {
+                                    turns,
+                                    calls,
+                                    index,
+                                    operation_id,
+                                    reference: next,
+                                };
+                                self.save(&c, Expected::Version(version))?;
+                            }
+                            return Ok(());
+                        }
+                        crate::poll::PollResult::Outcome(Outcome::Unknown(reason)) => {
+                            c.phase = Phase::Blocked {
+                                turns,
+                                calls,
+                                index,
+                                operation_id,
+                                reason,
+                            };
+                        }
+                        crate::poll::PollResult::Outcome(outcome) => {
+                            append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                            c.phase = Phase::Tools {
+                                turns,
+                                calls,
+                                index: index + 1,
+                            };
+                        }
+                        crate::poll::PollResult::Cancelled => return Err(Error::Interrupted),
+                        crate::poll::PollResult::Unavailable
+                        | crate::poll::PollResult::TimedOut => return Ok(()),
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -802,15 +1113,22 @@ impl Harness {
             ));
         }
         let (mut c, version) = self.load(id)?;
-        let Phase::Blocked {
-            turns,
-            calls,
-            index,
-            operation_id: expected,
-            ..
-        } = c.phase.clone()
-        else {
-            return Err(Error::Invalid("conversation is not blocked".into()));
+        let (turns, calls, index, expected) = match c.phase.clone() {
+            Phase::Blocked {
+                turns,
+                calls,
+                index,
+                operation_id,
+                ..
+            }
+            | Phase::Pending {
+                turns,
+                calls,
+                index,
+                operation_id,
+                ..
+            } => (turns, calls, index, operation_id),
+            _ => return Err(Error::Invalid("conversation is not blocked".into())),
         };
         if operation_id != expected {
             return Err(Error::Invalid("operation ID mismatch".into()));
@@ -831,6 +1149,11 @@ impl Harness {
                 reason,
                 ..
             } => Some((operation_id, reason)),
+            Phase::Pending {
+                operation_id,
+                reference,
+                ..
+            } => Some((operation_id, format!("pending: {reference}"))),
             _ => None,
         })
     }
@@ -867,8 +1190,39 @@ impl Scheduler {
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.harness.create_conversation(config)
     }
+    pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
+        self.harness.fork(id)
+    }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
+    }
+    pub fn history(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.harness.history(id, after, limit)
+    }
+    pub async fn watch_history(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<crate::observer::Page, Error> {
+        self.harness.watch_history(id, after, limit, interval).await
+    }
+    pub fn request_compaction(
+        &mut self,
+        id: Uuid,
+        keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        let queued = self.harness.request_compaction(id, keep_recent_tokens)?;
+        if queued {
+            self.schedule(id);
+        }
+        Ok(queued)
     }
     /// Commits the admission before scheduling, including duplicate request IDs.
     pub fn submit(
@@ -909,7 +1263,40 @@ impl Scheduler {
         let task = tokio::spawn(async move {
             let _lock = lock.lock().await;
             worker.recover_conversation(id)?;
-            worker.drive(id, &cancel).await
+            loop {
+                if let Err(error) = worker.drive(id, &cancel).await {
+                    let mut fresh = worker.worker();
+                    let retryable = matches!(error, Error::Model(_))
+                        && fresh
+                            .conversation(id)
+                            .is_ok_and(|c| matches!(c.phase, Phase::ModelRunning { .. }));
+                    if !retryable {
+                        return Err(error);
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Interrupted),
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => (),
+                    }
+                    fresh.recover_conversation(id)?;
+                    worker = fresh;
+                    continue;
+                }
+                let state = worker.conversation(id)?;
+                let should_poll = match &state.phase {
+                    Phase::Pending { calls, index, .. } => calls
+                        .get(*index)
+                        .and_then(|call| worker.tools.get(&call.name))
+                        .is_some_and(|tool| tool.tool.can_poll()),
+                    _ => false,
+                };
+                if !should_poll {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(Error::Interrupted),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => (),
+                }
+            }
         });
         self.tasks.entry(id).or_default().push(task);
     }
@@ -945,6 +1332,25 @@ impl Scheduler {
         }
         error.map_or(Ok(()), Err)
     }
+}
+
+fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
+    let mut old = serde_json::to_value(base)?;
+    let mut new = serde_json::to_value(latest)?;
+    let old_submissions = old
+        .as_object_mut()
+        .and_then(|v| v.remove("submissions"))
+        .ok_or_else(|| Error::Invalid("invalid baseline".into()))?;
+    let new_submissions = new
+        .as_object_mut()
+        .and_then(|v| v.remove("submissions"))
+        .ok_or_else(|| Error::Invalid("invalid snapshot".into()))?;
+    let (Some(old_submissions), Some(new_submissions)) =
+        (old_submissions.as_array(), new_submissions.as_array())
+    else {
+        return Err(Error::Invalid("invalid submissions".into()));
+    };
+    Ok(old == new && new_submissions.starts_with(old_submissions))
 }
 
 fn append_tool(
@@ -989,16 +1395,6 @@ fn finish_failure(c: &mut Conversation, reason: String) {
     c.phase = Phase::FailedIdle;
 }
 
-struct NoNestedTools;
-#[async_trait::async_trait]
-impl ToolHost for NoNestedTools {
-    fn tools(&self) -> Vec<ToolSpec> {
-        Vec::new()
-    }
-    async fn call(&self, _name: &str, _arguments: serde_json::Value) -> Outcome {
-        Outcome::Failed("nested tool calls are not supported by this runtime".into())
-    }
-}
 fn valid_schema(schema: &serde_json::Value, arguments: &serde_json::Value) -> bool {
     jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(arguments))
 }
@@ -1050,6 +1446,28 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+    #[test]
+    fn conflict_merge_rejects_non_admission_state_changes() {
+        let base = Conversation {
+            id: Uuid::new_v4(),
+            config: config(),
+            messages: vec![],
+            submissions: vec![],
+            tool_states: HashMap::new(),
+            active: None,
+            phase: Phase::Idle,
+        };
+        let mut latest = base.clone();
+        latest.submissions.push(Submission {
+            id: Uuid::new_v4(),
+            request_id: None,
+            content: "queued".into(),
+            status: Status::Queued,
+        });
+        assert!(admission_only(&base, &latest).unwrap());
+        latest.phase = Phase::ModelReady { turns: 0 };
+        assert!(!admission_only(&base, &latest).unwrap());
     }
     #[tokio::test]
     async fn concurrent_conversations_and_admission_during_execution() {
@@ -1123,11 +1541,15 @@ mod scheduler_tests {
         let b = s.create_conversation(config()).unwrap();
         s.submit(a, None, "fail".into()).unwrap();
         s.submit(b, None, "ok".into()).unwrap();
-        assert!(s.wait(a).await.is_err());
         s.wait(b).await.unwrap();
         assert!(matches!(
             s.conversation(b).unwrap().submissions[0].status,
             Status::Done { .. }
+        ));
+        s.wait(a).await.unwrap();
+        assert!(matches!(
+            s.conversation(a).unwrap().submissions[0].status,
+            Status::Unanswered { .. }
         ));
         s.shutdown().await.unwrap();
     }

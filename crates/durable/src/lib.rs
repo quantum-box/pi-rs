@@ -3,8 +3,11 @@
 //! State transitions must be committed atomically by the host. This crate is
 //! under development; it does not yet provide a complete agent harness.
 
+pub mod compact;
 pub mod conversation;
 pub mod model;
+pub mod nested;
+pub mod observer;
 pub mod poll;
 pub mod recovery;
 pub mod runtime;
