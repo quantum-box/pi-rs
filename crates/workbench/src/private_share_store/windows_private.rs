@@ -467,7 +467,11 @@ impl VerifiedDirectory {
         }
         // SAFETY: successful CreateFileW returns a new owned handle.
         let file = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
-        verify_private_file(&file)?;
+        if let Err(error) = verify_private_file(&file) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
         Ok(file)
     }
 
