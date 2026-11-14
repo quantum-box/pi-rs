@@ -3999,6 +3999,23 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Atomically admit input and document changes, then schedule the run.
+    pub fn submit_with_documents(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        change: impl FnMut(
+            &mut crate::document::AdmissionDocuments<'_>,
+        ) -> Result<(), crate::document::Error>,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_with_documents(id, request_id, content, options, change)?;
+        self.schedule(id);
+        Ok(submission)
+    }
     /// Admit a continuation and schedule its persisted run.
     pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
         let submission = self.harness.submit_continue(id, request_id)?;

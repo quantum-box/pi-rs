@@ -164,6 +164,54 @@ async fn forks_keep_application_entries_at_the_selected_snapshot() {
 }
 
 #[tokio::test]
+async fn scheduler_runs_atomically_admitted_document_input() {
+    use pi_rs_durable::{
+        document::{Address, Documents},
+        runtime::{AdmissionOptions, Scheduler, Status},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let address = Address {
+        scope: "test".into(),
+        name: "counter".into(),
+        key: "".into(),
+    };
+    let mut s = Scheduler::open(&path, opts()).unwrap();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    s.submit_with_documents(
+        id,
+        None,
+        "hello".into(),
+        AdmissionOptions::default(),
+        |docs| {
+            assert!(docs.get(&address)?.is_none());
+            docs.put(
+                &address,
+                serde_json::json!({"n":1}).as_object().unwrap().clone(),
+            )
+        },
+    )
+    .unwrap();
+    s.wait(id).await.unwrap();
+    assert!(matches!(
+        s.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    s.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    assert_eq!(
+        Documents::new(&store).get(&address).unwrap().unwrap().value["n"],
+        1
+    );
+}
+
+#[tokio::test]
 async fn historical_fork_uses_selected_settled_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
