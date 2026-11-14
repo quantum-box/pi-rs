@@ -303,6 +303,26 @@ async fn access_at(
     minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
+    access_at_inner(
+        path,
+        service,
+        minimum,
+        no_refresh,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn access_at_inner(
+    path: std::path::PathBuf,
+    service: Service,
+    minimum: Option<Duration>,
+    no_refresh: bool,
+    #[cfg(test)] observer: Option<
+        tokio::sync::mpsc::UnboundedSender<(&'static str, Option<String>)>,
+    >,
+) -> Result<String> {
     let refresh_window = minimum.unwrap_or_default().max(Duration::from_secs(300));
     let guard = match super::auth_lock::acquire_async(&path).await {
         Ok(guard) => guard,
@@ -326,30 +346,47 @@ async fn access_at(
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
     tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
-        let value = runtime.block_on(service.refresh(&value.refresh))?;
-        super::config::update_object_locked(&path, Some(&guard), |data| {
-            let current = data
-                .get_mut("xai")
-                .ok_or_else(|| error("credentials changed during refresh"))?;
-            if *current != previous {
-                return Err(error("credentials changed during refresh"));
+        #[cfg(test)]
+        let report = |stage, error| {
+            if let Some(observer) = &observer {
+                let _ = observer.send((stage, error));
             }
-            current["access"] = value.access.clone().into();
-            current["refresh"] = value.refresh.clone().into();
-            current["expires"] = value.expires.into();
-            Ok(())
-        })?;
-        // Preserve a successfully rotated credential even if its lifetime
-        // does not satisfy the caller's explicit minimum.
-        if minimum.is_some() && expires_soon(&value, refresh_window) {
-            return Err(error("refreshed token expires too soon"));
-        }
-        Ok(value.access)
+        };
+        #[cfg(test)]
+        report("runtime", None);
+        let result = (|| -> Result<String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| error("cannot start refresh runtime"))?;
+            let _barrier = super::process::refresh_barrier()?;
+            #[cfg(test)]
+            report("exchange", None);
+            let value = runtime.block_on(service.refresh(&value.refresh))?;
+            #[cfg(test)]
+            report("save", None);
+            super::config::update_object_locked(&path, Some(&guard), |data| {
+                let current = data
+                    .get_mut("xai")
+                    .ok_or_else(|| error("credentials changed during refresh"))?;
+                if *current != previous {
+                    return Err(error("credentials changed during refresh"));
+                }
+                current["access"] = value.access.clone().into();
+                current["refresh"] = value.refresh.clone().into();
+                current["expires"] = value.expires.into();
+                Ok(())
+            })?;
+            // Preserve a successfully rotated credential even if its lifetime
+            // does not satisfy the caller's explicit minimum.
+            if minimum.is_some() && expires_soon(&value, refresh_window) {
+                return Err(error("refreshed token expires too soon"));
+            }
+            Ok(value.access)
+        })();
+        #[cfg(test)]
+        report("finished", result.as_ref().err().map(ToString::to_string));
+        result
     })
     .await
     .map_err(|_| error("refresh task failed"))?
@@ -495,24 +532,50 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn cancelled_caller_still_saves_rotated_refresh_token() {
+    async fn cancelled_refresh_case(success: bool) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}/", listener.local_addr().unwrap());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = [0; 2048];
-            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request_line = String::new();
+            socket.read_line(&mut request_line).await.unwrap();
+            assert!(request_line.starts_with("POST /oauth2/token "));
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(!line.is_empty(), "request ended before headers");
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let length = length.expect("refresh request has content length");
+            assert!(length <= 4096);
+            let mut request_body = vec![0; length];
+            socket.read_exact(&mut request_body).await.unwrap();
             started_tx.send(()).unwrap();
             reply_rx.await.unwrap();
-            let body =
-                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+            let (status, body) = if success {
+                (
+                    "200 OK",
+                    r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+                )
+            } else {
+                ("400 Bad Request", r#"{"error":"refresh-secret"}"#)
+            };
             socket
                 .write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )
                     .as_bytes(),
@@ -531,22 +594,64 @@ mod tests {
                 .build()
                 .unwrap(),
         };
-        let task = tokio::spawn(access_at(path.clone(), service, None, false));
-        started_rx.await.unwrap();
+        let (observer, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(access_at_inner(
+            path.clone(),
+            service,
+            None,
+            false,
+            Some(observer),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("refresh request did not arrive")
+            .unwrap();
         task.abort();
         reply_tx.send(()).unwrap();
         server.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                if saved["xai"]["refresh"] == "new-refresh" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut stages = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let observed = loop {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("refresh worker did not finish; stages: {stages:?}"))
+                .unwrap_or_else(|| {
+                    panic!("refresh worker observation channel closed; stages: {stages:?}")
+                });
+            stages.push(event.0);
+            if event.0 == "finished" {
+                break event.1;
             }
-        })
-        .await
-        .unwrap();
+        };
+        assert!(stages.contains(&"exchange"));
+        if success {
+            assert!(stages.contains(&"save"));
+            assert_eq!(observed, None);
+        } else {
+            assert!(!stages.contains(&"save"));
+            let error = observed.expect("failed exchange must be observable");
+            assert!(error.contains("refresh failed"));
+            assert!(!error.contains("refresh-secret"));
+        }
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["xai"]["refresh"],
+            if success {
+                "new-refresh"
+            } else {
+                "old-refresh"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_still_saves_rotated_refresh_token() {
+        cancelled_refresh_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_observes_refresh_worker_failure() {
+        cancelled_refresh_case(false).await;
     }
 
     #[tokio::test]
