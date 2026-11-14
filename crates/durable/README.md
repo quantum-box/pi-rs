@@ -77,7 +77,13 @@ carry handoff text; busy resets are queued until a safe boundary.
 `RuntimeOwner::open` installs extension and task registries before recovering
 conversations, and owns both the scheduler and driver. Await `shutdown` to join
 conversation and task workers and release the store. Handlers must eventually
-return; provider adapters and managed subagents still use the lower-level setup.
+return. The `open_with_provider_adapter`, `open_with_subagent_management`,
+`open_with_restricted_subagent_management`, and
+`open_with_provider_and_subagent_management` variants install those services
+before recovery as well. They use the same parent validation and child tool
+policies as the corresponding `Scheduler` constructors. Provider selection
+remains opt-in per conversation, and hosts must supply the adapter and task
+registries again on reopen.
 
 For a finite catch-up on the standalone `observer::Observer`, capture `head()`
 and page with `read_through(processed, head, limit)`, persisting both cursors

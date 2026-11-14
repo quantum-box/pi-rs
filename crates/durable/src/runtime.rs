@@ -5835,9 +5835,8 @@ impl Scheduler {
 /// Owns the conversation scheduler and generic task driver together.
 ///
 /// Open inside a Tokio runtime. Extensions and task handlers must be registered
-/// before opening so recovered work sees them. This constructor does not install
-/// a provider adapter or parent-bound subagent management; hosts needing those
-/// configurations must use the existing lower-level APIs. Dropping without
+/// before opening so recovered work sees them. Configured constructors also
+/// install provider adapters and parent-bound management before recovery. Dropping without
 /// awaiting `shutdown` requests driver stop but does not wait for either worker.
 /// A synchronous task handler must eventually return for shutdown to finish.
 pub struct RuntimeOwner {
@@ -5852,12 +5851,97 @@ impl RuntimeOwner {
         extensions: crate::extension::Registry,
         tasks: crate::task_scheduler::Registry,
     ) -> Result<Self, Error> {
+        Self::open_configured(path, options, extensions, tasks, None, None)
+    }
+
+    /// Install the provider adapter before recovering conversations and tasks.
+    pub fn open_with_provider_adapter(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+    ) -> Result<Self, Error> {
+        Self::open_configured(path, options, extensions, tasks, None, Some(adapter))
+    }
+
+    /// Install parent-bound management with the default child tool allowlist.
+    pub fn open_with_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        parent: Uuid,
+        child_config: Config,
+    ) -> Result<Self, Error> {
+        let allowed = default_subagent_tools(&options);
+        Self::open_configured(
+            path,
+            options,
+            extensions,
+            tasks,
+            Some((parent, child_config, Some(allowed))),
+            None,
+        )
+    }
+
+    /// Install parent-bound management with an explicit child tool policy.
+    pub fn open_with_restricted_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        validate_allowed_tools(&allowed_tools)?;
+        Self::open_configured(
+            path,
+            options,
+            extensions,
+            tasks,
+            Some((parent, child_config, allowed_tools)),
+            None,
+        )
+    }
+
+    /// Install the adapter and parent-bound management with an explicit child tool policy.
+    pub fn open_with_provider_and_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        validate_allowed_tools(&allowed_tools)?;
+        Self::open_configured(
+            path,
+            options,
+            extensions,
+            tasks,
+            Some((parent, child_config, allowed_tools)),
+            Some(adapter),
+        )
+    }
+
+    fn open_configured(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        management: Option<(Uuid, Config, Option<Vec<String>>)>,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+    ) -> Result<Self, Error> {
         let (scheduler, driver) = Scheduler::open_configured_with_tasks(
             path,
             options,
             extensions,
-            None,
-            None,
+            management,
+            adapter,
             Some(tasks),
         )?;
         Ok(Self {

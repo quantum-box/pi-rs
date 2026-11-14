@@ -164,6 +164,60 @@ async fn scheduler_can_restore_provider_and_subagent_management_together() {
 }
 
 #[tokio::test]
+async fn runtime_owner_recovers_provider_and_parent_management_together() {
+    use pi_rs_durable::{extension::Registry, runtime::RuntimeOwner, subagent_management};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(Regular::default());
+    let fake = Arc::new(Fake::default());
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        install(&mut h, fake.clone(), &[]);
+        id = select(&mut h, 0);
+    }
+    let mut owner = RuntimeOwner::open_with_provider_and_subagent_management(
+        &path,
+        options(model.clone()),
+        Registry::default(),
+        Default::default(),
+        fake.clone(),
+        id,
+        config(),
+        Some(vec![]),
+    )
+    .unwrap();
+    owner
+        .scheduler_mut()
+        .select_extensions(id, vec![subagent_management::extension_name(id)])
+        .unwrap();
+    owner.shutdown().await.unwrap();
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        h.submit(id, None, "recovered".into()).unwrap();
+    }
+    let mut owner = RuntimeOwner::open_with_provider_and_subagent_management(
+        &path,
+        options(model.clone()),
+        Registry::default(),
+        Default::default(),
+        fake.clone(),
+        id,
+        config(),
+        Some(vec![]),
+    )
+    .unwrap();
+    owner.scheduler_mut().wait(id).await.unwrap();
+    assert!(matches!(
+        owner.scheduler().conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(fake.seen.lock().unwrap().len(), 1);
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn historical_fork_preserves_adapter_and_tool_filter() {
     use pi_rs_durable::observer::Cursor;
     let dir = tempfile::tempdir().unwrap();
@@ -221,6 +275,46 @@ async fn scheduler_preloads_adapter_before_recovery() {
     assert_eq!(fake.seen.lock().unwrap()[0].1["order"], "a");
     assert_eq!(model.0.load(Ordering::SeqCst), 0);
     scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_owner_preloads_adapter_before_recovery() {
+    use pi_rs_durable::{extension::Registry, runtime::RuntimeOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(Regular::default());
+    let fake = Arc::new(Fake::default());
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        install(&mut h, fake.clone(), &["a"]);
+        id = select(&mut h, 1);
+        h.submit(id, None, "hello".into()).unwrap();
+    }
+    let mut registry = Registry::default();
+    registry
+        .install(Extension {
+            name: "e0".into(),
+            hooks: vec![Arc::new(Rewrite("a"))],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut owner = RuntimeOwner::open_with_provider_adapter(
+        &path,
+        options(model.clone()),
+        registry,
+        Default::default(),
+        fake.clone(),
+    )
+    .unwrap();
+    owner.scheduler_mut().wait(id).await.unwrap();
+    assert!(matches!(
+        owner.scheduler().conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(fake.seen.lock().unwrap()[0].1["order"], "a");
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -366,4 +460,64 @@ async fn cancellation_during_hook_stops_dispatch_and_recovers_with_new_attempt()
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0.session_id, id);
     assert_eq!(seen[0].0.restarts, 1);
+}
+
+#[tokio::test]
+async fn runtime_owner_management_validates_parent_and_tool_policy() {
+    use pi_rs_durable::{extension::Registry, runtime::RuntimeOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(Regular::default());
+    let id = {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        h.create_conversation(config()).unwrap()
+    };
+    assert!(
+        RuntimeOwner::open_with_subagent_management(
+            &path,
+            options(model.clone()),
+            Registry::default(),
+            Default::default(),
+            uuid::Uuid::new_v4(),
+            config(),
+        )
+        .is_err()
+    );
+    assert!(
+        RuntimeOwner::open_with_restricted_subagent_management(
+            &path,
+            options(model.clone()),
+            Registry::default(),
+            Default::default(),
+            id,
+            config(),
+            Some(vec!["x".into(), "x".into()]),
+        )
+        .is_err()
+    );
+    assert!(
+        RuntimeOwner::open_with_provider_and_subagent_management(
+            &path,
+            options(model.clone()),
+            Registry::default(),
+            Default::default(),
+            Arc::new(Fake::default()),
+            id,
+            config(),
+            Some(vec!["".into()]),
+        )
+        .is_err()
+    );
+    RuntimeOwner::open_with_subagent_management(
+        &path,
+        options(model),
+        Registry::default(),
+        Default::default(),
+        id,
+        config(),
+    )
+    .unwrap()
+    .shutdown()
+    .await
+    .unwrap();
 }

@@ -556,6 +556,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_owner_recovers_restricted_child_before_first_dispatch() {
+        use crate::{recovery::ReplayPolicy, runtime::RegisteredTool};
+        struct Forbidden;
+        #[async_trait]
+        impl Tool for Forbidden {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "forbidden".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("forbidden tool executed")
+            }
+        }
+        struct Inspect;
+        #[async_trait]
+        impl Model for Inspect {
+            async fn stream(&self, req: ModelRequest) -> Result<ModelStream, Error> {
+                if req.messages.iter().any(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "hello"),
+                ) {
+                    assert!(
+                        req.tools.is_empty(),
+                        "child must be restricted on its first dispatch"
+                    );
+                }
+                Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                })])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = || {
+            let mut o = options();
+            o.model = Arc::new(Inspect);
+            o.tools.push(RegisteredTool {
+                tool: Arc::new(Forbidden),
+                replay: ReplayPolicy::Safe,
+            });
+            o
+        };
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        h.select_tools(parent, Some(vec!["forbidden".into()]))
+            .unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: Some(vec![]),
+        };
+        let op = Uuid::new_v4();
+        let args = json!({"action":"send","name":"worker","message":"hello"});
+        assert!(matches!(
+            tool.invoke(args.clone(), context(op)).await,
+            Outcome::Succeeded(_)
+        ));
+        let child = tool
+            .harness
+            .lock()
+            .unwrap()
+            .subagent(parent, "worker")
+            .unwrap()
+            .unwrap()
+            .child;
+        assert_eq!(
+            tool.harness
+                .lock()
+                .unwrap()
+                .conversation(parent)
+                .unwrap()
+                .allowed_tools,
+            Some(vec!["forbidden".into()])
+        );
+        drop(tool);
+        let owner = crate::runtime::RuntimeOwner::open_with_restricted_subagent_management(
+            &path,
+            opts(),
+            Default::default(),
+            Default::default(),
+            parent,
+            config(),
+            Some(vec![]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    owner.scheduler().conversation(child).unwrap().submissions[0].status,
+                    crate::runtime::Status::Done { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            owner.scheduler().conversation(child).unwrap().allowed_tools,
+            Some(vec![])
+        );
+        owner.shutdown().await.unwrap();
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        assert!(
+            h.ensure_subagent_restricted(
+                parent,
+                "worker",
+                config(),
+                false,
+                Some(vec!["forbidden".into()])
+            )
+            .is_err()
+        );
+        assert_eq!(
+            h.ensure_subagent_restricted(parent, "worker", config(), false, Some(vec![]))
+                .unwrap()
+                .child,
+            child
+        );
+    }
+
+    #[tokio::test]
     async fn stop_is_parent_scoped_and_replay_does_not_stop_later_work_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
