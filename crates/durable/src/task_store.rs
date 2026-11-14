@@ -53,6 +53,13 @@ pub enum Save<'a> {
     Update(&'a StoredTask),
 }
 
+/// Checks and writes for one owned checkpoint, to be included intact in a
+/// single host transaction alongside any transcript and observation writes.
+pub struct OwnedBatch {
+    pub checks: Vec<Check>,
+    pub mutations: Vec<Mutation>,
+}
+
 /// A durable, uniquely identified signal. IDs are scoped to a target task.
 /// Reusing an ID with identical content is idempotent, even after consumption.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +166,23 @@ impl<'a> TaskStore<'a> {
         checkpoint: &[u8],
         children: &[Task],
     ) -> Result<(), Error> {
+        let batch = self.prepare_owned_tasks(owner, owner_key, expected, checkpoint, children)?;
+        self.store.commit(&batch.checks, &batch.mutations)?;
+        Ok(())
+    }
+
+    /// Prepare the same atomic checkpoint operation for composition with other
+    /// records. The host must commit every check and mutation together, and
+    /// must not add conflicting writes to the same keys. Preparing this batch
+    /// does not reserve children or make them visible.
+    pub fn prepare_owned_tasks(
+        &self,
+        owner: &TaskOwner,
+        owner_key: &[u8],
+        expected: Expected,
+        checkpoint: &[u8],
+        children: &[Task],
+    ) -> Result<OwnedBatch, Error> {
         if owner_key.is_empty() || owner_key.starts_with(b"durable/") {
             return Err(Error::InvalidOwnedBatch);
         }
@@ -190,8 +214,7 @@ impl<'a> TaskStore<'a> {
                 value: serde_json::to_vec(child)?,
             });
         }
-        self.store.commit(&checks, &mutations)?;
-        Ok(())
+        Ok(OwnedBatch { checks, mutations })
     }
 
     /// Atomically commit any deterministic task transition against its snapshot.
@@ -526,6 +549,55 @@ mod tests {
             Err(Error::DuplicateTask)
         ));
         assert_eq!(ts.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owned_batch_composes_with_other_transaction_records() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let child = task(1, 3).registered("job".into(), true);
+        let owner = TaskOwner::Conversation(Uuid::from_u128(100));
+        let prepare = || {
+            ts.prepare_owned_tasks(
+                &owner,
+                b"runtime/conversation/100",
+                Expected::Missing,
+                b"checkpoint",
+                std::slice::from_ref(&child),
+            )
+            .unwrap()
+        };
+        let mut batch = prepare();
+        batch.checks.push(Check {
+            key: b"observation".to_vec(),
+            expected: Expected::Version(1),
+        });
+        batch.mutations.push(Mutation::Put {
+            key: b"observation".to_vec(),
+            value: b"event".to_vec(),
+        });
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(ts.load(child.id()).unwrap().is_none());
+        assert!(db.get(b"runtime/conversation/100").unwrap().is_none());
+        let mut batch = prepare();
+        batch.checks.push(Check {
+            key: b"observation".to_vec(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: b"observation".to_vec(),
+            value: b"event".to_vec(),
+        });
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        assert_eq!(ts.load(child.id()).unwrap().unwrap().task, child);
+        assert_eq!(
+            db.get(b"runtime/conversation/100").unwrap().unwrap().value,
+            b"checkpoint"
+        );
+        assert_eq!(db.get(b"observation").unwrap().unwrap().value, b"event");
     }
 
     #[test]

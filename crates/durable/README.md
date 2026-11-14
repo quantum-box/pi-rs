@@ -78,14 +78,20 @@ The scheduler rescans once per second and reopening resumes the wait. Signal
 keys are not yet subject to upstream single-wait or closed-after-deadline rules.
 
 `TaskStore::commit_owned_tasks` supplies a lower-level atomic checkpoint and
-registered-child creation primitive. The caller must store the child IDs in
+registered-child creation primitive. `prepare_owned_tasks` exposes the same
+checks and writes for inclusion in a larger transaction. The caller must store the child IDs in
 its checkpoint, validate registrations, fence executors, and inspect the
 checkpoint after conflicts or uncertain commits. It is not yet wired into the
 conversation lifecycle: its checkpoint is a single owner record, whereas the
 runtime also commits transcript, observation and fork records. Full integration
 must compose all of those writes, wait for child outcomes, coordinate the task
 driver and conversation recovery, and propagate aborts before hook tasks can
-be enabled safely.
+be enabled safely. In particular, lifecycle task registration must be bound to
+the active driver's definitions and replay policies; the persisted waiting phase
+must resume only after every child is terminal; and conversation abort must
+fence child execution and durably request child-first cleanup, including after
+restart. The existing driver is independently owned by the host and is not yet
+connected to these lifecycle operations.
 
 Current limits and differences from upstream Pi Durable:
 
