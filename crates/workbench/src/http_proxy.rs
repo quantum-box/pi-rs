@@ -50,16 +50,19 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
     if http.is_none() && https.is_none() {
         return Ok(Vec::new());
     }
-    Ok(vec![Proxy::custom(move |url| {
-        if bypasses_proxy(url, &excluded) {
-            return None;
-        }
-        match url.scheme() {
-            "http" => http.clone(),
-            "https" => https.clone(),
-            _ => None,
-        }
-    })])
+    Ok(vec![
+        Proxy::custom(move |url| {
+            if bypasses_proxy(url, &excluded) {
+                return None;
+            }
+            match url.scheme() {
+                "http" => http.clone(),
+                "https" => https.clone(),
+                _ => None,
+            }
+        })
+        .tunnel_http(true),
+    ])
 }
 
 /// Build a Smithy transport that applies the proxy decision to each request URL.
@@ -266,16 +269,19 @@ pub(super) fn configured_mcp(
         .collect();
     let mut proxies = Vec::new();
     if http.is_some() || https.is_some() {
-        proxies.push(reqwest_mcp::Proxy::custom(move |url| {
-            if bypasses_proxy(url, &excluded) {
-                return None;
-            }
-            match url.scheme() {
-                "http" => http.clone(),
-                "https" => https.clone(),
-                _ => None,
-            }
-        }));
+        proxies.push(
+            reqwest_mcp::Proxy::custom(move |url| {
+                if bypasses_proxy(url, &excluded) {
+                    return None;
+                }
+                match url.scheme() {
+                    "http" => http.clone(),
+                    "https" => https.clone(),
+                    _ => None,
+                }
+            })
+            .tunnel_http(true),
+        );
     }
     Ok(pi_rs_workbench::mcp::HttpOptionsWithProxyHosts {
         http: pi_rs_workbench::mcp::HttpOptions {
@@ -381,6 +387,1630 @@ pub(super) async fn test_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! redirect_proxy_auth_binding {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                async fn receive(listener: &TcpListener, response: &'static [u8]) -> String {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap();
+                        if line == "\r\n" || line.is_empty() { break; }
+                        request.push_str(&line);
+                    }
+                    socket.write_all(response).await.unwrap();
+                    request
+                }
+                let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a_address = a.local_addr().unwrap();
+                let b_address = b.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let first = receive(&a, b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let second = receive(&a, b"HTTP/1.1 302 Found\r\nLocation: /different\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let third = receive(&b, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    (first, second, third)
+                });
+                let count = Arc::new(AtomicUsize::new(0));
+                let calls = count.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let address = if calls.fetch_add(1, Ordering::SeqCst) < 2 { a_address } else { b_address };
+                    Some(format!("http://{address}"))
+                });
+                let client = $client::Client::builder().no_proxy().proxy(proxy).build().unwrap();
+                let response = timeout(Duration::from_secs(10), client.get("http://origin.invalid/first")
+                    .header("proxy-authorization", "Basic c2VjcmV0").send()).await.unwrap().unwrap();
+                assert!(response.status().is_success());
+                let (first, second, third) = server.await.unwrap();
+                for request in [first, second] {
+                    assert!(request.to_ascii_lowercase().contains("proxy-authorization: basic c2vjcmv0"), "{request}");
+                }
+                assert!(!third.to_ascii_lowercase().contains("proxy-authorization"), "{third}");
+                assert_eq!(count.load(Ordering::SeqCst), 3);
+            }
+        };
+    }
+    redirect_proxy_auth_binding!(redirect_keeps_caller_auth_bound_to_original_proxy, reqwest);
+    redirect_proxy_auth_binding!(
+        mcp_redirect_keeps_caller_auth_bound_to_original_proxy,
+        reqwest_mcp
+    );
+
+    macro_rules! no_proxy_caller_auth {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = origin.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    request
+                });
+                let proxy = $client::Proxy::all("http://127.0.0.1:1")
+                    .unwrap()
+                    .no_proxy($client::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true);
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(proxy)
+                    .build()
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(5),
+                    client
+                        .get(format!("http://{address}/"))
+                        .header("proxy-authorization", "Basic c2VjcmV0")
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.status().is_success());
+                let request = server.await.unwrap();
+                assert!(
+                    !request.to_ascii_lowercase().contains("proxy-authorization"),
+                    "{request}"
+                );
+            }
+        };
+    }
+    no_proxy_caller_auth!(no_proxy_never_receives_caller_auth, reqwest);
+    no_proxy_caller_auth!(mcp_no_proxy_never_receives_caller_auth, reqwest_mcp);
+
+    macro_rules! tunnel_caller_auth {
+        ($redirect:ident, $concurrent:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $redirect() {
+                use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                async fn exchange(listener: &TcpListener, response: &'static [u8]) -> (String, String) {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut connect = String::new();
+                    loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } connect.push_str(&line); }
+                    socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                    let mut origin = String::new();
+                    loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } origin.push_str(&line); }
+                    socket.write_all(response).await.unwrap();
+                    (connect, origin)
+                }
+                let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a_address = a.local_addr().unwrap(); let b_address = b.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let first = exchange(&a, b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let second = exchange(&a, b"HTTP/1.1 302 Found\r\nLocation: /different\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let third = exchange(&b, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    [first, second, third]
+                });
+                let count = Arc::new(AtomicUsize::new(0)); let calls = count.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let address = if calls.fetch_add(1, Ordering::SeqCst) < 2 { a_address } else { b_address };
+                    Some(format!("http://{address}"))
+                }).tunnel_http(true);
+                let client = $client::Client::builder().no_proxy().proxy(proxy).build().unwrap();
+                let response = timeout(Duration::from_secs(10), client.get("http://origin.invalid/first").header("proxy-authorization", "Basic c2VjcmV0").send()).await.unwrap().unwrap();
+                assert!(response.status().is_success());
+                let observed = server.await.unwrap();
+                for (i, (connect, origin)) in observed.iter().enumerate() {
+                    assert_eq!(connect.to_ascii_lowercase().contains("proxy-authorization: basic c2vjcmv0"), i < 2, "{connect}");
+                    assert!(!origin.to_ascii_lowercase().contains("proxy-authorization"), "{origin}");
+                }
+                assert_eq!(count.load(Ordering::SeqCst), 3);
+            }
+            #[tokio::test]
+            async fn $concurrent() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let mut tasks = Vec::new();
+                    for _ in 0..2 {
+                        let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                        tasks.push(tokio::spawn(async move {
+                            let mut socket = BufReader::new(socket); let mut connect = String::new();
+                            loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } connect.push_str(&line); }
+                            socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                            let mut origin = String::new();
+                            loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } origin.push_str(&line); }
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                            (connect, origin)
+                        }));
+                    }
+                    let mut out = Vec::new(); for task in tasks { out.push(task.await.unwrap()); } out
+                });
+                let client = $client::Client::builder().no_proxy().proxy($client::Proxy::all(format!("http://{address}")).unwrap().tunnel_http(true)).build().unwrap();
+                let one = client.get("http://origin.invalid/one").header("proxy-authorization", "Basic b25l").send();
+                let two = client.get("http://origin.invalid/two").header("proxy-authorization", "Basic dHdv").send();
+                let (one, two) = timeout(Duration::from_secs(10), async { tokio::join!(one, two) }).await.unwrap();
+                assert!(one.unwrap().status().is_success()); assert!(two.unwrap().status().is_success());
+                let observed = server.await.unwrap(); let mut auth = Vec::new();
+                for (connect, origin) in observed {
+                    assert!(!origin.to_ascii_lowercase().contains("proxy-authorization"), "{origin}");
+                    auth.push(connect.to_ascii_lowercase());
+                }
+                assert_eq!(auth.iter().filter(|s| s.contains("proxy-authorization: basic b25l")).count(), 1);
+                assert_eq!(auth.iter().filter(|s| s.contains("proxy-authorization: basic dhdv")).count(), 1);
+            }
+        };
+    }
+    tunnel_caller_auth!(
+        redirect_tunnel_caller_auth_bound_to_proxy,
+        concurrent_tunnel_auth_isolation,
+        reqwest
+    );
+    tunnel_caller_auth!(
+        mcp_redirect_tunnel_caller_auth_bound_to_proxy,
+        mcp_concurrent_tunnel_auth_isolation,
+        reqwest_mcp
+    );
+
+    macro_rules! static_proxy_security {
+        ($tunnel:ident, $ordered:ident, $local:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $tunnel() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut connect = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        connect.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut origin = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        origin.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    (connect, origin)
+                });
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(
+                        $client::Proxy::all(format!("http://{address}"))
+                            .unwrap()
+                            .basic_auth("configured", "password")
+                            .tunnel_http(true),
+                    )
+                    .build()
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(5),
+                    client
+                        .get("http://origin.invalid/path")
+                        .header("Proxy-Authorization", "Basic c2VjcmV0")
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.status().is_success());
+                let (connect, origin) = server.await.unwrap();
+                assert!(
+                    connect.starts_with("CONNECT origin.invalid:80"),
+                    "{connect}"
+                );
+                assert!(
+                    connect
+                        .to_ascii_lowercase()
+                        .contains("proxy-authorization: basic c2vjcmv0"),
+                    "{connect}"
+                );
+                assert!(
+                    !connect
+                        .to_ascii_lowercase()
+                        .contains("y29uzmlndxjlzdpwyxnzd29yza"),
+                    "{connect}"
+                );
+                assert!(
+                    !origin.to_ascii_lowercase().contains("proxy-authorization"),
+                    "{origin}"
+                );
+            }
+            #[tokio::test]
+            async fn $ordered() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    request
+                });
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy($client::Proxy::all(format!("http://{address}")).unwrap())
+                    .proxy(
+                        $client::Proxy::all("http://127.0.0.1:1")
+                            .unwrap()
+                            .basic_auth("later", "secret"),
+                    )
+                    .build()
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(5),
+                    client.get("http://origin.invalid/path").send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.status().is_success());
+                let request = server.await.unwrap();
+                assert!(
+                    request.starts_with("GET http://origin.invalid/path"),
+                    "{request}"
+                );
+                assert!(
+                    !request.to_ascii_lowercase().contains("proxy-authorization"),
+                    "{request}"
+                );
+            }
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn $local() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::UnixListener;
+                use tokio::time::{Duration, timeout};
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("server.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    request
+                });
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .unix_socket(path.as_path())
+                    .proxy(
+                        $client::Proxy::all("http://127.0.0.1:1")
+                            .unwrap()
+                            .basic_auth("user", "secret"),
+                    )
+                    .build()
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(5),
+                    client
+                        .get("http://local.invalid/path")
+                        .header("Proxy-Authorization", "Basic c2VjcmV0")
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.status().is_success());
+                let request = server.await.unwrap();
+                assert!(request.starts_with("GET /path"), "{request}");
+                assert!(
+                    !request.to_ascii_lowercase().contains("proxy-authorization"),
+                    "{request}"
+                );
+            }
+        };
+    }
+    static_proxy_security!(
+        static_tunnel_does_not_leak_caller_auth,
+        static_first_proxy_does_not_receive_later_auth,
+        local_socket_does_not_receive_proxy_auth,
+        reqwest
+    );
+    static_proxy_security!(
+        mcp_static_tunnel_does_not_leak_caller_auth,
+        mcp_static_first_proxy_does_not_receive_later_auth,
+        mcp_local_socket_does_not_receive_proxy_auth,
+        reqwest_mcp
+    );
+
+    macro_rules! route_pool_loopback {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{
+                    Arc,
+                    atomic::{AtomicUsize, Ordering},
+                };
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::{TcpListener, TcpStream};
+                use tokio::time::{Duration, timeout};
+                #[derive(Clone)]
+                struct CountingLayer(Arc<AtomicUsize>);
+                impl<S> tower::Layer<S> for CountingLayer {
+                    type Service = S;
+                    fn layer(&self, service: S) -> S {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        service
+                    }
+                }
+                async fn request(socket: &mut BufReader<TcpStream>) -> String {
+                    let mut result = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        result.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    result
+                }
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let password = if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                        "one"
+                    } else {
+                        "two"
+                    };
+                    Some(format!("http://user:{password}@{address}"))
+                });
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let first = request(&mut socket).await;
+                    let second = request(&mut socket).await;
+                    let (other, _) = timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let third = request(&mut BufReader::new(other)).await;
+                    (first, second, third)
+                });
+                let layers = Arc::new(AtomicUsize::new(0));
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(proxy)
+                    .connector_layer(CountingLayer(layers.clone()))
+                    .build()
+                    .unwrap();
+                for _ in 0..3 {
+                    let response = timeout(
+                        Duration::from_secs(5),
+                        client.get("http://origin.invalid/test").send(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(response.status().is_success());
+                }
+                let (first, second, third) = server.await.unwrap();
+                let auth = |request: &str| {
+                    request
+                        .lines()
+                        .find(|line| {
+                            line.to_ascii_lowercase()
+                                .starts_with("proxy-authorization:")
+                        })
+                        .unwrap()
+                        .to_owned()
+                };
+                assert_eq!(auth(&first), auth(&second));
+                assert_ne!(auth(&first), auth(&third));
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert_eq!(layers.load(Ordering::SeqCst), 1);
+            }
+        };
+    }
+    route_pool_loopback!(
+        route_pool_reuses_matching_proxy_and_isolates_credentials,
+        reqwest
+    );
+    route_pool_loopback!(
+        mcp_route_pool_reuses_matching_proxy_and_isolates_credentials,
+        reqwest_mcp
+    );
+
+    macro_rules! concurrent_routes_loopback {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let id = count.fetch_add(1, Ordering::SeqCst);
+                    Some(format!("http://user:secret{id}@{address}"))
+                });
+                let server = tokio::spawn(async move {
+                    let mut workers = Vec::new();
+                    for _ in 0..8 {
+                        let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                        workers.push(tokio::spawn(async move {
+                            let mut socket = BufReader::new(socket);
+                            let mut authorization = String::new();
+                            loop {
+                                let mut line = String::new();
+                                timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap();
+                                if line == "\r\n" || line.is_empty() { break; }
+                                if line.to_ascii_lowercase().starts_with("proxy-authorization:") { authorization = line; }
+                            }
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                            authorization
+                        }));
+                    }
+                    let mut headers = std::collections::HashSet::new();
+                    for worker in workers { headers.insert(worker.await.unwrap()); }
+                    headers
+                });
+                let client = $client::Client::builder().no_proxy().proxy(proxy).build().unwrap();
+                let mut workers = Vec::new();
+                for _ in 0..8 {
+                    let client = client.clone();
+                    workers.push(tokio::spawn(async move {
+                        timeout(Duration::from_secs(5), client.get("http://origin.invalid/test").send()).await.unwrap().unwrap().status()
+                    }));
+                }
+                for worker in workers { assert!(worker.await.unwrap().is_success()); }
+                let headers = server.await.unwrap();
+                assert_eq!(headers.len(), 8);
+                assert!(!headers.contains(""));
+                assert_eq!(calls.load(Ordering::SeqCst), 8);
+            }
+        };
+    }
+    concurrent_routes_loopback!(concurrent_proxy_credentials_are_isolated, reqwest);
+    concurrent_routes_loopback!(mcp_concurrent_proxy_credentials_are_isolated, reqwest_mcp);
+
+    macro_rules! socks_routes_loopback {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{
+                    Arc,
+                    atomic::{AtomicUsize, Ordering},
+                };
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let counter = calls.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let password = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "one"
+                    } else {
+                        "two"
+                    };
+                    Some(format!("socks5h://user:{password}@{address}"))
+                });
+                let server = tokio::spawn(async move {
+                    let mut passwords = Vec::new();
+                    let mut open_sockets = Vec::new();
+                    for _ in 0..2 {
+                        let (mut socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let mut greeting = [0u8; 2];
+                        socket.read_exact(&mut greeting).await.unwrap();
+                        assert_eq!(greeting[0], 5);
+                        let mut methods = vec![0; greeting[1] as usize];
+                        socket.read_exact(&mut methods).await.unwrap();
+                        assert!(methods.contains(&2));
+                        socket.write_all(&[5, 2]).await.unwrap();
+                        let mut prefix = [0u8; 2];
+                        socket.read_exact(&mut prefix).await.unwrap();
+                        assert_eq!(prefix[0], 1);
+                        let mut user = vec![0; prefix[1] as usize];
+                        socket.read_exact(&mut user).await.unwrap();
+                        let mut size = [0];
+                        socket.read_exact(&mut size).await.unwrap();
+                        let mut password = vec![0; size[0] as usize];
+                        socket.read_exact(&mut password).await.unwrap();
+                        assert_eq!(user, b"user");
+                        passwords.push(password);
+                        socket.write_all(&[1, 0]).await.unwrap();
+                        let mut command = [0; 4];
+                        socket.read_exact(&mut command).await.unwrap();
+                        assert_eq!(command, [5, 1, 0, 3]);
+                        socket.read_exact(&mut size).await.unwrap();
+                        let mut destination = vec![0; size[0] as usize + 2];
+                        socket.read_exact(&mut destination).await.unwrap();
+                        socket
+                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                            .await
+                            .unwrap();
+                        let mut socket = BufReader::new(socket);
+                        let mut headers = String::new();
+                        loop {
+                            let mut line = String::new();
+                            socket.read_line(&mut line).await.unwrap();
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            headers.push_str(&line);
+                        }
+                        assert!(
+                            !headers
+                                .to_ascii_lowercase()
+                                .contains("proxy-authorization:")
+                        );
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        open_sockets.push(socket);
+                    }
+                    passwords
+                });
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(proxy)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let response = timeout(
+                        Duration::from_secs(5),
+                        client.get("http://origin.invalid/test").send(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(response.status().is_success());
+                }
+                assert_eq!(server.await.unwrap(), [b"one".to_vec(), b"two".to_vec()]);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        };
+    }
+    socks_routes_loopback!(socks_credentials_do_not_reuse_another_route, reqwest);
+    socks_routes_loopback!(
+        mcp_socks_credentials_do_not_reuse_another_route,
+        reqwest_mcp
+    );
+
+    #[tokio::test]
+    async fn nonmatching_custom_rule_keeps_authenticated_forward_proxy() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (first, headers)
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::custom(|_| None::<String>))
+            .proxy(
+                reqwest::Proxy::all(format!("http://{address}"))
+                    .unwrap()
+                    .basic_auth("user", "pass"),
+            )
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await;
+        let (first, headers) = server.await.unwrap();
+        assert!(
+            first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
+            "{first}"
+        );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+        assert!(response.unwrap().unwrap().status().is_success());
+    }
+
+    #[tokio::test]
+    async fn mcp_nonmatching_custom_rule_keeps_authenticated_forward_proxy() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (first, headers)
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(reqwest_mcp::Proxy::custom(|_| None::<String>))
+            .proxy(
+                reqwest_mcp::Proxy::all(format!("http://{address}"))
+                    .unwrap()
+                    .basic_auth("user", "pass"),
+            )
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await;
+        let (first, headers) = server.await.unwrap();
+        assert!(
+            first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
+            "{first}"
+        );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+        assert!(response.unwrap().unwrap().status().is_success());
+    }
+
+    #[tokio::test]
+    async fn stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = origin.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://user:secret@{}", proxy.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let proxy_config = reqwest::Proxy::custom(move |_| {
+            (counter.fetch_add(1, Ordering::SeqCst) == 0).then(|| proxy_url.clone())
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), proxy.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut forwarded = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                forwarded.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut direct = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                direct.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (forwarded, direct)
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy_config)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let response = timeout(
+                Duration::from_secs(5),
+                client.get(format!("http://{target}/test")).send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.status().is_success());
+        }
+        let (forwarded, direct) = server.await.unwrap();
+        assert!(forwarded.starts_with(&format!("GET http://{target}/test HTTP/1.1\r\n")));
+        assert!(
+            forwarded
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpzzwnyzxq=")
+        );
+        assert!(direct.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(!direct.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = origin.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://user:secret@{}", proxy.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let proxy_config = reqwest_mcp::Proxy::custom(move |_| {
+            (counter.fetch_add(1, Ordering::SeqCst) == 0).then(|| proxy_url.clone())
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), proxy.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut forwarded = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                forwarded.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut direct = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                direct.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (forwarded, direct)
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy_config)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let response = timeout(
+                Duration::from_secs(5),
+                client.get(format!("http://{target}/test")).send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.status().is_success());
+        }
+        let (forwarded, direct) = server.await.unwrap();
+        assert!(forwarded.starts_with(&format!("GET http://{target}/test HTTP/1.1\r\n")));
+        assert!(
+            forwarded
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpzzwnyzxq=")
+        );
+        assert!(direct.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(!direct.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http_proxy_connects_before_request_without_leaking_proxy_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!(
+            "http://proxy-user:proxy-pass@{}",
+            listener.local_addr().unwrap()
+        );
+        let proxy = proxies(Some(&proxy_url), None, "").unwrap().pop().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            if !first.starts_with("CONNECT ") {
+                socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                return (first, headers, String::new());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut origin = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                origin.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            (first, headers, origin)
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .proxy(
+                reqwest::Proxy::all("http://127.0.0.1:1")
+                    .unwrap()
+                    .basic_auth("later", "secret"),
+            )
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid:8080/test").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (first, headers, origin) = server.await.unwrap();
+        assert_eq!(first, "CONNECT origin.invalid:8080 HTTP/1.1\r\n");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic chjvehktdxnlcjpwcm94es1wyxnz")
+        );
+        assert!(origin.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(!origin.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn mcp_http_proxy_uses_connect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .tunnel_http(true);
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            first
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid:8080/mcp").send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            "CONNECT origin.invalid:8080 HTTP/1.1\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_still_uses_authenticated_connect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = proxies(None, Some(&format!("http://user:pass@{address}")), "")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("https://origin.invalid/test").send(),
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("CONNECT origin.invalid:443 HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+    }
+
+    #[tokio::test]
+    async fn https_tunnel_preserves_origin_tls_verification() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+        for valid_name in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = proxies(
+                Some(&format!(
+                    "http://user:pass@{}",
+                    listener.local_addr().unwrap()
+                )),
+                Some(&format!(
+                    "http://user:pass@{}",
+                    listener.local_addr().unwrap()
+                )),
+                "",
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert!(first.starts_with("CONNECT "));
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                drop(reader);
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let cert = rustls::pki_types::CertificateDer::from(
+                    include_bytes!("../tests/fixtures/bedrock-proxy-tls/server.der").to_vec(),
+                );
+                let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        include_bytes!("../tests/fixtures/bedrock-proxy-tls/server-key.der")
+                            .to_vec(),
+                    ),
+                );
+                let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+                let mut tls = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                    socket,
+                );
+                let mut request = [0u8; 4096];
+                let result = tls.read(&mut request);
+                if valid_name {
+                    let n = result.unwrap();
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    assert!(request.starts_with("GET /test HTTP/1.1"));
+                    assert!(
+                        !request
+                            .to_ascii_lowercase()
+                            .contains("proxy-authorization:")
+                    );
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                } else {
+                    assert!(result.is_err());
+                }
+            });
+            let cert = reqwest::Certificate::from_pem(include_bytes!(
+                "../tests/fixtures/bedrock-proxy-tls/ca.pem"
+            ))
+            .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(proxy)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(cert)
+                .build()
+                .unwrap();
+            let host = if valid_name { "127.0.0.1" } else { "localhost" };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(format!("https://{host}:8443/test")).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), valid_name);
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_origin_uses_tls_proxy_and_keeps_auth_out_of_tunnel() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("https://user:pass@{}", listener.local_addr().unwrap());
+        let proxy = proxies(Some(&proxy_url), None, "").unwrap().pop().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let cert = rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/bedrock-proxy-tls/server.der").to_vec(),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    include_bytes!("../tests/fixtures/bedrock-proxy-tls/server-key.der").to_vec(),
+                ),
+            );
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+            let tls = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                socket,
+            );
+            let mut tls = BufReader::new(tls);
+            let mut connect = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                connect.push_str(&line);
+            }
+            assert!(connect.starts_with("CONNECT origin.invalid:80 HTTP/1.1\r\n"));
+            assert!(
+                connect
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnz")
+            );
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let mut origin = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                origin.push_str(&line);
+            }
+            assert!(origin.starts_with("GET /test HTTP/1.1\r\n"));
+            assert!(!origin.to_ascii_lowercase().contains("proxy-authorization:"));
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let cert = reqwest::Certificate::from_pem(include_bytes!(
+            "../tests/fixtures/bedrock-proxy-tls/ca.pem"
+        ))
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(cert)
+            .build()
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_http_origin_uses_tls_proxy_and_keeps_auth_out_of_tunnel() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("https://user:pass@{}", listener.local_addr().unwrap());
+        let proxy = reqwest_mcp::Proxy::all(&proxy_url)
+            .unwrap()
+            .tunnel_http(true);
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let cert = rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/bedrock-proxy-tls/server.der").to_vec(),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    include_bytes!("../tests/fixtures/bedrock-proxy-tls/server-key.der").to_vec(),
+                ),
+            );
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+            let tls = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                socket,
+            );
+            let mut tls = BufReader::new(tls);
+            let mut connect = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                connect.push_str(&line);
+            }
+            assert!(connect.starts_with("CONNECT origin.invalid:80 HTTP/1.1\r\n"));
+            assert!(
+                connect
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnz")
+            );
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let mut origin = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                origin.push_str(&line);
+            }
+            assert!(origin.starts_with("GET /test HTTP/1.1\r\n"));
+            assert!(!origin.to_ascii_lowercase().contains("proxy-authorization:"));
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let cert = reqwest_mcp::Certificate::from_pem(include_bytes!(
+            "../tests/fixtures/bedrock-proxy-tls/ca.pem"
+        ))
+        .unwrap();
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .tls_certs_only([cert])
+            .build()
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bypassed_http_request_does_not_receive_proxy_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = proxies(
+            Some("http://user:pass@127.0.0.1:1"),
+            None,
+            &address.to_string(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{address}/test")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_from_proxy_to_no_proxy_does_not_leak_auth() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = origin.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        let proxy = proxies(Some(&proxy_url), None, &address.to_string())
+            .unwrap()
+            .pop()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut connect = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                connect.push_str(&line);
+            }
+            assert!(connect.starts_with("CONNECT origin.invalid:80 HTTP/1.1\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{address}/end\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/start").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /end HTTP/1.1\r\n"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+    }
     #[test]
     fn bypass_rules_match_domains_ports_wildcards_and_ipv6() {
         let url = |url| Url::parse(url).unwrap();
