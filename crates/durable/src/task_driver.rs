@@ -381,7 +381,7 @@ impl Shared {
                 task.kind()
                     .and_then(|kind| self.policies.get(kind))
                     .copied()
-                    != Some(task.replay_safe())
+                    != Some((task.replay_safe(), task.definition_version()))
                     || task.owner() != &TaskOwner::Conversation(conversation)
                     || task.state() != &TaskState::Ready
                     || task.abort_requested()
