@@ -64,3 +64,43 @@ test('emits text before the response completes and rejects an incomplete stream'
   stream.close();
   await assert.rejects(pending, /before completion/);
 });
+
+test('routes Ollama requests to loopback without Tachyon credentials', async () => {
+  let called;
+  const gateway = createGatewayFetch({ origin, getProvider: () => 'ollama', getLocalModel: () => 'qwen2.5:7b', getToken: () => { throw new Error('must not access token'); }, onError: assert.fail, fetchImpl: async (url, options) => {
+    called = {url, options};
+    return new Response('data: {"choices":[{"delta":{"content":"local reply"}}]}\n\ndata: [DONE]\n\n');
+  }});
+  assert.deepEqual(await (await gateway(request())).json(), {text:'local reply'});
+  assert.equal(called.url, 'http://127.0.0.1:11434/v1/chat/completions');
+  assert.deepEqual(called.options.headers, {'content-type':'application/json'});
+  assert.equal(JSON.parse(called.options.body).model, 'qwen2.5:7b');
+});
+
+test('browser model requests stay in the worker, switch models, and abort', async () => {
+  const workers = [];
+  const previousWorker = globalThis.Worker;
+  globalThis.Worker = class {
+    constructor() { this.terminated = false; workers.push(this); }
+    postMessage(data) { this.data = data; }
+    terminate() { this.terminated = true; }
+  };
+  try {
+    let model = '0.6b';
+    const gateway = createGatewayFetch({origin, getProvider: () => 'browser', getBrowserModel: () => model, getToken: () => { throw Error('unexpected credential access'); }, onError: assert.fail, fetchImpl: () => { throw Error('unexpected network'); }});
+    const first = gateway(request());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(workers[0].data.model, '0.6b');
+    workers[0].onmessage({data:{type:'result',text:'hello',calls:[]}});
+    assert.deepEqual(await (await first).json(), {text:'hello',calls:[]});
+    model = '1.7b';
+    const controller = new AbortController();
+    const second = gateway(request(undefined, controller.signal));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(workers[0].terminated, true);
+    assert.equal(workers[1].data.model, '1.7b');
+    controller.abort();
+    await assert.rejects(second, {name:'AbortError'});
+    assert.equal(workers[1].terminated, true);
+  } finally { globalThis.Worker = previousWorker; }
+});

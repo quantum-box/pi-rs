@@ -20,7 +20,8 @@ const { once } = require('node:events');
     let body = ''; req.on('data', b => body += b); req.on('end', () => {
       const request = JSON.parse(body); request._auth = req.headers.authorization; requests.push(request);
       const last = request.messages.filter(m => m.role === 'user').at(-1)?.content;
-      if (last === 'resume me' && ++resumeRequests === 1) { setTimeout(() => { if (!res.destroyed) res.end(JSON.stringify({text:'too late'})); }, 5000); }
+      if (last === 'test tool') { const tool = request.messages.find(m => m.role === 'tool'); res.end(JSON.stringify(tool ? {text:'result ' + tool.content} : {text:'',calls:[{id:'call-1',name:'add_numbers',arguments:'{\"a\":2,\"b\":3}'}]})); }
+      else if (last === 'resume me' && ++resumeRequests === 1) { setTimeout(() => { if (!res.destroyed) res.end(JSON.stringify({text:'too late'})); }, 5000); }
       else if (last === 'resume me') { res.end(JSON.stringify({text:'resumed'})); }
       else if (last === 'fail me') { res.writeHead(403).end('private'); }
       else if (last === 'cancel me' || last === 'timeout me') {
@@ -111,6 +112,10 @@ try {
   }
   assert(session !== null, 'lock released after free');
   await Promise.all([session.close(), session.close()]); session.free();
+  const toolSession = await BrowserSession.open_demo('tool', base + '/gateway', 'browser-qwen', 'secret', 5000);
+  assert(await toolSession.prompt('test tool') === 'result 5', 'tool execution result');
+  assert(JSON.parse(toolSession.messages()).some(m => m.role === 'tool' && m.content === '5'), 'tool result saved');
+  await toolSession.close(); toolSession.free();
   sessionStorage.setItem('reloaded', 'yes');
   location.reload();
   }

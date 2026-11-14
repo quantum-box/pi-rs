@@ -16,5 +16,5 @@ if ! command -v wasm-bindgen >/dev/null 2>&1 || [ "$(wasm-bindgen --version)" !=
 fi
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo +1.89.0 build --locked --manifest-path crates/browser-sdk/Cargo.toml --target wasm32-unknown-unknown
 mkdir -p examples/browser-preview/dist/pkg
-cp examples/browser-preview/index.html examples/browser-preview/tachyon-gateway.mjs examples/browser-preview/dist/
+cp examples/browser-preview/index.html examples/browser-preview/tachyon-gateway.mjs examples/browser-preview/browser-model-worker.mjs examples/browser-preview/dist/
 wasm-bindgen --target web --out-dir examples/browser-preview/dist/pkg "${CARGO_TARGET_DIR:-crates/browser-sdk/target}/wasm32-unknown-unknown/debug/pi_rs_browser_sdk.wasm"

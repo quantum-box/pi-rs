@@ -6,6 +6,7 @@ on:
       - 'crates/core/**'
       - 'crates/browser-fetch/**'
       - 'crates/browser-sdk/**'
+      - 'examples/browser-preview/**'
       - '.github/workflows/browser-sdk.yml'
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - 'crates/core/**'
       - 'crates/browser-fetch/**'
       - 'crates/browser-sdk/**'
+      - 'examples/browser-preview/**'
       - '.github/workflows/browser-sdk.yml'
   workflow_dispatch:
 
@@ -32,6 +34,8 @@ jobs:
           node-version: '22'
       - id: chrome
         uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4 # v2
+      - name: Test browser preview adapter
+        run: node --test examples/browser-preview/tachyon-gateway.test.mjs
       - name: Install Rust and target
         run: |
           rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
