@@ -5606,6 +5606,88 @@ mod tree_tests {
         }
     }
 
+    struct TurnModel(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for TurnModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_uses_extension_summary_before_turn_model() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: events.clone(),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "answer");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, from_extension: true, .. } if summary == "extension summary")));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "session_compact"
+                    && event["reason"] == "threshold"
+                    && event["fromExtension"] == true)
+        );
+    }
+
     struct CompactionFailureObserver(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
     #[async_trait::async_trait]
     impl crate::Extension for CompactionFailureObserver {

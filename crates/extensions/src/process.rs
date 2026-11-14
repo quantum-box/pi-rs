@@ -5147,7 +5147,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'before_summary_compaction_v1':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -5166,6 +5166,7 @@ else:
     elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
     elif kind=='before_tree': result=None
+    elif kind=='before_summary_compaction': result={'cancel':False,'compaction':{'summary':'supplied','firstKeptEntry':1,'tokensBefore':2,'usage':None,'details':None}}
     elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
     elif kind=='after_compaction': result=None
     elif kind=='before_tool': result={'allow':True,'reason':None}
@@ -5338,6 +5339,23 @@ else:
                 .unwrap()
                 .is_none()
         );
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: Some(1),
+            tokens_before: 2,
+            reason: pi_rs_core::CompactionReason::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        let supplied = extension
+            .before_summary_compaction(&preparation, None, host.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(supplied.summary, "supplied");
+        assert_eq!(supplied.first_kept_entry, Some(1));
         let mut compaction = Compaction {
             summary: "summary".into(),
             keep_turns: 1,
@@ -5356,7 +5374,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 14);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 15);
     }
 
     #[tokio::test]
