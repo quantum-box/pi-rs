@@ -1341,9 +1341,18 @@ mod tests {
         let mutations = [first.mutations, second.mutations].concat();
         // Raw commits evaluate both missing-owner checks before either write.
         db.commit(&checks, &mutations).unwrap();
-        assert_eq!(ts.load(a.id()).unwrap().unwrap().task.owner(), &TaskOwner::Task(b.id()));
-        assert_eq!(ts.load(b.id()).unwrap().unwrap().task.owner(), &TaskOwner::Task(a.id()));
-        assert!(matches!(ts.save(&[Save::Create(&owned(3, 1))]), Err(Error::InvalidOwnership)));
+        assert_eq!(
+            ts.load(a.id()).unwrap().unwrap().task.owner(),
+            &TaskOwner::Task(b.id())
+        );
+        assert_eq!(
+            ts.load(b.id()).unwrap().unwrap().task.owner(),
+            &TaskOwner::Task(a.id())
+        );
+        assert!(matches!(
+            ts.save(&[Save::Create(&owned(3, 1))]),
+            Err(Error::InvalidOwnership)
+        ));
     }
 
     #[test]
@@ -1352,7 +1361,9 @@ mod tests {
         let ts = TaskStore::new(&db);
         let parent = owned(1, 9);
         let child = owned(2, 1);
-        let batch = ts.prepare_save(&[Save::Create(&parent), Save::Create(&child)]).unwrap();
+        let batch = ts
+            .prepare_save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
         db.commit(&batch.checks, &batch.mutations).unwrap();
         assert_eq!(ts.list().unwrap().len(), 2);
     }

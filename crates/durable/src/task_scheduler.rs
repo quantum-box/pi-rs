@@ -459,7 +459,8 @@ impl Scheduler {
             match result {
                 Ok((input, checkpoint)) => next.task.migrate(version, input, checkpoint),
                 Err(error) => {
-                    self.failed_migrations.insert(snapshot.task.id(), (identity, error));
+                    self.failed_migrations
+                        .insert(snapshot.task.id(), (identity, error));
                     return Ok(false);
                 }
             }
