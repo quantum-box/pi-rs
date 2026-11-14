@@ -743,6 +743,7 @@ async fn configure_after(
             "MCP discovery failed while preparing share context".into(),
         ));
     }
+    let skipped_disabled = discovered.skipped_disabled;
     let mcp_connections = discovered.connected;
     let result = async {
         let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
@@ -870,10 +871,18 @@ async fn configure_after(
                     .map(|path| (extension.id().to_owned(), path.to_owned()))
             })
             .collect();
-        let mut registry = Registry::compose(
-            extensions,
-            &args.disable_extension.iter().cloned().collect(),
-        )?;
+        let disabled = args
+            .disable_extension
+            .iter()
+            .filter(|id| {
+                !skipped_disabled.contains(*id)
+                    || extensions
+                        .iter()
+                        .any(|extension| extension.id() == id.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut registry = Registry::compose(extensions, &disabled)?;
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,

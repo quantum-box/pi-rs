@@ -198,6 +198,7 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
         "missing-command",
         "disabled-config",
         "disabled-extension",
+        "unknown-disabled-extension",
     ] {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -216,6 +217,7 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
         let server = match case {
             "invalid-map" => json!({"mcpServers": []}),
             "invalid-server" => json!({"mcpServers": {"fixture": {"command": 42}}}),
+            "unknown-disabled-extension" => json!({"mcpServers": {}}),
             "disabled-config" => {
                 let mut server = disabled.clone();
                 server["enabled"] = json!(false);
@@ -250,6 +252,8 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
             .arg(&path);
         if case == "disabled-extension" {
             command.args(["--disable-extension", "mcp-fixture"]);
+        } else if case == "unknown-disabled-extension" {
+            command.args(["--disable-extension", "mcp-unknown"]);
         }
         let child = command
             .arg("share")
@@ -317,7 +321,14 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
                     .any(|part| part == b"pi.share")
             );
         } else {
-            assert!(stderr.contains("MCP"), "{case}: {stderr}");
+            if case == "unknown-disabled-extension" {
+                assert!(
+                    stderr.contains("unknown disabled extension"),
+                    "{case}: {stderr}"
+                );
+            } else {
+                assert!(stderr.contains("MCP"), "{case}: {stderr}");
+            }
             assert!(uploaded.is_none(), "{case} uploaded an incomplete context");
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);

@@ -247,6 +247,7 @@ pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
     pub failed: bool,
+    pub skipped_disabled: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -276,13 +277,15 @@ pub(super) async fn discover(
                 }
             })
             .collect();
-        let relevant = value.get("enabled") != Some(&Value::Bool(false))
-            && !args
-                .disable_extension
-                .contains(&format!("mcp-{extension_id}"));
+        let extension_id = format!("mcp-{extension_id}");
+        let disabled_by_flag = args.disable_extension.contains(&extension_id);
+        let relevant = value.get("enabled") != Some(&Value::Bool(false)) && !disabled_by_flag;
         // A disabled server cannot contribute to the reconstructed context;
         // do not start it as a side effect of sharing.
         if strict && !relevant {
+            if disabled_by_flag {
+                discovery.skipped_disabled.insert(extension_id);
+            }
             continue;
         }
         if !normalized.insert(name.replace('-', "_")) {
