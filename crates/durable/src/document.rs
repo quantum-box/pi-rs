@@ -541,6 +541,10 @@ pub struct TaskDocuments<'a> {
     signal_keys: HashSet<(uuid::Uuid, String, String)>,
 }
 impl<'a> TaskDocuments<'a> {
+    pub(crate) fn belongs_to(&self, store: &Store, task: &crate::task::Task) -> bool {
+        std::ptr::eq(self.store, store) && &self.task == task
+    }
+
     pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
         Ok(Self {
             store,

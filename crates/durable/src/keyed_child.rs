@@ -18,6 +18,8 @@ pub(crate) enum Error {
     Store(#[from] durable_store::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Document(#[from] crate::document::Error),
     #[error("invalid key, child, or tool identity")]
     Invalid,
     #[error("parent is stale, missing, or closed")]
@@ -28,6 +30,10 @@ pub(crate) enum Error {
     InvalidStoredChild,
     #[error("wait must contain distinct existing keyed children")]
     InvalidWait,
+    #[error("document context belongs to a different store or task invocation")]
+    DocumentContext,
+    #[error("task gate poisoned")]
+    GatePoisoned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +57,40 @@ struct Prepared {
     child: Uuid,
     checks: Vec<Check>,
     mutations: Vec<Mutation>,
+}
+
+/// Commit staged task documents and a keyed park together. The caller must
+/// retain and fence the parent executor through this call; the task gate only
+/// serializes graph decisions and is not an executor lease. Do not call while
+/// holding the task gate. A conflict or uncertain commit requires inspection.
+pub(crate) fn park_with_documents(
+    owner: &durable_store::owner::OwnedStore,
+    parent: &StoredTask,
+    checkpoint: Checkpoint,
+    keys: &[&str],
+    documents: crate::document::TaskDocuments<'_>,
+) -> Result<(), Error> {
+    let _gate = owner.task_gate().lock().map_err(|_| Error::GatePoisoned)?;
+    let transaction =
+        prepare_park_with_documents(owner.store(), parent, checkpoint, keys, documents)?;
+    transaction.commit(owner.store())?;
+    Ok(())
+}
+
+fn prepare_park_with_documents(
+    store: &Store,
+    parent: &StoredTask,
+    checkpoint: Checkpoint,
+    keys: &[&str],
+    documents: crate::document::TaskDocuments<'_>,
+) -> Result<crate::document::Transaction, Error> {
+    if !documents.belongs_to(store, &parent.task) {
+        return Err(Error::DocumentContext);
+    }
+    let mut transaction = crate::document::Transaction::new();
+    transaction.append(documents.into_batch()?)?;
+    transaction.append(prepare_park_any(store, parent, checkpoint, keys)?)?;
+    Ok(transaction)
 }
 
 /// Persist a checkpoint and an any-child wait in one checked transaction. The
@@ -311,6 +351,181 @@ mod tests {
             phase: phase.into(),
             data: json!({"saved":true}),
         }
+    }
+
+    fn address() -> crate::document::Address {
+        crate::document::Address {
+            scope: "test".into(),
+            name: "park".into(),
+            key: "".into(),
+        }
+    }
+
+    fn staged<'a>(store: &'a Store, parent: &StoredTask) -> crate::document::TaskDocuments<'a> {
+        let mut docs = crate::document::TaskDocuments::new(store, &parent.task).unwrap();
+        docs.get(&address()).unwrap();
+        docs.put(
+            &address(),
+            json!({"saved":true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        docs
+    }
+
+    #[test]
+    fn documents_and_keyed_park_commit_together_and_scheduler_wakes_after_reopen() {
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = OwnedStore::open(&path).unwrap();
+        let p = registered_parent(owner.store(), false);
+        let (p, a, b) = admit_pair(owner.store(), &p);
+        let docs = staged(owner.store(), &p);
+        park_with_documents(&owner, &p, cp("parked"), &["a", "b"], docs).unwrap();
+        drop(owner);
+        let parent_runs = Arc::new(AtomicUsize::new(0));
+        let observed = parent_runs.clone();
+        let mut registry = Registry::default();
+        registry.register("parent-task", false, move |task: &Task| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(task.checkpoint(), &cp("parked"));
+            Ok(Step::Wait {
+                checkpoint: cp("finish"),
+                condition: WaitFor::Tasks(vec![Uuid::from_u128(3)]),
+                children: vec![],
+            })
+        });
+        registry.register("tool-task", true, |_: &Task| {
+            Ok(Step::Succeed(json!("child")))
+        });
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(parent_runs.load(Ordering::SeqCst), 0);
+        let stored = crate::document::Documents::new(scheduler.owner().store())
+            .get(&address())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.value,
+            json!({"saved":true}).as_object().unwrap().clone()
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(parent_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.get(a.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("child"))
+        );
+        assert_eq!(
+            scheduler.get(b.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+    }
+
+    #[test]
+    fn stale_document_or_abort_rolls_back_park_and_staged_document() {
+        for abort in [false, true] {
+            let db = Store::memory().unwrap();
+            let p = registered_parent(&db, true);
+            let (p, _, _) = admit_pair(&db, &p);
+            let docs = staged(&db, &p);
+            let tx = prepare_park_with_documents(&db, &p, cp("parked"), &["a", "b"], docs).unwrap();
+            if abort {
+                TaskStore::new(&db)
+                    .update(&p, |t| t.request_abort())
+                    .unwrap();
+            } else {
+                let mut concurrent = crate::document::Transaction::new();
+                concurrent
+                    .put(
+                        &address(),
+                        Expected::Missing,
+                        json!({"other":true}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                concurrent.commit(&db).unwrap();
+            }
+            assert!(matches!(
+                tx.commit(&db),
+                Err(crate::document::Error::Store(
+                    durable_store::Error::Conflict { .. }
+                ))
+            ));
+            let after = TaskStore::new(&db).load(p.task.id()).unwrap().unwrap();
+            assert_eq!(after.task.state(), &TaskState::Running);
+            assert_eq!(after.task.checkpoint(), p.task.checkpoint());
+            let doc = crate::document::Documents::new(&db)
+                .get(&address())
+                .unwrap();
+            if abort {
+                assert!(doc.is_none());
+            } else {
+                assert_eq!(
+                    doc.unwrap().value,
+                    json!({"other":true}).as_object().unwrap().clone()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_document_store_or_invocation_fails_closed() {
+        let db = Store::memory().unwrap();
+        let other = Store::memory().unwrap();
+        let p = registered_parent(&db, true);
+        let (p, _, _) = admit_pair(&db, &p);
+        let wrong_store = staged(&other, &p);
+        assert!(matches!(
+            prepare_park_with_documents(&db, &p, cp("parked"), &["a"], wrong_store),
+            Err(Error::DocumentContext)
+        ));
+        let mut stale = p.clone();
+        stale.task.advance(cp("other")).unwrap();
+        let wrong_task = staged(&db, &stale);
+        assert!(matches!(
+            prepare_park_with_documents(&db, &p, cp("parked"), &["a"], wrong_task),
+            Err(Error::DocumentContext)
+        ));
+        assert_eq!(TaskStore::new(&db).load(p.task.id()).unwrap().unwrap(), p);
+        assert!(
+            crate::document::Documents::new(&db)
+                .get(&address())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn poisoned_task_gate_leaves_park_and_documents_unchanged() {
+        use durable_store::owner::OwnedStore;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let p = registered_parent(owner.store(), true);
+        let (p, _, _) = admit_pair(owner.store(), &p);
+        let cloned = owner.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = cloned.task_gate().lock().unwrap();
+            panic!("poison gate");
+        })
+        .join();
+        let docs = staged(owner.store(), &p);
+        assert!(matches!(
+            park_with_documents(&owner, &p, cp("parked"), &["a"], docs),
+            Err(Error::GatePoisoned)
+        ));
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(p.task.id())
+                .unwrap()
+                .unwrap(),
+            p
+        );
+        assert!(
+            crate::document::Documents::new(owner.store())
+                .get(&address())
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn admit_pair(store: &Store, p: &StoredTask) -> (StoredTask, Task, Task) {
