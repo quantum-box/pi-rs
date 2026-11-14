@@ -2284,14 +2284,20 @@ Complete native prompt checkpointing remains open.
 Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
 after parsing them. Native estimates now count JavaScript binary64 number
 rounding and exponent formatting as well as UTF-16 string units, including in
-imported assistant messages. JSON parsing uses correctly rounded binary64
-conversion before estimation. Already persisted rounded values cannot recover
-their original decimal representation. This affects estimates and compaction boundaries;
-the original tool arguments and provider requests remain unchanged. Regressions
-cover exponent cutoffs, integers beyond 2^53, negative zero, nested values and
-escaped Unicode against Node 24. Inputs that Rust's JSON parser rejects, such as
-non-finite numeric overflow, retain the existing raw-input fallback, so complete
-JavaScript JSON parsing and token-estimator parity remain open.
+imported assistant messages. To retain the correct binary64 value when imported
+JSON is first read, the shared `serde_json` parser enables `float_roundtrip`.
+This also changes decimal floating-point parsing throughout binaries that use the
+core crate, including model configuration, provider responses, tool arguments,
+and reserialized provider requests. Pi likewise parses JSON decimals as
+JavaScript numbers. Native integer values retain their existing exact integer
+representation, even above 2^53, and other native consumers may observe more
+accurate decimal rounding. Previously persisted rounded values cannot recover
+their original decimal representation. Regressions cover exponent cutoffs,
+integers beyond 2^53, negative zero, nested values and escaped Unicode against
+Node 24, as well as tool execution and an Anthropic loopback request. Inputs
+that Rust's JSON parser rejects, such as non-finite numeric overflow, retain the
+existing raw-input fallback, so complete JavaScript JSON parsing and
+token-estimator parity remain open.
 
 ### Directory listing limits checkpoint
 
