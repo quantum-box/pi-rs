@@ -615,7 +615,11 @@ impl<'a> TaskStore<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<SignalResult, Error> {
-        self.deliver_signal_with_clock(task_id, token, key_text, value, || now_millis)
+        let start = std::time::Instant::now();
+        self.deliver_signal_with_clock(task_id, token, key_text, value, || {
+            now_millis
+                .saturating_add(i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX))
+        })
     }
 
     fn deliver_signal_with_clock(
@@ -647,6 +651,7 @@ impl<'a> TaskStore<'a> {
         value: Value,
         mut now: impl FnMut() -> i64,
     ) -> Result<(SignalResult, OwnedBatch), Error> {
+        let clock_start = std::time::Instant::now();
         let target = self.load(task_id)?;
         let mut batch = OwnedBatch {
             checks: vec![Check {
@@ -691,7 +696,26 @@ impl<'a> TaskStore<'a> {
                 ));
             }
         }
-        let expired = matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now() >= *deadline && signals.contains(signal.typed_key().unwrap()));
+        let deadline = match target.task.state() {
+            TaskState::Waiting(WaitFor::TypedSleep {
+                until_millis: Some(deadline),
+                signals,
+            }) if signals.contains(signal.typed_key().unwrap()) => Some(*deadline),
+            _ => None,
+        };
+        let sampled_now = deadline.map(|_| now());
+        let expired = deadline
+            .zip(sampled_now)
+            .is_some_and(|(deadline, now)| now >= deadline);
+        if let Some((deadline, now)) = deadline.zip(sampled_now).filter(|_| !expired) {
+            // Anchor the caller's clock to elapsed monotonic time so a staged
+            // delivery cannot cross its deadline while waiting for the writer lock.
+            let remaining = (deadline as i128 - now as i128) as u64;
+            let boundary = clock_start
+                .checked_add(std::time::Duration::from_millis(remaining))
+                .unwrap_or(clock_start);
+            batch.checks[0].expected = Expected::VersionBefore(target.version, boundary);
+        }
         signal.expired = expired;
         let receipt_key = signal_key(task_id, receipt_id);
         batch.checks.push(Check {

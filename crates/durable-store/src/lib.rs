@@ -10,7 +10,12 @@ pub mod controls;
 pub mod owner;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::{fmt, path::Path, sync::Mutex, time::Duration};
+use std::{
+    fmt,
+    path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -30,6 +35,8 @@ pub struct Check {
 pub enum Expected {
     Missing,
     Version(u64),
+    /// Version must match and the monotonic deadline must not have elapsed.
+    VersionBefore(u64, Instant),
     /// Document key has no mutations after this history boundary.
     DocumentUnchangedSince(u64),
     /// The database-wide document revision is still exactly this boundary.
@@ -551,6 +558,9 @@ impl Store {
                     )?;
                     current == revision
                 }
+                Expected::VersionBefore(v, deadline) => {
+                    version == Some(v) && Instant::now() < deadline
+                }
                 Expected::DocumentUnchangedSince(revision) => {
                     if !check.key.starts_with(b"durable/document/") {
                         return Err(Error::InvalidSnapshot);
@@ -651,6 +661,17 @@ impl Store {
             if let Mutation::Put { key, .. } = mutation {
                 if key.starts_with(b"runtime/fork/") {
                     tx.execute("INSERT OR IGNORE INTO durable_document_cuts(key,revision) SELECT ?1,revision FROM durable_document_history_meta WHERE id=1", [key])?;
+                }
+            }
+        }
+        // Recheck time after assembling writes, while still holding the write lock.
+        // A failure drops the transaction and rolls back every mutation.
+        for check in checks {
+            if let Expected::VersionBefore(_, deadline) = check.expected {
+                if Instant::now() >= deadline {
+                    return Err(Error::Conflict {
+                        key: check.key.clone(),
+                    });
                 }
             }
         }

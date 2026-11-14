@@ -58,7 +58,11 @@ impl Handler for Send {
                 &token,
                 "a",
                 json!(1),
-                if self.race == 3 { 100 } else { 99 },
+                if self.race == 3 || (self.race == 4 && !self.results.lock().unwrap().is_empty()) {
+                    100
+                } else {
+                    99
+                },
             )
             .unwrap();
         self.results.lock().unwrap().push(result);
@@ -78,6 +82,9 @@ impl Handler for Send {
                 let target = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
                 ts.update(&target, |t| t.cancel()).unwrap();
             }
+        }
+        if self.race == 4 && self.results.lock().unwrap().len() == 1 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(Step::Continue(cp("done")))
     }
@@ -294,4 +301,52 @@ fn driver_runs_receiver_after_atomic_delivery() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(*results.lock().unwrap(), vec![SignalResult::Delivered]);
+}
+
+#[test]
+fn deadline_crossing_rolls_back_entire_attempt_and_replays_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    setup(&path, Some(100));
+    let results = Arc::new(Mutex::new(vec![]));
+    let mut s = Scheduler::open(&path, registry(&path, 4, results.clone())).unwrap();
+    s.submit(&task(1, "sender")).unwrap();
+    s.tick(99).unwrap();
+    let db = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&db);
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_none());
+    assert_eq!(
+        ts.load(Uuid::from_u128(1))
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint()
+            .phase,
+        "start"
+    );
+    let token = SignalToken::new("answer", 1).unwrap();
+    assert_eq!(
+        ts.read_typed_signal_state(Uuid::from_u128(2), &token, "a")
+            .unwrap(),
+        None
+    );
+    drop(db);
+    s.tick(99).unwrap();
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![SignalResult::Delivered, SignalResult::Closed]
+    );
+    let db = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&db);
+    assert_eq!(
+        ts.read_typed_signal_state(Uuid::from_u128(2), &token, "a")
+            .unwrap(),
+        Some(pi_rs_durable::task_store::SignalState::Expired)
+    );
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_some());
+    assert_eq!(
+        ts.deliver_signal_at(Uuid::from_u128(2), &token, "a", json!(3), 101)
+            .unwrap(),
+        SignalResult::Closed
+    );
 }

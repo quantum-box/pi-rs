@@ -552,7 +552,9 @@ impl<'a> TaskDocuments<'a> {
     }
     /// Stage one typed delivery before document or entry writes. The returned
     /// outcome is provisional until this task's checkpoint commits. A conflict
-    /// replays only registered replay-safe handlers. Self-delivery is excluded.
+    /// replays only registered replay-safe handlers. Supply a fresh clock value
+    /// on replay; elapsed monotonic time is checked at the storage commit boundary.
+    /// Clock jumps after staging are not observed. Self-delivery is excluded.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,

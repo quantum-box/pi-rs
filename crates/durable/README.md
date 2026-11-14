@@ -265,8 +265,11 @@ Current limits and differences from upstream Pi Durable:
   Its status is provisional: the target task version and signal revision are
   checked with the handler's checkpoint and documents, and a conflict rolls
   back all of them. Replay-safe handlers are retried; other handlers require
-  reconciliation. The supplied timestamp must use the scheduler's clock and is
-  evaluated when staging, not at commit. Signal staging is limited to one call
+  reconciliation. The supplied timestamp must use the scheduler's clock. For
+  an empty key with a future deadline, monotonic elapsed time since staging is
+  checked under the storage write lock; crossing the deadline conflicts and
+  replay must sample a fresh timestamp. Clock jumps after staging are not observed.
+  Signal staging is limited to one call
   per invocation, excludes self-delivery, and cannot overlap another batch
   participant's checked keys (for example an entry's task ancestor or a newly
   created child). It is not a general host transaction or upstream `tx.signal`.
