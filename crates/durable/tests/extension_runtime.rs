@@ -167,8 +167,8 @@ async fn selection_persists_and_hooks_run_in_order_with_last_section_winning() {
 }
 
 #[tokio::test]
-async fn block_sleep_and_invalid_rewrite_never_dispatch() {
-    for case in ["block", "sleep", "invalid"] {
+async fn block_and_invalid_rewrite_never_dispatch() {
+    for case in ["block", "invalid"] {
         let dir = tempfile::tempdir().unwrap();
         let model = Arc::new(FakeModel::default());
         let tool = Arc::new(FakeTool::default());
@@ -186,12 +186,150 @@ async fn block_sleep_and_invalid_rewrite_never_dispatch() {
         assert!(
             match case {
                 "block" => message.contains("blocked by policy"),
-                "sleep" => message.contains("sleep is unsupported"),
                 _ => message.contains("schema"),
             },
             "{case}: {message}"
         );
     }
+}
+
+struct SignalGate;
+#[async_trait]
+impl Hook for SignalGate {
+    async fn before_tool(&self, _: &HookCall, ctx: &Context<'_>) -> Result<BeforeTool, String> {
+        if ctx.snapshot["phase"]["ToolPreparing"]["wake"]["reason"] == "signal" {
+            return Ok(BeforeTool::Pass);
+        }
+        Ok(BeforeTool::Sleep(Sleep {
+            signals: vec!["approve".into()],
+            until_millis: None,
+        }))
+    }
+}
+
+struct DeadlineGate;
+struct NotifyingGate(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl Hook for NotifyingGate {
+    async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+        self.0.add_permits(1);
+        Ok(BeforeTool::Sleep(Sleep {
+            signals: vec!["approve".into()],
+            until_millis: None,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn abort_sleeping_gate_never_dispatches_tool() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let seen = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext("gate", "p", Arc::new(NotifyingGate(seen.clone()))))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["gate".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("aborted"));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[async_trait]
+impl Hook for DeadlineGate {
+    async fn before_tool(&self, _: &HookCall, ctx: &Context<'_>) -> Result<BeforeTool, String> {
+        if ctx.snapshot["phase"]["ToolPreparing"]["wake"]["reason"] == "time" {
+            Ok(BeforeTool::Pass)
+        } else {
+            Ok(BeforeTool::Sleep(Sleep {
+                signals: vec![],
+                until_millis: Some(0),
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn scheduler_wakes_expired_gate_and_dispatches_tool() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext("gate", "p", Arc::new(DeadlineGate)))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["gate".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tool.0.lock().unwrap().len(), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sleeping_gate_resumes_after_signal_and_reopen() {
+    use pi_rs_durable::conversation_signal::{Inbox, Signal};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        h.install_extension(ext("gate", "p", Arc::new(SignalGate)))
+            .unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["gate".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(tool.0.lock().unwrap().is_empty());
+    }
+    let mut h = Harness::open_paused(&path, options(model, tool.clone())).unwrap();
+    h.install_extension(ext("gate", "p", Arc::new(SignalGate)))
+        .unwrap();
+    let signal = Signal::new(Uuid::new_v4(), id, "approve".into(), json!({"allow": true}));
+    h.send_signal(&signal).unwrap();
+    h.send_signal(&signal).unwrap();
+    h.resume(&CancellationToken::new()).await.unwrap();
+    assert_eq!(tool.0.lock().unwrap().len(), 1);
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    drop(h);
+    let store = durable_store::Store::open(&path).unwrap();
+    assert!(
+        Inbox::new(&store)
+            .receipt(id, signal.id)
+            .unwrap()
+            .unwrap()
+            .is_consumed()
+    );
 }
 
 struct CrashHook;

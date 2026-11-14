@@ -45,6 +45,8 @@ pub enum Error {
     Progress(#[from] crate::progress::Error),
     #[error("transcript: {0}")]
     Transcript(#[from] crate::transcript::Error),
+    #[error("conversation signal: {0}")]
+    Signal(#[from] crate::conversation_signal::Error),
     #[error("fork: {0}")]
     Fork(#[from] crate::fork::Error),
     #[error("task scheduler: {0}")]
@@ -190,6 +192,16 @@ enum Phase {
         calls: Vec<ToolCall>,
         index: usize,
         operation_id: Uuid,
+        #[serde(default)]
+        wake: Option<serde_json::Value>,
+    },
+    ToolGateSleeping {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        index: usize,
+        operation_id: Uuid,
+        until_millis: Option<i64>,
+        signals: Vec<String>,
     },
     ToolRunning {
         turns: u32,
@@ -526,6 +538,14 @@ impl Harness {
         Ok(())
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
+        self.save_with_wake(state, expected, None)
+    }
+    fn save_with_wake(
+        &mut self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+    ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -661,6 +681,10 @@ impl Harness {
                     checks.extend(prepared.checks);
                     mutations.extend(prepared.mutations);
                 }
+            }
+            if let Some(wake) = wake {
+                checks.extend(wake.checks.clone());
+                mutations.extend(wake.mutations.clone());
             }
             match self.owner.store().commit(&checks, &mutations) {
                 Ok(()) => break,
@@ -923,6 +947,12 @@ impl Harness {
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.load(id).map(|x| x.0)
+    }
+    /// Durably deliver an idempotent signal to a conversation hook gate.
+    pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
+        self.conversation(signal.conversation_id)?;
+        crate::conversation_signal::Inbox::new(self.owner.store()).send(signal)?;
+        Ok(())
     }
     /// Attach one generic task scheduler to the same locked store. Its owner
     /// guard survives this handle; callers explicitly drive its ticks.
@@ -1620,7 +1650,9 @@ impl Harness {
                     )?;
                 }
             }
-            Phase::Tools { calls, index, .. } | Phase::ToolPreparing { calls, index, .. } => {
+            Phase::Tools { calls, index, .. }
+            | Phase::ToolPreparing { calls, index, .. }
+            | Phase::ToolGateSleeping { calls, index, .. } => {
                 for i in index..calls.len() {
                     append_tool(
                         &mut c,
@@ -2299,6 +2331,7 @@ impl Harness {
                             calls,
                             index,
                             operation_id: Uuid::new_v4(),
+                            wake: None,
                         };
                     } else if let Some(reg) = self.tools.get(&calls[index].name) {
                         let operation_id = Uuid::new_v4();
@@ -2355,11 +2388,53 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::ToolGateSleeping {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    until_millis,
+                    signals,
+                } => {
+                    let wake = crate::conversation_signal::Inbox::new(self.owner.store())
+                        .prepare_wake(
+                            id,
+                            &signals,
+                            until_millis,
+                            unix_ms().try_into().unwrap_or(i64::MAX),
+                        )?;
+                    let Some(wake) = wake else {
+                        return Ok(());
+                    };
+                    let wake_value = match &wake.signal {
+                        Some(signal) => {
+                            serde_json::json!({"reason": "signal", "name": signal.name, "id": signal.id, "payload": signal.payload})
+                        }
+                        None if signals.is_empty() => serde_json::json!({"reason": "time"}),
+                        None => serde_json::json!({"reason": "expired"}),
+                    };
+                    c.phase = Phase::ToolPreparing {
+                        turns,
+                        calls,
+                        index,
+                        operation_id,
+                        wake: Some(wake_value),
+                    };
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let result = self.save_with_wake(&c, Expected::Version(version), Some(&wake));
+                    self.merge_admissions = merge;
+                    match result {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
+                }
                 Phase::ToolPreparing {
                     turns,
                     calls,
                     index,
                     operation_id,
+                    wake: _,
                 } => {
                     let selected = self.selected_extensions(&c)?;
                     let call = calls
@@ -2441,6 +2516,24 @@ impl Harness {
                         self.failed = true;
                         return Err(Error::Interrupted);
                     }
+                    if let crate::extension::BeforeTool::Sleep(sleep) = &decision {
+                        if (sleep.until_millis.is_none() && sleep.signals.is_empty())
+                            || sleep.until_millis.is_some_and(|time| time < 0)
+                            || sleep.signals.iter().any(String::is_empty)
+                        {
+                            return Err(Error::Invalid("invalid extension sleep".into()));
+                        }
+                        c.phase = Phase::ToolGateSleeping {
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            until_millis: sleep.until_millis,
+                            signals: sleep.signals.clone(),
+                        };
+                        self.save(&c, Expected::Version(version))?;
+                        return Ok(());
+                    }
                     let rejection = match decision {
                         crate::extension::BeforeTool::Pass => None,
                         crate::extension::BeforeTool::Block(reason) => {
@@ -2450,9 +2543,7 @@ impl Harness {
                                 format!("{reason}: {reports:?}")
                             })
                         }
-                        crate::extension::BeforeTool::Sleep(_) => {
-                            Some("extension sleep is unsupported; tool blocked".into())
-                        }
+                        crate::extension::BeforeTool::Sleep(_) => unreachable!(),
                         crate::extension::BeforeTool::Rewrite(_) => {
                             Some("invalid before-tool decision".into())
                         }
@@ -2945,6 +3036,9 @@ impl Scheduler {
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
     }
+    pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
+        self.harness.send_signal(signal)
+    }
     pub fn attach_tasks(
         &self,
         registry: crate::task_scheduler::Registry,
@@ -3290,6 +3384,7 @@ async fn drive_scheduled(
                 })
                 .transpose()?
                 .unwrap_or(false),
+            Phase::ToolGateSleeping { .. } => true,
             _ => false,
         };
         if !should_poll {

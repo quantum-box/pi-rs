@@ -17,8 +17,8 @@ within a conversation. `Harness`, `Scheduler`, and the lower-level
 `reject_when_idle` to refuse it while no run is active. Both may be set; an
 existing request ID returns its original submission before either policy is
 checked. Rejections persist nothing, and concurrent admissions recheck their
-policies after a version conflict. The runtime still validates input before
-checking a request ID and does not expose upstream's submit-in-commit API.
+policies after a version conflict. A duplicate input request ID is resolved before content validation. The runtime
+does not expose upstream's submit-in-commit API.
 
 `Scheduler::abort` durably withdraws queued inputs and fences further local
 dispatch for that conversation; `abort_and_wait` also waits for its workers.
@@ -64,11 +64,12 @@ with selected extensions also avoids replaying potentially overridden host tools
 The runtime supports before-request message replacement and observes completed
 responses; hook errors and non-string after-tool replacements have limited
 reporting. Provider-body hooks, on-yield, after-tools and after-run hooks and
-their durable child tasks are not integrated. Tool sleep gates remain unsupported.
-The conversation signal inbox provides deduplicated receipts and transaction
-fragments for a future wake, but is not connected to runtime admission, phase
-persistence, scheduler rescanning, hook replay, abort, or recovery. In
-particular, it does not yet persist sleep deadlines or enable sleeping hooks.
+their durable child tasks are not integrated. Before-tool hooks may sleep on
+an absolute deadline or named conversation signals; `send_signal` deduplicates
+receipts, and wake consumption commits atomically with the phase transition.
+The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
+The scheduler rescans once per second and reopening resumes the wait. Signal
+keys are not yet subject to upstream single-wait or closed-after-deadline rules.
 
 Current limits and differences from upstream Pi Durable:
 
