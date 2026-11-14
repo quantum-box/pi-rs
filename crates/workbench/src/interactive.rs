@@ -7208,8 +7208,13 @@ enum ExternalEditorTarget {
     Extension(uuid::Uuid),
 }
 
+#[cfg(windows)]
+type ExternalEditorChild = Box<dyn process_wrap::std::ChildWrapper>;
+#[cfg(not(windows))]
+type ExternalEditorChild = std::process::Child;
+
 struct RunningExternalEditor {
-    child: std::process::Child,
+    child: ExternalEditorChild,
     file: tempfile::NamedTempFile,
     target: ExternalEditorTarget,
     #[cfg(unix)]
@@ -7365,8 +7370,15 @@ impl RunningExternalEditor {
             use std::os::unix::process::CommandExt;
             process.process_group(0);
         }
-        let child = process
-            .spawn()
+        #[cfg(windows)]
+        let child = {
+            let mut wrapped = process_wrap::std::CommandWrap::from(process);
+            wrapped.wrap(process_wrap::std::JobObject);
+            wrapped.spawn()
+        };
+        #[cfg(not(windows))]
+        let child = process.spawn();
+        let child = child
             .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
         #[cfg(unix)]
         let mut child = child;
@@ -7416,7 +7428,12 @@ impl RunningExternalEditor {
                     return Err(error.into());
                 }
             } else if unsafe { info.si_pid() } != 0 {
-                foreground.suspend_and_resume(self.child.id() as libc::pid_t)?;
+                if let Err(error) = foreground.suspend_and_resume(self.child.id() as libc::pid_t) {
+                    if let Some(status) = self.child.try_wait()? {
+                        return Ok(Some(status));
+                    }
+                    return Err(error.into());
+                }
             }
         }
         Ok(self.child.try_wait()?)
@@ -7814,7 +7831,7 @@ mod tests {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test_name, "--nocapture"])
                 .env_remove(SUPERVISOR)
-                .env(CHILD, program)
+                .env(CHILD, &program)
                 .process_group(0)
                 .spawn()
                 .unwrap();
@@ -7826,6 +7843,15 @@ mod tests {
             );
             assert!(libc::WIFSTOPPED(status));
             println!("SUPERVISOR_SAW_STOP");
+            if test_name.contains("editor_exits_while_suspended") {
+                let pid_file = std::path::PathBuf::from(&program).with_extension("pid");
+                let pid: libc::pid_t = std::fs::read_to_string(pid_file)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, 0);
+            }
             super::set_foreground(0, child.id() as libc::pid_t).unwrap();
             assert_eq!(
                 unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGCONT) },
@@ -7915,7 +7941,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("editor");
-        std::fs::write(&program, "#!/bin/sh\nstty -echo -icanon\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n").unwrap();
+        std::fs::write(&program, "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut master = -1;
         let mut slave = -1;
@@ -8005,11 +8031,13 @@ mod tests {
                     // The supervisor resumes a managed job; unsupervised and
                     // shared-group cases must resume without external SIGCONT.
                     // Wait for the child to confirm it restored editor foreground.
-                    let until = Instant::now() + Duration::from_secs(3);
-                    while !output
-                        .windows(b"EDITOR_RESUMED".len())
-                        .any(|part| part == b"EDITOR_RESUMED")
-                    {
+                    let until = Instant::now() + Duration::from_secs(8);
+                    let expected = if test_name.contains("editor_exits_while_suspended") {
+                        b"PARENT_FINISHED".as_slice()
+                    } else {
+                        b"EDITOR_RESUMED".as_slice()
+                    };
+                    while !output.windows(expected.len()).any(|part| part == expected) {
                         let mut bytes = [0; 1024];
                         if let Ok(n) = master.read(&mut bytes) {
                             output.extend_from_slice(&bytes[..n]);
@@ -8021,7 +8049,9 @@ mod tests {
                         );
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    master.write_all(&[3]).unwrap();
+                    if !test_name.contains("editor_exits_while_suspended") {
+                        master.write_all(&[3]).unwrap();
+                    }
                     resumed = true;
                 } else if rc > 0 {
                     panic!(
@@ -8086,6 +8116,47 @@ mod tests {
             true,
             false,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_exits_while_suspended_without_stopping_tui() {
+        editor_pty_regression(
+            "interactive::tests::editor_exits_while_suspended_without_stopping_tui",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_external_editor_kills_wrapper_descendants() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("editor.cmd");
+        let marker = directory.path().join("descendant-finished");
+        std::fs::write(&wrapper, format!(
+            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho started>\"%~1\"\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"\r\n",
+            marker.display().to_string().replace('\'', "''"),
+        )).unwrap();
+        let mut editor = super::RunningExternalEditor::start(
+            &format!("\"{}\"", wrapper.display()),
+            "draft",
+            super::ExternalEditorTarget::Main,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(editor.file.path())
+            .unwrap()
+            .contains("started")
+        {
+            assert!(Instant::now() < deadline, "wrapper did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        editor.cancel();
+        drop(editor);
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!marker.exists(), "wrapper descendant outlived cancellation");
     }
 
     #[cfg(unix)]

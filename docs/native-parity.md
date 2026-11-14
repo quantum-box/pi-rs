@@ -4146,7 +4146,8 @@ parent job and resumes the editor with its terminal settings. When the shell
 shares Pi's process group without job control, or Pi's parent is in a different
 session, the editor resumes immediately instead of suspending a job that cannot
 be foregrounded. Cancellation restores
-the original terminal settings. Interrupts received while an editor
+the original terminal settings; on Windows it also terminates editor wrapper
+descendants through a job object. Interrupts received while an editor
 is active do not disable subsequent terminal interrupt handling.
 The native 1 MiB extension response limit also applies to externally edited text.
 
