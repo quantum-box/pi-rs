@@ -473,6 +473,13 @@ mod tests {
             let root = std::path::PathBuf::from(root);
             let store = Store::open_existing(&root).unwrap().unwrap();
             let actual = store.read(&root.join("session.jsonl"), &binding).unwrap();
+            if std::env::var_os(CHILD_EXPECT).is_none() {
+                let error = store
+                    .try_begin(&root.join("session.jsonl"), binding.clone())
+                    .err()
+                    .expect("another process owns this generation");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            }
             let expected = if std::env::var_os(CHILD_EXPECT).is_some() {
                 Some(json!({"prompt":"published"}))
             } else {

@@ -524,10 +524,46 @@ pub fn run(
     Box::pin(run_worker(args, ready))
 }
 
+#[cfg(any(unix, windows))]
+fn existing_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
+    use pi_rs_workbench::private_share_store::Store;
+    let parent = super::config::agent_dir();
+    match std::fs::symlink_metadata(parent.join("share-context-v1")) {
+        Ok(_) => Store::open_existing(&parent)?
+            .map(Some)
+            .ok_or_else(|| Error::Config("existing share cache cannot be verified".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// This invalidation-only bridge does not publish snapshots. Before adding a
+// publisher, cache creation and absent-cache startup must share a process-wide
+// protocol; otherwise a cache created after the absence check can go stale.
+#[cfg(any(unix, windows))]
+fn invalidate_existing_share_generation<'a>(
+    store: Option<&'a pi_rs_workbench::private_share_store::Store>,
+    path: &std::path::Path,
+) -> Result<Option<pi_rs_workbench::private_share_store::Generation<'a>>> {
+    let Some(store) = store else { return Ok(None) };
+    let session = match Session::snapshot(path) {
+        Ok(session) => session,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let binding = store.binding_for_session(&session, &())?;
+    Ok(Some(store.try_begin(path, binding)?))
+}
+
 async fn run_worker(
     mut args: Cli,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    #[cfg(any(unix, windows))]
+    let share_store = existing_share_store()?;
+    #[cfg(any(unix, windows))]
+    let mut share_generation =
+        invalidate_existing_share_generation(share_store.as_ref(), &args.session)?;
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
@@ -807,6 +843,15 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                // Invalidate the target before any lifecycle hook or discovery
+                // can change its live context. Retain the old lease until the
+                // new one is acquired successfully.
+                #[cfg(any(unix, windows))]
+                {
+                    let next =
+                        invalidate_existing_share_generation(share_store.as_ref(), &session)?;
+                    share_generation = next;
+                }
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -1383,7 +1428,10 @@ async fn run_worker(
         },
     )
     .await;
-    runtime.close().await
+    let result = runtime.close().await;
+    #[cfg(any(unix, windows))]
+    drop(share_generation);
+    result
 }
 
 async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {
@@ -1956,6 +2004,34 @@ mod share_context_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn existing_generation_is_invalidated_before_worker_initialization() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old":true}))
+            .unwrap();
+        drop(session);
+        let lease = invalidate_existing_share_generation(Some(&store), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.read(&path, &binding).unwrap(), None);
+        let error = store
+            .try_begin(&path, binding.clone())
+            .err()
+            .expect("worker owns generation");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(lease);
+        assert_eq!(store.read(&path, &binding).unwrap(), None);
     }
 
     #[test]
