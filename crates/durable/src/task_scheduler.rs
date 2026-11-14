@@ -71,6 +71,16 @@ pub enum BlockedReason {
     MigrationFailed(String),
 }
 
+fn orphan_diagnostic(reason: &BlockedReason) -> String {
+    match reason {
+        BlockedReason::MissingTask => "orphaned: missing task definition".into(),
+        BlockedReason::TaskTooOld => {
+            "orphaned: task definition is older than stored version".into()
+        }
+        BlockedReason::MigrationFailed(error) => format!("orphaned: migration failed: {error}"),
+    }
+}
+
 /// A live task whose stored definition cannot currently execute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockedTask {
@@ -580,15 +590,28 @@ impl Scheduler {
                 self.poisoned = false;
                 return Ok(true);
             }
+            if let Some(reason) = self.blocked_reason(&snapshot.task) {
+                let diagnostic = orphan_diagnostic(&reason);
+                self.ts().update(snapshot, |t| {
+                    t.start()?;
+                    t.fail(diagnostic)
+                })?;
+                self.poisoned = false;
+                return Ok(true);
+            }
             let abort = self
                 .registered(&snapshot.task)
                 .ok()
                 .and_then(|r| r.abort.clone());
-            if let Some(abort) = abort.filter(|_| self.blocked_reason(&snapshot.task).is_none()) {
+            if let Some(abort) = abort {
                 if !self.reserve_resolved(snapshot)? {
+                    let reason = self
+                        .blocked_reason(&snapshot.task)
+                        .ok_or(Error::Registration)?;
+                    let diagnostic = orphan_diagnostic(&reason);
                     self.ts().update(snapshot, |t| {
                         t.start()?;
-                        t.fail("orphaned: migration failed".into())
+                        t.fail(diagnostic)
                     })?;
                     self.poisoned = false;
                     return Ok(true);
@@ -1329,6 +1352,132 @@ mod tests {
         assert!(
             matches!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("orphaned"))
         );
+    }
+
+    #[test]
+    fn blocked_abort_drains_owned_child_and_persists_reason_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register("parent", true, |t: &Task| {
+            Ok(Step::Wait {
+                checkpoint: cp("waiting"),
+                condition: WaitFor::Tasks(vec![Uuid::from_u128(2)]),
+                children: vec![task(2, TaskOwner::Task(t.id()), "child", true, 5)],
+            })
+        });
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        {
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "parent",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            assert!(scheduler.tick(0).unwrap());
+            let mut registry = Registry::default();
+            registry.register_with_abort(
+                "child",
+                true,
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            scheduler.replace_registry(registry).unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                &TaskState::Ready
+            );
+        }
+        {
+            let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                &TaskState::Failed("orphaned: missing task definition".into())
+            );
+        }
+        let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Failed("orphaned: missing task definition".into())
+        );
+        assert!(scheduler.blocked_tasks().unwrap().is_empty());
+        assert!(!scheduler.tick(0).unwrap());
+    }
+
+    #[test]
+    fn blocked_abort_persists_version_and_migration_diagnostics() {
+        for scenario in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tasks.db");
+            let mut registry = Registry::default();
+            registry.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "job",
+                    true,
+                    5,
+                ))
+                .unwrap();
+            let mut registry = Registry::default();
+            if scenario == 0 {
+                // The stored version is newer than the available definition.
+                let snapshot = scheduler.ts().load(Uuid::from_u128(1)).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&snapshot, |t| {
+                        t.migrate(2, json!(null), cp("start"));
+                        Ok(())
+                    })
+                    .unwrap();
+                registry.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            } else {
+                registry.register_versioned(
+                    "job",
+                    2,
+                    true,
+                    |_: &Task| Ok(Step::Succeed(json!(null))),
+                    if scenario == 1 {
+                        None
+                    } else {
+                        Some(Arc::new(|_, _, _| Err("bad checkpoint".into())))
+                    },
+                );
+                registry.set_abort("job", |_: &Task| Ok(Step::Succeed(json!(null))));
+            }
+            scheduler.replace_registry(registry).unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+            assert!(scheduler.tick(0).unwrap());
+            let expected = match scenario {
+                0 => "orphaned: task definition is older than stored version",
+                1 => "orphaned: migration failed: missing migration",
+                _ => "orphaned: migration failed: bad checkpoint",
+            };
+            drop(scheduler);
+            let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+            assert_eq!(
+                scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                &TaskState::Failed(expected.into())
+            );
+        }
     }
 
     #[test]

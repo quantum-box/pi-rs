@@ -598,9 +598,13 @@ Parity limitations: the standalone scheduler uses host-driven ticks and both
 schedulers replace the whole registry. Unlike upstream, there is no report callback,
 task-graph integration, or host wake notification for blocked changes. The synchronous callback uses Rust `Result` and a structured
 `Checkpoint` rather than upstream's JavaScript task types and JSON checkpoint;
-panics are not converted into migration failure reports. Blocked aborts use the
-existing generic failed/orphan message rather than upstream's typed orphaned
-outcome and reason. Existing replay-safety and interrupted-execution recovery
+panics are not converted into migration failure reports. Explicit aborts of
+blocked definitions wait for owned children, then persist an orphan diagnostic
+in the existing `Failed(String)` state, including the missing definition,
+version incompatibility, or migration failure. This is not upstream's typed
+orphaned outcome. A migration callback is attempted during abort only when an
+abort handler is registered; otherwise the existing missing-handler diagnostic
+is retained. Restart abandonment is not represented. Existing replay-safety and interrupted-execution recovery
 policies remain pi-rs extensions and can differ from upstream, including leaving
 some interrupted tasks running until a missing definition returns. Generic tasks
 are not yet fully integrated into upstream's registry, task graph, or lifecycle.
