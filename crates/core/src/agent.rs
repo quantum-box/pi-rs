@@ -1916,7 +1916,31 @@ impl Agent<'_> {
             return;
         }
         let request_id = *request_id;
-        let output_tokens = usage.output_tokens;
+        let requests_used = branch
+            .iter()
+            .filter(|record| {
+                record.run_id == Some(run_id)
+                    && matches!(record.event, Event::ModelRequested { .. })
+            })
+            .count();
+        let output_used = branch
+            .iter()
+            .filter(|record| record.run_id == Some(run_id))
+            .try_fold(0_u64, |total, record| match &record.event {
+                Event::ModelFinished {
+                    usage: UsageReport::Measured { usage },
+                    ..
+                } => Some(total.saturating_add(usage.output_tokens)),
+                Event::ModelFinished {
+                    usage: UsageReport::Estimated { output_tokens },
+                    ..
+                } => Some(total.saturating_add(*output_tokens)),
+                Event::ModelFinished {
+                    usage: UsageReport::Unconfirmed,
+                    ..
+                } => None,
+                _ => Some(total),
+            });
         let matching = branch.iter().any(|record| matches!(&record.event,
             Event::ModelRequested { request_id: Some(id), model, .. } if *id == request_id && model == self.model_name));
         let completed = branch.iter().any(|record| matches!(&record.event,
@@ -1979,11 +2003,11 @@ impl Agent<'_> {
         {
             return;
         }
-        let output_limit = if self.limits.model_requests > 1 {
+        let output_limit = if requests_used < self.limits.model_requests && output_used.is_some() {
             self.limits.output_tokens_per_request.min(512).min(
                 self.limits
                     .output_tokens_per_run
-                    .saturating_sub(output_tokens.min(u64::from(u32::MAX)) as u32),
+                    .saturating_sub(output_used.unwrap_or_default().min(u64::from(u32::MAX)) as u32),
             )
         } else {
             0
