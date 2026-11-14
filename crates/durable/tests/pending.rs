@@ -284,3 +284,139 @@ async fn scheduler_polls_pending_jobs_until_complete() {
     );
     s.shutdown().await.unwrap();
 }
+
+struct ParkedJob {
+    calls: AtomicUsize,
+    polls: AtomicUsize,
+    seen: tokio::sync::Semaphore,
+    finish: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Tool for ParkedJob {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: "job".into(),
+        }
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.seen.add_permits(1);
+        Some(if self.finish.load(Ordering::SeqCst) {
+            Outcome::Succeeded("finished".into())
+        } else {
+            Outcome::Pending {
+                reference: "job".into(),
+            }
+        })
+    }
+}
+
+fn parked_options(job: Arc<ParkedJob>) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![RegisteredTool {
+            tool: job,
+            replay: ReplayPolicy::Unsafe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+async fn next_poll(job: &ParkedJob) {
+    tokio::time::timeout(std::time::Duration::from_millis(500), job.seen.acquire())
+        .await
+        .expect("scheduled worker did not reach the parked conversation")
+        .unwrap()
+        .forget();
+}
+
+#[tokio::test]
+async fn scheduled_retry_can_drive_a_parked_worker_without_redispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = Arc::new(ParkedJob {
+        calls: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+        seen: tokio::sync::Semaphore::new(0),
+        finish: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), parked_options(job.clone()))
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    next_poll(&job).await;
+    job.finish.store(true, Ordering::SeqCst);
+    for _ in 0..8 {
+        scheduler.schedule(id);
+    }
+    next_poll(&job).await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(job.polls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        scheduler.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn parked_worker_shutdown_and_reopen_preserves_pending_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let job = Arc::new(ParkedJob {
+        calls: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+        seen: tokio::sync::Semaphore::new(0),
+        finish: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut scheduler =
+        pi_rs_durable::runtime::Scheduler::open(&path, parked_options(job.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    next_poll(&job).await;
+    scheduler.schedule(id);
+    scheduler.shutdown().await.unwrap();
+    job.finish.store(true, Ordering::SeqCst);
+    let mut reopened =
+        pi_rs_durable::runtime::Scheduler::open(&path, parked_options(job.clone())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), reopened.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        reopened.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    reopened.shutdown().await.unwrap();
+}

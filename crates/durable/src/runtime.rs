@@ -1266,14 +1266,15 @@ impl Harness {
         stop: &CancellationToken,
     ) -> Result<(), Error> {
         let lock = self.owner.conversation_controls().get(id).worker;
-        let _guard = tokio::select! {
+        let guard = tokio::select! {
             guard = lock.lock() => guard,
             _ = stop.cancelled() => return Ok(()),
         };
         let control = self.owner.conversation_controls().get(id);
         self.execution_gate = Some(control.gate);
+        let mut guard = Some(guard);
         tokio::select! {
-            result = drive_scheduled(self, id, &control.cleanup_cancel) => result,
+            result = drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard) => result,
             _ = stop.cancelled() => Ok(()),
         }
     }
@@ -7296,12 +7297,22 @@ impl Scheduler {
         worker.execution_gate = Some(control.gate);
         let errors = self.worker_errors.clone();
         let task = tokio::spawn(async move {
-            let _lock = lock.lock().await;
+            let mut guard = Some(lock.lock().await);
+            // A cancelled queued retry never took over the failed execution.
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             // A queued retry has not yet superseded the previous execution.
             errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            let result = std::panic::AssertUnwindSafe(drive_scheduled(&mut worker, id, &cancel))
-                .catch_unwind()
-                .await;
+            let result = std::panic::AssertUnwindSafe(drive_scheduled(
+                &mut worker,
+                id,
+                &cancel,
+                &lock,
+                &mut guard,
+            ))
+            .catch_unwind()
+            .await;
             let failure = match &result {
                 Ok(Err(error)) => Some(error.to_string()),
                 Err(_) => Some("worker panicked".into()),
@@ -7376,24 +7387,36 @@ impl Scheduler {
                                     let lock =
                                         worker.owner.conversation_controls().get(child).worker;
                                     {
-                                        let _guard = lock.lock().await;
+                                        let mut guard = Some(lock.lock().await);
                                         let control =
                                             worker.owner.conversation_controls().get(child);
                                         worker.execution_gate = Some(control.gate);
-                                        drive_scheduled(&mut worker, child, &control.cancel)
-                                            .await?;
+                                        drive_scheduled(
+                                            &mut worker,
+                                            child,
+                                            &control.cancel,
+                                            &lock,
+                                            &mut guard,
+                                        )
+                                        .await?;
                                     }
                                     if let Some(parent) =
                                         worker.deliver_report(&task_key, &reporter)?
                                     {
                                         let lock =
                                             worker.owner.conversation_controls().get(parent).worker;
-                                        let _guard = lock.lock().await;
+                                        let mut guard = Some(lock.lock().await);
                                         let control =
                                             worker.owner.conversation_controls().get(parent);
                                         worker.execution_gate = Some(control.gate);
-                                        drive_scheduled(&mut worker, parent, &control.cancel)
-                                            .await?;
+                                        drive_scheduled(
+                                            &mut worker,
+                                            parent,
+                                            &control.cancel,
+                                            &lock,
+                                            &mut guard,
+                                        )
+                                        .await?;
                                     }
                                     Ok(())
                                 }),
@@ -7608,28 +7631,35 @@ impl RuntimeOwner {
 }
 
 /// Drive a conversation under its scheduler lock and cancellation fence.
-pub(crate) async fn drive_scheduled(
+pub(crate) async fn drive_scheduled<'a>(
     worker: &mut Harness,
     id: Uuid,
     cancel: &CancellationToken,
+    lock: &'a tokio::sync::Mutex<()>,
+    guard: &mut Option<tokio::sync::MutexGuard<'a, ()>>,
 ) -> Result<(), Error> {
     if cancel.is_cancelled() {
         return Ok(());
     }
-    if let Err(error) = worker.recover_conversation(id) {
-        let _gate = worker
-            .execution_gate
-            .as_ref()
-            .unwrap()
-            .lock()
-            .map_err(|_| Error::Failed)?;
-        return if cancel.is_cancelled() {
-            Ok(())
-        } else {
-            Err(error)
-        };
-    }
     loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        // Another owner may have failed while this worker was parked. Apply
+        // the same recovery policy as a newly scheduled worker before driving.
+        if let Err(error) = worker.recover_conversation(id) {
+            let _gate = worker
+                .execution_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .map_err(|_| Error::Failed)?;
+            return if cancel.is_cancelled() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
         if let Err(error) = worker.drive(id, cancel).await {
             let _gate = worker
                 .execution_gate
@@ -7672,7 +7702,15 @@ pub(crate) async fn drive_scheduled(
         if !should_poll {
             return Ok(());
         }
+        // `drive` has returned at a persisted wait boundary. No dispatch future
+        // remains live, so another worker can safely inspect and drive it.
+        drop(guard.take());
         tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(1)) => () }
+        *guard = Some(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            guard = lock.lock() => guard,
+        });
     }
 }
 
@@ -8639,6 +8677,22 @@ mod scheduler_tests {
         );
         scheduler.cancel.cancel();
         drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scheduler.tasks[&id].iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scheduler
+                .worker_errors
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(String::as_str),
+            Some("worker panicked")
+        );
         assert!(scheduler.shutdown().await.is_err());
     }
 

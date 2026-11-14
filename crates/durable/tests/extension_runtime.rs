@@ -212,6 +212,21 @@ impl Hook for SignalGate {
 
 struct DeadlineGate;
 struct NotifyingGate(Arc<tokio::sync::Semaphore>);
+struct NotifyingSignalGate(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl Hook for NotifyingSignalGate {
+    async fn before_tool(&self, _: &HookCall, ctx: &Context<'_>) -> Result<BeforeTool, String> {
+        self.0.add_permits(1);
+        if ctx.snapshot["phase"]["ToolPreparing"]["wake"]["reason"] == "signal" {
+            Ok(BeforeTool::Pass)
+        } else {
+            Ok(BeforeTool::Sleep(Sleep {
+                signals: vec!["approve".into()],
+                until_millis: None,
+            }))
+        }
+    }
+}
 #[async_trait]
 impl Hook for NotifyingGate {
     async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
@@ -250,6 +265,91 @@ async fn abort_sleeping_gate_never_dispatches_tool() {
     scheduler.abort_and_wait(id).await.unwrap();
     assert!(tool.0.lock().unwrap().is_empty());
     assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("aborted"));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_with_retry_queued_at_sleeping_gate() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let seen = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext("gate", "p", Arc::new(NotifyingGate(seen.clone()))))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["gate".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // Abort fences both the parked worker and the newly admitted retry.
+    scheduler.schedule(id);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        scheduler.abort_and_wait(id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    assert!(tool_message(&scheduler.conversation(id).unwrap()).contains("aborted"));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn scheduled_retry_wakes_a_parked_hook() {
+    use pi_rs_durable::{conversation_signal::Signal, runtime::Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let tool = Arc::new(FakeTool::default());
+    let seen = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        options(Arc::new(FakeModel::default()), tool.clone()),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(ext(
+            "gate",
+            "p",
+            Arc::new(NotifyingSignalGate(seen.clone())),
+        ))
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["gate".into()])
+        .unwrap();
+    scheduler.submit(id, None, "go".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler
+        .send_signal(&Signal::new(
+            Uuid::new_v4(),
+            id,
+            "approve".into(),
+            json!({}),
+        ))
+        .unwrap();
+    scheduler.schedule(id);
+    tokio::time::timeout(std::time::Duration::from_millis(500), seen.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.wait(id).await.unwrap();
+    assert_eq!(tool.0.lock().unwrap().len(), 1);
     scheduler.shutdown().await.unwrap();
 }
 
