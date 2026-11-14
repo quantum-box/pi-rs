@@ -171,6 +171,66 @@ impl Store {
             .optional()?)
     }
 
+    /// Read relevant immutable observer records and application-log snapshots
+    /// in complete store commit frames. The namespace contract forbids raw
+    /// mutation or deletion of these records.
+    pub fn conversation_commits(
+        &self,
+        observer_prefix: &[u8],
+        application_key: &[u8],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<KeyedEntry>)>, Error> {
+        if limit == 0 || limit > 256 || after > through || through > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current: u64 = tx.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if through > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let sql = "WITH records AS (
+            SELECT c.sequence,e.key,e.value,e.version FROM durable_store_entries e
+            JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version
+            WHERE substr(e.key,1,?1)=?2
+            UNION ALL
+            SELECT c.sequence,h.key,h.value,h.version FROM durable_document_history h
+            JOIN durable_commit_versions c ON c.key=h.key AND c.version=h.version
+            WHERE h.key=?3 AND h.value IS NOT NULL
+        ), chosen AS (SELECT DISTINCT sequence FROM records WHERE sequence>?4 AND sequence<=?5 ORDER BY sequence LIMIT ?6)
+        SELECT sequence,key,value,version FROM records WHERE sequence IN chosen ORDER BY sequence,key";
+        let mut stmt = tx.prepare(sql)?;
+        let mut rows = stmt.query(params![
+            observer_prefix.len() as i64,
+            observer_prefix,
+            application_key,
+            after,
+            through,
+            limit as i64
+        ])?;
+        let mut result: Vec<(u64, Vec<KeyedEntry>)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let sequence = row.get(0)?;
+            if result.last().is_none_or(|frame| frame.0 != sequence) {
+                result.push((sequence, Vec::new()));
+            }
+            result.last_mut().unwrap().1.push((
+                row.get(1)?,
+                Entry {
+                    value: row.get(2)?,
+                    version: row.get(3)?,
+                },
+            ));
+        }
+        Ok(result)
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Entry>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn

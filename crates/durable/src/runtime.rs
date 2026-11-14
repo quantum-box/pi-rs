@@ -665,6 +665,29 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
     }
 }
 
+/// Trusted cursor for a finite database-local unified history capture.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnifiedHistoryCursor {
+    conversation: Uuid,
+    after: u64,
+    through: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnifiedHistoryCommit {
+    pub sequence: u64,
+    pub snapshots: Vec<crate::observer::Record>,
+    /// Full application log at this commit, including inherited fork entries.
+    pub applications: Option<Vec<crate::application_entry::ApplicationEntry>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnifiedHistoryPage {
+    pub commits: Vec<UnifiedHistoryCommit>,
+    pub next: UnifiedHistoryCursor,
+    pub has_more: bool,
+}
+
 pub struct Harness {
     pub(crate) owner: Arc<OwnedStore>,
     options: Options,
@@ -2480,6 +2503,97 @@ impl Harness {
         *self.task_driver.lock().map_err(|_| Error::Failed)? = Some(driver.weak());
         Ok(driver)
     }
+    /// Capture a finite unified history range. Legacy stores require an explicit
+    /// opt-in to reading only commits recorded after sequence tracking began.
+    pub fn unified_history_start(
+        &self,
+        id: Uuid,
+        allow_legacy_boundary: bool,
+    ) -> Result<UnifiedHistoryCursor, Error> {
+        self.load(id)?;
+        let store = self.owner.store();
+        if store.legacy_version_boundary()? != 0 && !allow_legacy_boundary {
+            return Err(Error::Invalid(
+                "legacy commit order unavailable; explicitly start after the migration boundary"
+                    .into(),
+            ));
+        }
+        Ok(UnifiedHistoryCursor {
+            conversation: id,
+            after: 0,
+            through: store.commit_sequence()?,
+        })
+    }
+
+    /// Read at most `limit` complete commits in the captured range. Each model
+    /// record is an expanded observation snapshot; application records are full
+    /// log snapshots, not individually ordered transcript events.
+    pub fn unified_history(
+        &self,
+        cursor: &UnifiedHistoryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<UnifiedHistoryPage, Error> {
+        if limit.get() > 255 {
+            return Err(Error::Invalid("history page limit exceeds 255".into()));
+        }
+        self.load(cursor.conversation)?;
+        let mut prefix = b"durable/observer/".to_vec();
+        prefix.extend_from_slice(cursor.conversation.as_bytes());
+        prefix.extend_from_slice(b"/r");
+        let app_key = crate::application_entry::key(cursor.conversation);
+        let mut frames = self.owner.store().conversation_commits(
+            &prefix,
+            &app_key,
+            cursor.after,
+            cursor.through,
+            limit.get() + 1,
+        )?;
+        let has_more = frames.len() > limit.get();
+        frames.truncate(limit.get());
+        let mut commits = Vec::with_capacity(frames.len());
+        for (sequence, records) in frames {
+            let mut snapshots = Vec::new();
+            let mut applications = None;
+            for (key, entry) in records {
+                if key == app_key {
+                    if applications.is_some() {
+                        return Err(Error::Invalid("duplicate application snapshot".into()));
+                    }
+                    applications = Some(serde_json::from_slice(&entry.value)?);
+                } else {
+                    let suffix = key
+                        .strip_prefix(prefix.as_slice())
+                        .ok_or_else(|| Error::Invalid("invalid observation key".into()))?;
+                    let observation = u64::from_be_bytes(
+                        suffix
+                            .try_into()
+                            .map_err(|_| Error::Invalid("invalid observation key".into()))?,
+                    );
+                    let mut value = serde_json::from_slice(&entry.value)?;
+                    self.expand_event(cursor.conversation, &mut value)?;
+                    snapshots.push(crate::observer::Record {
+                        cursor: crate::observer::Cursor(observation),
+                        value,
+                    });
+                }
+            }
+            commits.push(UnifiedHistoryCommit {
+                sequence,
+                snapshots,
+                applications,
+            });
+        }
+        let mut next = cursor.clone();
+        if let Some(last) = commits.last() {
+            next.after = last.sequence;
+        }
+        Ok(UnifiedHistoryPage {
+            commits,
+            next,
+            has_more,
+        })
+    }
+
     /// Read committed snapshots after a cursor. Earlier cursors may be
     /// resumed; snapshots are retained independently of model context.
     pub fn history(

@@ -1337,3 +1337,163 @@ async fn fork_inherits_policies_for_absent_documents_at_the_cut() {
     };
     assert_eq!(docs.get(&descendant).unwrap().unwrap().value["n"], 42);
 }
+
+#[tokio::test]
+async fn unified_history_pages_survive_reopen_and_show_fork_snapshots() {
+    use pi_rs_durable::{
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    struct WriteEntry;
+    impl Handler for WriteEntry {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.note", serde_json::json!("task entry"))
+                .unwrap();
+            Ok(Step::Succeed(serde_json::Value::Null))
+        }
+    }
+    use uuid::Uuid;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(parent, None, "hello unified".into(), &cancel)
+        .await
+        .unwrap();
+    let task_id = Uuid::new_v4();
+    let task = Task::new(
+        task_id,
+        TaskOwner::Conversation(parent),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::json!({}),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("writer".into(), true);
+    let mut registry = Registry::default();
+    registry.register("writer", true, WriteEntry);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let store = durable_store::Store::open(&path).unwrap();
+    let app = pi_rs_durable::application_entry::list(&store, parent)
+        .unwrap()
+        .remove(0);
+    assert_eq!(app.author_task_id, task_id);
+    let captured = h.unified_history_start(parent, false).unwrap();
+    let first = h.unified_history(&captured, NonZeroUsize::MIN).unwrap();
+    assert_eq!(first.commits.len(), 1);
+    assert!(first.has_more);
+    let saved = serde_json::to_string(&first.next).unwrap();
+    h.submit_write(
+        parent,
+        None,
+        "app.later".into(),
+        Some(serde_json::json!("after capture")),
+    )
+    .unwrap();
+    let child = h.fork(parent).unwrap();
+    drop(h);
+    drop(store);
+    let h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let mut cursor = serde_json::from_str(&saved).unwrap();
+    let mut frames = first.commits;
+    loop {
+        let page = h.unified_history(&cursor, NonZeroUsize::MIN).unwrap();
+        frames.extend(page.commits);
+        cursor = page.next;
+        if !page.has_more {
+            break;
+        }
+    }
+    assert!(
+        frames
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    assert!(
+        frames
+            .iter()
+            .flat_map(|f| &f.snapshots)
+            .any(|s| s.value.to_string().contains("hello unified"))
+    );
+    assert_eq!(
+        frames.last().unwrap().applications.as_ref().unwrap(),
+        &vec![app.clone()]
+    );
+    assert!(
+        !frames
+            .iter()
+            .flat_map(|f| &f.snapshots)
+            .any(|s| s.value.to_string().contains("after capture"))
+    );
+    let child_page = h
+        .unified_history(
+            &h.unified_history_start(child, false).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+    assert!(child_page.commits.iter().any(|f| {
+        f.applications
+            .as_ref()
+            .is_some_and(|v| v == &vec![app.clone()])
+    }));
+    assert!(
+        child_page
+            .commits
+            .iter()
+            .flat_map(|f| &f.snapshots)
+            .any(|s| s.value.to_string().contains("hello unified"))
+    );
+    assert!(
+        h.unified_history(&cursor, NonZeroUsize::new(256).unwrap())
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unified_history_requires_explicit_legacy_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES (1, 1); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID; INSERT INTO durable_store_entries VALUES (X'78', X'79', 1);").unwrap();
+    }
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    assert!(h.unified_history_start(id, false).is_err());
+    let cursor = h.unified_history_start(id, true).unwrap();
+    assert!(
+        !h.unified_history(&cursor, NonZeroUsize::MIN)
+            .unwrap()
+            .commits
+            .is_empty()
+    );
+}
