@@ -810,12 +810,11 @@ impl Model for Ollama {
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
-            let permanent_quota = status.as_u16() == 429
+            let permanent_quota = (matches!(status.as_u16(), 408 | 429)
+                || status.is_server_error())
                 && pi_rs_core::permanent_provider_limit(response.bytes_stream()).await;
             return Err(if permanent_quota {
-                Error::Model(
-                    "Chat Completions account quota or billing limit reached (HTTP 429)".into(),
-                )
+                Error::Model("Chat Completions account quota or billing limit reached".into())
             } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
                 Error::RetryableModel(description)
             } else {
@@ -902,8 +901,12 @@ impl Model for Ollama {
                 }
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
-                if chunk.error.is_some() {
-                    Err(Error::Model("provider returned a stream error".into()))?;
+                if let Some(error) = &chunk.error {
+                    Err(if pi_rs_core::permanent_provider_error(error) {
+                        Error::Model("Chat Completions account quota or billing limit reached".into())
+                    } else {
+                        Error::Model("provider returned a stream error".into())
+                    })?;
                 }
                 let previous = metadata.clone();
                 if let Some(id) = chunk.id
@@ -1156,14 +1159,76 @@ struct CallDelta {
 #[cfg(test)]
 mod content_tests {
     #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for permanent in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Ollama::new(&format!("http://{address}"), None).unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
-        for (body, permanent) in [
+        for (status, body, permanent) in [
             (
+                429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
                 true,
             ),
-            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (408, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1171,7 +1236,7 @@ mod content_tests {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
                 let _ = socket.read(&mut request).unwrap();
-                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
             let model = Ollama::new(&format!("http://{address}"), None).unwrap();
             let result = model

@@ -466,15 +466,13 @@ impl Model for OpenAiResponses {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
-            if status.as_u16() == 429 {
+            if status.as_u16() == 429 || status.is_server_error() {
                 let info = pi_rs_core::provider_limit_info(response.bytes_stream()).await;
                 return Err(if info.permanent {
                     if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
                         response_error(info.recognized_code, Some(status))
                     } else {
-                        Error::Model(
-                            "OpenAI account quota or billing limit reached (HTTP 429)".into(),
-                        )
+                        Error::Model("OpenAI account quota or billing limit reached".into())
                     }
                 } else if info.recognized_code.is_some() {
                     response_error(info.recognized_code, Some(status))
@@ -581,7 +579,17 @@ impl Model for OpenAiResponses {
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
                     }
-                    "response.failed" | "error" => Err(response_error(event["response"]["error"]["code"].as_str().or_else(|| event["error"]["code"].as_str()), None))?,
+                    "response.failed" | "error" => {
+                        let error = event["response"].get("error").filter(|error| !error.is_null()).or_else(|| event.get("error")).unwrap_or(&Value::Null);
+                        let code = error["code"].as_str();
+                        Err(if code == Some("subscription_sharing_usage_limit_exceeded") {
+                            response_error(code, None)
+                        } else if pi_rs_core::permanent_provider_error(error) {
+                            Error::Model("OpenAI account quota or billing limit reached".into())
+                        } else {
+                            response_error(code, None)
+                        })?;
+                    },
                     _ => {}
                 }
             }
@@ -597,14 +605,80 @@ impl Model for OpenAiResponses {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for permanent in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type":"response.failed","response":{"error":{"code":"error","message":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"}}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "token".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
-        for (body, permanent) in [
+        for (status, body, permanent) in [
             (
+                429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
                 true,
             ),
-            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -612,7 +686,7 @@ mod tests {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
                 let _ = socket.read(&mut request).unwrap();
-                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
             let model = OpenAiResponses::new_api_provider(
                 &format!("http://{address}"),

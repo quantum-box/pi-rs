@@ -4308,9 +4308,11 @@ separate policy.
 ### Provider quota retry classification
 
 Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
-distinguish Pi's permanent account, billing and quota exhaustion markers from
-transient HTTP 429 rate limits. The adapters inspect at most 64 KiB for at most
-two seconds without logging or returning the response body. If no marker is
-found within that bound, or reading fails or times out, 429 remains retryable.
-Bedrock's typed SDK errors and non-chat model calls retain their separate retry
-policies; streaming-error parity also remains open.
+recognize permanent account, billing and quota exhaustion in structured error
+message, code and type fields for retryable HTTP statuses and stream errors.
+JSON metadata such as request IDs does not affect classification. Plain-text
+errors are also supported. HTTP body inspection is limited to 64 KiB and two
+seconds; failed, timed-out or truncated JSON inspection falls back to the
+existing transient classification. Provider error bodies are not logged or
+returned. Bedrock typed SDK errors and non-chat operations retain their separate
+policies.

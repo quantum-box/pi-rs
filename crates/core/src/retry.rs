@@ -46,7 +46,7 @@ where
             _ => None,
         };
         Some(ProviderLimitInfo {
-            permanent: permanent_limit_text(&bytes, complete),
+            permanent: permanent_limit_body(&bytes, complete),
             recognized_code,
         })
     })
@@ -66,6 +66,43 @@ where
     B: AsRef<[u8]>,
 {
     provider_limit_info(stream).await.permanent
+}
+
+// JSON envelope fields outside the provider error are metadata, not a reason
+// to suppress retries. Never scan request IDs or arbitrary nested values.
+#[doc(hidden)]
+pub fn permanent_provider_error(value: &serde_json::Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    if let Some(text) = error.as_str() {
+        return permanent_limit_text(text.as_bytes(), true);
+    }
+    let Some(object) = error.as_object() else {
+        return false;
+    };
+    ["message", "code", "type", "errorMessage"]
+        .iter()
+        .any(|key| {
+            let Some(value) = object.get(*key) else {
+                return false;
+            };
+            if *key == "code" && (value.as_u64() == Some(1308) || value.as_str() == Some("1308")) {
+                return true;
+            }
+            value
+                .as_str()
+                .is_some_and(|text| permanent_limit_text(text.as_bytes(), true))
+        })
+}
+
+fn permanent_limit_body(bytes: &[u8], complete: bool) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(value) => permanent_provider_error(&value),
+        // A partial or invalid JSON document can contain arbitrary metadata;
+        // do not mistake it for an error message.
+        Err(_) if text.trim_start().starts_with(['{', '[']) => false,
+        Err(_) => permanent_limit_text(bytes, complete),
+    }
 }
 
 fn permanent_limit_text(bytes: &[u8], complete: bool) -> bool {
@@ -264,6 +301,9 @@ mod quota_tests {
             Ok(b"quota".to_vec()),
         ]);
         assert!(permanent_provider_limit(chunks).await);
+        let metadata =
+            br#"{"error":{"message":"rate limit"},"request_id":"billing-secret"}"#.to_vec();
+        assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(metadata)])).await);
         let mut too_long = vec![b'x'; 64 * 1024];
         too_long.extend_from_slice(b"insufficient_quota");
         assert!(!permanent_provider_limit(stream::iter(vec![Ok::<_, ()>(too_long)])).await);
@@ -300,6 +340,16 @@ mod quota_tests {
         for value in ["rate limit exceeded", r#"{"code":13080}"#] {
             assert!(!permanent_limit_text(value.as_bytes(), true));
         }
-        assert!(!permanent_limit_text(br#"{"code":1308"#, false));
+        assert!(!permanent_limit_body(br#"{"code":1308"#, false));
+        assert!(!permanent_limit_body(
+            br#"{"request_id":"billing-secret"}"#,
+            true
+        ));
+        assert!(permanent_provider_error(
+            &serde_json::json!({"error":{"code":1308}})
+        ));
+        assert!(permanent_provider_error(
+            &serde_json::json!({"error":{"message":"quota exceeded"}})
+        ));
     }
 }

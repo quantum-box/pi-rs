@@ -593,10 +593,10 @@ impl Model for PiMessages {
         if !response.status().is_success() {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
-            let permanent_quota = status.as_u16() == 429
+            let permanent_quota = (status.as_u16() == 429 || status.is_server_error())
                 && pi_rs::permanent_provider_limit(response.bytes_stream()).await;
             return Err(if permanent_quota {
-                Error::Model("Pi Messages account quota or billing limit reached (HTTP 429)".into())
+                Error::Model("Pi Messages account quota or billing limit reached".into())
             } else if status.as_u16() == 429 || status.is_server_error() {
                 Error::RetryableModel(message)
             } else {
@@ -758,7 +758,7 @@ impl Model for PiMessages {
                         return;
                     }
                     "error" => {
-                        Err(if event["reason"] == "aborted" { Error::Cancelled } else { Error::Model("Pi Messages returned a stream error".into()) })?;
+                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"]) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
                     }
                     _ => Err(Error::Model("Unknown Pi Messages stream event".into()))?,
                 }
@@ -810,17 +810,79 @@ fn terminal_metadata(
 
 #[cfg(test)]
 mod tool_status_tests {
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for permanent in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model =
+                PiMessages::new("fixture", &format!("http://{address}/"), "token".into()).unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
     async fn quota_429_preserves_transient_retry_and_redacts_body() {
         use std::io::{Read, Write};
-        for (body, permanent) in [
+        for (status, body, permanent) in [
             (
+                429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
                 true,
             ),
-            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -828,7 +890,7 @@ mod tool_status_tests {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
                 let _ = socket.read(&mut request).unwrap();
-                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             });
             let model =
                 PiMessages::new("fixture", &format!("http://{address}/"), "token".into()).unwrap();
