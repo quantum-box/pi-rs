@@ -1778,6 +1778,23 @@ async fn capture(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<(Ve
     }
     Ok((output, overflow))
 }
+// Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
+// process-wrap child so cancellation also signals its still-live group.
+struct PackageChildGuard {
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    finished: bool,
+}
+
+impl Drop for PackageChildGuard {
+    fn drop(&mut self) {
+        // Once the direct child has been reaped, its numeric process group ID
+        // can be reused. Do not signal that ID after ownership is lost.
+        if !self.finished && self.child.id().is_some() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
 async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
@@ -1790,19 +1807,23 @@ async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(process_wrap::tokio::KillOnDrop);
-    let mut child = wrapped.spawn()?;
-    let stdout = child.stdout().take().expect("stdout");
-    let stderr = child.stderr().take().expect("stderr");
+    let mut child = PackageChildGuard {
+        child: wrapped.spawn()?,
+        finished: false,
+    };
+    let stdout = child.child.stdout().take().expect("stdout");
+    let stderr = child.child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
             tokio::try_join!(
-                async { child.wait().await.map_err(Error::from) },
+                async { child.child.wait().await.map_err(Error::from) },
                 capture(stdout, 8 * 1024 * 1024),
                 capture(stderr, 64 * 1024)
             )
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
+    child.finished = true;
     if !status.success() {
         return Err(Error::Config(format!(
             "package command failed ({status}): {}",
