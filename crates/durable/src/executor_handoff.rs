@@ -342,7 +342,10 @@ mod tests {
         fence_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         commit_thread.join().unwrap();
         fence_thread.join().unwrap();
-        assert!(matches!(lease.commit(effect_batch()), Err(Error::Cancelled)));
+        assert!(matches!(
+            lease.commit(effect_batch()),
+            Err(Error::Cancelled)
+        ));
         assert!(matches!(lease.commit(effect_batch()), Err(Error::Poisoned)));
     }
 
