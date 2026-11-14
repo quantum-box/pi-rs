@@ -1063,6 +1063,16 @@ impl Picker {
             "accent",
         )];
         let items = self.matches();
+        let tree_layout = self.tree.as_ref().map(|tree| {
+            let visible: Vec<_> = items
+                .iter()
+                .filter_map(|item| match item.selection {
+                    Selection::Checkout(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            tree.layout(&visible)
+        });
         let mut prefixes = vec![String::new(); items.len()];
         if self.active_session.is_some()
             && self.session_sort == SessionSort::Threaded
@@ -1100,6 +1110,51 @@ impl Picker {
             height,
         ));
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
+            if let (Some(tree), Some(layout), Selection::Checkout(id)) =
+                (&self.tree, &tree_layout, &item.selection)
+            {
+                let selected = index == self.selected;
+                let timestamp = if tree.show_label_timestamps {
+                    tree.label_timestamps
+                        .get(id)
+                        .map_or_else(String::new, |timestamp| {
+                            format!("{} ", format_label_timestamp(timestamp))
+                        })
+                } else {
+                    String::new()
+                };
+                lines.push(Line {
+                    spans: vec![
+                        super::render::Span::themed(
+                            if selected { "› " } else { "  " },
+                            theme,
+                            "accent",
+                        ),
+                        super::render::Span::themed(
+                            layout.get(id).cloned().unwrap_or_default(),
+                            theme,
+                            "dim",
+                        ),
+                        super::render::Span::themed(
+                            if tree.active_path.contains(id) {
+                                "• "
+                            } else {
+                                ""
+                            },
+                            theme,
+                            "accent",
+                        ),
+                        super::render::Span::themed(
+                            format!("{timestamp}{}", item.label),
+                            theme,
+                            "text",
+                        ),
+                    ],
+                    background: selected.then(|| theme.color("selectedBg")),
+                    image: None,
+                });
+                continue;
+            }
             if let Selection::Resume(path) = &item.selection
                 && self.session_documents.contains_key(path)
             {
@@ -1124,35 +1179,6 @@ impl Picker {
                             }
                             _ => item.label.clone(),
                         }
-                    } else if let (Some(tree), Selection::Checkout(id)) =
-                        (&self.tree, &item.selection)
-                    {
-                        format!(
-                            "{}{}{} {}{}",
-                            "  ".repeat(tree.depths.get(id).copied().unwrap_or(0).min(12)),
-                            if tree.collapsed.contains(id) {
-                                "▸"
-                            } else if tree
-                                .children
-                                .get(id)
-                                .is_some_and(|children| !children.is_empty())
-                            {
-                                "▾"
-                            } else {
-                                "·"
-                            },
-                            if *id == tree.head { "●" } else { " " },
-                            if tree.show_label_timestamps {
-                                tree.label_timestamps
-                                    .get(id)
-                                    .map_or_else(String::new, |timestamp| {
-                                        format!("{} ", format_label_timestamp(timestamp))
-                                    })
-                            } else {
-                                String::new()
-                            },
-                            item.label
-                        )
                     } else {
                         item.label.clone()
                     }
@@ -1354,7 +1380,7 @@ struct TreeState {
     show_label_timestamps: bool,
     roots: Vec<u64>,
     order: Vec<u64>,
-    depths: std::collections::BTreeMap<u64, usize>,
+    active_path: std::collections::BTreeSet<u64>,
     collapsed: std::collections::BTreeSet<u64>,
     visible: std::collections::BTreeSet<u64>,
     head: u64,
@@ -1379,6 +1405,18 @@ impl TreeState {
                 roots.push(id);
             }
         }
+        let mut active_path = std::collections::BTreeSet::new();
+        let mut current = Some(head);
+        while let Some(id) = current {
+            if !active_path.insert(id) {
+                break;
+            }
+            current = parents.get(&id).copied().flatten();
+        }
+        roots.sort_by_key(|id| !active_path.contains(id));
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(|id| !active_path.contains(id));
+        }
         let mut tree = Self {
             kinds,
             filter,
@@ -1389,18 +1427,16 @@ impl TreeState {
             show_label_timestamps: false,
             roots,
             order: vec![],
-            depths: Default::default(),
+            active_path,
             collapsed: Default::default(),
             visible: Default::default(),
             head,
         };
-        let mut pending: Vec<_> = tree.roots.iter().rev().map(|id| (*id, 0usize)).collect();
-        while let Some((id, depth)) = pending.pop() {
+        let mut pending: Vec<_> = tree.roots.iter().rev().copied().collect();
+        while let Some(id) = pending.pop() {
             tree.order.push(id);
-            tree.depths.insert(id, depth);
             if let Some(children) = tree.children.get(&id) {
-                let next_depth = depth + usize::from(children.len() > 1);
-                pending.extend(children.iter().rev().map(|child| (*child, next_depth)));
+                pending.extend(children.iter().rev().copied());
             }
         }
         tree.rebuild_visible();
@@ -1430,6 +1466,90 @@ impl TreeState {
             }
         }
         (parents, children)
+    }
+
+    // Filtering can hide branch points. Rebuild the layout from visible
+    // ancestors, as the navigation graph already does for branch jumps.
+    fn layout(&self, visible: &[u64]) -> std::collections::BTreeMap<u64, String> {
+        let (parents, children) = self.navigation_graph(visible);
+        let roots: Vec<_> = visible
+            .iter()
+            .copied()
+            .filter(|id| parents[id].is_none())
+            .collect();
+        let multiple_roots = roots.len() > 1;
+        // id, indent, follows a branch, has connector, last sibling, gutters, virtual root
+        let mut pending: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, &id)| {
+                (
+                    id,
+                    usize::from(multiple_roots),
+                    multiple_roots,
+                    multiple_roots,
+                    index + 1 == roots.len(),
+                    Vec::<(usize, bool)>::new(),
+                    multiple_roots,
+                )
+            })
+            .collect();
+        let mut result = std::collections::BTreeMap::new();
+        while let Some((id, indent, branched, connector, last, gutters, virtual_root)) =
+            pending.pop()
+        {
+            // Keep deeply nested, imported sessions bounded like the previous
+            // picker, even when every ancestor is a branch point.
+            let display_indent = indent.saturating_sub(usize::from(multiple_roots)).min(12);
+            let show_connector = connector && !virtual_root;
+            let connector_pos = display_indent.saturating_sub(1);
+            let mut prefix = String::new();
+            for level in 0..display_indent {
+                if let Some((_, show)) = gutters.iter().find(|(pos, _)| *pos == level) {
+                    prefix.push_str(if *show { "│  " } else { "   " });
+                } else if show_connector && level == connector_pos {
+                    let foldable = children.get(&id).is_some_and(|items| !items.is_empty())
+                        && parents[&id].is_none_or(|parent| {
+                            children.get(&parent).is_some_and(|items| items.len() > 1)
+                        });
+                    prefix.push(if last { '└' } else { '├' });
+                    prefix.push(if self.collapsed.contains(&id) {
+                        '⊞'
+                    } else if foldable {
+                        '⊟'
+                    } else {
+                        '─'
+                    });
+                    prefix.push(' ');
+                } else {
+                    prefix.push_str("   ");
+                }
+            }
+            if self.collapsed.contains(&id) && !show_connector {
+                prefix.push_str("⊞ ");
+            }
+            result.insert(id, prefix);
+            let descendants = children.get(&id).map_or(&[][..], Vec::as_slice);
+            let branches = descendants.len() > 1;
+            let next_indent = indent + usize::from(branches || (branched && indent > 0));
+            let mut next_gutters = gutters;
+            if show_connector && !next_gutters.iter().any(|(pos, _)| *pos == connector_pos) {
+                next_gutters.push((connector_pos, !last));
+            }
+            for (index, &child) in descendants.iter().enumerate().rev() {
+                pending.push((
+                    child,
+                    next_indent,
+                    branches,
+                    branches,
+                    index + 1 == descendants.len(),
+                    next_gutters.clone(),
+                    false,
+                ));
+            }
+        }
+        result
     }
 
     fn passes_filter(&self, id: u64) -> bool {
@@ -1696,7 +1816,7 @@ mod tests {
             TreeFilter::Default,
         );
         let keys = Keys::default();
-        assert_eq!(picker.selected, 4);
+        assert_eq!(picker.selected, 2);
         picker.focus_record(1);
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
         assert_eq!(picker.matches().len(), 1);
@@ -1710,7 +1830,7 @@ mod tests {
         picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
         assert!(matches!(
             picker.matches()[picker.selected].selection,
-            Selection::Checkout(2)
+            Selection::Checkout(4)
         ));
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
@@ -1727,6 +1847,68 @@ mod tests {
         assert!(
             matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
         );
+    }
+
+    #[test]
+    fn tree_layout_prioritizes_active_branch_and_reflows_filtered_nodes() {
+        let entries = [
+            (1, None),
+            (2, Some(1)),
+            (3, Some(2)),
+            (4, Some(1)),
+            (5, Some(4)),
+        ]
+        .into_iter()
+        .map(|(id, parent)| (id, (parent, TreeEntryKind::Message)))
+        .collect();
+        let items = (1..=5)
+            .map(|id| Item {
+                label: format!("node {id}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::tree(items, entries, Default::default(), 5, TreeFilter::Default);
+        let tree = picker.tree.as_ref().unwrap();
+        assert_eq!(tree.order, [1, 4, 5, 2, 3]);
+        let layout = tree.layout(&tree.order);
+        assert_eq!(layout[&1], "");
+        assert_eq!(layout[&4], "├⊟ ");
+        assert_eq!(layout[&5], "│     ");
+        assert_eq!(layout[&2], "└⊟ ");
+        assert_eq!(tree.layout(&[1, 5])[&5], "");
+        let layout = tree.layout(&[1, 5, 2, 3]);
+        assert_eq!(layout[&5], "├─ ");
+        assert_eq!(layout[&2], "└⊟ ");
+        let lines = picker.render(&Theme::system(), 80, 20, &Keys::default());
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line.contains("├⊟ • node 4")));
+        assert!(text.iter().any(|line| line.contains("└⊟ node 2")));
+        picker.focus_record(1);
+        picker.input(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            &Keys::default(),
+        );
+        assert!(matches!(
+            picker.matches()[picker.selected].selection,
+            Selection::Checkout(4)
+        ));
+    }
+
+    #[test]
+    fn tree_active_root_precedes_other_roots() {
+        let entries = [(1, None), (2, Some(1)), (3, None), (4, Some(3))]
+            .into_iter()
+            .map(|(id, parent)| (id, (parent, TreeEntryKind::Message)))
+            .collect();
+        let tree = TreeState::new(entries, Default::default(), 4, TreeFilter::Default);
+        assert_eq!(tree.order, [3, 4, 1, 2]);
+        let layout = tree.layout(&tree.order);
+        assert_eq!(layout[&3], "");
+        assert_eq!(layout[&1], "");
+        assert_eq!(layout[&4], "   ");
     }
 
     #[test]
