@@ -167,7 +167,9 @@ settled with its original request ID and metadata before compaction is committed
 the host must make settlement idempotent per request ID. A failed settlement
 leaves the summary available for retry instead of silently closing the run.
 SDK `resume()` also finds a recoverable summary on the latest branch run after
-reopening, and resumes that run instead of starting an unrelated one.
+reopening, and resumes that run instead of starting an unrelated one. It also
+recognizes interrupted compaction markers before a summary is complete, and
+restores the branch model before checking the interrupted request's identity.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

@@ -2630,25 +2630,31 @@ impl AgentSession {
             .await
     }
     pub async fn resume(&mut self) -> Result<String> {
+        self.start().await?;
         let recovery = {
             let journal = self.journal_async().await;
             crate::agent::resumable_compaction_run(&journal)
         };
-        if recovery.is_some() && !self.registry.extensions.is_empty() {
+        if recovery
+            .as_ref()
+            .is_some_and(|(_, _, completed)| *completed)
+            && !self.registry.extensions.is_empty()
+        {
             return Err(Error::Session(
                 "pending compaction recovery requires reconciliation after extensions changed"
                     .into(),
             ));
         }
-        if recovery
-            .as_ref()
-            .is_some_and(|(_, model)| model != &self.model_name)
-        {
+        if recovery.as_ref().is_some_and(|(_, model, _)| {
+            model
+                .as_ref()
+                .is_some_and(|model| model != &self.model_name)
+        }) {
             return Err(Error::Session(
                 "pending compaction recovery requires its original model".into(),
             ));
         }
-        let run_id = recovery.map(|(run_id, _)| run_id);
+        let run_id = recovery.map(|(run_id, _, _)| run_id);
         self.run(None, run_id.unwrap_or_else(Uuid::new_v4), &mut |_| {})
             .await
     }
@@ -9092,6 +9098,7 @@ mod tests {
             let turn_id = Uuid::new_v4();
             let summary_id = Uuid::new_v4();
             let mut journal = Session::open(&path).unwrap();
+            journal.select_model("fixture", None).unwrap();
             journal
                 .append(Event::User {
                     content: "old".into(),
@@ -9230,7 +9237,9 @@ mod tests {
                 }),
                 ..Limits::default()
             };
-            let mut session = SessionBuilder::new(model.clone(), "fixture")
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
                 .limits(limits.clone())
                 .open(&path)
                 .unwrap();
@@ -9252,7 +9261,9 @@ mod tests {
             );
             session.close().await.unwrap();
             drop(session);
-            let mut session = SessionBuilder::new(model.clone(), "fixture")
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
                 .limits(limits)
                 .open(&path)
                 .unwrap();
@@ -9268,6 +9279,153 @@ mod tests {
             assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
             assert_eq!(model.attempts.lock().unwrap().len(), 2);
             session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_handles_interrupted_compaction_markers_without_duplicate_requests() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            for started in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("interrupted.jsonl");
+                let run_id = Uuid::new_v4();
+                let turn_id = Uuid::new_v4();
+                let mut journal = Session::open(&path).unwrap();
+                journal
+                    .append(Event::User {
+                        content: "old".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "old reply".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: None,
+                    })
+                    .unwrap();
+                journal.set_run_id(Some(run_id));
+                journal
+                    .append(Event::Run {
+                        state: RunState::Running,
+                        initial: Some("new".into()),
+                    })
+                    .unwrap();
+                let boundary = journal
+                    .append(Event::User {
+                        content: "new".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap()
+                    .id;
+                if silent {
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(turn_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::ModelFinished {
+                            request_id: turn_id,
+                            metadata: Default::default(),
+                            usage: crate::UsageReport::Measured {
+                                usage: crate::Usage {
+                                    input_tokens: 1001,
+                                    output_tokens: 2,
+                                },
+                            },
+                            failure: None,
+                            partial: String::new(),
+                            reply: Some(RecordedReply {
+                                content: "answer".into(),
+                                invocations: vec![],
+                                advertised_tools: vec![],
+                                max_output_tokens: 16,
+                            }),
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::Assistant {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            }),
+                            request_id: Some(turn_id),
+                        })
+                        .unwrap();
+                }
+                journal
+                    .append(Event::SourceEntry {
+                        format: if silent {
+                            "pi-rs:silent-overflow"
+                        } else {
+                            "pi-rs:overflow-recovery"
+                        }
+                        .into(),
+                        entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                if started {
+                    journal.append(Event::SourceEntry { format: "pi-rs:overflow-retention-v1".into(), entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}) }).unwrap();
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(Uuid::new_v4()),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                }
+                drop(journal);
+                let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+                let mut session = SessionBuilder::new(model.clone(), "fixture")
+                    .limits(Limits {
+                        context_window: Some(1000),
+                        output_tokens_per_request: 16,
+                        model_requests: 3,
+                        compaction_tokens: Some(crate::CompactionTokens {
+                            reserve_tokens: Some(0),
+                            keep_recent_tokens: None,
+                        }),
+                        ..Limits::default()
+                    })
+                    .open(&path)
+                    .unwrap();
+                let result = session.resume().await;
+                if silent {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                } else if started {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("requires reconciliation")
+                    );
+                    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                } else {
+                    assert_eq!(result.unwrap(), "answer 2");
+                    assert_eq!(model.0.load(Ordering::SeqCst), 2);
+                }
+                session.close().await.unwrap();
+            }
         }
     }
 

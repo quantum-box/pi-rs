@@ -4479,23 +4479,43 @@ type RecoveredSummary = (
     ModelMetadata,
 );
 
-// Resume only the current branch's latest run, and only when it contains a
-// validated durable summary that can be settled without reissuing a request.
-pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, String)> {
+// Recover only an unfinished marker on the current branch's latest run.
+// A started request may be ambiguous even when no completed summary exists.
+pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Option<String>, bool)> {
     let branch = session.branch();
     let run_id = branch.iter().rev().find_map(|record| {
         matches!(record.event, Event::Run { .. })
             .then_some(record.run_id)
             .flatten()
     })?;
-    let model = branch.iter().rev().find_map(|record| match &record.event {
-        Event::ModelRequested { model, .. } if record.run_id == Some(run_id) => Some(model),
-        _ => None,
+    let marker = branch.iter().rposition(|record| {
+        record.run_id == Some(run_id) && matches!(&record.event,
+            Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow")
     })?;
-    ["pi-rs:overflow-recovery", "pi-rs:silent-overflow"]
-        .iter()
-        .any(|marker| completed_overflow_summary(session, run_id, marker, model).is_some())
-        .then(|| (run_id, model.clone()))
+    let following = &branch[marker + 1..];
+    if following.iter().any(|record| {
+        matches!(
+            record.event,
+            Event::Compacted { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::Assistant { .. }
+                | Event::ContextEdited { .. }
+                | Event::Checkout { .. }
+        )
+    }) {
+        return None;
+    }
+    let model = following.iter().find_map(|record| match &record.event {
+        Event::ModelRequested { model, .. } if record.run_id == Some(run_id) => Some(model.clone()),
+        _ => None,
+    });
+    let completed = model.as_ref().is_some_and(|model| {
+        ["pi-rs:overflow-recovery", "pi-rs:silent-overflow"]
+            .iter()
+            .any(|marker| completed_overflow_summary(session, run_id, marker, model).is_some())
+    });
+    Some((run_id, model, completed))
 }
 
 fn completed_overflow_summary(
