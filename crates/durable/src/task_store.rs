@@ -781,6 +781,22 @@ impl<'a> TaskStore<'a> {
     /// Pending is only a snapshot: the scheduler must arrange another reevaluation
     /// without losing concurrent notifications (for example periodic rescanning).
     pub fn poll_wait(&self, snapshot: &StoredTask, now_millis: i64) -> Result<WakeResult, Error> {
+        self.evaluate_wait(snapshot, now_millis, true)
+    }
+
+    pub(crate) fn wait_ready(&self, snapshot: &StoredTask, now_millis: i64) -> Result<bool, Error> {
+        Ok(matches!(
+            self.evaluate_wait(snapshot, now_millis, false)?,
+            WakeResult::Woken { .. }
+        ))
+    }
+
+    fn evaluate_wait(
+        &self,
+        snapshot: &StoredTask,
+        now_millis: i64,
+        commit: bool,
+    ) -> Result<WakeResult, Error> {
         let condition = match snapshot.task.state() {
             TaskState::Waiting(condition) => condition,
             _ => return Err(Error::NotWaiting),
@@ -989,6 +1005,9 @@ impl<'a> TaskStore<'a> {
                     return Ok(WakeResult::Pending);
                 }
             }
+        }
+        if !commit {
+            return Ok(WakeResult::Woken { signal: delivered });
         }
         let mut next = snapshot.task.clone();
         match &delivered {

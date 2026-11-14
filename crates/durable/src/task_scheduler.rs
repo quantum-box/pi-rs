@@ -90,6 +90,17 @@ pub struct BlockedTask {
     pub reason: BlockedReason,
 }
 
+/// Read-only view of generic task scheduling at a supplied Unix-millisecond clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WakeSnapshot {
+    /// Ready executable work, or a durable deadline that is already due.
+    pub active: bool,
+    /// Earliest future durable task deadline, in Unix milliseconds.
+    pub at: Option<i64>,
+    /// Live tasks whose definitions cannot currently execute.
+    pub blocked: Vec<BlockedTask>,
+}
+
 struct Registration {
     version: u32,
     migrate: Option<Arc<Migration>>,
@@ -360,6 +371,64 @@ impl Scheduler {
             })
             .collect())
     }
+    /// Inspect one task-store snapshot without polling waits or invoking user code.
+    pub fn wake_snapshot(&self, now_millis: i64) -> Result<WakeSnapshot, Error> {
+        self.check()?;
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let tasks = self.ts().list()?;
+        let mut result = WakeSnapshot {
+            active: false,
+            at: None,
+            blocked: Vec::new(),
+        };
+        for item in &tasks {
+            let task = &item.task;
+            if task.is_terminal() {
+                continue;
+            }
+            let reason = self.blocked_reason(task);
+            if let Some(reason) = reason.clone() {
+                result.blocked.push(BlockedTask {
+                    id: task.id(),
+                    kind: task.kind().map(str::to_owned),
+                    owner: task.owner().clone(),
+                    reason,
+                });
+            }
+            match task.state() {
+                TaskState::Ready if task.abort_requested() => {
+                    // Cleanup may have additional foreground conversation dependencies.
+                    if !tasks.iter().any(|child| {
+                        child.task.owner() == &TaskOwner::Task(task.id())
+                            && !child.task.is_terminal()
+                    }) {
+                        result.active = true;
+                    }
+                }
+                TaskState::Ready if reason.is_none() && self.ancestors_available(task, &tasks) => {
+                    result.active = true
+                }
+                TaskState::Running if reason.is_none() => result.active = true,
+                TaskState::Waiting(wait) => {
+                    let deadline = match wait {
+                        WaitFor::DeadlineMillis(at) => Some(*at),
+                        WaitFor::Sleep { until_millis, .. }
+                        | WaitFor::TypedSleep { until_millis, .. } => *until_millis,
+                        _ => None,
+                    };
+                    if self.ts().wait_ready(item, now_millis)? {
+                        result.active = true;
+                    } else if let Some(at) = deadline.filter(|at| *at > now_millis) {
+                        result.at = Some(result.at.map_or(at, |old| old.min(at)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
     // Compute migration on a detached record; persist it together with reservation.
     fn reserve_resolved(&mut self, snapshot: &task_store::StoredTask) -> Result<bool, Error> {
         if self.blocked_reason(&snapshot.task).is_some() {

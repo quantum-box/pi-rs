@@ -708,13 +708,24 @@ supported failure paths remain those of this runtime.
 ### Generic task wake hints
 
 `Driver::subscribe_wake()` takes the driver's single capacity-one channel. It is
-initially signaled so a subscriber can inspect recovered work, and later hints
-cover admissions, scheduling progress, and registry changes. Hints coalesce and
-may be spurious; inspect durable state after receiving. The channel closes when
-the driver shuts down or fails, and taking the subscription is one-shot. No host
-callback runs from the driver. Unlike upstream `onWake`, these hints do not give
-an active/deadline snapshot or replace the driver's polling and timers, and do
-not cover conversation scheduling. They are not a durable alarm mechanism.
+initially signaled and later hints coalesce; notifications may be spurious and
+close on shutdown or failure. After a hint, `Driver::wake_snapshot(now_millis)`
+reads the task state and registry at a scheduling boundary without invoking
+handlers or migrations. `active` reports ready executable tasks, running work,
+abort cleanup candidates and waits that can be polled now. `at` is the earliest
+future durable task deadline; `blocked` lists live definition failures. The
+explicit clock is Unix milliseconds. A satisfied wait counts as active even if
+its definition is blocked, because the scheduler can still persist its wake.
+The standalone task scheduler exposes the same inspection method.
+
+Inspection waits for an in-flight synchronous handler and can become stale as
+soon as it returns. Signal and child wait evaluation reads additional records;
+direct unfenced TaskStore writers are outside the consistency protocol. Abort
+cleanup may still depend on foreground conversations, and fail-fast sibling
+cleanup is not independently represented. Unlike upstream `onWake`, hints are
+not a change-only `{active, at}` callback, and the snapshot covers generic tasks
+only. The driver continues polling; this is not a host-managed alarm or a
+conversation scheduling snapshot.
 
 ### Task application entries
 

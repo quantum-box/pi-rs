@@ -183,12 +183,14 @@ body rebuilds are not intercepted; adapters must avoid hidden rebuilds or guard
 them themselves. This interface does not retrofit built-in provider clients,
 settlement, exactly-once network execution, or automatic adapter installation.
 
-**Generic task wake hints:** `task_driver::Driver::subscribe_wake` provides one
-capacity-one, coalescing channel, initially signaled to cover recovery and
-signaled after admissions, scheduling progress and registry changes. Hosts must
-inspect durable state after a hint; hints can be spurious and the channel closes
-on shutdown or failure. Delivery does not invoke host callbacks. Unlike upstream
-[`HarnessOptions.onWake`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md),
-this is not an `{ active, at }` change subscription, does not describe deadlines
-or replace timers, and covers only the generic task driver. The driver continues
-to poll and run work; it is not a host-managed hibernation or alarm API.
+**Generic task wake hints and snapshot:** `Driver::subscribe_wake` supplies a
+single initially signaled, capacity-one coalescing channel. `wake_snapshot(now)`
+inspects generic task readiness, blocked definitions and the nearest future
+durable deadline without invoking handlers or migrations. The standalone task
+scheduler provides the same view. Unlike upstream
+[`onWake`](https://github.com/earendil-works/pi/blob/c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0/packages/durable/src/harness/scheduler.ts#L566),
+notifications are hints rather than changes to `{active, at}`; polling continues,
+conversation scheduling is excluded, and inspection can wait for a handler.
+Satisfied waits count as active even when their definition is blocked, and abort
+cleanup candidates may still depend on conversations. Fail-fast sibling cleanup
+is not independently represented. See [snapshot tests](../crates/durable/tests/task_wake_snapshot.rs).

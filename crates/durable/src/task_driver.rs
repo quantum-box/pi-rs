@@ -238,6 +238,14 @@ impl Driver {
         Ok(())
     }
 
+    /// Inspect generic task wake state at a scheduling boundary using the supplied
+    /// Unix-millisecond clock. This may wait for an in-flight handler to finish.
+    pub fn wake_snapshot(&self, now_millis: i64) -> Result<task_scheduler::WakeSnapshot, Error> {
+        let scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
+        let _state = self.check()?;
+        Ok(scheduler.wake_snapshot(now_millis)?)
+    }
+
     /// Snapshot nonterminal tasks currently blocked by their definitions.
     pub fn blocked_tasks(&self) -> Result<Vec<task_scheduler::BlockedTask>, Error> {
         let scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
