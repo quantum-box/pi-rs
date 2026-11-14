@@ -2103,6 +2103,26 @@ mod share_context_tests {
     }
 
     #[tokio::test]
+    async fn paired_journal_encoding_refuses_a_second_outstanding_request() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let snapshot = super::super::sessions::ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: super::super::sessions::ShareContext {
+                system_prompt: "fixture".into(),
+                tools: vec![],
+            },
+            journal_tag: Some([1; 32]),
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = slots.clone().acquire_owned().await.unwrap();
+        let result = respond_share_capture_background(snapshot, session, slots, None);
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("already being encoded"))
+        );
+    }
+
+    #[tokio::test]
     async fn live_worker_response_binds_context_to_exact_journal() {
         let session = Session::with_store(MemoryStore::default()).unwrap();
         let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
