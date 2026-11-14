@@ -80,15 +80,22 @@ journals and workspace access, and uses OS-backed context fingerprinting.
 `SessionBuilder::in_memory()` changes journal storage but does not remove these
 dependencies from the crate. The default root feature also includes the Ollama
 HTTP adapter, whose native HTTP configuration needs separate browser review.
+The [initial public CI diagnostic](https://github.com/quantum-box/pi-rs/actions/runs/43569708117/job/132371210751)
+failed with exit code 101: `errno` 0.3.14 rejects the unknown target OS. The
+locked target tree reaches it through `cap-std` / `cap-primitives` → `rustix`
+→ `errno`. This is the first reported failure, not an exhaustive blocker list.
 
 For the locked dependency graph, `cargo tree -p pi-rs-core --target
 wasm32-unknown-unknown -i getrandom@0.3.4` shows the `jsonschema`/`ahash`
 path to `getrandom`. Its browser backend requires explicit feature and target
 configuration; see [getrandom 0.3's WebAssembly documentation](https://docs.rs/crate/getrandom/0.3.4/source/README.md).
-UUID randomness and any other resolved `getrandom` versions also need a
-version-specific audit. Enabling random-number support alone does not provide
-browser implementations of the filesystem, process, networking, or storage
-contracts.
+The locked `uuid` 1.29.2 enables `v4` but none of its browser randomness
+backends; its [target-specific implementation](https://docs.rs/crate/uuid/1.29.2/source/src/rng.rs)
+requires an explicit `js`, `rng-getrandom`, or `rng-rand` feature on this
+target. These are separate dependency paths. Other resolved randomness
+dependencies need their own target-specific audit. Enabling randomness alone
+does not provide browser implementations of the filesystem, process,
+networking, or storage contracts.
 
 The public CI workflow includes a **non-gating diagnostic** running
 `cargo check --locked -p pi-rs-core --target wasm32-unknown-unknown`. Its log
