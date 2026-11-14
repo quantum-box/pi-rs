@@ -4818,6 +4818,22 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     }
                     headers.push_str(&line.to_ascii_lowercase());
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut origin_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    origin_headers.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(!origin_headers.contains("proxy-authorization:"));
                 if first.starts_with("GET ") {
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
@@ -4885,10 +4901,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     String::from_utf8_lossy(&stderr)
                 )
             });
-        assert!(
-            request.starts_with("POST http://127.0.0.1:1/"),
-            "{provider}: {request}"
-        );
+        assert!(request.starts_with("POST /"), "{provider}: {request}");
         assert!(
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"

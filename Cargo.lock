@@ -3030,10 +3030,10 @@ dependencies = [
  "process-wrap",
  "pulldown-cmark",
  "regex",
- "rquickjs",
  "reqwest 0.12.28",
  "reqwest 0.13.5",
  "rmcp",
+ "rquickjs",
  "rustls 0.23.46",
  "serde",
  "serde_json",
@@ -3420,8 +3420,6 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3461,8 +3459,6 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",

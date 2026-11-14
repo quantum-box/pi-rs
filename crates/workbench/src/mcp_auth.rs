@@ -1573,7 +1573,8 @@ mod tests {
                         "http://localhost:{}",
                         listener.local_addr().unwrap().port()
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .tunnel_http(true),
                 ],
                 idle_timeout: None,
             },
@@ -1604,6 +1605,28 @@ mod tests {
                         len = n.trim().parse().unwrap();
                     }
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                first.clear();
+                socket.read_line(&mut first).await.unwrap();
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    assert!(
+                        !line
+                            .to_ascii_lowercase()
+                            .starts_with("proxy-authorization:")
+                    );
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = n.trim().parse().unwrap();
+                    }
+                }
                 let mut data = vec![0; len];
                 socket.read_exact(&mut data).await.unwrap();
                 requests.push((first, String::from_utf8(data).unwrap()));
@@ -1629,12 +1652,8 @@ mod tests {
         manager.set_credential_store(store);
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
-        assert!(
-            requests[0]
-                .0
-                .starts_with("POST http://127.0.0.1:1/register ")
-        );
-        assert!(requests[1].0.starts_with("POST http://127.0.0.1:1/token "));
+        assert!(requests[0].0.starts_with("POST /register "));
+        assert!(requests[1].0.starts_with("POST /token "));
         assert!(requests[1].1.contains("refresh_token=old-refresh"));
     }
 

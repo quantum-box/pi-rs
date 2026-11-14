@@ -50,16 +50,19 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
     if http.is_none() && https.is_none() {
         return Ok(Vec::new());
     }
-    Ok(vec![Proxy::custom(move |url| {
-        if bypasses_proxy(url, &excluded) {
-            return None;
-        }
-        match url.scheme() {
-            "http" => http.clone(),
-            "https" => https.clone(),
-            _ => None,
-        }
-    })])
+    Ok(vec![
+        Proxy::custom(move |url| {
+            if bypasses_proxy(url, &excluded) {
+                return None;
+            }
+            match url.scheme() {
+                "http" => http.clone(),
+                "https" => https.clone(),
+                _ => None,
+            }
+        })
+        .tunnel_http(true),
+    ])
 }
 
 /// Build a Smithy transport that applies the proxy decision to each request URL.
@@ -266,16 +269,19 @@ pub(super) fn configured_mcp(
         .collect();
     let mut proxies = Vec::new();
     if http.is_some() || https.is_some() {
-        proxies.push(reqwest_mcp::Proxy::custom(move |url| {
-            if bypasses_proxy(url, &excluded) {
-                return None;
-            }
-            match url.scheme() {
-                "http" => http.clone(),
-                "https" => https.clone(),
-                _ => None,
-            }
-        }));
+        proxies.push(
+            reqwest_mcp::Proxy::custom(move |url| {
+                if bypasses_proxy(url, &excluded) {
+                    return None;
+                }
+                match url.scheme() {
+                    "http" => http.clone(),
+                    "https" => https.clone(),
+                    _ => None,
+                }
+            })
+            .tunnel_http(true),
+        );
     }
     Ok(pi_rs_workbench::mcp::HttpOptionsWithProxyHosts {
         http: pi_rs_workbench::mcp::HttpOptions {
@@ -381,6 +387,194 @@ pub(super) async fn test_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_proxy_connects_before_request_without_leaking_proxy_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!(
+            "http://proxy-user:proxy-pass@{}",
+            listener.local_addr().unwrap()
+        );
+        let proxy = proxies(Some(&proxy_url), None, "").unwrap().pop().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            if !first.starts_with("CONNECT ") {
+                socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                return (first, headers, String::new());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut origin = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                origin.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            (first, headers, origin)
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid:8080/test").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (first, headers, origin) = server.await.unwrap();
+        assert_eq!(first, "CONNECT origin.invalid:8080 HTTP/1.1\r\n");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic chjvehktdxnlcjpwcm94es1wyxnz")
+        );
+        assert!(origin.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(!origin.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn mcp_http_proxy_uses_connect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .tunnel_http(true);
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            first
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid:8080/mcp").send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            "CONNECT origin.invalid:8080 HTTP/1.1\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_still_uses_authenticated_connect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = proxies(None, Some(&format!("http://user:pass@{address}")), "")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("https://origin.invalid/test").send(),
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("CONNECT origin.invalid:443 HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+    }
     #[test]
     fn bypass_rules_match_domains_ports_wildcards_and_ipv6() {
         let url = |url| Url::parse(url).unwrap();
