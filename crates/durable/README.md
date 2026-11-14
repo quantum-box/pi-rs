@@ -226,8 +226,8 @@ persisted before invocation. Hook-supplied summaries bypass model usage.
 This is a partial upstream durable hook: the host selects message ranges rather
 than upstream entry records, so it exposes messages and a message index rather
 than entry IDs or head markers. Manual compaction currently has no instructions
-argument. Hook errors are collected by the extension dispatcher but the harness
-has no `onReport` callback and currently discards those reports. Empty hook
+argument. Hook errors are retained in the extension report log; the harness
+does not yet expose upstream's `onReport` callback. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
 still subject to the host's existing idle/manual and context-selection limits.
 
