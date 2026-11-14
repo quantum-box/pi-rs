@@ -106,9 +106,9 @@ impl Model for WorkbenchModel {
         request: ModelRequest,
     ) -> Result<ModelStream> {
         let mut headers = HeaderMap::new();
-        if !self.session_affinity.is_empty() {
-            let value = HeaderValue::from_str(external_id)
-                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+        if !self.session_affinity.is_empty()
+            && let Ok(value) = HeaderValue::from_str(external_id)
+        {
             for &name in self.session_affinity {
                 headers.insert(name, value.clone());
             }
@@ -285,60 +285,90 @@ mod tests {
     async fn external_identity_is_used_for_affinity_header() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10))
+        for (identity, expected_header) in
+            [("custom-id.1", true), ("unsafe\r\nx-injected: yes", false)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("import.jsonl");
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session", "version":3, "id": identity})
+                ),
+            )
+            .unwrap();
+            let session = crate::session_import::read(&path).unwrap();
+            assert_eq!(session.external_session_id(), identity);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
                     }
-                    Err(error) => panic!("fixture accept failed: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut block = [0; 1024];
+                    let count = socket.read(&mut block).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&block[..count]);
                 }
-            };
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
-                let mut block = [0; 1024];
-                let count = socket.read(&mut block).unwrap();
-                assert_ne!(count, 0);
-                bytes.extend_from_slice(&block[..count]);
-            }
-            socket
-                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            String::from_utf8(bytes).unwrap()
-        });
-        let model = WorkbenchModel {
-            client: Client::Google(
-                pi_rs::google::Google::new(&format!("http://{address}"), "fixture-key")
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(bytes).unwrap()
+            });
+            let model = WorkbenchModel {
+                client: Client::Ollama(
+                    pi_rs::ollama::Ollama::new(
+                        &format!("http://{address}"),
+                        Some("fixture-key".into()),
+                    )
                     .unwrap()
-                    .with_context_probe(false),
-            ),
-            block_images: false,
-            supports_images: None,
-            session_affinity: &["x-session-id"],
-            price: None,
-        };
-        let request = ModelRequest {
-            model: "fixture".into(),
-            messages: vec![],
-            tools: vec![],
-            max_output_tokens: 1,
-        };
-        let _ = model
-            .stream_in_session_with_identity(Uuid::new_v4(), Uuid::new_v4(), "custom-id.1", request)
-            .await;
-        let headers = server.join().unwrap().to_ascii_lowercase();
-        assert!(headers.contains("\r\nx-session-id: custom-id.1\r\n"));
+                    .with_native_probes(false),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["x-session-id"],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            let _ = model
+                .stream_in_session_with_identity(
+                    Uuid::new_v4(),
+                    session.session_id(),
+                    &session.external_session_id(),
+                    request,
+                )
+                .await;
+            let headers = server.join().unwrap().to_ascii_lowercase();
+            assert_eq!(headers.contains("\r\nx-session-id:"), expected_header);
+            assert!(!headers.contains("\r\nx-injected:"));
+            if expected_header {
+                assert!(headers.contains("\r\nx-session-id: custom-id.1\r\n"));
+            }
+        }
     }
 
     #[cfg(any(unix, windows))]

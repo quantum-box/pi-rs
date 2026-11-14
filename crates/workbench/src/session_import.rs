@@ -340,9 +340,6 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     }
     let header = &entries[0];
     let external_id = header["id"].as_str();
-    if external_id.is_some_and(|id| !Session::valid_external_session_id(id)) {
-        return Err(Error::Session("invalid Pi session ID".into()));
-    }
     let version = header["version"].as_u64().unwrap_or(1);
     if !(1..=3).contains(&version) {
         return Err(Error::Session(format!(
@@ -2256,16 +2253,29 @@ mod tests {
         let fork = Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
         assert_ne!(fork.session_id(), reopened.session_id());
         assert_eq!(fork.external_session_id(), fork.session_id().to_string());
-        for invalid in ["", "-invalid", "invalid.", "a/b", "a\r\nb", "é"] {
-            assert!(
-                import_pi(vec![json!({"type":"session","version":3,"id":invalid})]).is_err(),
-                "{invalid:?}"
-            );
-        }
-        for valid in ["a", "test.id_1-2", "A0"] {
+        for valid in [
+            "",
+            "-invalid",
+            "invalid.",
+            "a/b",
+            "a b",
+            "a\r\nb",
+            "é",
+            "a",
+            "test.id_1-2",
+            "A0",
+        ] {
             let imported =
                 import_pi(vec![json!({"type":"session","version":3,"id":valid})]).unwrap();
             assert_eq!(imported.external_session_id(), valid);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.jsonl");
+            imported.export_jsonl(&path).unwrap();
+            let reopened = read(&path).unwrap();
+            assert_eq!(reopened.external_session_id(), valid);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_eq!(fork.external_session_id(), fork.session_id().to_string());
         }
     }
     #[test]

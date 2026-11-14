@@ -650,25 +650,11 @@ impl Session {
                     if format == "pi-rs:external-session-id"
                         && entry["native_id"].as_str() == Some(native.as_str()) =>
                 {
-                    entry["id"]
-                        .as_str()
-                        .filter(|id| Self::valid_external_session_id(id))
-                        .map(str::to_owned)
+                    entry["id"].as_str().map(str::to_owned)
                 }
                 _ => None,
             })
             .unwrap_or(native)
-    }
-
-    /// Validate the filename- and HTTP-header-safe ID accepted for new Pi sessions.
-    pub fn valid_external_session_id(id: &str) -> bool {
-        let bytes = id.as_bytes();
-        !bytes.is_empty()
-            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-            && bytes
-                .iter()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
     }
 
     pub fn head(&self) -> u64 {
