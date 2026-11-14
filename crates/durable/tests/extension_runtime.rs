@@ -1940,8 +1940,14 @@ async fn yield_children_choose_first_valid_result_or_queued_input() {
             ),
         )
         .unwrap();
-        let handler: Arc<dyn Handler> =
-            Arc::new(|task: &Task| Ok(Step::Succeed(task.checkpoint().data.clone())));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_release = release.clone();
+        let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+            while !handler_release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(Step::Succeed(task.checkpoint().data.clone()))
+        });
         h.install_extension(Extension {
             name: "reviewer".into(),
             hooks: vec![Arc::new(YieldReviews)],
@@ -1966,6 +1972,7 @@ async fn yield_children_choose_first_valid_result_or_queued_input() {
         if queued {
             h.submit(id, None, "queued message".into()).unwrap();
         }
+        release.store(true, std::sync::atomic::Ordering::Release);
         for child in ids {
             let child = child.as_str().unwrap().parse().unwrap();
             for _ in 0..200 {
