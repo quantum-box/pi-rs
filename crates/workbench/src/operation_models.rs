@@ -308,22 +308,23 @@ impl Catalogue {
         let mut seen = BTreeSet::new();
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
-            // Preserve the prior model-only custom endpoint binding before the
-            // built-in catalog is merged; ambiguous declarations bind nothing.
+            // Bind configured credentials only to an unambiguous user-declared base.
             let configured_binding =
-                if name == "vercel-ai-gateway" && provider["baseUrl"].as_str().is_none() {
+                if matches!(name.as_str(), "vercel-ai-gateway" | "cloudflare-workers-ai")
+                    && provider["baseUrl"].as_str().is_none()
+                {
                     providers
                         .iter()
                         .find(|(key, _)| key.eq_ignore_ascii_case(&name))
                         .and_then(|(_, configured)| {
-                            configured["models"]
-                                .as_array()
-                                .filter(|models| {
-                                    models
-                                        .iter()
-                                        .any(|model| model["baseUrl"].as_str().is_some())
-                                })
-                                .map(|_| unambiguous_model_base(configured))
+                            if name == "cloudflare-workers-ai" {
+                                cloudflare_model_binding(configured)
+                            } else {
+                                configured["models"]
+                                    .as_array()
+                                    .filter(|models| models.iter().any(|model| model["baseUrl"].as_str().is_some()))
+                                    .map(|_| unambiguous_model_base(configured))
+                            }
                         })
                 } else {
                     None
@@ -510,6 +511,30 @@ impl Catalogue {
         }
         entries
     }
+}
+
+// None means no model-level endpoint was configured. Some(None) means that
+// endpoints were configured but cannot be bound unambiguously.
+fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
+    let models = provider["models"].as_array()?;
+    if !models
+        .iter()
+        .any(|model| model["baseUrl"].as_str().is_some())
+    {
+        return None;
+    }
+    let binding = (|| {
+        let first = models.first()?["baseUrl"].as_str()?;
+        let expected = operation_endpoints(first, "run", true).ok()?.1;
+        for model in models {
+            let base = model["baseUrl"].as_str()?;
+            if operation_endpoints(base, "run", true).ok()?.1 != expected {
+                return None;
+            }
+        }
+        Some(first.to_owned())
+    })();
+    Some(binding)
 }
 
 fn unambiguous_model_base(provider: &Value) -> Option<String> {
@@ -1509,6 +1534,103 @@ mod tests {
                 .any(|entry| entry["id"] == "typesafe/jev" && entry["contextWindow"] == 32000)
         );
         assert!(entries.iter().any(|entry| entry["id"] == "@cf/cloudflare/clef" && entry["cost"]["input"] == 0.24));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_model_only_base_binds_provider_credentials_without_leaking_to_builtins() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/ai", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}}}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        let config = json!({"cloudflare-workers-ai":{"apiKey":"provider-key", "headers":{"x-provider-secret":"provider-value"}, "models":[
+            {"type":"classifier","id":"custom-a","api":"cloudflare-workers-ai-system-one","baseUrl":base},
+            {"type":"classifier","id":"custom-b","api":"cloudflare-workers-ai-system-one","baseUrl":format!("{base}/")}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let custom = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == "custom-a")
+            .unwrap();
+        let builtin = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+            })
+            .unwrap();
+        assert_eq!(custom.api_key.as_deref(), Some("provider-key"));
+        assert!(!builtin.model.headers.contains_key("x-provider-secret"));
+        assert!(builtin.api_key.is_none());
+        let keys = Keys::parse(&json!({}));
+        let available = catalogue
+            .list(
+                Kind::Classifier,
+                Some("cloudflare-workers-ai"),
+                Some("custom-a"),
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(available.len(), 1);
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = json!({"state":{}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(custom, &context, &keys, &mut json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.contains("authorization: bearer provider-key"));
+        assert!(request.contains("x-provider-secret: provider-value"));
+
+        for other in [
+            json!({"type":"classifier","id":"other","api":"cloudflare-workers-ai-system-one","baseUrl":"http://127.0.0.1:2/ai"}),
+            json!({"type":"classifier","id":"other","api":"cloudflare-workers-ai-system-one"}),
+        ] {
+            let mut ambiguous = config.clone();
+            ambiguous["cloudflare-workers-ai"]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(other);
+            let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
+            for entry in catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "cloudflare-workers-ai")
+            {
+                assert!(entry.api_key.is_none(), "{}", entry.model.id);
+                assert!(
+                    !entry.model.headers.contains_key("x-provider-secret"),
+                    "{}",
+                    entry.model.id
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -3270,6 +3270,9 @@ endpoint uses an explicit account ID from stored credential metadata or
 Configured official URLs can include `{CLOUDFLARE_ACCOUNT_ID}` or a concrete
 account ID; placeholder expansion is restricted to the official account path.
 Custom endpoints retain endpoint-scoped credential and header rules.
+If a Cloudflare provider has no base URL and its configured models all name
+the same endpoint, provider credentials and headers bind to that endpoint;
+ambiguous model endpoints do not inherit them.
 Codemode validates classifier and image model arguments before dispatch: invalid
 model references and malformed contexts reject the script promise, while an
 actual provider failure remains a structured model result. Classifier state
