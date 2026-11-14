@@ -154,7 +154,10 @@ least the prepared recent context and uses native numeric journal IDs; cuts that
 split a user message from its legacy image records or a tool call from its
 result are rejected. Later legacy hook changes can retain more history, but
 cannot move an extension-provided boundary forward. Native summary size and
-timeout limits still apply. Overflow recovery remains partial: when an
+timeout limits still apply. Custom `SessionStore` implementations that do not
+support atomic record metadata reject extension-produced compaction records
+rather than silently dropping their metadata; ordinary records remain supported.
+Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required
 recovery reports that reconciliation is needed; for a completed silent-overflow
