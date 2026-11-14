@@ -904,6 +904,8 @@ impl Model for Ollama {
                 if let Some(error) = &chunk.error {
                     Err(if pi_rs_core::permanent_provider_error(error) {
                         Error::Model("Chat Completions account quota or billing limit reached".into())
+                    } else if pi_rs_core::retryable_provider_error(error) {
+                        Error::RetryableModel("provider returned a transient stream error".into())
                     } else {
                         Error::Model("provider returned a stream error".into())
                     })?;
@@ -1164,7 +1166,7 @@ mod content_tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"}});
+            let event = json!({"error":{"code":"error","message":if permanent {"quota exceeded"} else {"rate limit exceeded"},"request_id":"billing-sentinel-secret"}});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -1194,6 +1196,7 @@ mod content_tests {
                 error.to_string().contains("quota or billing limit"),
                 permanent
             );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
             assert!(!error.to_string().contains("sentinel-secret"));
             worker.join().unwrap();
         }

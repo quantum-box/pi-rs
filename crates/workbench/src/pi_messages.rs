@@ -758,7 +758,7 @@ impl Model for PiMessages {
                         return;
                     }
                     "error" => {
-                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"]) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
+                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"]) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"]) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
                     }
                     _ => Err(Error::Model("Unknown Pi Messages stream event".into()))?,
                 }
@@ -816,7 +816,7 @@ mod tool_status_tests {
         for permanent in [false, true] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded"} else {"temporarily unavailable"},"request_id":"billing-sentinel-secret"});
+            let event = json!({"type":"error","reason":"error","errorMessage":if permanent {"quota exceeded"} else {"rate limit exceeded"},"request_id":"billing-sentinel-secret"});
             let worker = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0; 8192];
@@ -847,6 +847,7 @@ mod tool_status_tests {
                 error.to_string().contains("quota or billing limit"),
                 permanent
             );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
             assert!(!error.to_string().contains("sentinel-secret"));
             worker.join().unwrap();
         }
