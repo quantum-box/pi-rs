@@ -1998,17 +1998,16 @@ impl Harness {
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
-        if let Some(previous) = old {
-            if !previous.content_blocks.is_empty()
-                && (!state.messages.starts_with(&previous.messages)
-                    || previous
-                        .content_blocks
-                        .iter()
-                        .any(|(i, b)| state.content_blocks.get(i) != Some(b))
-                    || previous.context_generation != state.context_generation)
-            {
-                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-            }
+        if let Some(previous) = old
+            && !previous.content_blocks.is_empty()
+            && (!state.messages.starts_with(&previous.messages)
+                || previous
+                    .content_blocks
+                    .iter()
+                    .any(|(i, b)| state.content_blocks.get(i) != Some(b))
+                || previous.context_generation != state.context_generation)
+        {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
         let old_len = old.map_or(0, |s| s.messages.len());
         let mut block_ids = std::collections::HashSet::new();
