@@ -2082,7 +2082,10 @@ async fn synchronous_extension_panics_are_reported_and_replayed_after_reopen() {
         let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
         h.install_extension(Extension {
             name: "panic-extension".into(),
-            sections: vec![Arc::new(SynchronousPanicSection), Arc::new(PollPanicSection)],
+            sections: vec![
+                Arc::new(SynchronousPanicSection),
+                Arc::new(PollPanicSection),
+            ],
             hooks: vec![Arc::new(SynchronousPanicHook)],
             ..Default::default()
         })
@@ -2106,7 +2109,13 @@ async fn synchronous_extension_panics_are_reported_and_replayed_after_reopen() {
         }
         let section = first.iter().find(|d| d.batch.phase == "section").unwrap();
         assert_eq!(section.batch.reports.len(), 2);
-        assert!(section.batch.reports.iter().all(|r| r.error == "extension panicked"));
+        assert!(
+            section
+                .batch
+                .reports
+                .iter()
+                .all(|r| r.error == "extension panicked")
+        );
         assert!(tool.0.lock().unwrap().is_empty());
         assert_eq!(subscription.read(0, 256).unwrap(), first);
     }
