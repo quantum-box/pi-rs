@@ -2925,6 +2925,15 @@ async fn inherited_entries_require_atomic_parent_lineage() {
     let child = h.fork_at_application_entry(origin, entries[0].id).unwrap();
     let grandchild = h.fork_at_application_entry(child, entries[0].id).unwrap();
     assert_eq!(application_entry::list(&db, grandchild).unwrap(), entries);
+    let replay = h
+        .unified_history(
+            &h.unified_history_start(grandchild, false).unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+    assert!(replay.commits.iter().any(|frame| {
+        frame.applications.as_ref() == Some(&entries) && !frame.snapshots.is_empty()
+    }));
     // Simulate an unrelated conversation created atomically with a copied,
     // origin-matching prefix and a lineage record claiming the unrelated parent.
     let forged = Uuid::new_v4();
@@ -2952,6 +2961,49 @@ async fn inherited_entries_require_atomic_parent_lineage() {
         .next()
         .unwrap();
     let revision = db.document_snapshot().unwrap();
+    // Even if two creation records claim each other as parents, at least one
+    // link points to a prefix that did not exist at its recorded revision.
+    let cycle_a = Uuid::new_v4();
+    let cycle_b = Uuid::new_v4();
+    for (id, parent) in [(cycle_a, cycle_b), (cycle_b, cycle_a)] {
+        runtime["id"] = json!(id);
+        let parent_revision = db.document_snapshot().unwrap();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: format!("runtime/conversation/{id}").into_bytes(),
+                    value: serde_json::to_vec(&runtime).unwrap(),
+                },
+                Mutation::Put {
+                    key: format!("runtime/fork/{id}/{suffix}").into_bytes(),
+                    value: snapshot.clone(),
+                },
+                Mutation::Put {
+                    key: format!("durable/application-entries/{id}").into_bytes(),
+                    value: serde_json::to_vec(&entries).unwrap(),
+                },
+                Mutation::Put {
+                    key: format!("durable/application-lineage/{id}").into_bytes(),
+                    value: serde_json::to_vec(
+                        &json!({"parent": parent, "parent_revision": parent_revision}),
+                    )
+                    .unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    }
+    for id in [cycle_a, cycle_b] {
+        assert!(h.conversation(id).is_ok());
+        assert!(matches!(
+            h.fork_at_application_entry(id, entries[0].id),
+            Err(pi_rs_durable::runtime::Error::Fork(
+                pi_rs_durable::fork::Error::InvalidSnapshot
+            ))
+        ));
+    }
+    runtime["id"] = json!(forged);
     db.commit(
         &[],
         &[
