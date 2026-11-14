@@ -525,18 +525,21 @@ pub fn run(
 }
 
 #[cfg(any(unix, windows))]
-fn worker_share_store() -> Result<pi_rs_workbench::private_share_store::Store> {
+fn worker_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
     worker_share_store_at(&super::config::agent_dir())
 }
 
 #[cfg(any(unix, windows))]
 fn worker_share_store_at(
     parent: &std::path::Path,
-) -> Result<pi_rs_workbench::private_share_store::Store> {
-    // All workers must establish the same store before configuring a runtime;
-    // skipping an absent cache would race with another worker creating it.
-    std::fs::create_dir_all(parent)?;
-    Ok(pi_rs_workbench::private_share_store::Store::open(parent)?)
+) -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
+    // The prototype does not publish or serve snapshots. Do not create a cache
+    // merely because a worker started; existing entries can be invalidated.
+    match pi_rs_workbench::private_share_store::Store::open_existing(parent) {
+        Ok(store) => Ok(store),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 // Invalidation-only bridge: it does not publish or serve snapshots yet.
@@ -574,7 +577,7 @@ async fn run_worker(
     // Cache publishing and lookup are disabled. Storage errors must not stop
     // the existing worker; enabling a reader requires a durable failure fence.
     #[cfg(any(unix, windows))]
-    let share_store = worker_share_store().ok();
+    let share_store = worker_share_store().ok().flatten();
     #[cfg(any(unix, windows))]
     let mut share_generation = optional_share_generation(share_store.as_ref(), &args.session);
     let (startup_reason, previous_session_file) =
@@ -2019,21 +2022,20 @@ mod share_context_tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn worker_creates_store_and_rejects_unverifiable_existing_cache() {
+    fn worker_does_not_create_store_and_rejects_unverifiable_existing_cache() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().join("agent");
-        let store = worker_share_store_at(&parent).unwrap();
-        assert!(parent.join("share-context-v1").is_dir());
-        drop(store);
-        let other = directory.path().join("other");
-        std::fs::create_dir(&other).unwrap();
-        std::fs::write(other.join("share-context-v1"), b"not a directory").unwrap();
-        assert!(worker_share_store_at(&other).is_err());
+        assert!(worker_share_store_at(&parent).unwrap().is_none());
+        assert!(!parent.exists());
+        std::fs::create_dir(&parent).unwrap();
+        assert!(worker_share_store_at(&parent).unwrap().is_none());
+        std::fs::write(parent.join("share-context-v1"), b"not a directory").unwrap();
+        assert!(worker_share_store_at(&parent).is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn worker_store_failure_in_read_only_agent_directory_is_reported() {
+    fn read_only_agent_directory_is_a_non_creating_cache_miss() {
         use std::os::unix::fs::PermissionsExt;
         // Root can bypass directory permissions; this checks normal users.
         // SAFETY: geteuid takes no arguments and has no preconditions.
@@ -2044,7 +2046,7 @@ mod share_context_tests {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = worker_share_store_at(directory.path());
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.is_err());
+        assert!(result.unwrap().is_none());
         assert!(optional_share_generation(None, &directory.path().join("session.jsonl")).is_none());
         assert!(!directory.path().join("share-context-v1").exists());
     }
