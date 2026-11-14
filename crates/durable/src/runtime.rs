@@ -476,6 +476,7 @@ impl Conversation {
     }
     pub(crate) fn is_working(&self) -> bool {
         self.active.is_some()
+            || !self.pending_resets.is_empty()
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
             || self
                 .submissions
@@ -5248,6 +5249,9 @@ impl Scheduler {
                 return Err(Error::WaitCancelled);
             }
             let (busy, tasks_pending) = self.foreground_busy(id)?;
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
             if tasks_pending {
                 self.check_idle_task_driver()?;
             }
@@ -5277,15 +5281,40 @@ impl Scheduler {
     }
 
     fn foreground_busy(&self, root: Uuid) -> Result<(bool, bool), Error> {
-        use crate::ownership_edge::{EdgeStore, Mode};
+        use crate::ownership_edge::Mode;
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
         let owner = &self.harness.owner;
-        let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        if self.harness.failed
+            || self.harness.dirty.load(Ordering::Acquire)
+            || self.harness.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
         let store = owner.store();
-        let records = crate::task_store::TaskStore::new(store)
-            .list()
-            .map_err(|e| Error::Invalid(format!("task list: {e}")))?;
+        let snapshot = store.list_prefixes(&[
+            crate::task_store::PREFIX,
+            crate::ownership_edge::PREFIX,
+            b"runtime/conversation/",
+        ])?;
+        let mut records = Vec::new();
+        let mut edges = Vec::new();
+        let mut snapshots = HashMap::new();
+        for (key, entry) in snapshot {
+            if key.starts_with(crate::task_store::PREFIX) {
+                records.push(
+                    crate::task_store::decode(&key, entry)
+                        .map_err(|e| Error::Invalid(format!("task list: {e}")))?,
+                );
+            } else if key.starts_with(crate::ownership_edge::PREFIX) {
+                edges.push(
+                    crate::ownership_edge::decode(&key, entry)
+                        .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?,
+                );
+            } else {
+                snapshots.insert(key, entry);
+            }
+        }
         let by_id: HashMap<_, _> = records.iter().map(|r| (r.task.id(), r)).collect();
         let mut conversations = VecDeque::from([root]);
         let mut tasks = VecDeque::new();
@@ -5298,7 +5327,9 @@ impl Scheduler {
                 if !seen_conversations.insert(id) {
                     continue;
                 }
-                busy |= self.harness.load(id)?.0.is_working();
+                let entry = snapshots.get(&Harness::key(id)).ok_or(Error::NotFound)?;
+                let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                busy |= conversation.is_working();
                 for record in &records {
                     if record.task.owner() == &TaskOwner::Conversation(id)
                         && !record.task.is_background()
@@ -5318,10 +5349,7 @@ impl Scheduler {
                         tasks.push_back(child.task.id());
                     }
                 }
-                for edge in EdgeStore::new(store)
-                    .children(id)
-                    .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?
-                {
+                for edge in edges.iter().filter(|edge| edge.edge.task == id) {
                     if edge.edge.task_owner != *record.task.owner() {
                         return Err(Error::Invalid("ownership edge owner mismatch".into()));
                     }
@@ -6535,6 +6563,98 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+    #[tokio::test]
+    async fn idle_wait_includes_pending_reset_at_idle_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model)).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let (mut state, version) = scheduler.harness.load(id).unwrap();
+        state
+            .pending_resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+        scheduler
+            .harness
+            .save(&state, Expected::Version(version))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut wait = Box::pin(scheduler.wait_for_idle(id, &cancel));
+        assert!(matches!(
+            futures_util::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        cancel.cancel();
+        assert!(matches!(wait.await, Err(Error::WaitCancelled)));
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn idle_wait_does_not_block_executor_on_task_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let path = dir.path().join("db");
+        let cancel = CancellationToken::new();
+        let cancellation = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut scheduler = Scheduler::open(path, options(model)).unwrap();
+                let id = scheduler.create_conversation(config()).unwrap();
+                let (mut state, version) = scheduler.harness.load(id).unwrap();
+                state
+                    .pending_resets
+                    .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+                scheduler
+                    .harness
+                    .save(&state, Expected::Version(version))
+                    .unwrap();
+                owner_tx.send(scheduler.harness.owner.clone()).unwrap();
+                start_rx.recv().unwrap();
+                let mut wait = Box::pin(scheduler.wait_for_idle(id, &cancellation));
+                let pending = matches!(futures_util::poll!(&mut wait), std::task::Poll::Pending);
+                tx.send(pending).unwrap();
+                let result = (&mut wait).await;
+                done_tx
+                    .send(matches!(result, Err(Error::WaitCancelled)))
+                    .unwrap();
+                drop(wait);
+                scheduler.shutdown().await.unwrap();
+                result
+            })
+        });
+        let owner = owner_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let gate = owner.task_gate().lock().unwrap();
+        start_tx.send(()).unwrap();
+        let observed = rx.recv_timeout(Duration::from_secs(2));
+        cancel.cancel();
+        let cancelled_while_locked = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(gate);
+        let result = thread.join().unwrap();
+        assert_eq!(
+            observed.unwrap(),
+            true,
+            "poll must not block on the task gate"
+        );
+        assert_eq!(cancelled_while_locked.unwrap(), true);
+        assert!(matches!(result, Err(Error::WaitCancelled)));
     }
     #[test]
     fn extension_report_replay_keeps_first_batch() {

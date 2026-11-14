@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const PREFIX: &[u8] = b"durable/task/";
+pub(crate) const PREFIX: &[u8] = b"durable/task/";
 const SIGNAL_PREFIX: &[u8] = b"durable/signal/";
 const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
 
@@ -1061,7 +1061,7 @@ pub(crate) fn key(id: Uuid) -> Vec<u8> {
     key
 }
 
-fn decode(key_bytes: &[u8], entry: Entry) -> Result<StoredTask, Error> {
+pub(crate) fn decode(key_bytes: &[u8], entry: Entry) -> Result<StoredTask, Error> {
     let task: Task = serde_json::from_slice(&entry.value)?;
     if key(task.id()) != key_bytes {
         return Err(Error::InvalidKey);

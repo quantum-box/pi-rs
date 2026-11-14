@@ -154,6 +154,27 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+    /// Read multiple key ranges from one SQLite snapshot.
+    pub fn list_prefixes(&self, prefixes: &[&[u8]]) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
+        let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut result = Vec::new();
+        for prefix in prefixes {
+            let mut stmt = tx.prepare("SELECT key, value, version FROM durable_store_entries WHERE substr(key, 1, ?1)=?2 ORDER BY key")?;
+            let rows = stmt.query_map(params![prefix.len() as i64, prefix], |r| {
+                Ok((
+                    r.get(0)?,
+                    Entry {
+                        value: r.get(1)?,
+                        version: r.get(2)?,
+                    },
+                ))
+            })?;
+            result.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        tx.commit()?;
+        Ok(result)
+    }
     /// Read a metadata key and a bounded, ordered page from one SQLite snapshot.
     /// `after` is exclusive and must be a key in or before the prefix range.
     /// Pages across calls may observe newer commits.

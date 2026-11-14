@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-const PREFIX: &[u8] = b"durable/conversation-owner/";
+pub(crate) const PREFIX: &[u8] = b"durable/conversation-owner/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -65,7 +65,7 @@ pub(crate) fn edge_key(child: Uuid) -> Vec<u8> {
 fn child_key(child: Uuid) -> Vec<u8> {
     format!("runtime/conversation/{child}").into_bytes()
 }
-fn decode(key: &[u8], entry: Entry) -> Result<StoredEdge, Error> {
+pub(crate) fn decode(key: &[u8], entry: Entry) -> Result<StoredEdge, Error> {
     let edge: Edge = serde_json::from_slice(&entry.value)?;
     if edge_key(edge.child) != key || edge.task_owner == TaskOwner::Conversation(edge.child) {
         return Err(Error::Invalid);
