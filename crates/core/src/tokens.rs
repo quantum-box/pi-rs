@@ -518,6 +518,76 @@ mod tests {
     }
 
     #[test]
+    fn decimal_rounding_matches_pi_for_normal_and_imported_tool_calls() {
+        const ARGUMENTS: &str = r#"{"x":34450847700860466777e-23}"#;
+        let message = Message::Assistant {
+            content: String::new(),
+            calls: vec![crate::ToolCall {
+                id: "id".into(),
+                name: "c".into(),
+                arguments: ARGUMENTS.into(),
+            }],
+            replay: None,
+        };
+        // Node JSON.stringify emits {"x":0.00034450847700860464}: 28 UTF-16
+        // units, plus one for the tool name, rounded up to eight tokens.
+        assert_eq!(estimate_message_tokens(&message), 8);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = crate::Session::open(&path).unwrap();
+        let entry = serde_json::from_str(
+            r#"{"type":"message","message":{"role":"assistant","stopReason":"error","content":[{"type":"toolCall","name":"c","arguments":{"x":34450847700860466777e-23}}]}}"#,
+        ).unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi".into(),
+                entry,
+            })
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: Default::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        let source = session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap()
+            .id;
+        let fallback = Message::Assistant {
+            content: String::new(),
+            calls: Vec::new(),
+            replay: None,
+        };
+        // An empty fallback ensures this exercises the imported source entry,
+        // rather than silently passing via the ordinary message estimator.
+        assert!(session.imported_assistant_message(source).is_some());
+        let branch = session.path(source);
+        assert_eq!(
+            SourceTokenIndex::new(&session, &branch).estimate(source, &fallback),
+            8
+        );
+        drop(session);
+        let reopened = crate::Session::open(&path).unwrap();
+        let branch = reopened.path(source);
+        assert_eq!(
+            SourceTokenIndex::new(&reopened, &branch).estimate(source, &fallback),
+            8
+        );
+    }
+
+    #[test]
     fn replay_inline_images_use_fixed_allowance_but_signatures_remain_text() {
         let block =
             |n| serde_json::json!({"inlineData":{"mimeType":"image/png","data":"A".repeat(n)}});

@@ -2284,7 +2284,9 @@ Complete native prompt checkpointing remains open.
 Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
 after parsing them. Native estimates now count JavaScript binary64 number
 rounding and exponent formatting as well as UTF-16 string units, including in
-imported assistant messages. This affects estimates and compaction boundaries;
+imported assistant messages. JSON parsing uses correctly rounded binary64
+conversion before estimation. Already persisted rounded values cannot recover
+their original decimal representation. This affects estimates and compaction boundaries;
 the original tool arguments and provider requests remain unchanged. Regressions
 cover exponent cutoffs, integers beyond 2^53, negative zero, nested values and
 escaped Unicode against Node 24. Inputs that Rust's JSON parser rejects, such as
