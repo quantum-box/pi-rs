@@ -158,8 +158,9 @@ split a user message from its legacy image records or a tool call from its
 result are rejected. Later legacy hook changes can retain more history, but
 cannot move an extension-provided boundary forward. Native summary size and
 timeout limits still apply. Custom `SessionStore` implementations that do not
-support atomic record metadata reject extension-produced compaction records
-rather than silently dropping their metadata; ordinary records remain supported.
+support atomic record metadata reject new pre-summary extension compactions
+rather than silently dropping their metadata. Legacy compaction hooks continue
+to work on those stores with their previous metadata-free behavior.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

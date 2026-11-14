@@ -4284,6 +4284,8 @@ impl Agent<'_> {
             |result| result.tokens_before,
         );
         let from_extension = extension_result.is_some() || original_summary != compaction.summary;
+        let persist_metadata =
+            from_extension && (extension_result.is_some() || session.supports_record_metadata());
         commit_compaction_record(
             session,
             Event::Compacted {
@@ -4295,7 +4297,7 @@ impl Agent<'_> {
                 usage,
                 usage_metadata,
             },
-            from_extension.then(|| {
+            persist_metadata.then(|| {
                 let mut metadata = serde_json::json!({"fromExtension": true});
                 if let Some(details) = extension_result.and_then(|result| result.details.clone()) {
                     metadata["details"] = details;
@@ -4355,6 +4357,7 @@ impl Agent<'_> {
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         let tokens_before = session.context_usage_estimate().tokens;
         let from_extension = original_summary != compaction.summary;
+        let persist_metadata = from_extension && session.supports_record_metadata();
         commit_compaction_record(
             session,
             Event::Compacted {
@@ -4366,7 +4369,7 @@ impl Agent<'_> {
                 usage,
                 usage_metadata,
             },
-            from_extension.then(|| serde_json::json!({"fromExtension": true})),
+            persist_metadata.then(|| serde_json::json!({"fromExtension": true})),
             observer,
         )?;
         Ok(from_extension)
@@ -7854,6 +7857,63 @@ mod tree_tests {
                 .push(format!("after:{}", compaction.summary));
             Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_hook_still_works_with_legacy_store() {
+        struct LegacyStore(crate::MemoryStore);
+        impl crate::SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(events.clone())))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(LegacyStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "recent".into(),
+                input_id: None,
+            })
+            .unwrap();
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")));
+        assert_eq!(events.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

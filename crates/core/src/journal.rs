@@ -480,6 +480,11 @@ pub trait SessionStore: Send {
     fn load(&mut self) -> Result<Vec<Record>>;
     fn append(&mut self, record: &Record) -> Result<()>;
 
+    /// Whether this store supports atomic auxiliary record metadata.
+    fn supports_record_metadata(&self) -> bool {
+        false
+    }
+
     /// Load auxiliary data committed atomically with records. Legacy stores
     /// need not implement this until they support metadata-bearing records.
     fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
@@ -509,6 +514,9 @@ pub struct MemoryStore {
 }
 
 impl SessionStore for MemoryStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
         Ok(self.records.clone())
     }
@@ -547,6 +555,9 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn supports_record_metadata(&self) -> bool {
+        self.store.supports_record_metadata()
+    }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
     }
@@ -2823,6 +2834,9 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
 }
 
 impl SessionStore for FileStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
         let (records, metadata, offset, incomplete) = read_complete_records(&mut self.file)?;
         if incomplete {
