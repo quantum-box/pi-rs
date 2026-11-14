@@ -2023,6 +2023,23 @@ mod share_context_tests {
         assert!(worker_share_store_at(&other).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_store_failure_in_read_only_agent_directory_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can bypass directory permissions; this checks normal users.
+        // SAFETY: geteuid takes no arguments and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = worker_share_store_at(directory.path());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(!directory.path().join("share-context-v1").exists());
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn existing_generation_is_invalidated_before_worker_initialization() {
