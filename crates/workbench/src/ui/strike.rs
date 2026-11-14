@@ -239,12 +239,13 @@ fn token_nodes(
             let children = token.get("tokens")?.as_array()?;
             // Marked unescapes brackets in link labels before running the
             // inline lexer, so child raw text is not always a source substring.
-            let (normalized, local_offsets) = if kind == "link" {
+            let bracketed_link = kind == "link" && raw.starts_with('[');
+            let (normalized, local_offsets) = if bracketed_link {
                 unescape_with_offsets(raw, b"[]")
             } else {
                 (raw.to_owned(), (0..=raw.len()).collect())
             };
-            let search_start = if kind == "link" {
+            let search_start = if bracketed_link {
                 normalized.find('[')? + 1
             } else {
                 0

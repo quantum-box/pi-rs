@@ -1781,6 +1781,44 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 mod tests {
     use super::*;
     #[test]
+    fn marked_strike_keeps_bare_and_angle_autolinks() {
+        let theme = Theme::system();
+        for source in [
+            "https://example.com ~~deleted~~",
+            "<https://example.com> ~~deleted~~",
+            "~~https://example.com~~",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.hyperlink.as_deref() == Some("https://example.com")),
+                "{source}: {lines:?}"
+            );
+            let struck = if source.starts_with("~~") {
+                "https://example.com"
+            } else {
+                "deleted"
+            };
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text == struck && span.strikethrough),
+                "{source}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn marked_strike_runs_keep_safe_autolink_boundaries() {
         let theme = Theme::system();
         for source in [
