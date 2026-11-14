@@ -7286,6 +7286,11 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
 }
 
 fn complete_input(args: &Cli, view: &mut View) {
+    enum CompletionSource {
+        Builtin,
+        Prompt(Option<String>),
+        Other,
+    }
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
         .char_indices()
@@ -7321,7 +7326,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         ]
         .into_iter()
         .filter(|name| name.starts_with(word))
-        .map(|name| (name.to_owned(), None))
+        .map(|name| (name.to_owned(), CompletionSource::Builtin))
         .collect::<Vec<_>>()
     } else {
         let file_word = word.strip_prefix('@').unwrap_or(word);
@@ -7358,7 +7363,7 @@ fn complete_input(args: &Cli, view: &mut View) {
                         if word.starts_with('@') { "@" } else { "" },
                         parent.join(file_name).display()
                     ),
-                    None,
+                    CompletionSource::Other,
                 ))
             })
             .take(100)
@@ -7374,7 +7379,10 @@ fn complete_input(args: &Cli, view: &mut View) {
                     (Some(hint), true) => hint.clone(),
                     (None, _) => prompt.description.clone(),
                 };
-                candidates.push((text, (!description.is_empty()).then_some(description)));
+                candidates.push((
+                    text,
+                    CompletionSource::Prompt((!description.is_empty()).then_some(description)),
+                ));
             }
         }
         if args.settings.enable_skill_commands() {
@@ -7383,7 +7391,7 @@ fn complete_input(args: &Cli, view: &mut View) {
                 if text.starts_with(word)
                     && !candidates.iter().any(|(candidate, _)| candidate == &text)
                 {
-                    candidates.push((text, None));
+                    candidates.push((text, CompletionSource::Other));
                 }
             }
         }
@@ -7395,6 +7403,16 @@ fn complete_input(args: &Cli, view: &mut View) {
         [(candidate, _)] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(text, source)| {
+                    let description = match source {
+                        CompletionSource::Prompt(description) => description,
+                        CompletionSource::Builtin | CompletionSource::Other => None,
+                    };
+                    (text, description)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
