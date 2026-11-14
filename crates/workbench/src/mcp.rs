@@ -2314,8 +2314,12 @@ mod tests {
     async fn http_proxy_is_preserved_when_transport_reconnects() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy =
-            reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy = reqwest_mcp::Proxy::all(format!(
+            "http://user:pass@{}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap()
+        .tunnel_http(true);
         let initialized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = initialized.clone();
         let server = tokio::spawn(async move {
@@ -2342,13 +2346,44 @@ mod tests {
                             length = value.trim().parse().unwrap();
                         }
                     }
+                    assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                    if socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    first.clear();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        assert!(
+                            !line
+                                .to_ascii_lowercase()
+                                .starts_with("proxy-authorization:")
+                        );
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
                     let mut body = vec![0; length];
                     if socket.read_exact(&mut body).await.is_err() {
                         return;
                     }
                     let request: Value = serde_json::from_slice(&body).unwrap_or_default();
                     let response = if request["method"] == "initialize" {
-                        assert!(first.starts_with("POST http://127.0.0.1:1/mcp "));
+                        assert!(first.starts_with("POST /mcp "));
                         count.fetch_add(1, Ordering::SeqCst);
                         Some(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
                     } else {

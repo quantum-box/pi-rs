@@ -575,6 +575,68 @@ mod tests {
                 .contains("proxy-authorization: basic dxnlcjpwyxnz")
         );
     }
+
+    #[tokio::test]
+    async fn bypassed_http_request_does_not_receive_proxy_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = proxies(
+            Some("http://user:pass@127.0.0.1:1"),
+            None,
+            &address.to_string(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{address}/test")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+    }
     #[test]
     fn bypass_rules_match_domains_ports_wildcards_and_ipv6() {
         let url = |url| Url::parse(url).unwrap();

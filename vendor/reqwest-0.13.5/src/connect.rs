@@ -955,7 +955,11 @@ impl ConnectorService {
                 }
             }
             #[cfg(not(feature = "__tls"))]
-            Inner::Http(_) => (),
+            Inner::Http(_) => {
+                if proxy.tunnel_http() && dst.scheme_str() == Some("http") {
+                    return Err("HTTP CONNECT requires a TLS-enabled connector".into());
+                }
+            }
         }
 
         self.connect_with_maybe_proxy(proxy_dst, true).await

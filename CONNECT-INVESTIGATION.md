@@ -43,9 +43,8 @@ design: it changes resolver observations and can leak proxy credentials.
 ## Acceptance checks
 
 * HTTP loopback proxy requires CONNECT and then verifies origin-form request;
-  verify proxy credentials appear only in CONNECT. An ignored reproduction for
-  the current reqwest 0.12 path lives in `http_proxy.rs`; a separate ignored
-  reproduction checks the reqwest 0.13 MCP proxy request line.
+  verify proxy credentials appear only in CONNECT. Tests for the reqwest 0.12
+  and reqwest 0.13 paths live in `http_proxy.rs`.
 * Equivalent reqwest 0.13/MCP test including reconnect and OAuth metadata,
   registration and redirect handling.
 * HTTPS target and HTTPS proxy preserve certificate validation and tunnel
