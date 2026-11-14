@@ -207,8 +207,10 @@ budget, possibly lowered by a context extension. Expanding it would exceed a
 host or extension limit; there is no separate answer budget and headroom to
 expand. Raising both `--max-output-tokens` and `--output-budget` permits a larger
 thinking budget within those limits.
-Budgeted Messages requests use Pi's default level budgets and summarized
-thinking display, subject to that native ceiling.
+Budgeted Messages requests use Pi's default level budgets or the selected
+`thinkingBudgets` override and summarized thinking display, subject to that
+native ceiling. Overrides must be integers of at least 1,024 tokens, as required
+for Anthropic budgeted thinking; only the selected level is validated.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable

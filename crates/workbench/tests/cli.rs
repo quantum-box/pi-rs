@@ -853,7 +853,7 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
             "minimax",
             "MiniMax-M2.7",
             "low",
-            2048_u64,
+            1536_u64,
             2048_u32,
             8192_u32,
         ),
@@ -861,14 +861,19 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
             "minimax-cn",
             "MiniMax-M2.7-highspeed",
             "high",
-            16384,
+            3456,
             10000,
             3000,
         ),
-        ("minimax", "MiniMax-M2.7", "high", 16384, 10000, 10000),
+        ("minimax", "MiniMax-M2.7", "high", 3456, 10000, 10000),
         ("minimax", "MiniMax-M2.7", "off", 0, 2048, 8192),
     ] {
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            r#"{"thinkingBudgets":{"low":1536,"high":3456}}"#,
+        )
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!(
