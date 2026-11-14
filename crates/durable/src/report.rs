@@ -29,7 +29,6 @@ pub(crate) fn index(
     legacy: bool,
 ) -> Result<(), Error> {
     let mark = marker(&key);
-    let value = serde_json::to_value(batch)?;
     loop {
         if store.get(&mark)?.is_some() {
             return Ok(());
@@ -40,6 +39,17 @@ pub(crate) fn index(
             let old: ExtensionReportBatch = serde_json::from_slice(&existing.unwrap().value)?;
             return index(store, key, &old, true);
         }
+        // Migration must append the exact version guarded below, not the value
+        // from an earlier page (or from a previous failed attempt).
+        let indexed = if legacy {
+            let entry = existing
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("report disappeared during indexing".into()))?;
+            serde_json::from_slice::<ExtensionReportBatch>(&entry.value)?
+        } else {
+            batch.clone()
+        };
+        let value = serde_json::to_value(&indexed)?;
         let mut append = Observer::new(store, STREAM).prepare_append(&value)?;
         append.checks.push(Check {
             key: mark.clone(),
@@ -69,7 +79,24 @@ pub(crate) fn index(
         }
         match store.commit(&append.checks, &append.mutations) {
             Ok(()) => return Ok(()),
-            Err(durable_store::Error::Conflict { .. }) => continue,
+            Err(durable_store::Error::Conflict { .. }) => {
+                // An occupied next record with an unchanged head is an orphan,
+                // not contention. Retrying forever would hang the writer.
+                let head = &append.checks[0];
+                let record = &append.checks[1];
+                if store.get(&record.key)?.is_some() {
+                    let current = store.get(&head.key)?;
+                    let unchanged = match (&head.expected, current) {
+                        (Expected::Missing, None) => true,
+                        (Expected::Version(version), Some(entry)) => *version == entry.version,
+                        _ => false,
+                    };
+                    if unchanged {
+                        return Err(crate::observer::Error::Corrupt.into());
+                    }
+                }
+                continue;
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -208,6 +235,149 @@ mod tests {
         assert!(sub.read(cursor + 1, 1).is_err());
         assert!(sub.read(cursor, 257).is_err());
     }
+    #[test]
+    fn concurrent_duplicate_writers_commit_one_identical_delivery() {
+        let store = Arc::new(Store::memory().unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let first = batch(1);
+        let mut second = first.clone();
+        second.reports[0].error = "second".into();
+        let handles: Vec<_> = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|b| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    index(&store, key(&b), &b, false).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let stored: ExtensionReportBatch =
+            serde_json::from_slice(&store.get(&key(&first)).unwrap().unwrap().value).unwrap();
+        assert!(stored == first || stored == second);
+        let sub = Subscription::open(&store).unwrap();
+        let page = sub.read(0, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].batch, stored);
+        assert_eq!(page[0].cursor, 1);
+    }
+
+    #[test]
+    fn migration_uses_current_checked_value_and_duplicate_keeps_first() {
+        let store = Store::memory().unwrap();
+        let old = batch(1);
+        let mut replacement = old.clone();
+        replacement.reports[0].error = "replacement".into();
+        let key = key(&old);
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&old).unwrap(),
+                }],
+            )
+            .unwrap();
+        // Simulate a migration page captured before a concurrent replacement.
+        let (_, page) = store
+            .page_with_metadata(b"", REPORTS, REPORTS, MAX_PAGE)
+            .unwrap();
+        let stale: ExtensionReportBatch = serde_json::from_slice(&page[0].1.value).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&replacement).unwrap(),
+                }],
+            )
+            .unwrap();
+        index(&store, key.clone(), &stale, true).unwrap();
+        index(&store, key, &old, false).unwrap();
+        let sub = Subscription::open(&store).unwrap();
+        let deliveries = sub.read(0, 10).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].batch, replacement);
+        assert_eq!(deliveries[0].cursor, 1);
+        assert!(sub.read(1, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn orphaned_next_record_is_reported_as_corrupt() {
+        let store = Store::memory().unwrap();
+        let mut orphan = b"durable/observer/".to_vec();
+        orphan.extend_from_slice(STREAM.as_bytes());
+        orphan.extend_from_slice(b"/r");
+        orphan.extend_from_slice(&1u64.to_be_bytes());
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: orphan,
+                    value: b"null".to_vec(),
+                }],
+            )
+            .unwrap();
+        let b = batch(1);
+        assert!(matches!(
+            index(&store, key(&b), &b, false),
+            Err(Error::Observer(crate::observer::Error::Corrupt))
+        ));
+        assert!(store.get(&key(&b)).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_legacy_record_fails_without_appending() {
+        let store = Store::memory().unwrap();
+        let b = batch(1);
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key(&b),
+                    value: b"{".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(Subscription::open(&store), Err(Error::Json(_))));
+        assert_eq!(Observer::new(&store, STREAM).head().unwrap(), Cursor(0));
+        assert!(store.get(&marker(&key(&b))).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_and_new_writes_preserve_delivery_cursors() {
+        let store = Store::memory().unwrap();
+        let legacy = batch(1);
+        let newer = batch(2);
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key(&legacy),
+                    value: serde_json::to_vec(&legacy).unwrap(),
+                }],
+            )
+            .unwrap();
+        // A new write can index an existing identity before migration reaches it.
+        let mut duplicate = legacy.clone();
+        duplicate.reports[0].error = "later".into();
+        index(&store, key(&legacy), &duplicate, false).unwrap();
+        index(&store, key(&newer), &newer, false).unwrap();
+        let sub = Subscription::open(&store).unwrap();
+        let first = sub.read(0, 1).unwrap();
+        assert_eq!(first[0].batch, legacy);
+        assert_eq!(first[0].cursor, 1);
+        let second = sub.read(first[0].cursor, 1).unwrap();
+        assert_eq!(second[0].batch, newer);
+        assert_eq!(second[0].cursor, 2);
+        assert!(sub.read(2, 1).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn legacy_reconnect_and_cancelled_shutdown() {
         let dir = tempfile::tempdir().unwrap();

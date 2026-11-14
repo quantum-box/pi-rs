@@ -552,8 +552,12 @@ consumer may reenter the host. Dropping the pending future or subscription stops
 waiting; subscriptions borrow the host and must be dropped before host shutdown.
 Polling uses synchronous store reads on the calling async thread and adds latency
 up to the selected interval. Subscription setup scans the existing log and may
-perform storage writes; it can contend with execution. There is no deletion or
-retention policy, and the persistent log and index grow without bound.
+perform storage writes; it can contend with execution. A storage error during
+subscription setup poisons the host, requiring reopening and reconciliation.
+The report index and reserved observer stream are internal namespaces; modifying
+them externally invalidates delivery guarantees. Malformed records are reported
+as errors, and an orphaned next observer record is rejected instead of retried.
+There is no deletion or retention policy, and the persistent log and index grow without bound.
 
 This is an increment toward upstream's [`onReport(report)`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md#errors), not callback parity:
 it exposes batches of extension errors rather than individual reports and does

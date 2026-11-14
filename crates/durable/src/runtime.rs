@@ -772,7 +772,18 @@ impl Harness {
 
     /// Subscribe to committed extension batches, including batches from older databases.
     pub fn subscribe_extension_reports(&self) -> Result<crate::report::Subscription<'_>, Error> {
-        crate::report::Subscription::open(self.owner.store())
+        let result = crate::report::Subscription::open(self.owner.store());
+        self.poison_on_report_storage_error(&result);
+        result
+    }
+
+    fn poison_on_report_storage_error<T>(&self, result: &Result<T, Error>) {
+        if matches!(
+            result,
+            Err(Error::Storage(_)) | Err(Error::Observer(crate::observer::Error::Store(_)))
+        ) {
+            self.storage_failed.store(true, Ordering::Release);
+        }
     }
 
     fn record_extension_reports(
@@ -794,12 +805,7 @@ impl Harness {
             reports,
         };
         let result = crate::report::index(self.owner.store(), key, &batch, false);
-        if matches!(
-            result,
-            Err(Error::Storage(_)) | Err(Error::Observer(crate::observer::Error::Store(_)))
-        ) {
-            self.storage_failed.store(true, Ordering::Release);
-        }
+        self.poison_on_report_storage_error(&result);
         result
     }
 
@@ -6465,6 +6471,46 @@ mod scheduler_tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reports[0].error, "first");
     }
+    #[test]
+    fn report_migration_storage_failure_poisons_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let conversation_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let batch = ExtensionReportBatch {
+            conversation_id,
+            operation_id,
+            phase: "phase".into(),
+            reports: vec![],
+        };
+        let key =
+            format!("runtime/extension-report/{conversation_id}/{operation_id}/phase").into_bytes();
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&batch).unwrap(),
+                }],
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_report_index BEFORE INSERT ON durable_store_entries BEGIN SELECT RAISE(FAIL, 'injected failure'); END;").unwrap();
+        assert!(matches!(
+            h.subscribe_extension_reports(),
+            Err(Error::Storage(_))
+        ));
+        assert!(h.storage_failed.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn report_subscription_drop_allows_scheduler_shutdown_and_reopen() {
         let dir = tempfile::tempdir().unwrap();

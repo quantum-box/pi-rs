@@ -2255,6 +2255,7 @@ dependencies = [
  "jsonschema",
  "pi-rs-core",
  "pi-rs-workbench",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
