@@ -423,3 +423,306 @@ async fn panicking_parent_cannot_leave_nested_call_running() {
     .unwrap();
     assert!(h.blocked(id).unwrap().is_some());
 }
+
+struct KeyedParent {
+    executions: AtomicUsize,
+    cancel: CancellationToken,
+    change: bool,
+}
+#[async_trait]
+impl pi_rs_durable::keyed_tool::KeyedTool for KeyedParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let n = self.executions.fetch_add(1, Ordering::SeqCst);
+        let keys = if n == 0 {
+            ["first", "second"]
+        } else {
+            ["second", "first"]
+        };
+        for key in keys {
+            let value = if self.change && n > 0 && key == "first" {
+                99
+            } else if key == "first" {
+                1
+            } else {
+                2
+            };
+            let _ = host.call_keyed(key, "child", json!({"value":value})).await;
+        }
+        if n == 0 {
+            self.cancel.cancel();
+            std::future::pending::<()>().await;
+        }
+        Outcome::Succeeded("parent".into()).into()
+    }
+}
+
+async fn keyed_reopen(change: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        KeyedParent {
+            executions: AtomicUsize::new(0),
+            cancel: cancel.clone(),
+            change,
+        },
+    ));
+    let child = Arc::new(Child {
+        count: AtomicUsize::new(0),
+        unknown: false,
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let id;
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "work".into(), &cancel)
+                .await
+                .is_err()
+        );
+    }
+    let h = Harness::open(&path, opts(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(child.count.load(Ordering::SeqCst), 2);
+    assert_eq!(parent.0.executions.load(Ordering::SeqCst), 2);
+    if change {
+        assert!(h.blocked(id).unwrap().is_some());
+    } else {
+        assert_eq!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done {
+                answer: "done".into()
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn keyed_runtime_reorders_after_reopen_without_reexecuting_children() {
+    keyed_reopen(false).await;
+}
+#[tokio::test]
+async fn keyed_runtime_changed_arguments_block_even_if_ignored() {
+    keyed_reopen(true).await;
+}
+
+#[tokio::test]
+async fn keyed_adapter_fails_closed_without_durable_dispatch() {
+    struct EmptyHost;
+    #[async_trait]
+    impl ToolHost for EmptyHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![]
+        }
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            panic!("must not dispatch")
+        }
+    }
+    let tool = pi_rs_durable::keyed_tool::KeyedToolAdapter::new(KeyedParent {
+        executions: AtomicUsize::new(0),
+        cancel: CancellationToken::new(),
+        change: false,
+    });
+    let result = tool
+        .invoke_transaction(
+            json!({}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+            None,
+            Arc::new(EmptyHost),
+        )
+        .await;
+    assert!(matches!(result.outcome, Outcome::Skipped(_)));
+    assert_eq!(tool.0.executions.load(Ordering::SeqCst), 0);
+}
+
+// A normal tool must not be able to turn its ambient task-local scope into a
+// keyed invocation by calling an adapter directly instead of dispatching it.
+struct BorrowingParent {
+    adapter: Arc<pi_rs_durable::keyed_tool::KeyedToolAdapter<KeyedParent>>,
+}
+#[async_trait]
+impl Tool for BorrowingParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+    async fn invoke_transaction(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> pi_rs_core::ToolReply {
+        self.adapter
+            .invoke_transaction(args, context, state, host)
+            .await
+    }
+}
+#[tokio::test]
+async fn ordinary_tool_cannot_borrow_keyed_adapter_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let adapter = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        KeyedParent {
+            executions: AtomicUsize::new(0),
+            cancel: cancel.clone(),
+            change: false,
+        },
+    ));
+    let child = Arc::new(Child {
+        count: AtomicUsize::new(0),
+        unknown: false,
+    });
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(BorrowingParent {
+                    adapter: adapter.clone(),
+                }),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(adapter.0.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(child.count.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+}
+
+// A wrapper's first field shares its data address with the enclosing tool.
+#[repr(C)]
+struct EmbeddedParent(pi_rs_durable::keyed_tool::KeyedToolAdapter<KeyedParent>);
+#[async_trait]
+impl Tool for EmbeddedParent {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        unreachable!()
+    }
+    async fn invoke_transaction(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> pi_rs_core::ToolReply {
+        self.0.invoke_transaction(args, context, state, host).await
+    }
+}
+#[tokio::test]
+async fn embedded_adapter_cannot_borrow_enclosing_tool_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let parent = Arc::new(EmbeddedParent(
+        pi_rs_durable::keyed_tool::KeyedToolAdapter::new(KeyedParent {
+            executions: AtomicUsize::new(0),
+            cancel: cancel.clone(),
+            change: false,
+        }),
+    ));
+    let child = Arc::new(Child {
+        count: AtomicUsize::new(0),
+        unknown: false,
+    });
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: parent.clone(),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(parent.0.0.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(child.count.load(Ordering::SeqCst), 0);
+}

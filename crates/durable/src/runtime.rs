@@ -4954,14 +4954,20 @@ impl Harness {
                                             .map(|(host, _)| host.clone())
                                             .unwrap_or_else(|| host.clone());
                                         let reply = fenced_poll(
-                                            std::panic::AssertUnwindSafe(crate::tool::execute(
-                                                reg.tool.as_ref(),
-                                                &invocation,
-                                                prepared,
-                                                c.tool_states.get(&call.name),
-                                                progress_host,
-                                                cancel,
-                                                Duration::from_secs(120),
+                                            std::panic::AssertUnwindSafe(crate::keyed_tool::scope(
+                                                host.clone(),
+                                                reg.tool.clone(),
+                                                invocation.operation_id,
+                                                progress_host.clone(),
+                                                crate::tool::execute(
+                                                    reg.tool.as_ref(),
+                                                    &invocation,
+                                                    prepared,
+                                                    c.tool_states.get(&call.name),
+                                                    progress_host,
+                                                    cancel,
+                                                    Duration::from_secs(120),
+                                                ),
                                             ))
                                             .catch_unwind(),
                                             self.execution_gate.as_ref(),

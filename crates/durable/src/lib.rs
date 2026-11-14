@@ -12,6 +12,7 @@ pub mod conversation_signal;
 pub mod document;
 pub mod extension;
 pub mod fork;
+pub mod keyed_tool;
 pub mod model;
 pub mod nested;
 pub mod observer;

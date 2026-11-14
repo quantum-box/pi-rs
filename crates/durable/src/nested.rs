@@ -68,6 +68,8 @@ struct Lifecycle {
     active: usize,
     counts: HashMap<Uuid, u64>,
     keyed: HashSet<Vec<u8>>,
+    closed: HashSet<Uuid>,
+    active_by_parent: HashMap<Uuid, usize>,
 }
 
 /// One execution of one parent operation. Clone the Arc, not the host itself.
@@ -80,14 +82,39 @@ pub struct NestedHost {
     serial: tokio::sync::Mutex<()>,
 }
 
-struct Active(Arc<Shared>);
+struct Active(Arc<Shared>, Uuid);
 impl Drop for Active {
     fn drop(&mut self) {
         if let Ok(mut state) = self.0.lifecycle.lock() {
             state.active -= 1;
+            if let Some(count) = state.active_by_parent.get_mut(&self.1) {
+                *count -= 1;
+            }
             self.0.idle.notify_one();
         } else {
             self.0.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+// Revoke each invocation's host as soon as its dispatch finishes or is dropped.
+pub(crate) struct InvocationScope(pub(crate) Arc<NestedHost>);
+impl Drop for InvocationScope {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.shared.lifecycle.lock() {
+            state.closed.insert(self.0.parent);
+            if state
+                .active_by_parent
+                .get(&self.0.parent)
+                .copied()
+                .unwrap_or(0)
+                != 0
+            {
+                self.0.shared.failed.store(true, Ordering::Release);
+                self.0.shared.cancellation.cancel();
+            }
+        } else {
+            self.0.shared.failed.store(true, Ordering::Release);
         }
     }
 }
@@ -159,11 +186,13 @@ impl NestedHost {
             .lifecycle
             .lock()
             .map_err(|_| self.fail("nested lifecycle lock poisoned"))?;
-        if l.sealed || self.shared.failed.load(Ordering::Acquire) {
+        if l.sealed || l.closed.contains(&self.parent) || self.shared.failed.load(Ordering::Acquire)
+        {
             return Err(self.fail("nested host sealed or failed"));
         }
         l.active += 1;
-        Ok(Active(self.shared.clone()))
+        *l.active_by_parent.entry(self.parent).or_default() += 1;
+        Ok(Active(self.shared.clone(), self.parent))
     }
     /// Seal the entire host tree and check all records, including descendants.
     /// A successful inspection requires no active or detached nested calls, no
@@ -403,14 +432,20 @@ impl NestedHost {
         } else {
             return self.fail("nested lifecycle lock poisoned");
         }
-        let reply = crate::tool::execute(
-            reg.tool.as_ref(),
-            &invocation,
-            prepared,
-            None,
-            child,
-            &self.shared.cancellation,
-            self.shared.timeout,
+        let reply = crate::keyed_tool::scope(
+            child.clone(),
+            reg.tool.clone(),
+            invocation.operation_id,
+            child.clone(),
+            crate::tool::execute(
+                reg.tool.as_ref(),
+                &invocation,
+                prepared,
+                None,
+                child,
+                &self.shared.cancellation,
+                self.shared.timeout,
+            ),
         )
         .await;
         let outcome = if reply.state.is_some() {
@@ -751,6 +786,137 @@ mod tests {
         let _ = h.call("parent", json!({})).await;
         assert!(h.seal_and_inspect().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn dropped_root_dispatch_revokes_escaped_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake: Arc<dyn Tool> = Arc::new(Fake {
+            calls: calls.clone(),
+            pending: false,
+        });
+        let operation_id = Uuid::new_v4();
+        let host = NestedHost::new(
+            Arc::new(OwnedStore::open(dir.path().join("db")).unwrap()),
+            operation_id,
+            vec![RegisteredTool {
+                tool: fake.clone(),
+                replay: ReplayPolicy::Unsafe,
+            }],
+            CancellationToken::new(),
+            Duration::from_secs(10),
+            3,
+        )
+        .unwrap();
+        let ordinary: Arc<dyn ToolHost> = host.clone();
+        let mut dispatch = Box::pin(crate::keyed_tool::scope(
+            host.clone(),
+            fake,
+            operation_id,
+            ordinary,
+            std::future::pending::<()>(),
+        ));
+        assert!(futures_util::poll!(&mut dispatch).is_pending());
+        drop(dispatch);
+        assert!(matches!(
+            host.call_keyed("late", "fake", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(host.seal_and_inspect().is_err());
+    }
+    #[tokio::test]
+    async fn dropped_root_dispatch_cancels_active_nested_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let operation_id = Uuid::new_v4();
+        let host = host(
+            &dir.path().join("db"),
+            operation_id,
+            calls.clone(),
+            ReplayPolicy::Unsafe,
+            true,
+            3,
+        );
+        let fake: Arc<dyn Tool> = Arc::new(Fake {
+            calls: calls.clone(),
+            pending: true,
+        });
+        let mut dispatch = Box::pin(crate::keyed_tool::scope(
+            host.clone(),
+            fake,
+            operation_id,
+            host.clone(),
+            std::future::pending::<()>(),
+        ));
+        assert!(futures_util::poll!(dispatch.as_mut()).is_pending());
+        let mut nested = Box::pin(host.call_keyed("active", "fake", json!({})));
+        assert!(futures_util::poll!(nested.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(dispatch);
+        assert!(matches!(nested.await, Outcome::Unknown(_)));
+        assert!(host.seal_and_inspect().is_err());
+    }
+    struct CapturingKeyed {
+        saved: Arc<Mutex<Option<crate::keyed_tool::KeyedHost>>>,
+    }
+    #[async_trait]
+    impl crate::keyed_tool::KeyedTool for CapturingKeyed {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "capture".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: crate::keyed_tool::KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            *self.saved.lock().unwrap() = Some(host);
+            Outcome::Succeeded("done".into()).into()
+        }
+    }
+    #[tokio::test]
+    async fn completed_child_cannot_use_escaped_keyed_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(Mutex::new(None));
+        let h = NestedHost::new(
+            Arc::new(OwnedStore::open(dir.path().join("db")).unwrap()),
+            Uuid::new_v4(),
+            vec![
+                Arc::new(crate::keyed_tool::KeyedToolAdapter::new(CapturingKeyed {
+                    saved: saved.clone(),
+                }))
+                .register(ReplayPolicy::Safe),
+                RegisteredTool {
+                    tool: Arc::new(Fake {
+                        calls: calls.clone(),
+                        pending: false,
+                    }),
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            CancellationToken::new(),
+            Duration::from_secs(10),
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            h.call_keyed("first", "capture", json!({})).await,
+            Outcome::Succeeded(_)
+        ));
+        let escaped = saved.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            escaped.call_keyed("late", "fake", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(h.seal_and_inspect().is_err());
     }
     #[tokio::test]
     async fn intent_compare_and_swap_never_overwrites_an_existing_call() {
