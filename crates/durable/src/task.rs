@@ -3,6 +3,9 @@
 //! `task_store` provides durable wait evaluation; the host schedules polling
 //! and executes tasks after acquiring a reservation.
 
+#[path = "task_scheduler.rs"]
+pub mod scheduler;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -50,6 +53,12 @@ pub struct Task {
     restart_limit: u32,
     #[serde(default)]
     delivered_signal: Option<Uuid>,
+    /// Registration identity; absent on records created by the standalone API.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Only explicitly replay-safe tasks may run again after an interrupted invocation.
+    #[serde(default)]
+    replay_safe: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +87,23 @@ impl Task {
             restarts: 0,
             restart_limit,
             delivered_signal: None,
+            kind: None,
+            replay_safe: false,
         })
+    }
+
+    /// Bind a new task to a registered implementation and its persisted replay policy.
+    pub fn registered(mut self, kind: String, replay_safe: bool) -> Self {
+        self.kind = Some(kind);
+        self.replay_safe = replay_safe;
+        self
+    }
+
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+    pub fn replay_safe(&self) -> bool {
+        self.replay_safe
     }
 
     pub fn id(&self) -> Uuid {
@@ -124,6 +149,20 @@ impl Task {
         self.require_running()?;
         self.restarts = self.restarts.saturating_add(1);
         self.state = TaskState::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn yield_ready(&mut self) -> Result<(), TransitionError> {
+        self.require_running()?;
+        self.state = TaskState::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn exhaust_restarts(&mut self) -> Result<(), TransitionError> {
+        if self.state != TaskState::Ready {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Failed("restart limit exceeded".into());
         Ok(())
     }
 
