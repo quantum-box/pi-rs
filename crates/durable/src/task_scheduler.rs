@@ -116,18 +116,42 @@ pub struct Registry {
     entries: HashMap<String, Registration>,
 }
 impl Registry {
+    pub(crate) fn matches_task_tool(
+        &self,
+        identity: &crate::task_tool::Identity,
+        handler: &Arc<dyn Handler>,
+    ) -> bool {
+        self.entries.get(&identity.kind).is_some_and(|r| {
+            r.version == identity.definition_version
+                && r.replay_safe == identity.replay_safe
+                && Arc::ptr_eq(&r.handler, handler)
+        })
+    }
     pub fn register_shared(
         &mut self,
         kind: impl Into<String>,
         replay_safe: bool,
         handler: Arc<dyn Handler>,
     ) -> bool {
+        self.register_shared_versioned(kind, 1, replay_safe, handler)
+    }
+    /// Register a shared handler with its stable, host-assigned definition version.
+    pub fn register_shared_versioned(
+        &mut self,
+        kind: impl Into<String>,
+        version: u32,
+        replay_safe: bool,
+        handler: Arc<dyn Handler>,
+    ) -> bool {
+        if version == 0 {
+            return false;
+        }
         use std::collections::hash_map::Entry;
         match self.entries.entry(kind.into()) {
             Entry::Vacant(v) => {
                 v.insert(Registration {
                     identity: Arc::new(()),
-                    version: 1,
+                    version,
                     migrate: None,
                     replay_safe,
                     handler,

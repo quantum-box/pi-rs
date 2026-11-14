@@ -233,8 +233,23 @@ impl Driver {
     /// Replace the complete registry at a scheduling boundary. This waits for
     /// an in-flight handler and wakes the worker to reconsider blocked tasks.
     pub fn replace_registry(&self, registry: task_scheduler::Registry) -> Result<(), Error> {
+        let validator = self
+            .shared
+            .harness
+            .as_ref()
+            .map(|h| h.lock().map(|h| h.worker()).map_err(|_| Error::Poisoned))
+            .transpose()?;
         let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
         let mut state = self.check()?;
+        let _gate = self
+            .shared
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
+        if let Some(harness) = validator {
+            harness.validate_task_tool_registry(&registry)?;
+        }
         let result = scheduler.replace_registry(registry);
         state.policies = scheduler.policies();
         state.definitions = scheduler.definitions();
@@ -667,7 +682,6 @@ impl Shared {
                     || state.policies.get(kind).copied()
                         != Some((task.replay_safe(), task.definition_version()))
                     || *replay != task.replay_safe()
-                    || task.definition_version() != 1
                     || task.owner() != &TaskOwner::Conversation(conversation)
                     || task.state() != &TaskState::Ready
                     || task.abort_requested()

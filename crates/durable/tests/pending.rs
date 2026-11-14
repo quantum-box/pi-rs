@@ -561,6 +561,7 @@ async fn task_backed_tool_admits_and_resumes_after_reopen() {
         },
         "job-task",
         true,
+        1,
         handler.clone(),
     ));
     let opts = || Options {
@@ -655,6 +656,7 @@ async fn task_backed_tool_abort_waits_for_owned_task_cleanup() {
         },
         "job-task",
         true,
+        1,
         handler.clone(),
     ));
     let options = Options {
@@ -741,6 +743,7 @@ async fn task_tool_kill_worker() {
         },
         "job-task",
         safe,
+        1,
         handler.clone(),
     ));
     let opts = Options {
@@ -752,6 +755,24 @@ async fn task_tool_kill_worker() {
     };
     let cancel = CancellationToken::new();
     let mut h = Harness::open(path, opts, &cancel).await.unwrap();
+    if std::env::var_os("PI_TASK_TOOL_MARKER").is_some() {
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "work".into(), &cancel)
+                .await
+                .is_err()
+        );
+        println!("TASK_TOOL_MARKER_READY={id}");
+        std::io::stdout().flush().unwrap();
+        std::future::pending::<()>().await;
+        return;
+    }
     let mut registry = Registry::default();
     registry.register_shared("job-task", safe, handler);
     let _driver = h.start_tasks(registry).unwrap();
@@ -768,6 +789,86 @@ async fn task_tool_kill_worker() {
         .await
         .unwrap();
     std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_marker_crash_changed_definition_stays_blocked_on_retry() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Step},
+        task_tool::TaskTool,
+    };
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+        sync::mpsc,
+    };
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut process = Kill(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "task_tool_kill_worker", "--nocapture"])
+            .env("PI_TASK_TOOL_KILL_DB", &path)
+            .env("PI_TASK_TOOL_MARKER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let (tx, rx) = mpsc::channel();
+    let stdout = process.0.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, id)) = line.split_once("TASK_TOOL_MARKER_READY=") {
+                let _ = tx.send(id.parse::<uuid::Uuid>().unwrap());
+                break;
+            }
+        }
+    });
+    let id = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(Step::Succeed(json!("unexpected")))
+    });
+    let opts = |version| Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(TaskTool::new(
+                ToolSpec {
+                    name: "job".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                "job-task",
+                true,
+                version,
+                handler.clone(),
+            ))
+            .register(),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    {
+        let h = Harness::open_paused(&path, opts(2)).unwrap();
+        assert!(h.blocked(id).unwrap().unwrap().1.contains("identity"));
+    }
+    let h = Harness::open_paused(&path, opts(1)).unwrap();
+    assert!(h.blocked(id).unwrap().unwrap().1.contains("identity"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[cfg(unix)]
@@ -822,6 +923,33 @@ async fn task_backed_tool_process_death_replays_task_without_readmitting() {
         seen.fetch_add(1, Ordering::SeqCst);
         Ok(Step::Succeed(json!("recovered")))
     });
+    // A changed definition must be rejected before the recovered task can run;
+    // restoring the original version is a valid retry.
+    {
+        let changed = Arc::new(TaskTool::new(
+            ToolSpec {
+                name: "job".into(),
+                description: "".into(),
+                parameters: json!({"type":"object"}),
+            },
+            "job-task",
+            true,
+            2,
+            handler.clone(),
+        ));
+        let options = Options {
+            model: Arc::new(ModelStub),
+            tools: vec![changed.register()],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let h = Harness::open_paused(&path, options).unwrap();
+        let mut registry = Registry::default();
+        registry.register_shared_versioned("job-task", 2, true, handler.clone());
+        assert!(h.start_tasks(registry).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
     let adapter = Arc::new(TaskTool::new(
         ToolSpec {
             name: "job".into(),
@@ -830,6 +958,7 @@ async fn task_backed_tool_process_death_replays_task_without_readmitting() {
         },
         "job-task",
         true,
+        1,
         handler.clone(),
     ));
     let options = Options {
@@ -891,6 +1020,7 @@ async fn task_backed_tool_without_driver_fails_before_admission() {
         },
         "job-task",
         true,
+        1,
         handler.clone(),
     ));
     let opts = || Options {
@@ -955,6 +1085,7 @@ async fn task_backed_tool_rejects_unscoped_invocation() {
         },
         "job-task",
         true,
+        1,
         handler,
     ));
     let _registration = adapter.register();
@@ -988,6 +1119,7 @@ async fn task_backed_tool_scheduler_polls_to_completion() {
         },
         "job-task",
         true,
+        2,
         handler.clone(),
     ));
     let opts = Options {
@@ -999,7 +1131,7 @@ async fn task_backed_tool_scheduler_polls_to_completion() {
     };
     let mut s = pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), opts).unwrap();
     let mut registry = Registry::default();
-    registry.register_shared("job-task", true, handler);
+    registry.register_shared_versioned("job-task", 2, true, handler);
     let driver = s.start_tasks(registry).unwrap();
     let id = s
         .create_conversation(Config {
@@ -1042,6 +1174,7 @@ async fn task_backed_tool_abort_preserves_already_completed_result() {
         },
         "job-task",
         true,
+        1,
         handler.clone(),
     ));
     let opts = Options {
@@ -1089,6 +1222,91 @@ async fn task_backed_tool_abort_preserves_already_completed_result() {
 }
 
 #[tokio::test]
+async fn pending_task_rejects_registry_replacement_and_accepts_same_definition() {
+    use pi_rs_durable::{
+        task::{Checkpoint, Task, TaskState, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let handler: Arc<dyn Handler> = Arc::new(|_: &Task| {
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "wait".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::Signal("go".into()),
+            children: vec![],
+        })
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        1,
+        handler.clone(),
+    ));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), options, &cancel)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler.clone());
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let task = h
+        .conversation(id)
+        .unwrap()
+        .tool_attempt()
+        .unwrap()
+        .operation_id;
+    for _ in 0..100 {
+        if matches!(
+            driver.get(task).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(matches!(
+        driver.get(task).unwrap().unwrap().state(),
+        TaskState::Waiting(_)
+    ));
+    let mut changed = Registry::default();
+    changed.register_shared_versioned("job-task", 2, true, handler.clone());
+    assert!(driver.replace_registry(changed).is_err());
+    let mut same = Registry::default();
+    same.register_shared("job-task", true, handler);
+    driver.replace_registry(same).unwrap();
+    assert!(matches!(
+        driver.get(task).unwrap().unwrap().state(),
+        TaskState::Waiting(_)
+    ));
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn task_backed_tool_failure_requires_reconciliation() {
     use pi_rs_durable::{
         task::Task,
@@ -1106,6 +1324,7 @@ async fn task_backed_tool_failure_requires_reconciliation() {
         },
         "job-task",
         false,
+        1,
         handler.clone(),
     ));
     let opts = Options {
@@ -1222,6 +1441,7 @@ async fn task_backed_tool_process_death_unsafe_requires_reconciliation() {
         },
         "job-task",
         false,
+        1,
         handler.clone(),
     ));
     let options = Options {

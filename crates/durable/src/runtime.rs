@@ -340,6 +340,8 @@ enum Phase {
         restarts: u32,
         #[serde(default)]
         replay_ready: bool,
+        #[serde(default)]
+        dispatch_identity: Option<DispatchIdentity>,
     },
     /// An owned scheduler task and its tool operation were admitted atomically.
     TaskPending {
@@ -349,6 +351,8 @@ enum Phase {
         operation_id: Uuid,
         arguments: serde_json::Value,
         task: Uuid,
+        #[serde(default)]
+        identity: Option<crate::task_tool::Identity>,
     },
     /// The tool outcome and its state are committed before after-tool hooks run.
     ToolFinished {
@@ -379,6 +383,26 @@ enum Phase {
         #[serde(default)]
         arguments: Option<serde_json::Value>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum DispatchIdentity {
+    Other,
+    Task(crate::task_tool::Identity),
+}
+
+fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentity, Error> {
+    match crate::task_tool::lookup(tool) {
+        Some(adapter) => adapter
+            .identity()
+            .map(DispatchIdentity::Task)
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "task adapter requires a nonempty kind and nonzero definition version".into(),
+                )
+            }),
+        None => Ok(DispatchIdentity::Other),
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum ModelFailureDecision {
@@ -3789,10 +3813,57 @@ impl Harness {
         {
             return Err(Error::Failed);
         }
+        self.validate_task_tool_registry(&registry)?;
         Ok(crate::task_scheduler::Scheduler::attach(
             self.owner.clone(),
             registry,
         )?)
+    }
+    pub(crate) fn validate_task_tool_registry(
+        &self,
+        registry: &crate::task_scheduler::Registry,
+    ) -> Result<(), Error> {
+        for id in self.conversations()? {
+            let (c, _) = self.load(id)?;
+            if let Phase::TaskPending {
+                ref calls,
+                index,
+                task,
+                operation_id,
+                ref identity,
+                ..
+            } = c.phase
+            {
+                let identity = identity
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("legacy task adapter identity missing".into()))?;
+                let call = calls
+                    .get(index)
+                    .ok_or_else(|| Error::Invalid("invalid task tool index".into()))?;
+                let tools = self.resolved_tools(&c)?;
+                let adapter = tools
+                    .get(&call.name)
+                    .and_then(|r| crate::task_tool::lookup(&r.tool))
+                    .ok_or_else(|| Error::Invalid("task adapter missing".into()))?;
+                let child = crate::task_store::TaskStore::new(self.owner.store())
+                    .load(task)
+                    .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+                    .ok_or_else(|| Error::Invalid("task-backed tool task missing".into()))?;
+                if task != operation_id
+                    || adapter.identity().as_ref() != Some(identity)
+                    || !registry.matches_task_tool(identity, &adapter.handler())
+                    || child.task.owner() != &crate::task::TaskOwner::Conversation(id)
+                    || child.task.kind() != Some(identity.kind.as_str())
+                    || child.task.definition_version() != identity.definition_version
+                    || child.task.replay_safe() != identity.replay_safe
+                {
+                    return Err(Error::Invalid(
+                        "task adapter or definition identity changed".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
     pub fn start_tasks(
         &self,
@@ -4792,6 +4863,7 @@ impl Harness {
                     arguments,
                     restarts,
                     replay_ready,
+                    dispatch_identity: stored_identity,
                 } => {
                     let n = if replay_ready {
                         restarts
@@ -4812,9 +4884,15 @@ impl Harness {
                                         .is_none_or(|names| names.contains(&call.name))
                             })
                             .and_then(|x| self.tools.get(&x.name))
-                            .map(|x| x.replay)
                     } else {
                         None
+                    };
+                    let identity_matches = match (stored_identity.as_ref(), current) {
+                        (Some(stored), Some(tool)) => {
+                            dispatch_identity(&tool.tool).is_ok_and(|identity| &identity == stored)
+                        }
+                        (Some(DispatchIdentity::Other), None) => true,
+                        _ => false,
                     };
                     // A panic can be indexed before the blocked phase is committed,
                     // including while nested calls are being sealed. Never replay it.
@@ -4822,12 +4900,12 @@ impl Harness {
                         "runtime/extension-report/{id}/{operation_id}/tool_execution_panic"
                     );
                     let panicked = self.owner.store().get(panic_key.as_bytes())?.is_some();
-                    match if panicked {
+                    match if panicked || !identity_matches {
                         ToolRecovery::Reconcile
                     } else {
                         recover_tool(
                             replay,
-                            current,
+                            current.map(|tool| tool.replay),
                             n,
                             self.options.restart_limit,
                             self.options.uncertain_policy,
@@ -4843,6 +4921,7 @@ impl Harness {
                                 arguments,
                                 restarts: n,
                                 replay_ready: true,
+                                dispatch_identity: stored_identity,
                             }
                         }
                         ToolRecovery::Reconcile => {
@@ -4852,8 +4931,7 @@ impl Harness {
                                 calls,
                                 index,
                                 operation_id,
-                                reason: "interrupted; external outcome requires reconciliation"
-                                    .into(),
+                                reason: if !identity_matches { "interrupted; dispatch identity missing or changed; reconciliation required" } else { "interrupted; external outcome requires reconciliation" }.into(),
                                 arguments: Some(arguments),
                             }
                         }
@@ -4961,6 +5039,25 @@ impl Harness {
             crate::task::TaskState::Cancelled => Some(Outcome::Failed("task cancelled".into())),
             _ => None,
         })
+    }
+    fn validate_pending_task_identity(
+        &self,
+        c: &Conversation,
+        calls: &[ToolCall],
+        index: usize,
+        identity: &Option<crate::task_tool::Identity>,
+    ) -> Result<(), Error> {
+        let current = calls
+            .get(index)
+            .and_then(|call| self.resolved_tools(c).ok()?.get(&call.name).cloned())
+            .and_then(|reg| crate::task_tool::lookup(&reg.tool))
+            .and_then(|adapter| adapter.identity());
+        if identity.is_none() || current != *identity {
+            return Err(Error::Invalid(
+                "task adapter identity missing or changed".into(),
+            ));
+        }
+        Ok(())
     }
     async fn settle_abort(
         &mut self,
@@ -5070,7 +5167,9 @@ impl Harness {
                 task,
                 turns,
                 arguments,
+                identity,
             } => {
+                self.validate_pending_task_identity(&c, &calls, index, &identity)?;
                 let outcome = self
                     .task_tool_result(c.id, operation_id, task)?
                     .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
@@ -6324,6 +6423,7 @@ impl Harness {
                                     arguments: prepared.arguments().clone(),
                                     restarts: 0,
                                     replay_ready: false,
+                                    dispatch_identity: Some(dispatch_identity(&reg.tool)?),
                                 }
                             }
                             Err(outcome) => {
@@ -6550,6 +6650,7 @@ impl Harness {
                                     arguments: prepared.arguments().clone(),
                                     restarts: 0,
                                     replay_ready: false,
+                                    dispatch_identity: Some(dispatch_identity(&reg.tool)?),
                                 }
                             }
                             Err(outcome) => {
@@ -6573,6 +6674,7 @@ impl Harness {
                     operation_id,
                     arguments,
                     replay_ready,
+                    dispatch_identity: stored_identity,
                     ..
                 } => {
                     if replay_ready {
@@ -6596,6 +6698,23 @@ impl Harness {
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
+                    if !tools.get(&call.name).is_some_and(|reg| {
+                        dispatch_identity(&reg.tool).ok().as_ref() == stored_identity.as_ref()
+                            && stored_identity.is_some()
+                    }) {
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason: "dispatch identity missing or changed; reconciliation required"
+                                .into(),
+                            arguments: Some(arguments),
+                        };
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    }
                     let reply = if let Some(reg) = tools.get(&call.name).filter(|_| {
                         c.model_tools
                             .as_ref()
@@ -6767,6 +6886,7 @@ impl Harness {
                             operation_id,
                             arguments,
                             task: task.id(),
+                            identity: adapter.identity(),
                         };
                         self.save_hook_children(
                             &c,
@@ -6874,7 +6994,9 @@ impl Harness {
                     operation_id,
                     arguments,
                     task,
+                    identity,
                 } => {
+                    self.validate_pending_task_identity(&c, &calls, index, &identity)?;
                     let Some(outcome) = self.task_tool_result(c.id, operation_id, task)? else {
                         return Ok(());
                     };
@@ -9783,6 +9905,7 @@ mod scheduler_tests {
                 arguments: serde_json::json!({}),
                 restarts: 0,
                 replay_ready: false,
+                dispatch_identity: Some(DispatchIdentity::Other),
             };
             h.save(&c, Expected::Version(version)).unwrap();
             h.record_tool_panic(id, operation).unwrap();
@@ -10079,6 +10202,7 @@ mod scheduler_tests {
                 arguments: serde_json::json!({}),
                 restarts: 0,
                 replay_ready: false,
+                dispatch_identity: Some(DispatchIdentity::Other),
             },
             Phase::Pending {
                 turns: 0,
@@ -10135,6 +10259,7 @@ mod scheduler_tests {
                 arguments: serde_json::json!({}),
                 restarts: 0,
                 replay_ready: false,
+                dispatch_identity: Some(DispatchIdentity::Other),
             };
             state
         };
@@ -10207,6 +10332,7 @@ mod scheduler_tests {
             arguments: serde_json::json!({}),
             restarts: 0,
             replay_ready: false,
+            dispatch_identity: Some(DispatchIdentity::Other),
         };
         h.owner
             .store()
@@ -10253,6 +10379,159 @@ mod scheduler_tests {
             .tool_attempts(id, crate::observer::Cursor(0), limit)
             .unwrap();
         assert_eq!(page.records[0].value["attempt"], serde_json::json!(attempt));
+    }
+
+    #[test]
+    fn task_marker_identity_is_required_and_bound_on_recovery() {
+        use crate::task::{Task, TaskState};
+        use crate::task_scheduler::{Handler, Step};
+        use crate::task_tool::TaskTool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let handler: Arc<dyn Handler> =
+            Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null))));
+        let adapter = |kind: &str, version, description: &str| {
+            Arc::new(TaskTool::new(
+                pi_rs_core::ToolSpec {
+                    name: "job".into(),
+                    description: description.into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+                kind,
+                true,
+                version,
+                handler.clone(),
+            ))
+        };
+        for (case, changed, legacy, should_block) in [
+            ("same", Some(adapter("task", 1, "original")), false, false),
+            ("kind", Some(adapter("other", 1, "original")), false, true),
+            ("version", Some(adapter("task", 2, "original")), false, true),
+            ("spec", Some(adapter("task", 1, "changed")), false, true),
+            ("missing", None, false, true),
+            ("legacy", Some(adapter("task", 1, "original")), true, true),
+        ] {
+            let path = dir.path().join(case);
+            let original = adapter("task", 1, "original");
+            let mut first = options(model.clone());
+            first.tools = vec![original.register()];
+            let mut h = Harness::open_paused(&path, first).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.phase = Phase::ToolRunning {
+                turns: 0,
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                }],
+                index: 0,
+                operation_id: Uuid::new_v4(),
+                replay: ReplayPolicy::Safe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: false,
+                dispatch_identity: if legacy {
+                    None
+                } else {
+                    Some(DispatchIdentity::Task(original.identity().unwrap()))
+                },
+            };
+            h.save(&c, Expected::Version(version)).unwrap();
+            drop(h);
+            let mut second = options(model.clone());
+            second.tools = changed
+                .map(|adapter| vec![adapter.register()])
+                .unwrap_or_default();
+            let h = Harness::open_paused(&path, second).unwrap();
+            if should_block {
+                assert!(
+                    matches!(h.conversation(id).unwrap().phase, Phase::Blocked { .. }),
+                    "{case}"
+                );
+                assert!(h.blocked(id).unwrap().unwrap().1.contains("identity"));
+            } else {
+                assert!(matches!(
+                    h.conversation(id).unwrap().phase,
+                    Phase::ToolRunning {
+                        replay_ready: true,
+                        ..
+                    }
+                ));
+            }
+            // Recovery must not create or run a scheduler task.
+            assert!(
+                crate::task_store::TaskStore::new(h.owner.store())
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s.task.state() != &TaskState::Running)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pending_task_cannot_start_a_driver() {
+        use crate::task::Task;
+        use crate::task_scheduler::{Handler, Registry, Step};
+        use crate::task_tool::TaskTool;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let handler: Arc<dyn Handler> =
+            Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::json!(null))));
+        let adapter = Arc::new(TaskTool::new(
+            pi_rs_core::ToolSpec {
+                name: "job".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            "task",
+            true,
+            1,
+            handler.clone(),
+        ));
+        let mut opts = options(model);
+        opts.tools = vec![adapter.register()];
+        let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let operation_id = Uuid::new_v4();
+        let task = adapter
+            .task(id, operation_id, serde_json::json!({}), 5)
+            .unwrap();
+        c.phase = Phase::TaskPending {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id,
+            arguments: serde_json::json!({}),
+            task: operation_id,
+            identity: None,
+        };
+        h.save_composed(&c, Expected::Version(version), None, &[task])
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register_shared("task", true, handler);
+        assert!(h.start_tasks(registry).is_err());
+        assert!(matches!(
+            h.conversation(id).unwrap().phase,
+            Phase::TaskPending { .. }
+        ));
     }
 
     #[test]
@@ -11400,6 +11679,7 @@ mod tool_allowlist_tests {
             arguments: serde_json::json!({}),
             restarts: 0,
             replay_ready: false,
+            dispatch_identity: Some(DispatchIdentity::Other),
         };
         h.save(&c, Expected::Version(version)).unwrap();
         drop(h);
@@ -11434,6 +11714,7 @@ mod tool_allowlist_tests {
             arguments: serde_json::json!({}),
             restarts: 0,
             replay_ready: false,
+            dispatch_identity: Some(DispatchIdentity::Other),
         };
         h.save(&c, Expected::Version(version)).unwrap();
         drop(h);

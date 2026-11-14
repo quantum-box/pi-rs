@@ -10,19 +10,25 @@ pub struct TaskTool {
     spec: ToolSpec,
     kind: String,
     replay_safe: bool,
+    definition_version: u32,
     handler: Arc<dyn crate::task_scheduler::Handler>,
 }
 impl TaskTool {
+    /// `definition_version` must be nonzero and must change whenever the
+    /// handler's behavior or interpretation of its checkpoint changes. Register
+    /// the same kind, version, policy and handler with the task driver.
     pub fn new(
         spec: ToolSpec,
         kind: impl Into<String>,
         replay_safe: bool,
+        definition_version: u32,
         handler: Arc<dyn crate::task_scheduler::Handler>,
     ) -> Self {
         Self {
             spec,
             kind: kind.into(),
             replay_safe,
+            definition_version,
             handler,
         }
     }
@@ -74,6 +80,18 @@ pub(crate) fn lookup(tool: &Arc<dyn Tool>) -> Option<Arc<TaskTool>> {
     })
 }
 impl TaskTool {
+    pub(crate) fn identity(&self) -> Option<Identity> {
+        if self.kind.is_empty() || self.definition_version == 0 {
+            return None;
+        }
+        Some(Identity {
+            adapter_version: 1,
+            spec: self.spec.clone(),
+            kind: self.kind.clone(),
+            definition_version: self.definition_version,
+            replay_safe: self.replay_safe,
+        })
+    }
     pub(crate) fn task(
         &self,
         conversation: uuid::Uuid,
@@ -90,12 +108,29 @@ impl TaskTool {
             },
             limit,
         )
-        .and_then(|task| task.registered_versioned(self.kind.clone(), self.replay_safe, 1, input))
+        .and_then(|task| {
+            task.registered_versioned(
+                self.kind.clone(),
+                self.replay_safe,
+                self.definition_version,
+                input,
+            )
+        })
         .map_err(|e| format!("task creation: {e:?}"))
     }
     pub(crate) fn handler(&self) -> Arc<dyn crate::task_scheduler::Handler> {
         self.handler.clone()
     }
+}
+/// Stable host-declared identity. Changing handler behavior requires changing its
+/// kind or version; code identity cannot be inferred from a trait object.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Identity {
+    adapter_version: u32,
+    spec: ToolSpec,
+    pub(crate) kind: String,
+    pub(crate) definition_version: u32,
+    pub(crate) replay_safe: bool,
 }
 #[async_trait::async_trait]
 impl Tool for TaskTool {
