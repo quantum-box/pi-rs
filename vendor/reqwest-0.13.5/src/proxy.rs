@@ -68,7 +68,6 @@ pub struct NoProxy {
 #[derive(Clone)]
 struct Extra {
     tunnel_http: bool,
-    dynamic: bool,
     auth: Option<HeaderValue>,
     misc: Option<HeaderMap>,
 }
@@ -259,19 +258,16 @@ impl Proxy {
     where
         F: Fn(&Url) -> Option<U> + Send + Sync + 'static,
     {
-        let mut proxy = Proxy::new(Intercept::Custom(Custom {
+        Proxy::new(Intercept::Custom(Custom {
             func: Arc::new(move |url| fun(url).map(IntoProxy::into_proxy)),
             no_proxy: None,
-        }));
-        proxy.extra.dynamic = true;
-        proxy
+        }))
     }
 
     fn new(intercept: Intercept) -> Proxy {
         Proxy {
             extra: Extra {
                 tunnel_http: false,
-                dynamic: false,
                 auth: None,
                 misc: None,
             },
@@ -530,7 +526,6 @@ impl Matcher {
             inner: Matcher_::Util(matcher::Matcher::from_system()),
             extra: Extra {
                 tunnel_http: false,
-                dynamic: false,
                 auth: None,
                 misc: None,
             },
@@ -567,12 +562,6 @@ impl Matcher {
 
     pub(crate) fn maybe_has_http_custom_headers(&self) -> bool {
         self.maybe_has_http_custom_headers
-    }
-}
-
-impl Matcher {
-    pub(crate) fn is_dynamic(&self) -> bool {
-        self.extra.dynamic
     }
 }
 

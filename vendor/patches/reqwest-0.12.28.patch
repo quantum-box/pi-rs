@@ -1,32 +1,21 @@
 --- a/src/proxy.rs
 +++ b/src/proxy.rs
-@@ -69,0 +70,2 @@
+@@ -69,0 +70 @@
 +    tunnel_http: bool,
-+    dynamic: bool,
-@@ -89,0 +92 @@
+@@ -89,0 +91 @@
 +#[derive(Clone)]
-@@ -259 +262 @@
--        Proxy::new(Intercept::Custom(Custom {
-+        let mut proxy = Proxy::new(Intercept::Custom(Custom {
-@@ -262 +265,3 @@
--        }))
-+        }));
-+        proxy.extra.dynamic = true;
-+        proxy
-@@ -267,0 +273,2 @@
+@@ -267,0 +270 @@
 +                tunnel_http: false,
-+                dynamic: false,
-@@ -273,0 +281,6 @@
+@@ -273,0 +277,6 @@
 +    }
 +
 +    /// Tunnel HTTP requests through this proxy with CONNECT.
 +    pub fn tunnel_http(mut self, enabled: bool) -> Proxy {
 +        self.extra.tunnel_http = enabled;
 +        self
-@@ -518,0 +532,2 @@
+@@ -518,0 +528 @@
 +                tunnel_http: false,
-+                dynamic: false,
-@@ -553,11 +567,0 @@
+@@ -553,11 +562,0 @@
 -    pub(crate) fn http_non_tunnel_basic_auth(&self, dst: &Uri) -> Option<HeaderValue> {
 -        if let Some(proxy) = self.intercept(dst) {
 -            let scheme = proxy.uri().scheme();
@@ -38,7 +27,8 @@
 -        None
 -    }
 -
-@@ -567,10 +571,5 @@
+@@ -566,11 +564,0 @@
+-    }
 -
 -    pub(crate) fn http_non_tunnel_custom_headers(&self, dst: &Uri) -> Option<HeaderMap> {
 -        if let Some(proxy) = self.intercept(dst) {
@@ -49,12 +39,7 @@
 -        }
 -
 -        None
-+}
-+
-+impl Matcher {
-+    pub(crate) fn is_dynamic(&self) -> bool {
-+        self.extra.dynamic
-@@ -589,0 +589,20 @@
+@@ -589,0 +578,20 @@
 +    pub(crate) fn http_non_tunnel_basic_auth(&self) -> Option<HeaderValue> {
 +        let scheme = self.uri().scheme();
 +        if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
@@ -365,10 +350,46 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -1008 +1110,12 @@
+@@ -156,0 +259,35 @@
++    }
++}
++
++// H3 does not support the HTTP proxy connector. Reject a matched proxy on
++// every redirect hop instead of silently bypassing it, and never send proxy
++// credentials to a direct H3 origin.
++#[cfg(feature = "http3")]
++#[derive(Clone)]
++struct H3ProxyGuard {
++    inner: H3Client,
++    proxies: Arc<Vec<ProxyMatcher>>,
++}
++#[cfg(feature = "http3")]
++impl Service<http::Request<Body>> for H3ProxyGuard {
++    type Response = <H3Client as Service<http::Request<Body>>>::Response;
++    type Error = crate::Error;
++    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
++        request.headers_mut().remove(PROXY_AUTHORIZATION);
++        if self
++            .proxies
++            .iter()
++            .any(|proxy| proxy.intercept(request.uri()).is_some())
++        {
++            return Box::pin(async {
++                Err(crate::error::request(std::io::Error::other(
++                    "HTTP/3 proxy routing is unsupported",
++                )))
++            });
++        }
++        let mut inner = self.inner.clone();
++        Box::pin(async move { inner.call(request).await })
+@@ -1008 +1145,12 @@
 -        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
-+        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
-+            && !connector_builder.uses_local_transport();
++        let local_transport = connector_builder.uses_local_transport();
++        let dynamic_routing = !proxies.is_empty() && !local_transport;
 +        let connector = connector_builder.build(config.connector_layers);
 +        let routing = dynamic_routing.then(|| {
 +            Arc::new(RouteRouting {
@@ -379,18 +400,29 @@
 +            })
 +        });
 +        let hyper_client = builder.build(connector);
-@@ -1010,0 +1124 @@
+@@ -1010,0 +1159 @@
 +            routing,
-@@ -1097,0 +1212 @@
+@@ -1059 +1208,4 @@
+-                        let h3_service = H3Client::new(h3_connector, config.pool_idle_timeout);
++                        let h3_service = H3ProxyGuard {
++                            inner: H3Client::new(h3_connector, config.pool_idle_timeout),
++                            proxies: proxies.clone(),
++                        };
+@@ -1097,0 +1250,2 @@
 +                dynamic_routing,
-@@ -2605,2 +2720,4 @@
++                local_transport,
+@@ -2605,2 +2759,8 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
-+        if !self.inner.dynamic_routing {
++        // Local sockets bypass proxy selection and must never inherit proxy
++        // credentials or proxy-only headers. The no-proxy case is direct too.
++        if self.inner.local_transport || self.inner.proxies.is_empty() {
++            headers.remove(PROXY_AUTHORIZATION);
++        } else if !self.inner.dynamic_routing {
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2676,3 +2793,8 @@
+@@ -2676,3 +2836,8 @@
 -            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
 -                headers.insert(PROXY_AUTHORIZATION, header);
 -                break;
@@ -402,7 +434,7 @@
 +                    headers.insert(PROXY_AUTHORIZATION, header);
 +                    break;
 +                }
-@@ -2693,5 +2815,10 @@
+@@ -2693,5 +2858,10 @@
 -            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
 -                iter.iter().for_each(|(key, value)| {
 -                    headers.insert(key, value.clone());
@@ -418,5 +450,12 @@
 +                    });
 +                    break;
 +                }
-@@ -2925,0 +3053 @@
+@@ -2918 +3088 @@
+-    h3_client: Option<LayeredService<H3Client>>,
++    h3_client: Option<LayeredService<H3ProxyGuard>>,
+@@ -2925,0 +3096,2 @@
 +    dynamic_routing: bool,
++    local_transport: bool,
+@@ -2998 +3170 @@
+-    H3(LayeredFuture<H3Client>),
++    H3(LayeredFuture<H3ProxyGuard>),

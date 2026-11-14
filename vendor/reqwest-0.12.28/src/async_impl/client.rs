@@ -259,6 +259,41 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
     }
 }
 
+// H3 does not support the HTTP proxy connector. Reject a matched proxy on
+// every redirect hop instead of silently bypassing it, and never send proxy
+// credentials to a direct H3 origin.
+#[cfg(feature = "http3")]
+#[derive(Clone)]
+struct H3ProxyGuard {
+    inner: H3Client,
+    proxies: Arc<Vec<ProxyMatcher>>,
+}
+#[cfg(feature = "http3")]
+impl Service<http::Request<Body>> for H3ProxyGuard {
+    type Response = <H3Client as Service<http::Request<Body>>>::Response;
+    type Error = crate::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        request.headers_mut().remove(PROXY_AUTHORIZATION);
+        if self
+            .proxies
+            .iter()
+            .any(|proxy| proxy.intercept(request.uri()).is_some())
+        {
+            return Box::pin(async {
+                Err(crate::error::request(std::io::Error::other(
+                    "HTTP/3 proxy routing is unsupported",
+                )))
+            });
+        }
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(request).await })
+    }
+}
+
 struct Config {
     // NOTE: When adding a new field, update `fmt::Debug for ClientBuilder`
     accepts: Accepts,
@@ -1107,8 +1142,8 @@ impl ClientBuilder {
             Some(format!("{:?}", &config.redirect_policy))
         };
 
-        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
-            && !connector_builder.uses_local_transport();
+        let local_transport = connector_builder.uses_local_transport();
+        let dynamic_routing = !proxies.is_empty() && !local_transport;
         let connector = connector_builder.build(config.connector_layers);
         let routing = dynamic_routing.then(|| {
             Arc::new(RouteRouting {
@@ -1170,7 +1205,10 @@ impl ClientBuilder {
                 #[cfg(feature = "http3")]
                 h3_client: match h3_connector {
                     Some(h3_connector) => {
-                        let h3_service = H3Client::new(h3_connector, config.pool_idle_timeout);
+                        let h3_service = H3ProxyGuard {
+                            inner: H3Client::new(h3_connector, config.pool_idle_timeout),
+                            proxies: proxies.clone(),
+                        };
                         let svc = tower::retry::Retry::new(retry_policy, h3_service);
                         #[cfg(feature = "cookies")]
                         let svc = CookieService::new(svc, config.cookie_store);
@@ -1210,6 +1248,7 @@ impl ClientBuilder {
                 proxies_maybe_http_custom_headers,
                 https_only: config.https_only,
                 dynamic_routing,
+                local_transport,
                 redirect_policy_desc,
             }),
         })
@@ -2717,7 +2756,11 @@ impl Client {
 
         let body = body.unwrap_or_else(Body::empty);
 
-        if !self.inner.dynamic_routing {
+        // Local sockets bypass proxy selection and must never inherit proxy
+        // credentials or proxy-only headers. The no-proxy case is direct too.
+        if self.inner.local_transport || self.inner.proxies.is_empty() {
+            headers.remove(PROXY_AUTHORIZATION);
+        } else if !self.inner.dynamic_routing {
             self.proxy_auth(&uri, &mut headers);
             self.proxy_custom_headers(&uri, &mut headers);
         }
@@ -3042,7 +3085,7 @@ struct ClientRef {
     headers: HeaderMap,
     hyper: LayeredService<HyperService>,
     #[cfg(feature = "http3")]
-    h3_client: Option<LayeredService<H3Client>>,
+    h3_client: Option<LayeredService<H3ProxyGuard>>,
     referer: bool,
     total_timeout: RequestConfig<TotalTimeout>,
     read_timeout: Option<Duration>,
@@ -3051,6 +3094,7 @@ struct ClientRef {
     proxies_maybe_http_custom_headers: bool,
     https_only: bool,
     dynamic_routing: bool,
+    local_transport: bool,
     redirect_policy_desc: Option<String>,
 }
 
@@ -3123,7 +3167,7 @@ pin_project! {
 enum ResponseFuture {
     Default(LayeredFuture<HyperService>),
     #[cfg(feature = "http3")]
-    H3(LayeredFuture<H3Client>),
+    H3(LayeredFuture<H3ProxyGuard>),
 }
 
 impl PendingRequest {
