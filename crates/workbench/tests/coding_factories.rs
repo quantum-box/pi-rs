@@ -901,18 +901,17 @@ async fn read_event_metadata_tracks_outcome_without_leaking_stale_content() {
                 &mut inputs,
                 &CancellationToken::new(),
                 &mut |event| {
-                    if let pi_rs::Notification::Committed(record) = event {
-                        if let pi_rs::Event::ToolFinished {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
                             operation_id,
                             outcome,
                             ..
                         } = &record.event
-                        {
-                            if let Some(value) = pi_rs::tool_result_event_metadata(*operation_id) {
-                                metadata.push((*operation_id, value));
-                            }
-                            committed.push((*operation_id, outcome.clone()));
+                    {
+                        if let Some(value) = pi_rs::tool_result_event_metadata(*operation_id) {
+                            metadata.push((*operation_id, value));
                         }
+                        committed.push((*operation_id, outcome.clone()));
                     }
                 },
             )
