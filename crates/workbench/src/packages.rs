@@ -977,9 +977,20 @@ fn git_reference(source: &str) -> (&str, &str) {
     } else {
         source.find(':').map_or(0, |index| index + 1)
     };
-    match source.rfind('@').filter(|index| *index >= path_start) {
-        Some(index) => (&source[..index], &source[index + 1..]),
-        None => (source, "HEAD"),
+    // Pi splits at the first @ in the repository path, leaving subsequent
+    // @ characters as part of the ref. Do not split the URL's userinfo.
+    match source
+        .get(path_start..)
+        .and_then(|path| path.find('@'))
+        .map(|index| path_start + index)
+    {
+        Some(index)
+            if !source[path_start..index].trim_matches('/').is_empty()
+                && index + 1 < source.len() =>
+        {
+            (&source[..index], &source[index + 1..])
+        }
+        _ => (source, "HEAD"),
     }
 }
 fn key(source: &str) -> String {
@@ -2783,6 +2794,28 @@ mod tests {
             ),
             ("ssh://git@host/repo", "ssh://git@host/repo", "HEAD"),
             ("git@host:org/repo@v1", "git@host:org/repo", "v1"),
+            (
+                "git@host:org/repo@feature@v2",
+                "git@host:org/repo",
+                "feature@v2",
+            ),
+            (
+                "ssh://git@host/org/repo@feature@v2",
+                "ssh://git@host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://host/org/repo@feature@v2",
+                "https://host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://user:secret@host/org/repo@feature@v2",
+                "https://user:secret@host/org/repo",
+                "feature@v2",
+            ),
+            ("https://host/org/repo@", "https://host/org/repo@", "HEAD"),
+            ("git@host:@branch", "git@host:@branch", "HEAD"),
             ("git@host:org/repo", "git@host:org/repo", "HEAD"),
             (
                 "https://user@host/repo#old",
@@ -2792,6 +2825,20 @@ mod tests {
         ] {
             assert_eq!(git_reference(source), (url, reference));
         }
+        assert_eq!(
+            source_identity("git:ssh://git@host/org/repo@feature@v2"),
+            source_identity("git:https://host/org/repo@main")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org/repo@feature@v2", "prompts":["+prompts/keep.md"]}),
+            "git:ssh://git@host/org/repo@main",
+            Path::new("."),
+        ));
+        assert!(!matches_source(
+            &json!({"source":"git:https://host/org/repo@feature@v2"}),
+            "git:https://host/org/other@main",
+            Path::new("."),
+        ));
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {

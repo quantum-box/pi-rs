@@ -1734,7 +1734,10 @@ and repository path, including default ports and `.git` suffixes. Revision and
 transport changes preserve per-package resource filters and scope precedence.
 Explicit non-default ports and case-sensitive repository paths remain distinct.
 Regression tests cover transport aliases, ports, revisions and missing local
-sources.
+sources. As in Pi, the first `@` after a nonempty Git repository path starts a
+nonempty ref, so refs containing additional `@` characters remain intact and resolve to the
+same package identity as other refs. URL userinfo is not treated as a ref;
+existing credential-helper requirements and native `#ref` support remain.
 
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
