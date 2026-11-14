@@ -194,4 +194,24 @@ fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
     let stored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(agent.join("settings.json")).unwrap()).unwrap();
     assert_eq!(stored["packages"][0], source);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &agent)
+        .args([
+            "--offline",
+            "--no-trust",
+            "install",
+            "git:ssh://git@example.invalid/org/repo@stable",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("cannot install package in offline mode"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[redacted]@example.invalid"), "{stderr}");
+    assert!(!stderr.contains("ssh://git@"), "{stderr}");
 }

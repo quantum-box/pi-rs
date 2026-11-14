@@ -1039,25 +1039,6 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool) -> Result<Installed> {
-    install_inner(source, offline)
-        .await
-        .map_err(|error| sanitize_package_error(source, error))
-}
-
-fn sanitize_package_error(source: &str, error: Error) -> Error {
-    // Git and its helpers can echo the URL or just its userinfo in stderr.
-    // Preserve the useful static credential rejection; otherwise fail closed
-    // rather than expose userinfo through a subprocess diagnostic.
-    let sensitive = display_source(source) != source;
-    let safe_credential_error = matches!(&error, Error::Config(message) if message == "use a credential helper for git package authentication");
-    if sensitive && !safe_credential_error {
-        Error::Config("Git package with URL userinfo could not be prepared".into())
-    } else {
-        error
-    }
-}
-
-async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
             "cannot install package in offline mode: {}",
@@ -1112,7 +1093,7 @@ async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
         if let Some(version) = version {
             command.args(["--version", version]);
         }
-        let artifacts = run(command).await?;
+        let artifacts = run(command, source).await?;
         root = artifacts
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
@@ -1151,20 +1132,20 @@ async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
             command
                 .args(["clone", "--no-checkout", "--depth", "1", "--", url])
                 .arg(&root);
-            run(command).await?;
+            run(command, source).await?;
         }
         let mut fetch = tokio::process::Command::new("git");
         fetch
             .arg("-C")
             .arg(&root)
             .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch).await?;
+        run(fetch, source).await?;
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
             .args(["reset", "--hard", "FETCH_HEAD"]);
-        run(checkout).await?;
+        run(checkout, source).await?;
     }
     if root.is_file() {
         installed_binaries.push(root.clone());
@@ -1195,7 +1176,7 @@ async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
                 "--manifest-path",
             ])
             .arg(root.join("Cargo.toml"));
-        let metadata: Value = serde_json::from_slice(&run(metadata).await?)?;
+        let metadata: Value = serde_json::from_slice(&run(metadata, source).await?)?;
         let expected_manifest = root.join("Cargo.toml").canonicalize()?;
         if let Some(package) = metadata["packages"].as_array().and_then(|packages| {
             packages.iter().find(|package| {
@@ -1231,7 +1212,7 @@ async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
             if offline {
                 build.arg("--offline");
             }
-            let artifacts = run(build).await?;
+            let artifacts = run(build, source).await?;
             for line in artifacts.split(|byte| *byte == b'\n') {
                 if let Ok(artifact) = serde_json::from_slice::<Value>(line)
                     && artifact["reason"] == "compiler-artifact"
@@ -1843,7 +1824,22 @@ async fn capture(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<(Ve
     }
     Ok((output, overflow))
 }
-async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
+fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
+    // Subprocesses can echo the whole URL or just part of its userinfo.
+    // Keep status but never expose their stderr for such sources.
+    if display_source(source) != source {
+        Error::Config(format!(
+            "package command failed ({status}); subprocess output redacted"
+        ))
+    } else {
+        Error::Config(format!(
+            "package command failed ({status}): {}",
+            String::from_utf8_lossy(stderr)
+        ))
+    }
+}
+
+async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1869,10 +1865,7 @@ async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
     if !status.success() {
-        return Err(Error::Config(format!(
-            "package command failed ({status}): {}",
-            String::from_utf8_lossy(&stderr)
-        )));
+        return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
     if overflow {
         return Err(Error::Config("package command output exceeds limit".into()));
@@ -2940,18 +2933,59 @@ mod tests {
             source_identity("git:https://private-user:topsecret@example.invalid/org/repo@stable"),
             source_identity("git:https://example.invalid/org/repo#feature")
         );
-        let error = sanitize_package_error(
+        let error = package_command_failed(
             "git:ssh://private-user@example.invalid/org/repo",
-            Error::Config("helper echoed private-user".into()),
+            "exit status: 1",
+            b"helper echoed private-user",
         )
         .to_string();
         assert!(!error.contains("private-user"), "{error}");
-        let error = sanitize_package_error(
-            "git:https://private-user:topsecret@example.invalid/org/repo",
-            Error::Config("use a credential helper for git package authentication".into()),
+        assert!(
+            error.contains("exit status: 1") && error.contains("redacted"),
+            "{error}"
+        );
+        let error = package_command_failed(
+            "git:https://example.invalid/org/repo",
+            "exit status: 1",
+            b"useful error",
         )
         .to_string();
-        assert!(error.contains("use a credential helper"), "{error}");
+        assert!(error.contains("useful error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_keeps_safe_offline_diagnostic() {
+        let source = "git:ssh://git@example.invalid/org/repo@stable";
+        let error = match install(source, true).await {
+            Ok(_) => panic!("offline install unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("cannot install package in offline mode"),
+            "{error}"
+        );
+        assert!(error.contains("[redacted]@example.invalid"), "{error}");
+        assert!(!error.contains("ssh://git@"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_hides_real_subprocess_stderr() {
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "echo private-user 1>&2 & exit /b 7"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "printf private-user >&2; exit 7"]);
+            command
+        };
+        command.current_dir(std::env::temp_dir());
+        let error = run(command, "git:ssh://private-user@example.invalid/org/repo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("subprocess output redacted"), "{error}");
+        assert!(!error.contains("private-user"), "{error}");
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {
