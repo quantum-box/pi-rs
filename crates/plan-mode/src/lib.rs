@@ -47,6 +47,9 @@ impl Extension for PlanMode {
     fn id(&self) -> &str {
         "plan-mode"
     }
+    fn source_is_builtin(&self) -> bool {
+        true
+    }
 
     fn commands(&self) -> &[&str] {
         &["start", "revise", "accept", "discard"]
