@@ -31,6 +31,8 @@ pub enum Error {
     Corrupt,
     #[error("transcript does not exist")]
     Missing,
+    #[error("ordered transcript content blocks are unsupported by this operation")]
+    UnsupportedContentBlocks,
     #[error("transcript sequence exhausted")]
     SequenceExhausted,
     #[error("cursor belongs to another transcript")]
@@ -63,6 +65,17 @@ struct Entry {
     sequence: u64,
     previous: Option<Link>,
     value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_blocks: Option<Vec<MessageContentBlocks>>,
+}
+
+/// Ordered content for one message occurrence. The host must bind `message_id`
+/// to the corresponding identity in the opaque record value.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageContentBlocks {
+    pub message_id: Uuid,
+    pub blocks: Vec<Value>,
 }
 
 /// An opaque in-process position in a captured transcript snapshot.
@@ -82,6 +95,7 @@ impl Cursor {
 pub struct Record {
     pub sequence: u64,
     pub value: Value,
+    pub content_blocks: Option<Vec<MessageContentBlocks>>,
 }
 #[derive(Debug)]
 pub struct Page {
@@ -137,6 +151,29 @@ impl<'a> Transcript<'a> {
         value: &Value,
         create: bool,
     ) -> Result<(Batch, Cursor), Error> {
+        self.prepare_write_with_blocks(value, None, create)
+    }
+
+    /// Prepare an append carrying lossless ordered block arrays. A nonempty
+    /// collection is required; individual message arrays may be empty.
+    pub fn prepare_append_with_blocks(
+        &self,
+        value: &Value,
+        blocks: Vec<MessageContentBlocks>,
+    ) -> Result<Batch, Error> {
+        self.prepare_write_with_blocks(value, Some(blocks), false)
+            .map(|(batch, _)| batch)
+    }
+
+    fn prepare_write_with_blocks(
+        &self,
+        value: &Value,
+        blocks: Option<Vec<MessageContentBlocks>>,
+        create: bool,
+    ) -> Result<(Batch, Cursor), Error> {
+        if blocks.as_ref().is_some_and(|blocks| !valid_blocks(blocks)) {
+            return Err(Error::Corrupt);
+        }
         let (head, expected) = if create {
             (
                 Head {
@@ -161,11 +198,12 @@ impl<'a> Transcript<'a> {
             sequence,
         };
         let entry = Entry {
-            format: 1,
+            format: if blocks.is_some() { 2 } else { 1 },
             id: tip.id,
             sequence,
             previous: head.tip,
             value: value.clone(),
+            content_blocks: blocks,
         };
         let hk = head_key(self.id);
         let ek = entry_key(tip.id);
@@ -204,14 +242,13 @@ impl<'a> Transcript<'a> {
 
     /// Fork the current head. A simultaneous source append makes this batch
     /// conflict, so the caller can choose the new head explicitly on retry.
+    /// Scans the captured chain and rejects unsupported block-bearing records.
     pub fn prepare_fork(&self, child: Uuid) -> Result<Batch, Error> {
         if child == self.id {
             return Err(Error::SelfFork);
         }
         let (head, version) = self.load_head()?;
-        if let Some(tip) = head.tip {
-            self.load_entry(tip)?;
-        }
+        self.reject_blocks_in_chain(head.tip)?;
         let child_key = head_key(child);
         Ok(Batch {
             checks: vec![
@@ -243,9 +280,7 @@ impl<'a> Transcript<'a> {
         if child == self.id {
             return Err(Error::SelfFork);
         }
-        if let Some(tip) = cursor.next {
-            self.load_entry(tip)?;
-        }
+        self.reject_blocks_in_chain(cursor.next)?;
         let key = head_key(child);
         Ok((
             Batch {
@@ -279,7 +314,21 @@ impl<'a> Transcript<'a> {
 
     /// Read newest-first, returning no more than `limit` records. Pages may
     /// cross any number of fork boundaries without loading an ancestry table.
+    /// Rejects records with blocks; use `read_with_blocks` for lossless access.
     pub fn read(&self, cursor: &Cursor, limit: NonZeroUsize) -> Result<Page, Error> {
+        let page = self.read_with_blocks(cursor, limit)?;
+        if page
+            .records
+            .iter()
+            .any(|record| record.content_blocks.is_some())
+        {
+            return Err(Error::UnsupportedContentBlocks);
+        }
+        Ok(page)
+    }
+
+    /// Read losslessly, including versioned ordered content blocks.
+    pub fn read_with_blocks(&self, cursor: &Cursor, limit: NonZeroUsize) -> Result<Page, Error> {
         if cursor.transcript != self.id {
             return Err(Error::WrongTranscript);
         }
@@ -292,6 +341,7 @@ impl<'a> Transcript<'a> {
             records.push(Record {
                 sequence: entry.sequence,
                 value: entry.value,
+                content_blocks: entry.content_blocks,
             });
         }
         Ok(Page {
@@ -302,6 +352,17 @@ impl<'a> Transcript<'a> {
             },
             has_more: next.is_some(),
         })
+    }
+
+    fn reject_blocks_in_chain(&self, mut link: Option<Link>) -> Result<(), Error> {
+        while let Some(current) = link {
+            let entry = self.load_entry(current)?;
+            if entry.content_blocks.is_some() {
+                return Err(Error::UnsupportedContentBlocks);
+            }
+            link = entry.previous;
+        }
+        Ok(())
     }
 
     fn load_head(&self) -> Result<(Head, u64), Error> {
@@ -315,8 +376,11 @@ impl<'a> Transcript<'a> {
     fn load_entry(&self, link: Link) -> Result<Entry, Error> {
         let stored = self.store.get(&entry_key(link.id))?.ok_or(Error::Corrupt)?;
         let entry: Entry = decode(&stored.value)?;
-        if entry.format != 1
-            || entry.id != link.id
+        if !match (entry.format, entry.content_blocks.as_ref()) {
+            (1, None) => true,
+            (2, Some(blocks)) => valid_blocks(blocks),
+            _ => false,
+        } || entry.id != link.id
             || entry.sequence != link.sequence
             || match entry.previous {
                 None => entry.sequence != 1,
@@ -330,6 +394,14 @@ impl<'a> Transcript<'a> {
         Ok(entry)
     }
 }
+fn valid_blocks(blocks: &[MessageContentBlocks]) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    !blocks.is_empty()
+        && blocks
+            .iter()
+            .all(|block| !block.message_id.is_nil() && ids.insert(block.message_id))
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     Ok(serde_json::to_vec(value)?)
 }
@@ -377,6 +449,145 @@ mod tests {
                 return result;
             }
         }
+    }
+
+    #[test]
+    fn versioned_blocks_survive_append_and_reopen_and_forks_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let blocks = vec![
+            json!({"type":"text","text":"a","textSignature":"opaque"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"after"}),
+        ];
+        let db = Store::open(&path).unwrap();
+        create(&db, id);
+        append(&db, id, json!({"legacy": true}));
+        let transcript = Transcript::new(&db, id);
+        let content = vec![MessageContentBlocks {
+            message_id,
+            blocks: blocks.clone(),
+        }];
+        commit(
+            &db,
+            transcript
+                .prepare_append_with_blocks(&json!({"ids":[message_id]}), content.clone())
+                .unwrap(),
+        );
+        let blocked_snapshot = transcript.snapshot().unwrap();
+        append(&db, id, json!({"later": true}));
+        assert!(matches!(
+            transcript.prepare_fork(Uuid::new_v4()),
+            Err(Error::UnsupportedContentBlocks)
+        ));
+        assert!(matches!(
+            transcript.prepare_fork_at(&blocked_snapshot, Uuid::new_v4()),
+            Err(Error::UnsupportedContentBlocks)
+        ));
+        drop(db);
+
+        let db = Store::open(&path).unwrap();
+        let transcript = Transcript::new(&db, id);
+        let page = transcript
+            .read_with_blocks(
+                &transcript.snapshot().unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(page.records.len(), 3);
+        assert!(page.records[0].content_blocks.is_none());
+        assert_eq!(page.records[1].content_blocks, Some(content));
+        assert_eq!(page.records[2].value, json!({"legacy": true}));
+        assert!(page.records[2].content_blocks.is_none());
+        assert!(matches!(
+            transcript.read(
+                &transcript.snapshot().unwrap(),
+                NonZeroUsize::new(8).unwrap()
+            ),
+            Err(Error::UnsupportedContentBlocks)
+        ));
+    }
+
+    #[test]
+    fn empty_content_array_and_invalid_metadata() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let transcript = Transcript::new(&db, id);
+        assert!(matches!(
+            transcript.prepare_append_with_blocks(&json!(null), vec![]),
+            Err(Error::Corrupt)
+        ));
+        let invalid = MessageContentBlocks {
+            message_id: Uuid::nil(),
+            blocks: vec![],
+        };
+        assert!(matches!(
+            transcript.prepare_append_with_blocks(&json!(null), vec![invalid]),
+            Err(Error::Corrupt)
+        ));
+        let empty = MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![],
+        };
+        assert!(matches!(
+            transcript.prepare_append_with_blocks(&json!(null), vec![empty.clone(), empty.clone()]),
+            Err(Error::Corrupt)
+        ));
+        commit(
+            &db,
+            transcript
+                .prepare_append_with_blocks(&json!(null), vec![empty.clone()])
+                .unwrap(),
+        );
+        let page = transcript
+            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(page.records[0].content_blocks, Some(vec![empty]));
+    }
+    #[test]
+    fn record_version_and_content_must_agree() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        append(&db, id, json!("legacy"));
+        let transcript = Transcript::new(&db, id);
+        let cursor = transcript.snapshot().unwrap();
+        let link = cursor.next.unwrap();
+        let mut entry = transcript.load_entry(link).unwrap();
+        assert_eq!(entry.format, 1);
+        entry.content_blocks = Some(vec![MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![],
+        }]);
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: entry_key(link.id),
+                value: encode(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+        entry.format = 2;
+        entry.content_blocks = None;
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: entry_key(link.id),
+                value: encode(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
     }
 
     #[test]

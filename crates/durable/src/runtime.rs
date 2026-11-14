@@ -9052,6 +9052,115 @@ mod scheduler_tests {
         }
     }
 
+    #[test]
+    fn block_records_reopen_losslessly_and_runtime_boundaries_fail_closed() {
+        use crate::transcript::{MessageContentBlocks, Transcript};
+        use serde_json::json;
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut harness = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        let message_id = Uuid::new_v4();
+        let content = vec![MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"text","text":"signed","textSignature":"opaque"})],
+        }];
+        let store = harness.owner.store();
+        let transcript = Transcript::new(store, id);
+        let change = TranscriptChange::AppendV2 {
+            messages: vec![Message::User {
+                content: "placeholder".into(),
+            }],
+            ids: vec![message_id],
+            commit: 1,
+            origin: id,
+        };
+        let batch = transcript
+            .prepare_append_with_blocks(&serde_json::to_value(change).unwrap(), content.clone())
+            .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        let cursor = transcript.snapshot().unwrap();
+        let key = Harness::key(id);
+        let saved = store.get(&key).unwrap().unwrap();
+        let mut state: serde_json::Value = serde_json::from_slice(&saved.value).unwrap();
+        state["transcript"] = serde_json::to_value(&cursor).unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(saved.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&state).unwrap(),
+                }],
+            )
+            .unwrap();
+        let transcript = Transcript::new(harness.owner.store(), id);
+        let page = transcript
+            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(page.records[0].content_blocks, Some(content));
+        let blocked = |error| {
+            matches!(
+                error,
+                Error::Transcript(crate::transcript::Error::UnsupportedContentBlocks)
+            )
+        };
+        assert!(blocked(harness.conversation(id).unwrap_err()));
+        assert!(blocked(harness.fork(id).unwrap_err()));
+        assert!(blocked(
+            harness.fork_at(id, crate::observer::Cursor(1)).unwrap_err()
+        ));
+        assert!(blocked(
+            harness
+                .fork_at_position(
+                    id,
+                    ViewCursor {
+                        cursor,
+                        remaining: None
+                    }
+                )
+                .unwrap_err()
+        ));
+        assert!(blocked(
+            harness.fork_by_entry_id(id, message_id).unwrap_err()
+        ));
+        assert!(blocked(
+            harness
+                .fork_at_application_entry(id, message_id)
+                .unwrap_err()
+        ));
+        assert!(blocked(harness.request_compaction(id, 1).unwrap_err()));
+        assert!(blocked(
+            harness
+                .request_compaction_with_instructions(id, 1, None)
+                .unwrap_err()
+        ));
+        assert!(blocked(
+            harness.request_manual_compaction(id, 1, None).unwrap_err()
+        ));
+        drop(harness);
+        assert!(matches!(
+            Harness::open_paused(&path, options(model)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let store = durable_store::Store::open(&path).unwrap();
+        let transcript = Transcript::new(&store, id);
+        let page = transcript
+            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(
+            page.records[0].content_blocks.as_ref().unwrap()[0].message_id,
+            message_id
+        );
+    }
+
     #[tokio::test]
     async fn parked_driver_takes_over_after_another_driver_is_cancelled() {
         struct PendingTool(Arc<Semaphore>);
