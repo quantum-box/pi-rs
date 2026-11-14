@@ -569,6 +569,13 @@ changing the record. `blocked_reason` inspects this state without running code;
 `replace_registry` reconsiders blocked work at a scheduling boundary, and reopen
 also retries failures. New submissions must match the registered version.
 
+`Driver::wait_for_task(id, &cancel)` asynchronously returns the persisted task
+when it succeeds, fails, or is cancelled. Unknown IDs return an error. Cancelling
+the token or dropping the future stops only the wait; use `request_abort` to
+abort work. A running driver is required, including after reopening. The wait
+polls storage every 100 ms, so it may lag a terminal commit; unlike upstream's
+registered notifications, it also polls for driver shutdown and failure.
+
 Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal tasks,
 including their IDs, kinds, owners and current reasons; `blocked_reason` also
 inspects an individual record. The background driver's `replace_registry` waits

@@ -23,6 +23,10 @@ pub enum Error {
     Poisoned,
     #[error("task driver stopped: {0}")]
     Stopped(String),
+    #[error("task {0} does not exist")]
+    UnknownTask(Uuid),
+    #[error("task wait cancelled")]
+    WaitCancelled,
     #[error("conversation runtime: {0}")]
     Runtime(#[from] crate::runtime::Error),
 }
@@ -269,6 +273,29 @@ impl Driver {
             .load(id)
             .map_err(task_scheduler::Error::from)?
             .map(|snapshot| snapshot.task))
+    }
+    /// Wait for a persisted terminal task. Cancelling or dropping this future
+    /// stops only the wait, not the task. The driver must remain running.
+    /// Live records are polled at most every 100 ms, including after reopen.
+    pub async fn wait_for_task(
+        &self,
+        id: Uuid,
+        cancel: &pi_rs_core::CancellationToken,
+    ) -> Result<Task, Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            let task = self.get(id)?.ok_or(Error::UnknownTask(id))?;
+            if task.is_terminal() {
+                return Ok(task);
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
     }
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.stop();

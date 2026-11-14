@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
-use pi_rs_core::{Error, Model, ModelEvent, ModelRequest, ModelStream};
+use pi_rs_core::{CancellationToken, Error, Model, ModelEvent, ModelRequest, ModelStream};
 use pi_rs_durable::{
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler},
@@ -68,30 +68,165 @@ async fn generic_tasks_run_under_the_same_owner_and_survive_reopen() {
         .unwrap()
         .registered("test".into(), true);
         driver.submit(&task).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    driver.get(id).unwrap().unwrap().state(),
-                    TaskState::Succeeded(_)
-                ) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.wait_for_task(id, &CancellationToken::new()),
+        )
         .await
+        .unwrap()
         .unwrap();
+        assert_eq!(settled.state(), &TaskState::Succeeded(json!("finished")));
         driver.shutdown().unwrap();
         s.shutdown().await.unwrap();
     }
     let s = Scheduler::open(&path, options()).unwrap();
     let driver = s.start_tasks(registry()).unwrap();
-    assert!(matches!(
-        driver.get(id).unwrap().unwrap().state(),
-        TaskState::Succeeded(_)
-    ));
+    assert_eq!(
+        driver
+            .wait_for_task(id, &CancellationToken::new())
+            .await
+            .unwrap()
+            .state(),
+        &TaskState::Succeeded(json!("finished"))
+    );
     driver.shutdown().unwrap();
     s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn wait_cancellation_and_completion_races_do_not_abort_work() {
+    use pi_rs_durable::task_driver::Error as DriverError;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let conversation = s
+        .create_conversation(Config {
+            model: "m".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let mut registry = Registry::default();
+    registry.register("gated", true, move |_: &Task| {
+        started_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!(42)))
+    });
+    let driver = s.start_tasks(registry).unwrap();
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(conversation),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("gated".into(), true);
+    driver.submit(&task).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        driver
+            .wait_for_task(Uuid::new_v4(), &CancellationToken::new())
+            .await,
+        Err(DriverError::UnknownTask(_))
+    ));
+    {
+        let cancel = CancellationToken::new();
+        let wait = driver.wait_for_task(id, &cancel);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        assert!(matches!(wait.await, Err(DriverError::WaitCancelled)));
+    }
+    assert!(!driver.get(id).unwrap().unwrap().abort_requested());
+    let token = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        async {
+            release_tx.send(()).unwrap();
+            driver.wait_for_task(id, &token).await
+        },
+        driver.wait_for_task(id, &token)
+    );
+    assert_eq!(a.unwrap().state(), &TaskState::Succeeded(json!(42)));
+    assert_eq!(b.unwrap().state(), &TaskState::Succeeded(json!(42)));
+    driver.shutdown().unwrap();
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn wait_for_preexisting_live_task_after_reopen() {
+    use pi_rs_durable::{task_driver::Driver, task_scheduler};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("test".into(), true);
+    let scheduler = task_scheduler::Scheduler::open(&path, registry()).unwrap();
+    scheduler.submit(&task).unwrap();
+    drop(scheduler);
+    let scheduler = task_scheduler::Scheduler::open(&path, registry()).unwrap();
+    let driver = Driver::start(scheduler);
+    let settled = tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.wait_for_task(id, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(settled.state(), &TaskState::Succeeded(json!("finished")));
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn wait_returns_failed_task_outcome() {
+    use pi_rs_durable::{task_driver::Driver, task_scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("fail".into(), true);
+    let mut registry = Registry::default();
+    registry.register("fail", true, |_: &Task| Ok(Step::Fail("expected".into())));
+    let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    let driver = Driver::start(scheduler);
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        driver.wait_for_task(id, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(settled.state(), &TaskState::Failed("expected".into()));
+    driver.shutdown().unwrap();
 }
 
 #[tokio::test]
