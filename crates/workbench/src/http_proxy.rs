@@ -406,35 +406,47 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let mut headers = String::new();
             loop {
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
+                headers.push_str(&line);
             }
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-            first
+            (first, headers)
         });
         let client = reqwest::Client::builder()
             .no_proxy()
             .proxy(reqwest::Proxy::custom(|_| None::<String>))
-            .proxy(reqwest::Proxy::all(format!("http://user:pass@{address}")).unwrap())
+            .proxy(
+                reqwest::Proxy::all(format!("http://{address}"))
+                    .unwrap()
+                    .basic_auth("user", "pass"),
+            )
             .build()
             .unwrap();
-        let _ = timeout(
+        let response = timeout(
             Duration::from_secs(5),
             client.get("http://origin.invalid/test").send(),
         )
         .await;
-        let first = server.await.unwrap();
+        let (first, headers) = server.await.unwrap();
         assert!(
             first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
             "{first}"
         );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+        assert!(response.unwrap().unwrap().status().is_success());
     }
 
     #[tokio::test]
@@ -455,35 +467,47 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let mut headers = String::new();
             loop {
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
+                headers.push_str(&line);
             }
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-            first
+            (first, headers)
         });
         let client = reqwest_mcp::Client::builder()
             .no_proxy()
             .proxy(reqwest_mcp::Proxy::custom(|_| None::<String>))
-            .proxy(reqwest_mcp::Proxy::all(format!("http://user:pass@{address}")).unwrap())
+            .proxy(
+                reqwest_mcp::Proxy::all(format!("http://{address}"))
+                    .unwrap()
+                    .basic_auth("user", "pass"),
+            )
             .build()
             .unwrap();
-        let _ = timeout(
+        let response = timeout(
             Duration::from_secs(5),
             client.get("http://origin.invalid/test").send(),
         )
         .await;
-        let first = server.await.unwrap();
+        let (first, headers) = server.await.unwrap();
         assert!(
             first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
             "{first}"
         );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpwyxnz")
+        );
+        assert!(response.unwrap().unwrap().status().is_success());
     }
 
     #[tokio::test]

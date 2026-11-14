@@ -59,6 +59,16 @@ design: it changes resolver observations and can leak proxy credentials.
   ensure no unbounded background tasks and no replay of request bodies.
 * Model loopback and MCP transport fixtures, followed by cross-platform CI.
 
+Independent review found that forcing every authenticated proxy to tunnel when
+any dynamic rule exists also changes a nonmatching dynamic rule followed by a
+static authenticated forward-only proxy. Two active loopback regressions cover
+this and currently fail. The request-header and connector paths invoke the
+callback independently; preserving both dynamic changes and forward-proxy
+semantics requires a single request-scoped routing decision that survives
+redirects, concurrent requests and connection reuse. A client-wide per-host
+cache is insufficient because it changes callback semantics and can grow or
+become stale. No compatible solution has been implemented yet.
+
 The prototype is pending public CI and independent review. The two reqwest
 sources retain their MIT and Apache-2.0 license files. Vendoring is a temporary
 maintenance burden: every security update and dependency upgrade must rebase
