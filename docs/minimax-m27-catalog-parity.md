@@ -3,7 +3,11 @@
 Pinned Pi v1.5.0 (`f9a26365568127461c47a07a37dcb42c140a3ac5`) lists
 MiniMax-M2.7 and MiniMax-M2.7-highspeed for both direct MiniMax regions. Pi's
 Anthropic Messages adapter selects budgeted `thinking.type: enabled` for these
-entries because they do not opt into adaptive thinking.
+entries when thinking is enabled, because they do not opt into adaptive thinking.
+The simple API sends `thinking.type: disabled` when reasoning is off; a lower-level
+caller that leaves thinking unspecified omits the field. See the pinned
+[adapter](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/ai/src/api/anthropic-messages.ts)
+and [MiniMax catalog rules](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/ai/catalog/providers/minimax.ts).
 
 The current [China Messages API reference](https://platform.minimax.cn/docs/api-reference/text-chat-anthropic)
 lists M3 and M3.1 Flash, describes adaptive thinking for those models, and does
