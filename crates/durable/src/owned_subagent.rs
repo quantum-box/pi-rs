@@ -1,5 +1,4 @@
-//! Opt-in task-owned subagent admission. This only persists ownership; it does
-//! not schedule work. Harness abort traversal follows foreground ownership edges.
+//! Opt-in task-owned subagent admission. Harness abort traversal follows foreground edges.
 use crate::{
     ownership_edge::{self, Edge, Mode},
     runtime::{Config, Conversation, Error, Harness, Scheduler},
@@ -19,6 +18,15 @@ pub struct Admission {
     pub child: Uuid,
     pub config: Config,
     pub mode: Mode,
+    /// Initial submission, if this reservation was created with input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<InitialSubmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitialSubmission {
+    pub id: Uuid,
+    pub content: String,
 }
 
 fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
@@ -49,6 +57,36 @@ impl Harness {
         config: Config,
         mode: Mode,
     ) -> Result<Admission, Error> {
+        self.admit_task_owned_subagent(task, owner, name, config, mode, None)
+    }
+
+    /// Atomically reserve a child and admit its first input. The key permanently
+    /// binds the input as well as the owner, configuration and ownership mode.
+    /// A storage error has an uncertain outcome; reopen before retrying.
+    pub fn submit_task_owned_subagent(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        content: String,
+    ) -> Result<Admission, Error> {
+        if content.trim().is_empty() {
+            return Err(invalid());
+        }
+        self.admit_task_owned_subagent(task, owner, name, config, mode, Some(content))
+    }
+
+    fn admit_task_owned_subagent(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        content: Option<String>,
+    ) -> Result<Admission, Error> {
         if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
             return Err(invalid());
         }
@@ -62,6 +100,7 @@ impl Harness {
                     || a.key != name
                     || a.config != config
                     || a.mode != mode
+                    || a.submission.as_ref().map(|s| &s.content) != content.as_ref()
                     || a.task_owner == TaskOwner::Conversation(a.child)
                 {
                     return Err(invalid());
@@ -109,6 +148,10 @@ impl Harness {
                 child,
                 config: config.clone(),
                 mode,
+                submission: content.as_ref().map(|content| InitialSubmission {
+                    id: Uuid::new_v4(),
+                    content: content.clone(),
+                }),
             };
             let edge = Edge {
                 task,
@@ -116,8 +159,12 @@ impl Harness {
                 child,
                 mode,
             };
-            let ck = child_key(child);
             let ek = ownership_edge::edge_key(child);
+            let mut child_state = Harness::empty_conversation(child, config.clone());
+            if let Some(initial) = &a.submission {
+                child_state.admit_initial_input(initial.id, initial.content.clone());
+            }
+            let mut prepared = self.prepare_save(&child_state, Expected::Missing)?;
             let checks = [
                 Check {
                     key: tk.clone(),
@@ -125,10 +172,6 @@ impl Harness {
                 },
                 Check {
                     key: key.clone(),
-                    expected: Expected::Missing,
-                },
-                Check {
-                    key: ck.clone(),
                     expected: Expected::Missing,
                 },
                 Check {
@@ -146,15 +189,13 @@ impl Harness {
                     value: serde_json::to_vec(&a)?,
                 },
                 Mutation::Put {
-                    key: ck,
-                    value: serde_json::to_vec(&Harness::empty_conversation(child, config.clone()))?,
-                },
-                Mutation::Put {
                     key: ek,
                     value: serde_json::to_vec(&edge)?,
                 },
             ];
-            match store.commit(&checks, &mutations) {
+            prepared.checks.extend(checks);
+            prepared.mutations.extend(mutations);
+            match store.commit(&prepared.checks, &prepared.mutations) {
                 Ok(()) => return Ok(a),
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => {
@@ -166,6 +207,24 @@ impl Harness {
     }
 }
 impl Scheduler {
+    /// Commit ownership and initial input before scheduling the child. Reopening
+    /// also schedules committed children if the process stops before scheduling.
+    pub fn submit_task_owned_subagent(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        mode: Mode,
+        content: String,
+    ) -> Result<Admission, Error> {
+        let admission = self
+            .subagent_harness()
+            .submit_task_owned_subagent(task, owner, name, config, mode, content)?;
+        self.schedule(admission.child);
+        Ok(admission)
+    }
+
     /// Reserve an owned child without scheduling it.
     pub fn ensure_task_owned_subagent(
         &mut self,
@@ -235,6 +294,196 @@ mod tests {
             .unwrap();
         (task.id(), owner)
     }
+    #[test]
+    fn submitted_child_is_atomic_idempotent_and_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let mut worker = h.worker();
+                let owner = owner.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    worker
+                        .submit_task_owned_subagent(
+                            task,
+                            owner,
+                            "job",
+                            config(),
+                            Mode::Foreground,
+                            "hello".into(),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(results.iter().all(|a| a == &results[0]));
+        let a = &results[0];
+        let child = h.conversation(a.child).unwrap();
+        assert_eq!(child.submissions.len(), 1);
+        assert_eq!(child.submissions[0].id, a.submission.as_ref().unwrap().id);
+        assert_eq!(child.submissions[0].content, "hello");
+        let history = h
+            .history(
+                a.child,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(history.records.len(), 1);
+        assert!(history.records[0].value.to_string().contains("hello"));
+        assert_eq!(
+            EdgeStore::new(h.subagent_store().unwrap())
+                .children(task)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            h.submit_task_owned_subagent(
+                task,
+                owner.clone(),
+                "job",
+                config(),
+                Mode::Foreground,
+                "changed".into()
+            )
+            .is_err()
+        );
+        assert!(
+            h.ensure_task_owned_subagent(task, owner.clone(), "job", config(), Mode::Foreground)
+                .is_err()
+        );
+        h.request_abort_task(task).unwrap();
+        assert!(h.conversation(a.child).unwrap().abort_requested);
+        assert!(
+            h.submit_task_owned_subagent(
+                task,
+                owner.clone(),
+                "other",
+                config(),
+                Mode::Foreground,
+                "hello".into()
+            )
+            .is_err()
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.submit_task_owned_subagent(
+                task,
+                owner,
+                "job",
+                config(),
+                Mode::Foreground,
+                "hello".into()
+            )
+            .unwrap(),
+            *a
+        );
+    }
+
+    #[test]
+    fn submission_races_parent_abort_without_stranding_foreground_child() {
+        for _ in 0..30 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            let barrier = Arc::new(Barrier::new(2));
+            let mut worker = h.worker();
+            let b = barrier.clone();
+            let admission = std::thread::spawn(move || {
+                b.wait();
+                worker.submit_task_owned_subagent(
+                    task,
+                    owner,
+                    "job",
+                    config(),
+                    Mode::Foreground,
+                    "hello".into(),
+                )
+            });
+            barrier.wait();
+            h.request_abort_task(task).unwrap();
+            if let Ok(a) = admission.join().unwrap() {
+                let child = h.conversation(a.child).unwrap();
+                assert!(child.abort_requested);
+                assert_eq!(child.submissions.len(), 1);
+            } else {
+                assert!(
+                    EdgeStore::new(h.subagent_store().unwrap())
+                        .children(task)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submitted_children_schedule_and_recover_across_background_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Pending(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for Pending {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let fg = h
+            .submit_task_owned_subagent(
+                task,
+                owner.clone(),
+                "fg",
+                config(),
+                Mode::Foreground,
+                "recover".into(),
+            )
+            .unwrap();
+        drop(h); // committed, before any scheduler was started
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(Pending(started.clone()));
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let bg = scheduler
+            .submit_task_owned_subagent(
+                task,
+                owner,
+                "bg",
+                config(),
+                Mode::Background,
+                "background".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.abort_task(task).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(fg.child))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            scheduler.conversation(bg.child).unwrap().submissions[0].status,
+            crate::runtime::Status::Running
+        ));
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[test]
     fn duplicate_admission_and_reopen() {
         let dir = tempfile::tempdir().unwrap();

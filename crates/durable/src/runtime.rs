@@ -413,6 +413,19 @@ pub struct ToolAttempt {
 }
 
 impl Conversation {
+    pub(crate) fn admit_initial_input(&mut self, id: Uuid, content: String) {
+        self.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id,
+            request_id: None,
+            content: content.clone(),
+            status: Status::Running,
+        });
+        self.input_modes.insert(id, InputMode::FollowUp);
+        self.active = Some(id);
+        self.messages.push(Message::User { content });
+        self.phase = Phase::ModelReady { turns: 0 };
+    }
     pub(crate) fn is_working(&self) -> bool {
         self.active.is_some()
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
@@ -624,8 +637,8 @@ pub struct Harness {
 /// Prepared checks can become stale; a conflict requires preparing the entire batch again.
 pub(crate) struct PreparedConversationSave {
     owner: Arc<OwnedStore>,
-    checks: Vec<Check>,
-    mutations: Vec<Mutation>,
+    pub(crate) checks: Vec<Check>,
+    pub(crate) mutations: Vec<Mutation>,
 }
 
 impl PreparedConversationSave {
