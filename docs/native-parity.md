@@ -639,7 +639,9 @@ idle input hooks use that branch's client too. Register clients for historical
 model names with `SessionBuilder::branch_model` or
 `AgentSession::register_branch_model`; an unavailable client is reported
 instead of sending to a different one. Unlike Pi's automatic fallback on
-resume, a host can explicitly call `set_model` to select another client.
+resume, a host can explicitly call `set_model` or `set_model_with_hooks` to
+select another client. The hook-aware form installs the replacement after
+recovery and before startup hooks and any turns they trigger.
 Checkout, tree navigation, and persistent fork validate the destination model
 before tree hooks, changing the journal, or creating a file. Native
 SDK branch registrations are keyed by model name, so hosts must use distinct

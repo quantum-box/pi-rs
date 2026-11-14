@@ -1448,16 +1448,25 @@ impl AgentSession {
         descriptor: serde_json::Value,
         previous_descriptor: Option<serde_json::Value>,
     ) -> Result<()> {
-        self.start().await?;
         let name = name.into();
-        let previous_name = self.model_name.clone();
-        let previous_level = self
-            .session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .model_selection()
-            .and_then(|(_, level)| level)
-            .unwrap_or_else(|| "off".into());
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        let fallback_previous = self
+            .start_with_fallback(Some((model.clone(), name.clone())))
+            .await?;
+        let (previous_name, previous_level) = match fallback_previous {
+            Some(previous) => previous,
+            None => (
+                self.model_name.clone(),
+                self.session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?
+                    .model_selection()
+                    .and_then(|(_, level)| level)
+                    .unwrap_or_else(|| "off".into()),
+            ),
+        };
         self.set_model(model, name.clone())?;
         if previous_level != "off" {
             self.notify_selection_event(crate::LifecycleEvent::ThinkingLevelSelect {
@@ -1656,6 +1665,16 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
+        self.start_with_fallback(None).await.map(|_| ())
+    }
+
+    // Explicit model replacement is available during startup only when the
+    // recovered branch's client is missing. Install it before startup hooks
+    // can trigger work, while retaining the old selection for notifications.
+    async fn start_with_fallback(
+        &mut self,
+        fallback: Option<(Arc<dyn Model>, String)>,
+    ) -> Result<Option<(String, String)>> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
@@ -1668,8 +1687,33 @@ impl AgentSession {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
         }
-        if let Some((model, _)) = journal.model_selection() {
-            self.restore_branch_model(model)?;
+        let mut replaced = None;
+        if let Some((name, level)) = journal.model_selection() {
+            if self.registry.branch_model(self.session_id, &name).is_some() {
+                self.restore_branch_model(name)?;
+            } else if let Some((model, replacement)) = fallback {
+                self.registry.register_session_branch_model(
+                    self.session_id,
+                    replacement.clone(),
+                    model.clone(),
+                )?;
+                let before = journal.records().len();
+                journal.select_model(&replacement, None)?;
+                if journal.records().len() != before {
+                    emit(
+                        self.events.as_ref().expect("open session"),
+                        &Notification::Committed(
+                            journal.records().last().expect("model selection"),
+                        ),
+                    );
+                }
+                self.model = model;
+                self.model_name = replacement;
+                self.refresh_run_config();
+                replaced = Some((name, level.unwrap_or_else(|| "off".into())));
+            } else {
+                self.restore_branch_model(name)?;
+            }
         }
         let startup = self.pending_start.lock().expect("session startup").take();
         if let Some((reason, previous_session_file)) = startup {
@@ -1692,7 +1736,7 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let _ = self.drain_idle_triggers().await?;
-        Ok(())
+        Ok(replaced)
     }
 
     async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
@@ -3036,6 +3080,108 @@ mod tests {
         assert!(
             matches!(&observed[1], crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set } if model["id"] == "second" && previous["id"] == "first")
         );
+    }
+
+    struct ReplacementStartupHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+    #[async_trait::async_trait]
+    impl Extension for ReplacementStartupHook {
+        fn id(&self) -> &str {
+            "replacement-startup"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_model_selection(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(
+                event,
+                crate::LifecycleEvent::SessionStart { .. }
+                    | crate::LifecycleEvent::ThinkingLevelSelect { .. }
+                    | crate::LifecycleEvent::ModelSelect { .. }
+            ) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "startup".into(),
+                        content: crate::ContextContent::Text("start".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::TriggerTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_aware_model_switch_replaces_missing_reopened_model_before_startup_triggers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut original = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .open(&path)
+            .unwrap();
+        original
+            .journal()
+            .unwrap()
+            .select_model("model-A", Some("high"))
+            .unwrap();
+        original.prompt("original").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut reopened = SessionBuilder::new(Arc::new(NamedBranchModel("model-B")), "model-B")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        reopened
+            .set_model_with_hooks(
+                Arc::new(NamedBranchModel("model-B")),
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                Some(serde_json::json!({"id":"model-A", "provider":"fixture"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.model_name(), "model-B");
+        assert_eq!(
+            reopened.journal().unwrap().model_selection(),
+            Some(("model-B".into(), None))
+        );
+        assert!(
+            reopened
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(
+                    &record.event, crate::Event::ModelRequested { model, .. } if model == "model-B"
+                ))
+        );
+        assert_eq!(reopened.prompt("next").await.unwrap(), "model-B");
+        let events = observed.lock().unwrap();
+        assert!(matches!(events.as_slice(), [
+            crate::LifecycleEvent::SessionStart { .. },
+            crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
+            crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
+        ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
+        drop(events);
+        reopened.close().await.unwrap();
     }
 
     struct ForkHook(Arc<std::sync::atomic::AtomicBool>);
