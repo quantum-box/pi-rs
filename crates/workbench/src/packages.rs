@@ -1912,7 +1912,7 @@ mod tests {
             .unwrap();
         writeln!(stream, "{role} {}", std::process::id()).unwrap();
         if role == "parent" {
-            std::process::Command::new(std::env::current_exe().unwrap())
+            let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "packages::tests::package_process_fixture",
@@ -1924,6 +1924,11 @@ mod tests {
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap();
+            // Reap the descendant if it finishes while this parent is alive.
+            // The parent-exits-first case deliberately ends this waiter early.
+            std::thread::spawn(move || {
+                let _ = descendant.wait();
+            });
         }
         let mut byte = [0];
         // The test releases the parent, or closes the connection on cleanup.
