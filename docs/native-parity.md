@@ -670,6 +670,9 @@ only its exact registration, even if a name-only client exists. Older selections
 without a provider use only name-only registrations, so hosts must explicitly
 resolve ambiguous legacy identities. The SDK does not discover credentials or
 endpoints; the host constructs and registers clients under its own policy.
+`set_model_with_hooks` uses the descriptor's provider when present, including
+when replacing an unavailable startup model. Failed journal writes or a busy
+journal do not replace the previously registered client.
 
 Embedded hosts can use `coding_factories::create_coding_tools` and
 `create_read_only_tools` to register Pi's ordered coding or read-only tool sets

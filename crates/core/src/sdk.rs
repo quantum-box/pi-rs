@@ -1495,9 +1495,15 @@ impl AgentSession {
         name: String,
     ) -> Result<()> {
         self.ensure_open()?;
-        if name.trim().is_empty() {
-            return Err(Error::Config("model name is empty".into()));
+        if name.trim().is_empty() || provider.is_some_and(|provider| provider.trim().is_empty()) {
+            return Err(Error::Config("provider or model name is empty".into()));
         }
+        let session = self.session.clone();
+        let mut journal = session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let count = journal.records().len();
+        journal.select_provider_model(provider, &name, None)?;
         if let Some(provider) = provider {
             self.registry.register_session_provider_model(
                 self.session_id,
@@ -1512,25 +1518,10 @@ impl AgentSession {
                 model.clone(),
             )?;
         }
-        let count = self
-            .session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .records()
-            .len();
-        self.session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .select_provider_model(provider, &name, None)?;
-        if count
-            != self
-                .session
-                .try_lock()
-                .map_err(|_| Error::Session("session journal is in use".into()))?
-                .records()
-                .len()
+        if count != journal.records().len()
+            && let (Some(events), Some(record)) = (&self.events, journal.records().last())
         {
-            self.emit_last()?;
+            emit(events, &Notification::Committed(record));
         }
         self.model = model;
         self.model_name = name;
@@ -1552,22 +1543,35 @@ impl AgentSession {
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
-        let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), name.clone())))
-            .await?;
-        let (previous_name, previous_level) = match fallback_previous {
-            Some(previous) => previous,
-            None => (
-                self.model_name.clone(),
-                self.session
-                    .try_lock()
-                    .map_err(|_| Error::Session("session journal is in use".into()))?
-                    .model_selection()
-                    .and_then(|(_, level)| level)
-                    .unwrap_or_else(|| "off".into()),
-            ),
+        let provider = match descriptor.get("provider") {
+            Some(serde_json::Value::String(provider)) if !provider.trim().is_empty() => {
+                Some(provider.clone())
+            }
+            Some(_) => return Err(Error::Config("invalid model provider".into())),
+            None => None,
         };
-        self.set_model(model, name.clone())?;
+        let (fallback_previous, startup_error) = self
+            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())))
+            .await?;
+        let (previous_provider, previous_name, previous_level) = match fallback_previous {
+            Some(previous) => previous,
+            None => {
+                let journal = self
+                    .session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?;
+                let selection = journal.model_identity_at(journal.head());
+                let (previous_provider, previous_level) = selection
+                    .map(|(provider, _, level)| (provider, level))
+                    .unwrap_or_default();
+                (
+                    previous_provider,
+                    self.model_name.clone(),
+                    previous_level.unwrap_or_else(|| "off".into()),
+                )
+            }
+        };
+        self.set_model_identity(model, provider.as_deref(), name.clone())?;
         if previous_level != "off" {
             self.notify_selection_event(crate::LifecycleEvent::ThinkingLevelSelect {
                 level: "off".into(),
@@ -1585,7 +1589,7 @@ impl AgentSession {
                     .zip(descriptor.get("id"))
                     .is_some_and(|(left, right)| left != right)
         });
-        if previous_name != name || descriptor_changed {
+        if previous_name != name || previous_provider != provider || descriptor_changed {
             self.notify_selection_event(crate::LifecycleEvent::ModelSelect {
                 model: descriptor,
                 previous_model: previous_descriptor,
@@ -1783,8 +1787,8 @@ impl AgentSession {
     // can trigger work, while retaining the old selection for notifications.
     async fn start_with_fallback(
         &mut self,
-        fallback: Option<(Arc<dyn Model>, String)>,
-    ) -> Result<(Option<(String, String)>, Option<Error>)> {
+        fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+    ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
@@ -1802,14 +1806,27 @@ impl AgentSession {
             if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some()
             {
                 self.restore_branch_model(provider.as_deref(), name)?;
-            } else if let Some((model, replacement)) = fallback {
-                self.registry.register_session_branch_model(
-                    self.session_id,
-                    replacement.clone(),
-                    model.clone(),
-                )?;
+            } else if let Some((model, replacement_provider, replacement)) = fallback {
                 let before = journal.records().len();
-                journal.select_model(&replacement, None)?;
+                journal.select_provider_model(
+                    replacement_provider.as_deref(),
+                    &replacement,
+                    None,
+                )?;
+                if let Some(provider) = &replacement_provider {
+                    self.registry.register_session_provider_model(
+                        self.session_id,
+                        provider,
+                        &replacement,
+                        model.clone(),
+                    )?;
+                } else {
+                    self.registry.register_session_branch_model(
+                        self.session_id,
+                        replacement.clone(),
+                        model.clone(),
+                    )?;
+                }
                 if journal.records().len() != before {
                     emit(
                         self.events.as_ref().expect("open session"),
@@ -1821,7 +1838,7 @@ impl AgentSession {
                 self.model = model;
                 self.model_name = replacement;
                 self.refresh_run_config();
-                replaced = Some((name, level.unwrap_or_else(|| "off".into())));
+                replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else {
                 self.restore_branch_model(provider.as_deref(), name)?;
             }
@@ -3189,7 +3206,7 @@ mod tests {
             .set_model_with_hooks(
                 Arc::new(WaitingModel),
                 "second",
-                serde_json::json!({"id":"second"}),
+                serde_json::json!({"id":"second", "provider":"fixture"}),
                 None,
             )
             .await
@@ -3282,8 +3299,16 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.model_name(), "model-B");
         assert_eq!(
+            reopened.journal().unwrap().model_provider(),
+            Some("fixture")
+        );
+        assert_eq!(
             reopened.journal().unwrap().model_selection(),
             Some(("model-B".into(), None))
+        );
+        assert_eq!(
+            reopened.journal().unwrap().model_provider(),
+            Some("fixture")
         );
         assert!(
             reopened
@@ -4003,6 +4028,175 @@ mod tests {
         assert_eq!(session.prompt("after registration").await.unwrap(), "right");
         session.close().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn failed_selection_does_not_replace_registered_client() {
+        let old: Arc<dyn Model> = Arc::new(ProviderBranchModel("old"));
+        let new: Arc<dyn Model> = Arc::new(ProviderBranchModel("new"));
+        let mut session = SessionBuilder::new(old.clone(), "shared")
+            .provider("a")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .set_provider_model(old.clone(), "a", "shared")
+            .unwrap();
+        let journal = session.session.clone();
+        let guard = journal.lock().await;
+        assert!(session.set_provider_model(new, "a", "shared").is_err());
+        assert!(Arc::ptr_eq(
+            &branch_client(&session.registry, session.session_id, Some("a"), "shared").unwrap(),
+            &old
+        ));
+        drop(guard);
+        assert_eq!(session.prompt("still old").await.unwrap(), "old");
+        session.close().await.unwrap();
+    }
+
+    struct FailingSelectionStore {
+        inner: crate::MemoryStore,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::SessionStore for FailingSelectionStore {
+        fn load(&mut self) -> Result<Vec<crate::Record>> {
+            crate::SessionStore::load(&mut self.inner)
+        }
+        fn append(&mut self, record: &crate::Record) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Error::Session("fixture write failed".into()));
+            }
+            crate::SessionStore::append(&mut self.inner, record)
+        }
+    }
+
+    #[test]
+    fn failed_journal_write_does_not_replace_registered_client() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let journal = Session::with_store(FailingSelectionStore {
+            inner: crate::MemoryStore::default(),
+            fail: fail.clone(),
+        })
+        .unwrap();
+        let old: Arc<dyn Model> = Arc::new(ProviderBranchModel("old"));
+        let new: Arc<dyn Model> = Arc::new(ProviderBranchModel("new"));
+        let mut session = SessionBuilder::new(old.clone(), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(session.set_provider_model(new, "a", "shared").is_err());
+        assert!(Arc::ptr_eq(
+            &branch_client(&session.registry, session.session_id, Some("a"), "shared").unwrap(),
+            &old
+        ));
+    }
+
+    #[tokio::test]
+    async fn hook_selection_retains_provider_identity_for_identical_model_ids() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let a = Arc::new(ProviderBranchModel("a"));
+        let b = Arc::new(ProviderBranchModel("b"));
+        let mut session = SessionBuilder::new(a.clone(), "shared")
+            .provider("a")
+            .unwrap()
+            .extension(Arc::new(SelectionHook(events.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.set_provider_model(a, "a", "shared").unwrap();
+        let a_head = session.journal().unwrap().head();
+        session
+            .set_model_with_hooks(
+                b,
+                "shared",
+                serde_json::json!({"provider":"b", "id":"shared"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::LifecycleEvent::ModelSelect { .. }))
+        );
+        let b_head = session.journal().unwrap().head();
+        assert_eq!(session.prompt("b").await.unwrap(), "b");
+        session.checkout(a_head).unwrap();
+        assert_eq!(session.prompt("a").await.unwrap(), "a");
+        session.checkout(b_head).unwrap();
+        assert_eq!(session.prompt("b again").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_tree_handoff_from_qualified_to_legacy_uses_legacy_client() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal.select_model("shared", None).unwrap();
+        let id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "tree".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered { id, message })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let session = SessionBuilder::new(Arc::new(ProviderBranchModel("b")), "shared")
+            .provider("b")
+            .unwrap()
+            .branch_model("shared", Arc::new(ProviderBranchModel("legacy")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let agent = Agent {
+            model: session.model.as_ref(),
+            model_name: &session.model_name,
+            registry: &session.registry,
+            system_prompt: &session.system_prompt,
+            limits: session.limits.clone(),
+        };
+        let mut journal = session.session.lock().await;
+        let mut input = session.input.lock().await;
+        let answer = agent
+            .run_correlated(
+                &mut journal,
+                id,
+                None,
+                &mut input,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "legacy");
+        assert_eq!(journal.model_provider(), Some("b"));
+    }
     struct TriggerFromIdleInput;
     #[async_trait::async_trait]
     impl Extension for TriggerFromIdleInput {
@@ -4341,9 +4535,7 @@ mod tests {
         });
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
-        journal
-            .select_provider_model(Some("provider"), "model-A", None)
-            .unwrap();
+        journal.select_model("model-A", None).unwrap();
         journal
             .append(crate::Event::ExtensionStates {
                 states: [(
@@ -4670,6 +4862,8 @@ mod tests {
         let model_b = Arc::new(EchoModel(AtomicUsize::new(0)));
         let model_a = Arc::new(EchoModel(AtomicUsize::new(0)));
         let mut session = SessionBuilder::new(model_b.clone(), "model-B")
+            .provider("provider")
+            .unwrap()
             .build(journal)
             .unwrap();
         assert!(
@@ -4686,7 +4880,7 @@ mod tests {
             Some(run_id)
         );
         session
-            .register_branch_model("model-A", model_a.clone())
+            .register_provider_branch_model("provider", "model-A", model_a.clone())
             .unwrap();
         session.start().await.unwrap();
         assert_eq!(session.journal().unwrap().head(), branch_b);
@@ -4767,6 +4961,8 @@ mod tests {
         let origin = Arc::new(EchoModel(AtomicUsize::new(0)));
         let selected = Arc::new(EchoModel(AtomicUsize::new(0)));
         let mut session = SessionBuilder::new(selected, "selected-model")
+            .provider("selected")
+            .unwrap()
             .build(journal)
             .unwrap();
         session
