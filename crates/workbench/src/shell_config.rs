@@ -19,7 +19,7 @@ const SESSION_ENVIRONMENT: &[&str] = &[
 pub struct ShellConfig {
     path: Option<String>,
     prefix: Option<String>,
-    session: Arc<RwLock<Option<ShellContext>>>,
+    session: Arc<RwLock<Option<ShellSession>>>,
     expose_session_environment: bool,
     spawn_hook: Option<Arc<ShellSpawnHook>>,
     inherit_remote_environment: bool,
@@ -55,6 +55,11 @@ pub struct ShellContext {
     pub reasoning_level: Option<String>,
 }
 
+struct ShellSession {
+    context: ShellContext,
+    external_id: Option<String>,
+}
+
 pub(super) struct Launch {
     pub command: Command,
     pub input: Option<String>,
@@ -71,7 +76,18 @@ impl ShellConfig {
     }
 
     pub fn set_context(&self, context: ShellContext) {
-        *self.session.write().expect("shell session context") = Some(context);
+        *self.session.write().expect("shell session context") = Some(ShellSession {
+            context,
+            external_id: None,
+        });
+    }
+
+    /// Use an externally visible Pi ID while retaining the UUID in SDK context.
+    pub fn set_context_with_external_id(&self, context: ShellContext, external_id: String) {
+        *self.session.write().expect("shell session context") = Some(ShellSession {
+            context,
+            external_id: Some(external_id),
+        });
     }
 
     /// Set a hook for model-invoked shell tools; user `!` commands bypass it.
@@ -191,11 +207,21 @@ impl ShellConfig {
             if local
                 && (local_backend || self.inherit_remote_environment)
                 && self.expose_session_environment
-                && let Some(session) = &*self.session.read().expect("shell session context")
+                && let Some(stored) = &*self.session.read().expect("shell session context")
             {
-                context
-                    .env
-                    .insert("PI_SESSION_ID".into(), session.id.to_string().into());
+                let session = &stored.context;
+                let session_id = stored
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| session.id.to_string());
+                // An imported ID may contain NUL, which cannot be passed to a
+                // child process. Do not fail shell execution or substitute a
+                // different identity in that case.
+                if !session_id.contains('\0') {
+                    context
+                        .env
+                        .insert("PI_SESSION_ID".into(), session_id.into());
+                }
                 context
                     .env
                     .insert("PI_PROVIDER".into(), session.provider.clone().into());
@@ -307,4 +333,58 @@ fn is_legacy_wsl_bash(path: &Path) -> bool {
                     .eq_ignore_ascii_case(root.join(directory).join("bash.exe").as_os_str())
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_session_identity_is_forwarded_safely_and_can_be_reset() {
+        let config = ShellConfig::default();
+        let id = uuid::Uuid::new_v4();
+        let context = || ShellContext {
+            id,
+            path: None,
+            provider: "fixture".into(),
+            model: "model".into(),
+            reasoning_level: None,
+        };
+        let root = Path::new(".");
+        config.set_context_with_external_id(context(), "legacy ID 日本語".into());
+        let spawn = config
+            .spawn_context(root, true, "echo", true, true)
+            .unwrap();
+        assert_eq!(
+            spawn
+                .env
+                .get(std::ffi::OsStr::new("PI_SESSION_ID"))
+                .unwrap(),
+            "legacy ID 日本語"
+        );
+        config.set_context_with_external_id(context(), "bad\0id".into());
+        let spawn = config
+            .spawn_context(root, true, "echo", true, true)
+            .unwrap();
+        assert!(
+            !spawn
+                .env
+                .contains_key(std::ffi::OsStr::new("PI_SESSION_ID"))
+        );
+        assert_eq!(
+            spawn.env.get(std::ffi::OsStr::new("PI_MODEL")).unwrap(),
+            "model"
+        );
+        config.set_context(context());
+        let spawn = config
+            .spawn_context(root, true, "echo", true, true)
+            .unwrap();
+        assert_eq!(
+            spawn
+                .env
+                .get(std::ffi::OsStr::new("PI_SESSION_ID"))
+                .unwrap(),
+            &OsString::from(id.to_string())
+        );
+    }
 }

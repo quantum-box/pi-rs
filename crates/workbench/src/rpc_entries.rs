@@ -10,7 +10,7 @@ const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
 pub(super) fn session_header(session: &Session, cwd: &std::path::Path) -> Value {
     json!({
-        "type":"session", "version":3, "id":session.session_id(),
+        "type":"session", "version":3, "id":session.external_session_id(),
         "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
         "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
     })
@@ -880,6 +880,36 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn share_header_preserves_imported_external_id_and_fork_identity() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let identity = "ID / 日本語\r\nlegacy";
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session", "version":3, "id":identity})
+            ),
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let body = Entries::new(&session)
+            .write_share_branch(&session, dir.path())
+            .unwrap();
+        let first = body.split(|byte| *byte == b'\n').next().unwrap();
+        let header: Value = serde_json::from_slice(first).unwrap();
+        assert_eq!(header["id"], identity);
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        let body = Entries::new(&fork)
+            .write_share_branch(&fork, dir.path())
+            .unwrap();
+        let header: Value =
+            serde_json::from_slice(body.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["id"], fork.session_id().to_string());
+    }
+
     #[test]
     fn branch_fallback_projects_selection_and_summary() {
         use super::*;
