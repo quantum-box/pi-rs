@@ -1622,3 +1622,263 @@ async fn gate_deadline_and_early_signal_survive_restart() {
         ));
     }
 }
+
+struct TerminateRoundHook {
+    after_run: Arc<Mutex<Vec<Value>>>,
+}
+#[async_trait]
+impl Hook for TerminateRoundHook {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent, HookTask};
+        match event {
+            GenerationEvent::AfterTools => Ok(GenerationDecision::Tasks(vec![HookTask {
+                name: "decision".into(),
+                input: json!(null),
+            }])),
+            GenerationEvent::AfterRun => {
+                self.after_run.lock().unwrap().push(ctx.snapshot.clone());
+                Ok(GenerationDecision::Pass)
+            }
+            _ => Ok(GenerationDecision::Pass),
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_tools_termination_settles_before_after_run_and_recovers_queued_inputs() {
+    use pi_rs_durable::{
+        state::InputMode,
+        task::{Checkpoint, Task, TaskState, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_store::Signal,
+    };
+    for (decision, terminates) in [
+        (json!({"terminate": true}), true),
+        (json!({"terminate": true, "extra": 1}), false),
+        (json!({"terminate": false}), false),
+        (json!(null), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(FakeModel::default());
+        let tool = Arc::new(FakeTool::default());
+        let after_run = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+            if task.delivered_signal().is_some() {
+                Ok(Step::Succeed(decision.clone()))
+            } else {
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "waiting".into(),
+                        data: json!(null),
+                    },
+                    condition: WaitFor::Signal("go".into()),
+                    children: vec![],
+                })
+            }
+        });
+        let install = |h: &Harness| {
+            h.install_extension(Extension {
+                name: "decision".into(),
+                hooks: vec![Arc::new(TerminateRoundHook {
+                    after_run: after_run.clone(),
+                })],
+                tasks: vec![("decision".into(), handler.clone())],
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let registry = || {
+            let mut registry = Registry::default();
+            registry.register_shared("decision", true, handler.clone());
+            registry
+        };
+        let id;
+        let child;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+            install(&h);
+            let driver = h.start_tasks(registry()).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["decision".into()]).unwrap();
+            h.submit_and_run(id, None, "first".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+            child = state["phase"]["HookTasksWaiting"]["children"][0]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            h.submit_with_mode(id, None, "queued steer".into(), InputMode::Steer)
+                .unwrap();
+            h.submit(id, None, "queued followup".into()).unwrap();
+            driver.shutdown().unwrap();
+        }
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+            install(&h);
+            let driver = h.start_tasks(registry()).unwrap();
+            for _ in 0..200 {
+                if matches!(
+                    driver.get(child).unwrap().unwrap().state(),
+                    TaskState::Waiting(_)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            driver
+                .signal(&Signal::new(
+                    Uuid::new_v4(),
+                    child,
+                    "go".into(),
+                    json!(null),
+                ))
+                .unwrap();
+            for _ in 0..200 {
+                if driver.get(child).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(driver.get(child).unwrap().unwrap().is_terminal());
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            assert!(
+                c.submissions
+                    .iter()
+                    .all(|s| matches!(s.status, Status::Done { .. }))
+            );
+            let expected = if terminates { "tool answer" } else { "done" };
+            assert!(
+                matches!(&c.submissions[0].status, Status::Done { answer } if answer == expected)
+            );
+            let snapshots = after_run.lock().unwrap();
+            if terminates {
+                assert_eq!(snapshots.len(), 2);
+                let first = &snapshots[0];
+                assert!(first["submissions"][0]["status"]["Done"].is_object());
+                assert_eq!(first["submissions"][1]["status"], "Queued");
+                assert_eq!(first["submissions"][2]["status"], "Queued");
+                assert_eq!(model.0.lock().unwrap().len(), 2);
+            } else {
+                assert!(!snapshots.is_empty());
+            }
+            assert_eq!(tool.0.lock().unwrap().len(), 1);
+            driver.shutdown().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminate_crash_worker() {
+    use pi_rs_durable::task::Task;
+    use pi_rs_durable::task_scheduler::{Handler, Registry, Step};
+    let Ok(path) = std::env::var("PI_TERMINATE_CRASH_DB") else {
+        return;
+    };
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!({"terminate": true}))));
+    let mut h = Harness::open_paused(
+        &path,
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    h.install_extension(Extension {
+        name: "decision".into(),
+        hooks: vec![Arc::new(TerminateRoundHook {
+            after_run: Arc::default(),
+        })],
+        tasks: vec![("decision".into(), handler.clone())],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("decision", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["decision".into()]).unwrap();
+    h.submit_and_run(id, None, "first".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+    let child = state["phase"]["HookTasksWaiting"]["children"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    for _ in 0..500 {
+        if driver.get(child).unwrap().unwrap().is_terminal() {
+            std::fs::write(format!("{path}.ready"), id.to_string()).unwrap();
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("child did not finish");
+}
+
+#[tokio::test]
+async fn after_tools_termination_recovers_after_process_kill() {
+    use pi_rs_durable::task::Task;
+    use pi_rs_durable::task_scheduler::{Handler, Registry, Step};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "terminate_crash_worker"])
+        .env("PI_TERMINATE_CRASH_DB", &path)
+        .spawn()
+        .unwrap();
+    let ready = format!("{}.ready", path.display());
+    for _ in 0..500 {
+        if std::path::Path::new(&ready).exists() {
+            break;
+        }
+        assert!(
+            worker.try_wait().unwrap().is_none(),
+            "worker exited before barrier"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let id = std::fs::read_to_string(ready).unwrap().parse().unwrap();
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!({"terminate": true}))));
+    let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+    h.install_extension(Extension {
+        name: "decision".into(),
+        hooks: vec![Arc::new(TerminateRoundHook {
+            after_run: events.clone(),
+        })],
+        tasks: vec![("decision".into(), handler.clone())],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("decision", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&h.conversation(id).unwrap().submissions[0].status, Status::Done { answer } if answer == "tool answer")
+    );
+    assert_eq!(events.lock().unwrap().len(), 1);
+    assert!(model.0.lock().unwrap().is_empty());
+    assert!(tool.0.lock().unwrap().is_empty());
+    driver.shutdown().unwrap();
+}

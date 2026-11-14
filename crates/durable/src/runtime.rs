@@ -2677,6 +2677,7 @@ impl Harness {
                 }
                 Phase::HookTasksWaiting { children, turns } => {
                     let store = crate::task_store::TaskStore::new(self.owner.store());
+                    let mut terminate = false;
                     for id in children {
                         let task = store
                             .load(id)
@@ -2689,11 +2690,37 @@ impl Harness {
                         if !task.is_terminal() {
                             return Ok(());
                         }
+                        if turns.is_some()
+                            && matches!(task.state(), crate::task::TaskState::Succeeded(value)
+                                if value.as_object().is_some_and(|object|
+                                    object.len() == 1 && object.get("terminate") == Some(&serde_json::Value::Bool(true))))
+                        {
+                            terminate = true;
+                        }
                     }
-                    c.phase = turns.map_or(Phase::Idle, |turns| Phase::Boundary {
-                        turns,
-                        answer: None,
-                    });
+                    c.phase = if terminate {
+                        let answer = c
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|message| match message {
+                                Message::Assistant { content, calls, .. } if !calls.is_empty() => {
+                                    Some(content.clone())
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| Error::Invalid("missing tool-calling answer".into()))?;
+                        finish_answer(&mut c, answer.clone());
+                        Phase::AfterRun {
+                            answer,
+                            operation_id: Uuid::new_v4(),
+                        }
+                    } else {
+                        turns.map_or(Phase::Idle, |turns| Phase::Boundary {
+                            turns,
+                            answer: None,
+                        })
+                    };
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Tools {
