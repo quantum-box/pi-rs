@@ -920,8 +920,11 @@ Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
 loading. Prompt templates accept Pi string `argument-hint` frontmatter; native multi-match
 completion displays the hint before the description and inserts only the command
-name. Native completion still opens on explicit Tab and inserts a sole match
-directly, rather than reproducing Pi's continuously displayed autocomplete.
+name. Built-in candidates take precedence over same-named templates. Completion
+descriptions use Pi's single-line normalization, selected and muted theme roles,
+and narrow-width visibility. Native completion still opens on explicit Tab and
+inserts a sole match directly, rather than reproducing Pi's continuously displayed
+autocomplete.
 Declared `SKILL.md` files with missing descriptions report both the
 description problem and any invalid name diagnostics; unreadable skill files
 also report their source path. Empty-description checks use ECMAScript whitespace

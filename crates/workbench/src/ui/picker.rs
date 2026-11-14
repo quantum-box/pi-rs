@@ -20,6 +20,7 @@ pub enum Selection {
     Completion {
         range: std::ops::Range<usize>,
         text: String,
+        description: Option<String>,
     },
     LoginProvider(super::super::Provider),
     BedrockBearer,
@@ -208,17 +209,18 @@ impl Picker {
         }
     }
     pub fn completion(
-        candidates: Vec<(String, String)>,
+        candidates: Vec<(String, Option<String>)>,
         range: std::ops::Range<usize>,
         limit: usize,
     ) -> Self {
         let items = candidates
             .into_iter()
-            .map(|(text, label)| Item {
-                label,
+            .map(|(text, description)| Item {
+                label: text.clone(),
                 selection: Selection::Completion {
                     range: range.clone(),
                     text,
+                    description,
                 },
             })
             .collect();
@@ -1158,6 +1160,12 @@ impl Picker {
         } else {
             0
         };
+        let completion_column = items
+            .iter()
+            .map(|item| item.label.width() + 2)
+            .max()
+            .unwrap_or(12)
+            .clamp(12, 32);
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             if let (Some(tree), Some(layout), Selection::Checkout(id)) =
                 (&self.tree, &tree_layout, &item.selection)
@@ -1220,6 +1228,48 @@ impl Picker {
                     theme,
                     width,
                 ));
+                continue;
+            }
+            if let Selection::Completion {
+                text, description, ..
+            } = &item.selection
+            {
+                let selected = index == self.selected;
+                let role = if selected { "accent" } else { "text" };
+                let prefix = if selected { "› " } else { "  " };
+                let mut spans = vec![super::render::Span::themed(prefix, theme, role)];
+                let normalized = description.as_deref().map(normalize_completion_description);
+                let column = completion_column.min(width.saturating_sub(6)).max(1);
+                let primary = clip_completion(text, column.saturating_sub(2).max(1));
+                let spacing = column.saturating_sub(primary.width()).max(1);
+                let remaining = width.saturating_sub(2 + primary.width() + spacing + 2);
+                if width > 40
+                    && remaining > 10
+                    && normalized.as_ref().is_some_and(|s| !s.is_empty())
+                {
+                    spans.push(super::render::Span::themed(primary, theme, role));
+                    let desc = format!(
+                        "{}{}",
+                        " ".repeat(spacing),
+                        clip_completion(normalized.as_deref().unwrap_or_default(), remaining)
+                    );
+                    spans.push(super::render::Span::themed(
+                        desc,
+                        theme,
+                        if selected { "accent" } else { "muted" },
+                    ));
+                } else {
+                    spans.push(super::render::Span::themed(
+                        clip_completion(text, width.saturating_sub(4)),
+                        theme,
+                        role,
+                    ));
+                }
+                lines.push(Line {
+                    spans,
+                    background: selected.then(|| theme.color("selectedBg")),
+                    image: None,
+                });
                 continue;
             }
             let mut line = Line::themed(
@@ -1780,6 +1830,39 @@ fn short_path(path: &std::path::Path) -> String {
     }
     path.display().to_string()
 }
+fn normalize_completion_description(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_newline = false;
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            if !in_newline {
+                result.push(' ');
+            }
+            in_newline = true;
+        } else {
+            result.push(ch);
+            in_newline = false;
+        }
+    }
+    result
+        .trim_matches(|ch: char| (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}')
+        .to_owned()
+}
+
+fn clip_completion(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let next = grapheme.width();
+        if used + next > width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += next;
+    }
+    result
+}
+
 fn truncate(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.into();
@@ -1802,11 +1885,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completion_description_follows_pi_width_and_theme_rules() {
+        let picker = Picker::completion(
+            vec![
+                ("/audit".into(), Some("  <file>\r\n\n[focus]  ".into())),
+                (
+                    "/author".into(),
+                    Some("second description that is long enough".into()),
+                ),
+            ],
+            0..3,
+            10,
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let wide = picker.render(&theme, 80, 10, &keys);
+        let selected = &wide[1];
+        assert!(selected.spans.iter().any(
+            |span| span.text.contains("<file> [focus]") && span.color == theme.color("accent")
+        ));
+        let other = &wide[2];
+        assert!(
+            other
+                .spans
+                .iter()
+                .any(|span| span.text.contains("second description")
+                    && span.color == theme.color("muted"))
+        );
+        assert!(
+            selected
+                .spans
+                .iter()
+                .all(|span| !span.text.contains(['\r', '\n']))
+        );
+        let narrow = picker.render(&theme, 40, 10, &keys);
+        for line in &narrow[1..3] {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert!(!text.contains("file") && !text.contains("description"));
+            assert!(text.width() <= 40);
+        }
+        let clipped = picker.render(&theme, 43, 10, &keys);
+        assert!(
+            clipped[2]
+                .spans
+                .iter()
+                .map(|span| span.text.width())
+                .sum::<usize>()
+                <= 43
+        );
+        assert_eq!(
+            normalize_completion_description("\u{feff}a\r\n\nb\u{feff}"),
+            "a b"
+        );
+    }
+
+    #[test]
     fn completion_search_matches_inserted_text_not_description() {
         let mut picker = Picker::completion(
             vec![
-                ("/audit".into(), "/audit  <path> — Inspect changes".into()),
-                ("/author".into(), "/author".into()),
+                ("/audit".into(), Some("<path> — Inspect changes".into())),
+                ("/author".into(), None),
             ],
             0..3,
             10,
