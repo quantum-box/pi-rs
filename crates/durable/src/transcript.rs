@@ -434,11 +434,12 @@ fn valid_block_bindings(value: &Value, blocks: &[MessageContentBlocks]) -> bool 
     let mut seen = std::collections::HashSet::new();
     blocks.iter().all(|block| {
         seen.insert(block.message_id)
+            && crate::content::UserContent::from_yield(Value::Array(block.blocks.clone()), false)
+                .is_some()
             && occurrences.get(&block.message_id).is_some_and(|message| {
-                matches!(
-                    message.get("role").and_then(Value::as_str),
-                    Some("user" | "user_with_images")
-                )
+                message.get("role").and_then(Value::as_str) == Some("user")
+                    && message.get("content").and_then(Value::as_str) == Some("")
+                    && message.as_object().is_some_and(|object| object.len() == 2)
             })
     })
 }
@@ -514,7 +515,7 @@ mod tests {
         commit(
             &db,
             transcript
-                .prepare_append_with_blocks(&json!({"AppendV2":{"ids":[message_id],"messages":[{"role":"user","content":"placeholder"}]}}), content.clone())
+                .prepare_append_with_blocks(&json!({"AppendV2":{"ids":[message_id],"messages":[{"role":"user","content":""}]}}), content.clone())
                 .unwrap(),
         );
         let blocked_snapshot = transcript.snapshot().unwrap();
@@ -623,6 +624,74 @@ mod tests {
         let link = cursor.next.unwrap();
         let mut entry = transcript.load_entry(link).unwrap();
         entry.value["AppendV2"]["ids"][0] = json!(other_id);
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: entry_key(link.id),
+                value: encode(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_placeholders_and_malformed_blocks_on_write_and_read() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let transcript = Transcript::new(&db, id);
+        let message_id = Uuid::new_v4();
+        let good = json!({"AppendV2": {"ids": [message_id], "messages": [{"role":"user","content":""}]}});
+        let binding = MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"text", "text":"kept"})],
+        };
+        for message in [
+            json!({"role":"user", "content":"hidden"}),
+            json!({"role":"user_with_images", "content":"", "images":[]}),
+            json!({"role":"user", "content":"", "extra":"hidden"}),
+        ] {
+            let mut value = good.clone();
+            value["AppendV2"]["messages"][0] = message;
+            assert!(matches!(
+                transcript.prepare_append_with_blocks(&value, vec![binding.clone()]),
+                Err(Error::Corrupt)
+            ));
+        }
+        let invalid = MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"text"})],
+        };
+        assert!(matches!(
+            transcript.prepare_append_with_blocks(&good, vec![invalid.clone()]),
+            Err(Error::Corrupt)
+        ));
+        commit(
+            &db,
+            transcript.prepare_append_with_blocks(&good, vec![binding]).unwrap(),
+        );
+        let cursor = transcript.snapshot().unwrap();
+        let link = cursor.next.unwrap();
+        let mut entry = transcript.load_entry(link).unwrap();
+        entry.content_blocks = Some(vec![invalid]);
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: entry_key(link.id),
+                value: encode(&entry).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            transcript.read_with_blocks(&cursor, NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+        entry.content_blocks.as_mut().unwrap()[0].blocks = vec![];
+        entry.value["AppendV2"]["messages"][0]["content"] = json!("hidden");
         db.commit(
             &[],
             &[Mutation::Put {

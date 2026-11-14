@@ -2015,7 +2015,7 @@ impl Harness {
         for (&index, binding) in &state.content_blocks {
             if !matches!(
                 state.messages.get(index),
-                Some(Message::User { .. } | Message::UserWithImages { .. })
+                Some(Message::User { content }) if content.is_empty()
             ) || binding.message_id.is_nil()
                 || !block_ids.insert(binding.message_id)
                 || crate::content::UserContent::from_yield(
