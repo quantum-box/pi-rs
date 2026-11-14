@@ -1224,6 +1224,7 @@ impl Agent<'_> {
             .filter(|_| !trigger_unanswered)
         {
             if !apply_inputs(session, true, observer)? {
+                self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await;
                 return Ok(answer);
             }
         } else if !session.branch().iter().any(|record| {
@@ -1837,11 +1838,142 @@ impl Agent<'_> {
                     continue;
                 }
                 if !apply_inputs(session, true, observer)? {
+                    let compact_agent = Agent {
+                        registry: &runtime_registry,
+                        system_prompt: &runtime_prompt,
+                        model: self.model,
+                        model_name: self.model_name,
+                        limits: self.limits.clone(),
+                    };
+                    compact_agent
+                        .compact_silent_overflow(
+                            session, run_id, &states, cancel, observer, followups,
+                        )
+                        .await;
                     return Ok(answer);
                 }
             }
         }
         Err(Error::Budget)
+    }
+
+    async fn compact_silent_overflow<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+    ) {
+        if !session.auto_compaction_control().enabled() || cancel.is_cancelled() {
+            return;
+        }
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => platform_time::timeout(
+                self.limits.model_timeout,
+                self.model.context_window(self.model_name),
+            )
+            .await
+            .ok()
+            .flatten(),
+        };
+        let Some(window) = window.filter(|window| *window > 0) else {
+            return;
+        };
+        let branch = session.branch();
+        let Some((index, record)) = branch.iter().enumerate().rev().find(|(_, record)| {
+            record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+        }) else {
+            return;
+        };
+        let Event::Assistant {
+            invocations,
+            usage: Some(usage),
+            request_id: Some(request_id),
+            ..
+        } = &record.event
+        else {
+            return;
+        };
+        if !invocations.is_empty()
+            || usage.input_tokens <= u64::from(window)
+            || !session
+                .current_message_entries()
+                .iter()
+                .any(|(id, _)| *id == record.id)
+            || branch[index + 1..].iter().any(|record| {
+                matches!(
+                    record.event,
+                    Event::ContextEdited { .. }
+                        | Event::Compacted { .. }
+                        | Event::User { .. }
+                        | Event::UserWithImages { .. }
+                )
+            })
+        {
+            return;
+        }
+        let request_id = *request_id;
+        let output_tokens = usage.output_tokens;
+        let matching = branch.iter().any(|record| matches!(&record.event,
+            Event::ModelRequested { request_id: Some(id), model, .. } if *id == request_id && model == self.model_name));
+        let completed = branch.iter().any(|record| matches!(&record.event,
+            Event::ModelFinished { request_id: id, failure: None, metadata, .. } if *id == request_id && metadata.finish_reason.as_deref() != Some("length")));
+        let already_started = branch[index + 1..].iter().any(|record| matches!(&record.event,
+            Event::SourceEntry { format, entry } if format == "pi-rs:silent-overflow" && entry["requestId"] == request_id.to_string()));
+        if !matching || !completed || already_started {
+            return;
+        }
+        let Ok(retention) = configured_retention(
+            session,
+            self.compaction_tokens(session).keep_recent_tokens,
+            1,
+        ) else {
+            return;
+        };
+        if !has_summary_prefix(session, retention.boundary) {
+            return;
+        }
+        if commit(
+            session,
+            Event::SourceEntry {
+                format: "pi-rs:silent-overflow".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            },
+            observer,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let output_limit = if self.limits.model_requests > 1 {
+            self.limits.output_tokens_per_request.min(512).min(
+                self.limits
+                    .output_tokens_per_run
+                    .saturating_sub(output_tokens.min(u64::from(u32::MAX)) as u32),
+            )
+        } else {
+            0
+        };
+        let _ = self
+            .summarize_prefix(
+                session,
+                states,
+                SummaryScope {
+                    retention,
+                    instructions: None,
+                    output_limit,
+                    cancellation: cancel,
+                    reason: crate::CompactionTrigger::Overflow,
+                    will_retry: false,
+                    skip_without_model: false,
+                },
+                observer,
+                Some(followups),
+            )
+            .await;
     }
 
     fn migrate(
@@ -6485,6 +6617,89 @@ mod tree_tests {
     struct LengthModel {
         calls: std::sync::atomic::AtomicUsize,
         output: u64,
+    }
+
+    struct SilentOverflowModel(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for SilentOverflowModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1001,
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_silent_overflow_compacts_without_resending_answer() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 1,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let answer = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "overflow");
+        assert_eq!(events[0]["willRetry"], false);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "safe summary")));
+        assert!(session.current_messages().iter().any(
+            |message| matches!(message, Message::Assistant { content, .. } if content == "answer")
+        ));
     }
     #[async_trait::async_trait]
     impl Model for LengthModel {
