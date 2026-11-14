@@ -188,6 +188,8 @@ callbacks or queued triggers run. For an ambiguous silent-overflow summary,
 resume retains the answer, settles any started summary request as unconfirmed
 when its outcome is unknown, and records a durable skip before accepting more
 work. Failed settlement leaves recovery pending for retry.
+The low-level agent similarly rejects a new run or direct queued-input
+delivery until the interrupted run has been resumed or reconciled.
 Ordinary silent-summary model or budget failures also record the skip before
 returning the answer. A saved summary's incurred usage is settled even when
 the restored run budget prevents further work.

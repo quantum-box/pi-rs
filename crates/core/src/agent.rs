@@ -311,6 +311,11 @@ impl Agent<'_> {
         session: &mut Session,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
+        if resumable_compaction_run(session).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before applying queued input".into(),
+            ));
+        }
         ensure_settled(session.operations())?;
         apply_inputs(session, true, observer)
     }
@@ -328,6 +333,13 @@ impl Agent<'_> {
     ) -> Result<String> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(Error::Config("empty user input".into()));
+        }
+        if resumable_compaction_run(session)
+            .is_some_and(|(pending_run, _, _)| pending_run != run_id)
+        {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before starting another run".into(),
+            ));
         }
         if let Some(record) = session.recover_tree_trigger_handoff()? {
             observer(Notification::Committed(record));
@@ -8400,6 +8412,48 @@ mod tree_tests {
             },
         };
         let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let mut guarded = Session::from_records(session.records().to_vec()).unwrap();
+        let steering_id = Uuid::new_v4();
+        guarded
+            .append(Event::InputQueued {
+                input: crate::QueuedInput {
+                    id: steering_id,
+                    kind: crate::InputKind::Steer,
+                    content: "retain queued input".into(),
+                },
+            })
+            .unwrap();
+        let before = guarded.records().len();
+        assert!(
+            agent
+                .run(
+                    &mut guarded,
+                    Some("new run".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pending compaction recovery")
+        );
+        assert!(
+            agent
+                .apply_queued_inputs(&mut guarded, &mut |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("pending compaction recovery")
+        );
+        assert_eq!(guarded.records().len(), before);
+        assert!(
+            guarded
+                .queued_inputs()
+                .iter()
+                .any(|input| input.input.id == steering_id)
+        );
+        assert!(resumable_compaction_run(&guarded).is_some());
+        assert_eq!(model.turn.0.load(Ordering::SeqCst), 0);
         let failure = agent
             .run_correlated(
                 &mut session,
