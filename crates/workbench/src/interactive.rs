@@ -7140,20 +7140,33 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 }
 
 fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
-    let command = args
-        .settings
-        .string("externalEditor")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "nano".into()
-            }
-        });
-    let parts = shell_words::split(&command).map_err(|error| Error::Config(error.to_string()))?;
+    let command = external_editor_command(
+        args.settings.string("externalEditor"),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    run_external_editor(&command, editor)
+}
+
+fn external_editor_command(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> String {
+    configured
+        .filter(|command| {
+            !command
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+                .is_empty()
+        })
+        .or_else(|| visual.filter(|command| !command.is_empty()))
+        .or_else(|| editor.filter(|command| !command.is_empty()))
+        .unwrap_or(if cfg!(windows) { "notepad" } else { "nano" })
+        .to_owned()
+}
+
+fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
+    let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
         return Err(Error::Config("external editor is empty".into()));
     };
@@ -7169,8 +7182,15 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
             "external editor exited unsuccessfully".into(),
         ));
     }
-    editor.replace(std::fs::read_to_string(file.path())?);
+    let bytes = std::fs::read(file.path())?;
+    editor.replace(external_editor_text(&bytes));
     Ok(())
+}
+
+fn external_editor_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    text.strip_suffix('\n').unwrap_or(text).to_owned()
 }
 
 fn complete_input(args: &Cli, view: &mut View) {
@@ -7337,6 +7357,75 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_editor_selects_first_nonempty_command() {
+        assert_eq!(
+            super::external_editor_command(
+                Some("  \u{feff}"),
+                Some("visual --wait"),
+                Some("editor")
+            ),
+            "visual --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(
+                Some("configured --wait"),
+                Some("visual"),
+                Some("editor")
+            ),
+            "configured --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("editor")),
+            "editor"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("")),
+            if cfg!(windows) { "notepad" } else { "nano" }
+        );
+        assert_eq!(
+            super::external_editor_command(Some("\u{0085}"), None, None),
+            "\u{0085}"
+        );
+    }
+
+    #[test]
+    fn external_editor_strips_one_bom_and_one_final_lf() {
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbfprompt\n\n"),
+            "prompt\n"
+        );
+        assert_eq!(super::external_editor_text(b"prompt\r\n"), "prompt\r");
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbf\xef\xbb\xbftext"),
+            "\u{feff}text"
+        );
+        assert_eq!(super::external_editor_text(b"bad\xff\n"), "bad\u{fffd}");
+        assert_eq!(super::external_editor_text(b""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_updates_only_after_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277edited\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        super::run_external_editor(program.to_str().unwrap(), &mut editor).unwrap();
+        assert_eq!(editor.text, "edited\n");
+        assert_eq!(editor.cursor, editor.text.len());
+        std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
+        assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
+        assert_eq!(editor.text, "edited\n");
+    }
+
     #[test]
     fn live_frame_flushes_text_before_console_side_effects() {
         use std::io::Write;

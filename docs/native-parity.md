@@ -4129,6 +4129,14 @@ model discovery, and workbench proxy/idle-timeout settings. Custom model endpoin
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
 
+### External editor result
+
+The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
+platform-default precedence, ignoring blank configured values and empty
+environment values. On successful return it decodes UTF-8 with replacement,
+strips one leading BOM and removes exactly one final LF. Failed editors leave
+the draft unchanged. Native shell-style command splitting remains supported.
+
 ### Editor kill ring checkpoint
 
 Typing now follows Pi's undo grouping: consecutive non-whitespace characters
