@@ -623,11 +623,10 @@ fn configure_thinking(
         }
         Some(ThinkingMode::Budgeted) => {
             let preferred = match level {
-                "minimal" | "low" => 1024,
-                "medium" => 4096,
-                "high" => 8192,
-                "xhigh" => 16_384,
-                _ => 32_768,
+                "minimal" => 1024,
+                "low" => 2048,
+                "medium" => 8192,
+                _ => 16_384,
             };
             let budget = preferred.min(max_output.saturating_sub(1024).max(1024));
             if budget >= max_output {
@@ -635,7 +634,8 @@ fn configure_thinking(
                     "Anthropic budgeted thinking needs at least 1025 output tokens".into(),
                 ));
             }
-            body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+            body["thinking"] =
+                json!({"type":"enabled","budget_tokens":budget,"display":"summarized"});
         }
         None => {}
     }
@@ -917,8 +917,18 @@ impl Model for Anthropic {
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
-        let response =
-            send(self.authenticate(self.client.post(self.endpoint.clone()).json(&body))).await?;
+        let mut outbound = self.authenticate(self.client.post(self.endpoint.clone()).json(&body));
+        if matches!(self.provider.as_ref(), "minimax" | "minimax-cn")
+            && matches!(
+                requested_model.as_str(),
+                "MiniMax-M2.7" | "MiniMax-M2.7-highspeed"
+            )
+            && body["thinking"]["type"] == "enabled"
+            && !self.headers.contains_key("anthropic-beta")
+        {
+            outbound = outbound.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        }
+        let response = send(outbound).await?;
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1463,8 +1473,18 @@ mod tests {
         configure_thinking(&mut body, Some(&legacy), "high", 2048).unwrap();
         assert_eq!(
             body["thinking"],
-            json!({"type":"enabled","budget_tokens":1024})
+            json!({"type":"enabled","budget_tokens":1024,"display":"summarized"})
         );
+        for (level, expected) in [
+            ("minimal", 1024),
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 16384),
+            ("xhigh", 16384),
+        ] {
+            configure_thinking(&mut body, Some(&legacy), level, 20000).unwrap();
+            assert_eq!(body["thinking"]["budget_tokens"], expected);
+        }
     }
 
     #[test]

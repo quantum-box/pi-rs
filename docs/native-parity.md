@@ -197,7 +197,12 @@ MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled model
 catalogs include M3 and M3.1-Flash reasoning, image, context and pricing
 metadata; the same Anthropic-compatible streaming adapter is used for both
-regions. M2.7 needs its standard API adapter and remains unlisted.
+regions. MiniMax M2.7 and M2.7-highspeed use the pinned text-only catalog and
+budgeted thinking levels, including Pi's interleaved-thinking header. Native
+thinking budgets stay within the agent's configured output-token ceiling; Pi
+can expand an explicitly requested ceiling to accommodate thinking.
+Budgeted Messages requests use Pi's default level budgets and summarized
+thinking display, subject to that native ceiling.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
