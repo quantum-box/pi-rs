@@ -5440,20 +5440,14 @@ impl Harness {
                         )?;
                         continue;
                     }
-                    let continuation = match continuation {
-                        Some(serde_json::Value::String(text)) => Some(text),
-                        Some(_) => {
-                            return Err(Error::Invalid(
-                                "OnYield continuation must be a string".into(),
-                            ));
-                        }
-                        None => None,
-                    };
-                    if let Some(text) = continuation.filter(|_| {
+                    let continuation = continuation
+                        .as_ref()
+                        .and_then(crate::extension::yield_input);
+                    if let Some(message) = continuation.filter(|_| {
                         c.pending_resets.is_empty()
                             && !c.submissions.iter().any(|s| s.status == Status::Queued)
                     }) {
-                        c.messages.push(Message::User { content: text });
+                        c.messages.push(message);
                         c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns: 0 };
                     } else {
@@ -5508,17 +5502,18 @@ impl Harness {
                         }
                         if continuation.is_none()
                             && let crate::task::TaskState::Succeeded(value) = task.state()
-                            && let Some(text) = value.get("continue").and_then(|v| v.as_str())
-                            && !text.trim().is_empty()
+                            && let Some(message) = value
+                                .get("continue")
+                                .and_then(crate::extension::yield_input)
                         {
-                            continuation = Some(text.to_owned());
+                            continuation = Some(message);
                         }
                     }
-                    if let Some(text) = continuation.filter(|_| {
+                    if let Some(message) = continuation.filter(|_| {
                         c.pending_resets.is_empty()
                             && !c.submissions.iter().any(|s| s.status == Status::Queued)
                     }) {
-                        c.messages.push(Message::User { content: text });
+                        c.messages.push(message);
                         c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns: 0 };
                     } else {

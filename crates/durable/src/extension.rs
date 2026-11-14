@@ -14,6 +14,62 @@ use futures_util::FutureExt;
 use pi_rs_core::Tool;
 use serde_json::Value;
 
+// Convert only inputs whose content order is representable by core's user message.
+pub(crate) fn yield_input(value: &Value) -> Option<pi_rs_core::Message> {
+    if let Some(text) = value.as_str() {
+        return Some(pi_rs_core::Message::User {
+            content: text.into(),
+        });
+    }
+    let blocks = value.as_array().filter(|blocks| !blocks.is_empty())?;
+    let mut text = None;
+    let mut images = Vec::new();
+    for block in blocks {
+        match block.get("type")?.as_str()? {
+            "text" if text.is_none() && images.is_empty() => {
+                text = Some(block.get("text")?.as_str()?.to_owned());
+            }
+            "image" => {
+                let image = pi_rs_core::ImageContent {
+                    data: block.get("data")?.as_str()?.to_owned(),
+                    mime_type: block.get("mimeType")?.as_str()?.to_owned(),
+                };
+                image.validate().ok()?;
+                images.push(image);
+            }
+            _ => return None,
+        }
+    }
+    let content = text.unwrap_or_default();
+    Some(if images.is_empty() {
+        pi_rs_core::Message::User { content }
+    } else {
+        pi_rs_core::Message::UserWithImages { content, images }
+    })
+}
+
+#[cfg(test)]
+mod yield_input_tests {
+    use super::yield_input;
+    use serde_json::json;
+
+    #[test]
+    fn rejects_unrepresentable_or_invalid_content_without_partial_conversion() {
+        for value in [
+            json!([]),
+            json!([{"type":"text"}]),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            json!([{"type":"image","data":"aGk=","mimeType":"image/png"},{"type":"text","text":"after"}]),
+            json!([{"type":"image","data":"invalid","mimeType":"image/png"}]),
+        ] {
+            assert!(yield_input(&value).is_none(), "{value}");
+        }
+        assert!(
+            yield_input(&json!([{"type":"image","data":"aGk=","mimeType":"image/png"}])).is_some()
+        );
+    }
+}
+
 /// Host-provided task-scoped memo storage. `get_or_insert` must atomically
 /// persist the first value before returning it, including across process restarts.
 #[async_trait]
@@ -582,13 +638,13 @@ impl Resolved {
                         }
                     }
                     Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
-                        if v.as_str().is_some_and(|text| !text.trim().is_empty()) {
+                        if yield_input(&v).is_some() {
                             return (value, Some(v), tasks, reports);
                         }
                         reports.push(failure(
                             &e.name,
                             "generation",
-                            "OnYield continuation must be a nonempty string".into(),
+                            "OnYield continuation is invalid or cannot be represented".into(),
                         ));
                     }
                     Ok(GenerationDecision::Tasks(mut t))

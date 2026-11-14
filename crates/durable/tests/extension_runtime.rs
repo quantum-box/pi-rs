@@ -2013,7 +2013,7 @@ impl Hook for YieldReviews {
             Ok(GenerationDecision::Tasks(vec![
                 HookTask {
                     name: "review".into(),
-                    input: json!({"continue": " "}),
+                    input: json!({"continue": []}),
                 },
                 HookTask {
                     name: "review".into(),
@@ -3485,7 +3485,6 @@ async fn yield_invalid_and_failed_hooks_allow_later_continuation() {
         name: "yield".into(),
         hooks: vec![
             Arc::new(YieldDecisionHook("invalid")),
-            Arc::new(YieldDecisionHook("blank")),
             Arc::new(YieldDecisionHook("error")),
             Arc::new(YieldDecisionHook("continue")),
             Arc::new(YieldDecisionHook("later")),
@@ -3517,18 +3516,13 @@ async fn yield_invalid_and_failed_hooks_allow_later_continuation() {
     let yields: Vec<_> = reports.iter().filter(|r| r.phase == "OnYield").collect();
     assert_eq!(yields.len(), 2);
     for batch in yields {
-        assert_eq!(batch.reports.len(), 3);
+        assert_eq!(batch.reports.len(), 2);
         assert!(
             batch.reports[0]
                 .error
-                .contains("continuation must be a nonempty string")
+                .contains("continuation is invalid or cannot be represented")
         );
-        assert!(
-            batch.reports[1]
-                .error
-                .contains("continuation must be a nonempty string")
-        );
-        assert_eq!(batch.reports[2].error, "yield failed");
+        assert_eq!(batch.reports[1].error, "yield failed");
     }
 }
 
@@ -3617,4 +3611,124 @@ async fn yield_report_replay_deduplicates_and_later_hook_creates_child() {
     assert_eq!(h.extension_reports().unwrap(), reports);
     assert_eq!(tool.0.lock().unwrap().len(), 1);
     driver.shutdown().unwrap();
+}
+
+struct YieldOnce(Value, bool, std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl Hook for YieldOnce {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision as D, GenerationEvent as E, HookTask};
+        if event != E::OnYield || self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Ok(D::Pass);
+        }
+        if self.1 {
+            Ok(D::Tasks(vec![HookTask {
+                name: "once-review".into(),
+                input: json!({"continue": self.0}),
+            }]))
+        } else {
+            Ok(D::Continue(self.0.clone()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn yield_accepts_representable_inputs_directly_and_from_tasks() {
+    use pi_rs_durable::task::Task;
+    use pi_rs_durable::task_scheduler::{Handler, Registry, Step};
+    for input in [
+        json!(""),
+        json!(" \n"),
+        json!([{"type":"text","text":"array text"}]),
+        json!([{"type":"text","text":"look"},{"type":"image","data":"aGk=","mimeType":"image/png"}]),
+    ] {
+        for via_task in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(FakeModel::default());
+            let mut h = Harness::open_paused(
+                dir.path().join("db"),
+                options(model.clone(), Arc::new(FakeTool::default())),
+            )
+            .unwrap();
+            let handler: Arc<dyn Handler> =
+                Arc::new(|task: &Task| Ok(Step::Succeed(task.checkpoint().data.clone())));
+            h.install_extension(Extension {
+                name: "once".into(),
+                hooks: vec![Arc::new(YieldOnce(
+                    input.clone(),
+                    via_task,
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))],
+                tasks: vec![("once-review".into(), handler.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+            let mut registry = Registry::default();
+            registry.register_shared("once-review", true, handler);
+            let driver = h.start_tasks(registry).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["once".into()]).unwrap();
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            if via_task {
+                for _ in 0..200 {
+                    h.resume_conversation(id, &CancellationToken::new())
+                        .await
+                        .unwrap();
+                    if matches!(
+                        h.conversation(id).unwrap().submissions[0].status,
+                        Status::Done { .. }
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            let c = h.conversation(id).unwrap();
+            assert!(
+                matches!(c.submissions[0].status, Status::Done { .. }),
+                "{input}"
+            );
+            let expected = if input.is_string() {
+                Message::User {
+                    content: input.as_str().unwrap().into(),
+                }
+            } else if input.as_array().unwrap().len() == 1 {
+                Message::User {
+                    content: "array text".into(),
+                }
+            } else {
+                Message::UserWithImages {
+                    content: "look".into(),
+                    images: vec![pi_rs_core::ImageContent {
+                        data: "aGk=".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }
+            };
+            assert_eq!(
+                c.messages.iter().filter(|m| **m == expected).count(),
+                1,
+                "{input}"
+            );
+            assert_eq!(model.0.lock().unwrap().len(), 3);
+            assert!(
+                model
+                    .0
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .messages
+                    .contains(&expected)
+            );
+            driver.shutdown().unwrap();
+        }
+    }
 }
