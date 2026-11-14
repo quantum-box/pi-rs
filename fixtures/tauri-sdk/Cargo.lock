@@ -344,8 +344,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link 0.2.1",
 ]
 
@@ -948,9 +950,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2076,7 +2080,9 @@ dependencies = [
  "cap-std",
  "chrono",
  "futures-util",
+ "getrandom 0.3.4",
  "hmac",
+ "js-sys",
  "jsonschema",
  "libc",
  "pi-rs-tool-arguments",
@@ -2088,6 +2094,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "wasm-bindgen",
  "windows-sys 0.61.2",
 ]
 

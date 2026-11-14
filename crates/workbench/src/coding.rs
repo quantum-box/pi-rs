@@ -2650,7 +2650,12 @@ impl CodingTool {
         let mut grep = if is_find {
             None
         } else {
-            Some(crate::file_search::Grep::new(args, limit)?)
+            let grep = crate::file_search::Grep::new(args, limit)?;
+            Some(if base.is_file() {
+                grep.with_explicit_file()
+            } else {
+                grep
+            })
         };
         let mut results = Vec::new();
         let mut walker = ignore::WalkBuilder::new(&base);
@@ -5386,6 +5391,35 @@ mod tests {
                 "main.rs:1: needle"
             );
         }
+    }
+
+    #[test]
+    fn grep_explicit_binary_file_and_directory_use_distinct_binary_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("binary.dat"),
+            b"match first\nnext line\n\0remaining match\n",
+        )
+        .unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"match", "path":"binary.dat"}), &token)
+                .unwrap()
+                .tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"match"}), &token)
+                .unwrap()
+                .tool_content(),
+            "No matches found"
+        );
     }
 
     #[cfg(unix)]

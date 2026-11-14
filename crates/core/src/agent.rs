@@ -1,3 +1,4 @@
+use crate::runtime::time as platform_time;
 #[path = "turn_scheduler.rs"]
 mod turn_scheduler;
 
@@ -1248,7 +1249,7 @@ impl Agent<'_> {
             let update = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                update = tokio::time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
+                update = platform_time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
             };
             if let Some(update) = update {
                 runtime_registry = update.registry;
@@ -1348,7 +1349,7 @@ impl Agent<'_> {
                 let preparation = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = tokio::time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
+                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
                         result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
                 let prepared = match preparation {
@@ -1381,7 +1382,7 @@ impl Agent<'_> {
                             delay_ms,
                             error_message: message,
                         }));
-                        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                        let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
                         tokio::pin!(sleep);
                         let waited = loop {
                             tokio::select! {
@@ -1512,7 +1513,7 @@ impl Agent<'_> {
                         delay_ms,
                         error_message: message.clone(),
                     }));
-                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
                     tokio::pin!(sleep);
                     let waited = loop {
                         tokio::select! {
@@ -1569,7 +1570,7 @@ impl Agent<'_> {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(Error::Cancelled),
-                    update = tokio::time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
+                    update = platform_time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
                 }
             };
             let dispatch_update = match dispatch_update {
@@ -1812,7 +1813,7 @@ impl Agent<'_> {
                 }),
             };
             let result = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     self.limits.model_timeout,
                     extension.before_request_with_host(
                         &mut guarded,
@@ -1873,7 +1874,7 @@ impl Agent<'_> {
                 }),
             };
             let result = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     self.limits.model_timeout,
                     extension.context_with_system_with_host(
                         &mut guarded,
@@ -2106,7 +2107,7 @@ impl Agent<'_> {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, collect) =>
+            result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
         let (usage, failure) = match &result {
@@ -2157,7 +2158,7 @@ impl Agent<'_> {
         usage: &UsageReport,
         metadata: &ModelMetadata,
     ) -> Result<()> {
-        tokio::time::timeout(
+        platform_time::timeout(
             self.limits.model_timeout,
             self.model
                 .record_usage_with_metadata(request_id, usage, metadata),
@@ -2914,8 +2915,8 @@ impl Agent<'_> {
                 label: options.label.map(str::to_owned),
             };
             let states = session.extension_states();
-            let deadline =
-                tokio::time::Instant::now() + self.limits.tool_timeout.min(Duration::from_secs(10));
+            let deadline = platform_time::Instant::now()
+                + self.limits.tool_timeout.min(Duration::from_secs(10));
             for extension in self
                 .registry
                 .extensions
@@ -2925,7 +2926,7 @@ impl Agent<'_> {
                 let (sender, mut incoming) = mpsc::channel(32);
                 let host = Arc::new(LifecycleMessageHost { sender, idle: true });
                 let result = {
-                    let future = tokio::time::timeout_at(
+                    let future = platform_time::timeout_at(
                         deadline,
                         extension.before_tree_with_host(
                             &preparation,
@@ -3134,7 +3135,7 @@ impl Agent<'_> {
         let prepared = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))??,
         };
         let active = Agent {
@@ -3294,7 +3295,7 @@ impl Agent<'_> {
                 biased;
                 _ = cancel.cancelled() => break Err(Error::Cancelled),
                 _ = waiting.cancel.cancelled() => break Err(Error::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                _ = platform_time::sleep(Duration::from_millis(delay_ms)) => {}
             }
         };
         if retries > 0 {
@@ -3483,7 +3484,7 @@ impl Agent<'_> {
         let prepared = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
                 result.map_err(|_| Error::Config("model preparation timed out".into()))??,
         };
         let active = Agent {
@@ -3559,7 +3560,7 @@ impl Agent<'_> {
             None => tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
+                result = platform_time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
             },
         };
         Ok(window)
@@ -4036,7 +4037,7 @@ async fn serve_compaction_hook<T, I: Into<AgentInput> + Send>(
     observer: &mut Observer<'_>,
     inputs: &mut Option<&mut mpsc::Receiver<I>>,
 ) -> Result<crate::ExtensionResult<T>> {
-    let future = tokio::time::timeout(timeout, future);
+    let future = platform_time::timeout(timeout, future);
     tokio::pin!(future);
     loop {
         tokio::select! {
@@ -6219,7 +6220,7 @@ mod nested_host_tests {
             .unwrap();
         cancel.cancel();
         // The dispatcher still owns the other sender when cancellation occurs.
-        let outcomes = tokio::time::timeout(Duration::from_secs(1), call)
+        let outcomes = platform_time::timeout(Duration::from_secs(1), call)
             .await
             .expect("cancelled call remained blocked")
             .unwrap();
@@ -6504,7 +6505,7 @@ mod queue_tests {
                 parent_operation: Uuid::nil(),
             })
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             Duration::from_secs(3),
             agent.reject_truncated_tools(
                 &mut session,
@@ -6587,7 +6588,7 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
@@ -6601,14 +6602,14 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
             let (reply, result) = oneshot::channel();
             sender.send(AgentInput::ClearQueue { reply }).await.unwrap();
-            let removed = tokio::time::timeout(Duration::from_secs(1), result)
+            let removed = platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
