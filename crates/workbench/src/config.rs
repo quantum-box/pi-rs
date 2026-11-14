@@ -409,23 +409,51 @@ pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<
     match settings["defaultProjectTrust"].as_str() {
         Some("always") => Ok(Some(true)),
         Some("never") => Ok(Some(false)),
-        _ if ![
-            "settings.json",
-            "mcp.json",
-            "extensions",
-            "skills",
-            "prompts",
-            "themes",
-            "SYSTEM.md",
-            "APPEND_SYSTEM.md",
-        ]
-        .iter()
-        .any(|name| workspace.join(".pi").join(name).exists()) =>
-        {
-            Ok(Some(true))
-        }
+        _ if !has_trust_requiring_project_resources(&workspace) => Ok(Some(true)),
         _ => Ok(None),
     }
+}
+
+// Match Pi's trust gate for ancestor .agents/skills, while keeping the
+// user's global ~/.agents/skills available without project approval.
+fn has_trust_requiring_project_resources(workspace: &Path) -> bool {
+    if [
+        "settings.json",
+        "mcp.json",
+        "extensions",
+        "skills",
+        "prompts",
+        "themes",
+        "SYSTEM.md",
+        "APPEND_SYSTEM.md",
+    ]
+    .iter()
+    .any(|name| workspace.join(".pi").join(name).exists())
+    {
+        return true;
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|path| path.canonicalize().unwrap_or(path));
+    for directory in workspace.ancestors() {
+        let is_home = home.as_deref().is_some_and(|home| {
+            #[cfg(windows)]
+            {
+                directory
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&home.to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                directory == home
+            }
+        });
+        if !is_home && directory.join(".agents/skills").exists() {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
@@ -690,6 +718,121 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ancestor_agents_skills_require_project_trust_without_blocking_user_skills() {
+        const CHILD: &str = "PI_RS_TEST_AGENTS_TRUST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::ancestor_agents_skills_require_project_trust_without_blocking_user_skills", "--nocapture"])
+                .env("HOME", &home).env("USERPROFILE", &home)
+                .env("PI_RS_HOME", directory.path().join("agent"))
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use clap::Parser;
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let repo = home.join("projects/repo");
+        let workspace = repo.join("subdir");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let global = home.join(".agents/skills/global-example/SKILL.md");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "---\nname: global-example\ndescription: global\n---\nGlobal",
+        )
+        .unwrap();
+        // The home directory's user skills never cause a project trust prompt.
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        let above_repo = home.join("projects/.agents/skills/outside-example/SKILL.md");
+        std::fs::create_dir_all(above_repo.parent().unwrap()).unwrap();
+        std::fs::write(
+            &above_repo,
+            "---\nname: outside-example\ndescription: outside\n---\nOutside",
+        )
+        .unwrap();
+        // Pi's trust scan continues above the repository, even though skill
+        // discovery stops at the repository boundary.
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        let mut args = super::super::Cli::parse_from([
+            "pi",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace.clone();
+        args.trusted = true;
+        args.settings = super::Settings::load(&workspace, true).unwrap();
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("global-example"));
+        assert!(!resources.skills.contains_key("outside-example"));
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("outside-example"));
+        // Worktrees use a .git file rather than a directory.
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        std::fs::remove_dir_all(home.join("projects/.agents")).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        let inside = workspace.join(".agents/skills");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        std::fs::remove_dir_all(workspace.join(".agents")).unwrap();
+        let project = repo.join(".agents/skills/project-example/SKILL.md");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            "---\nname: project-example\ndescription: project\n---\nProject",
+        )
+        .unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        assert_eq!(
+            super::project_trust(&workspace, Some(false)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            super::project_trust(&workspace, Some(true)).unwrap(),
+            Some(true)
+        );
+        args.trusted = false;
+        args.settings = super::Settings::load(&workspace, false).unwrap();
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("global-example"));
+        assert!(!resources.skills.contains_key("project-example"));
+        args.trusted = true;
+        args.settings = super::Settings::load(&workspace, true).unwrap();
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("global-example"));
+        assert!(resources.skills.contains_key("project-example"));
+        assert!(!resources.skills.contains_key("outside-example"));
+        super::save_trust(&repo, false).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(false));
+        super::save_trust(&repo, true).unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        std::fs::remove_file(super::agent_dir().join("trust.json")).unwrap();
+        for (value, expected) in [("always", true), ("never", false)] {
+            std::fs::write(
+                super::agent_dir().join("settings.json"),
+                serde_json::json!({"defaultProjectTrust": value}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::project_trust(&workspace, None).unwrap(),
+                Some(expected)
+            );
+        }
+    }
     #[test]
     fn bom_handling_is_limited_to_mcp_configuration() {
         let directory = tempfile::tempdir().unwrap();
