@@ -265,6 +265,14 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn fail_abort_restart(&mut self) -> Result<(), TransitionError> {
+        if self.state != TaskState::Ready || !self.abort_requested {
+            return Err(TransitionError::InvalidState);
+        }
+        self.state = TaskState::Failed("abort restart limit".into());
+        Ok(())
+    }
+
     /// Cancellation is permitted for any nonterminal state, including blocked work.
     pub fn cancel(&mut self) -> Result<(), TransitionError> {
         if matches!(

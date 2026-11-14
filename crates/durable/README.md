@@ -130,8 +130,13 @@ can replay after a crash; external effects require idempotency and reconciliatio
 Conversation abort skips tasks explicitly marked as background and their
 descendants. Task-owned foreground subagent conversations are marked and
 scheduled for cleanup by the conversation scheduler; background edges are boundaries.
-Standalone task-driver aborts reject foreground conversation children because they
-cannot drive their cleanup. Task cleanup does not wait for child conversation cleanup.
+Task cleanup waits until each foreground child conversation has settled its abort,
+including that conversation's foreground tasks. `Scheduler::abort_and_wait` joins
+workers for the entire affected foreground scope. Standalone task-driver aborts
+still reject foreground conversation children because they cannot drive or cancel
+their workers. Cyclic ownership can prevent cleanup from making progress; callers
+must avoid cycles. A blocked uncertain operation requires reconciliation, and a
+task driver must be running to drain tasks.
 Current limits and differences from upstream Pi Durable:
 
 - Historical forks accept safe committed observation snapshots, including during runs,

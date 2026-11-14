@@ -4150,6 +4150,9 @@ impl Harness {
             }
         }
         if c.abort_requested {
+            if !self.conversation_tasks(c.id)?.is_empty() {
+                return Err(Error::Invalid("owned task cleanup is still pending".into()));
+            }
             append_tool(&mut c, &calls, index, outcome.tool_content())?;
             for i in index + 1..calls.len() {
                 append_tool(
@@ -4468,15 +4471,19 @@ impl Scheduler {
     }
     /// Persist intent before signalling every affected worker, then drive cleanup.
     pub fn abort(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort_graph(Some(id), None)
+        self.abort_graph(Some(id), None).map(|_| ())
     }
 
     /// Abort a task and its foreground owned conversations.
     pub fn abort_task(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort_graph(None, Some(id))
+        self.abort_graph(None, Some(id)).map(|_| ())
     }
 
-    fn abort_graph(&mut self, conversation: Option<Uuid>, task: Option<Uuid>) -> Result<(), Error> {
+    fn abort_graph(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, Error> {
         // Prevent controls from being created and fence every existing poll while
         // discovering and committing the graph. A child may be admitted right up
         // to the transaction, so fencing a previously read graph is insufficient.
@@ -4498,15 +4505,31 @@ impl Scheduler {
         }
         drop(_guards);
         drop(controls);
-        for id in affected {
-            self.schedule(id);
+        for id in &affected {
+            self.schedule(*id);
+        }
+        Ok(affected)
+    }
+    /// Request abort and join workers for every affected foreground conversation.
+    pub async fn abort_and_wait(&mut self, id: Uuid) -> Result<(), Error> {
+        let affected = self.abort_graph(Some(id), None)?;
+        let mut first_error = None;
+        for child in &affected {
+            if let Err(error) = self.wait(*child).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        for child in affected {
+            if self.harness.conversation(child)?.abort_requested {
+                return Err(Error::Invalid(format!(
+                    "abort cleanup remains pending for conversation {child}"
+                )));
+            }
         }
         Ok(())
-    }
-    /// Request abort and wait until this conversation's local workers stop.
-    pub async fn abort_and_wait(&mut self, id: Uuid) -> Result<(), Error> {
-        self.abort(id)?;
-        self.wait(id).await
     }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {

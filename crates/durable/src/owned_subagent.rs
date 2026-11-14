@@ -432,6 +432,99 @@ mod tests {
         scheduler.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn abort_and_wait_joins_active_owned_conversation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Pending(Arc<AtomicBool>);
+        #[async_trait]
+        impl Model for Pending {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                self.0.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let child = h
+            .ensure_task_owned_subagent(task, owner, "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        drop(h);
+        let started = Arc::new(AtomicBool::new(false));
+        let mut opts = options();
+        opts.model = Arc::new(Pending(started.clone()));
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let driver = scheduler.start_tasks(Default::default()).unwrap();
+        scheduler.submit(child, None, "active".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            scheduler.abort_and_wait(parent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!scheduler.conversation(child).unwrap().abort_requested);
+        assert!(!scheduler.conversation(parent).unwrap().abort_requested);
+        assert!(driver.get(task).unwrap().unwrap().is_terminal());
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_owned_conversation_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (parent_task, owner) = setup(&mut h);
+        let child = h
+            .ensure_task_owned_subagent(parent_task, owner, "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let nested = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.subagent_store().unwrap())
+            .save(&[Save::Create(&nested)])
+            .unwrap();
+        let ts = TaskStore::new(h.subagent_store().unwrap());
+        ts.reserve(&ts.load(parent_task).unwrap().unwrap()).unwrap();
+        h.request_abort_task(parent_task).unwrap();
+        drop(h); // crash with the parent handler reserved
+
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let mut tasks = h.attach_tasks(Default::default()).unwrap();
+        assert!(tasks.tick(0).unwrap()); // nested task cleanup
+        assert!(tasks.get(nested.id()).unwrap().unwrap().is_terminal());
+        assert!(!tasks.tick(0).unwrap()); // child conversation has not settled
+        assert!(!tasks.get(parent_task).unwrap().unwrap().is_terminal());
+        h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!h.conversation(child).unwrap().abort_requested);
+        assert!(tasks.tick(0).unwrap());
+        assert!(tasks.get(parent_task).unwrap().unwrap().is_terminal());
+    }
+
     #[test]
     fn traversal_terminates_on_ownership_cycle() {
         let dir = tempfile::tempdir().unwrap();

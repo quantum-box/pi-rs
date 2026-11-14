@@ -242,12 +242,8 @@ impl Scheduler {
                 continue;
             }
             if item.task.abort_requested() {
-                if item.task.restarts().saturating_add(1) >= item.task.restart_limit() {
-                    self.ts()
-                        .update(&item, |task| task.fail("abort restart limit".into()))?;
-                } else {
-                    self.ts().update(&item, |task| task.recover())?;
-                }
+                // Defer even restart-limit failure until owned cleanup settles.
+                self.ts().update(&item, |task| task.recover())?;
                 continue;
             }
             if !item.task.replay_safe() {
@@ -360,14 +356,59 @@ impl Scheduler {
         }
         let tasks = self.ts().list()?;
         // Children settle before their owner, including when definitions are missing.
-        if let Some(snapshot) = tasks.iter().find(|s| {
-            s.task.abort_requested()
-                && s.task.state() == &TaskState::Ready
-                && !tasks.iter().any(|child| {
-                    child.task.owner() == &TaskOwner::Task(s.task.id()) && !child.task.is_terminal()
+        let mut abortable = None;
+        for snapshot in &tasks {
+            if !snapshot.task.abort_requested()
+                || snapshot.task.state() != &TaskState::Ready
+                || tasks.iter().any(|child| {
+                    child.task.owner() == &TaskOwner::Task(snapshot.task.id())
+                        && !child.task.is_terminal()
                 })
-        }) {
+            {
+                continue;
+            }
+            // The persisted abort mark is cleared only after conversation cleanup
+            // and its foreground task descendants have settled. Read under the
+            // task gate so no new owned work can race this decision.
+            let mut pending = false;
+            for edge in crate::ownership_edge::EdgeStore::new(owner.store())
+                .children(snapshot.task.id())
+                .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+            {
+                if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                    continue;
+                }
+                let key = format!("runtime/conversation/{}", edge.edge.child);
+                let entry = owner
+                    .store()
+                    .get(key.as_bytes())
+                    .map_err(task_store::Error::from)?
+                    .ok_or(Error::Ownership)?;
+                let child: crate::runtime::Conversation =
+                    serde_json::from_slice(&entry.value).map_err(task_store::Error::from)?;
+                if child.id != edge.edge.child || edge.edge.task_owner != *snapshot.task.owner() {
+                    return Err(Error::Ownership);
+                }
+                if child.abort_requested {
+                    pending = true;
+                    break;
+                }
+            }
+            if !pending {
+                abortable = Some(snapshot);
+                break;
+            }
+        }
+        if let Some(snapshot) = abortable {
             self.poisoned = true;
+            if snapshot.task.restarts() > 0
+                && snapshot.task.restarts() >= snapshot.task.restart_limit()
+            {
+                self.ts()
+                    .update(snapshot, |task| task.fail_abort_restart())?;
+                self.poisoned = false;
+                return Ok(true);
+            }
             let abort = self
                 .registered(&snapshot.task)
                 .ok()
