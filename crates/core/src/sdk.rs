@@ -1452,7 +1452,7 @@ impl AgentSession {
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
-        let fallback_previous = self
+        let (fallback_previous, startup_error) = self
             .start_with_fallback(Some((model.clone(), name.clone())))
             .await?;
         let (previous_name, previous_level) = match fallback_previous {
@@ -1492,6 +1492,9 @@ impl AgentSession {
                 source: crate::ModelSelectSource::Set,
             })
             .await?;
+        }
+        if let Some(error) = startup_error {
+            return Err(error);
         }
         let _ = self.drain_idle_triggers().await?;
         Ok(())
@@ -1665,7 +1668,8 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        self.start_with_fallback(None).await.map(|_| ())
+        let (_, error) = self.start_with_fallback(None).await?;
+        error.map_or(Ok(()), Err)
     }
 
     // Explicit model replacement is available during startup only when the
@@ -1674,7 +1678,7 @@ impl AgentSession {
     async fn start_with_fallback(
         &mut self,
         fallback: Option<(Arc<dyn Model>, String)>,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<(Option<(String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
@@ -1716,7 +1720,7 @@ impl AgentSession {
             }
         }
         let startup = self.pending_start.lock().expect("session startup").take();
-        if let Some((reason, previous_session_file)) = startup {
+        let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
             let mut observe = |event: Notification<'_>| {
@@ -1731,12 +1735,21 @@ impl AgentSession {
                     &active.token,
                     &mut observe,
                 )
-                .await?;
-        }
+                .await
+        } else {
+            Ok(())
+        };
         drop(journal);
         drop(order);
-        let _ = self.drain_idle_triggers().await?;
-        Ok(replaced)
+        let startup_result = match startup_result {
+            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match startup_result {
+            Ok(()) => Ok((replaced, None)),
+            Err(error) if replaced.is_some() => Ok((replaced, Some(error))),
+            Err(error) => Err(error),
+        }
     }
 
     async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
@@ -3182,6 +3195,83 @@ mod tests {
             crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
         ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
         }
+        reopened.close().await.unwrap();
+    }
+
+    struct FailingStartupModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for FailingStartupModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(request.model, "model-B");
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Error::Model("startup fixture failure".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("recovered".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_startup_trigger_still_notifies_committed_model_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut original = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .open(&path)
+            .unwrap();
+        original
+            .journal()
+            .unwrap()
+            .select_model("model-A", Some("high"))
+            .unwrap();
+        original.prompt("original").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let replacement = Arc::new(FailingStartupModel(AtomicUsize::new(0)));
+        let mut reopened = SessionBuilder::new(replacement.clone(), "model-B")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        let error = reopened
+            .set_model_with_hooks(
+                replacement.clone(),
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                Some(serde_json::json!({"id":"model-A", "provider":"fixture"})),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("startup fixture failure"));
+        assert_eq!(
+            reopened.journal().unwrap().model_selection(),
+            Some(("model-B".into(), None))
+        );
+        {
+            let events = observed.lock().unwrap();
+            assert!(matches!(events.as_slice(), [
+                crate::LifecycleEvent::SessionStart { .. },
+                crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
+                crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
+            ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
+        }
+        reopened
+            .set_model_with_hooks(
+                replacement,
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(observed.lock().unwrap().len(), 3);
+        assert_eq!(reopened.prompt("next").await.unwrap(), "recovered");
         reopened.close().await.unwrap();
     }
 
