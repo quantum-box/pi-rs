@@ -191,6 +191,7 @@ scheduler provides the same view. Unlike upstream
 [`onWake`](https://github.com/earendil-works/pi/blob/c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0/packages/durable/src/harness/scheduler.ts#L566),
 notifications are hints rather than changes to `{active, at}`; polling continues,
 conversation scheduling is excluded, and inspection can wait for a handler.
-Satisfied waits count as active even when their definition is blocked, and abort
+Scheduler and driver signal delivery is fenced with inspection; direct TaskStore
+writes are outside that protocol. Satisfied waits count as active even when their definition is blocked, and abort
 cleanup candidates may still depend on conversations. Fail-fast sibling cleanup
 is not independently represented. See [snapshot tests](../crates/durable/tests/task_wake_snapshot.rs).

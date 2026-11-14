@@ -288,6 +288,12 @@ impl Driver {
     }
     pub fn signal(&self, signal: &Signal) -> Result<(), Error> {
         let _state = self.check()?;
+        let _gate = self
+            .shared
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
         TaskStore::new(self.shared.owner.store())
             .send_signal(signal)
             .map_err(task_scheduler::Error::from)?;
@@ -303,6 +309,12 @@ impl Driver {
         value: serde_json::Value,
     ) -> Result<task_store::SignalResult, Error> {
         let _state = self.check()?;
+        let _gate = self
+            .shared
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
         let result = TaskStore::new(self.shared.owner.store())
             .deliver_signal(task_id, token, key, value)
             .map_err(task_scheduler::Error::from)?;
@@ -669,6 +681,92 @@ mod tests {
         notifying.join().unwrap();
         while rx.try_recv().is_ok() {}
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn signal_delivery_waits_for_task_snapshot_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("wait", true, |_: &Task| {
+            Ok(task_scheduler::Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "wait".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::Signal("go".into()),
+                children: vec![],
+            })
+        });
+        let mut scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(Uuid::new_v4()),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("wait".into(), true);
+        scheduler.submit(&task).unwrap();
+        scheduler.tick(0).unwrap();
+        let shared = Arc::new(Shared {
+            owner: scheduler.owner(),
+            state: Mutex::new(State::default()),
+            scheduler: Mutex::new(scheduler),
+            wake: Condvar::new(),
+            harness: None,
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(None),
+            subscription: Mutex::new(None),
+        });
+        let driver = Driver {
+            shared,
+            worker: None,
+            cleanup: None,
+        };
+        let shared = driver.shared.clone();
+        let gate = shared.owner.task_gate().lock().unwrap();
+        let signal = Signal::new(Uuid::new_v4(), task.id(), "go".into(), json!(null));
+        let signal_id = signal.id;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let sender = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            driver.signal(&signal).unwrap();
+            done_tx.send(()).unwrap();
+            driver
+        });
+        started_rx.recv().unwrap();
+        // The signal holds state while it waits for the gate. Observing this
+        // lock proves the delivery attempt has reached the critical section.
+        let limit = std::time::Instant::now() + Duration::from_secs(5);
+        while shared.state.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < limit,
+                "signal bypassed the task gate"
+            );
+            thread::yield_now();
+        }
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            TaskStore::new(shared.owner.store())
+                .signal(task.id(), signal_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(gate);
+        let driver = sender.join().unwrap();
+        done_rx.recv().unwrap();
+        assert!(
+            TaskStore::new(shared.owner.store())
+                .signal(task.id(), signal_id)
+                .unwrap()
+                .is_some()
+        );
+        driver.shutdown().unwrap();
     }
 
     #[test]

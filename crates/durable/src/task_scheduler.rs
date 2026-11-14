@@ -532,6 +532,8 @@ impl Scheduler {
     }
     pub fn signal(&self, signal: &Signal) -> Result<(), Error> {
         self.check()?;
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         self.ts().send_signal(signal)?;
         Ok(())
     }
@@ -544,6 +546,8 @@ impl Scheduler {
         value: Value,
     ) -> Result<task_store::SignalResult, Error> {
         self.check()?;
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         Ok(self.ts().deliver_signal(task_id, token, key, value)?)
     }
     /// Deliver with an explicit clock value, matching `tick`'s time source.
@@ -556,6 +560,8 @@ impl Scheduler {
         now_millis: i64,
     ) -> Result<task_store::SignalResult, Error> {
         self.check()?;
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         Ok(self
             .ts()
             .deliver_signal_at(task_id, token, key, value, now_millis)?)
@@ -1636,6 +1642,54 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn wake_snapshot_respects_blocked_ancestors_and_pollable_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "missing",
+            true,
+            3,
+        );
+        parent.start().unwrap();
+        parent.wait(WaitFor::DeadlineMillis(100)).unwrap();
+        let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let before = scheduler.ts().list().unwrap();
+        let early = scheduler.wake_snapshot(99).unwrap();
+        assert!(!early.active);
+        assert_eq!(early.at, Some(100));
+        assert_eq!(early.blocked.len(), 1);
+        let due = scheduler.wake_snapshot(100).unwrap();
+        assert!(due.active);
+        assert_eq!(due.at, None);
+        assert_eq!(due.blocked.len(), 1);
+        let after = scheduler.ts().list().unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                before
+                    .iter()
+                    .map(|s| (&s.task, s.version))
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::to_value(
+                after
+                    .iter()
+                    .map(|s| (&s.task, s.version))
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
     }
 
     #[test]

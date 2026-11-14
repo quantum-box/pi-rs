@@ -720,7 +720,8 @@ The standalone task scheduler exposes the same inspection method.
 
 Inspection waits for an in-flight synchronous handler and can become stale as
 soon as it returns. Signal and child wait evaluation reads additional records;
-direct unfenced TaskStore writers are outside the consistency protocol. Abort
+driver and scheduler signal delivery is fenced by the task gate; direct unfenced
+TaskStore writers are outside the consistency protocol. Abort
 cleanup may still depend on foreground conversations, and fail-fast sibling
 cleanup is not independently represented. Unlike upstream `onWake`, hints are
 not a change-only `{active, at}` callback, and the snapshot covers generic tasks
