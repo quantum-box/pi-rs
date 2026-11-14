@@ -7259,7 +7259,40 @@ mod tests {
                 view.remote_task.is_some(),
                 "committed logout must remain observed"
             );
+            // Hold the session-store lock so the post-revocation cleanup is
+            // deterministically still in progress when the gate is released.
+            let session_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.path().join("chatgpt-sessions.lock"))
+                .unwrap();
+            session_lock.lock().unwrap();
             release_tx.send(()).unwrap();
+            // `started_rx` means logout already owns the auth lock. Reading
+            // through that lock waits for durable local removal, keeping slow
+            // filesystem syncs outside the event-delivery deadline below.
+            let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+            let auth_path = directory.path().join("auth.json");
+            let reader = std::thread::spawn(move || {
+                let _ = cleared_tx.send(super::super::config::read_object(&auth_path));
+            });
+            assert!(matches!(
+                cleared_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(matches!(
+                view.remote_task.as_ref().unwrap().receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(session_lock);
+            let auth = cleared_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            reader.join().unwrap();
+            assert!(auth.get("openai-chatgpt").is_none());
             let task = view.remote_task.take().unwrap();
             assert!(matches!(
                 task.receiver
