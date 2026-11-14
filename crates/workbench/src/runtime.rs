@@ -325,14 +325,17 @@ impl Runtime {
                 );
             }
         }
-        self.shell.set_context(ShellContext {
-            id: session_id,
-            path: (!args.no_session && !args.ephemeral_worker_session)
-                .then(|| args.session.clone()),
-            provider: args.provider.id().into(),
-            model: args.model.clone(),
-            reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-        });
+        self.shell.set_context_with_external_id(
+            ShellContext {
+                id: session_id,
+                path: (!args.no_session && !args.ephemeral_worker_session)
+                    .then(|| args.session.clone()),
+                provider: args.provider.id().into(),
+                model: args.model.clone(),
+                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+            },
+            session.external_session_id(),
+        );
         self.auto_compaction.set_token_settings(
             args.settings
                 .compaction_tokens(args.provider.id(), &args.model),

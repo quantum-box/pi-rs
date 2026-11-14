@@ -3838,6 +3838,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn model_shell_receives_external_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default();
+        config.set_context_with_external_id(
+            ShellContext {
+                id: uuid::Uuid::new_v4(),
+                path: None,
+                provider: "fixture".into(),
+                model: "model".into(),
+                reasoning_level: None,
+            },
+            "legacy 日本語".into(),
+        );
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"printf '%s' \"$PI_SESSION_ID\""}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.script, "legacy 日本語");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failing_shell_spawn_hook_stops_execution() {
         let root = tempfile::tempdir().unwrap();
         let config = ShellConfig::default()

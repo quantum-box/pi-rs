@@ -63,11 +63,14 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
         if stem == query {
             return Ok(path);
         }
-        let id = stored_id(&path).unwrap_or_default();
-        if id == query {
+        let (external_id, native_id) = stored_ids(&path).unwrap_or_default();
+        let ids = [Some(external_id.as_str()), native_id.as_deref()];
+        if ids.iter().flatten().any(|id| *id == query) {
             exact_ids.push(path.clone());
         }
-        if !explicit_filename && (stem.starts_with(query) || id.starts_with(query)) {
+        if !explicit_filename
+            && (stem.starts_with(query) || ids.iter().flatten().any(|id| id.starts_with(query)))
+        {
             matches.push(path);
         }
     }
@@ -131,16 +134,52 @@ fn sort_by_activity(paths: &mut [PathBuf]) {
     });
 }
 
-fn stored_id(path: &Path) -> Option<String> {
+fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     use std::io::{BufRead, Read};
     let mut line = String::new();
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?).take(1024 * 1024);
-    reader.read_line(&mut line).ok()?;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    reader
+        .by_ref()
+        .take(1024 * 1024)
+        .read_line(&mut line)
+        .ok()?;
     let record: serde_json::Value = serde_json::from_str(&line).ok()?;
-    record["event"]["session_id"]
-        .as_str()
-        .or_else(|| record["id"].as_str())
-        .map(str::to_owned)
+    let Some(native_id) = record["event"]["session_id"].as_str() else {
+        return record["id"].as_str().map(|id| (id.to_owned(), None));
+    };
+    let fallback = || Some((native_id.to_owned(), None));
+    if record["event"]["type"] != "created" || record["id"] != 1 {
+        return fallback();
+    }
+    line.clear();
+    // The external ID is the first imported record. Bound the read to the
+    // journal's maximum record size and verify ownership, including on forks.
+    if reader
+        .by_ref()
+        .take(16 * 1024 * 1024 + 1)
+        .read_line(&mut line)
+        .is_err()
+        || line.len() > 16 * 1024 * 1024
+    {
+        return fallback();
+    }
+    let Ok(next) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return fallback();
+    };
+    let event = &next["event"];
+    if next["id"] == 2
+        && next["parent"] == 1
+        && event["type"] == "source_entry"
+        && event["format"] == "pi-rs:external-session-id"
+        && event["entry"]["native_id"].as_str() == Some(native_id)
+        && let Some(id) = event["entry"]["id"].as_str()
+    {
+        return Some((
+            id.to_owned(),
+            (id != native_id).then(|| native_id.to_owned()),
+        ));
+    }
+    fallback()
 }
 
 #[derive(Serialize)]
@@ -1139,6 +1178,49 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_resolves_external_and_native_ids_without_following_fork_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().join("pi.jsonl");
+        std::fs::write(
+            &input,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"legacy-resume-id\"}\n",
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&input).unwrap();
+        let native_id = imported.session_id().to_string();
+        let output = root.path().join("native.jsonl");
+        imported.export_jsonl(&output).unwrap();
+        let before = std::fs::read(&output).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume-id"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new(&native_id), root.path()).unwrap(),
+            output
+        );
+        let fork = Session::from_records(imported.fork_records(imported.head()).unwrap()).unwrap();
+        let fork_path = root.path().join("fork.jsonl");
+        fork.export_jsonl(&fork_path).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume-id"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new(&fork.session_id().to_string()), root.path()).unwrap(),
+            fork_path
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), before);
+        std::fs::copy(&output, root.path().join("duplicate.jsonl")).unwrap();
+        assert!(resolve_reference(Path::new("legacy-resume-id"), root.path()).is_err());
+    }
     #[tokio::test]
     async fn radius_share_uses_configured_proxy() {
         let root = tempfile::tempdir().unwrap();
@@ -1208,6 +1290,44 @@ mod tests {
             entries[1]["data"]["tools"][0],
             serde_json::json!({"name":"read","description":"Read a file","parameters":{"type":"object"}})
         );
+    }
+
+    #[tokio::test]
+    async fn radius_share_uses_external_id_with_native_snapshot_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"share-legacy-id\"}\n",
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "snapshot".into(),
+                tools: vec![],
+            },
+        };
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+            .unwrap();
+        let (_, _, body) = server.await.unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(body.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["id"], "share-legacy-id");
     }
 
     #[tokio::test]

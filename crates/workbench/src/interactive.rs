@@ -3262,9 +3262,8 @@ fn slash(
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        let mut document = super::ui::session_search::Document::new(
-                            session.name().unwrap_or_default().into(),
-                            session.session_id().to_string(),
+                        let mut document = super::ui::session_search::Document::from_session(
+                            &session,
                             cwd.into(),
                             messages,
                             local,
