@@ -5674,10 +5674,10 @@ impl Scheduler {
         self.cancel.cancel();
         self.reporter_cancel.cancel();
         let mut error = None;
-        if let Some(reporter) = self.reporter.take() {
-            if let Err(e) = reporter.await {
-                error = Some(Error::Invalid(format!("reporter task failed: {e}")));
-            }
+        if let Some(reporter) = self.reporter.take()
+            && let Err(e) = reporter.await
+        {
+            error = Some(Error::Invalid(format!("reporter task failed: {e}")));
         }
         let tasks = std::mem::take(&mut self.tasks);
         for task in tasks.into_values().flatten() {

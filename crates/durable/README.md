@@ -74,6 +74,11 @@ direct-child waits use persistent task state. Hosts must register definitions
 again after reopening. `reset` preserves older observation records and can
 carry handoff text; busy resets are queued until a safe boundary.
 
+`RuntimeOwner::open` installs extension and task registries before recovering
+conversations, and owns both the scheduler and driver. Await `shutdown` to join
+conversation and task workers and release the store. Handlers must eventually
+return; provider adapters and managed subagents still use the lower-level setup.
+
 For a finite catch-up on the standalone `observer::Observer`, capture `head()`
 and page with `read_through(processed, head, limit)`, persisting both cursors
 after processing. The boundary remains fixed across later appends and reopening;
