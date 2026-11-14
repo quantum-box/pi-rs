@@ -324,7 +324,8 @@ impl NestedHost {
         if !valid_key(key) {
             return self.fail("invalid nested call key");
         }
-        self.call_inner(Some(key), name, arguments, false, true).await
+        self.call_inner(Some(key), name, arguments, false, true)
+            .await
     }
     /// Admit up to eight distinct keyed calls in order, then poll their persisted
     /// pending jobs concurrently. The parent remains active until all polls stop.
@@ -347,7 +348,10 @@ impl NestedHost {
         let _serial = match self.serial.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                return vec![self.fail("concurrent nested calls have no stable order"); calls.len()];
+                return vec![
+                    self.fail("concurrent nested calls have no stable order");
+                    calls.len()
+                ];
             }
         };
         let mut outcomes = Vec::with_capacity(calls.len());
@@ -538,7 +542,9 @@ impl NestedHost {
             Ok(active) => active,
             Err(outcome) => return outcome,
         };
-        let _serial = if serial_held { None } else {
+        let _serial = if serial_held {
+            None
+        } else {
             match self.serial.try_lock() {
                 Ok(guard) => Some(guard),
                 Err(_) => return self.fail("concurrent nested calls have no stable order"),
