@@ -9058,6 +9058,7 @@ impl SummaryPlacementDriver {
                             | Phase::OnYield { .. }
                             | Phase::YieldDecision { .. }
                             | Phase::YieldTasksWaiting { .. }
+                            | Phase::HookTasksWaiting { turns: Some(_), .. }
                     ) && state.active.is_some()
                         || matches!(
                             state.phase,

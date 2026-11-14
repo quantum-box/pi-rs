@@ -599,12 +599,15 @@ stale-submission API.
 `Scheduler::request_busy_independent_compaction` accepts a conversation while
 a single model request is running, with no queued inputs or resets at selection.
 It persists a bounded selection snapshot. When summarization completes during
-an active model request, on-yield or after-run hook, their parked task waits,
-or at idle, it checks the source prefix, context generation, original submission and write identities, and configuration.
+an active model request, on-yield or after-run hook, a parked lifecycle hook
+task, or at idle, it checks the source prefix, context generation, original
+submission and write identities, and configuration.
 This permits append-only model progress and fenced model restarts, while queued
-inputs, resets and application writes are ordered against the summary. A reset preceding the summary
-is placed first and makes the summary stale; queued inputs follow the selected
-writes. The placement ticket records the version at summary admission and
+inputs, resets and application writes are ordered against the summary. An
+after-tools task's result settles the tool round before placement; a tool
+handoff starts its new context first and makes the older summary stale. A
+queued reset preceding the summary is placed first and makes the summary stale;
+queued inputs follow the selected writes. The placement ticket records the version at summary admission and
 commits with the conversation's pending marker. Later writes follow that marker.
 The marker and its preceding reset IDs survive reopen. Conversation abort
 withdraws queued inputs but preserves a summary already admitted as a write;
@@ -616,9 +619,9 @@ it down after the scheduler. Task replay follows the registered handler policy;
 external task effects still require stable idempotency and reconciliation.
 
 This is not a general ordered inbox: a changed context, changed selected
-identities or configuration, an unsupported phase such as an after-tools task
-wait, or an old operation without a selection checkpoint settles stale. The selection and hook snapshots share a 512 KiB limit, and at
-most 128 preceding resets can be ordered. `wait_independent_compaction` may
+identities or configuration, another unsupported phase, or an old operation
+without a selection checkpoint settles stale. The selection and hook
+snapshots share a 512 KiB limit, and at most 128 preceding resets can be ordered. `wait_independent_compaction` may
 return `Running` while boundary placement is pending; inspect its status after
 the conversation reaches the boundary. On-yield decisions are checkpointed
 before inbox selection, so an admission race does not repeat a completed hook.

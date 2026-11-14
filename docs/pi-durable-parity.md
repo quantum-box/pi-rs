@@ -183,9 +183,11 @@ intervening changes retain the original submission and write identities and
 configuration; the context generation and selected source prefix must also
 match. Append-only model progress and fenced model restarts can therefore use a
 later conversation version for the atomic placement ticket and pending marker
-while the model is running, in on-yield or after-run hooks and their parked
-task waits, or at idle. The summary-and-task recovery constructor installs
-both registries before scheduling. After-tools task waits remain unsupported.
+while the model is running, in on-yield or after-run hooks, in parked lifecycle
+hook task waits, or at idle. Direct after-tools hook execution remains
+unsupported. A parked after-tools task settles the round first; a tool handoff
+changes context before the boundary and makes an older summary stale. The
+summary-and-task recovery constructor installs both registries before scheduling.
 On-yield decisions are checkpointed before inbox
 selection; an admission race does not rerun a completed hook. A crash before
 the checkpoint can replay it, so external effects require memo/idempotency.
