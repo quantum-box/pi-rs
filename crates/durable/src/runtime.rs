@@ -531,6 +531,20 @@ fn terminate_tool_round(c: &mut Conversation) -> Result<Phase, Error> {
 }
 
 impl Conversation {
+    pub(crate) fn active_tool_attempt(&self) -> Option<ToolAttempt> {
+        if self.abort_requested
+            || !matches!(
+                self.phase,
+                Phase::ToolRunning {
+                    replay_ready: false,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        self.tool_attempt()
+    }
     pub(crate) fn admit_initial_input(&mut self, id: Uuid, content: String) {
         self.submissions.push(Submission {
             kind: SubmissionKind::Input,

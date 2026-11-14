@@ -75,6 +75,10 @@ pub struct Task {
     #[serde(default)]
     input: Value,
     state: TaskState,
+    /// Identity of the current scheduler reservation; legacy and standalone
+    /// task records may have none. This is not by itself an executor lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<Uuid>,
     /// Consecutive recoveries since the last changed checkpoint.
     restarts: u32,
     restart_limit: u32,
@@ -127,6 +131,7 @@ impl Task {
             definition_version: 1,
             input: Value::Null,
             state: TaskState::Ready,
+            attempt_id: None,
             restarts: 0,
             restart_limit,
             delivered_signal: None,
@@ -258,7 +263,18 @@ impl Task {
             return Err(TransitionError::RestartLimit);
         }
         self.state = TaskState::Running;
+        self.attempt_id = None;
         Ok(())
+    }
+
+    pub(crate) fn start_attempt(&mut self, attempt_id: Uuid) -> Result<(), TransitionError> {
+        self.start()?;
+        self.attempt_id = Some(attempt_id);
+        Ok(())
+    }
+
+    pub(crate) fn attempt_id(&self) -> Option<Uuid> {
+        self.attempt_id
     }
 
     /// Explicitly recover a persisted running task after the host establishes
@@ -267,12 +283,14 @@ impl Task {
         self.require_running()?;
         self.restarts = self.restarts.saturating_add(1);
         self.state = TaskState::Ready;
+        self.attempt_id = None;
         Ok(())
     }
 
     pub(crate) fn yield_ready(&mut self) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Ready;
+        self.attempt_id = None;
         Ok(())
     }
 
@@ -316,6 +334,7 @@ impl Task {
         self.delivered_signal = None;
         self.typed_wake = None;
         self.state = TaskState::Waiting(condition);
+        self.attempt_id = None;
         Ok(())
     }
 
@@ -337,6 +356,7 @@ impl Task {
     pub fn succeed(&mut self, result: Value) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Succeeded(result);
+        self.attempt_id = None;
         self.typed_wake = None;
         Ok(())
     }
@@ -344,6 +364,7 @@ impl Task {
     pub fn fail(&mut self, reason: String) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Failed(reason);
+        self.attempt_id = None;
         self.typed_wake = None;
         Ok(())
     }
@@ -366,6 +387,7 @@ impl Task {
             return Err(TransitionError::InvalidState);
         }
         self.state = TaskState::Cancelled;
+        self.attempt_id = None;
         self.typed_wake = None;
         Ok(())
     }

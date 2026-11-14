@@ -465,7 +465,9 @@ impl Scheduler {
                 }
             }
         }
-        next.task.start().map_err(Error::Transition)?;
+        next.task
+            .start_attempt(Uuid::new_v4())
+            .map_err(Error::Transition)?;
         self.poisoned = true;
         self.ts().save(&[Save::Update(&next)])?;
         Ok(true)
