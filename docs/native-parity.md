@@ -109,8 +109,9 @@ identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
 external ID. RPC state and session statistics project the external ID; UI and
 share identity projection still uses the internal UUID.
 Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
-header bytes and whitespace normalization; unrepresentable or invalid values
-fail before dispatch when affinity is enabled.
+header bytes and whitespace normalization. Unrepresentable or invalid values
+fail before dispatch when an affinity default is needed; explicit headers win
+without validating an unused default.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
