@@ -2107,6 +2107,7 @@ impl Harness {
                         .cloned()
                     {
                         if !write.withdrawn
+                            && state.pending_independent_summary.is_none()
                             && write
                                 .after_reset
                                 .is_some_and(|id| state.resets.iter().any(|r| r.id == id))
@@ -2923,6 +2924,7 @@ impl Harness {
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
             || !state.pending_resets.is_empty()
+            || state.pending_independent_summary.is_some()
             || state
                 .submissions
                 .iter()
@@ -2995,6 +2997,7 @@ impl Harness {
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
             || !state.pending_resets.is_empty()
+            || state.pending_independent_summary.is_some()
         {
             return Err(Error::Invalid(
                 "fork requires a settled conversation".into(),
@@ -4636,6 +4639,11 @@ impl Harness {
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && state.pending_resets.is_empty()
+                && state.pending_independent_summary.is_none()
+                && !state
+                    .application_writes
+                    .iter()
+                    .any(|w| !w.placed && !w.withdrawn)
                 && !state.submissions.iter().any(|s| s.status == Status::Queued)
             {
                 place_reset(&mut state, marker.clone());
@@ -4693,7 +4701,12 @@ impl Harness {
                 request_id: request_id.clone(),
                 kind: kind.clone(),
                 data: data.clone(),
-                placed: c.pending_resets.is_empty(),
+                placed: c.pending_resets.is_empty()
+                    && c.pending_independent_summary.is_none()
+                    && !c
+                        .application_writes
+                        .iter()
+                        .any(|w| !w.placed && !w.withdrawn),
                 withdrawn: false,
                 after_reset,
             };
@@ -5063,6 +5076,11 @@ impl Harness {
             let sid = Uuid::new_v4();
             let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
                 && c.active.is_none()
+                && c.pending_independent_summary.is_none()
+                && !c
+                    .application_writes
+                    .iter()
+                    .any(|w| !w.placed && !w.withdrawn)
                 && c.pending_resets.is_empty()
                 && !c
                     .submissions
@@ -5185,7 +5203,13 @@ impl Harness {
             if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
-            if c.active.is_some() || !matches!(c.phase, Phase::Idle | Phase::FailedIdle) {
+            if c.active.is_some()
+                || c.pending_independent_summary.is_some()
+                || c.application_writes
+                    .iter()
+                    .any(|w| !w.placed && !w.withdrawn)
+                || !matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+            {
                 return Err(AdmissionError::Busy.into());
             }
             for marker in std::mem::take(&mut c.pending_resets) {
@@ -5414,9 +5438,18 @@ impl Harness {
                 }
                 state.abort_requested = true;
             }
+            let pending_writes: std::collections::HashMap<Uuid, Uuid> = states
+                .iter()
+                .filter_map(|(state, _)| {
+                    state
+                        .pending_independent_summary
+                        .as_ref()
+                        .map(|marker| (marker.id, state.id))
+                })
+                .collect();
             let (summary_checks, summary_mutations) =
                 crate::summary_store::SummaryStore::new(store)
-                    .prepare_owned_abort(&conversations)
+                    .prepare_owned_abort(&conversations, &pending_writes)
                     .map_err(|error| {
                         if matches!(error, crate::summary_store::Error::Store(_)) {
                             self.storage_failed.store(true, Ordering::Release);
@@ -5811,10 +5844,20 @@ impl Harness {
         let summaries = crate::summary_store::SummaryStore::new(self.owner.store())
             .list()
             .map_err(|e| Error::Invalid(format!("summary abort lookup: {e}")))?;
-        if let Some(summary) = summaries
-            .into_iter()
-            .find(|s| s.operation.session_id() == c.id && s.operation.is_live_owned())
-        {
+        if let Some(summary) = summaries.into_iter().find(|s| {
+            s.operation.session_id() == c.id
+                && s.operation.is_live_owned()
+                && !c
+                    .pending_independent_summary
+                    .as_ref()
+                    .is_some_and(|marker| {
+                        marker.id == s.operation.id()
+                            && matches!(
+                                s.operation.state(),
+                                crate::summary_store::State::PlacementPending { .. }
+                            )
+                    })
+        }) {
             if !matches!(
                 summary.operation.state(),
                 crate::summary_store::State::Aborting { .. }
@@ -6215,10 +6258,9 @@ impl Harness {
         store
             .placement_ticket(&snap)
             .map_err(|e| Error::Invalid(format!("summary: {e}")))?;
-        let placed = state.submissions.len() == marker.submissions
-            && state.application_writes.len() == marker.writes
+        let placed = state.submissions.len() >= marker.submissions
+            && state.application_writes.len() >= marker.writes
             && state.resets.len() == marker.resets
-            && state.pending_resets.is_empty()
             && !state.abort_requested
             && state.content_blocks.is_empty()
             && !result.is_stale(&state.messages, state.context_generation);
@@ -6284,6 +6326,28 @@ impl Harness {
                     other => other?,
                 }
                 continue;
+            }
+            if c.pending_independent_summary.is_none()
+                && matches!(
+                    c.phase,
+                    Phase::Boundary { .. } | Phase::Idle | Phase::FailedIdle
+                )
+            {
+                let preceding_reset = c.resets.last().map(|reset| reset.id);
+                let mut changed = false;
+                for write in &mut c.application_writes {
+                    if !write.placed && !write.withdrawn && write.after_reset == preceding_reset {
+                        write.placed = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    match self.save(&c, Expected::Version(version)) {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
+                    continue;
+                }
             }
             if self.prepare_nested_resume(&mut c)? {
                 match self.save(&c, Expected::Version(version)) {

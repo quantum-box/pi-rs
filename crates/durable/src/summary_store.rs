@@ -427,6 +427,7 @@ impl<'a> SummaryStore<'a> {
     pub(crate) fn prepare_owned_abort(
         &self,
         conversations: &std::collections::HashSet<Uuid>,
+        pending_writes: &std::collections::HashMap<Uuid, Uuid>,
     ) -> Result<(Vec<Check>, Vec<Mutation>), Error> {
         let mut checks = Vec::new();
         let mut mutations = Vec::new();
@@ -442,6 +443,15 @@ impl<'a> SummaryStore<'a> {
             if !conversations.contains(&snap.operation.session_id)
                 || !snap.operation.is_live_owned()
             {
+                continue;
+            }
+            if pending_writes.get(&snap.operation.id) == Some(&snap.operation.session_id)
+                && matches!(snap.operation.state, State::PlacementPending { .. })
+            {
+                checks.push(Check {
+                    key: Self::key(snap.operation.id),
+                    expected: Expected::Version(snap.version),
+                });
                 continue;
             }
             if matches!(snap.operation.state, State::Aborting { .. }) {

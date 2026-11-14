@@ -600,15 +600,17 @@ stale-submission API.
 while a single model request is running, with no queued inputs or resets. The
 summary must finish before that conversation snapshot changes. Its completed
 result is atomically registered as a pending conversation write and decided at
-the next boundary. Inputs, resets, or application writes admitted after that
-registration conservatively make it stale. The same is true if its context
-generation or source prefix changes. This is narrower than upstream's ordered
-inbox: it does not place a summary around competing admissions. Conversation
-abort still aborts the pending operation, including its already queued write,
-an intentional difference from upstream. Recovery requires the matching
-provider identity. `wait_independent_compaction` may return `Running` after
-the summary worker finishes while boundary placement is still pending; use
-`independent_compaction_status` after the conversation reaches its boundary.
+the next boundary. Inputs, resets and application writes admitted after the
+marker follow its placement; application writes are held until that boundary.
+A changed context generation or source prefix settles the summary stale.
+Conversation abort withdraws queued inputs but preserves the pending summary
+and application writes. A separately requested operation abort still cancels
+the summary. This does not implement upstream's general ordered inbox: work
+admitted before summary completion changes the selected version and makes the
+summary stale. Recovery requires the matching provider identity.
+`wait_independent_compaction` may return `Running` after the summary worker
+finishes while boundary placement is pending; inspect its status after the
+conversation reaches the boundary.
 
 `Scheduler::request_idle_independent_compaction` starts an independent summary
 for an idle conversation. Supply and retain a
@@ -622,9 +624,10 @@ reopen. Selected `beforeCompact` hooks run from a persisted admission snapshot
 with operation-scoped durable memo; the first decision wins. Use
 `request_idle_independent_compaction_with_instructions` for optional
 instructions. Admission checks the conversation's own phase and queue, not
-activity in its owned tasks or descendants. Conversation abort marks owned
+activity in its owned tasks or descendants. Conversation abort marks running owned
 independent operations atomically and waits for their cancellation and usage
-settlement; foreground idle waits include them. Hook replay after interruption
+settlement; an already queued summary write is preserved. Foreground idle waits
+include them. Hook replay after interruption
 may execute the hook again, as on the existing manual path. Recovery requires
 the selected extensions and matching summary provider identity.
 
@@ -636,13 +639,13 @@ if scheduler.request_idle_independent_compaction(conversation, operation, 0)? {
 }
 ```
 
-The independent placement accepts only an idle context at the exact version
-captured at preparation; a change settles the operation stale. The context edit
+Idle independent placement accepts only the exact context version captured
+at preparation; a change settles the operation stale. The context edit
 and terminal status commit together. Before an eligible placement decision,
 the internal path atomically stores a version-fenced pending state and an
 immutable placement-admission ticket. Its store commit sequence survives
 reopen and can be compared with tracked conversation commits. This is an
-ordering prerequisite, not yet a shared inbox or busy admission path.
+ordering boundary for the narrow busy path, not a general shared inbox.
 Placement limits transcript records and
 processed payload sizes, but the storage API still materializes individual
 entries before their sizes can be checked. `Scheduler::open_with_summary_recovery`

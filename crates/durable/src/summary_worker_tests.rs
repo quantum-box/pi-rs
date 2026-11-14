@@ -368,7 +368,7 @@ async fn concurrent_summary_admission_invalidates_graph_abort_snapshot() {
     started(&model).await;
     let owner = scheduler.harness.owner.clone();
     let (checks, mutations) = SummaryStore::new(owner.store())
-        .prepare_owned_abort(&[conversation].into_iter().collect())
+        .prepare_owned_abort(&[conversation].into_iter().collect(), &Default::default())
         .unwrap();
     let second = request_public(&mut scheduler, conversation)
         .unwrap()
