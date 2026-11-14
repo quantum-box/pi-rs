@@ -4243,3 +4243,10 @@ tool styling and preview limits, so a long output may hide its status until expa
 Shell transcript rendering strips terminal escape sequences and normalizes line
 endings, including for imported and extension-provided output; journal and
 model-context text retain the original bytes.
+
+### Model listing search checkpoint
+
+`--list-models` searches provider and model IDs with Pi's tokenized fuzzy
+matching, including the ASCII letter/number swap (for example `p2` matches
+`nova-2p`). Display names alone do not match. The native JSON listing remains
+available; model scope and picker selection retain their existing behavior.
