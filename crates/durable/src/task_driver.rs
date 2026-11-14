@@ -125,11 +125,7 @@ impl Driver {
                     .unwrap_or_default()
                     .as_millis()
                     .min(i64::MAX as u128) as i64;
-                let result = task_shared
-                    .scheduler
-                    .lock()
-                    .map_err(|_| "task scheduler lock poisoned".to_string())
-                    .and_then(|mut scheduler| scheduler.tick(now).map_err(|e| e.to_string()));
+                let result = task_shared.tick_and_record_failure(now);
                 match result {
                     Ok(true) => {
                         task_shared.notify_host();
@@ -517,9 +513,27 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 impl Shared {
+    // Publish a failed tick before releasing the scheduler mutex. Otherwise a
+    // quiescent commit can slip between an unpoisoned tick error and stop.
+    fn tick_and_record_failure(&self, now: i64) -> Result<bool, String> {
+        let mut scheduler = self
+            .scheduler
+            .lock()
+            .map_err(|_| "task scheduler lock poisoned".to_string())?;
+        let result = scheduler.tick(now).map_err(|e| e.to_string());
+        if let Err(error) = &result {
+            if let Ok(mut state) = self.state.lock() {
+                state.failure = Some(error.clone());
+                state.stop = true;
+            }
+        }
+        result
+    }
+
     /// Commit only while the driver owns no executing scheduler handler. The
-    /// scheduler mutex is held through the conversation lease's checked commit;
-    /// try-lock avoids waiting while holding any conversation/task fence. The
+    /// scheduler mutex is held through the conversation lease's checked commit.
+    /// The caller must hold no conversation worker, poll, registry, or task gate;
+    /// try-lock only avoids waiting for the scheduler, not the other fences. The
     /// stopped flag is checked at entry; shutdown may race an already-started
     /// commit. This cannot join detached work or authorize external effects.
     #[allow(dead_code)]
@@ -900,6 +914,65 @@ mod tests {
         assert!(matches!(
             executor_handoff::checks(scheduler.owner().store(), &next),
             Err(executor_handoff::Error::Stale)
+        ));
+    }
+
+    #[test]
+    fn tick_failure_stops_quiescent_commits_even_before_reservation() {
+        use crate::executor_handoff::Binding;
+        use crate::runtime::ToolAttempt;
+        use durable_store::{Check, Expected, Mutation};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), Default::default()).unwrap();
+        let owner = scheduler.owner();
+        // Malformed task data makes tick fail during its initial scan, before
+        // any reservation sets the scheduler's own poisoned flag.
+        owner
+            .store()
+            .commit(
+                &[Check {
+                    key: task_store::key(Uuid::from_u128(10)),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: task_store::key(Uuid::from_u128(10)),
+                    value: b"invalid".to_vec(),
+                }],
+            )
+            .unwrap();
+        let shared = Shared {
+            owner,
+            scheduler: Mutex::new(scheduler),
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            harness: None,
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(None),
+            subscription: Mutex::new(None),
+        };
+        assert!(shared.tick_and_record_failure(0).is_err());
+        assert!(shared.scheduler.lock().unwrap().check().is_ok());
+        assert!(shared.state.lock().unwrap().failure.is_some());
+        let binding = Binding {
+            conversation: Uuid::from_u128(1),
+            tool: ToolAttempt {
+                operation_id: Uuid::from_u128(2),
+                attempt_id: Uuid::from_u128(3),
+            },
+            task: Uuid::from_u128(4),
+            task_attempt: Uuid::from_u128(5),
+        };
+        assert!(matches!(
+            shared.try_quiescent_commit(
+                binding,
+                task_store::OwnedBatch {
+                    checks: vec![],
+                    mutations: vec![],
+                }
+            ),
+            Err(QuiescentError::Stopped)
         ));
     }
 
