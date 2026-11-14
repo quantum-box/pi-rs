@@ -108,7 +108,10 @@ mod unix {
     fn secure_dir(file: &File) -> io::Result<()> {
         let meta = file.metadata()?;
         // SAFETY: geteuid has no arguments or preconditions.
-        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o777 != 0o700
+        {
             return Err(invalid());
         }
         reject_extended_acl(file)
@@ -349,6 +352,7 @@ mod unix {
         /// Invalidates the last generation before runtime preparation. The
         /// exclusive lock remains held until the generation is dropped.
         pub fn begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+            secure_dir(&self.directory)?;
             let lock = self.lock(path, &binding, true)?;
             lock.lock()?;
             let name = name_for(&self.key, path, binding.session_id, "json")?;
@@ -365,6 +369,7 @@ mod unix {
         /// A missing, busy, mismatched, malformed, or old-format entry is a
         /// cache miss. Caller determines how to reconstruct a legacy session.
         pub fn read(&self, path: &Path, binding: &Binding) -> io::Result<Option<Value>> {
+            secure_dir(&self.directory)?;
             let lock = match self.lock(path, binding, false) {
                 Ok(lock) => lock,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -733,6 +738,25 @@ mod tests {
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         assert!(store.read(path, &binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_directory_without_invalidation_permission_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        let store = Store::open(root.path()).unwrap();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(store.read(path, &binding).is_err());
+        assert!(Store::open_existing(root.path()).is_err());
+        assert!(Store::open(root.path()).is_err());
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
