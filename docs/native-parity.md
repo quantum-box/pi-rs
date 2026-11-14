@@ -345,6 +345,11 @@ compact. Lists containing only block elements still need comparison.
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
+styling and the same terminal-dependent behavior. Bare URLs stop before CJK
+punctuation while explicit links retain it in their destination. Markdown syntax
+that the underlying parser treats as formatting inside a bare URL can still
+split the link; explicit links avoid that limitation.
 Wrapped link fragments are closed on every rendered line, and control characters
 in destinations cannot enter terminal escape sequences. Fullscreen clicks on
 visible links launch the platform handler without a shell; dragging selects text

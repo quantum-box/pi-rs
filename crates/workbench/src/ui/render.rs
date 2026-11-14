@@ -871,6 +871,80 @@ fn safe_hyperlink(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(char::is_control)
 }
 
+// Pi's GFM tokenizer links bare URLs and emails, but stops URLs at CJK
+// punctuation. Explicit Markdown links are handled separately by the parser.
+fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
+    static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?:(?i:https?://|ftp://)|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*|[A-Za-z0-9._+-]+@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+").unwrap()
+    });
+    static CJK_PUNCT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"[\p{P}&&[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}\p{scx=Bopomofo}]]|[，．：；！？（）［］｛｝“”‘’…—]").unwrap()
+    });
+    let mut links = Vec::new();
+    let mut offset = 0;
+    while let Some(found) = URL.find_at(text, offset) {
+        let start = found.start();
+        let mut end = found.end();
+        let candidate = &text[start..end];
+        let email = !candidate.contains("://") && !candidate.starts_with("www.");
+        if !email {
+            if let Some(punctuation) = CJK_PUNCT.find(candidate) {
+                end = start + punctuation.start();
+            }
+            // An unmatched opening parenthesis is outside marked's URL token.
+            // Stop there before trimming any punctuation immediately before it.
+            let mut scan = start;
+            while let Some(relative) = text[scan..end].find('(') {
+                let open = scan + relative;
+                if let Some(close) = text[open + 1..end].find(')') {
+                    scan = open + 1 + close + 1;
+                } else {
+                    end = open;
+                    break;
+                }
+            }
+            // Marked's backpedal excludes trailing punctuation, while keeping
+            // a closing parenthesis that belongs to a balanced URL path.
+            let value = &text[start..end];
+            let opens = value.bytes().filter(|b| *b == b'(').count();
+            let mut closes = value.bytes().filter(|b| *b == b')').count();
+            loop {
+                let value = &text[start..end];
+                let Some(last) = value.chars().last() else {
+                    break;
+                };
+                let remove = matches!(
+                    last,
+                    '?' | '!' | '.' | ',' | ':' | ';' | '*' | '_' | '\'' | '"' | '~' | '&'
+                ) || (last == ')' && closes > opens);
+                if !remove {
+                    break;
+                }
+                if last == ')' {
+                    closes -= 1;
+                }
+                end -= last.len_utf8();
+            }
+        } else if text[end..].starts_with(['-', '_']) {
+            offset = found.end();
+            continue;
+        }
+        if end > start {
+            let label = &text[start..end];
+            let href = if email {
+                format!("mailto:{label}")
+            } else if label.starts_with("www.") {
+                format!("http://{label}")
+            } else {
+                label.to_owned()
+            };
+            links.push((start..end, href));
+        }
+        offset = end.max(start + 1);
+    }
+    links
+}
+
 fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
     let line = source.trim_start_matches(' ');
     let bytes = line.as_bytes();
@@ -953,7 +1027,8 @@ fn markdown_at_depth(
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
-    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+    let mut events = Parser::new_ext(text, options).into_offset_iter().peekable();
+    while let Some((event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
                 Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
@@ -962,6 +1037,7 @@ fn markdown_at_depth(
             }
             continue;
         }
+        let is_text = matches!(&event, Event::Text(_));
         match event {
             Event::Start(Tag::Paragraph) if lists.is_empty() => {
                 if let Some(end) = previous_paragraph_end.take()
@@ -1229,6 +1305,22 @@ fn markdown_at_depth(
                 if code.is_some() {
                     code_text.push_str(&content);
                 } else {
+                    let mut merged = content.into_string();
+                    if is_text
+                        && links.is_empty()
+                        && text.get(range.clone()) == Some(merged.as_str())
+                    {
+                        while let Some((Event::Text(next), next_range)) = events.peek() {
+                            if next_range.start != range.end
+                                || text.get(next_range.clone()) != Some(next.as_ref())
+                            {
+                                break;
+                            }
+                            merged.push_str(next);
+                            range.end = next_range.end;
+                            events.next();
+                        }
+                    }
                     let preceding = text.as_bytes()[..range.start]
                         .iter()
                         .rev()
@@ -1237,9 +1329,9 @@ fn markdown_at_depth(
                     let displayed = if preserve_source && preceding % 2 == 1 {
                         &text[range.start - 1..range.end]
                     } else if preserve_source && text[range.clone()].starts_with('\\') {
-                        &text[range]
+                        &text[range.clone()]
                     } else {
-                        content.as_ref()
+                        merged.as_str()
                     };
                     if let Some((_, label)) = links.last_mut() {
                         label.push_str(displayed);
@@ -1262,7 +1354,42 @@ fn markdown_at_depth(
                     });
                     span.italic = italic > 0;
                     span.strikethrough = strikethrough > 0;
-                    spans.push(span);
+                    if is_text
+                        && links.is_empty()
+                        && preceding % 2 == 0
+                        && displayed == &text[range.clone()]
+                    {
+                        let mut cursor = 0;
+                        for (range, url) in bare_links(displayed) {
+                            if cursor < range.start {
+                                let mut plain = span.clone();
+                                plain.text = clean(&displayed[cursor..range.start]);
+                                spans.push(plain);
+                            }
+                            let label = &displayed[range.clone()];
+                            let mut link = span.clone();
+                            link.text = clean(label);
+                            link.color = theme.color("mdLink");
+                            link.dim = theme.is_dim("mdLink");
+                            link.underline = true;
+                            link.hyperlink =
+                                (hyperlinks && safe_hyperlink(&url)).then(|| url.clone());
+                            spans.push(link);
+                            if (!hyperlinks || !safe_hyperlink(&url))
+                                && label != url
+                                && url.strip_prefix("mailto:") != Some(label)
+                            {
+                                spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
+                            }
+                            cursor = range.end;
+                        }
+                        if cursor < displayed.len() {
+                            span.text = clean(&displayed[cursor..]);
+                            spans.push(span);
+                        }
+                    } else {
+                        spans.push(span);
+                    }
                 }
             }
             Event::Code(text) => {
@@ -2012,6 +2139,120 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn markdown_bare_links_preserve_cjk_boundaries_and_styles() {
+        let theme = Theme::system();
+        let render = |source: &str, hyperlinks| {
+            markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                hyperlinks,
+                false,
+            )
+        };
+        for punctuation in "。，；：！？、“”‘’（）【】《》「」『』…—·・〈〉［］｛｝．｡｢｣､･".chars()
+        {
+            let source = format!("https://example.com/中文?q=搜索#片段{punctuation}后文");
+            let lines = render(&source, true);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(
+                spans.iter().any(|span| span.hyperlink.as_deref()
+                    == Some("https://example.com/中文?q=搜索#片段")),
+                "{source}: {spans:?}"
+            );
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                source
+            );
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text.contains(punctuation) && span.hyperlink.is_none())
+            );
+        }
+        for (source, expected) in [
+            (
+                "https://example.com/a_(b).，后文",
+                "https://example.com/a_(b)",
+            ),
+            (
+                "https://example.com/path(unclosed",
+                "https://example.com/path",
+            ),
+            ("www.example.com/path", "http://www.example.com/path"),
+            ("user@example.com", "mailto:user@example.com"),
+            (
+                "https://example.com/テストー한글",
+                "https://example.com/テストー한글",
+            ),
+        ] {
+            let lines = render(source, true);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.underline && span.hyperlink.as_deref() == Some(expected)),
+                "{source}: {lines:?}"
+            );
+        }
+        let lines = render("Contact user@example.com and https://example.com.", false);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "Contact user@example.com and https://example.com."
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.underline && s.text == "user@example.com")
+        );
+        assert!(spans.iter().all(|s| s.hyperlink.is_none()));
+        let lines = render("www.example.com", false);
+        assert_eq!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "www.example.com (http://www.example.com)"
+        );
+        let lines = render("https://a.example，https://b.example", true);
+        let targets: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.hyperlink.as_deref())
+            .collect();
+        assert_eq!(targets, ["https://a.example", "https://b.example"]);
+        let lines = render(
+            "`https://example.com` [link](https://example.com/中文，路径)",
+            true,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "https://example.com" && s.hyperlink.is_none())
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://example.com/中文，路径"))
+        );
+        let lines = render("https://example.com/\u{1b}]malicious", true);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !span.text.contains('\u{1b}') && span.hyperlink.is_none())
+        );
     }
 
     #[test]
