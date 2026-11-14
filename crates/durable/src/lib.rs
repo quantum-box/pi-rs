@@ -7,6 +7,7 @@ pub mod application_entry;
 #[cfg(feature = "coding-tools")]
 pub mod coding_tools;
 pub mod compact;
+pub mod content;
 pub mod conversation;
 pub mod conversation_signal;
 pub mod document;
