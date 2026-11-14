@@ -100,11 +100,35 @@ pub fn provider_error_secrets<'a>(
 fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
     let mut masked = text.to_owned();
     for secret in secrets {
-        if !secret.is_empty() {
+        if should_mask_provider_secret(secret) {
             masked = masked.replace(secret, "\0\0");
         }
     }
     masked
+}
+
+// A header value can itself be an ordinary classifier word. Suppressing such
+// a value would also suppress a real provider error; fixed diagnostics keep
+// even these ambiguous values out of the user's output.
+fn should_mask_provider_secret(secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let lower = secret.to_ascii_lowercase();
+    ![
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing limit reached",
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    ]
+    .iter()
+    .any(|marker| marker.contains(&lower))
 }
 
 #[doc(hidden)]
@@ -316,6 +340,7 @@ fn permanent_limit_body(bytes: &[u8], complete: bool, secrets: &[String]) -> boo
                 // A bounded body can end in the middle of an echoed secret.
                 let suffix = secrets
                     .iter()
+                    .filter(|secret| should_mask_provider_secret(secret))
                     .flat_map(|secret| {
                         secret
                             .char_indices()
@@ -661,6 +686,25 @@ mod quota_tests {
             assert!(!permanent_provider_error(&value, &secrets));
             assert!(retryable_provider_error(&value, &secrets));
         }
+    }
+
+    #[test]
+    fn ordinary_header_values_do_not_hide_quota_markers() {
+        let headers = ["billing", "quota", "quota exceeded", "BILLING"];
+        let secrets =
+            provider_error_secrets(Some("sk-provider-billing-secret"), headers.into_iter());
+        for message in ["billing limit reached", "quota exceeded"] {
+            let value = serde_json::json!({"error":{"message": message}});
+            assert!(permanent_provider_error(&value, &secrets), "{message}");
+            assert!(
+                permanent_limit_body(message.as_bytes(), true, &secrets),
+                "{message}"
+            );
+        }
+        let value =
+            serde_json::json!({"error":{"message":"rate limit sk-provider-billing-secret"}});
+        assert!(!permanent_provider_error(&value, &secrets));
+        assert!(retryable_provider_error(&value, &secrets));
     }
 
     #[test]

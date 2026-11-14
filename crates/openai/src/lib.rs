@@ -658,6 +658,7 @@ mod tests {
         use std::io::{Read, Write};
         for (message, permanent, retryable) in [
             ("quota exceeded sk-provider-billing-secret", true, false),
+            ("billing limit reached", true, false),
             (
                 "rate limit exceeded sk-provider-billing-secret",
                 false,
@@ -685,7 +686,14 @@ mod tests {
                 "sk-provider-billing-secret".into(),
                 "fixture",
             )
-            .unwrap();
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-tenant", "billing".parse().unwrap());
+                headers.insert("x-policy", "quota".parse().unwrap());
+                headers.insert("x-plan", "quota exceeded".parse().unwrap());
+                headers
+            });
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![],
@@ -718,6 +726,11 @@ mod tests {
     async fn quota_429_is_permanent_and_transient_is_retryable() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"billing limit reached"}}"#,
+                true,
+            ),
             (
                 429,
                 r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
@@ -767,7 +780,14 @@ mod tests {
                 "sk-provider-billing-secret".into(),
                 "fixture",
             )
-            .unwrap();
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-tenant", "billing".parse().unwrap());
+                headers.insert("x-policy", "quota".parse().unwrap());
+                headers.insert("x-plan", "quota exceeded".parse().unwrap());
+                headers
+            });
             let result = model.stream(request()).await;
             let error = match result {
                 Err(error) => error,
