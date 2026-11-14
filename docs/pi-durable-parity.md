@@ -100,3 +100,39 @@ Custom JSON-object documents now have version-checked writes and deletes, and ch
 ## Verification baseline
 
 For the already implemented subsets, run `cargo test -p durable-store` and `cargo test -p pi-rs-durable`; the standalone example `cargo run -p pi-rs-durable --example resume -- start DB_PATH` followed by `resume DB_PATH CONVERSATION_ID` demonstrates admission across two processes, not the missing capabilities above. Run upstream tests against the pinned upstream revision when implementing a specific compatibility gate. For crash cases use process termination and controlled barriers, not graceful shutdown or timing-dependent sleeps. No general exactly-once guarantee follows from local persistence.
+
+### Opt-in provider request bodies
+
+A host can install a `model::ProviderAdapter`, then select its stable, versioned
+ID for a settled conversation with `Harness::select_provider_adapter`. Selection
+is persisted (including in fork snapshots); after reopening, install the same
+adapter and selected extensions on `open_paused` before resuming. A missing or
+mismatched adapter fails closed. Unselected conversations continue to use the
+existing `Model` interface. Core and built-in providers are unchanged.
+
+The adapter prepares the provider JSON body without dispatching. The selected
+`BeforeProviderRequest` hooks receive `{model, payload}` in selection order and
+return `Replace({"payload": ...})` or `Pass`. The model here is the configured
+model name, not upstream's full model descriptor. Each replacement feeds the
+next hook. The runtime rejects hook errors, malformed replacements, non-object
+or over-8-MiB bodies, then calls the host's provider-specific validation before
+dispatch. The host must implement both validation and guarded dispatch, and
+must send exactly the validated body while enforcing authorization, endpoint
+and budget policy. The adapter is trusted code; the runtime cannot enforce its
+internal behavior. Hook failures deliberately fail closed, whereas upstream
+reports the error and continues the chain (upstream pi commit
+`1cfb326bfcc5c221526809fa081c4ff85b459847`,
+`packages/durable/src/harness/generation.ts` and `CHANGELOG.md`).
+
+The attempt carries the committed conversation and request IDs, turn, retry
+count and restart count. New generation attempts after retry or recovery get a
+new request ID. Hook context contains the persisted conversation snapshot and
+request-scoped durable memo. Bodies and arbitrary hook side effects are not
+checkpointed: hooks and preparation run again for each attempt and should use
+memo for stable values. Cancellation stops preparation, hook execution or
+stream collection, but cannot prove a remote request did not execute; recovery
+settles the abandoned request as unconfirmed. As upstream, compaction bypasses
+this generation hook. Unlike upstream pi-ai, provider-internal HTTP retries or
+body rebuilds are not intercepted; adapters must avoid hidden rebuilds or guard
+them themselves. This interface does not retrofit built-in provider clients,
+settlement, exactly-once network execution, or automatic adapter installation.

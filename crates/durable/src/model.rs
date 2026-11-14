@@ -29,6 +29,44 @@ pub fn model_request(
     }
 }
 
+/// Identity of a committed generation attempt. A retry or recovery gets a new
+/// request ID; the conversation and turn remain stable. Counters are zero-based.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAttempt {
+    pub session_id: Uuid,
+    pub request_id: Uuid,
+    pub turn: u32,
+    pub retries: u32,
+    pub restarts: u32,
+}
+
+/// An opt-in host implementation for one provider. `dispatch` must send exactly
+/// the validated body and enforce its own authorization, budgets and endpoint
+/// restrictions. Preparation must not send a request. Errors fail closed.
+#[async_trait::async_trait]
+pub trait ProviderAdapter: Send + Sync {
+    /// Stable, versioned identity used to bind persisted conversations.
+    fn id(&self) -> &str;
+    async fn prepare(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+    ) -> Result<serde_json::Value>;
+    /// Validate provider-specific invariants after all hooks have run.
+    fn validate(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+        body: &serde_json::Value,
+    ) -> Result<()>;
+    async fn dispatch(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ModelRequest,
+        body: serde_json::Value,
+    ) -> Result<ModelStream>;
+}
+
 /// Transient display updates; these do not constitute a completed generation.
 #[derive(Clone, Debug)]
 pub enum GenerationProgress {

@@ -523,7 +523,19 @@ impl Resolved {
                             GenerationEvent::BeforeRequest | GenerationEvent::BeforeProviderRequest
                         ) =>
                     {
-                        value = v
+                        if event == GenerationEvent::BeforeProviderRequest {
+                            if let Some(payload) = v.get("payload") {
+                                value["payload"] = payload.clone();
+                            } else {
+                                reports.push(failure(
+                                    &e.name,
+                                    "generation",
+                                    "provider replacement omitted payload".into(),
+                                ));
+                            }
+                        } else {
+                            value = v;
+                        }
                     }
                     Ok(GenerationDecision::Continue(v)) if event == GenerationEvent::OnYield => {
                         return (value, Some(v), tasks, reports);

@@ -371,6 +371,9 @@ pub struct Conversation {
     /// Installed extension names in execution order. Older conversations select none.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Stable adapter identity, if provider-body hooks are enabled.
+    #[serde(default)]
+    pub provider_adapter: Option<String>,
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
@@ -620,6 +623,7 @@ pub struct Harness {
     owner: Arc<OwnedStore>,
     options: Options,
     tools: HashMap<String, RegisteredTool>,
+    provider_adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     failed: bool,
     dirty: Arc<AtomicBool>,
@@ -769,6 +773,7 @@ impl Harness {
             owner: Arc::new(OwnedStore::open(path)?),
             options,
             tools,
+            provider_adapter: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
@@ -788,6 +793,7 @@ impl Harness {
             owner: self.owner.clone(),
             options: self.options.clone(),
             tools: self.tools.clone(),
+            provider_adapter: self.provider_adapter.clone(),
             extensions: self.extensions.clone(),
             failed: false,
             dirty: Arc::new(AtomicBool::new(false)),
@@ -888,6 +894,38 @@ impl Harness {
             );
         }
         Ok(tools)
+    }
+    /// Install a host adapter before resuming any conversation that selected it.
+    pub fn install_provider_adapter(
+        &mut self,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+    ) -> Result<(), Error> {
+        if adapter.id().trim().is_empty() {
+            return Err(Error::Invalid("empty provider adapter identity".into()));
+        }
+        self.provider_adapter = Some(adapter);
+        Ok(())
+    }
+    /// Persist opt-in for a settled conversation. Reopen requires the same adapter ID.
+    pub fn select_provider_adapter(&mut self, id: Uuid, enabled: bool) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "adapter selection requires a settled conversation".into(),
+            ));
+        }
+        c.provider_adapter = if enabled {
+            Some(
+                self.provider_adapter
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("provider adapter unavailable".into()))?
+                    .id()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        self.save(&c, Expected::Version(version))
     }
     /// Select installed names for a settled conversation, preserving their order.
     pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
@@ -1237,6 +1275,7 @@ impl Harness {
                     "pi-rs/runtime/extensions".into(),
                     serde_json::to_value(&state.extensions)?,
                 ),
+                ("pi-rs/runtime/provider-adapter".into(), serde_json::to_value(&state.provider_adapter)?),
                 (
                     "pi-rs/runtime/resets".into(),
                     serde_json::to_value(&state.resets)?,
@@ -1471,6 +1510,7 @@ impl Harness {
             config,
             queue_modes: QueueModes::default(),
             extensions: vec![],
+            provider_adapter: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
@@ -1598,6 +1638,12 @@ impl Harness {
                 .documents
                 .get("pi-rs/runtime/extensions")
                 .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
+            provider_adapter: point
+                .documents
+                .get("pi-rs/runtime/provider-adapter")
+                .map(|v| serde_json::from_value(v.clone()))
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
@@ -3274,7 +3320,9 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelRunning {
-                    turns, request_id, ..
+                    turns,
+                    request_id,
+                    restarts,
                 } => {
                     let mut system_prompt = c.config.system_prompt.clone();
                     if !c.extensions.is_empty() {
@@ -3349,6 +3397,62 @@ impl Harness {
                                 Error::Invalid(format!("invalid before-request messages: {e}"))
                             })?;
                     }
+                    let prepared = if let Some(adapter_id) = &c.provider_adapter {
+                        let adapter = self
+                            .provider_adapter
+                            .as_ref()
+                            .filter(|a| a.id() == adapter_id)
+                            .ok_or_else(|| {
+                                Error::Invalid(format!(
+                                    "selected provider adapter unavailable: {adapter_id}"
+                                ))
+                            })?
+                            .clone();
+                        let attempt = crate::model::ProviderAttempt {
+                            session_id: id,
+                            request_id,
+                            turn: turns,
+                            retries: c.retry_state.retries_scheduled,
+                            restarts,
+                        };
+                        let mut body = fenced_poll(adapter.prepare(&attempt, &request), self.execution_gate.as_ref(), cancel)
+                            .await.ok_or(Error::Interrupted)??;
+                        if !c.extensions.is_empty() {
+                            let selected = self.selected_extensions(&c)?;
+                            let snapshot = serde_json::to_value(&c)?;
+                            let memo = self.extension_memo(request_id)?;
+                            let context = crate::extension::Context {
+                                snapshot: &snapshot,
+                                memo: &memo,
+                            };
+                            let (value, _, _, reports) = fenced_poll(
+                                selected.generation(crate::extension::GenerationEvent::BeforeProviderRequest, serde_json::json!({"model": request.model, "payload": body}), &context),
+                                self.execution_gate.as_ref(), cancel,
+                            ).await.ok_or(Error::Interrupted)?;
+                            self.subagent_store()?;
+                            if !reports.is_empty() {
+                                return Err(Error::Invalid(format!(
+                                    "before-provider-request hook failed: {reports:?}"
+                                )));
+                            }
+                            body = value.get("payload").cloned().ok_or_else(|| {
+                                Error::Invalid("provider hook omitted payload".into())
+                            })?;
+                        }
+                        if cancel.is_cancelled() {
+                            self.failed = true;
+                            return Err(Error::Interrupted);
+                        }
+                        if !body.is_object() || serde_json::to_vec(&body)?.len() > 8 * 1024 * 1024 {
+                            return Err(Error::Invalid(
+                                "provider body must be an object within the size limit".into(),
+                            ));
+                        }
+                        adapter.validate(&attempt, &request, &body)?;
+                        Some((adapter, attempt, body))
+                    } else {
+                        None
+                    };
                     let store = self.owner.store();
                     let mut snapshot = crate::progress::Snapshot::load(store, request_id)?;
                     let mut last_flush: Option<Instant> = None;
@@ -3357,9 +3461,12 @@ impl Harness {
                     let mut progress_full = false;
                     let request_cancel = cancel.child_token();
                     let response = fenced_poll(collect_generation_with_metadata(
-                        self.options
-                            .model
-                            .stream_in_session(request_id, id, request),
+                        async {
+                            match prepared {
+                                Some((adapter, attempt, body)) => adapter.dispatch(&attempt, &request, body).await,
+                                None => self.options.model.stream_in_session(request_id, id, request).await,
+                            }
+                        },
                         &request_cancel,
                         |event| {
                             if progress_failure.is_some() || progress_full { return; }
@@ -4604,7 +4711,16 @@ impl Scheduler {
         options: Options,
         registry: crate::extension::Registry,
     ) -> Result<Self, Error> {
-        Self::open_configured(path, options, registry, None)
+        Self::open_configured(path, options, registry, None, None)
+    }
+    /// Install the provider adapter before recovering persisted conversations.
+    pub fn open_with_provider_adapter(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+    ) -> Result<Self, Error> {
+        Self::open_configured(path, options, registry, None, Some(adapter))
     }
     /// Open with a parent-bound, opt-in background subagent extension installed before recovery.
     pub fn open_with_subagent_management(
@@ -4614,17 +4730,19 @@ impl Scheduler {
         parent: Uuid,
         child_config: Config,
     ) -> Result<Self, Error> {
-        Self::open_configured(path, options, registry, Some((parent, child_config)))
+        Self::open_configured(path, options, registry, Some((parent, child_config)), None)
     }
     fn open_configured(
         path: impl AsRef<Path>,
         options: Options,
         registry: crate::extension::Registry,
         management: Option<(Uuid, Config)>,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
-        let harness = Harness::open_paused(path, options)?;
+        let mut harness = Harness::open_paused(path, options)?;
+        if let Some(adapter) = adapter { harness.install_provider_adapter(adapter)?; }
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
         if let Some((parent, config)) = management {
             harness.conversation(parent)?;
@@ -4662,6 +4780,9 @@ impl Scheduler {
     }
     pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
         self.harness.select_extensions(id, names)
+    }
+    pub fn select_provider_adapter(&mut self, id: Uuid, enabled: bool) -> Result<(), Error> {
+        self.harness.select_provider_adapter(id, enabled)
     }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
@@ -5521,6 +5642,7 @@ mod scheduler_tests {
             config: config(),
             queue_modes: QueueModes::default(),
             extensions: vec![],
+            provider_adapter: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
