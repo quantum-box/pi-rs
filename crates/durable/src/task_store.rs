@@ -45,6 +45,8 @@ pub enum Error {
     InvalidOwnedBatch,
     #[error("task ownership cannot be changed")]
     OwnerChanged,
+    #[error("retired task attempt is stale or aborted")]
+    StaleRetiredAttempt,
     #[error("task ownership contains a cycle or invalid edge")]
     InvalidOwnership,
     #[error("signal name, version, or key is invalid")]
@@ -220,6 +222,24 @@ pub enum SignalResult {
 pub struct StoredTask {
     pub task: Task,
     pub version: u64,
+}
+
+/// Prepare a version fence for a committed handler transition. The returned
+/// check must be committed with dependent writes, after independently proving
+/// the executor has stopped and validating conversation and ownership fences.
+#[allow(dead_code)] // Storage prerequisite, not yet used for executor handoff.
+pub(crate) fn retired_attempt_check(snapshot: &StoredTask, attempt: Uuid) -> Result<Check, Error> {
+    if snapshot.task.abort_requested()
+        || snapshot.task.state() == &TaskState::Running
+        || snapshot.task.attempt_id().is_some()
+        || snapshot.task.retired_attempt_id() != Some(attempt)
+    {
+        return Err(Error::StaleRetiredAttempt);
+    }
+    Ok(Check {
+        key: key(snapshot.task.id()),
+        expected: Expected::Version(snapshot.version),
+    })
 }
 
 /// One member of an atomic batch. Updates must use a previously read version.

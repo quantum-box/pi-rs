@@ -1091,3 +1091,13 @@ retirement, and compose these checks with authoritative conversation, task and
 abort fences in the same transaction. The record is not an executor lease and
 is not connected to live execution: it does not park or release a worker, start
 pollers, transfer ownership, or cancel external jobs.
+
+The generic task scheduler retains the last committed handler attempt as an
+internal retired ID in the task record. A version-checked snapshot can fence a
+future handoff against reservation, replay, and abort; its check must be
+composed with conversation and ownership fences in the dependent transaction.
+New reservations and abort marks clear the marker. Legacy records without it,
+interrupted handlers, and discarded transitions do not acquire one. Older
+executors do not enforce this fence and must not participate in a handoff. It
+records that the handler returned and its transition committed, not that detached work
+or another executor has joined, and it is not wired to live parking.

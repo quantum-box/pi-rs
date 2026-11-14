@@ -817,7 +817,7 @@ impl Scheduler {
         let step = result.map_err(Error::Handler)?;
         if let Step::Fail(reason) = step {
             // Failure discards all staged effects, including child admissions.
-            self.finish_failed(&running, reason)?;
+            self.finish_failed_completed(&running, reason)?;
             self.poisoned = false;
             return Ok(true);
         }
@@ -890,6 +890,9 @@ impl Scheduler {
             }
             Step::Fail(_) => unreachable!(),
         }
+        next.task
+            .record_completed_attempt(&running.task)
+            .map_err(Error::Transition)?;
         let mut batch = vec![Save::Update(&next)];
         batch.extend(children.iter().map(Save::Create));
         // Validate all newly created children as one ownership graph, including
@@ -1086,7 +1089,22 @@ impl Scheduler {
         Ok(())
     }
 
+    fn finish_failed_completed(
+        &self,
+        parent: &task_store::StoredTask,
+        reason: String,
+    ) -> Result<(), Error> {
+        self.finish_failed_inner(parent, reason, true)
+    }
     fn finish_failed(&self, parent: &task_store::StoredTask, reason: String) -> Result<(), Error> {
+        self.finish_failed_inner(parent, reason, false)
+    }
+    fn finish_failed_inner(
+        &self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        completed: bool,
+    ) -> Result<(), Error> {
         let records = self.ts().list()?;
         let roots: Vec<_> = records
             .iter()
@@ -1095,6 +1113,11 @@ impl Scheduler {
             .collect();
         let mut next = parent.clone();
         next.task.fail(reason).map_err(Error::Transition)?;
+        if completed {
+            next.task
+                .record_completed_attempt(&parent.task)
+                .map_err(Error::Transition)?;
+        }
         self.cancel_roots(&records, &roots, Some(next))
     }
 
@@ -1207,6 +1230,156 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn retired_attempt_survives_reopen_and_is_fenced_by_replay_and_abort() {
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let make_registry = || {
+            let mut registry = Registry::default();
+            let seen = seen.clone();
+            registry.register("job", true, move |t: &Task| {
+                assert_eq!(t.retired_attempt_id(), None);
+                seen.lock().unwrap().push(t.attempt_id().unwrap());
+                if t.checkpoint().phase == "start" {
+                    Ok(Step::Continue(cp("again")))
+                } else {
+                    Ok(Step::Wait {
+                        checkpoint: cp("waiting"),
+                        condition: WaitFor::DeadlineMillis(100),
+                        children: vec![],
+                    })
+                }
+            });
+            registry
+        };
+        let id = Uuid::from_u128(1);
+        let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(2)),
+                "job",
+                true,
+                5,
+            ))
+            .unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let first = scheduler.ts().load(id).unwrap().unwrap();
+        let first_attempt = seen.lock().unwrap()[0];
+        assert_eq!(first.task.retired_attempt_id(), Some(first_attempt));
+        assert_eq!(first.task.attempt_id(), None);
+        let stale_check = task_store::retired_attempt_check(&first, first_attempt).unwrap();
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+        assert_eq!(
+            scheduler
+                .ts()
+                .load(id)
+                .unwrap()
+                .unwrap()
+                .task
+                .retired_attempt_id(),
+            Some(first_attempt)
+        );
+        assert!(scheduler.tick(0).unwrap());
+        let second = scheduler.ts().load(id).unwrap().unwrap();
+        let second_attempt = seen.lock().unwrap()[1];
+        assert_ne!(first_attempt, second_attempt);
+        assert_eq!(second.task.retired_attempt_id(), Some(second_attempt));
+        assert!(scheduler.ts().store().commit(&[stale_check], &[]).is_err());
+        let before_abort = task_store::retired_attempt_check(&second, second_attempt).unwrap();
+        scheduler.request_abort(id).unwrap();
+        assert!(scheduler.ts().store().commit(&[before_abort], &[]).is_err());
+        let aborted = scheduler.ts().load(id).unwrap().unwrap();
+        assert!(aborted.task.abort_requested());
+        assert_eq!(aborted.task.retired_attempt_id(), None);
+        assert!(matches!(
+            task_store::retired_attempt_check(&aborted, second_attempt),
+            Err(task_store::Error::StaleRetiredAttempt)
+        ));
+    }
+
+    #[test]
+    fn retired_identity_is_recorded_for_committed_success_and_failure() {
+        use std::sync::Mutex;
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = Arc::new(Mutex::new(None));
+            let observed = seen.clone();
+            let mut registry = Registry::default();
+            registry.register("job", true, move |t: &Task| {
+                *observed.lock().unwrap() = t.attempt_id();
+                if fail {
+                    Ok(Step::Fail("failed".into()))
+                } else {
+                    Ok(Step::Succeed(json!("done")))
+                }
+            });
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let t = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(2)),
+                "job",
+                true,
+                5,
+            );
+            scheduler.submit(&t).unwrap();
+            scheduler.tick(0).unwrap();
+            let result = scheduler.ts().load(t.id()).unwrap().unwrap();
+            let attempt = seen.lock().unwrap().unwrap();
+            assert_eq!(result.task.retired_attempt_id(), Some(attempt));
+            assert!(task_store::retired_attempt_check(&result, attempt).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_record_and_migration_do_not_invent_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let original = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            "job",
+            true,
+            5,
+        );
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("retired_attempt_id");
+        let legacy: Task = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.retired_attempt_id(), None);
+        {
+            let db = durable_store::Store::open(&path).unwrap();
+            TaskStore::new(&db).save(&[Save::Create(&legacy)]).unwrap();
+        }
+        let mut registry = Registry::default();
+        registry.register_versioned(
+            "job",
+            2,
+            true,
+            |t: &Task| {
+                assert_eq!(t.definition_version(), 2);
+                assert!(t.attempt_id().is_some());
+                assert_eq!(t.retired_attempt_id(), None);
+                Ok(Step::Succeed(json!(null)))
+            },
+            Some(Arc::new(|input, checkpoint, _| {
+                Ok((input.clone(), checkpoint.clone()))
+            })),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert!(
+            scheduler
+                .get(original.id())
+                .unwrap()
+                .unwrap()
+                .retired_attempt_id()
+                .is_some()
+        );
+    }
+
     #[test]
     fn versions_block_and_retry_on_registry_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -1530,6 +1703,7 @@ mod tests {
         scheduler.tick(0).unwrap();
         let after = scheduler.get(t.id()).unwrap().unwrap();
         assert!(after.abort_requested());
+        assert_eq!(after.retired_attempt_id(), None);
         assert_eq!(after.state(), &TaskState::Ready);
         assert_eq!(after.checkpoint(), t.checkpoint());
         let db = Store::open(&path).unwrap();
@@ -2119,6 +2293,7 @@ mod tests {
                 Ok(Step::Succeed(serde_json::json!("done")))
             });
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            assert_eq!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().retired_attempt_id(), None);
             if safe {
                 assert_eq!(
                     scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
@@ -2443,6 +2618,7 @@ mod tests {
                 Ok(Step::Succeed(json!("should not execute")))
             });
             let mut s = Scheduler::open(&path, registry).unwrap();
+            assert_eq!(s.get(Uuid::from_u128(1)).unwrap().unwrap().retired_attempt_id(), None);
             if safe {
                 assert_eq!(
                     s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),

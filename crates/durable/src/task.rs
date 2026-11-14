@@ -79,6 +79,10 @@ pub struct Task {
     /// task records may have none. This is not by itself an executor lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attempt_id: Option<Uuid>,
+    /// Last scheduler attempt whose handler returned and whose transition committed.
+    /// This is storage evidence only, not proof that detached work has stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_attempt_id: Option<Uuid>,
     /// Consecutive recoveries since the last changed checkpoint.
     restarts: u32,
     restart_limit: u32,
@@ -139,6 +143,7 @@ impl Task {
             input: Value::Null,
             state: TaskState::Ready,
             attempt_id: None,
+            retired_attempt_id: None,
             restarts: 0,
             restart_limit,
             delivered_signal: None,
@@ -223,6 +228,7 @@ impl Task {
         }
         if !self.abort_requested {
             self.abort_requested = true;
+            self.retired_attempt_id = None;
             self.restarts = 0;
         }
         self.typed_wake = None;
@@ -297,6 +303,7 @@ impl Task {
         }
         self.state = TaskState::Running;
         self.attempt_id = None;
+        self.retired_attempt_id = None;
         Ok(())
     }
 
@@ -310,6 +317,31 @@ impl Task {
         self.attempt_id
     }
 
+    /// A completed reservation is valid only together with the task's storage
+    /// version and external executor/abort fences; it does not prove a join.
+    pub(crate) fn retired_attempt_id(&self) -> Option<Uuid> {
+        self.retired_attempt_id
+    }
+
+    /// Called only after the handler returned and its proposed transition has
+    /// been applied to a clone. Persist it in the same CAS as that transition.
+    pub(crate) fn record_completed_attempt(
+        &mut self,
+        running: &Task,
+    ) -> Result<(), TransitionError> {
+        if self.id != running.id
+            || running.state != TaskState::Running
+            || self.state == TaskState::Running
+            || self.attempt_id.is_some()
+            || self.abort_requested
+            || running.abort_requested
+        {
+            return Err(TransitionError::InvalidState);
+        }
+        self.retired_attempt_id = Some(running.attempt_id.ok_or(TransitionError::InvalidState)?);
+        Ok(())
+    }
+
     /// Explicitly recover a persisted running task after the host establishes
     /// that its prior executor is gone. No effects are replayed by this method.
     pub fn recover(&mut self) -> Result<(), TransitionError> {
@@ -317,6 +349,7 @@ impl Task {
         self.restarts = self.restarts.saturating_add(1);
         self.state = TaskState::Ready;
         self.attempt_id = None;
+        self.retired_attempt_id = None;
         Ok(())
     }
 
@@ -431,6 +464,7 @@ impl Task {
         }
         self.state = TaskState::Cancelled;
         self.attempt_id = None;
+        self.retired_attempt_id = None;
         self.typed_wake = None;
         self.ended_children = None;
         self.wake_children = None;

@@ -12641,6 +12641,15 @@ mod scheduler_tests {
                 .attempt_id(),
             None
         );
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(task_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .retired_attempt_id(),
+            Some(task_attempt)
+        );
         assert!(matches!(
             ConversationLease::acquire(owner.clone(), binding.clone()),
             Err(executor_handoff::Error::Busy)
