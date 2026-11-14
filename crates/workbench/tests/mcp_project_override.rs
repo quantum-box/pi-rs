@@ -46,6 +46,20 @@ fn malformed_project_override_never_starts_disabled_server() {
     assert!(String::from_utf8_lossy(&trusted_null.stderr).contains("enabled"));
     assert!(!sentinel.exists());
     assert_eq!(std::fs::read_to_string(&project).unwrap(), null_enabled);
+    for field in [
+        serde_json::json!({"enabled": true, "exposure": null}),
+        serde_json::json!({"enabled": true, "toolExposure": {"read": "invalid"}}),
+        serde_json::json!({"enabled": true, "oauth": {"callbackPort": null}}),
+    ] {
+        std::fs::write(
+            &project,
+            serde_json::json!({"mcpServers":{"fixture":field}}).to_string(),
+        )
+        .unwrap();
+        let output = run("--trust");
+        assert!(!output.status.success());
+        assert!(!sentinel.exists());
+    }
     let untrusted = run("--no-trust");
     assert!(
         untrusted.status.success(),

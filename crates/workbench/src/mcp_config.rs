@@ -121,6 +121,14 @@ fn merge_project_servers(
             }
             let mut candidate = base.clone();
             candidate.extend(overlay.clone());
+            if candidate
+                .get("oauth")
+                .is_some_and(|value| !valid_oauth(value))
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} override has invalid OAuth settings"
+                )));
+            }
             let config: ServerConfig =
                 serde_json::from_value(Value::Object(candidate)).map_err(|_| {
                     Error::Config(format!("project MCP server {name} override is invalid"))
@@ -166,6 +174,14 @@ fn valid_exposure(value: &Value) -> bool {
 fn valid_oauth(value: &Value) -> bool {
     use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
 
+    // Serde treats null in an optional member as absent, but Pi validates
+    // explicitly supplied OAuth fields and rejects null values.
+    if value
+        .as_object()
+        .is_some_and(|fields| fields.values().any(Value::is_null))
+    {
+        return false;
+    }
     match serde_json::from_value::<OAuthSetting>(value.clone()) {
         Ok(OAuthSetting::Enabled(_)) => true,
         Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
@@ -605,6 +621,8 @@ mod tests {
             json!({"enabled": true, "exposure": "unknown"}),
             json!({"enabled": true, "toolExposure": {"read": "unknown"}}),
             json!({"enabled": true, "oauth": null}),
+            json!({"enabled": true, "oauth": {"callbackPort": null}}),
+            json!({"enabled": true, "oauth": {"clientId": null}}),
             json!({"enabled": true, "oauth": {"clientRegistration": "unknown"}}),
             json!({"enabled": true, "oauth": {"clientSecret": "secret"}}),
             json!({"enabled": true, "oauth": {"clientId": " "}}),
@@ -633,9 +651,13 @@ mod tests {
         let invalid = json!({"service":{"enabled":true,"oauth":true}});
         assert!(merge_project_servers(&mut servers, invalid.as_object().unwrap()).is_err());
         assert_eq!(Value::Object(servers), original);
-        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackPort":0}}});
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackUrl":null}}});
         let mut servers = original.as_object().unwrap().clone();
         let enabled = json!({"service":{"enabled":true}});
+        assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackPort":0}}});
+        let mut servers = original.as_object().unwrap().clone();
         assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
         assert_eq!(Value::Object(servers), original);
     }
