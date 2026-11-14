@@ -23,6 +23,26 @@ const ID: &str = "codemode";
 const MODEL_OPERATION: &str = "pi_model_operation";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
+const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+async fn acquire_worker<'a>(
+    workers: &'a tokio::sync::Semaphore,
+    cancellation: &pi_rs_core::CancellationToken,
+    deadline: Option<Duration>,
+    wait_limit: Duration,
+) -> Result<tokio::sync::SemaphorePermit<'a>, &'static str> {
+    let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err("Script cancelled while waiting for a worker"),
+        result = tokio::time::timeout(wait, workers.acquire()) => match result {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("Codemode worker pool closed"),
+            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err("Script timed out while waiting for a codemode worker"),
+            Err(_) => Err("No codemode worker became free within 60 seconds; retry after other scripts finish"),
+        },
+    }
+}
 
 pub struct Codemode {
     pub only: bool,
@@ -166,21 +186,31 @@ impl Tool for ScriptTool {
                 .unwrap_or(2);
             tokio::sync::Semaphore::new(maximum)
         });
-        let acquire = async {
-            match options.timeout {
-                Some(timeout) => tokio::time::timeout(timeout, workers.acquire())
-                    .await
-                    .map_err(|_| "Timed out waiting for a codemode worker")?,
-                None => workers.acquire().await,
-            }
-            .map_err(|_| "Codemode worker pool closed")
+        let admission_deadline = match options.timeout {
+            Some(timeout) => match timeout
+                .checked_sub(started.elapsed())
+                .filter(|time| !time.is_zero())
+            {
+                Some(remaining) => Some(remaining),
+                None => {
+                    return Outcome::Failed(
+                        "Script timed out while waiting for a codemode worker".into(),
+                    )
+                    .into();
+                }
+            },
+            None => None,
         };
-        let permit = tokio::select! {
-            _ = context.cancellation.cancelled() => return Outcome::Failed("Script cancelled while waiting for a worker".into()).into(),
-            permit = acquire => match permit {
-                Ok(permit) => permit,
-                Err(error) => return Outcome::Failed(error.into()).into(),
-            }
+        let permit = match acquire_worker(
+            workers,
+            &context.cancellation,
+            admission_deadline,
+            WORKER_WAIT_LIMIT,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => return Outcome::Failed(error.into()).into(),
         };
         let store = previous
             .map(|state| state.data.clone())
@@ -1191,6 +1221,46 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_admission_is_bounded_and_cancellable_without_leaking_permits() {
+        assert_eq!(WORKER_WAIT_LIMIT, Duration::from_secs(60));
+        let workers = tokio::sync::Semaphore::new(1);
+        let held = workers.acquire().await.unwrap();
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let short = Duration::from_millis(10);
+        let overall = Duration::from_secs(5);
+
+        let result = tokio::time::timeout(
+            overall,
+            acquire_worker(&workers, &cancellation, None, short),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(error) if error.contains("No codemode worker")));
+        let result = tokio::time::timeout(
+            overall,
+            acquire_worker(&workers, &cancellation, Some(short), Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(error) if error.contains("Script timed out")));
+
+        let waiting = acquire_worker(&workers, &cancellation, None, overall);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
+        cancellation.cancel();
+        let result = tokio::time::timeout(overall, waiting).await.unwrap();
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        drop(held);
+        assert_eq!(workers.available_permits(), 1);
+        let fresh = pi_rs_core::CancellationToken::new();
+        assert!(
+            acquire_worker(&workers, &fresh, None, overall)
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn structured_tool_error_flags_propagate_without_exposing_details() {

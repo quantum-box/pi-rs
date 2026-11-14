@@ -901,7 +901,11 @@ partial output without committing their store. Filesystem, network and Node
 APIs are absent from the script context. Memory, stack and output have explicit
 bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
-waiting for a worker. In the Rust SDK, `Codemode.timeout` remains a `Duration`;
+waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
+when execution has no deadline; a shorter script or host deadline and
+cancellation stop the wait sooner. Waiting counts toward the script deadline,
+and a cancelled waiter does not release another script's worker. In the Rust
+SDK, `Codemode.timeout` remains a `Duration`;
 its default `Duration::MAX` means no deadline, while other values set a limit.
 `Limits::default().tool_timeout` remains 30 seconds; passing `Limits` explicitly
 to `SessionBuilder::limits` enforces that timeout for Codemode too. Direct
