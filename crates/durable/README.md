@@ -511,8 +511,8 @@ value. The policy and initial object are persisted, independently versioned,
 and inherited by the child. Policy changes can be committed atomically with
 document writes, and historical forks use the policy at the selected cut. An
 absent policy, including for legacy documents, means copy. Policies belong to
-addresses and survive document deletion and recreation; a missing document is
-not created by a fork. Policies affect only conversation-scoped fork copies.
+addresses and survive document deletion and recreation. A fork inherits policies
+even when the corresponding document is missing, without creating that document. Policies affect only conversation-scoped fork copies.
 Policy changes advance the document revision but do not appear in document
 watch streams.
 

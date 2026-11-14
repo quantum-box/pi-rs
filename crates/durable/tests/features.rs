@@ -1222,3 +1222,118 @@ async fn document_fork_policies_are_persisted_and_follow_historical_cuts() {
         ForkPolicy::Copy
     );
 }
+
+#[tokio::test]
+async fn fork_inherits_policies_for_absent_documents_at_the_cut() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        document::{Address, Documents, ForkPolicy, Transaction},
+        runtime::AdmissionOptions,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let deleted = Address {
+        scope: parent.to_string(),
+        name: "deleted".into(),
+        key: "x".into(),
+    };
+    let never = Address {
+        name: "never".into(),
+        ..deleted.clone()
+    };
+    let shared = Address {
+        scope: "shared".into(),
+        name: "shared".into(),
+        key: "x".into(),
+    };
+    let db = Store::open(&path).unwrap();
+    let initial = ForkPolicy::Initial {
+        value: serde_json::json!({"n": 42}).as_object().unwrap().clone(),
+    };
+    let mut tx = Transaction::new();
+    tx.put(
+        &deleted,
+        Expected::Missing,
+        &serde_json::json!({"n": 1}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    for address in [&deleted, &never, &shared] {
+        tx.set_fork_policy(address, Expected::Missing, &initial)
+            .unwrap();
+    }
+    tx.commit(&db).unwrap();
+    let mut tx = Transaction::new();
+    tx.delete(
+        &deleted,
+        Documents::new(&db).get(&deleted).unwrap().unwrap().version,
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    h.submit_with_documents(
+        parent,
+        None,
+        "cut".into(),
+        AdmissionOptions::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let cut = h
+        .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .next;
+    let version = Documents::new(&db)
+        .fork_policy(&deleted)
+        .unwrap()
+        .unwrap()
+        .version;
+    let mut tx = Transaction::new();
+    tx.set_fork_policy(&deleted, Expected::Version(version), &ForkPolicy::Copy)
+        .unwrap();
+    tx.commit(&db).unwrap();
+    h.resume(&cancel).await.unwrap();
+    let child = h.fork_at(parent, cut).unwrap();
+    let docs = Documents::new(&db);
+    for address in [&deleted, &never] {
+        let child_address = Address {
+            scope: child.to_string(),
+            ..address.clone()
+        };
+        assert!(docs.get(&child_address).unwrap().is_none());
+        assert_eq!(
+            docs.fork_policy(&child_address).unwrap().unwrap().policy,
+            initial
+        );
+    }
+    let shared_child = Address {
+        scope: child.to_string(),
+        ..shared.clone()
+    };
+    assert!(docs.fork_policy(&shared_child).unwrap().is_none());
+    let child_address = Address {
+        scope: child.to_string(),
+        ..deleted.clone()
+    };
+    let mut tx = Transaction::new();
+    tx.put(
+        &child_address,
+        Expected::Missing,
+        &serde_json::json!({"n": 7}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let grandchild = h.fork(child).unwrap();
+    let descendant = Address {
+        scope: grandchild.to_string(),
+        ..deleted
+    };
+    assert_eq!(docs.get(&descendant).unwrap().unwrap().value["n"], 42);
+}

@@ -386,6 +386,16 @@ impl Store {
 
     /// Enumerate live document entries at an immutable revision.
     pub fn documents_at(&self, revision: u64) -> Result<Vec<KeyedEntry>, Error> {
+        self.entries_at_prefix(revision, b"durable/document/")
+    }
+
+    /// Enumerate live fork policies at an immutable revision, including policies
+    /// whose document is absent.
+    pub fn document_policies_at(&self, revision: u64) -> Result<Vec<KeyedEntry>, Error> {
+        self.entries_at_prefix(revision, b"durable/document-policy/")
+    }
+
+    fn entries_at_prefix(&self, revision: u64, prefix: &[u8]) -> Result<Vec<KeyedEntry>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let current: u64 = conn.query_row(
             "SELECT revision FROM durable_document_history_meta WHERE id=1",
@@ -395,8 +405,8 @@ impl Store {
         if revision > current {
             return Err(Error::InvalidSnapshot);
         }
-        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE substr(h.key,1,17)=CAST('durable/document/' AS BLOB) AND h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
-        let rows = stmt.query_map([revision], |r| {
+        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE substr(h.key,1,length(?2))=?2 AND h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
+        let rows = stmt.query_map(params![revision, prefix], |r| {
             Ok((
                 r.get(0)?,
                 Entry {

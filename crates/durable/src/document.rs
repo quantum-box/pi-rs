@@ -284,21 +284,32 @@ impl<'a> Documents<'a> {
                 expected: Expected::Missing,
             });
             batch.mutations.push(Mutation::Put { key: target, value });
-            if let Some(policy_entry) = policy_entry {
-                let child_address = Address {
-                    scope: child.to_string(),
-                    ..source_address
-                };
-                let key = child_address.policy_key()?;
-                batch.checks.push(Check {
-                    key: key.clone(),
-                    expected: Expected::Missing,
-                });
-                batch.mutations.push(Mutation::Put {
-                    key,
-                    value: policy_entry.value,
-                });
+        }
+        // Policies are address-level state and must survive even when the
+        // corresponding document is absent at the cut.
+        for (key, entry) in self.store.document_policies_at(revision)? {
+            let [scope, name, key]: [String; 3] = serde_json::from_slice(
+                key.strip_prefix(POLICY_PREFIX)
+                    .ok_or(Error::InvalidDocument)?,
+            )?;
+            if scope != parent.to_string() {
+                continue;
             }
+            let _: ForkPolicy = serde_json::from_slice(&entry.value)?;
+            let target = Address {
+                scope: child.to_string(),
+                name,
+                key,
+            }
+            .policy_key()?;
+            batch.checks.push(Check {
+                key: target.clone(),
+                expected: Expected::Missing,
+            });
+            batch.mutations.push(Mutation::Put {
+                key: target,
+                value: entry.value,
+            });
         }
         Ok(batch)
     }
