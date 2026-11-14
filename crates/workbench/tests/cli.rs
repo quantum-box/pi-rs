@@ -10,6 +10,34 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn repeated_session_id_selects_the_last_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .args([
+            "--session-id",
+            "first",
+            "--session-id",
+            "last",
+            "name",
+            "selected",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sessions.join("first.jsonl").exists());
+    assert!(sessions.join("last.jsonl").is_file());
+}
+
+#[test]
 fn jsonl_session_id_can_be_opened_by_session_and_resume() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
