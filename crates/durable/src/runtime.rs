@@ -2887,11 +2887,6 @@ impl Harness {
         kind: String,
         data: Option<serde_json::Value>,
     ) -> Result<Uuid, Error> {
-        if kind.is_empty() || kind.starts_with("pi.") {
-            return Err(Error::Invalid(
-                "application entry kind must be nonempty and outside pi.".into(),
-            ));
-        }
         loop {
             let (mut c, version) = self.load(id)?;
             if let Some(key) = request_id.as_ref() {
@@ -2910,6 +2905,11 @@ impl Harness {
                 {
                     return Ok(write.id);
                 }
+            }
+            if kind.is_empty() || kind.starts_with("pi.") {
+                return Err(Error::Invalid(
+                    "application entry kind must be nonempty and outside pi.".into(),
+                ));
             }
             let after_reset = c
                 .pending_resets

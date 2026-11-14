@@ -3310,3 +3310,74 @@ async fn resumed_legacy_round_records_handoff_without_termination_slots() {
     assert_eq!(c.resets[0].handoff.as_deref(), Some("new context"));
     assert!(matches!(&c.submissions[0].status, Status::Done { answer } if answer == "answer"));
 }
+
+#[test]
+fn withdrawn_write_retry_ignores_replacement_kind_and_legacy_json_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    owner.reset(id, None).unwrap();
+    let write = owner
+        .submit_write(id, Some("key".into()), "app.note".into(), None)
+        .unwrap();
+    assert_eq!(owner.withdraw_submission(id, write).unwrap(), WithdrawResult::Aborted);
+    for kind in ["", "pi.reserved"] {
+        assert_eq!(
+            owner.submit_write(id, Some("key".into()), kind.into(), None).unwrap(),
+            write
+        );
+        assert!(owner.submit_write(id, Some("other".into()), kind.into(), None).is_err());
+    }
+    let current = owner.conversation(id).unwrap();
+    let mut legacy = serde_json::to_value(&current.application_writes[0]).unwrap();
+    legacy.as_object_mut().unwrap().remove("withdrawn");
+    let restored: ApplicationWrite = serde_json::from_value(legacy).unwrap();
+    assert!(!restored.withdrawn);
+    assert!(!restored.placed);
+    let roundtrip: ApplicationWrite =
+        serde_json::from_value(serde_json::to_value(&current.application_writes[0]).unwrap()).unwrap();
+    assert!(roundtrip.withdrawn && !roundtrip.placed);
+}
+
+#[test]
+fn withdrawal_of_new_write_survives_stale_worker_placing_its_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let reset = owner.reset(id, None).unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    let marker = stale.pending_resets.remove(0);
+    place_reset(&mut stale, marker);
+    let withdrawn = owner
+        .submit_write(id, Some("withdrawn".into()), "app.note".into(), None)
+        .unwrap();
+    let kept = owner
+        .submit_write(id, Some("kept".into()), "app.note".into(), None)
+        .unwrap();
+    assert_eq!(
+        owner.withdraw_submission(id, withdrawn).unwrap(),
+        WithdrawResult::Aborted
+    );
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    let state = owner.conversation(id).unwrap();
+    assert!(state.resets.iter().any(|r| r.id == reset));
+    let removed = state.application_writes.iter().find(|w| w.id == withdrawn).unwrap();
+    let placed = state.application_writes.iter().find(|w| w.id == kept).unwrap();
+    assert!(removed.withdrawn && !removed.placed);
+    assert!(!placed.withdrawn && placed.placed);
+}
