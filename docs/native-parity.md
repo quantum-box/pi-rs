@@ -718,6 +718,11 @@ checkout and in-memory forks. Explicit asynchronous close releases shared
 extensions after the last fork closes. Managed host-bound sessions continue to
 use the existing host API.
 
+For shutdown, `SessionControl::request_shutdown` permanently cancels current and
+subsequently registered runs; the owner still awaits the operation and calls
+`close` to finish cleanup. Ordinary `abort` remains limited to the active run.
+This is a native embedding control rather than an upstream Pi API.
+
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
@@ -739,13 +744,30 @@ revocation during the write prevents the entire staged client set from being
 installed, and conflicting in-flight registrations are rejected before the
 journal write.
 The durable selection can then exist without a client and requires a new
-authorized registration before dispatch. The SDK
-cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
+authorized registration before dispatch. The SDK cannot verify an opaque
+client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
-existing exact registrations take precedence. This resolver runs on session
-construction, after recovering interrupted handoffs, not branch navigation or
-fork. Fallback commits a single native selection record even after an imported
-Pi source, using a distinct timestamp so older projections retain the change.
+existing exact registrations take precedence. The resolver runs on session
+construction and before checkout, tree navigation and forks; forks retain the
+resolver for later navigation. It resolves before transition hooks and file
+publication. Fallback checkout and tree navigation persist the destination and
+replacement selection in one record, including for a branch summary. The
+fallback clears thinking and a competing registration cannot be overwritten.
+If a host revokes clients during a successful transition write, the SDK emits
+the committed record and reports the successful transition, while subsequent
+dispatch fails closed until an authorized client is registered. Persistent
+forks resolve pending handoffs from the complete source journal before selecting
+their branch and validate their complete snapshot before
+publishing and retain the locked published file handle.
+Failures before publication remove the temporary snapshot and do not replace a
+destination. As with existing journal export, a directory-sync failure after
+the atomic publish can leave the complete destination in place; callers should
+inspect it before retrying.
+Construction fallback commits a single native selection record even after an
+imported Pi source, using a distinct timestamp so older projections retain the
+change. Older journals remain readable; journals containing the new transition
+records use journal version 4, which version 3 readers reject rather than
+silently ignoring the fallback selection.
 Hosts can also explicitly call
 `set_model` or `set_model_with_hooks` to select another client. The hook-aware form installs the replacement after
 recovery and before startup hooks and any turns they trigger.
@@ -3307,7 +3329,9 @@ indefinitely. Executable extensions negotiate keyed-message support.
 The journal records completion of turn-end callbacks and application of deferred
 context. Recovery reruns an unfinished callback before returning an existing
 answer or advancing the tool turn, then applies deferred context once. Journal
-version 3 identifies turns that use these boundaries. An older assistant record
+version 3 identifies turns that use these boundaries. New records appended to a
+version 1 or 2 journal use at least version 3; earlier records retain their
+original version. An older assistant record
 without a completion marker is treated as already observed: older journals
 cannot distinguish a completed callback from one interrupted before completion.
 Before a new run starts, unfinished earlier turn boundaries are resolved and
@@ -3462,6 +3486,12 @@ select the token-limit field, message roles, streaming usage and finish
 handling, and provider-specific thinking fields. Textual assistant reasoning
 is replayed only to the model and endpoint that produced it when the receiving
 adapter requires that field.
+
+For Chat Completions, `compat.vllmPriority` supplies the numeric top-level
+`priority` request field, including zero and negative values. Model settings
+override provider settings, model overrides apply afterward, and explicit
+`samplingParams.priority` takes final precedence. Focused loopback tests cover
+these configuration paths; no live vLLM server was used.
 
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.

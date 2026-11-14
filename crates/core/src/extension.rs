@@ -1473,6 +1473,60 @@ impl Registry {
     ) -> Result<()> {
         self.register_session_provider_model_with_limits(session_id, provider, name, model, None)
     }
+    /// Commit a branch transition and install its resolved client without
+    /// replacing a concurrently registered client for the same identity.
+    pub(crate) fn commit_resolved_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        if provider.trim().is_empty() || name.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let key = (Some(session_id), Some(provider.to_owned()), name.to_owned());
+        let reservation_key = (session_id, provider.to_owned(), name.to_owned());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            if reservations.contains_key(&reservation_key)
+                || reservations.contains_key(&(session_id, String::new(), String::new()))
+                || self
+                    .branch_models
+                    .read()
+                    .expect("branch models")
+                    .get(&key)
+                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {provider}/{name}"
+                )));
+            }
+            reservations.insert(reservation_key.clone(), false);
+        }
+        let _reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key: reservation_key,
+        };
+        let result = commit()?;
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        let revoked = reservations.get(&_reservation.key) == Some(&true);
+        if !revoked {
+            self.branch_models
+                .write()
+                .expect("branch models")
+                .entry(key)
+                .or_insert((model, None));
+        }
+        Ok((result, revoked))
+    }
     /// Reserve the entire session while startup commits and installs its
     /// complete staged model set. A concurrent revocation wins as a unit.
     pub(crate) fn commit_session_model_bindings<T>(
