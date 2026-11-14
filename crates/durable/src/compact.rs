@@ -381,6 +381,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_and_absent_instructions_remain_distinct_across_recovery() {
+        for instructions in [None, Some(""), Some("  ")] {
+            let preparation = prepare(&history(), "m", 100, 0, instructions)
+                .unwrap()
+                .unwrap();
+            let restored: Preparation =
+                serde_json::from_slice(&serde_json::to_vec(&preparation).unwrap()).unwrap();
+            assert_eq!(
+                restored.hook_input(crate::extension::CompactionReason::Manual).instructions.as_deref(),
+                instructions
+            );
+            assert_eq!(restored.request(), preparation.request());
+        }
+        assert!(prepare(&[], "m", 100, 0, Some("anything")).unwrap().is_none());
+        assert!(prepare(&[user("only")], "m", 100, 0, Some("anything"))
+            .unwrap()
+            .is_none());
+    }
+
     struct Stub(Mutex<Option<(Uuid, Uuid, ModelRequest)>>);
     #[async_trait::async_trait]
     impl Model for Stub {

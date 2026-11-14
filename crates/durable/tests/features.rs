@@ -269,6 +269,94 @@ async fn manual_compaction_instructions_survive_reopen() {
 }
 
 #[tokio::test]
+async fn manual_compaction_retry_preserves_request_and_context() {
+    use pi_rs_durable::extension::{BeforeCompact, CompactionInput, Context, Hook};
+    use std::sync::Mutex;
+
+    struct CaptureHook(Arc<Mutex<Vec<CompactionInput>>>);
+    #[async_trait]
+    impl Hook for CaptureHook {
+        async fn before_compact(
+            &self,
+            input: &CompactionInput,
+            _: &Context<'_>,
+        ) -> Result<BeforeCompact, String> {
+            self.0.lock().unwrap().push(input.clone());
+            Ok(BeforeCompact::Pass)
+        }
+    }
+    struct RetryModel(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait]
+    impl Model for RetryModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                let mut requests = self.0.lock().unwrap();
+                requests.push(request);
+                if requests.len() == 1 {
+                    return Ok(stream::pending().boxed());
+                }
+                return Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("recovered summary".into())),
+                    Ok(ModelEvent::Complete { calls: vec![], usage: None }),
+                ]).boxed());
+            }
+            ModelStub.stream(request).await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let hooks = Arc::new(Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(RetryModel(requests.clone())),
+        ..opts()
+    };
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(compact_extension(vec![Arc::new(CaptureHook(hooks.clone()))]))
+            .unwrap();
+        id = h.create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "system".into(),
+            max_output_tokens: 128,
+        }).unwrap();
+        h.select_extensions(id, vec!["compact".into()]).unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel).await.unwrap();
+        h.submit_and_run(id, None, "latest".into(), &cancel).await.unwrap();
+        assert!(h.request_compaction_with_instructions(id, 0, Some("preserve names")).unwrap());
+        let stop = CancellationToken::new();
+        let trigger = stop.clone();
+        let captured = requests.clone();
+        tokio::spawn(async move {
+            while captured.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            trigger.cancel();
+        });
+        assert!(h.resume(&stop).await.is_err());
+    }
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(compact_extension(vec![Arc::new(CaptureHook(hooks.clone()))]))
+            .unwrap();
+        h.resume(&cancel).await.unwrap();
+        let messages = h.conversation(id).unwrap().messages;
+        assert!(matches!(&messages[0], Message::User { content } if content.contains("recovered summary")));
+        assert!(matches!(&messages[1], Message::User { content } if content == "latest"));
+    }
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(matches!(&requests[0].messages[1], Message::User { content } if content.contains("preserve names") && content.contains("old") && !content.contains("latest")));
+    let hooks = hooks.lock().unwrap();
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].instructions.as_deref(), Some("preserve names"));
+    assert!(matches!(&hooks[0].messages[0], Message::User { content } if content == "old"));
+}
+
+#[tokio::test]
 async fn fork_copies_settled_context_but_not_submissions() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
