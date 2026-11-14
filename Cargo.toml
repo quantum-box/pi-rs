@@ -34,3 +34,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 uuid = "1"
 pi-rs-review = { path = "crates/review" }
+
+[patch.crates-io]
+reqwest-012 = { package = "reqwest", path = "vendor/reqwest-0.12.28" }
+reqwest-013 = { package = "reqwest", path = "vendor/reqwest-0.13.5" }

@@ -1573,7 +1573,8 @@ mod tests {
                         "http://localhost:{}",
                         listener.local_addr().unwrap().port()
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .tunnel_http(true),
                 ],
                 idle_timeout: None,
             },
@@ -1604,6 +1605,28 @@ mod tests {
                         len = n.trim().parse().unwrap();
                     }
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                first.clear();
+                socket.read_line(&mut first).await.unwrap();
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    assert!(
+                        !line
+                            .to_ascii_lowercase()
+                            .starts_with("proxy-authorization:")
+                    );
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = n.trim().parse().unwrap();
+                    }
+                }
                 let mut data = vec![0; len];
                 socket.read_exact(&mut data).await.unwrap();
                 requests.push((first, String::from_utf8(data).unwrap()));
@@ -1629,12 +1652,8 @@ mod tests {
         manager.set_credential_store(store);
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
-        assert!(
-            requests[0]
-                .0
-                .starts_with("POST http://127.0.0.1:1/register ")
-        );
-        assert!(requests[1].0.starts_with("POST http://127.0.0.1:1/token "));
+        assert!(requests[0].0.starts_with("POST /register "));
+        assert!(requests[1].0.starts_with("POST /token "));
         assert!(requests[1].1.contains("refresh_token=old-refresh"));
     }
 
@@ -1717,25 +1736,54 @@ mod tests {
 
     #[tokio::test]
     async fn registration_redirect_to_proxy_hostname_is_rejected() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = origin.local_addr().unwrap().port();
         let target_port = destination.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = origin.accept().await.unwrap();
-            let mut buffer = [0; 4096];
-            let _ = socket.read(&mut buffer).await.unwrap();
+            let (socket, _) = origin.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            socket.read_line(&mut first).await.unwrap();
+            assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
             socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{target_port}/register\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         });
         let options = crate::mcp::HttpOptionsWithProxyHosts {
             http: crate::mcp::HttpOptions {
-                proxies: vec![],
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!("http://localhost:{port}"))
+                        .unwrap()
+                        .tunnel_http(true),
+                ],
                 idle_timeout: None,
             },
             proxy_hosts: vec!["localhost".into()],
         };
-        let base = format!("http://127.0.0.1:{port}");
+        let base = "http://127.0.0.1:1".to_owned();
         let mut manager = oauth_manager(&base, Some(&options)).await.unwrap();
         manager.set_metadata(serde_json::from_value(serde_json::json!({
             "issuer":base, "authorization_endpoint":format!("{base}/authorize"),

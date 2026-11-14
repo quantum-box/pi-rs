@@ -2021,7 +2021,12 @@ fn forward_event(
             }
             if matches!(
                 event["type"].as_str(),
-                Some("text_delta" | "tool_call_delta" | "summary_request_start")
+                Some(
+                    "text_delta"
+                        | "tool_call_delta"
+                        | "summary_request_start"
+                        | "internal_tool_result_metadata"
+                )
             ) {
                 return Ok(());
             }

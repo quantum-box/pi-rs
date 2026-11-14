@@ -48,7 +48,8 @@ impl ToolResultPatch {
     }
 }
 
-/// Partial text result update with an independently adjustable error status.
+/// Partial result update with an independently adjustable error status.
+/// Metadata-only patches retain structured content and attachments.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultPatchV2 {
     pub output: Option<String>,
@@ -58,6 +59,43 @@ pub struct ToolResultPatchV2 {
 
 impl ToolResultPatchV2 {
     pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        if let Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } = outcome
+        {
+            let existing_details = match outcome {
+                Outcome::StructuredWithDetails { details, .. } => Some(details.clone()),
+                _ => None,
+            };
+            let details = self.details.or(existing_details);
+            let is_error = self.is_error.unwrap_or_else(|| outcome.is_error());
+            if let Some(output) = self.output {
+                return Ok(Outcome::TextResult {
+                    output,
+                    details,
+                    is_error,
+                });
+            }
+            let mut data = data.clone();
+            if is_error != outcome.is_error() {
+                let object = data
+                    .as_object_mut()
+                    .ok_or("cannot change error status of non-object structured result")?;
+                object.insert("isError".into(), Value::Bool(is_error));
+            }
+            return Ok(match details {
+                Some(details) => Outcome::StructuredWithDetails {
+                    data,
+                    attachments: attachments.clone(),
+                    details,
+                },
+                None => Outcome::Structured {
+                    data,
+                    attachments: attachments.clone(),
+                },
+            });
+        }
         let (output, details, is_error) = match outcome {
             Outcome::Succeeded(output) => (output.clone(), None, false),
             Outcome::SucceededWithDetails { output, details } => {
@@ -423,6 +461,10 @@ pub trait Tool: Send + Sync {
     }
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
+    }
+    /// Ephemeral result metadata for event projection, separate from the SDK outcome.
+    fn event_structured_content(&self, _outcome: &Outcome) -> Option<Value> {
+        None
     }
     /// Maximum serialized result bytes, bounded by the agent's 8 MiB ceiling.
     fn output_limit(&self) -> usize {
@@ -835,6 +877,71 @@ pub enum UserBashReplacement {
         extension: Arc<dyn Extension>,
         state: Option<ExtensionState>,
     },
+}
+
+tokio::task_local! {
+    pub(crate) static STRUCTURED_PATCH_PRESERVATION: std::cell::Cell<(Option<bool>, bool)>;
+}
+
+// Error status is metadata for structured outcomes. Compare all other data
+// and attachment references without cloning potentially large image payloads.
+fn same_tool_result_content(original: &Outcome, updated: &Outcome) -> bool {
+    fn parts(value: &Outcome) -> Option<(&Value, &[crate::AttachmentRef])> {
+        match value {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } => Some((data, attachments)),
+            _ => None,
+        }
+    }
+    if let (Some((a, aa)), Some((b, ba))) = (parts(original), parts(updated)) {
+        if aa != ba {
+            return false;
+        }
+        return match (a.as_object(), b.as_object()) {
+            (Some(a), Some(b)) => {
+                let left = a.iter().filter(|(key, _)| *key != "isError");
+                left.clone().count() == b.iter().filter(|(key, _)| *key != "isError").count()
+                    && left
+                        .into_iter()
+                        .all(|(key, value)| b.get(key) == Some(value))
+            }
+            _ => a == b,
+        };
+    }
+    if parts(original).is_some() || parts(updated).is_some() {
+        return false;
+    }
+    original.tool_content() == updated.tool_content()
+}
+
+/// Run a result hook while retaining trustworthy output-field presence.
+#[doc(hidden)]
+pub async fn track_tool_result_presence(
+    extension: &dyn Extension,
+    call: &crate::ToolCall,
+    outcome: &Outcome,
+    context: &ToolContext,
+    state: Option<&ExtensionState>,
+    host: Option<Arc<dyn ToolHost>>,
+) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+    let has_host = host.is_some();
+    STRUCTURED_PATCH_PRESERVATION
+        .scope(std::cell::Cell::new((None, false)), async {
+            let (result, explicit) = extension
+                .tool_result_update_with_presence(call, outcome, context, state, host)
+                .await?;
+            let tracking = STRUCTURED_PATCH_PRESERVATION.with(std::cell::Cell::get);
+            let preserves =
+                explicit.unwrap_or(tracking.0 == Some(true) && (!has_host || tracking.1));
+            let preserves = preserves
+                && result
+                    .as_ref()
+                    .is_none_or(|updated| same_tool_result_content(outcome, updated));
+            Ok((result, Some(preserves)))
+        })
+        .await
 }
 
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
@@ -1289,7 +1396,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text results while preserving fields omitted by the handler.
+    /// Patch result fields while preserving fields omitted by the handler.
     async fn tool_result_patch(
         &self,
         _call: &crate::ToolCall,
@@ -1300,7 +1407,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text, metadata and error status independently. The default delegates
+    /// Patch output, metadata and error status independently. The default delegates
     /// to the original partial-patch hook for source compatibility.
     async fn tool_result_patch_v2(
         &self,
@@ -1328,12 +1435,21 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
         let replacement = self.tool_result(call, outcome, context, state).await?;
+        if replacement.is_some() {
+            let _ = STRUCTURED_PATCH_PRESERVATION
+                .try_with(|state| state.set((Some(false), state.get().1)));
+        }
         let current = replacement.as_ref().unwrap_or(outcome);
         match self
             .tool_result_patch_v2(call, current, context, state)
             .await?
         {
-            Some(patch) => patch.apply(current).map(Some),
+            Some(patch) => {
+                let preserves = patch.output.is_none() && replacement.is_none();
+                let _ = STRUCTURED_PATCH_PRESERVATION
+                    .try_with(|state| state.set((Some(preserves), state.get().1)));
+                patch.apply(current).map(Some)
+            }
             None => Ok(replacement),
         }
     }
@@ -1346,7 +1462,35 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<Outcome>> {
-        self.tool_result_update(call, outcome, context, state).await
+        let result = self.tool_result_update(call, outcome, context, state).await;
+        let _ = STRUCTURED_PATCH_PRESERVATION
+            .try_with(|tracking| tracking.set((tracking.get().0, true)));
+        result
+    }
+
+    /// Override to report whether a result update leaves the output field
+    /// untouched. `None` means field presence is unknown; `Some(true)` means
+    /// output was not replaced, even with identical text. Existing hooks need
+    /// not implement this method.
+    async fn tool_result_update_with_presence(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        let result = match host {
+            Some(host) => {
+                self.tool_result_update_with_host(call, outcome, context, state, host)
+                    .await?
+            }
+            None => {
+                self.tool_result_update(call, outcome, context, state)
+                    .await?
+            }
+        };
+        Ok((result, None))
     }
 
     fn after_tool(
