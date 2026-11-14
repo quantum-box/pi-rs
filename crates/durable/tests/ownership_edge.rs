@@ -193,3 +193,67 @@ fn identity_owner_and_endpoint_versions_are_fenced() {
     assert!(edges.prepare_create(&edge).is_err());
     assert!(edges.get(child).unwrap().is_none());
 }
+
+#[test]
+fn composed_admission_advances_task_fence_and_recovers_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (parent, child) = {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        (
+            h.create_conversation(config()).unwrap(),
+            h.create_conversation(config()).unwrap(),
+        )
+    };
+    let t = task(parent);
+    let edge = Edge {
+        task: t.id(),
+        task_owner: t.owner().clone(),
+        child,
+        mode: Mode::Foreground,
+    };
+    let mut task_key = b"durable/task/".to_vec();
+    task_key.extend_from_slice(t.id().as_bytes());
+    let admission_key = b"test/child-admission".to_vec();
+    {
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&t)]).unwrap();
+        // A traversal that read this version before admission must fail its
+        // subsequent abort CAS, even if it did not see the new edge.
+        let stale = db.get(&task_key).unwrap().unwrap();
+        let prepared = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        let mut checks = prepared.checks;
+        checks.push(Check {
+            key: admission_key.clone(),
+            expected: Expected::Missing,
+        });
+        let mut mutations = prepared.mutations;
+        // Rewriting the unchanged checkpoint advances its storage version.
+        mutations.push(Mutation::Put {
+            key: task_key.clone(),
+            value: stale.value.clone(),
+        });
+        mutations.push(Mutation::Put {
+            key: admission_key.clone(),
+            value: b"admitted".to_vec(),
+        });
+        db.commit(&checks, &mutations).unwrap();
+        assert!(matches!(
+            db.commit(
+                &[Check {
+                    key: task_key.clone(),
+                    expected: Expected::Version(stale.version)
+                }],
+                &[Mutation::Put {
+                    key: task_key.clone(),
+                    value: stale.value
+                }],
+            ),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
+    let db = Store::open(&path).unwrap();
+    assert_eq!(EdgeStore::new(&db).get(child).unwrap().unwrap().edge, edge);
+    assert_eq!(db.get(&admission_key).unwrap().unwrap().value, b"admitted");
+}

@@ -34,7 +34,10 @@ pub struct StoredEdge {
 
 /// Include all checks and mutations unchanged in one `Store::commit`. Do not
 /// add conflicting writes to these keys or replace either endpoint with a
-/// different identity or ownership in the same transaction. On an uncertain
+/// different identity or ownership in the same transaction. A caller that
+/// traverses edges for abort must also advance the task record version in this
+/// transaction: an edge write alone does not invalidate a traversal that has
+/// already read the task and not yet observed the edge. On an uncertain
 /// commit outcome, reopen and inspect the records before retrying.
 pub struct PreparedEdge {
     pub checks: Vec<Check>,
