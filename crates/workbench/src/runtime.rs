@@ -719,6 +719,15 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 }
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
+    configure_after(args, interactive_mcp, std::future::ready(())).await
+}
+
+async fn configure_after(
+    args: &Cli,
+    interactive_mcp: bool,
+    before_preparation: impl std::future::Future<Output = ()>,
+) -> Result<Runtime> {
+    before_preparation.await;
     super::packages::prepare(args).await?;
     let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {

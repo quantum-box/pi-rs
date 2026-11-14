@@ -1594,6 +1594,7 @@ mod tests {
         .unwrap();
         let session = super::super::session_import::read(&path).unwrap();
         let snapshot = ShareSnapshot {
+            journal_tag: None,
             session_id: session.session_id(),
             head: session.head(),
             context: ShareContext {
@@ -1612,7 +1613,7 @@ mod tests {
             idle_timeout: None,
         };
         destination
-            .share(session, root.path(), Some(snapshot))
+            .share(session, root.path(), Some(snapshot), None)
             .await
             .unwrap();
         let (_, _, body) = server.await.unwrap();
