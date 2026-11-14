@@ -5075,19 +5075,54 @@ mod tests {
     }
     #[tokio::test]
     async fn before_tree_queued_messages_survive_checkout_cancel_and_reopen() {
+        const CHILD: &str = "PI_RS_TREE_MESSAGE_TEST_CHILD";
+        let mode = match std::env::var(CHILD) {
+            Ok(mode) => mode,
+            Err(_) => {
+                // A parent process can terminate a child even if synchronous
+                // journal I/O or a current-thread runtime stalls indefinitely.
+                for mode in ["memory", "file"] {
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "sdk::tests::before_tree_queued_messages_survive_checkout_cancel_and_reopen", "--nocapture"])
+                        .env(CHILD, mode)
+                        .spawn().unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+                    let status = loop {
+                        if let Some(status) = child.try_wait().unwrap() {
+                            break status;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            panic!("{mode} tree fixture exceeded the 180-second watchdog");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    };
+                    assert!(
+                        status.success(),
+                        "{mode} tree fixture child failed: {status}"
+                    );
+                }
+                return;
+            }
+        };
+        assert!(matches!(mode.as_str(), "memory" | "file"));
         for cancel_tree in [false, true] {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tree-messages.jsonl");
-            let mut session =
+            let builder =
                 SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
                     .extension(Arc::new(BeforeTreeMessages {
                         cancel: cancel_tree,
                         trigger: true,
                     }))
-                    .unwrap()
-                    .in_memory()
                     .unwrap();
+            let mut session = if mode == "file" {
+                builder.open(&path).unwrap()
+            } else {
+                builder.in_memory().unwrap()
+            };
             session.prompt("first").await.unwrap();
             let selected = session
                 .journal()
@@ -5097,12 +5132,9 @@ mod tests {
                 .find(|record| matches!(record.event, crate::Event::User { .. }))
                 .unwrap()
                 .id;
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                session.navigate_tree(selected, crate::TreeNavigationOptions::default()),
-            )
-            .await
-            .unwrap();
+            let result = session
+                .navigate_tree(selected, crate::TreeNavigationOptions::default())
+                .await;
             if cancel_tree {
                 assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
             } else {
@@ -5137,17 +5169,16 @@ mod tests {
                 .collect();
             assert!(texts.ends_with(&["tree trigger", "tree next"]), "{texts:?}");
             drop(snapshots);
-            // The timeout above checks for a stalled callback, not disk speed.
-            // Persist the complete journal once outside that deadline, then
-            // reopen through the real file-backed reader.
-            let records = session.journal().unwrap().records().to_vec();
+            let records = (mode == "memory").then(|| session.journal().unwrap().records().to_vec());
             drop(session);
-            let mut contents = Vec::new();
-            for record in &records {
-                serde_json::to_writer(&mut contents, record).unwrap();
-                contents.push(b'\n');
+            if let Some(records) = records {
+                let mut contents = Vec::new();
+                for record in &records {
+                    serde_json::to_writer(&mut contents, record).unwrap();
+                    contents.push(b'\n');
+                }
+                std::fs::write(&path, contents).unwrap();
             }
-            std::fs::write(&path, contents).unwrap();
             let restored = Session::open(&path).unwrap();
             assert!(restored.pending_custom_trigger().is_none());
             assert!(restored.queued_custom_messages().is_empty());
