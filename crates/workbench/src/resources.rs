@@ -598,18 +598,22 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter(&read(path)?)?;
+    let (metadata, body) = frontmatter_with_trim(&read(path)?, true)?;
     let description = metadata
         .description
         .filter(|description| !description.is_empty())
         .unwrap_or_else(|| {
             let first = body
                 .lines()
-                .find(|line| !line.trim().is_empty())
+                .find(|line| !line.trim_matches(is_prompt_space).is_empty())
                 .unwrap_or_default();
-            let mut characters = first.chars();
-            let mut description: String = characters.by_ref().take(60).collect();
-            if characters.next().is_some() {
+            // Pi's String.slice and length count UTF-16 code units. A slice
+            // through a surrogate pair is encoded as a replacement character
+            // when displayed as UTF-8.
+            let mut units = first.encode_utf16();
+            let prefix: Vec<_> = units.by_ref().take(60).collect();
+            let mut description = String::from_utf16_lossy(&prefix);
+            if units.next().is_some() {
                 description.push_str("...");
             }
             description
@@ -623,10 +627,16 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
 }
 
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
-    let normalized = text
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    frontmatter_with_trim(text, false)
+}
+
+fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
+    let text = if prompt {
+        text.strip_prefix('\u{feff}').unwrap_or(text)
+    } else {
+        text.trim_start_matches('\u{feff}')
+    };
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let Some(end) = normalized
         .strip_prefix("---")
         .and_then(|rest| rest.find("\n---"))
@@ -655,7 +665,16 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
             .and_then(|v| v.as_bool())
             == Some(true),
     };
-    Ok((metadata, normalized[end + 4..].trim().into()))
+    let body = &normalized[end + 4..];
+    Ok((
+        metadata,
+        if prompt {
+            body.trim_matches(is_prompt_space)
+        } else {
+            body.trim()
+        }
+        .into(),
+    ))
 }
 fn context_file(
     directory: &Path,
@@ -1604,6 +1623,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_fallback_description_matches_ecmascript_whitespace_and_utf16() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (body, expected) in [
+            (" \u{feff}\nvisible", "visible".to_owned()),
+            ("\u{0085}\nvisible", "\u{0085}".to_owned()),
+            (
+                "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x",
+                format!("{}...", "😀".repeat(30)),
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.description, expected);
+            assert_eq!(prompt.body, body);
+        }
+        let body = format!("{}😀tail", "x".repeat(59));
+        std::fs::write(&path, &body).unwrap();
+        let prompt = parse_prompt(&path).unwrap();
+        assert_eq!(prompt.description, format!("{}�...", "x".repeat(59)));
+        assert_eq!(prompt.body, body);
+        std::fs::write(&path, format!("---\ndescription: explicit\n---\n{body}")).unwrap();
+        assert_eq!(parse_prompt(&path).unwrap().description, "explicit");
+    }
+
+    #[test]
     fn frontmatter_reads_multiline_yaml_without_exposing_it_as_prompt() {
         let (metadata, body) = frontmatter(
             "---\nname: test\ndescription: >\n  first line\n  second line\n---\nInstructions",
@@ -1614,6 +1659,61 @@ mod tests {
             Some("first line second line\n")
         );
         assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn prompt_frontmatter_body_uses_ecmascript_trim_without_changing_skill_trim() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            (
+                "---\nother: value\n---\n\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}",
+            ),
+            (
+                "---\nother: value\n---\n\u{feff}\nvisible\n\u{feff}",
+                "visible",
+                "visible",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        assert_eq!(
+            frontmatter("---\nother: value\n---\n\u{0085}body\u{0085}")
+                .unwrap()
+                .1,
+            "body"
+        );
+    }
+
+    #[test]
+    fn prompt_frontmatter_strips_only_one_leading_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            ("\u{feff}\u{feff}", "\u{feff}", ""),
+            (
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "body",
+                "explicit",
+            ),
+            (
+                "\u{feff}\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        // Keep existing non-prompt callers' BOM behavior.
+        assert_eq!(frontmatter("\u{feff}\u{feff}body").unwrap().1, "body");
     }
 
     #[test]
