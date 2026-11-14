@@ -74,131 +74,120 @@ fn accept_model_request(listener: TcpListener) -> (std::net::TcpStream, Value) {
 
 #[test]
 fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
-    {
-        let (missing_model_credentials, pending_trust) = (false, false);
-        let root = tempfile::tempdir().unwrap();
-        if pending_trust {
-            std::fs::create_dir_all(root.path().join(".agents/skills/example")).unwrap();
-        }
-        let path = root.path().join("session.jsonl");
-        let prompt = root.path().join("system.txt");
-        std::fs::write(&prompt, "Unique standalone share prompt").unwrap();
-        let mut session = pi_rs::Session::open(&path).unwrap();
-        session
-            .append_user_with_images("hello".into(), Vec::new(), None)
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    let prompt = root.path().join("system.txt");
+    std::fs::write(&prompt, "Unique standalone share prompt").unwrap();
+    let mut session = pi_rs::Session::open(&path).unwrap();
+    session
+        .append_user_with_images("hello".into(), Vec::new(), None)
+        .unwrap();
+    drop(session);
+    let original = std::fs::read(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        drop(session);
-        let original = std::fs::read(&path).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
-        let (sender, receiver) = mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap();
-                }
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
             }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
-            sender.send(body).unwrap();
-        });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-        command
-            .current_dir(root.path())
-            .env("PI_RS_HOME", root.path().join("home"))
-            .env("RADIUS_API_KEY", "fixture")
-            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
-            .env_remove("GEMINI_API_KEY")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("PI_RS_MODEL_TOKEN")
-            .args([
-                "--offline",
-                "--no-mcp",
-                "--no-extensions",
-                "--no-skills",
-                "--no-context-files",
-                "--tools",
-                "read",
-                "--system-prompt",
-            ])
-            .arg(&prompt)
-            .arg("--session")
-            .arg(&path);
-        if !pending_trust {
-            command.arg("--no-trust");
-        }
-        if missing_model_credentials {
-            command.args(["--provider", "google", "--model", "gemini-2.5-flash"]);
-        } else {
-            command.args(["--endpoint", "http://127.0.0.1:1/v1/chat/completions"]);
-        }
-        let mut child = command
-            .arg("share")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("standalone share timed out");
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let body = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
-        server.join().unwrap();
-        let entries: Vec<Value> = body
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice(line).unwrap())
-            .collect();
-        let metadata = entries
-            .iter()
-            .find(|entry| entry["customType"] == "pi.share");
-        if missing_model_credentials || pending_trust {
-            assert!(metadata.is_none());
-        } else {
-            let metadata = metadata.unwrap();
-            assert_eq!(entries.last(), Some(metadata));
-            assert_eq!(metadata["parentId"], entries[entries.len() - 2]["id"]);
-            assert!(
-                metadata["data"]["systemPrompt"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Unique standalone share prompt")
-            );
-            assert!(
-                metadata["data"]["tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
-            );
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        sender.send(body).unwrap();
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--tools",
+            "read",
+            "--system-prompt",
+        ])
+        .arg(&prompt)
+        .arg("--session")
+        .arg(&path);
+    command.args([
+        "--no-trust",
+        "--endpoint",
+        "http://127.0.0.1:1/v1/chat/completions",
+    ]);
+    let mut child = command
+        .arg("share")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("standalone share timed out");
         }
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    server.join().unwrap();
+    let entries: Vec<Value> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let metadata = entries
+        .iter()
+        .find(|entry| entry["customType"] == "pi.share");
+    {
+        let metadata = metadata.unwrap();
+        assert_eq!(entries.last(), Some(metadata));
+        assert_eq!(metadata["parentId"], entries[entries.len() - 2]["id"]);
+        assert!(
+            metadata["data"]["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .contains("Unique standalone share prompt")
+        );
+        assert!(
+            metadata["data"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
 #[test]
