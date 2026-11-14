@@ -1,5 +1,7 @@
 # Pi Durable compatibility inventory
 
+**Opt-in Ollama adapter:** The standalone [durable-ollama crate](../crates/durable-ollama/README.md) prepares and dispatches validated post-hook OpenAI-compatible chat-completions bodies to a numeric loopback endpoint. It supports SSE text and tool calls but intentionally omits native Ollama NDJSON, provider compatibility options, reasoning replay and detailed accounting. It is not automatically installed or selected; see the crate README for its trust and cancellation boundaries.
+
 
 **Task document transaction checkpoint:** Generic task handlers can stage checked document reads and writes with a successful checkpoint transition and `Wait` children in one commit. Confirmed document conflicts retry replay-safe handlers, while unsafe handlers fail for reconciliation; other transaction conflicts require reopening. The reservation commits separately. Failures and abort handlers do not commit staged documents. This remains narrower than upstream §4: no entries, asynchronous or general session transaction, read-your-writes, consistent multi-document snapshot, or arbitrary child creation. See [task transaction tests](../crates/durable/tests/task_document_transaction.rs) and the [durable README](../crates/durable/README.md).
 Upstream was rechecked at commit `c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0` on 2026-11-15; `packages/durable` is unchanged from the audited `827383a15262905f82e418483825a49dbb1adbf5` baseline below.
