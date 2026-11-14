@@ -249,6 +249,152 @@ fn worker_returns_keyed_share_journal_tag() {
     reader.join().unwrap();
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn standalone_radius_share_reconstructs_instead_of_using_old_cache() {
+    use pi_rs_workbench::private_share_store::Store;
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = root.path().join("session.jsonl");
+    let prompt = root.path().join("prompt.txt");
+    std::fs::write(&prompt, "fresh-from-disk").unwrap();
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("fixture".into(), Vec::new(), None)
+        .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let store = Store::open(&home).unwrap();
+    let binding = store.binding_for_session(&session, &()).unwrap();
+    let stale = json!({"sessionId":session.session_id(), "head":session.head(),
+        "context":{"systemPrompt":"stale-cache-canary", "tools":[]}});
+    store
+        .begin(&path, binding.clone())
+        .unwrap()
+        .publish(binding.clone(), stale.clone())
+        .unwrap();
+    drop(store);
+    drop(session);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+        let Some(length) = length.filter(|length| *length <= 1024 * 1024) else {
+            return;
+        };
+        let mut body = vec![0; length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        );
+        let _ = sender.send((first, body));
+    });
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env("RADIUS_API_KEY", "fixture")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--system-prompt",
+        ])
+        .arg(&prompt)
+        .arg("--session")
+        .arg(&path)
+        .arg("share")
+        .stdout(Stdio::from(stdout.reopen().unwrap()))
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child
+        .0
+        .try_wait()
+        .unwrap()
+        .expect("standalone share did not exit");
+    assert!(
+        status.success(),
+        "{}",
+        String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+    );
+    let (first, body) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Radius request not received");
+    server.join().unwrap();
+    assert!(first.starts_with("POST /v1/artifacts?"), "{first}");
+    let entries: Vec<Value> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let metadata = entries
+        .iter()
+        .find(|entry| entry["customType"] == "pi.share")
+        .expect("missing share metadata");
+    assert!(
+        metadata["data"]["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .contains("fresh-from-disk")
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("stale-cache-canary"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let store = Store::open_existing(&home).unwrap().unwrap();
+    assert_eq!(store.read(&path, &binding).unwrap(), Some(stale));
+}
+
 #[test]
 fn missing_session_id_does_not_create_a_journal() {
     let root = tempfile::tempdir().unwrap();

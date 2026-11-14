@@ -41,3 +41,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_response_keeps_its_private_journal_key
       - name: Test live share private fields
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_share_uploads_context_for_matching_snapshot
+      - name: Test standalone share ignores stale cache
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli standalone_radius_share_reconstructs_instead_of_using_old_cache
