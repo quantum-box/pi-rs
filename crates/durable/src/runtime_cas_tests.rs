@@ -151,6 +151,95 @@ fn withdrawal_is_durable_and_merges_with_worker_progress() {
 }
 
 #[test]
+fn queued_write_withdrawal_wins_over_stale_reset_placement_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let reset = owner.reset(id, None).unwrap();
+    let write = owner
+        .submit_write(id, Some("write-key".into()), "app.note".into(), None)
+        .unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    let marker = stale.pending_resets.remove(0);
+    place_reset(&mut stale, marker);
+    stale.phase = Phase::Idle;
+    assert_eq!(
+        owner.withdraw_submission(id, write).unwrap(),
+        WithdrawResult::Aborted
+    );
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    let state = owner.conversation(id).unwrap();
+    assert_eq!(state.resets.last().unwrap().id, reset);
+    assert!(state.application_writes[0].withdrawn);
+    assert!(!state.application_writes[0].placed);
+    drop(worker);
+    drop(owner);
+    let mut reopened = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        reopened.withdraw_submission(id, write).unwrap(),
+        WithdrawResult::Settled
+    );
+    assert_eq!(
+        reopened
+            .submit_write(id, Some("write-key".into()), "app.other".into(), None)
+            .unwrap(),
+        write
+    );
+    assert!(
+        reopened
+            .submit(id, Some("write-key".into()), "input".into())
+            .is_err()
+    );
+    let state = reopened.conversation(id).unwrap();
+    assert!(state.application_writes[0].withdrawn && !state.application_writes[0].placed);
+}
+
+#[test]
+fn committed_write_placement_wins_over_stale_withdrawal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    owner.reset(id, None).unwrap();
+    let write = owner
+        .submit_write(id, None, "app.note".into(), None)
+        .unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    stale.application_writes[0].withdrawn = true;
+    let (mut placed, current) = owner.load(id).unwrap();
+    let marker = placed.pending_resets.remove(0);
+    place_reset(&mut placed, marker);
+    owner.save(&placed, Expected::Version(current)).unwrap();
+    worker.merge_admissions = false;
+    assert!(matches!(
+        worker.save(&stale, Expected::Version(version)),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert_eq!(
+        worker.withdraw_submission(id, write).unwrap(),
+        WithdrawResult::Settled
+    );
+    let state = owner.conversation(id).unwrap();
+    assert!(state.application_writes[0].placed && !state.application_writes[0].withdrawn);
+}
+
+#[test]
 fn submissions_racing_abort_are_neither_lost_nor_duplicated() {
     let dir = tempfile::tempdir().unwrap();
     let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();

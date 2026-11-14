@@ -5,7 +5,9 @@ use pi_rs_core::{
 };
 use pi_rs_durable::{
     recovery::UncertainPolicy,
-    runtime::{Config, Error, Options, Scheduler, SubmissionKind, SubmissionSettlement},
+    runtime::{
+        Config, Error, Options, Scheduler, SubmissionKind, SubmissionSettlement, WithdrawResult,
+    },
 };
 use std::{sync::Arc, task::Poll, time::Duration};
 use tokio::sync::Notify;
@@ -149,6 +151,66 @@ async fn queued_write_waits_until_reset_is_placed() {
         SubmissionSettlement::Write
     );
     drop(pending);
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn withdrawn_write_settles_across_reopen_and_other_writes_follow_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut s = Scheduler::open(&path, options(started.clone(), release.clone())).unwrap();
+    let c = s.create_conversation(config()).unwrap();
+    let immediate = s
+        .submit_write(c, None, "app.immediate".into(), None)
+        .unwrap();
+    assert_eq!(
+        s.withdraw_submission(c, immediate).unwrap(),
+        WithdrawResult::Settled
+    );
+    s.submit(c, None, "first".into()).unwrap();
+    started.notified().await;
+    let first = s.reset(c, None).unwrap();
+    let withdrawn = s
+        .submit_write(c, Some("key".into()), "app.withdrawn".into(), None)
+        .unwrap();
+    let second = s.reset(c, None).unwrap();
+    let kept = s.submit_write(c, None, "app.kept".into(), None).unwrap();
+    assert_eq!(
+        s.withdraw_submission(c, withdrawn).unwrap(),
+        WithdrawResult::Aborted
+    );
+    assert_eq!(
+        wait(&s, c, withdrawn).await.unwrap(),
+        SubmissionSettlement::WriteUnanswered {
+            reason: "aborted".into()
+        }
+    );
+    s.shutdown().await.unwrap();
+    let s = Scheduler::open(&path, options(started.clone(), release.clone())).unwrap();
+    assert_eq!(
+        wait(&s, c, withdrawn).await.unwrap(),
+        SubmissionSettlement::WriteUnanswered {
+            reason: "aborted".into()
+        }
+    );
+    started.notified().await;
+    release.notify_one();
+    assert_eq!(wait(&s, c, kept).await.unwrap(), SubmissionSettlement::Write);
+    let state = s.conversation(c).unwrap();
+    let w = state
+        .application_writes
+        .iter()
+        .find(|w| w.id == withdrawn)
+        .unwrap();
+    assert!(w.withdrawn && !w.placed && w.after_reset == Some(first));
+    let w = state
+        .application_writes
+        .iter()
+        .find(|w| w.id == kept)
+        .unwrap();
+    assert!(w.placed && !w.withdrawn && w.after_reset == Some(second));
     s.shutdown().await.unwrap();
 }
 

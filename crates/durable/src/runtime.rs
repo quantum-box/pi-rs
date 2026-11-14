@@ -147,6 +147,9 @@ pub struct ApplicationWrite {
     pub kind: String,
     pub data: Option<serde_json::Value>,
     pub placed: bool,
+    /// Terminal withdrawal of a write that was still queued.
+    #[serde(default)]
+    pub withdrawn: bool,
     /// The last reset preceding this write, if any.
     pub after_reset: Option<Uuid>,
 }
@@ -167,9 +170,11 @@ pub enum SubmissionSettlement {
     },
     /// The display-only application write has been placed.
     Write,
+    /// The queued display-only write was withdrawn before placement.
+    WriteUnanswered { reason: String },
 }
 
-/// Result of attempting to withdraw a single input.
+/// Result of attempting to withdraw a single submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithdrawResult {
     Aborted,
@@ -1392,15 +1397,30 @@ impl Harness {
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
+                    for (original, current) in
+                        base.application_writes.iter().zip(&latest.application_writes)
+                    {
+                        if !original.withdrawn
+                            && current.withdrawn
+                            && let Some(write) = state
+                                .application_writes
+                                .iter_mut()
+                                .find(|w| w.id == current.id)
+                        {
+                            write.placed = false;
+                            write.withdrawn = true;
+                        }
+                    }
                     for mut write in latest
                         .application_writes
                         .iter()
                         .skip(base.application_writes.len())
                         .cloned()
                     {
-                        if write
-                            .after_reset
-                            .is_some_and(|id| state.resets.iter().any(|r| r.id == id))
+                        if !write.withdrawn
+                            && write
+                                .after_reset
+                                .is_some_and(|id| state.resets.iter().any(|r| r.id == id))
                         {
                             write.placed = true;
                         }
@@ -1987,6 +2007,7 @@ impl Harness {
             .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
         state.config = config;
         state.submissions.clear();
+        state.application_writes.retain(|write| write.placed);
         for write in &mut state.application_writes {
             write.request_id = None;
         }
@@ -2049,6 +2070,7 @@ impl Harness {
         state.active = None;
         state.abort_requested = false;
         state.submissions.clear();
+        state.application_writes.retain(|write| write.placed);
         for write in &mut state.application_writes {
             write.request_id = None;
         }
@@ -2900,6 +2922,7 @@ impl Harness {
                 kind: kind.clone(),
                 data: data.clone(),
                 placed: c.pending_resets.is_empty(),
+                withdrawn: false,
                 after_reset,
             };
             let write_id = write.id;
@@ -3271,7 +3294,7 @@ impl Harness {
             }
         }
     }
-    /// Withdraw an input only while it is still queued. Request IDs remain reserved.
+    /// Withdraw an input or write only while queued. Request IDs remain reserved.
     pub fn withdraw_submission(
         &mut self,
         id: Uuid,
@@ -3279,19 +3302,33 @@ impl Harness {
     ) -> Result<WithdrawResult, Error> {
         loop {
             let (mut c, version) = self.load(id)?;
-            let Some(item) = c.submissions.iter_mut().find(|item| item.id == submission) else {
-                return Ok(WithdrawResult::NotFound);
-            };
-            match item.status {
-                Status::Queued => {
-                    item.status = Status::Unanswered {
-                        reason: "aborted".into(),
+            if let Some(item) = c.submissions.iter_mut().find(|item| item.id == submission) {
+                match item.status {
+                    Status::Queued => {
+                        item.status = Status::Unanswered {
+                            reason: "aborted".into(),
+                        }
                     }
+                    Status::Running => return Ok(WithdrawResult::AlreadyPlaced),
+                    _ => return Ok(WithdrawResult::Settled),
                 }
-                Status::Running => return Ok(WithdrawResult::AlreadyPlaced),
-                _ => return Ok(WithdrawResult::Settled),
+            } else if let Some(write) = c
+                .application_writes
+                .iter_mut()
+                .find(|write| write.id == submission)
+            {
+                if write.placed || write.withdrawn {
+                    return Ok(WithdrawResult::Settled);
+                }
+                write.withdrawn = true;
+            } else {
+                return Ok(WithdrawResult::NotFound);
             }
-            match self.save(&c, Expected::Version(version)) {
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&c, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
                 Ok(()) => return Ok(WithdrawResult::Aborted),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(error) => return Err(error),
@@ -5741,7 +5778,13 @@ impl Scheduler {
                 }
             } else if let Some(write) = state.application_writes.iter().find(|w| w.id == submission)
             {
-                write.placed.then_some(SubmissionSettlement::Write)
+                if write.withdrawn {
+                    Some(SubmissionSettlement::WriteUnanswered {
+                        reason: "aborted".into(),
+                    })
+                } else {
+                    write.placed.then_some(SubmissionSettlement::Write)
+                }
             } else {
                 return Err(Error::SubmissionNotFound);
             };
@@ -6960,7 +7003,20 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .and_then(|v| v.remove("application_writes"));
     let writes_unchanged = match (old_writes, new_writes) {
         (Some(serde_json::Value::Array(old)), Some(serde_json::Value::Array(new))) => {
-            new.starts_with(&old)
+            new.len() >= old.len()
+                && old.iter().zip(&new).all(|(a, b)| {
+                    if a == b {
+                        return true;
+                    }
+                    let mut a = a.clone();
+                    let mut b = b.clone();
+                    let old_withdrawn = a.as_object_mut().and_then(|v| v.remove("withdrawn"));
+                    let new_withdrawn = b.as_object_mut().and_then(|v| v.remove("withdrawn"));
+                    a == b
+                        && old_withdrawn == Some(serde_json::json!(false))
+                        && new_withdrawn == Some(serde_json::json!(true))
+                        && a.get("placed") == Some(&serde_json::json!(false))
+                })
         }
         _ => false,
     };
@@ -7024,7 +7080,7 @@ fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
         c.messages.push(message);
     }
     for write in &mut c.application_writes {
-        if write.after_reset == Some(marker.id) {
+        if !write.withdrawn && write.after_reset == Some(marker.id) {
             write.placed = true;
         }
     }
