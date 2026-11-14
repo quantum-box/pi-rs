@@ -714,3 +714,131 @@ fn driver_runs_all_receivers_after_multiple_atomic_deliveries() {
         assert_eq!(signal_value(&path, id, key), Some(json!(key)));
     }
 }
+
+// The parent kills this process only after tick has committed the sender's
+// checkpoint, document and signal, but before any receiver poll can occur.
+#[cfg(unix)]
+#[test]
+fn signal_commit_process_child() {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("PI_SIGNAL_DEATH_DB") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    setup(&path, Some(100));
+    let results = Arc::new(Mutex::new(vec![]));
+    let mut scheduler = Scheduler::open(&path, registry(&path, 0, results.clone())).unwrap();
+    scheduler.submit(&task(1, "sender")).unwrap();
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(*results.lock().unwrap(), vec![SignalResult::Delivered]);
+    println!("SIGNAL_COMMITTED_BEFORE_WAIT_POLL");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn committed_typed_signal_survives_process_death_before_wait_poll() {
+    use pi_rs_durable::{
+        task::TypedWake,
+        task_store::{SignalState, WakeResult},
+    };
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::process::ExitStatusExt,
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        time::Duration,
+    };
+
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "signal_commit_process_child", "--nocapture"])
+            .env("PI_SIGNAL_DEATH_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line.unwrap().contains("SIGNAL_COMMITTED_BEFORE_WAIT_POLL") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("child did not commit signal");
+    child.0.kill().unwrap();
+    assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+
+    let token = SignalToken::new("answer", 1).unwrap();
+    let receiver = Uuid::from_u128(2);
+    {
+        let db = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&db);
+        assert_eq!(
+            ts.load(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .task
+                .checkpoint()
+                .phase,
+            "done"
+        );
+        assert_eq!(
+            Documents::new(&db).get(&addr()).unwrap().unwrap().value["done"],
+            true
+        );
+        let waiting = ts.load(receiver).unwrap().unwrap();
+        assert!(matches!(
+            waiting.task.state(),
+            TaskState::Waiting(WaitFor::TypedSleep { .. })
+        ));
+        assert_eq!(
+            ts.read_typed_signal_state(receiver, &token, "a").unwrap(),
+            Some(SignalState::Value(json!(1)))
+        );
+        assert_eq!(
+            ts.deliver_signal_at(receiver, &token, "a", json!(1), 100)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        // A value committed before the deadline wins even when polling after it.
+        assert!(matches!(
+            ts.poll_wait(&ts.load(receiver).unwrap().unwrap(), 100)
+                .unwrap(),
+            WakeResult::Woken { signal: Some(_) }
+        ));
+    }
+    let db = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&db);
+    let recovered = ts.load(receiver).unwrap().unwrap();
+    assert_eq!(
+        recovered.task.typed_wake(),
+        Some(&TypedWake::Signal(token.key("a").unwrap()))
+    );
+    assert_eq!(
+        ts.read_typed_signal_state(receiver, &token, "a").unwrap(),
+        Some(SignalState::Value(json!(1)))
+    );
+    assert_eq!(
+        ts.deliver_signal_at(receiver, &token, "a", json!(2), 101)
+            .unwrap(),
+        SignalResult::Duplicate
+    );
+}
