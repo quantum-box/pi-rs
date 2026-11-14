@@ -8566,6 +8566,26 @@ impl SummaryPlacementDriver {
                         .as_ref()
                         .is_some_and(|marker| marker.id == id)
                     {
+                        if matches!(raw.phase, Phase::Idle | Phase::FailedIdle)
+                            && raw.active.is_none()
+                            && !raw.abort_requested
+                        {
+                            let (mut state, version) =
+                                self.harness.load_for_summary_placement(conversation)?;
+                            if current.as_ref().map(|entry| entry.version) != Some(version) {
+                                continue;
+                            }
+                            match self
+                                .harness
+                                .consume_independent_summary(&mut state, version)
+                            {
+                                Ok(())
+                                | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         return Ok(SummaryPlacement::Queued);
                     }
                 }
@@ -8583,19 +8603,19 @@ impl SummaryPlacementDriver {
                     true
                 } else if let Some(checkpoint) = snap.operation.busy_checkpoint() {
                     let base: Conversation = serde_json::from_value(checkpoint.clone())?;
-                    admission_only(&base, &state)?
+                    admission_only(&base, &state)? || summary_progress_only(&base, &state)?
                 } else {
                     false
                 };
                 let marker = if admissions_proven
-                    && matches!(state.phase, Phase::ModelRunning { .. })
-                    && state.active.is_some()
+                    && (matches!(state.phase, Phase::ModelRunning { .. }) && state.active.is_some()
+                        || matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+                            && state.active.is_none())
                     && state.pending_independent_summary.is_none()
                     && state.pending_resets.len() <= SUMMARY_MAX_HISTORY_RECORDS
                     && !state.abort_requested
-                    && result.source_matches(&state.messages)
                     && (if result.has_blocks() {
-                        result.matches_blocks(
+                        result.matches_blocks_prefix(
                             &state.messages,
                             &state.content_blocks,
                             state.context_generation,
@@ -8634,7 +8654,7 @@ impl SummaryPlacementDriver {
                 } else if marker.is_some() || snap.operation.placement_version() == Some(version) {
                     let queued = marker.is_some();
                     match store.admit_placement_with_marker(&snap, key.clone(), version, marker) {
-                        Ok(()) if queued => return Ok(SummaryPlacement::Queued),
+                        Ok(()) if queued => continue,
                         Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
                         Err(error) => return Err(self.summary_store_error(error)),
                     }
@@ -10772,6 +10792,58 @@ impl Drop for Scheduler {
         // The poller is otherwise perpetual and would keep the owner alive.
         self.reporter_cancel.cancel();
     }
+}
+
+// Prove that model progress has retained the selected ownership and inbox
+// identities. The caller additionally checks the source prefix, block bindings
+// and context generation, and fences the observed conversation version.
+fn summary_progress_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
+    if base.id != latest.id
+        || base.context_generation != latest.context_generation
+        || base.resets != latest.resets
+        || latest.submissions.len() < base.submissions.len()
+        || latest.application_writes.len() < base.application_writes.len()
+        || serde_json::to_value((
+            &base.config,
+            &base.extensions,
+            &base.provider_adapter,
+            &base.allowed_tools,
+            &base.model_tools,
+        ))? != serde_json::to_value((
+            &latest.config,
+            &latest.extensions,
+            &latest.provider_adapter,
+            &latest.allowed_tools,
+            &latest.model_tools,
+        ))?
+    {
+        return Ok(false);
+    }
+    for (old, new) in base.submissions.iter().zip(&latest.submissions) {
+        if old.id != new.id
+            || old.kind != new.kind
+            || old.request_id != new.request_id
+            || old.content != new.content
+            || base.input_modes.get(&old.id) != latest.input_modes.get(&old.id)
+        {
+            return Ok(false);
+        }
+    }
+    for (old, new) in base
+        .application_writes
+        .iter()
+        .zip(&latest.application_writes)
+    {
+        if old.id != new.id
+            || old.request_id != new.request_id
+            || old.kind != new.kind
+            || old.data != new.data
+            || old.after_reset != new.after_reset
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {

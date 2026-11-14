@@ -175,15 +175,19 @@ original audit table below remains a historical baseline.
 
 **Narrow busy independent summary:** A public opt-in accepts a summary while a
 model request is running. A bounded durable selection snapshot proves that any
-intervening changes are admissions before a later conversation version can be
-used for the atomic placement ticket and pending marker. A preceding reset is
+intervening changes retain the original submission and write identities and
+configuration; the context generation and selected source prefix must also
+match. Append-only model progress and fenced model restarts can therefore use a
+later conversation version for the atomic placement ticket and pending marker
+while the model is running or at idle. A preceding reset is
 placed first and makes the summary stale; queued inputs follow the writes.
 In-flight model saves merge the marker, and context-generation and source-prefix
 checks guard the atomic settlement. Later writes follow the marker. Conversation
 abort preserves a queued summary and passive writes; explicit operation abort
 withdraws it. Pending work survives reopen. The selection and hook snapshots
 share a 512 KiB limit, and the preceding reset prefix is limited to 128. Other
-changes and old unbound operations fail closed. This is not a general ordered inbox. See
+changed contexts, unsupported phases, and old unbound operations fail closed.
+This is not a general ordered inbox. See
 [public tests](../crates/durable/tests/independent_compaction.rs).
 
 **Independent summary worker and placement:** An opt-in public idle path starts a scheduler-owned independent worker, runs selected `beforeCompact` hooks from a persisted snapshot with operation-scoped memo and optional instructions, settles usage under the per-operation fence, and automatically places or marks its result stale. Conversation graph abort marks running owned summaries and waits for cleanup while preserving an already queued summary write; foreground idle waits include them. Admission still checks the conversation's own phase and queue rather than its owned graph. Placement requires the exact captured conversation version and preserves retained provenance. The recovery constructor installs its adapter and extensions first, scans at most 128 total records of at most 4 MiB each, and resumes matching provider-bound execution and public automatic placement. Hook snapshots are limited to 512 KiB; a missing selected extension blocks execution. Legacy or mismatched identities are blocked; the host must identify the provider, tenant and idempotency namespace correctly. The record limit includes terminal records, public admission rejects a full store, and no retention policy exists. Individual store entries are materialized before size checks. The narrow busy path described above does not yet provide a general ordered inbox. See [public test](../crates/durable/tests/independent_compaction.rs) and [worker tests](../crates/durable/src/summary_worker_tests.rs).

@@ -598,9 +598,11 @@ These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
 `Scheduler::request_busy_independent_compaction` accepts a conversation while
 a single model request is running, with no queued inputs or resets at selection.
-It persists a bounded selection snapshot. If the model is still on that request
-when summarization completes, queued inputs, resets and application writes
-admitted in the meantime are checked against it. A reset preceding the summary
+It persists a bounded selection snapshot. When summarization completes during
+an active model request or at idle, it checks the source prefix, context
+generation, original submission and write identities, and configuration.
+This permits append-only model progress and fenced model restarts, while queued
+inputs, resets and application writes are ordered against the summary. A reset preceding the summary
 is placed first and makes the summary stale; queued inputs follow the selected
 writes. The placement ticket records the version at summary admission and
 commits with the conversation's pending marker. Later writes follow that marker.
@@ -609,9 +611,9 @@ withdraws queued inputs but preserves a summary already admitted as a write;
 an explicit operation abort withdraws it. Recovery requires the matching
 provider identity.
 
-This is not a general ordered inbox: changes other than proven admissions, a
-model phase change, or an old operation without a selection checkpoint settle
-conservatively stale. The selection and hook snapshots share a 512 KiB limit, and at
+This is not a general ordered inbox: a changed context, changed selected
+identities or configuration, an unsupported phase such as an active after-run
+hook, or an old operation without a selection checkpoint settles stale. The selection and hook snapshots share a 512 KiB limit, and at
 most 128 preceding resets can be ordered. `wait_independent_compaction` may
 return `Running` while boundary placement is pending; inspect its status after
 the conversation reaches the boundary.

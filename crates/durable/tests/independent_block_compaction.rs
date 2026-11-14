@@ -514,3 +514,75 @@ async fn public_independent_hook_recovers_block_snapshot_and_memo() {
     }
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn busy_block_summary_places_after_model_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = model(0);
+    let seen = Arc::new(Mutex::new(vec![]));
+    let adapter = Arc::new(BusyBlockAdapter {
+        started: Semaphore::new(0),
+        release: Arc::new(Semaphore::new(0)),
+    });
+    let (id, kept);
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        h.install_extension(extension(seen.clone())).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 64,
+            })
+            .unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"old".repeat(3000)})])
+            .unwrap();
+        kept = h
+            .append_user_blocks(
+                id,
+                vec![
+                    json!({"type":"text","text":"keep"}),
+                    json!({"type":"image","data":"Ymll","mimeType":"image/png"}),
+                ],
+            )
+            .unwrap();
+    }
+    let mut s = Scheduler::open_with_summary_recovery(
+        &path,
+        options(model.clone()),
+        registry(seen),
+        Some(adapter.clone()),
+        provider(),
+    )
+    .unwrap();
+    s.submit(id, None, "latest".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), adapter.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let op = Uuid::new_v4();
+    assert!(s.request_busy_independent_compaction(id, op, 1500).unwrap());
+    started(&model).await;
+    adapter.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    model.release.add_permits(1);
+    assert_eq!(
+        s.wait_independent_compaction(op).await.unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    let c = s.conversation(id).unwrap();
+    assert!(
+        c.content_blocks
+            .values()
+            .any(|b| b.message_id == kept && b.blocks[0]["text"] == "keep")
+    );
+    assert!(c.messages.iter().any(
+        |m| matches!(m, pi_rs_core::Message::Assistant { content, .. } if content == "busy answer")
+    ));
+    s.shutdown().await.unwrap();
+}
