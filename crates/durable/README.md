@@ -245,7 +245,7 @@ sequence numbers. Addresses are caller-defined and do not enforce ownership.
 Raw prepared batches are trusted and must respect reserved namespaces and JSON
 invariants. Do not perform external effects while preparing a batch.
 
-`Harness::submit_with_documents` admits one new input and document changes in
+`Harness::submit_with_documents` and `Scheduler::submit_with_documents` admit one new input and document changes in
 the same durable commit as the conversation, transcript and observation updates.
 Its callback reads documents before staging any writes; every read, including
 missing or read-only values, is checked at commit. Write only addresses read in
