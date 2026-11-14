@@ -1250,7 +1250,7 @@ fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet
                 }
             }
             Event::End(TagEnd::Item) => {
-                if let Some((_, _, previous_blank)) = lists.last_mut() {
+                if let Some((_, list_quote_depth, previous_blank)) = lists.last_mut() {
                     // Item ranges include blank lines between sibling items.
                     // Inspect only the trailing line, not blank lines inside
                     // fenced code or a nested blockquote.
@@ -1258,7 +1258,7 @@ fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet
                     *previous_blank = lines.next() == Some("")
                         && lines
                             .next()
-                            .is_some_and(|line| line.trim_matches([' ', '\t', '\r']).is_empty());
+                            .is_some_and(|line| blank_list_separator(line, *list_quote_depth));
                 }
             }
             Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
@@ -1274,6 +1274,20 @@ fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet
         }
     }
     loose
+}
+
+fn blank_list_separator(line: &str, quote_depth: usize) -> bool {
+    let mut rest = line.trim_matches([' ', '\t', '\r']);
+    if rest.is_empty() {
+        return true;
+    }
+    for _ in 0..quote_depth {
+        let Some(after) = rest.strip_prefix('>') else {
+            return false;
+        };
+        rest = after.trim_start_matches([' ', '\t']);
+    }
+    rest.is_empty()
 }
 
 fn markdown_at_depth(
@@ -2626,6 +2640,22 @@ mod tests {
             loose_list_offsets(source, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn quoted_block_only_loose_list_keeps_item_spacing() {
+        let source = "> - > first\n>\n> - > second";
+        let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+        assert!(!loose_list_offsets(source, options).is_empty());
+        assert!(blank_list_separator(" > >  ", 2));
+        assert!(!blank_list_separator("> > content", 2));
+        assert!(!blank_list_separator("> >", 1));
+        let lines = markdown(source, &Theme::system(), 80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line == "│ "), "{text:?}");
     }
 
     #[test]

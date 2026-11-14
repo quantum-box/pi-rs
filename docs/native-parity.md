@@ -392,8 +392,8 @@ remaining feature rows above still need their own acceptance checks.
 
 Markdown lists preserve the reference spacing between items in loose lists
 with direct text paragraphs, including nested lists, and between block-only
-items separated by blank lines. Tight lists remain compact; blank lines inside
-fenced code do not loosen the enclosing list. Other block-only looseness and
+items separated by blank lines, including within blockquotes. Tight lists remain
+compact; blank lines inside fenced code do not loosen the enclosing list. Other block-only looseness and
 layout cases still need comparison.
 
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
