@@ -232,9 +232,34 @@ named children, optionally by name, without creating or scheduling them.
 interruption. Queued inputs count as working, even if a failed run has left them
 waiting for another input. This is a committed snapshot, not a watch.
 
+An embedding host can opt in to a parent-bound `subagent` extension with
+`Scheduler::open_with_subagent_management(path, options, registry, parent, child_config)`.
+Create the parent first with `Harness::open_paused`, then open the scheduler and
+select `subagent_management::extension_name(parent)` on that settled parent,
+preserving any other selected extensions. On reopen use the same constructor,
+parent and child configuration: the extension must be installed before recovery.
+The tool exposes `list` and `send` (optional `follow_up` or `steer` mode).
+A send creates the named child if needed and queues its answer as a parent
+follow-up. Calls with the same persisted operation ID reuse the first message,
+child and reporter; a new operation ID is a new send. Errors after admission
+starts are uncertain and require reconciliation. The reporter runs while the
+scheduler is open. Extension tools are currently marked unsafe for automatic
+replay, so an interrupted invocation may require manual reconciliation even
+though its admission uses an idempotency key.
+
+The extension is bound to one parent and rejects selection on other conversations,
+including forks; named children start without selected extensions. Do not register
+this tool globally or replace the bound extension with another implementation.
+`ToolContext` does not identify the caller or its owning task. In particular,
+this API cannot verify a caller through independently implemented `ToolHost`s,
+restrict global tools available to a child, or implement ownership-safe stop or
+wait. The host must trust the configured tools and registry. It must also ensure
+the child configuration is suitable for every child; no per-child model,
+agent definition, working directory, history inheritance, or recursion policy is
+provided. Named links are independent, not task-owned background anchors.
+
 This is not the complete upstream background-subagent extension. There is no
-model-facing management tool, automatic child-tool restriction, or ownership
-tree for these named links. Extension selection can be configured on a settled
+automatic child-tool restriction or ownership tree for these named links. Extension selection can be configured on a settled
 conversation, but does not restrict globally registered tools and is not an
 atomic child admission policy. Named links do not inherit parent extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests

@@ -838,6 +838,14 @@ impl Harness {
         Ok(())
     }
     fn selected_extensions(&self, c: &Conversation) -> Result<crate::extension::Resolved, Error> {
+        if c.extensions.iter().any(|name| {
+            name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
+                && name != &crate::subagent_management::extension_name(c.id)
+        }) {
+            return Err(Error::Invalid(
+                "subagent management extension belongs to another conversation".into(),
+            ));
+        }
         let snapshot = self
             .extensions
             .read()
@@ -4555,10 +4563,37 @@ impl Scheduler {
         options: Options,
         registry: crate::extension::Registry,
     ) -> Result<Self, Error> {
+        Self::open_configured(path, options, registry, None)
+    }
+    /// Open with a parent-bound, opt-in background subagent extension installed before recovery.
+    pub fn open_with_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        parent: Uuid,
+        child_config: Config,
+    ) -> Result<Self, Error> {
+        Self::open_configured(path, options, registry, Some((parent, child_config)))
+    }
+    fn open_configured(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        management: Option<(Uuid, Config)>,
+    ) -> Result<Self, Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
         let harness = Harness::open_paused(path, options)?;
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
+        if let Some((parent, config)) = management {
+            harness.conversation(parent)?;
+            let mut worker = harness.worker();
+            worker.extensions =
+                Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
+            harness.install_extension(crate::subagent_management::extension(
+                worker, parent, config,
+            ))?;
+        }
         let ids = harness.conversations()?;
         let mut scheduler = Self {
             cancel: harness.owner.conversation_controls().root(),
