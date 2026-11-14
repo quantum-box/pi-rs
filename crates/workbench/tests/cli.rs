@@ -1406,9 +1406,11 @@ fn rpc_reports_native_extension_failures_with_pi_fields() {
 import json, sys
 request = json.load(sys.stdin)
 if request['type'] == 'describe':
-    response = {'Ok':{'id':'failure-fixture', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'session_lifecycle_hook':True, 'input_hook':True}}
+    response = {'Ok':{'id':'failure-fixture', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'session_lifecycle_hook':True, 'resource_discovery_hook':True, 'input_hook':True}}
 elif request['type'] == 'lifecycle' and request['event']['type'] == 'session_start':
     response = {'Err':'fixture start failure'}
+elif request['type'] == 'discover_resources':
+    response = {'Err':'fixture discovery failure'}
 elif request['type'] == 'input':
     response = {'Ok':{'action':'handled'}}
 else:
@@ -1454,7 +1456,7 @@ print(json.dumps({'version':1, 'response':response}))
     )
     .unwrap();
     input.flush().unwrap();
-    let mut failure = None;
+    let mut failures = Vec::new();
     let mut responded = false;
     loop {
         let event = receiver
@@ -1464,27 +1466,32 @@ print(json.dumps({'version':1, 'response':response}))
                 panic!("RPC event timed out: {error}");
             });
         if event["type"] == "extension_error" {
-            failure = Some(event.clone());
+            failures.push(event.clone());
         }
+        assert_ne!(event["type"], "error", "unexpected generic error: {event}");
         if event["type"] == "response" && event["id"] == "run" {
             assert_eq!(event["success"], true);
             responded = true;
         }
-        if responded && failure.is_some() {
+        if responded && failures.len() >= 2 {
             break;
         }
     }
-    let failure = failure.expect("session_start error was not forwarded");
-    assert_eq!(failure["extensionPath"], "failure-fixture");
-    assert_eq!(failure["extension"], "failure-fixture");
-    assert_eq!(failure["event"], "session_start");
-    assert!(
-        failure["error"]
-            .as_str()
-            .unwrap()
-            .contains("fixture start failure")
-    );
-    assert_eq!(failure["message"], failure["error"]);
+    for (kind, message) in [
+        ("session_start", "fixture start failure"),
+        ("resources_discover", "fixture discovery failure"),
+    ] {
+        let matching: Vec<_> = failures
+            .iter()
+            .filter(|failure| failure["event"] == kind)
+            .collect();
+        assert_eq!(matching.len(), 1, "expected one {kind} error: {failures:?}");
+        let failure = matching[0];
+        assert_eq!(failure["extensionPath"], "failure-fixture");
+        assert_eq!(failure["extension"], "failure-fixture");
+        assert!(failure["error"].as_str().unwrap().contains(message));
+        assert_eq!(failure["message"], failure["error"]);
+    }
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);
     let status = child.wait().unwrap();

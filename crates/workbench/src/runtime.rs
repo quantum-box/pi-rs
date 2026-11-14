@@ -76,7 +76,14 @@ impl Runtime {
                     &session.extension_states(),
                     args.tool_timeout(),
                     |extension, error| {
-                        eprintln!("Extension {extension} (resources_discover): {error}")
+                        super::observe(
+                            pi_rs::Notification::ExtensionLifecycleError {
+                                extension,
+                                event: "resources_discover",
+                                message: error,
+                            },
+                            args.trace,
+                        )
                     },
                 )
                 .await
@@ -88,7 +95,14 @@ impl Runtime {
                     args.tool_timeout(),
                     &mut |event| super::observe(event, args.trace),
                     |extension, error| {
-                        eprintln!("Extension {extension} (resources_discover): {error}")
+                        super::observe(
+                            pi_rs::Notification::ExtensionLifecycleError {
+                                extension,
+                                event: "resources_discover",
+                                message: error,
+                            },
+                            args.trace,
+                        )
                     },
                 )
                 .await?

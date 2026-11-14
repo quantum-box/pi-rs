@@ -194,7 +194,7 @@ RPC `extension_error` events include Pi's `extensionPath` and `error` fields
 alongside the native `extension` and `message` fields. Native extensions use
 their registered ID as `extensionPath`; unlike Pi's JavaScript extensions,
 an embedded extension need not have a source path. This also applies to cache
-warming hook errors.
+warming and resource-discovery hook errors, including startup discovery.
 
 The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_state`, `get_messages`, `new_session`, `set_model`, `compact`,
