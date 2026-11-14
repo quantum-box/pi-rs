@@ -4143,12 +4143,11 @@ the dialog, and extension cancellation still removes the correlated request.
 If the extension worker exits during editing, its editor is stopped and the
 terminal is restored. On Unix, suspending the external editor stops Pi's
 process group, including its workers, then resumes the group and editor with
-its terminal settings. When the shell
-shares Pi's process group without job control, or Pi's parent is in a different
+its terminal settings. When the shell shares Pi's process group without job control, or Pi's parent is in a different
 session, the editor resumes immediately instead of suspending a job that cannot
-be foregrounded. For a same-session launcher without job control, a bounded
-watchdog resumes Pi only while Pi still owns the terminal; a shell that takes
-terminal ownership retains control of the stopped job. Cancellation restores
+be foregrounded. For a same-session launcher without job control, a separate
+supervisor resumes Pi if it still owns the terminal after one second. A shell
+that takes terminal ownership retains control until it foregrounds Pi. Cancellation restores
 the original terminal settings; on Windows it also terminates editor wrapper
 descendants through a job object. Interrupts received while an editor
 is active do not disable subsequent terminal interrupt handling.
