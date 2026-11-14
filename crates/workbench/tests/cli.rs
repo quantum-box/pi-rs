@@ -301,6 +301,101 @@ fn xai_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn chat_completion_vllm_priority_respects_config_and_sampling_precedence() {
+    for (provider_compat, model_compat, override_compat, sampling, expected) in [
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!(7),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":0}),
+            json!({}),
+            json!({}),
+            json!(0),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":2}),
+            json!({"vllmPriority":-3}),
+            json!({}),
+            json!(-3),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({"priority":4}),
+            json!(4),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"relay":{
+                "baseUrl":base, "api":"openai-completions", "apiKey":"fixture",
+                "compat":provider_compat,
+                "models":[{"id":"fixture-model", "compat":model_compat, "samplingParams":sampling}],
+                "modelOverrides":{"fixture-model":{"compat":override_compat}}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["priority"], expected);
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "relay",
+                "--model",
+                "fixture-model",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
     for (level, temperature, top_k) in [("high", 0.2, 40), ("off", 0.7, 10)] {
         let root = tempfile::tempdir().unwrap();

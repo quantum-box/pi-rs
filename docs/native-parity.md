@@ -3452,6 +3452,12 @@ handling, and provider-specific thinking fields. Textual assistant reasoning
 is replayed only to the model and endpoint that produced it when the receiving
 adapter requires that field.
 
+For Chat Completions, `compat.vllmPriority` supplies the numeric top-level
+`priority` request field, including zero and negative values. Model settings
+override provider settings, model overrides apply afterward, and explicit
+`samplingParams.priority` takes final precedence. Focused loopback tests cover
+these configuration paths; no live vLLM server was used.
+
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
