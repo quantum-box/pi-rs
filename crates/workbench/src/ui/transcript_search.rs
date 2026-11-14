@@ -87,8 +87,11 @@ impl Search {
         let cursor_prefix = &self.editor.text[..self.editor.cursor];
         let mut cursor = 0;
         let mut offset = cursor_prefix.len();
-        for (start, glyph) in cursor_prefix.grapheme_indices(true).rev() {
-            let size = super::render::search_display_width(glyph);
+        let mut graphemes = Vec::new();
+        super::render::search_graphemes(cursor_prefix, |range, glyph| {
+            graphemes.push((range.start, glyph.width()));
+        });
+        for (start, size) in graphemes.into_iter().rev() {
             if cursor + size >= input_width {
                 break;
             }
@@ -264,6 +267,11 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
                 .collect()
         })
         .collect();
+    let display_rows: Vec<_> = rows
+        .iter()
+        .zip(&controls)
+        .map(|(row, offsets)| (!offsets.is_empty()).then(|| row.replace('\u{85}', "")))
+        .collect();
     for (row, text) in rows.iter().enumerate() {
         let mut append = |offset: usize, word: &str| {
             if !corpus.is_empty() {
@@ -341,9 +349,27 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
                             - controls[part.row].partition_point(|position| *position < offset)
                                 * '\u{85}'.len_utf8()
                     };
+                    let mut display_bytes = display_offset(bytes.start)..display_offset(bytes.end);
+                    if let Some(display) = &display_rows[part.row]
+                        && !display_bytes.is_empty()
+                    {
+                        let mut glyphs =
+                            display
+                                .grapheme_indices(true)
+                                .skip_while(|(offset, glyph)| {
+                                    offset + glyph.len() <= display_bytes.start
+                                });
+                        if let Some((first, glyph)) = glyphs.next() {
+                            let last = glyphs
+                                .take_while(|(offset, _)| *offset < display_bytes.end)
+                                .last()
+                                .unwrap_or((first, glyph));
+                            display_bytes = first..last.0 + last.1.len();
+                        }
+                    }
                     Segment {
                         row: part.row,
-                        bytes: display_offset(bytes.start)..display_offset(bytes.end),
+                        bytes: display_bytes,
                     }
                 })
                 .collect()
@@ -557,6 +583,36 @@ mod tests {
         assert!(narrow[1].spans.iter().any(|span| span.text == "b"));
         let mut output = Vec::new();
         for line in lines.iter().chain(&overlay).chain(&narrow) {
+            line.draw(&mut output, 8).unwrap();
+        }
+        assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));
+    }
+
+    #[test]
+    fn removed_control_can_join_a_displayed_emoji_grapheme() {
+        let source = "👩\u{85}\u{200d}💻";
+        let lines = super::super::render::wrap(&[Span::new(source, Color::Reset)], 2);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].text, "👩\u{200d}💻");
+        assert_eq!(lines[0].spans[0].searchable(), source);
+        let mut search = Search::default();
+        search.paste(source);
+        assert_eq!(search.update(&lines, 0), Some(0..1));
+        let mut partial = Search::default();
+        partial.paste("👩");
+        partial.update(&lines, 0);
+        assert_eq!(partial.matches[0][0].bytes, 0.."👩\u{200d}💻".len());
+        let mut highlighted = lines.clone();
+        partial.highlight(&mut highlighted, 0..1, &Theme::system());
+        assert_eq!(highlighted[0].spans[0].text, "👩\u{200d}💻");
+        let wrapped =
+            super::super::render::wrap(&[Span::new(format!("x{source}"), Color::Reset)], 2);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[1].spans[0].searchable(), source);
+        let (overlay, row, column) = search.overlay(&Theme::system(), &Keys::default(), 8);
+        assert_eq!((row, column), (1, 3));
+        let mut output = Vec::new();
+        for line in lines.iter().chain(&overlay) {
             line.draw(&mut output, 8).unwrap();
         }
         assert!(!output.windows(2).any(|pair| pair == "\u{85}".as_bytes()));

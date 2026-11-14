@@ -566,11 +566,36 @@ fn clean_for_search(text: &str) -> String {
         .replace('\t', "    ")
 }
 
-pub(super) fn search_display_width(grapheme: &str) -> usize {
-    if grapheme.contains('\u{85}') {
-        UnicodeWidthStr::width(clean(grapheme).as_str())
-    } else {
-        UnicodeWidthStr::width(grapheme)
+// Segment after sanitizing: removing a control can join a ZWJ emoji into one
+// displayed grapheme. Return the corresponding byte range in the raw source.
+pub(super) fn search_graphemes(text: &str, mut visit: impl FnMut(Range<usize>, &str)) {
+    if !text.contains('\u{85}') {
+        for (start, grapheme) in text.grapheme_indices(true) {
+            visit(start..start + grapheme.len(), grapheme);
+        }
+        return;
+    }
+    let display = clean(text);
+    let mut raw = text.char_indices();
+    let mut raw_start = 0;
+    for (start, grapheme) in display.grapheme_indices(true) {
+        let mut visible = 0;
+        let mut raw_end = raw_start;
+        while visible < grapheme.len() {
+            let (offset, character) = raw.next().expect("sanitized grapheme has source");
+            raw_end = offset + character.len_utf8();
+            if character != '\u{85}' {
+                visible += character.len_utf8();
+            }
+        }
+        if start + grapheme.len() == display.len() {
+            raw_end = text.len();
+        }
+        visit(raw_start..raw_end, grapheme);
+        raw_start = raw_end;
+    }
+    if display.is_empty() {
+        visit(0..text.len(), "");
     }
 }
 
@@ -633,8 +658,17 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
         let mut fragment = span.clone();
         fragment.text.clear();
         fragment.search_text = span.search_text.as_ref().map(|_| String::new());
-        for grapheme in span.searchable().graphemes(true) {
-            let size = search_display_width(grapheme);
+        search_graphemes(span.searchable(), |range, grapheme| {
+            let size = UnicodeWidthStr::width(grapheme);
+            let source = &span.searchable()[range];
+            let (before_newline, after_newline) = if grapheme == "\n" {
+                source.split_once('\n').unwrap_or(("", ""))
+            } else {
+                ("", "")
+            };
+            if let Some(raw) = &mut fragment.search_text {
+                raw.push_str(before_newline);
+            }
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
                 fragment.text.clear();
@@ -644,21 +678,20 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
                 lines.push(Line::default());
                 used = 0;
                 if grapheme == "\n" {
-                    continue;
+                    if let Some(raw) = &mut fragment.search_text {
+                        raw.push_str(after_newline);
+                    }
+                    return;
                 }
             }
             if size <= width {
-                if grapheme.contains('\u{85}') {
-                    fragment.text.push_str(&clean(grapheme));
-                } else {
-                    fragment.text.push_str(grapheme);
-                }
+                fragment.text.push_str(grapheme);
                 if let Some(raw) = &mut fragment.search_text {
-                    raw.push_str(grapheme);
+                    raw.push_str(source);
                 }
                 used += size;
             }
-        }
+        });
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
