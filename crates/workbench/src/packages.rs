@@ -1839,6 +1839,23 @@ fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
     }
 }
 
+// Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
+// process-wrap child so cancellation also signals its still-live group.
+struct PackageChildGuard {
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    finished: bool,
+}
+
+impl Drop for PackageChildGuard {
+    fn drop(&mut self) {
+        // Once the direct child has been reaped, its numeric process group ID
+        // can be reused. Do not signal that ID after ownership is lost.
+        if !self.finished && self.child.id().is_some() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
 async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
@@ -1851,19 +1868,23 @@ async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(process_wrap::tokio::KillOnDrop);
-    let mut child = wrapped.spawn()?;
-    let stdout = child.stdout().take().expect("stdout");
-    let stderr = child.stderr().take().expect("stderr");
+    let mut child = PackageChildGuard {
+        child: wrapped.spawn()?,
+        finished: false,
+    };
+    let stdout = child.child.stdout().take().expect("stdout");
+    let stderr = child.child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
             tokio::try_join!(
-                async { child.wait().await.map_err(Error::from) },
+                async { child.child.wait().await.map_err(Error::from) },
                 capture(stdout, 8 * 1024 * 1024),
                 capture(stderr, 64 * 1024)
             )
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
+    child.finished = true;
     if !status.success() {
         return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
@@ -1932,6 +1953,172 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A private test subprocess: the child owns a connection until it exits,
+    // letting the test observe that exact process without relying on PID reuse.
+    #[test]
+    fn package_process_fixture() {
+        use std::io::{Read, Write};
+        let Ok(role) = std::env::var("PI_PACKAGE_TEST_ROLE") else {
+            return;
+        };
+        let address = std::env::var("PI_PACKAGE_TEST_ADDRESS").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(90)))
+            .unwrap();
+        writeln!(stream, "{role} {}", std::process::id()).unwrap();
+        if role == "parent" {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::package_process_fixture",
+                    "--nocapture",
+                ])
+                .env("PI_PACKAGE_TEST_ROLE", "child")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+        }
+        let mut byte = [0];
+        // The test releases the parent, or closes the connection on cleanup.
+        let _ = stream.read(&mut byte);
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn check_package_process_tree(parent_exits: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "packages::tests::package_process_fixture",
+                "--nocapture",
+            ])
+            .env("PI_PACKAGE_TEST_ROLE", "parent")
+            .env(
+                "PI_PACKAGE_TEST_ADDRESS",
+                listener.local_addr().unwrap().to_string(),
+            );
+        let task = tokio::spawn(run(command, "test"));
+        let _cleanup = AbortOnDrop(task.abort_handle());
+        let (mut parent, mut child, child_pid) =
+            tokio::time::timeout(Duration::from_secs(45), async {
+                let mut parent = None;
+                let mut child = None;
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let (role, pid) = line.split_once(' ').unwrap();
+                    let pid: u32 = pid.trim().parse().unwrap();
+                    match role {
+                        "parent" => parent = Some(reader.into_inner()),
+                        "child" => child = Some((reader.into_inner(), pid)),
+                        _ => panic!("unexpected fixture role"),
+                    }
+                }
+                let (child, pid) = child.unwrap();
+                (parent.unwrap(), child, pid)
+            })
+            .await
+            .expect("package process tree did not become ready");
+
+        #[cfg(windows)]
+        let child_handle = {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+                WaitForSingleObject,
+            };
+            struct Handle(HANDLE);
+            impl Drop for Handle {
+                fn drop(&mut self) {
+                    // SAFETY: this handle refers to the original child, even if its PID is reused.
+                    unsafe {
+                        if WaitForSingleObject(self.0, 0) == WAIT_TIMEOUT {
+                            TerminateProcess(self.0, 1);
+                        }
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+            // SAFETY: open the PID reported through the child's own connection.
+            let handle =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, child_pid) };
+            assert!(
+                !handle.is_null(),
+                "cannot open child: {}",
+                std::io::Error::last_os_error()
+            );
+            let handle = Handle(handle);
+            // SAFETY: handle remains owned until the end of this test.
+            assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
+            handle
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: signal zero only checks that the reporting process exists.
+            assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0);
+        }
+        if parent_exits {
+            parent.write_all(&[1]).await.unwrap();
+            let mut byte = [0];
+            tokio::time::timeout(Duration::from_secs(15), parent.read(&mut byte))
+                .await
+                .expect("parent did not exit")
+                .unwrap();
+            // Allow a concurrent wait implementation to observe and reap the parent.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        let mut byte = [0];
+        let count = tokio::time::timeout(Duration::from_secs(15), child.read(&mut byte))
+            .await
+            .expect("child connection remained open after cancellation")
+            .unwrap();
+        assert_eq!(count, 0, "child sent unexpected data");
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            // SAFETY: the original child handle remains valid and is not PID-based.
+            assert_eq!(
+                unsafe { WaitForSingleObject(child_handle.0, 5000) },
+                WAIT_OBJECT_0,
+                "the original child process survived cancellation"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_package_command_terminates_its_running_process_group() {
+        check_package_process_tree(false).await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_package_command_after_parent_exit_terminates_pipe_holder() {
+        check_package_process_tree(true).await;
+    }
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");
