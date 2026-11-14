@@ -825,3 +825,28 @@ This is an independent, unbounded per-conversation JSON log, rewritten on each a
 `Harness::unified_history_start(id, false)` captures a finite store-sequence boundary; `unified_history(&cursor, limit)` returns up to 255 complete commit frames and a serializable cursor for reopening. Each frame contains expanded runtime observation snapshots and, when changed, the complete task application-entry log. Snapshots repeat previously seen data; a fork exposes its inherited state in the child's fork commit, not the parent's original commit stream. Entries within one commit have no independent order. This is not upstream's entry transcript and does not add entries to model context.
 
 Stores with any pre-sequence versions fail closed unless `unified_history_start(id, true)` explicitly accepts the migration boundary. That mode shows only commits recorded after tracking began, and cannot reconstruct earlier ordering. Cursors are trusted and database-local. Page limits bound commit frames, not snapshot size, transcript expansion or database work. The reader assumes reserved namespaces are not changed or deleted by raw or older writers.
+
+### Host submission settlement waits
+
+`Scheduler::wait_for_submission(conversation_id, submission_id, &cancel)` waits
+for the specific committed submission, including queued work and work recovered
+after reopening. Input and continue results include the stored answer text and
+optional answer ID; legacy answers can lack an ID. Unanswered results retain the
+submission kind and stored reason. A display-only write settles when placed,
+including after a preceding reset; this API reports placement, not an upstream
+transcript entry reference. Unknown conversations and submission IDs return
+`NotFound` and `SubmissionNotFound` respectively. Cancelling or dropping the
+wait leaves the submission running; an already-cancelled token takes precedence
+when observed. Multiple waits are independent.
+
+This is an incremental counterpart to upstream's [`Submission.wait`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md):
+it polls committed conversation state at 100 ms intervals rather than subscribing
+to session commits. A pending wait returns `Interrupted` on scheduler stop and
+reports a scheduled worker error or panic; a committed settlement takes precedence
+when observed. Re-scheduling starts a fresh worker-error observation, while
+`Scheduler::wait` and `shutdown` retain their own join/error behavior. A wait
+borrows the scheduler, so cancel or drop it before consuming the scheduler in
+`shutdown`. The wait does not start a task driver or resolve blocked work; a
+missing/stopped driver or an externally blocked operation can leave it pending
+until cancellation or host intervention. It does not offer upstream's global
+submission handle or durable task notification.

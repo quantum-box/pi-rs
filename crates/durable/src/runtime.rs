@@ -60,13 +60,15 @@ pub enum Error {
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
     NotFound,
+    #[error("submission not found in conversation")]
+    SubmissionNotFound,
     #[error(transparent)]
     Admission(#[from] AdmissionError),
     #[error("session failed; reopen before further operations")]
     Failed,
     #[error("execution interrupted; reopen to recover")]
     Interrupted,
-    #[error("idle wait cancelled")]
+    #[error("wait cancelled")]
     WaitCancelled,
     #[error("invalid operation: {0}")]
     Invalid(String),
@@ -148,6 +150,25 @@ pub struct ApplicationWrite {
     /// The last reset preceding this write, if any.
     pub after_reset: Option<Uuid>,
 }
+/// A committed terminal result for a submission in this conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmissionSettlement {
+    Input {
+        answer: String,
+        answer_id: Option<Uuid>,
+    },
+    Continue {
+        answer: String,
+        answer_id: Option<Uuid>,
+    },
+    Unanswered {
+        kind: SubmissionKind,
+        reason: String,
+    },
+    /// The display-only application write has been placed.
+    Write,
+}
+
 /// Result of attempting to withdraw a single input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithdrawResult {
@@ -5535,9 +5556,75 @@ pub struct Scheduler {
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
+    worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, (Uuid, Option<String>)>>>,
 }
 
 impl Scheduler {
+    /// Wait for a persisted submission settlement. Dropping or cancelling the
+    /// wait leaves the submission untouched. The conversation is polled every
+    /// 100 ms; blocked work may require host intervention or a task driver.
+    pub async fn wait_for_submission(
+        &self,
+        conversation: Uuid,
+        submission: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<SubmissionSettlement, Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            let state = self.harness.conversation(conversation)?;
+            let result = if let Some(item) = state.submissions.iter().find(|s| s.id == submission) {
+                match &item.status {
+                    Status::Done { answer } => Some(match item.kind {
+                        SubmissionKind::Input => SubmissionSettlement::Input {
+                            answer: answer.clone(),
+                            answer_id: state.answer_id(submission),
+                        },
+                        SubmissionKind::Continue => SubmissionSettlement::Continue {
+                            answer: answer.clone(),
+                            answer_id: state.answer_id(submission),
+                        },
+                    }),
+                    Status::Unanswered { reason } => Some(SubmissionSettlement::Unanswered {
+                        kind: item.kind,
+                        reason: reason.clone(),
+                    }),
+                    Status::Queued | Status::Running => None,
+                }
+            } else if let Some(write) = state.application_writes.iter().find(|w| w.id == submission)
+            {
+                write.placed.then_some(SubmissionSettlement::Write)
+            } else {
+                return Err(Error::SubmissionNotFound);
+            };
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            if self.cancel.is_cancelled() {
+                return Err(Error::Interrupted);
+            }
+            if let Some(error) = self
+                .worker_errors
+                .lock()
+                .map_err(|_| Error::Failed)?
+                .get(&conversation)
+                .and_then(|(_, error)| error.clone())
+            {
+                return Err(Error::Invalid(format!("scheduler worker failed: {error}")));
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                _ = self.cancel.cancelled() => return Err(Error::Interrupted),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
     /// Wait until the conversation and its foreground owned graph have no work.
     /// Cancelling or dropping the future does not abort work. Live generic tasks
     /// require a running task driver. State is polled every 100 ms.
@@ -5781,6 +5868,7 @@ impl Scheduler {
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
+            worker_errors: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         // Attach and publish the task driver before any recovered worker is spawned.
         let driver = tasks
@@ -6212,9 +6300,36 @@ impl Scheduler {
         let cancel = control.cancel;
         let mut worker = self.harness.worker();
         worker.execution_gate = Some(control.gate);
+        let errors = self.worker_errors.clone();
+        let execution = Uuid::new_v4();
+        errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (execution, None));
         let task = tokio::spawn(async move {
-            let _lock = lock.lock().await;
-            drive_scheduled(&mut worker, id, &cancel).await
+            let result = std::panic::AssertUnwindSafe(async {
+                let _lock = lock.lock().await;
+                drive_scheduled(&mut worker, id, &cancel).await
+            })
+            .catch_unwind()
+            .await;
+            let failure = match &result {
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("worker panicked".into()),
+                Ok(Ok(())) => None,
+            };
+            if let Some(failure) = failure {
+                let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((current, error)) = errors.get_mut(&id)
+                    && *current == execution
+                {
+                    *error = Some(failure);
+                }
+            }
+            match result {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         });
         self.tasks.entry(id).or_default().push(task);
     }
@@ -6894,6 +7009,30 @@ mod scheduler_tests {
             max_output_tokens: 10,
         }
     }
+    #[tokio::test]
+    async fn submission_wait_reports_scheduler_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let submission = scheduler.submit(id, None, "hello".into()).unwrap();
+        model.started.acquire().await.unwrap().forget();
+        let cancel = CancellationToken::new();
+        let mut wait = Box::pin(scheduler.wait_for_submission(id, submission, &cancel));
+        assert!(matches!(
+            futures_util::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        scheduler.cancel.cancel();
+        assert!(matches!(wait.await, Err(Error::Interrupted)));
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_wait_includes_pending_reset_at_idle_boundary() {
         let dir = tempfile::tempdir().unwrap();
