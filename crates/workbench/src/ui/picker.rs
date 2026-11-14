@@ -27,6 +27,7 @@ pub enum Selection {
     BedrockChain,
     LoginOpenRouter,
     LoginKimi,
+    LoginMeta,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),

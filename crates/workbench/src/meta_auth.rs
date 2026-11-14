@@ -61,11 +61,17 @@ struct Service {
 }
 impl Service {
     fn new(settings: &super::config::Settings) -> Result<Self> {
+        Self::with_proxies(settings, super::http_proxy::configured(settings)?)
+    }
+    fn with_proxies(
+        settings: &super::config::Settings,
+        proxies: Vec<reqwest::Proxy>,
+    ) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15));
-        for proxy in super::http_proxy::configured(settings)? {
+            .timeout(Duration::from_secs(30));
+        for proxy in proxies {
             builder = builder.proxy(proxy);
         }
         if let Some(timeout) = settings.http_idle_timeout() {
@@ -113,6 +119,223 @@ impl Service {
             .map(str::to_owned)
             .ok_or_else(|| error("key mint response did not contain a valid API key"))
     }
+}
+
+const DEVICE_AUTH_URL: &str = "https://auth.meta.com/oidc/device/authorization/";
+const DEVICE_TOKEN_URL: &str = "https://auth.meta.com/oidc/device/token/";
+const CLIENT_ID: &str = "1031625952748946";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+#[derive(Clone)]
+struct DeviceService {
+    authorization: reqwest::Url,
+    token: reqwest::Url,
+    mint: Service,
+}
+impl DeviceService {
+    fn new(settings: &super::config::Settings) -> Result<Self> {
+        Ok(Self {
+            authorization: reqwest::Url::parse(DEVICE_AUTH_URL).expect("constant URL"),
+            token: reqwest::Url::parse(DEVICE_TOKEN_URL).expect("constant URL"),
+            mint: Service::new(settings)?,
+        })
+    }
+    async fn post(
+        &self,
+        url: &reqwest::Url,
+        form: &[(&str, &str)],
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let mut encoded = reqwest::Url::parse("https://localhost/").unwrap();
+        encoded.query_pairs_mut().extend_pairs(form.iter().copied());
+        let mut response = self
+            .mint
+            .client
+            .post(url.clone())
+            .header("accept", "application/json")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(encoded.query().unwrap_or_default().to_owned())
+            .send()
+            .await
+            .map_err(|_| error("device request failed"))?;
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| error("device response failed"))?
+        {
+            if body.len().saturating_add(chunk.len()) > 65536 {
+                return Err(error("device response too large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    }
+    async fn login(&self, announce: impl Fn(&reqwest::Url, &str)) -> Result<Credential> {
+        let (status, device) = self
+            .post(&self.authorization, &[("client_id", CLIENT_ID)])
+            .await?;
+        if !status.is_success() {
+            return Err(error(&format!("device authorization failed ({status})")));
+        }
+        let device_code = device["device_code"]
+            .as_str()
+            .filter(|s| super::model_auth::valid_key(s))
+            .ok_or_else(|| error("invalid device authorization response"))?;
+        let user_code = device["user_code"]
+            .as_str()
+            .filter(|s| super::model_auth::valid_key(s))
+            .ok_or_else(|| error("invalid device authorization response"))?;
+        let verification = ["verification_uri_complete", "verification_uri"]
+            .iter()
+            .filter_map(|key| device[*key].as_str())
+            .find_map(verification_url)
+            .ok_or_else(|| error("invalid verification URL"))?;
+        announce(&verification, user_code);
+        let mut interval =
+            poll_duration(device["interval"].as_f64(), 5.0).max(Duration::from_secs(1));
+        let expires = device["expires_in"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| poll_duration(Some(v), 900.0));
+        let deadline = expires.map(|duration| tokio::time::Instant::now() + duration);
+        let identity = loop {
+            let wait = match deadline {
+                Some(deadline) => {
+                    interval.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                }
+                None => interval,
+            };
+            tokio::time::sleep(wait).await;
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(error("device authorization expired; restart login"));
+            }
+            let (status, json) = self
+                .post(
+                    &self.token,
+                    &[
+                        ("grant_type", DEVICE_GRANT),
+                        ("device_code", device_code),
+                        ("client_id", CLIENT_ID),
+                    ],
+                )
+                .await?;
+            if status.is_success()
+                && let Some(identity) = json["access_token"]
+                    .as_str()
+                    .filter(|s| super::model_auth::valid_key(s))
+            {
+                break identity.to_owned();
+            }
+            match json["error"].as_str() {
+                Some("authorization_pending") => {}
+                Some("slow_down") => {
+                    interval = json["interval"]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| poll_duration(Some(v), 5.0).max(Duration::from_secs(1)))
+                        .unwrap_or(interval.saturating_add(Duration::from_secs(5)))
+                }
+                Some("access_denied") => return Err(error("login denied")),
+                Some("expired_token") => {
+                    return Err(error("device authorization expired; restart login"));
+                }
+                _ => return Err(error(&format!("device token request failed ({status})"))),
+            }
+        };
+        let access = self.mint.mint(&identity).await?;
+        Ok(Credential {
+            kind: "oauth".into(),
+            access,
+            refresh: identity,
+            expires: now().saturating_add(KEY_LIFETIME_MS),
+        })
+    }
+}
+fn poll_duration(value: Option<f64>, default: f64) -> Duration {
+    Duration::from_secs_f64(
+        value
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(default)
+            .min(86400.0),
+    )
+}
+fn verification_url(value: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+#[derive(Clone, Default)]
+pub(super) struct LoginControl(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl LoginControl {
+    // Only one of cancellation and the start of the synchronous commit wins.
+    pub(super) fn cancel_before_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+    #[cfg(test)]
+    pub(super) fn is_committing(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == 1
+    }
+    fn begin_commit(&self) -> Result<()> {
+        self.0
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|_| error("login cancelled"))
+    }
+}
+
+pub(super) async fn save_login(
+    path: &std::path::Path,
+    previous: Option<Value>,
+    credential: Credential,
+    control: LoginControl,
+) -> Result<()> {
+    let guard = super::auth_lock::acquire_async(path).await?;
+    // update_object_locked can block on the independent file lock. Once it
+    // starts, the UI must retain the task and observe its actual result.
+    control.begin_commit()?;
+    super::config::update_object_locked(path, Some(&guard), |data| {
+        if data.get("meta") != previous.as_ref() {
+            return Err(error("credentials changed during login"));
+        }
+        data.insert("meta".into(), serde_json::to_value(&credential)?);
+        Ok(())
+    })
+}
+
+pub(super) async fn login(
+    settings: &super::config::Settings,
+    control: LoginControl,
+    announce: impl Fn(&reqwest::Url, &str),
+) -> Result<()> {
+    let path = super::config::agent_dir().join("auth.json");
+    let previous = {
+        let guard = super::auth_lock::acquire_async(&path).await?;
+        let value = super::config::read_object_unlocked(&path)?
+            .get("meta")
+            .cloned();
+        guard.check()?;
+        value
+    };
+    let credential = DeviceService::new(settings)?.login(announce).await?;
+    save_login(&path, previous, credential, control).await
 }
 
 async fn access_at(
@@ -200,6 +423,13 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (Service, tokio::task::JoinHandle<String>) {
+        server_with_delay(status, body, Duration::ZERO).await
+    }
+    async fn server_with_delay(
+        status: &'static str,
+        body: &'static str,
+        delay: Duration,
+    ) -> (Service, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = reqwest::Url::parse(&format!(
             "http://{}/muse-code/key",
@@ -230,20 +460,228 @@ mod tests {
                     }
                 }
             }
+            tokio::time::sleep(delay).await;
             socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             String::from_utf8(request).unwrap()
         });
-        (
-            Service {
-                url,
-                client: reqwest::Client::builder()
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap(),
+        let mut service =
+            Service::with_proxies(&super::super::config::Settings::default(), vec![]).unwrap();
+        service.url = url;
+        (service, task)
+    }
+
+    async fn device_login_fixture(delayed_response: usize, delay: Duration) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let responses = [
+                (
+                    "200 OK",
+                    r#"{"device_code":"device-secret","user_code":"CODE","verification_uri":"https://auth.meta.com/device","verification_uri_complete":"https://auth.meta.com/device?code=CODE","interval":0.01,"expires_in":4}"#,
+                ),
+                ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
+                ("200 OK", r#"{"access_token":"identity-secret"}"#),
+                ("200 OK", r#"{"api_key":"inference-key"}"#),
+            ];
+            let mut requests = Vec::new();
+            for (index, (status, body)) in responses.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                // Delay either the in-flight token response or the mint past expiry.
+                if index == delayed_response {
+                    tokio::time::sleep(delay).await;
+                }
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        // Exercise the same timeout and redirect configuration used in production;
+        // only destinations are replaced with the isolated loopback fixture.
+        let mut mint =
+            Service::with_proxies(&super::super::config::Settings::default(), vec![]).unwrap();
+        mint.url = reqwest::Url::parse(&format!("{base}/muse-code/key")).unwrap();
+        let service = DeviceService {
+            authorization: reqwest::Url::parse(&format!("{base}/oidc/device/authorization/"))
+                .unwrap(),
+            token: reqwest::Url::parse(&format!("{base}/oidc/device/token/")).unwrap(),
+            mint,
+        };
+        let credential = service
+            .login(|url, code| {
+                assert_eq!(url.as_str(), "https://auth.meta.com/device?code=CODE");
+                assert_eq!(code, "CODE");
+            })
+            .await
+            .unwrap();
+        assert_eq!(credential.access, "inference-key");
+        assert_eq!(credential.refresh, "identity-secret");
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("POST /oidc/device/authorization/ "));
+        assert!(requests[0].contains("client_id=1031625952748946"));
+        assert!(requests[1].starts_with("POST /oidc/device/token/ "));
+        assert!(requests[1].contains("device_code=device-secret"));
+        assert!(
+            requests[2]
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code")
+        );
+        assert!(
+            requests[3]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer identity-secret")
+        );
+        assert!(requests[3].ends_with("{}"));
+    }
+    #[tokio::test]
+    async fn device_login_accepts_token_response_after_expiry() {
+        device_login_fixture(2, Duration::from_secs(3)).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_allows_mint_to_finish_after_expiry() {
+        device_login_fixture(3, Duration::from_secs(3)).await;
+    }
+
+    #[tokio::test]
+    async fn device_poll_uses_production_30_second_request_timeout() {
+        device_login_fixture(2, Duration::from_secs(16)).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_does_not_start_poll_after_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 2048];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            let body = r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://auth.meta.com/device","interval":1,"expires_in":0.05}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let service = DeviceService {
+            authorization: reqwest::Url::parse(&format!("{base}/authorization")).unwrap(),
+            token: reqwest::Url::parse(&format!("{base}/token")).unwrap(),
+            mint: Service {
+                url: reqwest::Url::parse(&format!("{base}/mint")).unwrap(),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
             },
-            task,
+        };
+        let message = match service.login(|_, _| {}).await {
+            Ok(_) => panic!("expired login succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("expired"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn blocked_file_lock_keeps_commit_observable_after_escape() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let control = LoginControl::default();
+        let worker_control = control.clone();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(save_login(
+                &worker_path,
+                None,
+                Credential {
+                    kind: "oauth".into(),
+                    access: "key".into(),
+                    refresh: "identity".into(),
+                    expires: 1,
+                },
+                worker_control,
+            ))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control.0.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "commit never started");
+            std::thread::yield_now();
+        }
+        assert!(
+            !control.cancel_before_commit(),
+            "Escape must retain the committing task"
+        );
+        assert!(
+            !worker.is_finished(),
+            "the file lock must still block the write"
+        );
+        lock.unlock().unwrap();
+        worker.join().unwrap().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["meta"]["access"], "key");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_commit_never_writes_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let control = LoginControl::default();
+        assert!(control.cancel_before_commit());
+        let result = save_login(
+            &path,
+            None,
+            Credential {
+                kind: "oauth".into(),
+                access: "key".into(),
+                refresh: "identity".into(),
+                expires: 1,
+            },
+            control,
         )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn verification_urls_do_not_accept_unsafe_schemes_or_credentials() {
+        assert!(verification_url("javascript:alert(1)").is_none());
+        assert!(verification_url("http://127.0.0.1/").is_none());
+        assert!(verification_url("https://user@auth.meta.com/").is_none());
+        assert!(verification_url("https://auth.meta.com/device").is_some());
     }
 
     #[tokio::test]
@@ -286,6 +724,27 @@ mod tests {
         assert!(!message.contains("identity-secret"));
         assert_eq!(std::fs::read(path).unwrap(), before);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_production_30_second_request_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        fixture(&path, 1);
+        let (service, server) = server_with_delay(
+            "200 OK",
+            r#"{"api_key":"minted-key"}"#,
+            Duration::from_secs(16),
+        )
+        .await;
+        assert_eq!(
+            access_at(path.clone(), service, None, false).await.unwrap(),
+            "minted-key"
+        );
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer identity-secret"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["meta"]["access"], "minted-key");
     }
 
     #[tokio::test]
