@@ -389,6 +389,104 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn nonmatching_custom_rule_keeps_authenticated_forward_proxy() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            first
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::custom(|_| None::<String>))
+            .proxy(reqwest::Proxy::all(format!("http://user:pass@{address}")).unwrap())
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await;
+        let first = server.await.unwrap();
+        assert!(
+            first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
+            "{first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_nonmatching_custom_rule_keeps_authenticated_forward_proxy() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            timeout(Duration::from_secs(5), socket.read_line(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            first
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(reqwest_mcp::Proxy::custom(|_| None::<String>))
+            .proxy(reqwest_mcp::Proxy::all(format!("http://user:pass@{address}")).unwrap())
+            .build()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await;
+        let first = server.await.unwrap();
+        assert!(
+            first.starts_with("GET http://origin.invalid/test HTTP/1.1"),
+            "{first}"
+        );
+    }
+
+    #[tokio::test]
     async fn stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
         use std::sync::{
             Arc,
