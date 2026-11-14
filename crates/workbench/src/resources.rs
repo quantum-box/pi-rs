@@ -605,11 +605,15 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
         .unwrap_or_else(|| {
             let first = body
                 .lines()
-                .find(|line| !line.trim().is_empty())
+                .find(|line| !line.trim_matches(is_prompt_space).is_empty())
                 .unwrap_or_default();
-            let mut characters = first.chars();
-            let mut description: String = characters.by_ref().take(60).collect();
-            if characters.next().is_some() {
+            // Pi's String.slice and length count UTF-16 code units. A slice
+            // through a surrogate pair is encoded as a replacement character
+            // when displayed as UTF-8.
+            let mut units = first.encode_utf16();
+            let prefix: Vec<_> = units.by_ref().take(60).collect();
+            let mut description = String::from_utf16_lossy(&prefix);
+            if units.next().is_some() {
                 description.push_str("...");
             }
             description
@@ -1601,6 +1605,32 @@ mod tests {
             assert_eq!(prompt.argument_hint.as_deref(), expected);
             assert_eq!(prompt.body, "Review $1");
         }
+    }
+
+    #[test]
+    fn prompt_fallback_description_matches_ecmascript_whitespace_and_utf16() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (body, expected) in [
+            (" \u{feff}\nvisible", "visible".to_owned()),
+            ("\u{0085}\nvisible", "\u{0085}".to_owned()),
+            (
+                "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x",
+                format!("{}...", "😀".repeat(30)),
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.description, expected);
+            assert_eq!(prompt.body, body);
+        }
+        let body = format!("{}😀tail", "x".repeat(59));
+        std::fs::write(&path, &body).unwrap();
+        let prompt = parse_prompt(&path).unwrap();
+        assert_eq!(prompt.description, format!("{}�...", "x".repeat(59)));
+        assert_eq!(prompt.body, body);
+        std::fs::write(&path, format!("---\ndescription: explicit\n---\n{body}")).unwrap();
+        assert_eq!(parse_prompt(&path).unwrap().description, "explicit");
     }
 
     #[test]
