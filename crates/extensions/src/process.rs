@@ -2968,17 +2968,11 @@ fn project_overflow_reason(request: &mut ProtocolRequest, supported: bool) {
         return;
     }
     let reason = match request {
-        ProtocolRequest::Lifecycle {
-            event:
-                LifecycleEvent::SessionCompact { reason, .. }
-                | LifecycleEvent::SessionCompactFailed { reason, .. },
-            ..
-        } => reason,
         ProtocolRequest::BeforeSummaryCompaction { preparation, .. } => &mut preparation.reason,
         _ => return,
     };
-    if matches!(*reason, pi_rs_core::CompactionReason::Overflow) {
-        *reason = pi_rs_core::CompactionReason::Threshold;
+    if matches!(*reason, pi_rs_core::CompactionTrigger::Overflow) {
+        *reason = pi_rs_core::CompactionTrigger::Threshold;
     }
 }
 
@@ -4026,42 +4020,13 @@ mod tests {
 
     #[test]
     fn overflow_reason_is_negotiated_for_legacy_executables() {
-        #[derive(Debug, serde::Deserialize, PartialEq)]
-        #[serde(rename_all = "snake_case")]
-        enum LegacyReason {
-            Manual,
-            Threshold,
-        }
         for supported in [false, true] {
-            let mut event = ProtocolRequest::Lifecycle {
-                event: LifecycleEvent::SessionCompactFailed {
-                    reason: pi_rs_core::CompactionReason::Overflow,
-                    error_message: None,
-                    aborted: false,
-                    will_retry: false,
-                    from_extension: false,
-                },
-                state: None,
-            };
-            project_overflow_reason(&mut event, supported);
-            let event = serde_json::to_value(event).unwrap();
-            assert_eq!(
-                event["event"]["reason"],
-                if supported { "overflow" } else { "threshold" }
-            );
-            if !supported {
-                assert_eq!(
-                    serde_json::from_value::<LegacyReason>(event["event"]["reason"].clone())
-                        .unwrap(),
-                    LegacyReason::Threshold
-                );
-            }
             let mut pre = ProtocolRequest::BeforeSummaryCompaction {
                 preparation: pi_rs_core::CompactionPreparation {
                     branch_entries: vec![],
                     first_kept_entry: None,
                     tokens_before: 0,
-                    reason: pi_rs_core::CompactionReason::Overflow,
+                    reason: pi_rs_core::CompactionTrigger::Overflow,
                     will_retry: true,
                     custom_instructions: None,
                 },
@@ -4124,7 +4089,7 @@ mod tests {
                     branch_entries: vec![],
                     first_kept_entry: Some(8),
                     tokens_before: 17,
-                    reason: pi_rs_core::CompactionReason::Threshold,
+                    reason: pi_rs_core::CompactionTrigger::Threshold,
                     will_retry: false,
                     custom_instructions: None,
                 },
@@ -4163,7 +4128,7 @@ mod tests {
             branch_entries: vec![],
             first_kept_entry: None,
             tokens_before: 0,
-            reason: pi_rs_core::CompactionReason::Manual,
+            reason: pi_rs_core::CompactionTrigger::Manual,
             will_retry: false,
             custom_instructions: None,
         };
@@ -4190,7 +4155,7 @@ mod tests {
                 branch_entries: vec![],
                 first_kept_entry: Some(7),
                 tokens_before: 42,
-                reason: pi_rs_core::CompactionReason::Manual,
+                reason: pi_rs_core::CompactionTrigger::Manual,
                 will_retry: false,
                 custom_instructions: Some("instructions".into()),
             },
@@ -5906,7 +5871,7 @@ else:
             branch_entries: vec![],
             first_kept_entry: Some(1),
             tokens_before: 2,
-            reason: pi_rs_core::CompactionReason::Manual,
+            reason: pi_rs_core::CompactionTrigger::Manual,
             will_retry: false,
             custom_instructions: None,
         };

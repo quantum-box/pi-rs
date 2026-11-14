@@ -101,7 +101,6 @@ pub enum SessionSwitchReason {
 pub enum CompactionReason {
     Manual,
     Threshold,
-    Overflow,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

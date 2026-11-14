@@ -552,6 +552,24 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
+/// Detailed trigger for the new pre-summary compaction interface.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
+impl CompactionTrigger {
+    pub(crate) fn legacy_reason(self) -> crate::CompactionReason {
+        match self {
+            Self::Manual => crate::CompactionReason::Manual,
+            Self::Threshold | Self::Overflow => crate::CompactionReason::Threshold,
+        }
+    }
+}
+
 /// Prepared model-summary compaction, before an extension or model supplies its summary.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -559,7 +577,7 @@ pub struct CompactionPreparation {
     pub branch_entries: Vec<crate::Record>,
     pub first_kept_entry: Option<u64>,
     pub tokens_before: u64,
-    pub reason: crate::CompactionReason,
+    pub reason: CompactionTrigger,
     pub will_retry: bool,
     pub custom_instructions: Option<String>,
 }

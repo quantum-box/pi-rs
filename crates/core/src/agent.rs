@@ -1326,7 +1326,7 @@ impl Agent<'_> {
                             instructions: None,
                             output_limit: summary_limit,
                             cancellation: cancel,
-                            reason: crate::CompactionReason::Overflow,
+                            reason: crate::CompactionTrigger::Overflow,
                             will_retry: true,
                             skip_without_model: false,
                         },
@@ -1551,7 +1551,7 @@ impl Agent<'_> {
                                 instructions: None,
                                 output_limit: summary_limit,
                                 cancellation: cancel,
-                                reason: crate::CompactionReason::Threshold,
+                                reason: crate::CompactionTrigger::Threshold,
                                 will_retry: false,
                                 skip_without_model: !exceeds && !model_summary_available,
                             },
@@ -3500,7 +3500,7 @@ impl Agent<'_> {
             Ok(preparation) => preparation,
             Err(error) => {
                 let event =
-                    compaction_failed_event(crate::CompactionReason::Manual, &error, cancel);
+                    compaction_failed_event(crate::CompactionTrigger::Manual, &error, cancel);
                 let idle = session.current_run_id().is_none();
                 if let Err(notification_error) = crate::lifecycle::notify_session_with_host(
                     self.registry,
@@ -3534,7 +3534,7 @@ impl Agent<'_> {
                 instructions,
                 output_limit: limit,
                 cancellation: cancel,
-                reason: crate::CompactionReason::Manual,
+                reason: crate::CompactionTrigger::Manual,
                 will_retry: false,
                 skip_without_model: false,
             },
@@ -3573,7 +3573,7 @@ impl Agent<'_> {
                         .clone(),
                 ),
                 from_extension: *from_extension,
-                reason,
+                reason: reason.legacy_reason(),
                 will_retry,
             },
             Ok(None) => unreachable!("skipped above"),
@@ -4414,7 +4414,7 @@ struct SummaryScope<'a> {
     instructions: Option<&'a str>,
     output_limit: u32,
     cancellation: &'a CancellationToken,
-    reason: crate::CompactionReason,
+    reason: crate::CompactionTrigger,
     will_retry: bool,
     skip_without_model: bool,
 }
@@ -4432,21 +4432,21 @@ fn abandon_turn_request_for_summary(
 }
 
 fn compaction_failed_event(
-    reason: crate::CompactionReason,
+    reason: crate::CompactionTrigger,
     error: &Error,
     cancellation: &CancellationToken,
 ) -> crate::LifecycleEvent {
     let aborted = cancellation.is_cancelled() || matches!(error, Error::Cancelled);
     let error_message = (!aborted).then(|| {
         let prefix = match reason {
-            crate::CompactionReason::Manual => "Compaction failed",
-            crate::CompactionReason::Threshold => "Auto-compaction failed",
-            crate::CompactionReason::Overflow => "Context overflow recovery failed",
+            crate::CompactionTrigger::Manual => "Compaction failed",
+            crate::CompactionTrigger::Threshold => "Auto-compaction failed",
+            crate::CompactionTrigger::Overflow => "Context overflow recovery failed",
         };
         format!("{prefix}: {error}")
     });
     crate::LifecycleEvent::SessionCompactFailed {
-        reason,
+        reason: reason.legacy_reason(),
         error_message,
         aborted,
         will_retry: false,
@@ -5965,8 +5965,8 @@ mod tree_tests {
     #[tokio::test]
     async fn extension_summary_commits_or_rejects_before_model_for_each_reason() {
         for reason in [
-            crate::CompactionReason::Manual,
-            crate::CompactionReason::Threshold,
+            crate::CompactionTrigger::Manual,
+            crate::CompactionTrigger::Threshold,
         ] {
             for (cancel, invalid) in [(false, false), (true, false), (false, true)] {
                 let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6007,7 +6007,7 @@ mod tree_tests {
                 let retention = RetentionPlan::turns(&session, 1);
                 let before = session.records().len();
                 let token = CancellationToken::new();
-                let result = if matches!(reason, crate::CompactionReason::Manual) {
+                let result = if matches!(reason, crate::CompactionTrigger::Manual) {
                     agent
                         .summarize(&mut session, 1, &token, &mut |_| {})
                         .await
@@ -7142,7 +7142,7 @@ mod tree_tests {
                         instructions: None,
                         output_limit: 0,
                         cancellation: &token,
-                        reason: crate::CompactionReason::Threshold,
+                        reason: crate::CompactionTrigger::Threshold,
                         will_retry: false,
                         skip_without_model: false,
                     },
