@@ -4,7 +4,7 @@ use pi_rs_core::{Error, Model, ModelEvent, ModelRequest, ModelStream};
 use pi_rs_durable::{
     recovery::UncertainPolicy,
     runtime::{Config, Harness, InputMode, Options, Scheduler, Status},
-    subagent::ReportedInput,
+    subagent::{ChildState, ReportedInput, format_status},
 };
 use std::{process::Command, sync::Arc};
 use uuid::Uuid;
@@ -38,6 +38,42 @@ fn config() -> Config {
         system_prompt: "child".into(),
         max_output_tokens: 100,
     }
+}
+
+#[tokio::test]
+async fn status_is_parent_scoped_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h.create_conversation(config()).unwrap();
+    let other = h.create_conversation(config()).unwrap();
+    h.ensure_subagent(parent, "zeta", config()).unwrap();
+    let (child, _) = h
+        .submit_subagent(
+            parent,
+            "alpha",
+            config(),
+            "one",
+            "hello".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+    h.ensure_subagent(other, "hidden", config()).unwrap();
+    let states = h.subagent_status(parent, None).unwrap();
+    assert_eq!(format_status(&states), "alpha: working\nzeta: idle");
+    assert_eq!(states[0].state, ChildState::Working);
+    assert_eq!(
+        format_status(&h.subagent_status(parent, Some("missing")).unwrap()),
+        "No subagents."
+    );
+    drop(h);
+    let mut s = Scheduler::open(&path, options()).unwrap();
+    s.wait(child.child).await.unwrap();
+    assert_eq!(
+        format_status(&s.subagent_status(parent, Some("alpha")).unwrap()),
+        "alpha: idle"
+    );
+    assert_eq!(s.subagent_status(parent, None).unwrap().len(), 2);
 }
 
 #[test]

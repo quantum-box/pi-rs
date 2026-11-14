@@ -221,8 +221,18 @@ driven `Harness` persists intents but does not run the reporter; open a
 `Scheduler` to deliver them. Legacy answers created before answer IDs cannot be
 reported and require reconciliation.
 
+`Harness::subagent_status` and `Scheduler::subagent_status` inspect a parent's
+named children, optionally by name, without creating or scheduling them.
+`format_status` produces the upstream example's `working`/`idle` text, with
+`reserved` for a persisted reservation whose child was not created before an
+interruption. Queued inputs count as working, even if a failed run has left them
+waiting for another input. This is a committed snapshot, not a watch.
+
 This is not the complete upstream background-subagent extension. There is no
-child-tool restriction, status command, or parent ownership tree.
+model-facing management tool, automatic child-tool restriction, or ownership
+tree for these named links. Extension selection can be configured on a settled
+conversation, but does not restrict globally registered tools and is not an
+atomic child admission policy. Named links do not inherit parent extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.

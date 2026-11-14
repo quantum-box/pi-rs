@@ -413,6 +413,14 @@ pub struct ToolAttempt {
 }
 
 impl Conversation {
+    pub(crate) fn is_working(&self) -> bool {
+        self.active.is_some()
+            || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
+            || self
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+    }
     /// The most recent attempt for the currently running, pending, blocked or
     /// finishing operation. Legacy records may have no known attempt identity.
     pub fn tool_attempt(&self) -> Option<ToolAttempt> {

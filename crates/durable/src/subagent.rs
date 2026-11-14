@@ -20,6 +20,42 @@ pub struct Link {
     pub child: Uuid,
     pub config: Config,
 }
+/// A named reservation and its child's committed state. A reservation can
+/// survive a crash before the child conversation is created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildStatus {
+    pub link: Link,
+    pub state: ChildState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildState {
+    Reserved,
+    Working,
+    Idle,
+}
+
+/// Format status for a user, following the upstream example for created children.
+pub fn format_status(children: &[ChildStatus]) -> String {
+    if children.is_empty() {
+        return "No subagents.".into();
+    }
+    children
+        .iter()
+        .map(|child| {
+            format!(
+                "{}: {}",
+                child.link.key,
+                match child.state {
+                    ChildState::Reserved => "reserved",
+                    ChildState::Working => "working",
+                    ChildState::Idle => "idle",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 #[derive(Serialize, Deserialize)]
 struct Reservation {
     #[serde(flatten)]
@@ -76,6 +112,53 @@ impl Harness {
     /// Returns a reservation, which may not yet have a created child.
     pub fn subagent(&self, parent: Uuid, name: &str) -> Result<Option<Link>, Error> {
         Ok(self.reservation(parent, name)?.map(|r| r.link))
+    }
+    /// Inspect one or all named children without creating or scheduling work.
+    /// Queued inputs count as working, including before a scheduler picks them up.
+    pub fn subagent_status(
+        &self,
+        parent: Uuid,
+        name: Option<&str>,
+    ) -> Result<Vec<ChildStatus>, Error> {
+        self.conversation(parent)?;
+        let names = if let Some(name) = name {
+            vec![name.to_owned()]
+        } else {
+            let prefix = format!("runtime/subagent/{parent}/");
+            self.subagent_store()?
+                .list(prefix.as_bytes())?
+                .into_iter()
+                .map(|(key, _)| {
+                    String::from_utf8(key[prefix.len()..].to_vec())
+                        .map_err(|_| Error::Invalid("invalid subagent key".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut result = Vec::new();
+        for name in names {
+            let Some(link) = self.subagent(parent, &name)? else {
+                continue;
+            };
+            let state = match self.conversation(link.child) {
+                Ok(child) if child.id == link.child && child.config == link.config => {
+                    if child.is_working() {
+                        ChildState::Working
+                    } else {
+                        ChildState::Idle
+                    }
+                }
+                Ok(_) => {
+                    return Err(Error::Invalid(
+                        "subagent child identity or configuration mismatch".into(),
+                    ));
+                }
+                Err(Error::NotFound) => ChildState::Reserved,
+                Err(error) => return Err(error),
+            };
+            result.push(ChildStatus { link, state });
+        }
+        result.sort_by(|a, b| a.link.key.cmp(&b.link.key));
+        Ok(result)
     }
     pub fn ensure_subagent(
         &mut self,
@@ -345,6 +428,13 @@ impl Harness {
     }
 }
 impl Scheduler {
+    pub fn subagent_status(
+        &mut self,
+        parent: Uuid,
+        name: Option<&str>,
+    ) -> Result<Vec<ChildStatus>, Error> {
+        self.subagent_harness().subagent_status(parent, name)
+    }
     pub fn subagent(&mut self, parent: Uuid, name: &str) -> Result<Option<Link>, Error> {
         self.subagent_harness().subagent(parent, name)
     }
