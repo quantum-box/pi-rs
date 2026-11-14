@@ -631,17 +631,17 @@ mod tests {
         task.abort();
         reply_tx.send(()).unwrap();
         server.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                if saved["xai"]["refresh"] == "new-refresh" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        // The refresh task retains this lock through persistence. Acquiring it
+        // distinguishes a completed failed refresh from one still in flight.
+        let _guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::auth_lock::acquire_async(&path),
+        )
         .await
-        .unwrap();
+        .expect("refresh did not release the auth lock")
+        .expect("could not acquire the auth lock");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["xai"]["refresh"], "new-refresh");
     }
 
     #[tokio::test]
