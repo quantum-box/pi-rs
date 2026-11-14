@@ -240,6 +240,13 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
+Completed tool-call JSON parsing and incremental argument previews live in the
+portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
+frontends. The standalone crate is compile-checked for
+`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
+on that target. Preview behavior retains the existing native parser's documented
+differences from Pi's streaming parser.
+
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
 alongside the native `extension` and `message` fields. `extensionPath` is the
 executable's resolved source path when available; embedded extensions without
@@ -985,7 +992,10 @@ bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
 waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
-cancellation stop the wait sooner. Waiting counts toward the script deadline,
+cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
+admitting or releasing workers, allowing embedders to change the limit while
+running. Reducing it does not interrupt existing workers; native retains its
+1,024-worker ceiling and uses the default of two for invalid values. Waiting counts toward the script deadline,
 and a cancelled waiter does not release another script's worker. In the Rust
 SDK, `Codemode.timeout` remains a `Duration`;
 its default `Duration::MAX` means no deadline, while other values set a limit.
@@ -4212,3 +4222,24 @@ content blocks, matching its session-context projection. RPC messages report
 empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
+
+### RPC truncated JSON diagnostics
+
+Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
+initial object property names, unfinished unescaped strings, and missing values.
+Offsets and columns in these diagnostics count UTF-16 units. Other malformed
+JSON, escaped unfinished strings and carriage-return position handling retain
+the native parser's diagnostics; full malformed-input parity remains open.
+
+### Shell execution transcript checkpoint
+
+Imported and live Pi-style shell executions display their output and completion
+status separately from the command, instead of showing the model-context
+`Ran ...` wrapper and Markdown fences in the terminal. Cancellation, nonzero
+exit status and truncation paths are included in the display output; the native
+excluded-from-context label is retained. Model context and journal data retain
+their existing framing and values. The terminal continues to use its generic
+tool styling and preview limits, so a long output may hide its status until expanded.
+Shell transcript rendering strips terminal escape sequences and normalizes line
+endings, including for imported and extension-provided output; journal and
+model-context text retain the original bytes.

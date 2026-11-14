@@ -2085,6 +2085,7 @@ dependencies = [
  "js-sys",
  "jsonschema",
  "libc",
+ "pi-rs-tool-arguments",
  "serde",
  "serde_json",
  "sha2",
@@ -2107,6 +2108,13 @@ dependencies = [
  "serde_json",
  "tauri",
  "tokio",
+]
+
+[[package]]
+name = "pi-rs-tool-arguments"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
