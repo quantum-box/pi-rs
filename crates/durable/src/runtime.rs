@@ -6648,12 +6648,8 @@ mod scheduler_tests {
         let cancelled_while_locked = done_rx.recv_timeout(Duration::from_secs(2));
         drop(gate);
         let result = thread.join().unwrap();
-        assert_eq!(
-            observed.unwrap(),
-            true,
-            "poll must not block on the task gate"
-        );
-        assert_eq!(cancelled_while_locked.unwrap(), true);
+        assert!(observed.unwrap(), "poll must not block on the task gate");
+        assert!(cancelled_while_locked.unwrap());
         assert!(matches!(result, Err(Error::WaitCancelled)));
     }
     #[test]
