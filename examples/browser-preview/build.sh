@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if ! command -v rustup >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.89.0
-  export PATH="$HOME/.cargo/bin:$PATH"
+# Keep rustup and Cargo in one isolated location. Cloud builders may set a
+# shared CARGO_HOME that does not contain their preinstalled rustup proxies.
+export CARGO_HOME="${TMPDIR:-/tmp}/pi-rs-browser-preview/cargo"
+export RUSTUP_HOME="${TMPDIR:-/tmp}/pi-rs-browser-preview/rustup"
+export PATH="$CARGO_HOME/bin:$PATH"
+if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.89.0
 fi
 rustup toolchain install 1.89.0 --profile minimal
 rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
