@@ -184,13 +184,11 @@ impl Task {
             until_millis,
             signals,
         } = &condition
-        {
-            if (until_millis.is_none() && signals.is_empty())
+            && ((until_millis.is_none() && signals.is_empty())
                 || until_millis.is_some_and(|time| time < 0)
-                || signals.iter().any(String::is_empty)
-            {
-                return Err(TransitionError::InvalidWait);
-            }
+                || signals.iter().any(String::is_empty))
+        {
+            return Err(TransitionError::InvalidWait);
         }
         self.delivered_signal = None;
         self.state = TaskState::Waiting(condition);
