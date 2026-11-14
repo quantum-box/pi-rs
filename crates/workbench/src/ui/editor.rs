@@ -17,6 +17,7 @@ pub struct Editor {
     pub text: String,
     pub cursor: usize,
     undo: Vec<Snapshot>,
+    typing_word: bool,
     kills: Vec<String>,
     last_kill: bool,
     yank: Option<(Range<usize>, usize)>,
@@ -37,6 +38,7 @@ impl Editor {
         self.last_kill = false;
         self.preferred_column = None;
         self.jump_forward = None;
+        self.typing_word = false;
     }
     pub fn replace(&mut self, text: String) {
         self.remember();
@@ -49,13 +51,37 @@ impl Editor {
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
+    /// Insert a typed character, grouping consecutive typing as Pi does.
+    /// Paste and programmatic insertion continue to use the atomic `insert`.
+    pub fn type_character(&mut self, character: char) {
+        let text = super::render::clean(&character.to_string());
+        if text.is_empty() {
+            return;
+        }
+        // JavaScript's /\s/ includes BOM but not U+0085.
+        let whitespace =
+            (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}';
+        if whitespace || !self.typing_word {
+            self.remember();
+        } else {
+            self.yank = None;
+            self.last_kill = false;
+            self.preferred_column = None;
+            self.jump_forward = None;
+        }
+        self.text.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        self.typing_word = true;
+    }
     pub fn left(&mut self) {
+        self.typing_word = false;
         self.cursor = self.text[..self.cursor]
             .grapheme_indices(true)
             .next_back()
             .map_or(0, |(index, _)| index);
     }
     pub fn right(&mut self) {
+        self.typing_word = false;
         self.cursor += self.text[self.cursor..]
             .graphemes(true)
             .next()
@@ -152,6 +178,7 @@ impl Editor {
     }
     /// Returns false at the first/last logical line so the caller can browse history.
     pub fn vertical(&mut self, down: bool) -> bool {
+        self.typing_word = false;
         self.last_kill = false;
         self.yank = None;
         let start = self.line_start();
@@ -202,6 +229,7 @@ impl Editor {
 
     /// False at a viewport boundary, where the caller may switch to history navigation.
     pub fn visual_move(&mut self, width: usize, delta: isize) -> bool {
+        self.typing_word = false;
         self.last_kill = false;
         self.yank = None;
         let layout = Layout::new(&self.text, width);
@@ -226,6 +254,7 @@ impl Editor {
             _ => None,
         };
         if let Some(direction) = direction {
+            self.typing_word = false;
             self.last_kill = false;
             self.yank = None;
             self.jump_forward = if self.jump_forward.is_some() {
@@ -238,6 +267,7 @@ impl Editor {
         let Some(forward) = self.jump_forward.take() else {
             return false;
         };
+        self.typing_word = false;
         if let KeyCode::Char(character) = key.code
             && !character.is_control()
             && !key
@@ -362,6 +392,7 @@ impl Editor {
             "tui.input.newLine" => self.insert("\n"),
             _ => return false,
         }
+        self.typing_word = false;
         self.preferred_column = None;
         if !matches!(action, "tui.editor.yank" | "tui.editor.yankPop") {
             self.yank = None;
@@ -372,6 +403,71 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn type_text(editor: &mut Editor, text: &str) {
+        for character in text.chars() {
+            // The interactive loop first tries a keybinding for each key.
+            assert!(!editor.action(""));
+            editor.type_character(character);
+        }
+    }
+
+    #[test]
+    fn typing_undo_groups_words_and_individual_spaces() {
+        let mut editor = Editor::default();
+        type_text(&mut editor, "hello world  ");
+        for expected in ["hello world ", "hello world", "hello", ""] {
+            assert!(editor.action("tui.editor.undo"));
+            assert_eq!(editor.text, expected);
+            assert_eq!(editor.cursor, expected.len());
+        }
+    }
+
+    #[test]
+    fn typing_undo_respects_newlines_movement_and_atomic_insertion() {
+        let mut editor = Editor::default();
+        type_text(&mut editor, "hello");
+        editor.action("tui.input.newLine");
+        type_text(&mut editor, "world");
+        for expected in ["hello\n", "hello", ""] {
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, expected);
+        }
+
+        type_text(&mut editor, "abc");
+        editor.action("tui.editor.cursorLeft");
+        type_text(&mut editor, "XY");
+        assert_eq!(editor.text, "abXYc");
+        editor.action("tui.editor.undo");
+        assert_eq!((&*editor.text, editor.cursor), ("abc", 2));
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "");
+
+        type_text(&mut editor, "before");
+        editor.insert(" pasted text");
+        type_text(&mut editor, "after");
+        for expected in ["before pasted text", "before", ""] {
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, expected);
+        }
+    }
+
+    #[test]
+    fn typing_undo_preserves_unicode_and_resets_after_navigation() {
+        let mut editor = Editor::default();
+        type_text(&mut editor, "日本\u{00a0}e\u{301}👩\u{200d}💻");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "日本");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "");
+
+        type_text(&mut editor, "ab");
+        assert!(!editor.visual_move(80, -1));
+        type_text(&mut editor, "c");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "ab");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "");
+    }
     #[test]
     fn consecutive_kills_accumulate_in_direction_and_across_lines() {
         let mut editor = Editor::default();
