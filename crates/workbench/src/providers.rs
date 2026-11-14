@@ -1215,6 +1215,7 @@ mod estimation_tests {
             ),
             (None, 1, json!({"thinkingLevel":"HIGH"})),
             (None, 0, json!({"thinkingLevel":"LOW"})),
+            (None, 3, json!({"thinkingLevel":"LOW"})),
             (None, 2, json!({"thinkingBudget":0})),
             (
                 Some("high"),
@@ -1260,10 +1261,10 @@ mod estimation_tests {
             });
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.provider = Provider::Google;
-            args.model = if profile == 2 {
-                "custom-reasoner"
-            } else {
-                "gemini-3.1-pro-preview"
+            args.model = match profile {
+                2 => "custom-reasoner",
+                3 => "gemini-4-argon",
+                _ => "gemini-3.1-pro-preview",
             }
             .into();
             args.thinking = selected.map(str::to_owned);
@@ -1272,7 +1273,7 @@ mod estimation_tests {
             } else if profile == 2 {
                 json!({"providers":{"google":{"models":[{"id":"custom-reasoner","reasoning":true,"thinkingLevelMap":{"high":"low"}}]}}})
             } else { json!({}) }).unwrap();
-            if profile == 0 {
+            if profile == 0 || profile == 3 {
                 let model = args
                     .model_profiles
                     .model(&args.provider, &args.model)
