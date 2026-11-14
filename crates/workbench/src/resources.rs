@@ -571,7 +571,9 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
         }
     };
     let (metadata, _) = frontmatter(&text)?;
-    let description = metadata.description.filter(|text| !text.trim().is_empty());
+    let description = metadata
+        .description
+        .filter(|text| !text.trim_matches(is_prompt_space).is_empty());
     let declared = path.file_name().is_some_and(|name| name == "SKILL.md");
     if description.is_none() && !declared {
         return Ok(None);
@@ -1119,6 +1121,39 @@ mod tests {
                 .any(|message| message.contains("exceeds 1024"))
         );
         assert!(warnings.iter().all(|message| message.contains("SKILL.md")));
+    }
+
+    #[test]
+    fn skill_description_uses_ecmascript_whitespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let declared = directory.path().join("SKILL.md");
+        let legacy = directory.path().join("legacy.md");
+        for path in [&declared, &legacy] {
+            std::fs::write(
+                path,
+                "---\nname: fixture\ndescription: \"\\uFEFF\"\n---\nBody",
+            )
+            .unwrap();
+            let mut warnings = Vec::new();
+            assert!(parse_skill(path, &mut warnings).unwrap().is_none());
+            assert_eq!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("description is required")),
+                path == &declared
+            );
+
+            std::fs::write(
+                path,
+                "---\nname: fixture\ndescription: \"\\u0085\"\n---\nBody",
+            )
+            .unwrap();
+            let mut warnings = Vec::new();
+            let (name, skill) = parse_skill(path, &mut warnings).unwrap().unwrap();
+            assert_eq!(name, "fixture");
+            assert_eq!(skill.description, "\u{0085}");
+            assert!(warnings.is_empty());
+        }
     }
 
     #[test]
