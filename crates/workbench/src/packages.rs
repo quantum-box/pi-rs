@@ -1874,6 +1874,39 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_package_command_terminates_its_running_process_group() {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        let leaked = root.path().join("leaked");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c")
+            .arg("(i=0; while [ ! -f \"$3\" ] && [ \"$i\" -lt 200 ]; do i=$((i+1)); sleep 0.05; done; if [ -f \"$3\" ]; then printf leaked > \"$1\"; fi) & printf ready > \"$2\"; wait")
+            .arg("sh").arg(&leaked).arg(&ready).arg(&release);
+        let task = tokio::spawn(run(command));
+        let _cleanup = AbortOnDrop(task.abort_handle());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("package child did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::write(release, b"release").unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!leaked.exists(), "package descendant survived cancellation");
+    }
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");

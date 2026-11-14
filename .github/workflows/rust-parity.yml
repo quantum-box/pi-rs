@@ -1,53 +1,15 @@
-name: Focused share context validation
+name: Package cancellation regression
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  focused:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  regression:
+    runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      CARGO_TERM_COLOR: always
-      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.89.0 --profile minimal
-      - name: Test OAuth refresh and private storage
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs refresh
-      - name: Test private storage
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
-      - name: Test live share capture
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
-      - name: Test standalone share runtime tools
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_uses_reconstructed_runtime_tools
-      - name: Test Radius cached context export
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_upload_uses_reopened_journal_bound_cached_context
-      - name: Test unavailable cache RPC startup
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli rpc_worker_starts_when_
-      - name: Test live journal integrity
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_rejects_different_journal
-      - name: Test pending share correlation
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs pending_share_keeps_extension_dialog_and_response_correlated
-      - name: Test live worker journal tag
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli worker_returns_keyed_share_journal_tag
-      - name: Test missing live context rejection
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_share_rejects_
-      - name: Test live journal key correlation
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs live_share_response_keeps_its_private_journal_key
-      - name: Test live share private fields
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_share_uploads_context_for_matching_snapshot
-      - name: Test standalone share ignores stale cache
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli standalone_radius_share_reconstructs_instead_of_using_old_cache
-      - name: Test real terminal and standalone share flows
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation -- --test-threads=1
-      - name: Test live share fallback correlation
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs failed_live_share_response_requires_authenticated_context
-      - name: Test malformed live response remains authenticated
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs malformed_success_keeps_live_authentication_required
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelling_package_command_terminates_its_running_process_group
