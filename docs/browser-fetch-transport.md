@@ -1,17 +1,13 @@
 # Experimental browser Fetch transport
 
-`crates/browser-fetch` is an isolated transport experiment for a future browser
-host. It uses the browser's Fetch and ReadableStream APIs to POST a UTF-8 body,
-read bounded byte chunks, and abort either an in-flight request or response
-stream. The package is deliberately independent of the native workspace while
-parallel core and workspace changes are in flight.
+`crates/browser-fetch` is a transport used by the experimental
+[browser SDK](browser-sdk.md). It uses Fetch and ReadableStream to POST a UTF-8
+body, read bounded byte chunks, and abort an in-flight request or response
+stream. The package remains independent of the native workspace.
 
-This is **not** a browser agent, SDK session, provider adapter, or persistence
-backend. Nothing in `pi-rs-core` calls it yet. In particular, the existing SDK
-still does not compile for `wasm32-unknown-unknown`: filesystem capabilities,
-journal storage, executor/timer and randomness integration, tool boundaries,
-model protocol decoding, and the session API still need platform work. Passing
-this transport test does not establish browser session support.
+This transport alone is not a provider adapter or persistence backend. The
+browser SDK adds a text gateway and session storage; consult its documentation
+for the tested browser behavior and the native SDK features it does not expose.
 
 The caller supplies an absolute HTTP(S) URL, body and headers. URL userinfo is
 rejected, ambient credentials are omitted, and redirects fail instead of
