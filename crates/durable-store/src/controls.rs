@@ -36,9 +36,15 @@ pub enum FenceError<E> {
 pub struct ConversationControls {
     root: CancellationToken,
     entries: Mutex<HashMap<Uuid, Control>>,
+    worker_errors: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 impl ConversationControls {
+    /// Failures are shared by all drivers attached to this store owner.
+    pub fn worker_errors(&self) -> Arc<Mutex<HashMap<Uuid, String>>> {
+        self.worker_errors.clone()
+    }
+
     pub fn root(&self) -> CancellationToken {
         self.root.clone()
     }
@@ -131,6 +137,13 @@ mod tests {
         let attached = owner.clone();
         let first = owner.conversation_controls().get(id);
         let second = attached.conversation_controls().get(id);
+        let failures = owner.conversation_controls().worker_errors();
+        let attached_failures = attached.conversation_controls().worker_errors();
+        failures.lock().unwrap().insert(id, "failed".into());
+        assert_eq!(
+            attached_failures.lock().unwrap().get(&id).map(String::as_str),
+            Some("failed")
+        );
         assert!(Arc::ptr_eq(&first.worker, &second.worker));
         let worker_guard = first.worker.try_lock().unwrap();
         assert!(second.worker.try_lock().is_err());
@@ -155,6 +168,12 @@ mod tests {
         drop(owner);
         let reopened = OwnedStore::open(&path).unwrap();
         let fresh = reopened.conversation_controls().get(id);
+        assert!(reopened
+            .conversation_controls()
+            .worker_errors()
+            .lock()
+            .unwrap()
+            .is_empty());
         assert!(!fresh.cancel.is_cancelled());
         assert!(!Arc::ptr_eq(&first.gate, &fresh.gate));
     }

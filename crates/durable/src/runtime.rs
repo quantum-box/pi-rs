@@ -1267,15 +1267,33 @@ impl Harness {
     ) -> Result<(), Error> {
         let lock = self.owner.conversation_controls().get(id).worker;
         let guard = tokio::select! {
-            guard = lock.lock() => guard,
+            biased;
             _ = stop.cancelled() => return Ok(()),
+            guard = lock.lock() => guard,
         };
         let control = self.owner.conversation_controls().get(id);
         self.execution_gate = Some(control.gate);
         let mut guard = Some(guard);
-        tokio::select! {
-            result = drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard, None) => result,
-            _ = stop.cancelled() => Ok(()),
+        let errors = self.owner.conversation_controls().worker_errors();
+        let result = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(()),
+            result = std::panic::AssertUnwindSafe(drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard, Some(&errors))).catch_unwind() => result,
+        };
+        let failure = match &result {
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("worker panicked".into()),
+            Ok(Ok(())) => None,
+        };
+        if let Some(failure) = failure {
+            errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, failure);
+        }
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
@@ -6820,12 +6838,12 @@ impl Scheduler {
         let ids = harness.conversations()?;
         let mut scheduler = Self {
             cancel: harness.owner.conversation_controls().root(),
+            worker_errors: harness.owner.conversation_controls().worker_errors(),
             harness,
             tasks: HashMap::new(),
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
-            worker_errors: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         // Attach and publish the task driver before any recovered worker is spawned.
         let driver = tasks
@@ -7297,7 +7315,12 @@ impl Scheduler {
         worker.execution_gate = Some(control.gate);
         let errors = self.worker_errors.clone();
         let task = tokio::spawn(async move {
-            let mut guard = Some(lock.lock().await);
+            // A queued worker must not delay shutdown behind another owner.
+            let mut guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                guard = lock.lock() => guard,
+            });
             // A cancelled queued retry never took over the failed execution.
             if cancel.is_cancelled() {
                 return Ok(());
@@ -7379,6 +7402,7 @@ impl Scheduler {
                             let mut worker = source.worker();
                             let task_key = key.clone();
                             let worker_errors = worker_errors.clone();
+                            let reporter_stop = cancel.clone();
                             active.insert(
                                 key,
                                 tokio::spawn(async move {
@@ -7388,7 +7412,11 @@ impl Scheduler {
                                     let lock =
                                         worker.owner.conversation_controls().get(child).worker;
                                     {
-                                        let mut guard = Some(lock.lock().await);
+                                        let mut guard = Some(tokio::select! {
+                                            biased;
+                                            _ = reporter_stop.cancelled() => return Ok(()),
+                                            guard = lock.lock() => guard,
+                                        });
                                         let control =
                                             worker.owner.conversation_controls().get(child);
                                         worker.execution_gate = Some(control.gate);
@@ -7407,7 +7435,11 @@ impl Scheduler {
                                     {
                                         let lock =
                                             worker.owner.conversation_controls().get(parent).worker;
-                                        let mut guard = Some(lock.lock().await);
+                                        let mut guard = Some(tokio::select! {
+                                            biased;
+                                            _ = reporter_stop.cancelled() => return Ok(()),
+                                            guard = lock.lock() => guard,
+                                        });
                                         let control =
                                             worker.owner.conversation_controls().get(parent);
                                         worker.execution_gate = Some(control.gate);
@@ -8211,7 +8243,53 @@ mod scheduler_tests {
             .forget();
         first_cancel.cancel();
         first.await.unwrap().unwrap();
+
+        // Cleanup drivers also supersede an earlier failed scheduler worker.
+        let errors = harness.owner.conversation_controls().worker_errors();
+        errors.lock().unwrap().insert(id, "worker panicked".into());
+        let stop = CancellationToken::new();
+        let mut cleanup = harness.worker();
+        let cleanup_stop = stop.clone();
+        let task = tokio::spawn(async move { cleanup.drive_owned_cleanup(id, &cleanup_stop).await });
+        tokio::time::timeout(Duration::from_secs(2), polls.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(!errors.lock().unwrap().contains_key(&id));
+        stop.cancel();
+        task.await.unwrap().unwrap();
+
+        // Cancellation before acquiring the lock cannot erase a failure.
+        errors.lock().unwrap().insert(id, "worker panicked".into());
+        let lock = control.worker.clone();
+        let guard = lock.lock().await;
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let mut cleanup = harness.worker();
+        cleanup.drive_owned_cleanup(id, &stop).await.unwrap();
+        assert_eq!(
+            errors.lock().unwrap().get(&id).map(String::as_str),
+            Some("worker panicked")
+        );
+        drop(guard);
     }
+    #[tokio::test]
+    async fn cleanup_failure_is_visible_to_other_drivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = Uuid::new_v4();
+        let errors = harness.owner.conversation_controls().worker_errors();
+        assert!(
+            harness
+                .drive_owned_cleanup(id, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(errors.lock().unwrap().contains_key(&id));
+    }
+
     fn placement_model() -> Arc<GatedModel> {
         Arc::new(GatedModel {
             started: Arc::new(Semaphore::new(0)),
@@ -8817,6 +8895,28 @@ mod scheduler_tests {
             Some("worker panicked")
         );
         assert!(scheduler.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_queued_worker_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler =
+            Scheduler::open(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        let lock = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .worker;
+        let guard = lock.lock().await;
+        scheduler.schedule(id);
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), scheduler.shutdown())
+            .await
+            .expect("shutdown waited for a queued worker")
+            .unwrap();
+        drop(guard);
     }
 
     #[tokio::test]
