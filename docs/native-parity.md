@@ -108,7 +108,9 @@ model request and cache warming affinity. A separate internal UUID continues to
 identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
 external ID. RPC state and session statistics project the external ID; UI and
 share identity projection still uses the internal UUID.
-An ID that is invalid as an HTTP header is omitted from affinity headers.
+Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
+header bytes and whitespace normalization; unrepresentable or invalid values
+fail before dispatch when affinity is enabled.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
