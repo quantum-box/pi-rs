@@ -913,9 +913,10 @@ An explicit Pi `package.json` resource list contributes themes only and prevents
 previously cached native resources from being loaded. Unreadable local manifests
 are skipped instead of falling back to cached resources.
 When an in-progress package command is cancelled, the host requests termination
-of its process group (or Windows job) while the direct child is still owned. This
-does not impose a deadline on all share context preparation or cover processes
-that have detached from that group.
+of its process group (or Windows job) while the direct child is still owned. The
+host retains the child identity until inherited output pipes close, including when
+the parent has already exited. This does not impose a deadline on all share
+context preparation or cover processes that detach or close their inherited pipes.
 
 ### System prompt checkpoint
 
