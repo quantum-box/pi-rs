@@ -3264,6 +3264,50 @@ mod session_metadata_tests {
     }
 
     #[test]
+    fn share_open_rejects_pending_handoff_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_user_with_images("A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(2).unwrap();
+        session
+            .append_user_with_images("B".into(), vec![], None)
+            .unwrap();
+        let original_head = session.head();
+        session.begin_tree_trigger_handoff(run_id).unwrap().unwrap();
+        drop(session);
+        let original = std::fs::read(&path).unwrap();
+        assert!(Session::open_for_share(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(Session::open(&path).unwrap().head(), original_head);
+    }
+
+    #[test]
     fn dropping_the_store_unlocks_duplicated_file_descriptors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
