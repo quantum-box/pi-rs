@@ -429,3 +429,128 @@ async fn input_is_placed_before_second_follow_up_is_admitted() {
     h.resume(&cancel).await.unwrap();
     assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn mid_run_cut_survives_reopen_and_does_not_inherit_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let (parent, child, selected);
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        parent = h
+            .create_conversation(Config {
+                model: "historical".into(),
+                system_prompt: "system".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        let reset = h.reset(parent, Some("handoff".into())).unwrap();
+        h.submit_write(parent, Some("old-write".into()), "app.note".into(), None)
+            .unwrap();
+        h.submit_and_run(
+            parent,
+            Some("parent-request".into()),
+            "mid-run question".into(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let page = h
+            .history(parent, Cursor(0), NonZeroUsize::new(1000).unwrap())
+            .unwrap();
+        let record = page
+            .records
+            .iter()
+            .find(|r| {
+                let messages = r.value["messages"].as_array().unwrap();
+                messages
+                    .iter()
+                    .any(|m| m.to_string().contains("mid-run question"))
+                    && !messages.iter().any(|m| m.to_string().contains("answer"))
+                    && r.value["submissions"].to_string().contains("Running")
+            })
+            .expect("active cut after user placement");
+        selected =
+            serde_json::from_value::<Vec<Message>>(record.value["messages"].clone()).unwrap();
+        child = h.fork_at(parent, record.cursor).unwrap();
+        let c = h.conversation(child).unwrap();
+        assert_eq!(c.messages, selected);
+        assert_eq!(c.config.model, "historical");
+        assert!(c.submissions.is_empty());
+        assert_eq!(c.resets.last().unwrap().id, reset);
+        assert_eq!(c.application_writes[0].after_reset, Some(reset));
+        assert!(c.application_writes[0].request_id.is_none());
+    }
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        assert_eq!(h.conversation(child).unwrap().messages, selected);
+        assert!(h.conversation(child).unwrap().submissions.is_empty());
+        h.submit_and_run(
+            child,
+            Some("parent-request".into()),
+            "child question".into(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !h.conversation(parent)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "child question"))
+        );
+        let grandchild = h
+            .fork_at(
+                child,
+                h.history(child, Cursor(0), NonZeroUsize::new(1000).unwrap())
+                    .unwrap()
+                    .next,
+            )
+            .unwrap();
+        assert_eq!(
+            h.conversation(grandchild).unwrap().messages,
+            h.conversation(child).unwrap().messages
+        );
+    }
+}
+
+#[tokio::test]
+async fn fork_drops_queued_reset_and_unplaced_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(dir.path().join("db"), opts(), &cancel)
+        .await
+        .unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit(parent, None, "active".into()).unwrap();
+    h.reset(parent, Some("queued handoff".into())).unwrap();
+    h.submit_write(parent, None, "app.pending".into(), None)
+        .unwrap();
+    h.submit(parent, None, "queued input".into()).unwrap();
+    let cursor = h
+        .history(parent, Cursor(0), NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .next;
+    let child = h.fork_at(parent, cursor).unwrap();
+    let c = h.conversation(child).unwrap();
+    assert!(c.submissions.is_empty());
+    assert!(c.resets.is_empty());
+    assert!(c.application_writes.is_empty());
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "active"))
+    );
+    assert!(!c.messages.iter().any(|m| matches!(m, Message::User { content } if content == "queued input" || content == "queued handoff")));
+    h.submit_write(child, None, "app.child".into(), None)
+        .unwrap();
+    assert!(h.conversation(child).unwrap().application_writes[0].placed);
+}

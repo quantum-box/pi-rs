@@ -1,4 +1,4 @@
-//! Extraction of conservative historical fork points from observer records.
+//! Extraction of historical fork points from committed observer snapshots.
 //!
 //! The runtime must atomically append a complete `Snapshot` with each state
 //! transition. Existing observer records contain only messages and submissions;
@@ -124,7 +124,43 @@ pub fn extract(parent_id: Uuid, record: &Record) -> Result<ForkPoint, Error> {
     })
 }
 
+/// Extract a committed cut even while its parent is working. Only a complete
+/// model context can seed an idle child; no parent work is copied.
+pub fn extract_cut(parent_id: Uuid, record: &Record) -> Result<ForkPoint, Error> {
+    if record.cursor.0 == 0 {
+        return Err(Error::InvalidCursor);
+    }
+    let snapshot: Snapshot =
+        serde_json::from_value(record.value.clone()).map_err(|_| Error::InvalidSnapshot)?;
+    if snapshot.version != 1 {
+        return Err(Error::InvalidSnapshot);
+    }
+    if snapshot.conversation_id != parent_id {
+        return Err(Error::WrongConversation);
+    }
+    validate_context(&snapshot.messages)?;
+    Ok(ForkPoint {
+        parent_id,
+        cursor: record.cursor,
+        config: snapshot.config,
+        messages: snapshot.messages,
+        tool_states: snapshot.tool_states,
+        documents: snapshot.documents,
+    })
+}
+
 fn validate_transcript(messages: &[Message]) -> Result<(), Error> {
+    validate_context(messages)?;
+    if matches!(
+        messages.last(),
+        Some(Message::Tool { .. } | Message::User { .. } | Message::UserWithImages { .. })
+    ) {
+        return Err(Error::InvalidTranscript);
+    }
+    Ok(())
+}
+
+fn validate_context(messages: &[Message]) -> Result<(), Error> {
     let mut pending = HashSet::new();
     let mut seen = HashSet::new();
     let mut non_system = false;
@@ -156,12 +192,7 @@ fn validate_transcript(messages: &[Message]) -> Result<(), Error> {
         }
         non_system = true;
     }
-    if !pending.is_empty()
-        || matches!(
-            messages.last(),
-            Some(Message::Tool { .. } | Message::User { .. } | Message::UserWithImages { .. })
-        )
-    {
+    if !pending.is_empty() {
         return Err(Error::InvalidTranscript);
     }
     Ok(())
@@ -290,6 +321,36 @@ mod tests {
         };
         assert!(matches!(extract(id, &record(&s)), Err(Error::Unsettled)));
     }
+    #[test]
+    fn active_cut_requires_complete_tool_batch() {
+        let id = Uuid::new_v4();
+        let mut s = snapshot(id);
+        s.active = Some(Uuid::new_v4());
+        s.phase = json!({"Tools": {"index": 0}});
+        s.messages.push(Message::Assistant {
+            content: String::new(),
+            calls: vec![call("a"), call("b")],
+            replay: None,
+        });
+        s.messages.push(Message::Tool {
+            call_id: "a".into(),
+            content: "done".into(),
+        });
+        assert!(matches!(
+            extract_cut(id, &record(&s)),
+            Err(Error::InvalidTranscript)
+        ));
+        s.messages.push(Message::Tool {
+            call_id: "b".into(),
+            content: "done".into(),
+        });
+        assert!(extract_cut(id, &record(&s)).is_ok());
+        s.messages.push(Message::User {
+            content: "next".into(),
+        });
+        assert!(extract_cut(id, &record(&s)).is_ok());
+    }
+
     #[test]
     fn rejects_partial_and_malformed_tool_batches_even_if_marked_idle() {
         let id = Uuid::new_v4();

@@ -705,6 +705,10 @@ impl Harness {
                         serde_json::to_value(&state.extensions)?,
                     ),
                     (
+                        "pi-rs/runtime/resets".into(),
+                        serde_json::to_value(&state.resets)?,
+                    ),
+                    (
                         "pi-rs/runtime/application-writes".into(),
                         serde_json::to_value(&state.application_writes)?,
                     ),
@@ -990,7 +994,7 @@ impl Harness {
         self.save(seed, Expected::Missing)
     }
     /// Fork the current settled conversation. Queued inputs and request IDs
-    /// are not inherited. Historical entry-point forking is not yet supported.
+    /// are not inherited. Use `fork_at` for historical observation cuts.
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
         let (mut state, _) = self.load(id)?;
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
@@ -1019,8 +1023,8 @@ impl Harness {
         self.save(&state, Expected::Missing)?;
         Ok(state.id)
     }
-    /// Fork a committed, settled snapshot by its observation cursor. Older
-    /// snapshots without historical configuration fail closed.
+    /// Fork a committed observation cut, including cuts during active work.
+    /// Incomplete tool batches and snapshots without historical state fail closed.
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
@@ -1040,7 +1044,7 @@ impl Harness {
             .transpose()?;
         self.expand_event(id, &mut value)?;
         let record = crate::observer::Record { cursor, value };
-        let point = crate::fork::extract(id, &record)?;
+        let point = crate::fork::extract_cut(id, &record)?;
         let state = Conversation {
             id: Uuid::new_v4(),
             config: point.config,
@@ -1060,7 +1064,13 @@ impl Harness {
             transcript,
             submissions: vec![],
             aborted_generations: vec![],
-            resets: vec![],
+            resets: serde_json::from_value(
+                point
+                    .documents
+                    .get("pi-rs/runtime/resets")
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?
+                    .clone(),
+            )?,
             pending_resets: vec![],
             application_writes: point
                 .documents
@@ -1069,6 +1079,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|write| write.placed)
                 .map(|mut write| {
                     write.request_id = None;
                     write
