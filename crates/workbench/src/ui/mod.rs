@@ -12,6 +12,7 @@ pub mod picker;
 pub mod render;
 pub mod session_search;
 pub mod session_threads;
+mod strike;
 pub mod theme;
 pub mod transcript_search;
 pub mod viewport;

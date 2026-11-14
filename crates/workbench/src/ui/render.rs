@@ -896,7 +896,7 @@ thread_local! {
     static BARE_WEB_MATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
+pub(super) fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
     static EMAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+"#).unwrap()
     });
@@ -1104,7 +1104,7 @@ fn protect_bare_links(text: &str, options: Options) -> String {
     let mut after_table = 0;
     let mut protected = 0usize;
     let mut formatting = Vec::new();
-    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+    for (event, range) in super::strike::events(text, text, options) {
         match event {
             Event::Start(Tag::Table(_)) => {
                 segments.push((after_table..range.start, false));
@@ -1275,8 +1275,7 @@ fn markdown_at_depth(
     let mut code: Option<String> = None;
     let mut code_text = String::new();
     let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let loose_lists = loose_list_offsets(text, options);
     let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
@@ -1286,10 +1285,10 @@ fn markdown_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let protected_text = protect_bare_links(text, options);
-    let mut events = Parser::new_ext(&protected_text, options)
-        .into_offset_iter()
+    let mut events = super::strike::events(text, &protected_text, options)
+        .into_iter()
         .peekable();
-    while let Some((mut event, mut range)) = events.next() {
+    while let Some((event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
                 Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
@@ -1297,21 +1296,6 @@ fn markdown_at_depth(
                 _ => {}
             }
             continue;
-        }
-        // Pi's Marked tokenizer only accepts paired double tildes. Pulldown
-        // also parses a single tilde pair; retain its delimiters as text while
-        // still rendering any formatting nested inside the pair.
-        if matches!(
-            event,
-            Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough)
-        ) && text.as_bytes().get(range.start + 1) != Some(&b'~')
-        {
-            if matches!(event, Event::Start(_)) {
-                range.end = range.start + 1;
-            } else {
-                range.start = range.end - 1;
-            }
-            event = Event::Text("~".into());
         }
         let is_text = matches!(&event, Event::Text(_));
         match event {
@@ -1347,17 +1331,21 @@ fn markdown_at_depth(
                     lines.extend(table.render(theme, width));
                 }
             }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                links.push((dest_url.into_string(), String::new()));
+            Event::Start(Tag::Link { dest_url, id, .. }) => {
+                let raw_label = id.strip_prefix("\0pi-marked-label:").map(str::to_owned);
+                links.push((dest_url.into_string(), String::new(), raw_label));
             }
             Event::End(TagEnd::Link) => {
-                if let Some((url, label)) = links.pop() {
+                if let Some((url, label, raw_label)) = links.pop() {
+                    let label = raw_label.as_deref().unwrap_or(&label);
                     let comparable_url = url.strip_prefix("mailto:").unwrap_or(&url);
                     if (!hyperlinks || !safe_hyperlink(&url))
                         && label != url
                         && label != comparable_url
                     {
-                        spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
+                        let mut suffix = Span::themed(format!(" ({url})"), theme, "mdLinkUrl");
+                        suffix.strikethrough = strikethrough > 0;
+                        spans.push(suffix);
                     }
                 }
             }
@@ -1614,7 +1602,7 @@ fn markdown_at_depth(
                     } else {
                         merged.as_str()
                     };
-                    if let Some((_, label)) = links.last_mut() {
+                    if let Some((_, label, _)) = links.last_mut() {
                         label.push_str(displayed);
                     }
                     let mut span = Span::themed(
@@ -1630,7 +1618,7 @@ fn markdown_at_depth(
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1 || !links.is_empty();
-                    span.hyperlink = links.last().and_then(|(url, _)| {
+                    span.hyperlink = links.last().and_then(|(url, _, _)| {
                         (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
                     });
                     span.italic = italic > 0;
@@ -1696,26 +1684,27 @@ fn markdown_at_depth(
                 }
             }
             Event::Code(text) => {
-                if let Some((_, label)) = links.last_mut() {
+                if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
                 }
                 let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1 || !links.is_empty();
-                span.hyperlink = links
-                    .last()
-                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
-                span.bold = heading > 0;
+                span.hyperlink = links.last().and_then(|(url, _, _)| {
+                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                });
+                span.bold = bold > 0 || heading > 0;
+                span.italic = italic > 0;
                 span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
             Event::SoftBreak => {
-                if let Some((_, label)) = links.last_mut() {
+                if let Some((_, label, _)) = links.last_mut() {
                     label.push(' ');
                 }
                 let mut span = Span::themed(" ", theme, "text");
-                span.hyperlink = links
-                    .last()
-                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
+                span.hyperlink = links.last().and_then(|(url, _, _)| {
+                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                });
                 spans.push(span);
             }
             Event::End(TagEnd::Item) => {
@@ -1791,6 +1780,98 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strict_strike_matches_pinned_marked_delimiters_and_code_boundaries() {
+        let theme = Theme::system();
+        // Expected text and strike spans were generated by the pinned Pi
+        // MarkdownTokenizer with marked 18.0.11.
+        for (source, expected, deleted) in [
+            ("~foo ~~bar~~ baz~", "~foo bar baz~", "bar"),
+            ("~~a ~b~ c~~", "a ~b~ c", "a ~b~ c"),
+            ("~~x~~~", "~~x~~~", ""),
+            ("x~~~a~~y", "x~~~a~~y", ""),
+            (r"\~~~a~~", "~a", "a"),
+            ("~~a~~~b~~", "a~~~b", "a~~~b"),
+            ("*~~a`*~~", "*a`*", "a`*"),
+            ("*~~a*~~", "~~a~~", ""),
+            (r"~~a\~b~~", "a~b", "a~b"),
+            (r"\~~a~~", "~~a~~", ""),
+            ("~~a `b~~c` d", "a `bc` d", "a `b"),
+            ("`~~x~~` ~~y~~", "~~x~~ y", "y"),
+            ("~~a [link](url~~tail)", "a [link](urltail)", "a [link](url"),
+            ("~~a~~ ~~b~~", "a b", "ab"),
+        ] {
+            let lines = markdown(source, &theme, 200);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let rendered: String = spans.iter().map(|span| span.text.as_str()).collect();
+            let strike: String = spans
+                .iter()
+                .filter(|span| span.strikethrough)
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+            assert_eq!(strike, deleted, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn strict_strike_keeps_inline_and_reference_link_destinations() {
+        let theme = Theme::system();
+        let url = "https://example.com/a~b";
+        for source in [
+            "[~~hi~~](https://example.com/a~b)",
+            "~~[hi](https://example.com/a~b)~~",
+            "[~~hi~~][id]\n\n[id]: https://example.com/a~b",
+            "[~~hi~~][iD]\n\n[ID]: https://example.com/a~b",
+            "~~[hi][id]~~\n\n[id]: https://example.com/a~b",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                120,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                "hi",
+                "{source:?}"
+            );
+            assert!(
+                spans.iter().any(|span| span.text == "hi"
+                    && span.strikethrough
+                    && span.hyperlink.as_deref() == Some(url)),
+                "{source:?}"
+            );
+        }
+        let lines = markdown("~~[hi](https://example.com/a~b)~~", &theme, 120);
+        let suffix = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.text.contains("example.com"))
+            .unwrap();
+        assert!(suffix.strikethrough);
+
+        // Pi compares the raw link label, including Markdown delimiters.
+        let lines = markdown(
+            "[~~https://example.com~~](https://example.com)",
+            &theme,
+            120,
+        );
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(rendered, "https://example.com (https://example.com)");
+    }
+
     #[test]
     fn inline_code_in_strikethrough_inherits_strikethrough() {
         let theme = Theme::system();
