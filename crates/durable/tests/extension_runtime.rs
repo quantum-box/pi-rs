@@ -1083,12 +1083,10 @@ async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
                 .submit_and_run(id, None, "go".into(), &CancellationToken::new())
                 .await
                 .unwrap_err();
-            let expected = if event == GenerationEvent::OnYield {
-                "atomic scheduling is not supported"
-            } else {
-                "unselected task registration"
-            };
-            assert!(err.to_string().contains(expected), "{err}");
+            assert!(
+                err.to_string().contains("unselected task registration"),
+                "{err}"
+            );
             driver.shutdown().unwrap();
         }
         let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
