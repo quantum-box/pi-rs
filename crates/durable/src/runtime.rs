@@ -8715,6 +8715,146 @@ mod scheduler_tests {
         started: Arc<Semaphore>,
         count: Arc<AtomicUsize>,
     }
+
+    struct ControlledUnknownTool {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for ControlledUnknownTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "barrier".into(),
+                description: "".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Outcome::Unknown("test handoff boundary".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_tool_and_task_handler_have_no_existing_handoff_window() {
+        use crate::executor_handoff::{self, Binding, ConversationLease};
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_scheduler::{Registry, Step};
+        use crate::task_store::TaskStore;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let opts = Options {
+            model: Arc::new(ToolModel),
+            tools: vec![RegisteredTool {
+                tool: Arc::new(ControlledUnknownTool {
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+                replay: ReplayPolicy::Safe,
+            }],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let mut conversation = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let id = conversation.create_conversation(config()).unwrap();
+        conversation.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let tool_attempt = conversation
+            .harness
+            .conversation(id)
+            .unwrap()
+            .active_tool_attempt()
+            .unwrap();
+        let owner = conversation.harness.owner.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let stop_rx = std::sync::Mutex::new(stop_rx);
+        let mut registry = Registry::default();
+        registry.register("actual-handler", true, move |task: &Task| {
+            entered_tx.send(task.attempt_id().unwrap()).unwrap();
+            stop_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(serde_json::json!(null)))
+        });
+        let mut tasks = crate::task_scheduler::Scheduler::attach(owner.clone(), registry).unwrap();
+        let task_id = Uuid::new_v4();
+        let task = Task::new(
+            task_id,
+            TaskOwner::Conversation(id),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("actual-handler".into(), true);
+        tasks.submit(&task).unwrap();
+        let worker = std::thread::spawn(move || {
+            tasks.tick(0).unwrap();
+            tasks
+        });
+        let task_attempt = entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let binding = Binding {
+            conversation: id,
+            tool: tool_attempt,
+            task: task_id,
+            task_attempt,
+        };
+        let batch = executor_handoff::prepare_binding(owner.store(), &binding).unwrap();
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .unwrap();
+        assert!(matches!(
+            ConversationLease::acquire(owner.clone(), binding.clone()),
+            Err(executor_handoff::Error::Busy)
+        ));
+        stop_tx.send(()).unwrap();
+        let tasks = worker.join().unwrap();
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(task_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .attempt_id(),
+            None
+        );
+        assert!(matches!(
+            ConversationLease::acquire(owner.clone(), binding.clone()),
+            Err(executor_handoff::Error::Busy)
+        ));
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), conversation.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conversation.harness.blocked(id).unwrap().is_some());
+        assert_eq!(
+            conversation
+                .harness
+                .conversation(id)
+                .unwrap()
+                .active_tool_attempt(),
+            None
+        );
+        assert!(matches!(
+            ConversationLease::acquire(owner.clone(), binding),
+            Err(executor_handoff::Error::Stale)
+        ));
+        drop(tasks);
+        drop(owner);
+        conversation.shutdown().await.unwrap();
+    }
     #[async_trait::async_trait]
     impl Tool for BarrierTool {
         fn spec(&self) -> ToolSpec {
