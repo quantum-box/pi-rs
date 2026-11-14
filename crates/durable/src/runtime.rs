@@ -310,6 +310,13 @@ enum TranscriptChange {
         origin: Uuid,
         stable_prefix: usize,
     },
+    AppendV4 {
+        messages: Vec<Message>,
+        ids: Vec<Uuid>,
+        commit: u64,
+        origin: Uuid,
+        stable_prefix: usize,
+    },
     ReplaceV2 {
         messages: Vec<Message>,
         ids: Vec<Uuid>,
@@ -332,6 +339,13 @@ impl TranscriptChange {
                 origin,
             } => (messages, false, Some((ids, commit, origin))),
             Self::AppendV3 {
+                messages,
+                ids,
+                commit,
+                origin,
+                ..
+            } => (messages, false, Some((ids, commit, origin))),
+            Self::AppendV4 {
                 messages,
                 ids,
                 commit,
@@ -1319,6 +1333,24 @@ impl Harness {
                         ))), (Ok(a), Ok(b)) if a == b)
             })
             .map(|previous| previous.messages.len());
+        // A tool-free append may atomically change only model configuration.
+        // Upstream forks use the final state of the entry's commit. Excluding
+        // tool-bearing batches avoids copying effects from beyond the cut.
+        let config_prefix = old.filter(|previous| {
+            !create && state.messages.starts_with(&previous.messages)
+                && state.messages[previous.messages.len()..].iter().all(|message| match message {
+                    Message::Tool { .. } => false,
+                    Message::Assistant { calls, .. } => calls.is_empty(),
+                    _ => true,
+                })
+                && matches!((serde_json::to_value((
+                    &state.queue_modes, &state.extensions, &state.provider_adapter,
+                    &state.allowed_tools, &state.resets, &state.application_writes, &state.tool_states,
+                )), serde_json::to_value((
+                    &previous.queue_modes, &previous.extensions, &previous.provider_adapter,
+                    &previous.allowed_tools, &previous.resets, &previous.application_writes, &previous.tool_states,
+                ))), (Ok(a), Ok(b)) if a == b)
+        }).map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
         // state cannot be reconstructed. Keep the migration batch unannotated.
         let change = change.map(|change| {
@@ -1333,6 +1365,15 @@ impl Harness {
                         commit,
                         origin: state.id,
                         stable_prefix: stable_prefix.unwrap(),
+                    }
+                }
+                TranscriptChange::Append(messages) if config_prefix.is_some() => {
+                    TranscriptChange::AppendV4 {
+                        ids: messages.iter().map(|_| Uuid::new_v4()).collect(),
+                        messages,
+                        commit,
+                        origin: state.id,
+                        stable_prefix: config_prefix.unwrap(),
                     }
                 }
                 TranscriptChange::Append(messages) => TranscriptChange::AppendV2 {
@@ -1879,8 +1920,8 @@ impl Harness {
         Ok(state.id)
     }
     /// Fork at the commit that first exposed this complete message batch.
-    /// Interior positions require metadata proving unchanged fork state across
-    /// the append; incomplete tool transcripts and legacy metadata are rejected.
+    /// Interior positions require proof of unchanged fork state or a tool-free
+    /// append changing only config; incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
         self.load(id)?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
@@ -1891,7 +1932,8 @@ impl Harness {
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
         let stable_prefix = match &change {
-            TranscriptChange::AppendV3 { stable_prefix, .. } => Some(*stable_prefix),
+            TranscriptChange::AppendV3 { stable_prefix, .. }
+            | TranscriptChange::AppendV4 { stable_prefix, .. } => Some(*stable_prefix),
             _ => None,
         };
         let (messages, _, metadata) = change.parts()?;
@@ -1971,7 +2013,7 @@ impl Harness {
         Err(crate::fork::Error::InvalidSnapshot.into())
     }
     /// Fork at the exact committed boundary of a message occurrence.
-    /// Interior messages require a proven stable-state append; legacy entries and
+    /// Interior messages require a proven safe append; legacy entries and
     /// entries originating in another conversation are rejected. Retained
     /// observations are scanned in bounded pages, including across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {

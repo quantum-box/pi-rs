@@ -1824,3 +1824,121 @@ fn current_fork_retries_when_parent_changes_before_document_snapshot() {
     };
     assert_eq!(h.document(&copied).unwrap().unwrap().value["n"], 2);
 }
+
+#[test]
+fn interior_fork_captures_same_commit_config_and_is_independent_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "before".into(),
+            system_prompt: "before".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.config = Config {
+        model: "at-entry".into(),
+        system_prompt: "historical".into(),
+        max_output_tokens: 42,
+    };
+    state.messages.extend([
+        Message::User {
+            content: "included".into(),
+        },
+        Message::User {
+            content: "excluded".into(),
+        },
+    ]);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let entry = entries[1].history.as_ref().unwrap().id;
+    let position = entries[1].position.clone();
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "later".into();
+    h.save(&state, Expected::Version(version)).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let child = h.fork_by_entry_id(id, entry).unwrap();
+    let by_position = h.fork_at_position(id, position).unwrap();
+    for fork in [child, by_position] {
+        let result = h.conversation(fork).unwrap();
+        assert_eq!(result.config.model, "at-entry");
+        assert_eq!(result.config.system_prompt, "historical");
+        assert_eq!(result.config.max_output_tokens, 42);
+        assert_eq!(
+            result.messages,
+            vec![Message::User {
+                content: "included".into()
+            }]
+        );
+    }
+    let (mut state, version) = h.load(child).unwrap();
+    state.config.model = "child".into();
+    state.messages.push(Message::User {
+        content: "child-only".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().config.model, "later");
+    assert_eq!(h.conversation(id).unwrap().messages.len(), 2);
+    assert_eq!(h.conversation(child).unwrap().config.model, "child");
+    assert_eq!(h.conversation(child).unwrap().messages.len(), 2);
+    assert_eq!(
+        h.conversation(by_position).unwrap().config.model,
+        "at-entry"
+    );
+    assert_eq!(h.conversation(by_position).unwrap().messages.len(), 1);
+}
+
+#[test]
+fn config_change_does_not_authorize_interior_tool_batch_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "before".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "after".into();
+    state.messages.extend([
+        Message::User {
+            content: "before tool".into(),
+        },
+        Message::Assistant {
+            content: "".into(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "call".into(),
+            content: "result".into(),
+        },
+    ]);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    assert!(
+        h.fork_by_entry_id(id, entries[2].history.as_ref().unwrap().id)
+            .is_err()
+    );
+    assert!(h.fork_at_position(id, entries[1].position.clone()).is_err());
+    assert!(
+        h.fork_by_entry_id(id, entries[0].history.as_ref().unwrap().id)
+            .is_ok()
+    );
+}

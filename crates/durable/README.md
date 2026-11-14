@@ -50,8 +50,12 @@ originating atomic observation commit through positioned views. New append batch
 also record when fork-relevant state was unchanged across the commit. For such a
 batch, `fork_at_position` and `fork_by_entry_id` can fork an interior message
 using the captured state and its exact message prefix, provided the prefix has a
-complete tool-call/result context. Changes to fork state in the same commit,
-legacy batches without this proof, and interior replacement batches fail closed.
+complete tool-call/result context. A newly recorded tool-free append may also change only model configuration in
+the same commit; an interior fork uses that commit’s final configuration. Other
+fork-state changes, configuration-changing batches containing any tool call or
+result, legacy batches without the required proof, and interior replacement
+batches fail closed. The document revision must also be unchanged across the
+commit, even if an unrelated scope caused the change.
 Replacement batches assign fresh occurrence IDs, and an interior fork currently
 materializes a new transcript with fresh IDs. Inherited foreign occurrences are
 not selectable in the child. See the parity document for remaining limitations.
