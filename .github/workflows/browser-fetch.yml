@@ -19,8 +19,6 @@ jobs:
   browser-fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/pi-fetch-target
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -30,6 +28,8 @@ jobs:
           node-version: '22'
       - id: chrome
         uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4 # v2
+      - name: Set target directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/pi-fetch-target" >> "$GITHUB_ENV"
       - name: Install Rust and target
         run: |
           rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
