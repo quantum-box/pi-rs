@@ -321,7 +321,7 @@ impl Entries {
 // V8's Date comparator treats a comparison involving an invalid date as
 // equal. That relation is not transitive, so passing it to Rust's general
 // stable sort is invalid. Reproduce V8's natural-run and binary-insertion
-// sequence for short arrays, and use bounded stable merges for longer ones.
+// sequence, run-stack and galloping merges used by Node 22 and 24.
 fn sort_tree_children(children: &mut [Value]) {
     let mut entries: Vec<_> = children
         .iter()
@@ -344,88 +344,9 @@ fn sort_tree_children(children: &mut [Value]) {
     }
 }
 
-fn tree_less(left: Option<i64>, right: Option<i64>) -> bool {
-    matches!((left, right), (Some(left), Some(right)) if left < right)
-}
-
-fn sort_tree_mixed(entries: &mut [(Option<i64>, usize)]) {
-    let len = entries.len();
-    if len < 2 {
-        return;
-    }
-    let mut min_run = len;
-    let mut remainder = 0;
-    while min_run >= 64 {
-        remainder |= min_run & 1;
-        min_run >>= 1;
-    }
-    min_run += remainder;
-    let mut runs = Vec::new();
-    let mut start = 0;
-    while start < len {
-        let mut end = start + 1;
-        if end < len {
-            let descending = tree_less(entries[end].0, entries[start].0);
-            end += 1;
-            while end < len
-                && if descending {
-                    tree_less(entries[end].0, entries[end - 1].0)
-                } else {
-                    !tree_less(entries[end].0, entries[end - 1].0)
-                }
-            {
-                end += 1;
-            }
-            if descending {
-                entries[start..end].reverse();
-            }
-        }
-        let target = start.saturating_add(min_run).min(len);
-        while end < target {
-            let item = entries[end];
-            let (mut low, mut high) = (start, end);
-            while low < high {
-                let middle = low + (high - low) / 2;
-                if tree_less(item.0, entries[middle].0) {
-                    high = middle;
-                } else {
-                    low = middle + 1;
-                }
-            }
-            entries[low..=end].rotate_right(1);
-            end += 1;
-        }
-        runs.push(start..end);
-        start = end;
-    }
-    let mut scratch = Vec::with_capacity(len);
-    while runs.len() > 1 {
-        let mut next = Vec::with_capacity(runs.len().div_ceil(2));
-        for pair in runs.chunks(2) {
-            if pair.len() == 1 {
-                next.push(pair[0].clone());
-                continue;
-            }
-            let (left, right) = (&pair[0], &pair[1]);
-            scratch.clear();
-            let (mut i, mut j) = (left.start, right.start);
-            while i < left.end && j < right.end {
-                if tree_less(entries[j].0, entries[i].0) {
-                    scratch.push(entries[j]);
-                    j += 1;
-                } else {
-                    scratch.push(entries[i]);
-                    i += 1;
-                }
-            }
-            scratch.extend_from_slice(&entries[i..left.end]);
-            scratch.extend_from_slice(&entries[j..right.end]);
-            entries[left.start..right.end].copy_from_slice(&scratch);
-            next.push(left.start..right.end);
-        }
-        runs = next;
-    }
-}
+#[path = "rpc_tree_sort.rs"]
+mod rpc_tree_sort;
+use rpc_tree_sort::sort_tree_mixed;
 
 // JavaScript Date treats valid ISO date-only forms as UTC midnight, whereas
 // chrono's RFC 3339 parser requires a time and offset.
