@@ -97,6 +97,9 @@ async fn acquire_worker(
     deadline: Option<Duration>,
     wait_limit: Duration,
 ) -> Result<WorkerPermit, &'static str> {
+    if cancellation.is_cancelled() {
+        return Err("Script cancelled while waiting for a worker");
+    }
     workers.resize();
     let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
     let acquire = async {
@@ -1411,6 +1414,40 @@ mod tests {
         let third = third.await.unwrap();
         drop((second, third));
         assert_eq!(workers.semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_does_not_resize_or_wake_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(2);
+        let held = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        let waiting = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        limit.store(2, Ordering::SeqCst);
+        let already_cancelled = pi_rs_core::CancellationToken::new();
+        already_cancelled.cancel();
+        assert!(
+            acquire_worker(&workers, &already_cancelled, None, wait)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(*workers.capacity.lock().unwrap(), 1);
+        drop(held);
+        drop(waiting.await.unwrap());
     }
 
     #[test]
