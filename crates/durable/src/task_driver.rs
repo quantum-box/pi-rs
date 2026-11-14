@@ -23,6 +23,8 @@ pub enum Error {
     Poisoned,
     #[error("task driver stopped: {0}")]
     Stopped(String),
+    #[error("conversation runtime: {0}")]
+    Runtime(#[from] crate::runtime::Error),
 }
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
@@ -31,6 +33,8 @@ pub(crate) struct Shared {
     definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
     state: Mutex<State>,
     wake: Condvar,
+    harness: Option<Mutex<crate::runtime::Harness>>,
+    cleanup_stop: pi_rs_core::CancellationToken,
 }
 #[derive(Default)]
 struct State {
@@ -42,9 +46,22 @@ struct State {
 pub struct Driver {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    cleanup: Option<JoinHandle<()>>,
 }
 impl Driver {
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
+        Self::start_inner(scheduler, None)
+    }
+    pub(crate) fn start_with_harness(
+        scheduler: task_scheduler::Scheduler,
+        harness: crate::runtime::Harness,
+    ) -> Self {
+        Self::start_inner(scheduler, Some(harness))
+    }
+    fn start_inner(
+        scheduler: task_scheduler::Scheduler,
+        harness: Option<crate::runtime::Harness>,
+    ) -> Self {
         let owner = scheduler.owner();
         let policies = scheduler.policies();
         let definitions = scheduler.definitions();
@@ -55,6 +72,8 @@ impl Driver {
             definitions,
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
+            harness: harness.map(Mutex::new),
+            cleanup_stop: pi_rs_core::CancellationToken::new(),
         });
         let task_shared = shared.clone();
         let worker = thread::spawn(move || {
@@ -94,9 +113,14 @@ impl Driver {
                     .wait_timeout(state, Duration::from_millis(100));
             }
         });
+        let cleanup = shared.harness.as_ref().map(|_| {
+            let shared = shared.clone();
+            thread::spawn(move || cleanup_loop(shared))
+        });
         Self {
             shared,
             worker: Some(worker),
+            cleanup,
         }
     }
     pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
@@ -158,13 +182,25 @@ impl Driver {
     /// output is discarded when it returns; cleanup then runs on the worker.
     pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
         let _state = self.check()?;
-        let _gate = self
-            .shared
-            .owner
-            .task_gate()
-            .lock()
-            .map_err(|_| Error::Poisoned)?;
-        task_scheduler::request_abort_subtree(&TaskStore::new(self.shared.owner.store()), id)?;
+        if let Some(harness) = &self.shared.harness {
+            let mut harness = harness.lock().map_err(|_| Error::Poisoned)?;
+            self.shared
+                .owner
+                .conversation_controls()
+                .fence(|| harness.abort_owned_graph(None, Some(id)))
+                .map_err(|e| match e {
+                    durable_store::controls::FenceError::Poisoned => Error::Poisoned,
+                    durable_store::controls::FenceError::Commit(e) => Error::Runtime(e),
+                })?;
+        } else {
+            let _gate = self
+                .shared
+                .owner
+                .task_gate()
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            task_scheduler::request_abort_subtree(&TaskStore::new(self.shared.owner.store()), id)?;
+        }
         self.shared.wake.notify_one();
         Ok(())
     }
@@ -190,6 +226,11 @@ impl Driver {
                 .join()
                 .map_err(|_| Error::Stopped("worker panicked".into()))?;
         }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup
+                .join()
+                .map_err(|_| Error::Stopped("cleanup worker panicked".into()))?;
+        }
         let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
         if let Some(error) = &state.failure {
             return Err(Error::Stopped(error.clone()));
@@ -197,6 +238,7 @@ impl Driver {
         Ok(())
     }
     fn stop(&self) {
+        self.shared.cleanup_stop.cancel();
         if let Ok(mut state) = self.shared.state.lock() {
             state.stop = true;
             self.shared.wake.notify_all();
@@ -207,6 +249,113 @@ impl Drop for Driver {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// Discover persisted marks on every pass, so shutdown/reopen needs no volatile queue.
+fn cleanup_loop(shared: Arc<Shared>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            fail_cleanup(&shared, error.to_string());
+            return;
+        }
+    };
+    runtime.block_on(async {
+        let mut active: tokio::task::JoinSet<(Uuid, Result<(), crate::runtime::Error>)> =
+            tokio::task::JoinSet::new();
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            if shared.cleanup_stop.is_cancelled() {
+                break;
+            }
+            while let Some(result) = active.try_join_next() {
+                match result {
+                    Ok((id, Ok(()))) => {
+                        ids.remove(&id);
+                    }
+                    Ok((_, Err(error))) => {
+                        fail_cleanup(&shared, error.to_string());
+                        return;
+                    }
+                    Err(error) => {
+                        fail_cleanup(&shared, error.to_string());
+                        return;
+                    }
+                }
+            }
+            let discovered = (|| -> Result<Vec<Uuid>, String> {
+                let store = shared.owner.store();
+                let tasks = TaskStore::new(store).list().map_err(|e| e.to_string())?;
+                let edges = crate::ownership_edge::EdgeStore::new(store);
+                let mut found = Vec::new();
+                for task in tasks
+                    .iter()
+                    .filter(|t| t.task.abort_requested() || t.task.is_terminal())
+                {
+                    for edge in edges.children(task.task.id()).map_err(|e| e.to_string())? {
+                        if edge.edge.task_owner != *task.task.owner() {
+                            return Err("ownership edge owner mismatch".into());
+                        }
+                        if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                            continue;
+                        }
+                        let h = shared
+                            .harness
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .map_err(|e| e.to_string())?;
+                        if h.conversation(edge.edge.child)
+                            .map_err(|e| e.to_string())?
+                            .abort_requested
+                        {
+                            found.push(edge.edge.child);
+                        }
+                    }
+                }
+                Ok(found)
+            })();
+            match discovered {
+                Ok(found) => {
+                    for id in found {
+                        if ids.insert(id) {
+                            let mut worker = shared
+                                .harness
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .worker();
+                            let stop = shared.cleanup_stop.clone();
+                            active.spawn(async move {
+                                (id, worker.drive_owned_cleanup(id, &stop).await)
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    fail_cleanup(&shared, error);
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = shared.cleanup_stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => (),
+            }
+        }
+        while active.join_next().await.is_some() {}
+    });
+}
+fn fail_cleanup(shared: &Shared, error: String) {
+    if let Ok(mut state) = shared.state.lock() {
+        state.failure = Some(error);
+        state.stop = true;
+        shared.wake.notify_all();
+    }
+    shared.cleanup_stop.cancel();
 }
 
 impl Shared {

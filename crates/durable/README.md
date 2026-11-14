@@ -27,8 +27,12 @@ for replay-safe tools; cancellation cannot undo an external effect. Reporter
 workers use the same conversation fence as ordinary scheduled work. The store owner
 shares process-local conversation gates, cancellation epochs, and worker locks
 with attached components. Controls are recreated on reopen; they do not fence
-noncooperating writers or processes. An attached task driver still cannot abort
-foreground owned conversations; this registry is a prerequisite for that work.
+noncooperating writers or processes. A task driver started through the harness
+atomically marks its foreground owned graph, cancels active conversation workers,
+and drives cleanup using the harness registrations. Pending cleanup is discovered
+again when the driver is restarted. Shutdown can interrupt cleanup; blocked effects
+still require reconciliation. A driver started directly from a standalone task
+scheduler has no conversation runtime and continues to reject foreground aborts.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before

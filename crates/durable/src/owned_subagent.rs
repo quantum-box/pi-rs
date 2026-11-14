@@ -379,12 +379,12 @@ mod tests {
     }
 
     #[test]
-    fn standalone_driver_rejection_leaves_graph_unchanged_after_reopen() {
+    fn driver_recovers_persisted_owned_cleanup_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut h = Harness::open_paused(&path, options()).unwrap();
         let (task, owner) = setup(&mut h);
-        let foreground = h
+        let child = h
             .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
             .unwrap()
             .child;
@@ -392,29 +392,22 @@ mod tests {
             .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
             .unwrap()
             .child;
+        h.request_abort_task(task).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
         let driver = h.start_tasks(Default::default()).unwrap();
-        assert!(matches!(
-            driver.request_abort(task),
-            Err(crate::task_driver::Error::Task(
-                crate::task_scheduler::Error::ForegroundAbortUnsupported
-            ))
-        ));
-        assert!(!driver.get(task).unwrap().unwrap().abort_requested());
-        assert!(!h.conversation(foreground).unwrap().abort_requested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.conversation(child).unwrap().abort_requested
+            || !driver.get(task).unwrap().unwrap().is_terminal()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert!(!h.conversation(background).unwrap().abort_requested);
         driver.shutdown().unwrap();
         drop(h);
-
         let h = Harness::open_paused(&path, options()).unwrap();
-        assert!(
-            !TaskStore::new(h.subagent_store().unwrap())
-                .load(task)
-                .unwrap()
-                .unwrap()
-                .task
-                .abort_requested()
-        );
-        assert!(!h.conversation(foreground).unwrap().abort_requested);
+        assert!(!h.conversation(child).unwrap().abort_requested);
         assert!(!h.conversation(background).unwrap().abort_requested);
     }
 
@@ -435,20 +428,13 @@ mod tests {
             barrier.wait();
             let abort = driver.request_abort(task);
             let admitted = admission.join().unwrap();
-            match admitted {
-                Ok(child) => {
-                    assert!(matches!(
-                        abort,
-                        Err(crate::task_driver::Error::Task(
-                            crate::task_scheduler::Error::ForegroundAbortUnsupported
-                        ))
-                    ));
-                    assert!(!h.conversation(child.child).unwrap().abort_requested);
-                    assert!(!driver.get(task).unwrap().unwrap().abort_requested());
-                }
-                Err(_) => {
-                    assert!(abort.is_ok());
-                    assert!(driver.get(task).unwrap().unwrap().abort_requested());
+            assert!(abort.is_ok());
+            assert!(driver.get(task).unwrap().unwrap().abort_requested());
+            if let Ok(child) = admitted {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while h.conversation(child.child).unwrap().abort_requested {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
                 }
             }
             driver.shutdown().unwrap();
@@ -510,13 +496,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_and_wait_joins_active_owned_conversation() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct Pending(Arc<AtomicBool>);
+    async fn driver_abort_joins_active_owned_conversation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Pending(Arc<AtomicUsize>);
         #[async_trait]
         impl Model for Pending {
             async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
-                self.0.store(true, Ordering::SeqCst);
+                self.0.fetch_add(1, Ordering::SeqCst);
                 std::future::pending().await
             }
         }
@@ -529,32 +515,50 @@ mod tests {
             _ => unreachable!(),
         };
         let child = h
-            .ensure_task_owned_subagent(task, owner, "fg", config(), Mode::Foreground)
+            .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let background = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
             .unwrap()
             .child;
         drop(h);
-        let started = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicUsize::new(0));
         let mut opts = options();
         opts.model = Arc::new(Pending(started.clone()));
         let mut scheduler = Scheduler::open(&path, opts).unwrap();
         let driver = scheduler.start_tasks(Default::default()).unwrap();
         scheduler.submit(child, None, "active".into()).unwrap();
+        scheduler
+            .submit(background, None, "active background".into())
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !started.load(Ordering::SeqCst) {
+            while started.load(Ordering::SeqCst) < 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            scheduler.abort_and_wait(parent),
-        )
+        driver.request_abort(task).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                if !scheduler.conversation(child).unwrap().abort_requested
+                    && driver.get(task).unwrap().unwrap().is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .unwrap()
         .unwrap();
         assert!(!scheduler.conversation(child).unwrap().abort_requested);
         assert!(!scheduler.conversation(parent).unwrap().abort_requested);
+        assert!(!scheduler.conversation(background).unwrap().abort_requested);
+        assert!(matches!(
+            scheduler.conversation(background).unwrap().submissions[0].status,
+            crate::runtime::Status::Running
+        ));
         assert!(driver.get(task).unwrap().unwrap().is_terminal());
         driver.shutdown().unwrap();
         scheduler.shutdown().await.unwrap();

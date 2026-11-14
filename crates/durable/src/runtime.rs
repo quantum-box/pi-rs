@@ -787,6 +787,23 @@ impl Harness {
             clock: self.clock.clone(),
         }
     }
+    pub(crate) async fn drive_owned_cleanup(
+        &mut self,
+        id: Uuid,
+        stop: &CancellationToken,
+    ) -> Result<(), Error> {
+        let lock = self.owner.conversation_controls().get(id).worker;
+        let _guard = tokio::select! {
+            guard = lock.lock() => guard,
+            _ = stop.cancelled() => return Ok(()),
+        };
+        let control = self.owner.conversation_controls().get(id);
+        self.execution_gate = Some(control.gate);
+        tokio::select! {
+            result = drive_scheduled(self, id, &control.cancel) => result,
+            _ = stop.cancelled() => Ok(()),
+        }
+    }
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
@@ -1907,7 +1924,10 @@ impl Harness {
         &self,
         registry: crate::task_scheduler::Registry,
     ) -> Result<crate::task_driver::Driver, Error> {
-        let driver = crate::task_driver::Driver::start(self.attach_tasks(registry)?);
+        let driver = crate::task_driver::Driver::start_with_harness(
+            self.attach_tasks(registry)?,
+            self.worker(),
+        );
         *self.task_driver.lock().map_err(|_| Error::Failed)? = Some(driver.weak());
         Ok(driver)
     }
@@ -2354,7 +2374,7 @@ impl Harness {
         self.abort_owned_graph(None, Some(id)).map(|_| ())
     }
 
-    fn abort_owned_graph(
+    pub(crate) fn abort_owned_graph(
         &mut self,
         conversation: Option<Uuid>,
         task: Option<Uuid>,
@@ -4968,7 +4988,7 @@ impl Scheduler {
 }
 
 /// Drive a conversation under its scheduler lock and cancellation fence.
-async fn drive_scheduled(
+pub(crate) async fn drive_scheduled(
     worker: &mut Harness,
     id: Uuid,
     cancel: &CancellationToken,
