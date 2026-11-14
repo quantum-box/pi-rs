@@ -2266,25 +2266,7 @@ impl Scheduler {
         let cancel = self.cancel.clone();
         let task = tokio::spawn(async move {
             let _lock = lock.lock().await;
-            worker.recover_conversation(id)?;
-            loop {
-                worker.drive(id, &cancel).await?;
-                let state = worker.conversation(id)?;
-                let should_poll = match &state.phase {
-                    Phase::Pending { calls, index, .. } => calls
-                        .get(*index)
-                        .and_then(|call| worker.tools.get(&call.name))
-                        .is_some_and(|tool| tool.tool.can_poll()),
-                    _ => false,
-                };
-                if !should_poll {
-                    return Ok(());
-                }
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(Error::Interrupted),
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => (),
-                }
-            }
+            drive_scheduled(&mut worker, id, &cancel).await
         });
         self.tasks.entry(id).or_default().push(task);
     }
@@ -2345,16 +2327,14 @@ impl Scheduler {
                                     let lock = conversation_lock(&locks, child);
                                     {
                                         let _guard = lock.lock().await;
-                                        worker.recover_conversation(child)?;
-                                        worker.drive(child, &cancel).await?;
+                                        drive_scheduled(&mut worker, child, &cancel).await?;
                                     }
                                     if let Some(parent) =
                                         worker.deliver_report(&task_key, &reporter)?
                                     {
                                         let lock = conversation_lock(&locks, parent);
                                         let _guard = lock.lock().await;
-                                        worker.recover_conversation(parent)?;
-                                        worker.drive(parent, &cancel).await?;
+                                        drive_scheduled(&mut worker, parent, &cancel).await?;
                                     }
                                     Ok(())
                                 }),
@@ -2412,6 +2392,34 @@ impl Scheduler {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+}
+
+/// Shared scheduling path for ordinary submissions and subagent reporters.
+/// The caller must hold this conversation's scheduler lock.
+async fn drive_scheduled(
+    worker: &mut Harness,
+    id: Uuid,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    worker.recover_conversation(id)?;
+    loop {
+        worker.drive(id, cancel).await?;
+        let state = worker.conversation(id)?;
+        let should_poll = match &state.phase {
+            Phase::Pending { calls, index, .. } => calls
+                .get(*index)
+                .and_then(|call| worker.tools.get(&call.name))
+                .is_some_and(|tool| tool.tool.can_poll()),
+            _ => false,
+        };
+        if !should_poll {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(Error::Interrupted),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => (),
+        }
     }
 }
 
