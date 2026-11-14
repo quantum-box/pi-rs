@@ -169,7 +169,9 @@ leaves the summary available for retry instead of silently closing the run.
 SDK `resume()` also finds a recoverable summary on the latest branch run after
 reopening, and resumes that run instead of starting an unrelated one. It also
 recognizes interrupted compaction markers before a summary is complete, and
-restores the branch model before checking the interrupted request's identity.
+recognizes a durable overflow or length stop before its marker is written. It
+restores the branch model before checking the interrupted request's identity;
+queued trigger turns do not overtake an unresolved compaction recovery.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

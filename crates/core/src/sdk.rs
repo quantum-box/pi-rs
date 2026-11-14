@@ -1774,7 +1774,7 @@ impl AgentSession {
             None => None,
         };
         let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())))
+            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())), true)
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
@@ -2137,7 +2137,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None).await?;
+        let (_, error) = self.start_with_fallback(None, true).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2147,6 +2147,7 @@ impl AgentSession {
     async fn start_with_fallback(
         &mut self,
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+        drain_triggers: bool,
     ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
@@ -2225,7 +2226,8 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
@@ -2603,8 +2605,15 @@ impl AgentSession {
     }
 
     pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, &mut |_| {})
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
     }
     /// Submit text and images as one durable user message.
     pub async fn prompt_with_images(
@@ -2617,6 +2626,7 @@ impl AgentSession {
             Some(images),
             Uuid::new_v4(),
             true,
+            false,
             &mut |_| {},
         )
         .await
@@ -2626,11 +2636,21 @@ impl AgentSession {
         input: impl Into<String>,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, observer)
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            observer,
+        )
+        .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        self.start().await?;
+        let (_, startup_error) = self.start_with_fallback(None, false).await?;
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
         let recovery = {
             let journal = self.journal_async().await;
             crate::agent::resumable_compaction_run(&journal)
@@ -2655,8 +2675,18 @@ impl AgentSession {
             ));
         }
         let run_id = recovery.map(|(run_id, _, _)| run_id);
-        self.run(None, run_id.unwrap_or_else(Uuid::new_v4), &mut |_| {})
-            .await
+        if run_id.is_none() {
+            self.drain_idle_triggers().await?;
+        }
+        self.run_input(
+            None,
+            None,
+            run_id.unwrap_or_else(Uuid::new_v4),
+            false,
+            true,
+            &mut |_| {},
+        )
+        .await
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -2665,7 +2695,8 @@ impl AgentSession {
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(input, None, run_id, false, observer).await
+        self.run_input(input, None, run_id, false, false, observer)
+            .await
     }
     async fn run_input(
         &mut self,
@@ -2673,9 +2704,12 @@ impl AgentSession {
         mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         prepare: bool,
+        already_started: bool,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.start().await?;
+        if !already_started {
+            self.start().await?;
+        }
         let journal_owner = self
             .control
             .owner
@@ -9393,6 +9427,23 @@ mod tests {
                         })
                         .unwrap();
                 }
+                let trigger = Uuid::new_v4();
+                if started && !silent {
+                    journal
+                        .append(Event::CustomMessageQueued {
+                            input: crate::QueuedCustomMessage {
+                                id: trigger,
+                                delivery: crate::CustomMessageDelivery::TriggerTurn,
+                                message: crate::CustomMessage {
+                                    custom_type: "queued".into(),
+                                    content: crate::ContextContent::Text("later".into()),
+                                    display: false,
+                                    details: None,
+                                },
+                            },
+                        })
+                        .unwrap();
+                }
                 drop(journal);
                 let model = Arc::new(EchoModel(AtomicUsize::new(0)));
                 let mut session = SessionBuilder::new(model.clone(), "fixture")
@@ -9420,12 +9471,132 @@ mod tests {
                             .contains("requires reconciliation")
                     );
                     assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        session.journal().unwrap().pending_custom_trigger(),
+                        Some(trigger)
+                    );
                 } else {
                     assert_eq!(result.unwrap(), "answer 2");
                     assert_eq!(model.0.load(Ordering::SeqCst), 2);
                 }
                 session.close().await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_recovers_overflow_before_marker_without_resending_turn() {
+        use crate::journal::{Event, ModelFailure, RecordedReply, RunState};
+        for length in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("before-marker.jsonl");
+            let run_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some(
+                            if length {
+                                "length"
+                            } else {
+                                "pi-rs:context-overflow"
+                            }
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                    usage: if length {
+                        crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 20,
+                                output_tokens: 2,
+                            },
+                        }
+                    } else {
+                        crate::UsageReport::Unconfirmed
+                    },
+                    failure: (!length).then_some(ModelFailure::Failed),
+                    partial: String::new(),
+                    reply: length.then(|| RecordedReply {
+                        content: "partial".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: 16,
+                    }),
+                })
+                .unwrap();
+            drop(journal);
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: 3,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .open(&path)
+                .unwrap();
+            assert_eq!(session.resume().await.unwrap(), "answer 2");
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                2,
+                "only summary and retry may call the model"
+            );
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
         }
     }
 

@@ -455,7 +455,10 @@ impl Agent<'_> {
             succeeded: result.is_ok(),
             error: error.as_deref(),
         });
-        while !cancel.is_cancelled() && ensure_settled(session.operations()).is_ok() {
+        while !cancel.is_cancelled()
+            && ensure_settled(session.operations()).is_ok()
+            && !(result.is_err() && resumable_compaction_run(session).is_some())
+        {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
@@ -4491,7 +4494,26 @@ pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Optio
     let marker = branch.iter().rposition(|record| {
         record.run_id == Some(run_id) && matches!(&record.event,
             Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow")
-    })?;
+    });
+    let Some(marker) = marker else {
+        let request_id = overflow_recovery_state(session, run_id)
+            .filter(|state| !state.compacted)
+            .map(|state| state.request_id)
+            .or_else(|| {
+                pending_reply(session, run_id).and_then(|(id, metadata, _, _)| {
+                    (metadata.finish_reason.as_deref() == Some("length")).then_some(id)
+                })
+            })?;
+        let model = branch.iter().rev().find_map(|record| match &record.event {
+            Event::ModelRequested {
+                request_id: Some(id),
+                model,
+                ..
+            } if *id == request_id => Some(model.clone()),
+            _ => None,
+        });
+        return Some((run_id, model, false));
+    };
     let following = &branch[marker + 1..];
     if following.iter().any(|record| {
         matches!(
