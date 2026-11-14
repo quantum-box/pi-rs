@@ -859,9 +859,10 @@ impl StreamUsage {
 #[async_trait::async_trait]
 impl Model for Anthropic {
     fn context_identity(&self) -> Option<String> {
-        // Unconfigured thinking can consult a changing remote model catalog.
+        // Thinking and discovered output limits can depend on a changing catalog.
         if !self.http_proxies.is_empty()
-            || (self.thinking_level.is_some() && self.configured_thinking.is_none())
+            || (self.thinking_level.is_some()
+                && (self.configured_thinking.is_none() || self.probe_context))
         {
             return None;
         }
@@ -1257,6 +1258,14 @@ mod tests {
                 .clone()
                 .with_configured_thinking("high", true, true)
                 .context_identity()
+        );
+        let configured = first.clone().with_configured_thinking("high", true, true);
+        assert!(configured.context_identity().is_none());
+        assert!(
+            configured
+                .with_context_probe(false)
+                .context_identity()
+                .is_some()
         );
         assert!(
             first
