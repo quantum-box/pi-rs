@@ -7386,6 +7386,33 @@ fn complete_input(args: &Cli, view: &mut View) {
         [candidate] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|text| {
+                    let prompt = text
+                        .strip_prefix('/')
+                        .and_then(|name| view.resources.prompts.get(name));
+                    let label = prompt.map_or_else(
+                        || text.clone(),
+                        |prompt| {
+                            let description =
+                                match (&prompt.argument_hint, prompt.description.is_empty()) {
+                                    (Some(hint), false) => {
+                                        format!("{hint} — {}", prompt.description)
+                                    }
+                                    (Some(hint), true) => hint.clone(),
+                                    (None, _) => prompt.description.clone(),
+                                };
+                            if description.is_empty() {
+                                text.clone()
+                            } else {
+                                format!("{text}  {description}")
+                            }
+                        },
+                    );
+                    (text, label)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
@@ -8338,6 +8365,50 @@ mod tests {
         assert_eq!(args.model, "initial");
         assert_eq!(args.thinking.as_deref(), Some("high"));
     }
+    #[test]
+    fn prompt_completion_displays_argument_hint_without_inserting_it() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("audit.md"),
+            "---\ndescription: Inspect changes\nargument-hint: '<path>'\n---\nReview $1",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("author.md"), "Write text").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/au".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().expect("multiple matching commands");
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("/audit  <path> — Inspect changes"),
+            "{rendered}"
+        );
+        let input = picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, .. }) if text == "/audit")
+        );
+    }
+
     #[test]
     fn patched_results_render_status_and_details_from_record_events() {
         use super::*;

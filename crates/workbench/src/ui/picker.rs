@@ -208,14 +208,14 @@ impl Picker {
         }
     }
     pub fn completion(
-        candidates: Vec<String>,
+        candidates: Vec<(String, String)>,
         range: std::ops::Range<usize>,
         limit: usize,
     ) -> Self {
         let items = candidates
             .into_iter()
-            .map(|text| Item {
-                label: text.clone(),
+            .map(|(text, label)| Item {
+                label,
                 selection: Selection::Completion {
                     range: range.clone(),
                     text,
@@ -609,7 +609,10 @@ impl Picker {
                 {
                     return session_query.score(document).is_some();
                 }
-                let label = item.label.to_lowercase();
+                let label = match &item.selection {
+                    Selection::Completion { text, .. } => text.to_lowercase(),
+                    _ => item.label.to_lowercase(),
+                };
                 if self.title == "Settings" {
                     crate::model_selection::fuzzy(
                         &query,
@@ -636,7 +639,10 @@ impl Picker {
                 {
                     return (session_query.score(document).unwrap_or(i64::MAX), 0);
                 }
-                let label = item.label.to_lowercase();
+                let label = match &item.selection {
+                    Selection::Completion { text, .. } => text.to_lowercase(),
+                    _ => item.label.to_lowercase(),
+                };
                 (
                     label
                         .find(&query)
@@ -1794,6 +1800,23 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_search_matches_inserted_text_not_description() {
+        let mut picker = Picker::completion(
+            vec![
+                ("/audit".into(), "/audit  <path> — Inspect changes".into()),
+                ("/author".into(), "/author".into()),
+            ],
+            0..3,
+            10,
+        );
+        picker.paste("changes");
+        assert!(picker.matches().is_empty());
+        picker.query.clear();
+        picker.paste("audit");
+        assert_eq!(picker.matches().len(), 1);
+    }
 
     #[test]
     fn search_deletes_words_at_unicode_and_punctuation_boundaries() {
