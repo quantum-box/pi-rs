@@ -2195,6 +2195,16 @@ impl Harness {
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
     ) -> Result<Uuid, Error> {
+        self.fork_at_selected(id, cursor, prefix, None)
+    }
+
+    fn fork_at_selected(
+        &mut self,
+        id: Uuid,
+        cursor: crate::observer::Cursor,
+        prefix: Option<(usize, usize)>,
+        application_cut: Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
+    ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
             return Err(crate::fork::Error::InvalidCursor.into());
@@ -2205,11 +2215,14 @@ impl Harness {
             .store()
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
-        let revision = self
-            .owner
-            .store()
-            .document_cut(key.as_bytes())?
-            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let revision = match &application_cut {
+            Some((revision, _)) => *revision,
+            None => self
+                .owner
+                .store()
+                .document_cut(key.as_bytes())?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        };
         if prefix.is_some() {
             let previous = cursor
                 .0
@@ -2320,12 +2333,87 @@ impl Harness {
             phase: Phase::Idle,
         };
         retry_document_fork(|| {
-            let batch = crate::document::Documents::new(self.owner.store())
+            let mut batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
+            if let Some((_, entries)) = &application_cut {
+                let target = crate::application_entry::key(state.id);
+                let mutation = batch
+                    .mutations
+                    .iter_mut()
+                    .find(|mutation| {
+                        matches!(mutation,
+                    durable_store::Mutation::Put { key, .. } if *key == target)
+                    })
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if let durable_store::Mutation::Put { value, .. } = mutation {
+                    *value = serde_json::to_vec(entries)?;
+                }
+            }
             self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
         })?;
         Ok(state.id)
     }
+    /// Fork at a local committed task application entry. The search examines at
+    /// most 256 application-log versions and rejects inherited or ambiguous IDs.
+    /// Documents use the entry commit's final revision; later entries in that
+    /// commit are excluded. Runtime writes in the same commit are rejected.
+    pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.load(id)?;
+        if entry_id.is_nil() || self.owner.store().legacy_version_boundary()? != 0 {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let key = crate::application_entry::key(id);
+        let versions = self.owner.store().application_history(&key, 257)?;
+        let mut previous: Vec<crate::application_entry::ApplicationEntry> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (revision, sequence, snapshot) in versions.into_iter().take(256) {
+            let sequence = sequence.ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let entries: Vec<crate::application_entry::ApplicationEntry> =
+                serde_json::from_slice(&snapshot.value)?;
+            if !entries.starts_with(&previous) || entries.len() <= previous.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            for entry in &entries[previous.len()..] {
+                if entry.id.is_nil() || entry.conversation_id != id || !seen.insert(entry.id) {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+            }
+            if let Some(index) = entries[previous.len()..]
+                .iter()
+                .position(|entry| entry.id == entry_id)
+            {
+                let index = previous.len() + index;
+                let runtime_key = format!("runtime/conversation/{id}");
+                let prefix = format!("runtime/fork/{id}/");
+                let (runtime_sequence, snapshot_key) = self
+                    .owner
+                    .store()
+                    .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), sequence)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                // Without per-entry ordering, a runtime write in the same commit
+                // cannot be placed before or after this application entry.
+                if runtime_sequence >= sequence {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let suffix = snapshot_key
+                    .strip_prefix(prefix.as_bytes())
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let cursor = std::str::from_utf8(suffix)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                return self.fork_at_selected(
+                    id,
+                    crate::observer::Cursor(cursor),
+                    None,
+                    Some((revision, entries[..=index].to_vec())),
+                );
+            }
+            previous = entries;
+        }
+        Err(crate::fork::Error::InvalidCursor.into())
+    }
+
     /// Fork at the commit that first exposed this complete message batch.
     /// Interior positions require proof of unchanged fork state or a tool-free
     /// append changing only config; incomplete tool transcripts are rejected.
@@ -6347,6 +6435,9 @@ impl Scheduler {
     }
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
         self.harness.fork_at_position(id, position)
+    }
+    pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.harness.fork_at_application_entry(id, entry_id)
     }
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork_by_entry_id(id, entry_id)

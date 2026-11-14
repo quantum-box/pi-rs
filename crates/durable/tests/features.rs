@@ -1896,3 +1896,203 @@ async fn current_policy_uses_latest_value_and_policy_at_historical_fork_after_re
         );
     }
 }
+
+#[tokio::test]
+async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
+    use durable_store::{Expected, Store};
+    use pi_rs_durable::{
+        application_entry,
+        document::{Address, Documents, TaskDocuments, Transaction},
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct WritePair(Address);
+    impl Handler for WritePair {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&self.0).unwrap();
+            docs.append_entry("app.first", json!(1)).unwrap();
+            docs.put(&self.0, json!({"n": 7}).as_object().unwrap().clone())
+                .unwrap();
+            docs.append_entry("app.second", json!(2)).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(parent, None, "before task".into(), &cancel)
+        .await
+        .unwrap();
+    let expected_messages = h.conversation(parent).unwrap().messages;
+    let address = Address {
+        scope: parent.to_string(),
+        name: "note".into(),
+        key: "".into(),
+    };
+    let mut registry = Registry::default();
+    registry.register("pair", true, WritePair(address.clone()));
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(parent),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("pair".into(), true);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    let entries = application_entry::list(&db, parent).unwrap();
+    assert_eq!(entries.len(), 2);
+    h.submit_and_run(parent, None, "after task".into(), &cancel)
+        .await
+        .unwrap();
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        Expected::Version(Documents::new(&db).get(&address).unwrap().unwrap().version),
+        &json!({"n": 9}).as_object().unwrap().clone(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    assert!(h.fork_at_application_entry(parent, Uuid::new_v4()).is_err());
+    let child = h.fork_at_application_entry(parent, entries[0].id).unwrap();
+    let child_address = Address {
+        scope: child.to_string(),
+        ..address.clone()
+    };
+    assert_eq!(application_entry::list(&db, child).unwrap(), entries[..1]);
+    assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 7);
+    assert_eq!(h.conversation(child).unwrap().messages, expected_messages);
+    assert!(h.fork_at_application_entry(child, entries[0].id).is_err());
+    drop(h);
+    drop(db);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = Store::open(&path).unwrap();
+    assert_eq!(application_entry::list(&db, child).unwrap(), entries[..1]);
+    assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 7);
+    let second = h.fork_at_application_entry(parent, entries[1].id).unwrap();
+    assert_eq!(application_entry::list(&db, second).unwrap(), entries);
+    assert_eq!(
+        h.document(&Address {
+            scope: second.to_string(),
+            ..address.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
+
+    // Race independent document commits against fork preparation. A fence
+    // conflict may exhaust bounded retries; every successful fork must still
+    // contain the exact historical document and truncated log.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let writer_gate = gate.clone();
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let db = Store::open(writer_path).unwrap();
+        let other = Address {
+            scope: "unrelated".into(),
+            name: "race".into(),
+            key: "".into(),
+        };
+        writer_gate.wait();
+        for n in 0..24 {
+            let current = Documents::new(&db).get(&other).unwrap();
+            let expected = current.map_or(Expected::Missing, |doc| Expected::Version(doc.version));
+            let mut tx = Transaction::new();
+            tx.put(
+                &other,
+                expected,
+                &json!({"n": n}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            tx.commit(&db).unwrap();
+            std::thread::yield_now();
+        }
+    });
+    gate.wait();
+    for _ in 0..8 {
+        if let Ok(raced) = h.fork_at_application_entry(parent, entries[0].id) {
+            assert_eq!(application_entry::list(&db, raced).unwrap(), entries[..1]);
+            assert_eq!(
+                h.document(&Address {
+                    scope: raced.to_string(),
+                    ..address.clone()
+                })
+                .unwrap()
+                .unwrap()
+                .value["n"],
+                7
+            );
+        }
+    }
+    writer.join().unwrap();
+    let after_race = h.fork_at_application_entry(parent, entries[0].id).unwrap();
+    assert_eq!(
+        application_entry::list(&db, after_race).unwrap(),
+        entries[..1]
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.document(&Address {
+            scope: after_race.to_string(),
+            ..address.clone()
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
+
+    // A simultaneous runtime mutation with no corresponding immutable fork
+    // snapshot makes the entry's runtime state unprovable.
+    let runtime_key = format!("runtime/conversation/{parent}").into_bytes();
+    let app_key = format!("durable/application-entries/{parent}").into_bytes();
+    let runtime = db.get(&runtime_key).unwrap().unwrap();
+    let mut corrupted = entries.clone();
+    let mut extra = entries[0].clone();
+    extra.id = Uuid::new_v4();
+    corrupted.push(extra.clone());
+    db.commit(
+        &[],
+        &[
+            durable_store::Mutation::Put {
+                key: runtime_key,
+                value: runtime.value,
+            },
+            durable_store::Mutation::Put {
+                key: app_key,
+                value: serde_json::to_vec(&corrupted).unwrap(),
+            },
+        ],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(parent, extra.id).is_err());
+}

@@ -465,6 +465,69 @@ impl Store {
             .optional()?)
     }
 
+    /// Bounded, immutable application snapshots in commit order. Missing commit
+    /// metadata (including migration seeds) is returned as `None` and must not
+    /// be treated as a reconstructible entry boundary.
+    pub fn application_history(
+        &self,
+        key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(u64, Option<u64>, Entry)>, Error> {
+        if !key.starts_with(b"durable/application-entries/") || limit == 0 || limit > 257 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT h.revision,c.sequence,h.value,h.version FROM durable_document_history h LEFT JOIN durable_commit_versions c ON c.key=h.key AND c.version=h.version WHERE h.key=?1 ORDER BY h.revision LIMIT ?2")?;
+        let mut rows = stmt.query(params![key, limit as i64])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let value: Option<Vec<u8>> = row.get(2)?;
+            let version: Option<u64> = row.get(3)?;
+            let (Some(value), Some(version)) = (value, version) else {
+                return Err(Error::InvalidSnapshot);
+            };
+            result.push((row.get(0)?, row.get(1)?, Entry { value, version }));
+        }
+        Ok(result)
+    }
+
+    /// Find the immutable fork snapshot from the last tracked runtime write at
+    /// or before `sequence`. A write lacking a matching snapshot fails closed.
+    pub fn runtime_snapshot_at(
+        &self,
+        runtime_key: &[u8],
+        snapshot_prefix: &[u8],
+        sequence: u64,
+    ) -> Result<Option<(u64, Vec<u8>)>, Error> {
+        if sequence > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let runtime_sequence: Option<u64> = conn.query_row(
+            "SELECT MAX(sequence) FROM durable_commit_versions WHERE key=?1 AND sequence<=?2",
+            params![runtime_key, sequence],
+            |r| r.get(0),
+        )?;
+        let Some(runtime_sequence) = runtime_sequence else {
+            return Ok(None);
+        };
+        let mut stmt = conn.prepare("SELECT e.key FROM durable_store_entries e JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version WHERE substr(e.key,1,?1)=?2 AND c.sequence=?3 LIMIT 2")?;
+        let keys = stmt
+            .query_map(
+                params![
+                    snapshot_prefix.len() as i64,
+                    snapshot_prefix,
+                    runtime_sequence
+                ],
+                |r| r.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if keys.len() != 1 {
+            return Ok(None);
+        }
+        Ok(keys.into_iter().next().map(|key| (runtime_sequence, key)))
+    }
+
     /// Read an application log at a proven history boundary. Older cuts are
     /// rejected because pre-migration log changes were not recorded.
     pub fn application_entries_at(
