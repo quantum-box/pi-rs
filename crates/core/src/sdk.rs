@@ -3174,13 +3174,14 @@ mod tests {
                 ))
         );
         assert_eq!(reopened.prompt("next").await.unwrap(), "model-B");
-        let events = observed.lock().unwrap();
-        assert!(matches!(events.as_slice(), [
+        {
+            let events = observed.lock().unwrap();
+            assert!(matches!(events.as_slice(), [
             crate::LifecycleEvent::SessionStart { .. },
             crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
             crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
         ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
-        drop(events);
+        }
         reopened.close().await.unwrap();
     }
 
