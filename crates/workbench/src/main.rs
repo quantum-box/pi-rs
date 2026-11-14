@@ -1290,6 +1290,18 @@ fn main() {
     };
     #[cfg(not(windows))]
     let code = run_cli();
+    // A normal startup failure can prove that no live context was started.
+    // A crash or lost stdout does not provide this proof and must fail closed.
+    if code != 0
+        && std::env::var_os(process::REFRESH_BARRIER_ENV).is_some()
+        && !process::SHARE_CONTEXT_STARTED.load(Ordering::SeqCst)
+    {
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            json!({"type":"share_context_not_started"})
+        );
+    }
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();

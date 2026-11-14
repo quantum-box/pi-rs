@@ -4105,7 +4105,7 @@ pub(super) async fn run(
                 if let Some(mut pending) = view.pending_share.take() {
                     // Only a worker known to have failed before context setup
                     // may use the legacy metadata-free fallback.
-                    if !view.share_context_may_exist {
+                    if finished.startup_proven_empty && !view.share_context_may_exist {
                         pending.journal_key = None;
                     }
                     start_share_upload(&mut view, pending, None);

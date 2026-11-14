@@ -587,11 +587,11 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     drop(changed);
     assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
     master.write_all(b"/share\r").unwrap();
+    wait_output(&mut master, "Preparing share");
     wait_output(&mut master, "Live share context is unavailable");
     master.write_all(b"/share\r").unwrap();
-    // The worker cannot read either request while stopped. Its termination
-    // exercises the exit fallback independently of the timeout above.
-    std::thread::sleep(Duration::from_millis(200));
+    // The visible pending state proves the request was sent before exit.
+    wait_output(&mut master, "Preparing share");
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     wait_output(&mut master, "Live share context is unavailable");
     stop_tx.send(()).unwrap();

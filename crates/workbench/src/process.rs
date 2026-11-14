@@ -12,6 +12,8 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+pub(super) static SHARE_CONTEXT_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -162,6 +164,7 @@ pub(super) struct Worker {
     events: Receiver<Value>,
     pending_events: Vec<Value>,
     pub(super) context_may_exist: bool,
+    pub(super) startup_proven_empty: bool,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
@@ -330,9 +333,20 @@ impl Worker {
         let readers = vec![
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if let Ok(event) = serde_json::from_str(&line) {
-                        let _ = sender.send(event);
+                    match line {
+                        Ok(line) => match serde_json::from_str(&line) {
+                            Ok(event) => {
+                                let _ = sender.send(event);
+                            }
+                            Err(_) => {
+                                let _ = sender.send(json!({"type":"share_context_initializing"}));
+                            }
+                        },
+                        Err(_) => {
+                            // A failed stream can hide the initialization marker.
+                            let _ = sender.send(json!({"type":"share_context_initializing"}));
+                            break;
+                        }
                     }
                 }
             }),
@@ -362,6 +376,7 @@ impl Worker {
             events,
             pending_events: Vec::new(),
             context_may_exist: false,
+            startup_proven_empty: false,
             extension_sources: Default::default(),
             readers,
         })
@@ -454,6 +469,10 @@ impl Worker {
             .filter_map(|mut event| {
                 if event["type"] == "share_context_initializing" {
                     self.context_may_exist = true;
+                    return None;
+                }
+                if event["type"] == "share_context_not_started" {
+                    self.startup_proven_empty = true;
                     return None;
                 }
                 if event["type"] == "worker_extension_sources" {
@@ -893,6 +912,7 @@ mod tests {
             events,
             pending_events: Vec::new(),
             context_may_exist: false,
+            startup_proven_empty: false,
             extension_sources: Default::default(),
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
