@@ -106,7 +106,8 @@ including for model request affinity. Pi also permits non-UUID custom IDs;
 custom IDs are preserved across native export and reopen and used for
 model request and cache warming affinity. A separate internal UUID continues to
 identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
-external ID. RPC, UI and share identity projection still uses the internal UUID.
+external ID. RPC state and session statistics project the external ID; UI and
+share identity projection still uses the internal UUID.
 Empty IDs omit affinity headers. Nonempty IDs use Fetch-compatible Latin-1
 header bytes and whitespace normalization. Unrepresentable or invalid values
 fail before dispatch when an affinity default is needed; explicit headers win
@@ -4332,11 +4333,11 @@ non-null content. Other specialized message variants remain open.
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
-(including lone surrogate escapes), and
-missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
-counted as line breaks. Other malformed JSON, including incomplete escapes,
-retains the native parser's diagnostics; full malformed-input parity remains
-open.
+(including lone surrogate escapes), dangling backslashes, incomplete Unicode
+escapes, and missing values. Offsets and columns count UTF-16 units; CR, LF and
+CRLF are counted as line breaks. Incomplete escapes following lone surrogate
+escapes and other malformed JSON retain the native parser's diagnostics; full
+malformed-input parity remains open.
 
 ### Shell execution transcript checkpoint
 

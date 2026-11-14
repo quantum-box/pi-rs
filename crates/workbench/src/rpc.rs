@@ -823,10 +823,52 @@ mod jsonl_framing_tests {
     }
 
     #[test]
-    fn unfinished_escapes_keep_native_diagnostic() {
-        for input in ["\"a\\", "\"a\\u12"] {
+    fn unfinished_escapes_report_v8_diagnostic() {
+        for (input, expected) in [
+            ("\"a\\", "Unexpected end of JSON input"),
+            (
+                "\"a\\u",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "\"a\\u1",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"a\\u12",
+                "Bad Unicode escape in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "\"a\\u123",
+                "Bad Unicode escape in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"😺\\u1",
+                "Bad Unicode escape in JSON at position 11 (line 1 column 12)",
+            ),
+            (
+                "[\r\n\"x\\u12",
+                "Bad Unicode escape in JSON at position 9 (line 2 column 7)",
+            ),
+            ("[\"a\\\\u12\\", "Unexpected end of JSON input"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
+        for input in ["[false,] \"x\\u1", "\"x\\q\\u1", "\"x\n\\u1"] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-            assert_eq!(super::rpc_json_error(input, &error), error.to_string());
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
         }
     }
 
@@ -866,6 +908,29 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    if error.is_eof() && message.starts_with("EOF while parsing a string") {
+        match unfinished_json_escape(line) {
+            Some(false) => return "Unexpected end of JSON input".into(),
+            Some(true) => {
+                let position = line.encode_utf16().count();
+                let row = line.bytes().filter(|byte| *byte == b'\r').count()
+                    + line.bytes().filter(|byte| *byte == b'\n').count()
+                    - line.matches("\r\n").count()
+                    + 1;
+                let column = line
+                    .rsplit(['\r', '\n'])
+                    .next()
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .count()
+                    + 1;
+                return format!(
+                    "Bad Unicode escape in JSON at position {position} (line {row} column {column})"
+                );
+            }
+            None => {}
+        }
+    }
     let surrogate_eof = (message.starts_with("lone leading surrogate in hex escape")
         || message.starts_with("unexpected end of hex escape"))
         && unterminated_surrogate_string(line, error);
@@ -873,8 +938,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         return error.to_string();
     }
     let tail = line.trim_end_matches([' ', '\t', '\n', '\r']);
-    // Only map complete escapes: a dangling backslash or partial Unicode escape
-    // has a different V8 diagnostic and is left to serde for now.
+    // The remaining unterminated-string case has complete escapes; incomplete
+    // escapes above use different V8 diagnostics.
     let reason = if surrogate_eof
         || message.starts_with("EOF while parsing a string") && complete_json_escapes(line)
     {
@@ -917,6 +982,35 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// Identify only an incomplete escape inside an open string. Earlier invalid
+// escapes and control characters must retain their own diagnostics.
+fn unfinished_json_escape(line: &str) -> Option<bool> {
+    let mut chars = line.chars();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => match chars.next() {
+                None => return Some(false),
+                Some('u') => {
+                    for _ in 0..4 {
+                        match chars.next() {
+                            None => return Some(true),
+                            Some(hex) if hex.is_ascii_hexdigit() => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {}
+                Some(_) => return None,
+            },
+            ch if in_string && ch < ' ' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 // serde rejects lone surrogate escapes that V8 permits in JSON strings. Only
@@ -1375,7 +1469,7 @@ pub(super) fn snapshot_response(
             let pending = pending_request();
             state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
             state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
-            state["sessionId"] = json!(session.session_id());
+            state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
             }
@@ -1437,6 +1531,7 @@ pub(super) fn snapshot_response(
             native.tokens.total = native.tokens.total.saturating_add(operations.total_tokens);
             native.cost = native.cost.map(|cost| cost + operations.cost.total);
             let mut stats = serde_json::to_value(native)?;
+            stats["sessionId"] = json!(session.external_session_id());
             if operations.measured() {
                 stats["operationUsage"] = serde_json::to_value(operations)?;
             }
@@ -2063,6 +2158,56 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn rpc_session_identity_survives_import_export_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.jsonl");
+        for identity in ["legacy-id", "ID / 日本語", "bad\r\nid"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"session", "version":3, "id":identity})
+                ),
+            )
+            .unwrap();
+            let imported = super::super::session_import::read(&path).unwrap();
+            let check = |session: &Session, expected: &str| {
+                for command in ["get_state", "get_session_stats"] {
+                    for native in [false, true] {
+                        let result = snapshot_response(
+                            &json!({"type":command,"includeNative":native}),
+                            session,
+                            &path,
+                            None,
+                            json!({}),
+                        )
+                        .unwrap();
+                        assert_eq!(result["sessionId"], expected, "{command}");
+                    }
+                }
+            };
+            check(&imported, identity);
+            assert_eq!(imported.statistics().session_id, imported.session_id());
+            let export = directory.path().join("export.jsonl");
+            imported.export_jsonl(&export).unwrap();
+            let reopened = super::super::session_import::read(&export).unwrap();
+            check(&reopened, identity);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_ne!(fork.session_id(), reopened.session_id());
+            check(&fork, &fork.session_id().to_string());
+            std::fs::remove_file(export).unwrap();
+        }
+        let native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for command in ["get_state", "get_session_stats"] {
+            let result =
+                snapshot_response(&json!({"type":command}), &native, &path, None, json!({}))
+                    .unwrap();
+            assert_eq!(result["sessionId"], native.session_id().to_string());
+        }
+    }
 
     #[cfg(unix)]
     #[test]
