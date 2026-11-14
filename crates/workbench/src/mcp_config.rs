@@ -70,32 +70,138 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
-            for (name, entry) in entries {
-                if entry.get("auth").is_some() {
-                    return Err(Error::Config(format!(
-                        "project MCP server {name} cannot use auth.provider"
-                    )));
-                }
-                if !["command", "url", "type"]
-                    .iter()
-                    .any(|key| entry.get(*key).is_some())
-                    && let (Some(base), Some(overlay)) = (
-                        servers.get_mut(name).and_then(Value::as_object_mut),
-                        entry.as_object(),
-                    )
-                {
-                    for key in ["enabled", "exposure", "toolExposure", "oauth"] {
-                        if let Some(value) = overlay.get(key) {
-                            base.insert(key.into(), value.clone());
-                        }
-                    }
-                    continue;
-                }
-                servers.insert(name.clone(), entry.clone());
-            }
+            merge_project_servers(&mut servers, entries)?;
         }
     }
     Ok(servers.into_iter().collect())
+}
+
+fn merge_project_servers(
+    servers: &mut serde_json::Map<String, Value>,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    const OVERRIDE_KEYS: &[&str] = &["enabled", "exposure", "toolExposure", "oauth"];
+    for (name, entry) in entries {
+        if entry.get("auth").is_some() {
+            return Err(Error::Config(format!(
+                "project MCP server {name} cannot use auth.provider"
+            )));
+        }
+        if !["command", "url", "type"]
+            .iter()
+            .any(|key| entry.get(*key).is_some())
+            && let (Some(base), Some(overlay)) = (
+                servers.get_mut(name).and_then(Value::as_object_mut),
+                entry.as_object(),
+            )
+        {
+            if let Some(key) = overlay
+                .keys()
+                .find(|key| !OVERRIDE_KEYS.contains(&key.as_str()))
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} override has unsupported field {key}"
+                )));
+            }
+            for (key, value) in overlay {
+                if !valid_override_value(key, value) {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} override has invalid field {key}"
+                    )));
+                }
+            }
+            let mut candidate = base.clone();
+            candidate.extend(overlay.clone());
+            for key in OVERRIDE_KEYS {
+                if !overlay.contains_key(*key) {
+                    // Preserve serde's existing global Option semantics while
+                    // validating non-null inherited values before enabling.
+                    if *key == "oauth"
+                        || (matches!(*key, "enabled" | "exposure")
+                            && candidate.get(*key).is_some_and(Value::is_null))
+                    {
+                        continue;
+                    }
+                }
+                if candidate
+                    .get(*key)
+                    .is_some_and(|value| !valid_override_value(key, value))
+                {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} merged configuration has invalid field {key}"
+                    )));
+                }
+            }
+            let config: ServerConfig =
+                serde_json::from_value(Value::Object(candidate)).map_err(|_| {
+                    Error::Config(format!("project MCP server {name} override is invalid"))
+                })?;
+            if let Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(client)) = &config.oauth {
+                pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).map_err(
+                    |_| {
+                        Error::Config(format!(
+                            "project MCP server {name} override has invalid OAuth settings"
+                        ))
+                    },
+                )?;
+            }
+            if matches!(
+                config.oauth,
+                Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(_))
+                    | Some(pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(true))
+            ) && config.command.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} OAuth requires an HTTP server"
+                )));
+            }
+            for (key, value) in overlay {
+                base.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+        servers.insert(name.clone(), entry.clone());
+    }
+    Ok(())
+}
+
+fn valid_override_value(key: &str, value: &Value) -> bool {
+    match key {
+        "enabled" => value.is_boolean(),
+        "exposure" => valid_exposure(value),
+        "toolExposure" => value
+            .as_object()
+            .is_some_and(|tools| tools.values().all(valid_exposure)),
+        "oauth" => valid_oauth(value),
+        _ => false,
+    }
+}
+
+fn valid_exposure(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        matches!(
+            value,
+            "direct" | "deferred" | "codemode" | "codemode-deferred" | "hidden" | "off"
+        )
+    })
+}
+
+fn valid_oauth(value: &Value) -> bool {
+    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
+
+    // Serde treats null in an optional member as absent, but Pi validates
+    // explicitly supplied OAuth fields and rejects null values.
+    if value
+        .as_object()
+        .is_some_and(|fields| fields.values().any(Value::is_null))
+    {
+        return false;
+    }
+    match serde_json::from_value::<OAuthSetting>(value.clone()) {
+        Ok(OAuthSetting::Enabled(_)) => true,
+        Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
+        Err(_) => false,
+    }
 }
 
 pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
@@ -483,5 +589,149 @@ fn path(args: &Cli, local: bool) -> PathBuf {
         args.workspace.join(".pi/mcp.json")
     } else {
         config::agent_dir().join("mcp.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_override_rejects_unknown_fields_before_changing_global_server() {
+        for extra in ["headers", "args", "url_typo", "description"] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"headers":{"Authorization":"Bearer ${TOKEN}"}}});
+            let mut servers = original.as_object().unwrap().clone();
+            let mut overlay = json!({"service":{"enabled":true}});
+            overlay["service"][extra] = json!("unexpected");
+            let error =
+                merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(extra));
+            assert_eq!(Value::Object(servers), original);
+        }
+    }
+
+    #[test]
+    fn project_override_retains_native_oauth_and_global_credentials() {
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer ${TOKEN}"},"enabled":false}}).as_object().unwrap().clone();
+        let project = json!({"service":{"enabled":true,"exposure":"deferred","toolExposure":{"read":"hidden"},"oauth":false}});
+        merge_project_servers(&mut servers, project.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        assert_eq!(servers["service"]["oauth"], false);
+        assert_eq!(
+            servers["service"]["headers"]["Authorization"],
+            "Bearer ${TOKEN}"
+        );
+        let before = servers.clone();
+        let forbidden = json!({"service":{"enabled":true,"auth":{"provider":"openai"}}});
+        assert!(merge_project_servers(&mut servers, forbidden.as_object().unwrap()).is_err());
+        assert_eq!(servers, before);
+    }
+
+    #[test]
+    fn project_override_rejects_invalid_values_before_enabling_server() {
+        for invalid in [
+            json!({"enabled": null}),
+            json!({"enabled": "true"}),
+            json!({"enabled": true, "exposure": null}),
+            json!({"enabled": true, "exposure": "unknown"}),
+            json!({"enabled": true, "toolExposure": {"read": "unknown"}}),
+            json!({"enabled": true, "oauth": null}),
+            json!({"enabled": true, "oauth": {"callbackPort": null}}),
+            json!({"enabled": true, "oauth": {"clientId": null}}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "unknown"}}),
+            json!({"enabled": true, "oauth": {"clientSecret": "secret"}}),
+            json!({"enabled": true, "oauth": {"clientId": " "}}),
+            json!({"enabled": true, "oauth": {"clientName": ""}}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "cimd", "clientId": "id"}}),
+            json!({"enabled": true, "oauth": {"callbackPort": 0}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://example.com/callback"}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://127.0.0.1:9000/callback", "callbackPort": 9001}}),
+            json!({"enabled": true, "oauth": {"clientMetadataUrl": "http://example.com/client.json"}}),
+        ] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
+            let mut servers = original.as_object().unwrap().clone();
+            let overlay = json!({"service": invalid});
+            assert!(merge_project_servers(&mut servers, overlay.as_object().unwrap()).is_err());
+            assert_eq!(Value::Object(servers), original);
+        }
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let valid = json!({"service":{"enabled":true,"oauth":{"callbackUrl":"http://127.0.0.1:9000/callback","callbackPort":9000,"clientMetadataUrl":"https://example.com/client.json"}}});
+        merge_project_servers(&mut servers, valid.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        let original = json!({"service":{"command":"fixture","enabled":false}});
+        let mut servers = original.as_object().unwrap().clone();
+        let invalid = json!({"service":{"enabled":true,"oauth":true}});
+        assert!(merge_project_servers(&mut servers, invalid.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        let enabled = json!({"service":{"enabled":true}});
+        for inherited in [
+            json!(null),
+            json!({"callbackUrl": null, "callbackPort": null}),
+        ] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":inherited}});
+            let mut servers = original.as_object().unwrap().clone();
+            merge_project_servers(&mut servers, enabled.as_object().unwrap()).unwrap();
+            assert_eq!(servers["service"]["enabled"], true);
+            assert_eq!(servers["service"]["oauth"], original["service"]["oauth"]);
+        }
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackPort":0}}});
+        let mut servers = original.as_object().unwrap().clone();
+        assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        for (key, value) in [
+            ("exposure", json!("bad")),
+            ("toolExposure", json!(null)),
+            ("toolExposure", json!({"read": null})),
+        ] {
+            let mut original =
+                json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
+            original["service"][key] = value;
+            let mut servers = original.as_object().unwrap().clone();
+            let error =
+                merge_project_servers(&mut servers, enabled.as_object().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(key));
+            assert_eq!(Value::Object(servers), original);
+        }
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackUrl":"http://127.0.0.1:80/callback","callbackPort":9001,"clientId":"sensitive-id"}}});
+        let mut servers = original.as_object().unwrap().clone();
+        let error = merge_project_servers(&mut servers, enabled.as_object().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("sensitive-id"));
+        assert_eq!(Value::Object(servers), original);
+    }
+
+    #[test]
+    fn inherited_optional_nulls_preserve_native_defaults() {
+        for (global, project) in [
+            (json!({"enabled":null}), json!({"exposure":"hidden"})),
+            (
+                json!({"enabled":false,"exposure":null}),
+                json!({"enabled":true}),
+            ),
+            (
+                json!({"enabled":false,"exposure":null,"oauth":null}),
+                json!({"enabled":true}),
+            ),
+        ] {
+            let mut base = json!({"url":"https://example.invalid/mcp"});
+            base.as_object_mut()
+                .unwrap()
+                .extend(global.as_object().unwrap().clone());
+            let mut servers = json!({"service":base}).as_object().unwrap().clone();
+            let overlay = json!({"service":project});
+            merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap();
+            let config: ServerConfig = serde_json::from_value(servers["service"].clone()).unwrap();
+            if global["enabled"].is_null() {
+                assert_eq!(config.enabled, None);
+            }
+            if global.get("exposure").is_some_and(Value::is_null) {
+                assert_eq!(config.exposure, None);
+                assert_eq!(config.exposure.as_deref().unwrap_or("codemode"), "codemode");
+            }
+        }
     }
 }

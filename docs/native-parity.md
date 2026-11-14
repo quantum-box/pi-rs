@@ -515,6 +515,16 @@ listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
 
+Trusted project overrides of a global MCP server reject unknown fields and
+invalid values before applying any part of that override, so a typo or
+`enabled: null` cannot silently enable a server.
+Pi ignores invalid overrides and reports a diagnostic; native fails the
+configuration load. Native additionally permits `oauth` in an override for its
+existing OAuth controls, alongside Pi's `enabled`, `exposure`, and
+`toolExposure`. Explicit project nulls are rejected; inherited global optional
+`enabled`, `exposure`, and OAuth nulls retain native's absent-value behavior, while
+non-null settings are validated. Project `auth.provider` remains forbidden.
+
 Resource and template listings omit MCP App `ui://` entries and entries whose
 MIME profile starts with `mcp-app`, along with listing icons and `_meta`, matching
 pinned Pi's prefix regex. This also hides non-App profiles such as
@@ -3853,6 +3863,15 @@ respect the model and provider compatibility settings. Other chat models
 keep their standard request shape. Compaction omits automatic cache
 markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
+
+A configured Anthropic `reasoning: true` declaration supplies fallback thinking
+levels when model discovery is unavailable or omits thinking capability. When the Models API returns a
+capability, its supported modes and levels drive both selection and requests;
+explicit adaptive or thinking-level-map overrides remain authoritative. Other
+discovered model metadata, including output limits, is retained with overrides.
+Automatic thinking discovery for configured Anthropic Messages-compatible models
+is restricted to the Anthropic provider; other gateways retain their declared
+capabilities without an additional Models API probe.
 
 ### Native Anthropic authorization header checkpoint
 
