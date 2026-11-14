@@ -203,7 +203,7 @@ impl Google {
             .send()
             .await
             .map_err(|_| Error::Model("Google model catalog request failed".into()))?;
-        let mut response = check_status(response)?;
+        let mut response = check_status(response).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -483,13 +483,18 @@ fn apply_thinking_budget(
     Ok(())
 }
 
-fn check_status(response: Response) -> Result<Response> {
+async fn check_status(response: Response) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let message = format!("Google Gemini returned HTTP {status}");
-    if status.as_u16() == 429 || status.is_server_error() {
+    if status.as_u16() == 429 && pi_rs_core::permanent_provider_limit(response.bytes_stream()).await
+    {
+        Err(Error::Model(
+            "Google Gemini account quota or billing limit reached (HTTP 429)".into(),
+        ))
+    } else if status.as_u16() == 429 || status.is_server_error() {
         Err(Error::RetryableModel(message))
     } else {
         Err(Error::Model(message))
@@ -830,7 +835,7 @@ impl Model for Google {
                     .into(),
                 )
             })?;
-        let response = check_status(response)?;
+        let response = check_status(response).await?;
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
         let provider = self.provider.clone();
@@ -979,6 +984,41 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (body, permanent) in [
+            (
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let client = Client::builder().no_proxy().build().unwrap();
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = check_status(response).await.unwrap_err();
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[cfg(any(unix, windows))]

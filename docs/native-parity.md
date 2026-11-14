@@ -4304,3 +4304,13 @@ the agent remain governed by the configured SDK policy.
 Pi's non-chat System One provider-level policy retries transient HTTP status
 codes including 429 without classifying the response body; native keeps that
 separate policy.
+
+### Provider quota retry classification
+
+Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
+distinguish Pi's permanent account, billing and quota exhaustion markers from
+transient HTTP 429 rate limits. The adapters inspect at most 64 KiB for at most
+two seconds without logging or returning the response body. If no marker is
+found within that bound, or reading fails or times out, 429 remains retryable.
+Bedrock's typed SDK errors and non-chat model calls retain their separate retry
+policies; streaming-error parity also remains open.

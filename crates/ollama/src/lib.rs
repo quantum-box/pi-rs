@@ -810,13 +810,17 @@ impl Model for Ollama {
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
-            return Err(
-                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
-                    Error::RetryableModel(description)
-                } else {
-                    Error::Model(description)
-                },
-            );
+            let permanent_quota = status.as_u16() == 429
+                && pi_rs_core::permanent_provider_limit(response.bytes_stream()).await;
+            return Err(if permanent_quota {
+                Error::Model(
+                    "Chat Completions account quota or billing limit reached (HTTP 429)".into(),
+                )
+            } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                Error::RetryableModel(description)
+            } else {
+                Error::Model(description)
+            });
         }
         if !response
             .headers()
@@ -1151,6 +1155,47 @@ struct CallDelta {
 
 #[cfg(test)]
 mod content_tests {
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (body, permanent) in [
+            (
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Ollama::new(&format!("http://{address}"), None).unwrap();
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[test]

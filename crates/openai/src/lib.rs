@@ -466,6 +466,22 @@ impl Model for OpenAiResponses {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
+            if status.as_u16() == 429 {
+                let info = pi_rs_core::provider_limit_info(response.bytes_stream()).await;
+                return Err(if info.permanent {
+                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
+                        response_error(info.recognized_code, Some(status))
+                    } else {
+                        Error::Model(
+                            "OpenAI account quota or billing limit reached (HTTP 429)".into(),
+                        )
+                    }
+                } else if info.recognized_code.is_some() {
+                    response_error(info.recognized_code, Some(status))
+                } else {
+                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
+                });
+            }
             let mut bytes = Vec::new();
             while let Ok(Some(chunk)) = response.chunk().await {
                 if bytes.len() + chunk.len() > 64 * 1024 {
@@ -580,6 +596,45 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (body, permanent) in [
+            (
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "token".into(),
+                "fixture",
+            )
+            .unwrap();
+            let result = model.stream(request()).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -593,7 +593,11 @@ impl Model for PiMessages {
         if !response.status().is_success() {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
-            return Err(if status.as_u16() == 429 || status.is_server_error() {
+            let permanent_quota = status.as_u16() == 429
+                && pi_rs::permanent_provider_limit(response.bytes_stream()).await;
+            return Err(if permanent_quota {
+                Error::Model("Pi Messages account quota or billing limit reached (HTTP 429)".into())
+            } else if status.as_u16() == 429 || status.is_server_error() {
                 Error::RetryableModel(message)
             } else {
                 Error::Model(message)
@@ -807,6 +811,48 @@ fn terminal_metadata(
 #[cfg(test)]
 mod tool_status_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quota_429_preserves_transient_retry_and_redacts_body() {
+        use std::io::{Read, Write};
+        for (body, permanent) in [
+            (
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (r#"{"error":{"message":"rate limit exceeded"}}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model =
+                PiMessages::new("fixture", &format!("http://{address}/"), "token".into()).unwrap();
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            worker.join().unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn radius_estimation_matches_replay_origin_after_route_change() {
