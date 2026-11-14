@@ -7717,7 +7717,12 @@ mod scheduler_tests {
             };
             h.save(&c, Expected::Version(version)).unwrap();
             h.record_tool_panic(id, operation).unwrap();
-            cursor = h.subscribe_extension_reports().unwrap().read(0, 10).unwrap()[0].cursor;
+            cursor = h
+                .subscribe_extension_reports()
+                .unwrap()
+                .read(0, 10)
+                .unwrap()[0]
+                .cursor;
         }
         for _ in 0..2 {
             let h = Harness::open_paused(&path, opts()).unwrap();

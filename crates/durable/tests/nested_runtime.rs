@@ -924,5 +924,9 @@ async fn cancellation_after_panic_preserves_report_and_prevents_replay() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let reports = h.extension_reports().unwrap();
     assert_eq!(reports.len(), 1);
-    assert!(!serde_json::to_string(&reports).unwrap().contains("sensitive"));
+    assert!(
+        !serde_json::to_string(&reports)
+            .unwrap()
+            .contains("sensitive")
+    );
 }
