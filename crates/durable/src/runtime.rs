@@ -3613,6 +3613,9 @@ impl Harness {
                                 c.allowed_tools
                                     .as_ref()
                                     .is_none_or(|names| names.contains(&call.name))
+                                    && c.model_tools
+                                        .as_ref()
+                                        .is_none_or(|names| names.contains(&call.name))
                             })
                             .and_then(|x| self.tools.get(&x.name))
                             .map(|x| x.replay)
@@ -4957,7 +4960,15 @@ impl Harness {
                             operation_id: Uuid::new_v4(),
                             wake: None,
                         };
-                    } else if let Some(reg) = self.tools.get(&calls[index].name) {
+                    } else if let Some(reg) = self
+                        .resolved_tools(&c)?
+                        .get(&calls[index].name)
+                        .filter(|_| {
+                            c.model_tools
+                                .as_ref()
+                                .is_none_or(|names| names.contains(&calls[index].name))
+                        })
+                    {
                         let operation_id = Uuid::new_v4();
                         let invocation = Invocation {
                             operation_id,
@@ -5263,7 +5274,11 @@ impl Harness {
                     let tools = self.resolved_tools(&c)?;
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
-                    let reply = if let Some(reg) = tools.get(&call.name) {
+                    let reply = if let Some(reg) = tools.get(&call.name).filter(|_| {
+                        c.model_tools
+                            .as_ref()
+                            .is_none_or(|names| names.contains(&call.name))
+                    }) {
                         let invocation = Invocation {
                             operation_id,
                             call: call.clone(),
@@ -8592,6 +8607,55 @@ mod tool_allowlist_tests {
         );
     }
 
+    #[test]
+    fn historical_fork_retains_model_selection_at_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = || opts(Arc::new(Mutex::new(vec![])), Arc::new(AtomicUsize::new(0)));
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_model_tools(id, Some(vec!["allowed".into()]))
+            .unwrap();
+        let cursor = h
+            .history(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(100).unwrap(),
+            )
+            .unwrap()
+            .next;
+        h.select_model_tools(id, Some(vec!["blocked".into()]))
+            .unwrap();
+        let fork = h.fork_at(id, cursor).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, opts()).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().model_tools,
+            Some(vec!["allowed".into()])
+        );
+        assert_eq!(
+            h.conversation(id).unwrap().model_tools,
+            Some(vec!["blocked".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn model_calls_respect_enabled_selection_without_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut h = Harness::open_paused(
+            dir.path().join("db"),
+            opts(Arc::new(Mutex::new(vec![])), count.clone()),
+        )
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_tools(id, Some(vec!["allowed".into()])).unwrap();
+        h.submit_and_run(id, None, "work".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn child_selection_persists_and_filters_specs_and_dispatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -8650,6 +8714,41 @@ mod tool_allowlist_tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn stale_running_tool_is_not_replayed_when_hidden_from_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seen = Arc::new(Mutex::new(vec![]));
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_tools(id, Some(vec!["blocked".into()])).unwrap();
+        h.select_model_tools(id, Some(vec![])).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        c.phase = Phase::ToolRunning {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "blocked".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: Uuid::new_v4(),
+            replay: ReplayPolicy::Safe,
+            arguments: serde_json::json!({}),
+            restarts: 0,
+            replay_ready: false,
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, opts(seen, count.clone())).unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().phase,
+            Phase::ToolFinished { .. }
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

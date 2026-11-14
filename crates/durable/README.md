@@ -382,8 +382,10 @@ ceiling, and nested calls can still access enabled tools hidden from the model.
 Model-issued calls to hidden tools are rejected. Unknown names remain stored;
 forks retain the selection and old conversations default to `None`. Tool control
 additions append to both lists when each is set, preserving the existing behavior
-when the model selection is unset. This bounded subset does not implement upstream
-caller permissions, remove patches, or deferred tools.
+when the model selection is unset. Like upstream, a tool returning `add_tools` can
+therefore widen the enabled allowlist as well as the model selection; only trusted
+tool implementations should return this control. This bounded subset does not
+implement upstream caller permissions, remove patches, or deferred tools.
 
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
