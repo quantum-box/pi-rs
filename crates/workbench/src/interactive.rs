@@ -7338,40 +7338,40 @@ impl EditorJobSupervisor {
                 let ready = u8::from(libc::setpgid(0, 0) == 0);
                 libc::write(response[1], (&ready as *const u8).cast(), 1);
                 let mut command = 0u8;
-                if ready == 1 && libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 1 {
-                    if libc::fcntl(control[0], libc::F_SETFL, libc::O_NONBLOCK) == 0
-                        && libc::kill(-group, libc::SIGSTOP) == 0
-                    {
-                        // Give a managing shell time to take the terminal. Keep
-                        // waiting while it owns the terminal, including a long
-                        // stopped job; foregrounding Pi permits resumption.
-                        for attempt in 0.. {
-                            let mut delay = if attempt == 0 {
-                                libc::timespec {
-                                    tv_sec: 1,
-                                    tv_nsec: 0,
-                                }
-                            } else {
-                                libc::timespec {
-                                    tv_sec: 0,
-                                    tv_nsec: 250_000_000,
-                                }
-                            };
-                            let mut remaining: libc::timespec = std::mem::zeroed();
-                            while libc::nanosleep(&delay, &mut remaining) != 0 {
-                                delay = remaining;
+                if ready == 1
+                    && libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 1
+                    && libc::fcntl(control[0], libc::F_SETFL, libc::O_NONBLOCK) == 0
+                    && libc::kill(-group, libc::SIGSTOP) == 0
+                {
+                    // Give a managing shell time to take the terminal. Keep
+                    // waiting while it owns the terminal, including a long
+                    // stopped job; foregrounding Pi permits resumption.
+                    for attempt in 0.. {
+                        let mut delay = if attempt == 0 {
+                            libc::timespec {
+                                tv_sec: 1,
+                                tv_nsec: 0,
                             }
-                            if libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 0
-                                || libc::getppid() != parent
-                            {
-                                break;
+                        } else {
+                            libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: 250_000_000,
                             }
-                            if libc::tcgetpgrp(tty) == group {
-                                libc::kill(-group, libc::SIGCONT);
-                                let done = 1u8;
-                                libc::write(response[1], (&done as *const u8).cast(), 1);
-                                break;
-                            }
+                        };
+                        let mut remaining: libc::timespec = std::mem::zeroed();
+                        while libc::nanosleep(&delay, &mut remaining) != 0 {
+                            delay = remaining;
+                        }
+                        if libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 0
+                            || libc::getppid() != parent
+                        {
+                            break;
+                        }
+                        if libc::tcgetpgrp(tty) == group {
+                            libc::kill(-group, libc::SIGCONT);
+                            let done = 1u8;
+                            libc::write(response[1], (&done as *const u8).cast(), 1);
+                            break;
                         }
                     }
                 }
