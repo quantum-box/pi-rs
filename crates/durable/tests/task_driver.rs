@@ -150,3 +150,76 @@ async fn signal_is_admitted_while_handler_is_running() {
     Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn typed_delivery_wakes_background_task() {
+    use pi_rs_durable::task::WaitFor;
+    use pi_rs_durable::task_store::{SignalResult, SignalToken};
+    let dir = tempfile::tempdir().unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "m".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let token = SignalToken::new("approval", 1).unwrap();
+    let key = token.key("decision").unwrap();
+    let mut registry = Registry::default();
+    registry.register("waiter", true, move |task: &Task| {
+        if task.checkpoint().phase == "start" {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "done".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::TypedSignal(key.clone()),
+                children: vec![],
+            })
+        } else {
+            Ok(Step::Succeed(json!(task.delivered_signal().is_some())))
+        }
+    });
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(conversation),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("waiter".into(), true);
+    driver.submit(&task).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                driver.get(id).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        driver
+            .deliver_signal(id, &token, "decision", json!(true))
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(driver.get(id).unwrap().unwrap().state(), TaskState::Succeeded(value) if value == &json!(true)) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    driver.shutdown().unwrap();
+    scheduler.shutdown().await.unwrap();
+}

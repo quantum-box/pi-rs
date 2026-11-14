@@ -4,7 +4,7 @@
 use crate::{
     task::{Task, TaskOwner, TaskState},
     task_scheduler,
-    task_store::{Save, Signal, TaskStore},
+    task_store::{self, Save, Signal, TaskStore},
 };
 use durable_store::owner::OwnedStore;
 use std::{
@@ -245,6 +245,23 @@ impl Driver {
             .map_err(task_scheduler::Error::from)?;
         self.shared.wake.notify_one();
         Ok(())
+    }
+    /// Deliver a typed signal and wake the background scheduler when accepted.
+    pub fn deliver_signal(
+        &self,
+        task_id: Uuid,
+        token: &task_store::SignalToken,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<task_store::SignalResult, Error> {
+        let _state = self.check()?;
+        let result = TaskStore::new(self.shared.owner.store())
+            .deliver_signal(task_id, token, key, value)
+            .map_err(task_scheduler::Error::from)?;
+        if result == task_store::SignalResult::Delivered {
+            self.shared.wake.notify_one();
+        }
+        Ok(result)
     }
     pub fn get(&self, id: Uuid) -> Result<Option<Task>, Error> {
         let _state = self.check()?;
