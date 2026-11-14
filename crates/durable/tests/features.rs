@@ -2784,3 +2784,83 @@ async fn inherited_application_forks_use_origin_and_immediate_parent_after_reope
         2
     );
 }
+
+#[tokio::test]
+async fn local_entry_cannot_hide_an_unproven_inherited_prefix() {
+    use durable_store::{Mutation, Store};
+    use pi_rs_durable::{
+        application_entry::{self, ApplicationEntry},
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Append;
+    impl Handler for Append {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.local", json!(1)).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "origin".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let db = Store::open(&path).unwrap();
+    let bogus = ApplicationEntry {
+        id: Uuid::new_v4(),
+        conversation_id: Uuid::new_v4(),
+        author_task_id: Uuid::new_v4(),
+        kind: "app.forged".into(),
+        data: json!(null),
+    };
+    db.commit(
+        &[],
+        &[Mutation::Put {
+            key: format!("durable/application-entries/{parent}").into_bytes(),
+            value: serde_json::to_vec(&vec![bogus]).unwrap(),
+        }],
+    )
+    .unwrap();
+    let child = h.fork(parent).unwrap();
+    let mut registry = Registry::default();
+    registry.register("app", true, Append);
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(child),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("app".into(), true);
+    let mut tasks = h.attach_tasks(registry).unwrap();
+    tasks.submit(&task).unwrap();
+    tasks.tick(0).unwrap();
+    drop(tasks);
+    let entries = application_entry::list(&db, child).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(h.fork_at_application_entry(child, entries[1].id).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.fork_at_application_entry(child, entries[1].id).is_err());
+}

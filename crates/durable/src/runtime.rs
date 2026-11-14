@@ -2391,15 +2391,24 @@ impl Harness {
     /// Locate a visible application entry in at most 256 recorded log versions.
     /// A foreign prefix is accepted only when installed atomically with the
     /// conversation's first tracked runtime snapshot; later appends must be local.
-    fn application_entry_cut(
+    fn application_entry_cut_unverified(
         &self,
         id: Uuid,
         entry_id: Uuid,
-    ) -> Result<(u64, u64, Vec<crate::application_entry::ApplicationEntry>), Error> {
+    ) -> Result<
+        (
+            u64,
+            u64,
+            Vec<crate::application_entry::ApplicationEntry>,
+            Option<(u64, Vec<crate::application_entry::ApplicationEntry>)>,
+        ),
+        Error,
+    > {
         let key = crate::application_entry::key(id);
         let versions = self.owner.store().application_history(&key, 257)?;
         let mut previous: Vec<crate::application_entry::ApplicationEntry> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut inherited = None;
         for (revision, sequence, snapshot) in versions.into_iter().take(256) {
             let sequence = sequence.ok_or(crate::fork::Error::InvalidSnapshot)?;
             let entries: Vec<crate::application_entry::ApplicationEntry> =
@@ -2427,6 +2436,7 @@ impl Harness {
                 if first != Some(sequence) || snapshot.as_ref().map(|s| s.0) != Some(sequence) {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
+                inherited = Some((sequence, entries.clone()));
             }
             for entry in added {
                 if entry.id.is_nil() || entry.conversation_id.is_nil() || !seen.insert(entry.id) {
@@ -2435,11 +2445,40 @@ impl Harness {
             }
             if let Some(index) = added.iter().position(|entry| entry.id == entry_id) {
                 let index = previous.len() + index;
-                return Ok((revision, sequence, entries[..=index].to_vec()));
+                let visible = entries[..=index].to_vec();
+                if let Some((_, prefix)) = &mut inherited {
+                    prefix.truncate(visible.len());
+                }
+                return Ok((revision, sequence, visible, inherited));
             }
             previous = entries;
         }
         Err(crate::fork::Error::InvalidCursor.into())
+    }
+
+    // Every inherited prefix, including one preceding a local selection, must
+    // match an older origin history. Strictly decreasing commit sequences also
+    // make forged cycles fail closed.
+    fn application_entry_cut(
+        &self,
+        id: Uuid,
+        entry_id: Uuid,
+    ) -> Result<(u64, u64, Vec<crate::application_entry::ApplicationEntry>), Error> {
+        let (revision, sequence, visible, mut inherited) =
+            self.application_entry_cut_unverified(id, entry_id)?;
+        for _ in 0..256 {
+            let Some((installed, prefix)) = inherited else {
+                return Ok((revision, sequence, visible));
+            };
+            let last = prefix.last().ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let (_, origin_sequence, origin_prefix, origin_inherited) =
+                self.application_entry_cut_unverified(last.conversation_id, last.id)?;
+            if origin_sequence >= installed || origin_prefix != prefix {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            inherited = origin_inherited;
+        }
+        Err(crate::fork::Error::InvalidSnapshot.into())
     }
 
     /// Fork a visible task application entry, including a proven inherited
