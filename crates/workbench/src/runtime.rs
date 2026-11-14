@@ -257,7 +257,11 @@ impl Runtime {
             }
             commands.push(entry);
         }
+        let mut prompt_surrogates = Vec::new();
         for (name, prompt) in &self.resources.prompts {
+            if let Some(unit) = prompt.fallback_surrogate {
+                prompt_surrogates.push(json!([commands.len(), unit]));
+            }
             commands.push(json!({
                 "name": name,
                 "description": prompt.description,
@@ -273,7 +277,11 @@ impl Runtime {
                 "sourceInfo": ResourceOrigin::source_info(&skill.path, &self.resource_origins.skills).unwrap_or_else(|| source_info(&skill.path, &self.resources.packages.skills)),
             }));
         }
-        json!({"commands":commands})
+        let mut catalog = json!({"commands":commands});
+        if !prompt_surrogates.is_empty() {
+            catalog["_pi_rs_prompt_surrogates"] = json!(prompt_surrogates);
+        }
+        catalog
     }
 
     pub fn agent<'a>(&'a self, args: &'a Cli, session: &Session) -> Agent<'a> {

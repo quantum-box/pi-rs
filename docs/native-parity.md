@@ -958,6 +958,11 @@ packages indexed by older versions gain their declared themes without a build.
 An explicit Pi `package.json` resource list contributes themes only and prevents
 previously cached native resources from being loaded. Unreadable local manifests
 are skipped instead of falling back to cached resources.
+When an in-progress package command is cancelled, the host requests termination
+of its process group (or Windows job) while the direct child is still owned. The
+host retains the child identity until inherited output pipes close, including when
+the parent has already exited. This does not impose a deadline on all share
+context preparation or cover processes that detach or close their inherited pipes.
 
 ### System prompt checkpoint
 
@@ -978,10 +983,10 @@ Prompt template parsing strips one leading BOM and applies ECMAScript trim to
 the body after frontmatter. When no explicit description is present, the first
 nonblank line uses ECMAScript whitespace rules and the first 60 UTF-16 code
 units, as in Pi.
-If the cutoff splits a surrogate pair, Rust's UTF-8 strings replace the unpaired
-surrogate with U+FFFD. Pi retains the unpaired UTF-16 unit and RPC `get_commands`
-serializes it as a `\ud83d`-style JSON escape, so that boundary is not RPC
-parity; native RPC returns U+FFFD. Prompt bodies and explicit descriptions are
+If the cutoff splits a surrogate pair, RPC `get_commands` preserves the unpaired
+UTF-16 unit as a `\ud83d`-style JSON escape, as Pi does. Native display uses
+U+FFFD for the unpaired unit because its strings contain valid UTF-8; actual
+U+FFFD characters remain distinct. Prompt bodies and explicit descriptions are
 not truncated.
 Declared `SKILL.md` files with missing descriptions report both the
 description problem and any invalid name diagnostics; unreadable skill files
@@ -1611,7 +1616,11 @@ File edits preserve UTF-8 BOMs and the file's LF/CRLF convention. Matching first
 uses exact text, then Pi-compatible Unicode normalization, quote/dash handling
 and trailing-space normalization. If fuzzy matching is needed, only touched
 line blocks are rewritten from the normalized view. Other line content retains
-its original characters and whitespace.
+its original characters and whitespace. Fuzzy trailing-space matching follows
+ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
+U+0085 in an edit target therefore cannot cause a fuzzy match and file rewrite.
+Local and injected edit regressions verify that this mismatch leaves the file
+or backend untouched.
 
 Batch input accepts arrays, a single edit object or a JSON-encoded array/object.
 Legacy replacements can accompany a batch. All replacements match the same

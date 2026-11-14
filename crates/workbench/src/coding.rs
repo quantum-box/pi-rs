@@ -5128,6 +5128,71 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_does_not_remove_u0085_via_fuzzy_match() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.txt");
+        let original = "alpha\u{0085}\nbeta\n";
+        std::fs::write(&path, original).unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let error = tool
+            .edit(&json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Config(message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn injected_edit_does_not_write_for_u0085_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Backend(AtomicUsize);
+        #[async_trait::async_trait]
+        impl EditOperations for Backend {
+            async fn access(&self, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+                Ok("alpha\u{0085}\nbeta\n".as_bytes().to_vec())
+            }
+            async fn write_file(&self, _: &Path, _: &str) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn write_if_unchanged(
+                &self,
+                _: &Path,
+                _: &[u8],
+                _: &str,
+            ) -> Result<ConditionalEdit> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ConditionalEdit::Applied)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(Backend(AtomicUsize::new(0)));
+        let tool = create_edit_tool(&root.path().canonicalize().unwrap(), backend.clone()).unwrap();
+        let result = tool
+            .invoke(
+                json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(ref message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn directory_output_sorts_case_insensitively_and_reports_limits() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
