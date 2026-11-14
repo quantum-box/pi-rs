@@ -7568,8 +7568,7 @@ impl Harness {
         root: Uuid,
     ) -> Result<Vec<crate::nested::PendingJob>, Error> {
         let (c, _) = self.load(id)?;
-        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
-        {
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root) {
             return Err(Error::Invalid(
                 "conversation is not blocked on this operation".into(),
             ));
@@ -7588,8 +7587,7 @@ impl Harness {
         outcome: Outcome,
     ) -> Result<(), Error> {
         let (c, version) = self.load(id)?;
-        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
-        {
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root) {
             return Err(Error::Invalid(
                 "conversation is not blocked on this operation".into(),
             ));
@@ -7616,8 +7614,7 @@ impl Harness {
         reason: String,
     ) -> Result<(), Error> {
         let (c, version) = self.load(id)?;
-        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
-        {
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root) {
             return Err(Error::Invalid(
                 "conversation is not blocked on this operation".into(),
             ));
@@ -8397,9 +8394,8 @@ impl Scheduler {
         reference: &str,
         outcome: Outcome,
     ) -> Result<(), Error> {
-        self.harness.reconcile_nested_pending(
-            id, root, operation, reference, outcome,
-        )
+        self.harness
+            .reconcile_nested_pending(id, root, operation, reference, outcome)
     }
     pub fn cancel_nested_pending(
         &mut self,

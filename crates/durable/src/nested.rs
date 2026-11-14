@@ -86,13 +86,10 @@ pub(crate) fn resolve_pending(
     use crate::runtime::Error;
     if !matches!(
         outcome,
-        Outcome::Succeeded(_)
-            | Outcome::SucceededWithDetails { .. }
-            | Outcome::Failed(_)
+        Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } | Outcome::Failed(_)
     ) {
         return Err(Error::Invalid(
-            "nested reconciliation requires a known terminal outcome"
-                .into(),
+            "nested reconciliation requires a known terminal outcome".into(),
         ));
     }
     let mut found = None;
@@ -100,16 +97,13 @@ pub(crate) fn resolve_pending(
         let record: Record = serde_json::from_slice(&entry.value)?;
         if record.operation_id == operation {
             if found.is_some() {
-                return Err(Error::Invalid(
-                    "duplicate nested operation ID".into(),
-                ));
+                return Err(Error::Invalid("duplicate nested operation ID".into()));
             }
             found = Some((key, entry, record));
         }
     }
-    let (key, entry, mut record) = found.ok_or_else(|| {
-        Error::Invalid("nested operation not found".into())
-    })?;
+    let (key, entry, mut record) =
+        found.ok_or_else(|| Error::Invalid("nested operation not found".into()))?;
     let resolution = Resolution {
         reference: reference.into(),
         outcome: outcome.clone(),
@@ -117,9 +111,7 @@ pub(crate) fn resolve_pending(
     };
     if let Some(existing) = &record.resolution {
         if *existing != resolution {
-            return Err(Error::Invalid(
-                "conflicting nested resolution".into(),
-            ));
+            return Err(Error::Invalid("conflicting nested resolution".into()));
         }
         // Check the conversation even on a retry.
         store.commit(
@@ -729,20 +721,56 @@ mod tests {
         let conversation = b"conversation-fence".to_vec();
         let key = format!("nested/{root}/{root}/00000000000000000000").into_bytes();
         let record = Record {
-            name: "job".into(), arguments: serde_json::json!({}),
-            prepared: serde_json::json!({}), policy: ReplayPolicy::Unsafe,
+            name: "job".into(),
+            arguments: serde_json::json!({}),
+            prepared: serde_json::json!({}),
+            policy: ReplayPolicy::Unsafe,
             operation_id: operation,
-            outcome: Some(Outcome::Pending { reference: "opaque".into() }),
+            outcome: Some(Outcome::Pending {
+                reference: "opaque".into(),
+            }),
             resolution: None,
         };
-        store.commit(&[], &[
-            Mutation::Put { key: conversation.clone(), value: vec![1] },
-            Mutation::Put { key: key.clone(), value: serde_json::to_vec(&record).unwrap() },
-        ]).unwrap();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: conversation.clone(),
+                        value: vec![1],
+                    },
+                    Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&record).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
         let stale = store.get(&conversation).unwrap().unwrap().version;
-        store.commit(&[], &[Mutation::Put { key: conversation.clone(), value: vec![2] }]).unwrap();
-        assert!(resolve_pending(&store, conversation, stale, root, operation, "opaque", Outcome::Succeeded("done".into()), false).is_err());
-        let retained: Record = serde_json::from_slice(&store.get(&key).unwrap().unwrap().value).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: conversation.clone(),
+                    value: vec![2],
+                }],
+            )
+            .unwrap();
+        assert!(
+            resolve_pending(
+                &store,
+                conversation,
+                stale,
+                root,
+                operation,
+                "opaque",
+                Outcome::Succeeded("done".into()),
+                false
+            )
+            .is_err()
+        );
+        let retained: Record =
+            serde_json::from_slice(&store.get(&key).unwrap().unwrap().value).unwrap();
         assert_eq!(retained.outcome, record.outcome);
     }
 
