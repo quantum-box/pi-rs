@@ -490,9 +490,88 @@ fn permanent_quota_value(value: &Value) -> bool {
         })
 }
 
+// Keep only complete, directly nested error fields observed before an EOF at
+// the bounded prefix. Unrelated metadata and incomplete values are ignored.
+fn quota_prefix_value(body: &[u8]) -> Option<Value> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+    use std::fmt;
+    struct Root<'a>(&'a mut serde_json::Map<String, Value>);
+    struct Fields<'a>(&'a mut serde_json::Map<String, Value>);
+    impl<'de> DeserializeSeed<'de> for Root<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            struct RootVisitor<'a>(&'a mut serde_json::Map<String, Value>);
+            impl<'de> Visitor<'de> for RootVisitor<'_> {
+                type Value = ();
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("error envelope")
+                }
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<(), M::Error> {
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "error" {
+                            self.0.clear();
+                            map.next_value_seed(Fields(self.0))?;
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            d.deserialize_map(RootVisitor(self.0))
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Fields<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            struct FieldsVisitor<'a>(&'a mut serde_json::Map<String, Value>);
+            impl<'de> Visitor<'de> for FieldsVisitor<'_> {
+                type Value = ();
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("error fields")
+                }
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<(), M::Error> {
+                    while let Some(key) = map.next_key::<String>()? {
+                        if matches!(key.as_str(), "message" | "code" | "type" | "errorMessage") {
+                            self.0.remove(&key);
+                            let value = map.next_value::<Value>()?;
+                            self.0.insert(key, value);
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            d.deserialize_map(FieldsVisitor(self.0))
+        }
+    }
+    let mut fields = serde_json::Map::new();
+    let mut de = serde_json::Deserializer::from_slice(body);
+    match Root(&mut fields).deserialize(&mut de) {
+        Err(error) if error.is_eof() && !fields.is_empty() => Some(Value::Object(fields)),
+        _ => None,
+    }
+}
+
 fn permanent_quota_error(body: &[u8], complete: bool) -> bool {
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => permanent_quota_value(&value),
+        Err(_) if !complete && String::from_utf8_lossy(body).trim_start().starts_with('{') => {
+            quota_prefix_value(body).is_some_and(|value| permanent_quota_value(&value))
+        }
         Err(_)
             if String::from_utf8_lossy(body)
                 .trim_start()
@@ -1498,6 +1577,86 @@ mod tests {
             assert!(!error.to_string().contains("sentinel-secret"));
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn bounded_http_error_keeps_complete_quota_field() {
+        use std::io::{Read, Write};
+        for permanent in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).unwrap();
+                let kind = if permanent {
+                    "insufficient_quota"
+                } else {
+                    "overloaded_error"
+                };
+                let body = format!(
+                    "{{\"error\":{{\"type\":\"{kind}\",\"request_id\":\"billing-{}\"}}}}",
+                    "x".repeat(70_000)
+                );
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 503 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .unwrap()
+                        .get(format!("http://{address}/")),
+                ))
+                .unwrap_err();
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            assert!(!error.to_string().contains("billing-"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_json_retains_only_complete_error_fields() {
+        let long = "x".repeat(70_000);
+        for prefix in [
+            r#"{"error":{"type":"insufficient_quota","detail":""#,
+            r#"{"request_id":"other","error":{"message":"quota exceeded","extra":""#,
+        ] {
+            let body = format!("{prefix}{long}\"}}}}");
+            assert!(super::permanent_quota_error(
+                &body.as_bytes()[..64 * 1024],
+                false
+            ));
+        }
+        for prefix in [
+            r#"{"request_id":"billing","error":{"message":"temporary","extra":""#,
+            r#"{"error":{"metadata":{"type":"insufficient_quota"},"message":"temporary","extra":""#,
+            r#"{"error":{"message":"billing"#,
+            r#"{"error":{"type":"insufficient_quota","type":""#,
+        ] {
+            let body = format!("{prefix}{long}");
+            assert!(!super::permanent_quota_error(
+                &body.as_bytes()[..64 * 1024],
+                false
+            ));
+        }
+        assert!(!super::permanent_quota_error(
+            br#"{"error":{"type":"insufficient_quota",!"#,
+            false
+        ));
     }
 
     use super::*;

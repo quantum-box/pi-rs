@@ -4259,4 +4259,6 @@ request identifiers and other metadata. Those failures
 stop agent retries; transient rate limits remain retryable. Response bodies are
 not surfaced or logged. Classification falls back to the existing retry behavior
 when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Complete error fields preceding a truncated later JSON field remain classifiable;
+unrelated metadata and incomplete values are ignored.
 Other provider adapters still need equivalent quota classification.
