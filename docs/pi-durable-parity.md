@@ -176,3 +176,13 @@ this generation hook. Unlike upstream pi-ai, provider-internal HTTP retries or
 body rebuilds are not intercepted; adapters must avoid hidden rebuilds or guard
 them themselves. This interface does not retrofit built-in provider clients,
 settlement, exactly-once network execution, or automatic adapter installation.
+
+**Generic task wake hints:** `task_driver::Driver::subscribe_wake` provides one
+capacity-one, coalescing channel, initially signaled to cover recovery and
+signaled after admissions, scheduling progress and registry changes. Hosts must
+inspect durable state after a hint; hints can be spurious and the channel closes
+on shutdown or failure. Delivery does not invoke host callbacks. Unlike upstream
+[`HarnessOptions.onWake`](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md),
+this is not an `{ active, at }` change subscription, does not describe deadlines
+or replace timers, and covers only the generic task driver. The driver continues
+to poll and run work; it is not a host-managed hibernation or alarm API.

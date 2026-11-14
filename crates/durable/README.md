@@ -667,3 +667,14 @@ per-conversation here, rather than upstream's harness setting. Historical
 snapshots predating this setting default to `Keep`; inheritance by independently
 created or task-owned children is not implemented. Existing failure reasons and
 supported failure paths remain those of this runtime.
+
+### Generic task wake hints
+
+`Driver::subscribe_wake()` takes the driver's single capacity-one channel. It is
+initially signaled so a subscriber can inspect recovered work, and later hints
+cover admissions, scheduling progress, and registry changes. Hints coalesce and
+may be spurious; inspect durable state after receiving. The channel closes when
+the driver shuts down or fails, and taking the subscription is one-shot. No host
+callback runs from the driver. Unlike upstream `onWake`, these hints do not give
+an active/deadline snapshot or replace the driver's polling and timers, and do
+not cover conversation scheduling. They are not a durable alarm mechanism.

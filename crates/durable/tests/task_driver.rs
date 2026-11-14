@@ -358,3 +358,112 @@ async fn typed_delivery_wakes_background_task() {
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
+
+#[test]
+fn wake_subscription_recovers_unblocks_coalesces_and_closes() {
+    use pi_rs_durable::{task_driver::Driver, task_scheduler};
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("test".into(), true);
+    let scheduler = task_scheduler::Scheduler::open(&path, registry()).unwrap();
+    scheduler.submit(&task).unwrap();
+    drop(scheduler);
+    let scheduler = task_scheduler::Scheduler::open(&path, Registry::default()).unwrap();
+    let driver = Driver::start(scheduler);
+    let rx = driver.subscribe_wake().unwrap().unwrap();
+    assert!(driver.subscribe_wake().unwrap().is_none());
+    rx.recv_timeout(Duration::from_secs(5)).unwrap(); // recovery, even if already scanned
+    driver.replace_registry(registry()).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap(); // unblocked
+    // A host can reenter the driver after receiving, without callback lock inversion.
+    assert!(driver.get(task.id()).unwrap().is_some());
+    // Repeated notifications never accumulate beyond one.
+    for _ in 0..100 {
+        driver.replace_registry(registry()).unwrap();
+    }
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Stop first, so the worker cannot race this capacity check.
+    driver.shutdown().unwrap();
+    while rx.try_recv().is_ok() {}
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+}
+
+#[tokio::test]
+async fn wake_subscription_sees_concurrent_admission_and_shutdown() {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "m".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let driver = Arc::new(scheduler.start_tasks(registry()).unwrap());
+    let rx = driver.subscribe_wake().unwrap().unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(conversation),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("test".into(), true);
+    let d = driver.clone();
+    let submit = std::thread::spawn(move || d.submit(&task));
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    submit.join().unwrap().unwrap();
+    Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    while rx.try_recv().is_ok() {}
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    scheduler.shutdown().await.unwrap();
+}
+
+#[test]
+fn wake_channel_is_bounded_and_closes_on_handler_panic() {
+    use pi_rs_durable::{task_driver::Driver, task_scheduler};
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = Registry::default();
+    registry.register("panic", true, |_: &Task| -> Result<Step, String> {
+        panic!("handler panic")
+    });
+    let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("panic".into(), true);
+    scheduler.submit(&task).unwrap();
+    let driver = Driver::start(scheduler);
+    let rx = driver.subscribe_wake().unwrap().unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    assert!(driver.shutdown().is_err());
+}

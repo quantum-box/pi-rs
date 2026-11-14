@@ -9,7 +9,10 @@ use crate::{
 use durable_store::owner::OwnedStore;
 use std::{
     collections::HashMap,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -37,6 +40,8 @@ pub(crate) struct Shared {
     wake: Condvar,
     harness: Option<Mutex<crate::runtime::Harness>>,
     cleanup_stop: pi_rs_core::CancellationToken,
+    notifications: Mutex<Option<SyncSender<()>>>,
+    subscription: Mutex<Option<Receiver<()>>>,
 }
 #[derive(Default)]
 struct State {
@@ -69,6 +74,9 @@ impl Driver {
         let owner = scheduler.owner();
         let policies = scheduler.policies();
         let definitions = scheduler.definitions();
+        let (notify_tx, notify_rx) = mpsc::sync_channel(1);
+        // Seed the subscription so recovery before subscription cannot be missed.
+        let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
             owner,
@@ -80,9 +88,19 @@ impl Driver {
             wake: Condvar::new(),
             harness: harness.map(Mutex::new),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(Some(notify_tx)),
+            subscription: Mutex::new(Some(notify_rx)),
         });
         let task_shared = shared.clone();
         let worker = thread::spawn(move || {
+            // Close the host channel even if a handler panics.
+            struct CloseOnExit(Arc<Shared>);
+            impl Drop for CloseOnExit {
+                fn drop(&mut self) {
+                    self.0.close_notifications();
+                }
+            }
+            let _close = CloseOnExit(task_shared.clone());
             loop {
                 if task_shared.state.lock().map_or(true, |s| s.stop) {
                     break;
@@ -98,13 +116,17 @@ impl Driver {
                     .map_err(|_| "task scheduler lock poisoned".to_string())
                     .and_then(|mut scheduler| scheduler.tick(now).map_err(|e| e.to_string()));
                 match result {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        task_shared.notify_host();
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         if let Ok(mut state) = task_shared.state.lock() {
                             state.failure = Some(error);
                             state.stop = true;
                         }
+                        task_shared.close_notifications();
                         break;
                     }
                 }
@@ -128,6 +150,19 @@ impl Driver {
             worker: Some(worker),
             cleanup,
         }
+    }
+    /// Take the driver's single, capacity-one work-change subscription. The first
+    /// hint is immediate, including when work was recovered before subscription.
+    /// Hints coalesce and may be spurious; inspect durable state after receiving.
+    /// The channel closes on shutdown or driver failure. Taking it is one-shot.
+    pub fn subscribe_wake(&self) -> Result<Option<Receiver<()>>, Error> {
+        let _state = self.check()?;
+        Ok(self
+            .shared
+            .subscription
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .take())
     }
     pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
         Arc::downgrade(&self.shared)
@@ -181,7 +216,7 @@ impl Driver {
         TaskStore::new(self.shared.owner.store())
             .save(&[Save::Create(task)])
             .map_err(task_scheduler::Error::from)?;
-        self.shared.wake.notify_one();
+        self.shared.notify_work();
         Ok(())
     }
     /// Replace the complete registry at a scheduling boundary. This waits for
@@ -196,9 +231,10 @@ impl Driver {
             state.failure = Some(error.to_string());
             state.stop = true;
             self.shared.wake.notify_all();
+            self.shared.close_notifications();
             return Err(error.into());
         }
-        self.shared.wake.notify_one();
+        self.shared.notify_work();
         Ok(())
     }
 
@@ -239,7 +275,7 @@ impl Driver {
                 .map_err(|_| Error::Poisoned)?;
             task_scheduler::request_abort_subtree(&TaskStore::new(self.shared.owner.store()), id)?;
         }
-        self.shared.wake.notify_one();
+        self.shared.notify_work();
         Ok(())
     }
     pub fn signal(&self, signal: &Signal) -> Result<(), Error> {
@@ -247,7 +283,7 @@ impl Driver {
         TaskStore::new(self.shared.owner.store())
             .send_signal(signal)
             .map_err(task_scheduler::Error::from)?;
-        self.shared.wake.notify_one();
+        self.shared.notify_work();
         Ok(())
     }
     /// Deliver a typed signal and wake the background scheduler when accepted.
@@ -263,7 +299,7 @@ impl Driver {
             .deliver_signal(task_id, token, key, value)
             .map_err(task_scheduler::Error::from)?;
         if result == task_store::SignalResult::Delivered {
-            self.shared.wake.notify_one();
+            self.shared.notify_work();
         }
         Ok(result)
     }
@@ -324,6 +360,7 @@ impl Driver {
         self.stop_worker();
     }
     fn stop_worker(&self) {
+        self.shared.close_notifications();
         if let Ok(mut state) = self.shared.state.lock() {
             state.stop = true;
             self.shared.wake.notify_all();
@@ -441,9 +478,28 @@ fn fail_cleanup(shared: &Shared, error: String) {
         shared.wake.notify_all();
     }
     shared.cleanup_stop.cancel();
+    shared.close_notifications();
 }
 
 impl Shared {
+    fn notify_host(&self) {
+        if let Ok(mut sender) = self.notifications.lock() {
+            if let Some(tx) = sender.as_ref() {
+                if matches!(tx.try_send(()), Err(TrySendError::Disconnected(_))) {
+                    *sender = None;
+                }
+            }
+        }
+    }
+    fn notify_work(&self) {
+        self.wake.notify_one();
+        self.notify_host();
+    }
+    fn close_notifications(&self) {
+        if let Ok(mut sender) = self.notifications.lock() {
+            sender.take();
+        }
+    }
     pub(crate) fn with_admission<T>(
         &self,
         tasks: &[Task],
@@ -488,7 +544,7 @@ impl Shared {
         }
         let result = f();
         if result.is_ok() {
-            self.wake.notify_one();
+            self.notify_work();
         }
         result
     }
@@ -507,7 +563,7 @@ impl Shared {
                 state.failure.as_deref().unwrap_or("shutdown")
             )));
         }
-        self.wake.notify_one();
+        self.notify_work();
         Ok(())
     }
 
@@ -550,7 +606,7 @@ impl Shared {
             .map_err(|_| crate::runtime::Error::Failed)?;
         let result = f();
         if result.is_ok() {
-            self.wake.notify_one();
+            self.notify_work();
         }
         result
     }
@@ -579,6 +635,36 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn wake_hints_are_bounded_and_shutdown_races_are_safe() {
+        use std::sync::mpsc::TryRecvError;
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), Default::default()).unwrap();
+        let driver = Driver::start(scheduler);
+        let rx = driver.subscribe_wake().unwrap().unwrap();
+        rx.try_recv().unwrap();
+        for _ in 0..1000 {
+            driver.shared.notify_host();
+        }
+        rx.try_recv().unwrap();
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        let shared = driver.shared.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let notifying = thread::spawn(move || {
+            other_barrier.wait();
+            for _ in 0..1000 {
+                shared.notify_host();
+            }
+        });
+        barrier.wait();
+        driver.shutdown().unwrap();
+        notifying.join().unwrap();
+        while rx.try_recv().is_ok() {}
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
     fn hook_commit_and_registry_replacement_are_fenced() {
         let dir = tempfile::tempdir().unwrap();
         let handler: Arc<dyn task_scheduler::Handler> =
@@ -599,6 +685,8 @@ mod tests {
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(None),
+            subscription: Mutex::new(None),
         });
         let conversation = Uuid::new_v4();
         let child = Task::new(
@@ -876,6 +964,8 @@ mod tests {
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
+            notifications: Mutex::new(None),
+            subscription: Mutex::new(None),
         });
         let gate = shared.owner.conversation_controls().get(conversation).gate;
         let driver = Driver {
