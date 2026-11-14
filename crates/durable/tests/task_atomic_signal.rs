@@ -732,7 +732,12 @@ fn signal_commit_process_child() {
     assert!(scheduler.tick(99).unwrap());
     assert_eq!(*results.lock().unwrap(), vec![SignalResult::Delivered]);
     assert_eq!(
-        scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().checkpoint().phase,
+        scheduler
+            .get(Uuid::from_u128(1))
+            .unwrap()
+            .unwrap()
+            .checkpoint()
+            .phase,
         "done",
         "staged delivery did not commit"
     );
