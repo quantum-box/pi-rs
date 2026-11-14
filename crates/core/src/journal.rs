@@ -3559,6 +3559,44 @@ mod record_metadata_tests {
     }
 
     #[test]
+    fn fork_invalidates_overflow_boundary_on_another_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let abandoned = session.head();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":abandoned,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let entry = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(entry.get("boundary").is_none());
+    }
+
+    #[test]
     fn metadata_envelope_rejects_duplicate_record_fields() {
         let record = Session::with_store(MemoryStore::default())
             .unwrap()
