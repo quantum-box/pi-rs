@@ -2,7 +2,7 @@
 //!
 //! A committed phase is the authority for recovery. External calls never run
 //! inside storage transactions. Independent conversations can run concurrently.
-pub use crate::state::InputMode;
+pub use crate::state::{AdmissionError, AdmissionOptions, InputMode};
 use crate::{
     model::{
         CompletedGeneration, GenerationProgress, collect_generation_with_metadata, model_request,
@@ -51,6 +51,8 @@ pub enum Error {
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
     NotFound,
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
     #[error("session failed; reopen before further operations")]
     Failed,
     #[error("execution interrupted; reopen to recover")]
@@ -850,6 +852,24 @@ impl Harness {
         content: String,
         mode: InputMode,
     ) -> Result<Uuid, Error> {
+        self.submit_with_options(
+            id,
+            request_id,
+            content,
+            AdmissionOptions {
+                mode,
+                ..Default::default()
+            },
+        )
+    }
+    /// Persist an input with optional busy and idle rejection policies.
+    pub fn submit_with_options(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+    ) -> Result<Uuid, Error> {
         if request_id
             .as_deref()
             .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
@@ -858,7 +878,7 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal(id, request_id, content, mode)
+        self.submit_internal_with_options(id, request_id, content, options)
     }
     pub(crate) fn submit_internal(
         &mut self,
@@ -866,6 +886,23 @@ impl Harness {
         request_id: Option<String>,
         content: String,
         mode: InputMode,
+    ) -> Result<Uuid, Error> {
+        self.submit_internal_with_options(
+            id,
+            request_id,
+            content,
+            AdmissionOptions {
+                mode,
+                ..Default::default()
+            },
+        )
+    }
+    fn submit_internal_with_options(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
     ) -> Result<Uuid, Error> {
         if content.trim().is_empty() {
             return Err(Error::Invalid("empty input".into()));
@@ -879,6 +916,13 @@ impl Harness {
                     .find(|s| s.request_id.as_ref() == Some(key))
             {
                 return Ok(s.id);
+            }
+            let busy = c.active.is_some();
+            if busy && options.reject_when_busy {
+                return Err(AdmissionError::Busy.into());
+            }
+            if !busy && options.reject_when_idle {
+                return Err(AdmissionError::Idle.into());
             }
             let sid = Uuid::new_v4();
             let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
@@ -898,7 +942,7 @@ impl Harness {
                     Status::Queued
                 },
             });
-            c.input_modes.insert(sid, mode);
+            c.input_modes.insert(sid, options.mode);
             if place_now {
                 c.active = Some(sid);
                 c.messages.push(Message::User {
@@ -2494,6 +2538,20 @@ impl Scheduler {
         let submission = self
             .harness
             .submit_with_mode(id, request_id, content, mode)?;
+        self.schedule(id);
+        Ok(submission)
+    }
+    /// Admit with policies and schedule only after a successful admission.
+    pub fn submit_with_options(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_with_options(id, request_id, content, options)?;
         self.schedule(id);
         Ok(submission)
     }

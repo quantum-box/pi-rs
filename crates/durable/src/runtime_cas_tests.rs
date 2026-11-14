@@ -203,3 +203,154 @@ fn submissions_racing_abort_are_neither_lost_nor_duplicated() {
         );
     }
 }
+#[test]
+fn admission_policies_race_and_recover_with_idempotency() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let idle_reject = AdmissionOptions {
+        reject_when_idle: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        owner.submit_with_options(id, Some("idle".into()), "x".into(), idle_reject),
+        Err(Error::Admission(AdmissionError::Idle))
+    ));
+    assert!(owner.conversation(id).unwrap().submissions.is_empty());
+
+    let barrier = Arc::new(std::sync::Barrier::new(12));
+    let threads: Vec<_> = (0..12)
+        .map(|i| {
+            let mut worker = owner.worker();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                worker.submit_with_options(
+                    id,
+                    Some(format!("key-{i}")),
+                    "work".into(),
+                    AdmissionOptions {
+                        reject_when_busy: true,
+                        ..Default::default()
+                    },
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::Admission(AdmissionError::Busy))))
+            .count(),
+        11
+    );
+    let winning_index = results.iter().position(Result::is_ok).unwrap();
+    let winner = *results[winning_index].as_ref().unwrap();
+    let both = AdmissionOptions {
+        reject_when_busy: true,
+        reject_when_idle: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        owner
+            .submit_with_options(
+                id,
+                Some(format!("key-{winning_index}")),
+                "changed".into(),
+                both
+            )
+            .unwrap(),
+        winner
+    );
+    let queued = owner
+        .submit_with_options(
+            id,
+            Some("idle".into()),
+            "steer".into(),
+            AdmissionOptions {
+                mode: InputMode::Steer,
+                ..idle_reject
+            },
+        )
+        .unwrap();
+    assert_ne!(winner, queued);
+    drop(owner);
+    let mut reopened = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(reopened.conversation(id).unwrap().submissions.len(), 2);
+    assert_eq!(
+        reopened
+            .submit_with_options(
+                id,
+                Some(format!("key-{winning_index}")),
+                "again".into(),
+                both
+            )
+            .unwrap(),
+        winner
+    );
+    assert!(matches!(
+        reopened.submit_with_options(id, None, "new".into(), both),
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    // Settling the active run makes idle rejection apply even with retained queued work.
+    let (mut state, version) = reopened.load(id).unwrap();
+    finish_failure(&mut state, "failure".into());
+    reopened.save(&state, Expected::Version(version)).unwrap();
+    assert_eq!(
+        reopened
+            .submit_with_options(id, Some("idle".into()), "retry".into(), both)
+            .unwrap(),
+        queued
+    );
+    assert!(matches!(
+        reopened.submit_with_options(id, None, "new".into(), both),
+        Err(Error::Admission(AdmissionError::Idle))
+    ));
+    assert_eq!(reopened.conversation(id).unwrap().submissions.len(), 2);
+}
+
+#[test]
+fn concurrent_same_request_wins_before_busy_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(10));
+    let threads: Vec<_> = (0..10)
+        .map(|_| {
+            let mut worker = owner.worker();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                worker
+                    .submit_with_options(
+                        id,
+                        Some("same".into()),
+                        "input".into(),
+                        AdmissionOptions {
+                            reject_when_busy: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    assert_eq!(owner.conversation(id).unwrap().submissions.len(), 1);
+}

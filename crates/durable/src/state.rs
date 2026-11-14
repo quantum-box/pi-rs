@@ -11,6 +11,32 @@ pub enum InputMode {
     FollowUp,
 }
 
+/// Optional input admission policies. Defaults preserve ordinary follow-up admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionOptions {
+    pub mode: InputMode,
+    pub reject_when_busy: bool,
+    pub reject_when_idle: bool,
+}
+
+impl Default for AdmissionOptions {
+    fn default() -> Self {
+        Self {
+            mode: InputMode::FollowUp,
+            reject_when_busy: false,
+            reject_when_idle: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AdmissionError {
+    #[error("conversation is busy")]
+    Busy,
+    #[error("conversation is idle")]
+    Idle,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubmissionStatus {
     Queued,
@@ -63,21 +89,44 @@ impl ConversationState {
     /// Match upstream request-ID admission: reuse an existing input even if the
     /// resent content differs. IDs are scoped to this conversation.
     pub fn submit(&mut self, request_id: Option<String>, content: String, mode: InputMode) -> Uuid {
+        self.submit_with_options(
+            request_id,
+            content,
+            AdmissionOptions {
+                mode,
+                ..Default::default()
+            },
+        )
+        .expect("default admission cannot reject")
+    }
+
+    pub fn submit_with_options(
+        &mut self,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+    ) -> Result<Uuid, AdmissionError> {
         if let Some(key) = request_id.as_ref()
             && let Some(existing) = self
                 .submissions
                 .iter()
                 .find(|s| s.request_id.as_ref() == Some(key))
         {
-            return existing.id;
+            return Ok(existing.id);
+        }
+        let busy = !self.active.is_empty();
+        if busy && options.reject_when_busy {
+            return Err(AdmissionError::Busy);
+        }
+        if !busy && options.reject_when_idle {
+            return Err(AdmissionError::Idle);
         }
         let id = Uuid::new_v4();
-        let busy = !self.active.is_empty();
         self.submissions.push(Submission {
             id,
             request_id,
             content,
-            mode,
+            mode: options.mode,
             status: SubmissionStatus::Queued,
         });
         // A queued follow-up prevents a later submission jumping the queue.
@@ -89,7 +138,7 @@ impl ConversationState {
         {
             self.place(id);
         }
-        id
+        Ok(id)
     }
 
     fn place(&mut self, id: Uuid) {

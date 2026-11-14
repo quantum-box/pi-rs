@@ -11,7 +11,14 @@ and joins workers. Different conversations can run concurrently. Each
 conversation executes one operation at a time. Follow-ups wait for the run;
 `submit_with_mode` accepts durable steering at the next safe tool-round boundary. `runtime::Harness` also provides an explicitly driven
 API with `submit_and_run`, `resume`, and `open_paused`. Request IDs deduplicate
-within a conversation.
+within a conversation. `Harness`, `Scheduler`, and the lower-level
+`Conversations` helper also expose `submit_with_options`: set
+`AdmissionOptions::reject_when_busy` to refuse input while a run is active, or
+`reject_when_idle` to refuse it while no run is active. Both may be set; an
+existing request ID returns its original submission before either policy is
+checked. Rejections persist nothing, and concurrent admissions recheck their
+policies after a version conflict. The runtime still validates input before
+checking a request ID and does not expose upstream's submit-in-commit API.
 
 `Scheduler::abort` durably withdraws queued inputs and fences further local
 dispatch for that conversation; `abort_and_wait` also waits for its workers.

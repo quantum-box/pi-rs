@@ -13,6 +13,16 @@ P0 means recovery/effect safety or fundamental execution semantics; P1 means cor
 
 **Abort and reporter checkpoint:** `Scheduler::abort` persists conversation aborts, withdraws queued inputs and fences both ordinary and reporter-driven dispatch; `abort_and_wait` waits for local workers. A dispatched uncertain effect requires reconciliation even if replay-safe. Background reporter children remain independent: parent abort does not propagate through an ownership tree. See [abort tests](../crates/durable/tests/abort.rs) and [reporter tests](../crates/durable/tests/reporter_pending.rs).
 
+**Admission policy checkpoint:** `Harness`, `Scheduler`, and the state-backed
+conversation helper now support optional busy and idle rejection for input,
+with request-ID deduplication before the policy check and version-checked
+admission under contention. Busy means an active run, even when queued input
+remains after a failed run. Unlike upstream, runtime input validation still
+precedes deduplication, and arbitrary host transactions / `submit(tx, draft)`
+are not supported. See the admission concurrency and recovery tests in
+[`runtime_cas_tests.rs`](../crates/durable/src/runtime_cas_tests.rs). The
+original audit table below remains a historical baseline.
+
 | Priority / feature | Status and evidence | User-visible semantics and test method |
 | --- | --- | --- |
 | **P0 — generic tasks, ownership and crash recovery** | **Partial / missing integration.** Upstream schedules registered checkpointed tasks and owned children, including abort and restart handling ([spec §5](https://github.com/earendil-works/pi/blob/827383a15262905f82e418483825a49dbb1adbf5/packages/durable/docs/spec.md#5-tasks)). Rust has task states and persisted `task_store`, but the runtime scheduler does not execute that generic graph ([task](../crates/durable/src/task.rs), [task store](../crates/durable/src/task_store.rs), [README](../crates/durable/README.md)). | A host cannot register an upstream-style durable task and expect it or its children to run, resume, or be aborted by the conversation scheduler. Test with a real process kill before/after checkpoint, reopen with definitions, assert one logical child, bounded restart, missing-definition behavior, and parent/child terminal outcomes. Existing [recovery fixtures](../crates/durable-tests/README.md) are **not executable tests**. |

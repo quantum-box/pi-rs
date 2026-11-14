@@ -10,7 +10,7 @@ use std::sync::{
 use durable_store::{Check, Expected, Mutation, Store};
 use uuid::Uuid;
 
-use crate::state::{ConversationState, InputMode};
+use crate::state::{AdmissionOptions, ConversationState, InputMode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -20,6 +20,8 @@ pub enum Error {
     Encoding(#[from] serde_json::Error),
     #[error("conversation does not exist")]
     NotFound,
+    #[error(transparent)]
+    Admission(#[from] crate::state::AdmissionError),
     #[error("storage operation failed; reopen before further use")]
     Failed,
     #[error("conversation mutation lock poisoned")]
@@ -147,6 +149,20 @@ impl Conversations {
         self.update(id, |state| {
             state.submit(request_id.clone(), content.clone(), mode)
         })
+    }
+
+    /// Check policies and admit in the same versioned state transition.
+    pub fn submit_with_options(
+        &self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+    ) -> Result<Uuid, Error> {
+        self.update(id, |state| {
+            state.submit_with_options(request_id.clone(), content.clone(), options)
+        })?
+        .map_err(Error::from)
     }
 
     pub fn place_steer(&self, id: Uuid) -> Result<Option<Uuid>, Error> {
