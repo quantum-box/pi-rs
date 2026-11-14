@@ -584,6 +584,7 @@ pub struct TaskDocuments<'a> {
     entries: Option<PendingEntries>,
     entry_initial_len: usize,
     runtime_cut: Option<usize>,
+    runtime_config: Option<crate::runtime::Config>,
     signal: OwnedBatch,
     signal_keys: HashSet<(uuid::Uuid, String, String)>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -600,6 +601,7 @@ impl<'a> TaskDocuments<'a> {
             entries: None,
             entry_initial_len: 0,
             runtime_cut: None,
+            runtime_config: None,
             signal: OwnedBatch {
                 checks: Vec::new(),
                 mutations: Vec::new(),
@@ -766,6 +768,21 @@ impl<'a> TaskDocuments<'a> {
         Ok(())
     }
 
+    /// Stage an ordered checkpoint that changes configuration for an idle root
+    /// conversation. The new configuration is the end-of-commit agent state,
+    /// including for entries before the checkpoint. Model context is unchanged.
+    pub fn configure_runtime_at_checkpoint(
+        &mut self,
+        config: crate::runtime::Config,
+    ) -> Result<(), Error> {
+        if config.model.is_empty() || config.max_output_tokens == 0 {
+            return Err(Error::InvalidApplicationEntry);
+        }
+        self.checkpoint_runtime()?;
+        self.runtime_config = Some(config);
+        Ok(())
+    }
+
     /// Append only if the application log's last entry matches `expected`.
     /// `None` expects an empty log. Earlier entries staged in this invocation
     /// are included. Even a mismatch retains a read dependency on the observed
@@ -908,6 +925,7 @@ impl<'a> TaskDocuments<'a> {
                     self.entry_initial_len,
                     index,
                     &entries,
+                    self.runtime_config.as_ref(),
                 )?;
                 batch.checks.extend(cut.checks);
                 batch.mutations.extend(cut.mutations);

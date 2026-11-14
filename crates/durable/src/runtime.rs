@@ -965,6 +965,7 @@ pub(crate) fn prepare_ordered_task_checkpoint(
     first: usize,
     checkpoint: usize,
     entries: &[crate::application_entry::ApplicationEntry],
+    config: Option<&Config>,
 ) -> Result<crate::task_store::OwnedBatch, crate::document::Error> {
     use crate::document::Error as DError;
     let invalid = || DError::InvalidApplicationEntry;
@@ -988,6 +989,32 @@ pub(crate) fn prepare_ordered_task_checkpoint(
         .filter(|(s, _)| *s == seq)
         .ok_or_else(invalid)?;
     let old = store.get(&old_key)?.ok_or_else(invalid)?;
+    let mut root_value: serde_json::Value = serde_json::from_slice(&root.value)?;
+    let mut snapshot_value: serde_json::Value = serde_json::from_slice(&old.value)?;
+    if let Some(config) = config {
+        let state: Conversation = serde_json::from_value(root_value.clone())?;
+        if state.id != id
+            || state.abort_requested
+            || state.active.is_some()
+            || !matches!(state.phase, Phase::Idle)
+            || !state.pending_resets.is_empty()
+            || state.active_manual_compaction.is_some()
+            || state.tool_attempt.is_some()
+            || state
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+            || state
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+            || snapshot_value.get("config") != root_value.get("config")
+        {
+            return Err(invalid());
+        }
+        root_value["config"] = serde_json::to_value(config)?;
+        snapshot_value["config"] = serde_json::to_value(config)?;
+    }
     let observer = crate::observer::Observer::new(store, id);
     let head = observer.head().map_err(|_| invalid())?;
     if head.0 == 0 {
@@ -1016,7 +1043,7 @@ pub(crate) fn prepare_ordered_task_checkpoint(
     let snapshot_key = format!("{prefix}{:020}", append.cursor.0).into_bytes();
     let order_key = crate::application_entry::ordered_cut_key(id, append.cursor.0);
     let proof = crate::application_entry::OrderedCut {
-        version: 1,
+        version: if config.is_some() { 2 } else { 1 },
         previous_runtime_version: root.version,
         first_index: first,
         checkpoint_index: checkpoint,
@@ -1041,11 +1068,19 @@ pub(crate) fn prepare_ordered_task_checkpoint(
     mutations.extend([
         Mutation::Put {
             key,
-            value: root.value,
+            value: if config.is_some() {
+                serde_json::to_vec(&root_value)?
+            } else {
+                root.value
+            },
         },
         Mutation::Put {
             key: snapshot_key,
-            value: old.value,
+            value: if config.is_some() {
+                serde_json::to_vec(&snapshot_value)?
+            } else {
+                old.value
+            },
         },
         Mutation::Put {
             key: order_key,
@@ -2741,12 +2776,27 @@ impl Harness {
                 .store()
                 .get(&snapshot_key)?
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
-            if proof.version != 1
+            let snapshots_match = match proof.version {
+                1 => prior.value == current.value,
+                2 => {
+                    let mut before: serde_json::Value = serde_json::from_slice(&prior.value)?;
+                    let mut after: serde_json::Value = serde_json::from_slice(&current.value)?;
+                    let before_config = before.as_object_mut().and_then(|v| v.remove("config"));
+                    let after_config = after.as_object_mut().and_then(|v| v.remove("config"));
+                    let valid = |value: Option<serde_json::Value>| {
+                        value
+                            .and_then(|v| serde_json::from_value::<Config>(v).ok())
+                            .is_some_and(|c| !c.model.is_empty() && c.max_output_tokens > 0)
+                    };
+                    valid(before_config) && valid(after_config) && before == after
+                }
+                _ => false,
+            };
+            if !snapshots_match
                 || previous_seq >= sequence
                 || immediately_before.0 != previous_seq
                 || proof.first_index != previous_entries.len()
                 || !full.starts_with(&previous_entries)
-                || prior.value != current.value
                 || proof.first_index >= proof.checkpoint_index
                 || proof.checkpoint_index > full.len()
                 || full.get(proof.first_index..).is_none_or(|tail| {

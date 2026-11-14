@@ -3520,3 +3520,356 @@ async fn ordered_cut_rejects_forged_batch_start_and_stale_runtime_version() {
         assert!(h.fork_at_application_entry(id, second.id).is_err());
     }
 }
+
+#[tokio::test]
+async fn task_ordered_configuration_change_forks_reopen_and_retries_races() {
+    use pi_rs_durable::{
+        application_entry,
+        document::{Address, TaskDocuments},
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Writer {
+        address: Address,
+        ready: Option<std::sync::mpsc::Sender<()>>,
+        resume: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&self.address).unwrap();
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: "changed".into(),
+                system_prompt: "new".into(),
+                max_output_tokens: 64,
+            })
+            .unwrap();
+            docs.append_entry("app.after", json!(2)).unwrap();
+            docs.put(&self.address, json!({"n": 7}).as_object().unwrap().clone())
+                .unwrap();
+            if let Some(rx) = self.resume.lock().unwrap().take() {
+                self.ready.as_ref().unwrap().send(()).unwrap();
+                rx.recv().unwrap();
+            }
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "original".into(), &cancel)
+        .await
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "cut".into(),
+        key: "".into(),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "ordered",
+        true,
+        Writer {
+            address: address.clone(),
+            ready: Some(ready_tx),
+            resume: std::sync::Mutex::new(Some(resume_rx)),
+        },
+    );
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("ordered".into(), true);
+    scheduler.submit(&task).unwrap();
+    let writer = std::thread::spawn(move || {
+        scheduler.tick(0).unwrap();
+        scheduler
+    });
+    ready_rx.recv().unwrap();
+    h.submit_write(id, None, "app.race".into(), None).unwrap();
+    resume_tx.send(()).unwrap();
+    let mut scheduler = writer.join().unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(application_entry::list(&db, id).unwrap().is_empty());
+    assert!(
+        db.list(format!("durable/application-ordered-cut/{id}/").as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.document(&address).unwrap().is_none());
+    assert_eq!(h.conversation(id).unwrap().config.model, "test");
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    assert_eq!(h.conversation(id).unwrap().config.model, "changed");
+    let entries = application_entry::list(&db, id).unwrap();
+    assert_eq!(entries.len(), 2);
+    let first = h.fork_at_application_entry(id, entries[0].id).unwrap();
+    let second = h.fork_at_application_entry(id, entries[1].id).unwrap();
+    assert_eq!(application_entry::list(&db, first).unwrap(), entries[..1]);
+    assert_eq!(application_entry::list(&db, second).unwrap(), entries);
+    for child in [first, second] {
+        assert_eq!(h.conversation(child).unwrap().config.model, "changed");
+        assert_eq!(
+            h.document(&Address {
+                scope: child.to_string(),
+                ..address.clone()
+            })
+            .unwrap()
+            .unwrap()
+            .value["n"],
+            7
+        );
+        assert_eq!(
+            h.conversation(child).unwrap().messages,
+            h.conversation(id).unwrap().messages
+        );
+    }
+    drop(h);
+    drop(db);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    let grandchild = h.fork_at_application_entry(first, entries[0].id).unwrap();
+    assert_eq!(h.conversation(grandchild).unwrap().config.model, "changed");
+    assert_eq!(
+        application_entry::list(&db, grandchild).unwrap(),
+        entries[..1]
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: grandchild.to_string(),
+            ..address
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        7
+    );
+    // An untracked or missing proof cannot authorize a same-commit cut.
+    let prefix = format!("durable/application-ordered-cut/{id}/");
+    let proofs = db.list(prefix.as_bytes()).unwrap();
+    assert_eq!(proofs.len(), 1);
+    db.commit(
+        &[],
+        &[durable_store::Mutation::Delete {
+            key: proofs[0].0.clone(),
+        }],
+    )
+    .unwrap();
+    assert!(h.fork_at_application_entry(id, entries[0].id).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.fork_at_application_entry(id, entries[1].id).is_err());
+}
+
+#[test]
+fn ordered_config_process_child() {
+    use pi_rs_durable::{
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    let Ok(path) = std::env::var("PI_ORDERED_CONFIG_DB") else {
+        return;
+    };
+    struct Writer;
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: "after".into(),
+                system_prompt: "new".into(),
+                max_output_tokens: 64,
+            })
+            .unwrap();
+            docs.append_entry("app.after", json!(2)).unwrap();
+            if std::env::var_os("PI_ORDERED_CONFIG_BEFORE").is_some() {
+                std::process::exit(0);
+            }
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "before".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("ordered".into(), true);
+    let mut registry = Registry::default();
+    registry.register("ordered", true, Writer);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    std::fs::write(format!("{path}.id"), id.to_string()).unwrap();
+    scheduler.tick(0).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn ordered_config_commit_survives_process_loss() {
+    use pi_rs_durable::application_entry;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "ordered_config_process_child"])
+        .env("PI_ORDERED_CONFIG_DB", &path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let id =
+        uuid::Uuid::parse_str(&std::fs::read_to_string(format!("{}.id", path.display())).unwrap())
+            .unwrap();
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    let entries = application_entry::list(&db, id).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(h.conversation(id).unwrap().config.model, "after");
+    for (i, entry) in entries.iter().enumerate() {
+        let child = h.fork_at_application_entry(id, entry.id).unwrap();
+        assert_eq!(h.conversation(child).unwrap().config.model, "after");
+        assert_eq!(application_entry::list(&db, child).unwrap(), entries[..=i]);
+    }
+}
+
+#[test]
+fn ordered_config_staging_is_lost_on_process_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "ordered_config_process_child"])
+        .env("PI_ORDERED_CONFIG_DB", &path)
+        .env("PI_ORDERED_CONFIG_BEFORE", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let id =
+        uuid::Uuid::parse_str(&std::fs::read_to_string(format!("{}.id", path.display())).unwrap())
+            .unwrap();
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    assert_eq!(h.conversation(id).unwrap().config.model, "before");
+    assert!(
+        pi_rs_durable::application_entry::list(&db, id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.list(format!("durable/application-ordered-cut/{id}/").as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn ordered_config_rejects_active_conversations() {
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{
+            Checkpoint, Task, TaskOwner,
+            scheduler::{Handler, Registry, Step},
+        },
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Writer;
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: "after".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 64,
+            })
+            .unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "before".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("ordered".into(), true);
+    let mut registry = Registry::default();
+    registry.register("ordered", true, Writer);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    scheduler.submit(&task).unwrap();
+    assert!(scheduler.tick(0).is_err());
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(application_entry::list(&db, id).unwrap().is_empty());
+    assert_eq!(h.conversation(id).unwrap().config.model, "before");
+}
