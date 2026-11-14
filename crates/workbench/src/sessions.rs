@@ -951,7 +951,7 @@ pub(super) fn share_journal_tag(
     key: &[u8; 32],
 ) -> Result<[u8; 32]> {
     use hmac::Mac;
-    Ok(share_journal_mac(session, key)?
+    Ok(share_journal_mac(session, context, key)?
         .finalize()
         .into_bytes()
         .into())
