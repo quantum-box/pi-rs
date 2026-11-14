@@ -96,7 +96,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 packages.push(entry);
                 Ok(())
             })?;
-            output(json!({"type":"package_installed","source":source}));
+            output(json!({"type":"package_installed","source":display_source(&source)}));
         }
         PackageCommand::Remove { source, local } => {
             let target = normalize(&source, &args.workspace)?;
@@ -120,7 +120,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 }
                 Ok(())
             })?;
-            output(json!({"type":"package_removed","source":target}));
+            output(json!({"type":"package_removed","source":display_source(&target)}));
         }
         PackageCommand::Update { source, .. } => {
             let requested = source
@@ -144,7 +144,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .is_none_or(|requested| source_identity(requested) == source_identity(&source))
                 {
                     install(&source, args.offline).await?;
-                    output(json!({"type":"package_updated","source":source}));
+                    output(json!({"type":"package_updated","source":display_source(&source)}));
                 }
             }
         }
@@ -157,7 +157,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":declaration.source,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -172,18 +172,24 @@ pub async fn prepare(args: &Cli) -> Result<()> {
         let cached = installed.contains_key(&key(&declaration.source));
         if args.offline && remote(&declaration.source) {
             if !cached {
-                eprintln!("Package {}: skipped in offline mode", declaration.source);
+                eprintln!(
+                    "Package {}: skipped in offline mode",
+                    display_source(&declaration.source)
+                );
             }
             continue;
         }
         if declaration.transient || !cached {
-            eprintln!("Preparing native package {}", declaration.source);
+            eprintln!(
+                "Preparing native package {}",
+                display_source(&declaration.source)
+            );
             match install(&declaration.source, args.offline).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
                 Err(error) if declaration.transient && !cached => return Err(error),
-                Err(error) => eprintln!("Package {}: {error}", declaration.source),
+                Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
             }
         }
     }
@@ -735,6 +741,25 @@ fn source_field(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("source")?.as_str())
 }
 
+// Git URL userinfo is rejected before invoking Git, but declarations can
+// still contain it. Never print it while reporting or listing a package.
+fn display_source(source: &str) -> String {
+    let Some(git) = source.strip_prefix("git:") else {
+        return source.to_owned();
+    };
+    let Some(scheme_end) = git.find("://") else {
+        return source.to_owned();
+    };
+    let start = "git:".len() + scheme_end + 3;
+    let end = source[start..]
+        .find(['/', '?', '#'])
+        .map_or(source.len(), |i| start + i);
+    let Some(at) = source[start..end].rfind('@') else {
+        return source.to_owned();
+    };
+    format!("{}[redacted]{}", &source[..start], &source[start + at..])
+}
+
 // Updates reconcile each configured revision, including a user declaration
 // shadowed by a project declaration. Transient CLI packages are not persisted
 // and are refreshed by prepare instead.
@@ -1014,9 +1039,29 @@ fn remote(source: &str) -> bool {
 }
 
 async fn install(source: &str, offline: bool) -> Result<Installed> {
+    install_inner(source, offline)
+        .await
+        .map_err(|error| sanitize_package_error(source, error))
+}
+
+fn sanitize_package_error(source: &str, error: Error) -> Error {
+    // Git and its helpers can echo the URL or just its userinfo in stderr.
+    // Preserve the useful static credential rejection; otherwise fail closed
+    // rather than expose userinfo through a subprocess diagnostic.
+    let sensitive = display_source(source) != source;
+    let safe_credential_error = matches!(&error, Error::Config(message) if message == "use a credential helper for git package authentication");
+    if sensitive && !safe_credential_error {
+        Error::Config("Git package with URL userinfo could not be prepared".into())
+    } else {
+        error
+    }
+}
+
+async fn install_inner(source: &str, offline: bool) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
-            "cannot install package in offline mode: {source}"
+            "cannot install package in offline mode: {}",
+            display_source(source)
         )));
     }
     if !remote(source) && !Path::new(source).exists() {
@@ -2870,6 +2915,43 @@ mod tests {
             "https://host/org@team/repo#stable"
         ));
         assert!(!ambiguous_git_reference("ssh://git@host/org/repo@stable"));
+    }
+
+    #[test]
+    fn git_source_display_redacts_url_userinfo_without_changing_identity() {
+        for source in [
+            "git:https://private-user:topsecret@example.invalid/org/repo@stable",
+            "git:ssh://private-user@example.invalid/org/repo#feature@v2",
+            "git:https://private-user:topsecret@example.invalid?query@value",
+        ] {
+            let displayed = display_source(source);
+            assert!(!displayed.contains("private-user"), "{displayed}");
+            assert!(!displayed.contains("topsecret"), "{displayed}");
+            assert!(
+                displayed.contains("[redacted]@example.invalid"),
+                "{displayed}"
+            );
+        }
+        assert_eq!(
+            display_source("git:https://example.invalid/org/repo@stable"),
+            "git:https://example.invalid/org/repo@stable"
+        );
+        assert_eq!(
+            source_identity("git:https://private-user:topsecret@example.invalid/org/repo@stable"),
+            source_identity("git:https://example.invalid/org/repo#feature")
+        );
+        let error = sanitize_package_error(
+            "git:ssh://private-user@example.invalid/org/repo",
+            Error::Config("helper echoed private-user".into()),
+        )
+        .to_string();
+        assert!(!error.contains("private-user"), "{error}");
+        let error = sanitize_package_error(
+            "git:https://private-user:topsecret@example.invalid/org/repo",
+            Error::Config("use a credential helper for git package authentication".into()),
+        )
+        .to_string();
+        assert!(error.contains("use a credential helper"), "{error}");
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {

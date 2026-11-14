@@ -118,3 +118,80 @@ fn installs_explicit_ref_and_preserves_legacy_at_sign_repository() {
         serde_json::json!(["+prompts/selected.md"])
     );
 }
+
+#[test]
+fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = directory.path().join("agent");
+    std::fs::create_dir(&agent).unwrap();
+    let source = "git:https://private-user:topsecret@example.invalid/org/repo@stable";
+    std::fs::write(
+        agent.join("settings.json"),
+        serde_json::json!({"packages":[source]}).to_string(),
+    )
+    .unwrap();
+    for offline in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &agent)
+            .env_remove("PI_OFFLINE")
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "google",
+                "--model",
+                "gemini-2.5-flash",
+            ]);
+        if offline {
+            command.arg("--offline");
+        }
+        let output = command.args(["--print", "hello"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(if offline {
+                "skipped in offline mode"
+            } else {
+                "Preparing native package"
+            }),
+            "{stderr}"
+        );
+        if !offline {
+            assert!(stderr.contains("use a credential helper"), "{stderr}");
+        }
+        assert!(
+            !stderr.contains("private-user")
+                && !stderr.contains("topsecret")
+                && !stderr.contains(source),
+            "{stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("topsecret"));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &agent)
+        .args(["--no-trust", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[redacted]@example.invalid"), "{stdout}");
+    assert!(
+        !stdout.contains("private-user") && !stdout.contains("topsecret"),
+        "{stdout}"
+    );
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(agent.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(stored["packages"][0], source);
+}

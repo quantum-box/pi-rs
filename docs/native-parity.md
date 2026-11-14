@@ -1741,7 +1741,9 @@ the native `#ref` separator to disambiguate, for example
 `git:https://host/team/repo#feature@v2` or
 `git:https://host/org@team/repo#stable`. Both forms preserve repository identity
 and resource filters. URL userinfo is not treated as a ref, and credential-helper
-requirements remain unchanged.
+requirements remain unchanged. Package diagnostics and list output redact URL
+userinfo, including before a configured source is validated; saved declarations
+and internal identity matching are not rewritten.
 
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
