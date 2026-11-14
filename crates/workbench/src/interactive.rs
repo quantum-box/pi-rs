@@ -2914,6 +2914,10 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
+        "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
+            edit_provider_key(super::Provider::named("xai").expect("xAI provider"), view)
+        }
         "/login" if rest.eq_ignore_ascii_case("meta") => start_meta_login(view, &args.settings),
         "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
             edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
@@ -2993,6 +2997,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "xai · Subscription OAuth".into(),
+                            selection: Selection::LoginXai,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -5594,6 +5605,26 @@ fn start_kimi_logout(view: &mut View) {
     ));
 }
 
+fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to xAI",
+        "xAI login cancelled",
+        move |sender| async move {
+            super::xai_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to xAI".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_meta_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -5719,7 +5750,11 @@ fn interrupt_remote_task(view: &mut View) {
         clear_openrouter_editor(view);
         view.append(message);
     } else if task.meta_login_control.is_some() {
-        view.append("Meta sign-in is completing; waiting for the result");
+        view.append(if task.status == "Signing in to xAI" {
+            "xAI sign-in is completing; waiting for the result"
+        } else {
+            "Meta sign-in is completing; waiting for the result"
+        });
     } else {
         view.append("ChatGPT sign-out is completing; waiting for the result");
     }
@@ -6670,6 +6705,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),

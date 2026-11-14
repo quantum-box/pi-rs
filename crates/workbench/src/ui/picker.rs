@@ -28,6 +28,7 @@ pub enum Selection {
     LoginOpenRouter,
     LoginKimi,
     LoginMeta,
+    LoginXai,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),
