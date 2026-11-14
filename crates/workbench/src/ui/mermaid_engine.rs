@@ -304,7 +304,7 @@ fn parse_statement(st: &str, graph: &mut Graph) -> Option<String> {
     let mut i = 0;
 
     let Some((mut prev, ni)) = parse_node_group(&chars, i, graph) else {
-        return Some(format!("dropped, expected a node: \"{st}\""));
+        return Some(format!("dropped, does not start with a node: \"{st}\""));
     };
     i = ni;
 
@@ -319,8 +319,7 @@ fn parse_statement(st: &str, graph: &mut Graph) -> Option<String> {
         };
         i = skip_spaces(&chars, ni);
         let Some((next, ni)) = parse_node_group(&chars, i, graph) else {
-            let rest: String = chars[i..].iter().collect();
-            return Some(format!("dropped, expected a node: \"{rest}\""));
+            return Some(format!("dropped, link has no target: \"{st}\""));
         };
         i = ni;
         for &f in &prev {
@@ -442,10 +441,10 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
             .copied()
             .is_some_and(|c| is_id_char(c) || c == '-')
         {
-            if chars[after] == '-' && parse_link(chars, after).is_some() {
-                break;
-            }
             after += 1;
+        }
+        while after > class_start && chars[after - 1] == '-' {
+            after -= 1;
         }
         if after == class_start {
             after = tag_start;

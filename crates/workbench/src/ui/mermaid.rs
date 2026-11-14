@@ -172,6 +172,26 @@ mod tests {
         );
         assert!(lines.is_some());
         assert!(warning.is_none());
+        let (lines, warning) = render(
+            "flowchart LR\nA[Foo]:::dark-mode",
+            &theme,
+            120,
+            Mermaid::Final,
+        );
+        assert!(warning.is_none());
+        let text = lines
+            .unwrap()
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("Foo"));
+        assert!(!text.contains("mode"));
+        let (_, warning) = render("flowchart LR\nA -->", &theme, 120, Mermaid::Final);
+        assert_eq!(
+            warning.as_deref(),
+            Some("Mermaid diagram not rendered: dropped, link has no target: \"A -->\"")
+        );
         let source = "flowchart LR\nA[unfinished";
         let (lines, warning) = render(source, &theme, 120, Mermaid::Final);
         assert!(lines.is_none());
