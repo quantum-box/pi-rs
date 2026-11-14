@@ -1870,6 +1870,25 @@ impl Session {
         Ok(())
     }
 
+    /// Resolve the actual destination of a tree selection without changing the journal.
+    pub(crate) fn tree_navigation_target(&self, selected: u64) -> Result<Option<u64>> {
+        self.validate_checkout(selected)?;
+        if selected == self.head() {
+            return Ok(None);
+        }
+        let record = &self.records[selected as usize - 1];
+        let target = if matches!(
+            record.event,
+            Event::User { .. } | Event::UserWithImages { .. }
+        ) {
+            record.parent.unwrap_or(1)
+        } else {
+            selected
+        };
+        self.validate_checkout(target)?;
+        Ok(Some(target))
+    }
+
     /// Confirm the outcome via the system that owns the effect, using the operation ID.
     pub fn reconcile(&mut self, operation_id: Uuid, outcome: Outcome) -> Result<()> {
         if !matches!(

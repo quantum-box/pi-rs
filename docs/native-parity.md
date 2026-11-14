@@ -640,8 +640,8 @@ model names with `SessionBuilder::branch_model` or
 `AgentSession::register_branch_model`; an unavailable client is reported
 instead of sending to a different one. Unlike Pi's automatic fallback on
 resume, a host can explicitly call `set_model` to select another client.
-Checkout and persistent fork validate
-the destination model before changing the journal or creating a file. Native
+Checkout, tree navigation, and persistent fork validate the destination model
+before tree hooks, changing the journal, or creating a file. Native
 SDK branch registrations are keyed by model name, so hosts must use distinct
 names for clients from different providers.
 

@@ -1213,6 +1213,17 @@ pub struct AgentSession {
     session_file: Option<PathBuf>,
 }
 impl AgentSession {
+    fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
+        if let Some(target) = journal.tree_navigation_target(selected)?
+            && let Some((name, _)) = journal.model_selection_at(target)
+            && self.registry.branch_model(self.session_id, &name).is_none()
+        {
+            return Err(Error::Config(format!(
+                "session branch requires registered model {name}"
+            )));
+        }
+        Ok(())
+    }
     fn restore_branch_model(&mut self, name: String) -> Result<()> {
         let model = self
             .registry
@@ -1548,9 +1559,15 @@ impl AgentSession {
         selected: u64,
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
+        self.ensure_open()?;
+        {
+            let journal = self.session.lock().await;
+            self.validate_tree_model(&journal, selected)?;
+        }
         self.start().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        self.validate_tree_model(&journal, selected)?;
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -3685,6 +3702,127 @@ mod tests {
         assert!(!fork_path.exists());
         assert_eq!(reopened.prompt("unchanged").await.unwrap(), "model-B");
         reopened.close().await.unwrap();
+    }
+
+    struct TreePreflightHook(Arc<Mutex<Vec<&'static str>>>);
+    #[async_trait::async_trait]
+    impl Extension for TreePreflightHook {
+        fn id(&self) -> &str {
+            "tree-preflight"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn before_tree(
+            &self,
+            _: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            self.0.lock().unwrap().push("before");
+            Ok(Some(crate::TreeDecision {
+                summary: Some(crate::TreeSummary {
+                    summary: "extension summary".into(),
+                    details: None,
+                    usage: None,
+                }),
+                label: Some("hook label".into()),
+                ..Default::default()
+            }))
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionTree { .. }) {
+                self.0.lock().unwrap().push("after");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_navigation_rejects_missing_destination_before_hooks_or_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tree.jsonl");
+        let a = Arc::new(NamedBranchModel("model-A"));
+        let b = Arc::new(NamedBranchModel("model-B"));
+        let mut original = SessionBuilder::new(a.clone(), "model-A")
+            .open(&path)
+            .unwrap();
+        original.set_model(a.clone(), "model-A").unwrap();
+        original.prompt("branch A").await.unwrap();
+        let target = original.journal().unwrap().head();
+        original.set_model(b.clone(), "model-B").unwrap();
+        original.prompt("branch B").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(b, "model-B")
+            .extension(Arc::new(TreePreflightHook(calls.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.start().await.unwrap();
+        let mut events = session.subscribe();
+        let (head, count, labels) = {
+            let journal = session.journal().unwrap();
+            (journal.head(), journal.records().len(), journal.labels())
+        };
+        for summarize in [false, true] {
+            let options = crate::TreeNavigationOptions {
+                summary: summarize.then_some(crate::BranchSummaryOptions {
+                    instructions: None,
+                    reserve_tokens: 1024,
+                }),
+                label: Some("requested"),
+                ..Default::default()
+            };
+            let error = session.navigate_tree(target, options).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires registered model model-A")
+            );
+            let journal = session.journal().unwrap();
+            assert_eq!(journal.head(), head);
+            assert_eq!(journal.records().len(), count);
+            assert_eq!(journal.labels(), labels);
+            assert_eq!(session.model_name(), "model-B");
+            assert!(events.try_recv().is_err());
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        session.register_branch_model("model-A", a).unwrap();
+        let result = session
+            .navigate_tree(
+                target,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: None,
+                        reserve_tokens: 1024,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let summary = result.summary_entry.unwrap();
+        assert!(
+            matches!(&summary.event, crate::Event::BranchSummary { summary, .. } if summary == "extension summary")
+        );
+        assert_eq!(
+            session.journal().unwrap().labels()[&summary.id],
+            "hook label"
+        );
+        assert_eq!(&*calls.lock().unwrap(), &["before", "after"]);
+        assert_eq!(session.model_name(), "model-A");
+        assert_eq!(session.prompt("after navigation").await.unwrap(), "model-A");
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
