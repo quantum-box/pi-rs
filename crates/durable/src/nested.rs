@@ -15,6 +15,7 @@
 
 use crate::{recovery::ReplayPolicy, runtime::RegisteredTool};
 use durable_store::{Check, Expected, Mutation, owner::OwnedStore};
+use futures_util::FutureExt;
 use pi_rs_core::{CancellationToken, Invocation, Outcome, ToolCall, ToolHost, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -340,8 +341,11 @@ impl NestedHost {
             if record.name != name || record.arguments != arguments || record.policy != reg.replay {
                 return self.fail("nested call identity, arguments, or replay policy changed");
             }
-            if let Some(outcome) = record.outcome {
-                return outcome;
+            if let Some(outcome) = &record.outcome {
+                if matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
+                    return self.poll_pending(&key, record, entry.version, reg).await;
+                }
+                return outcome.clone();
             }
             if record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe {
                 return self.fail("interrupted unsafe nested call requires reconciliation");
@@ -470,11 +474,82 @@ impl NestedHost {
                 key: key.clone(),
                 expected: Expected::Version(version),
             }],
-            &[Mutation::Put { key, value }],
+            &[Mutation::Put {
+                key: key.clone(),
+                value,
+            }],
         ) {
             return self.fail(format!("nested result commit: {e}"));
         }
+        if matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
+            let version = match store.get(&key) {
+                Ok(Some(entry)) => entry.version,
+                _ => return self.fail("nested pending record missing after commit"),
+            };
+            return self.poll_pending(&key, completed, version, reg).await;
+        }
         outcome
+    }
+
+    async fn poll_pending(
+        &self,
+        key: &[u8],
+        mut record: Record,
+        mut version: u64,
+        reg: &RegisteredTool,
+    ) -> Outcome {
+        loop {
+            let Some(Outcome::Pending { reference }) = &record.outcome else {
+                return self.fail("invalid nested pending record");
+            };
+            let result = std::panic::AssertUnwindSafe(crate::poll::poll_once(
+                reg.tool.as_ref(),
+                record.operation_id,
+                reference,
+                &self.shared.cancellation,
+                self.shared.timeout,
+            ))
+            .catch_unwind()
+            .await;
+            let outcome = match result {
+                Ok(crate::poll::PollResult::Outcome(outcome)) => outcome,
+                Ok(crate::poll::PollResult::Cancelled) => {
+                    return self.fail("nested polling cancelled");
+                }
+                Ok(crate::poll::PollResult::Unavailable | crate::poll::PollResult::TimedOut)
+                | Err(_) => {
+                    return self.fail("nested polling failed; pending reference retained");
+                }
+            };
+            record.outcome = Some(outcome.clone());
+            let value = match serde_json::to_vec(&record) {
+                Ok(value) => value,
+                Err(e) => return self.fail(e.to_string()),
+            };
+            if let Err(e) = self.shared.owner.store().commit(
+                &[Check {
+                    key: key.to_vec(),
+                    expected: Expected::Version(version),
+                }],
+                &[Mutation::Put {
+                    key: key.to_vec(),
+                    value,
+                }],
+            ) {
+                return self.fail(format!("nested poll result commit: {e}"));
+            }
+            if !matches!(outcome, Outcome::Pending { .. }) {
+                return outcome;
+            }
+            version = match self.shared.owner.store().get(key) {
+                Ok(Some(entry)) => entry.version,
+                _ => return self.fail("nested pending record missing after poll"),
+            };
+            tokio::select! {
+                _ = self.shared.cancellation.cancelled() => return self.fail("nested polling cancelled"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
     }
 }
 #[async_trait::async_trait]
@@ -503,6 +578,107 @@ mod tests {
     use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    struct Polling {
+        invoked: AtomicUsize,
+        mode: AtomicUsize,
+        ids: Mutex<Vec<Uuid>>,
+    }
+    #[async_trait]
+    impl Tool for Polling {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "polling".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        async fn invoke(&self, _: Value, context: ToolContext) -> Outcome {
+            self.invoked.fetch_add(1, Ordering::SeqCst);
+            self.ids.lock().unwrap().push(context.operation_id);
+            Outcome::Pending {
+                reference: "job".into(),
+            }
+        }
+        async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
+            assert_eq!(reference, "job");
+            self.ids.lock().unwrap().push(context.operation_id);
+            match self.mode.load(Ordering::SeqCst) {
+                0 => std::future::pending().await,
+                1 => None,
+                _ => Some(Outcome::Succeeded("done".into())),
+            }
+        }
+    }
+    fn polling_host(
+        path: &std::path::Path,
+        root: Uuid,
+        tool: Arc<Polling>,
+        cancel: CancellationToken,
+    ) -> Arc<NestedHost> {
+        NestedHost::new(
+            Arc::new(OwnedStore::open(path).unwrap()),
+            root,
+            vec![RegisteredTool {
+                tool,
+                replay: ReplayPolicy::Unsafe,
+            }],
+            cancel,
+            Duration::from_secs(10),
+            2,
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn keyed_pending_survives_interruption_failure_and_abort_without_redispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(0),
+            ids: Mutex::new(vec![]),
+        });
+        let cancel = CancellationToken::new();
+        let h = polling_host(&path, root, tool.clone(), cancel);
+        let mut future = Box::pin(h.call_keyed("job-key", "polling", json!({})));
+        assert!(futures_util::poll!(future.as_mut()).is_pending());
+        drop(future); // process loss after the pending reference was committed
+        drop(h);
+
+        tool.mode.store(1, Ordering::SeqCst);
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            h.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+
+        tool.mode.store(0, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let h = polling_host(&path, root, tool.clone(), cancel.clone());
+        let mut future = Box::pin(h.call_keyed("job-key", "polling", json!({})));
+        assert!(futures_util::poll!(future.as_mut()).is_pending());
+        cancel.cancel();
+        assert!(matches!(future.await, Outcome::Unknown(_)));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+
+        tool.mode.store(2, Ordering::SeqCst);
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert_eq!(
+            h.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Succeeded("done".into())
+        );
+        h.seal_and_inspect().unwrap();
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 1);
+        let ids = tool.ids.lock().unwrap();
+        assert!(ids.len() >= 5 && ids.iter().all(|id| *id == ids[0]));
+    }
 
     struct Fake {
         calls: Arc<AtomicUsize>,

@@ -953,14 +953,21 @@ impl Tool for PendingNested {
             reference: "child-job".into(),
         }
     }
-    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
-        self.polled.fetch_add(1, Ordering::SeqCst);
-        Some(Outcome::Succeeded("finished".into()))
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        if self.polled.fetch_add(1, Ordering::SeqCst) == 0 {
+            assert_eq!(reference, "child-job");
+            Some(Outcome::Pending {
+                reference: "child-job-next".into(),
+            })
+        } else {
+            assert_eq!(reference, "child-job-next");
+            Some(Outcome::Succeeded("finished".into()))
+        }
     }
 }
 
 #[tokio::test]
-async fn nested_pending_is_not_polled_and_blocks_parent_after_reopen() {
+async fn nested_pending_is_polled_to_completion_without_redispatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let cancel = CancellationToken::new();
@@ -997,17 +1004,139 @@ async fn nested_pending_is_not_polled_and_blocks_parent_after_reopen() {
         h.submit_and_run(id, None, "work".into(), &cancel)
             .await
             .unwrap();
-        let (_, reason) = h
-            .blocked(id)
-            .unwrap()
-            .expect("unresolved nested result must block");
-        assert!(reason.contains("nested tool requires reconciliation"));
+        assert!(h.blocked(id).unwrap().is_none());
     }
     {
         let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
         h.resume_conversation(id, &cancel).await.unwrap();
-        assert!(h.blocked(id).unwrap().is_some());
+        assert!(h.blocked(id).unwrap().is_none());
     }
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
-    assert_eq!(child.polled.load(Ordering::SeqCst), 0);
+    assert_eq!(child.polled.load(Ordering::SeqCst), 2);
+}
+
+struct ProcessPending {
+    root: std::path::PathBuf,
+    worker: bool,
+}
+#[async_trait]
+impl Tool for ProcessPending {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: Value, ctx: ToolContext) -> Outcome {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("invocations"))
+            .unwrap();
+        writeln!(file, "{}", ctx.operation_id).unwrap();
+        Outcome::Pending {
+            reference: "process-job".into(),
+        }
+    }
+    async fn poll(&self, reference: &str, ctx: ToolContext) -> Option<Outcome> {
+        assert_eq!(reference, "process-job");
+        std::fs::write(self.root.join("poll-id"), ctx.operation_id.to_string()).unwrap();
+        if self.worker {
+            std::future::pending().await
+        } else {
+            Some(Outcome::Succeeded("done".into()))
+        }
+    }
+}
+fn process_options(root: &std::path::Path, worker: bool) -> Options {
+    Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(Parent),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: Arc::new(ProcessPending {
+                    root: root.into(),
+                    worker,
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn nested_poll_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_POLL_WORKER") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(root.join("db"), process_options(&root, true), &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(root.join("id"), id.to_string()).unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn killed_nested_poll_reattaches_to_unsafe_job() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut worker = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_poll_kill_worker"])
+            .env("PI_NESTED_POLL_WORKER", root)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !root.join("poll-id").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker never reached polling");
+    worker.0.kill().unwrap();
+    worker.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(root.join("db"), process_options(root, false), &cancel)
+        .await
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    let invocations = std::fs::read_to_string(root.join("invocations")).unwrap();
+    assert_eq!(invocations.lines().count(), 1);
+    assert_eq!(
+        invocations.trim(),
+        std::fs::read_to_string(root.join("poll-id")).unwrap()
+    );
 }
