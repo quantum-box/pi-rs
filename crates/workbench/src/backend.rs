@@ -526,10 +526,16 @@ pub fn run(
 
 #[cfg(any(unix, windows))]
 fn existing_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
+    existing_share_store_at(&super::config::agent_dir())
+}
+
+#[cfg(any(unix, windows))]
+fn existing_share_store_at(
+    parent: &std::path::Path,
+) -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
     use pi_rs_workbench::private_share_store::Store;
-    let parent = super::config::agent_dir();
     match std::fs::symlink_metadata(parent.join("share-context-v1")) {
-        Ok(_) => Store::open_existing(&parent)?
+        Ok(_) => Store::open_existing(parent)?
             .map(Some)
             .ok_or_else(|| Error::Config("existing share cache cannot be verified".into())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2008,6 +2014,16 @@ mod share_context_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn worker_rejects_unverifiable_existing_cache_without_creating_one() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(existing_share_store_at(directory.path()).unwrap().is_none());
+        assert!(!directory.path().join("share-context-v1").exists());
+        std::fs::create_dir(directory.path().join("share-context-v1")).unwrap();
+        assert!(existing_share_store_at(directory.path()).is_err());
     }
 
     #[cfg(any(unix, windows))]
