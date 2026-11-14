@@ -69,7 +69,6 @@ pub struct NoProxy {
 struct Extra {
     tunnel_http: bool,
     dynamic: bool,
-    sensitive_tunnel: bool,
     auth: Option<HeaderValue>,
     misc: Option<HeaderMap>,
 }
@@ -90,6 +89,7 @@ enum Matcher_ {
 
 /// Our own type, wrapping an `Intercept`, since we may have a few additional
 /// pieces attached thanks to `reqwest`s extra proxy configuration.
+#[derive(Clone)]
 pub(crate) struct Intercepted {
     inner: matcher::Intercept,
     /// This is because of `reqwest::Proxy`'s design which allows configuring
@@ -272,7 +272,6 @@ impl Proxy {
             extra: Extra {
                 tunnel_http: false,
                 dynamic: false,
-                sensitive_tunnel: false,
                 auth: None,
                 misc: None,
             },
@@ -532,7 +531,6 @@ impl Matcher {
             extra: Extra {
                 tunnel_http: false,
                 dynamic: false,
-                sensitive_tunnel: false,
                 auth: None,
                 misc: None,
             },
@@ -576,9 +574,6 @@ impl Matcher {
     pub(crate) fn is_dynamic(&self) -> bool {
         self.extra.dynamic
     }
-    pub(crate) fn require_sensitive_tunnel(&mut self) {
-        self.extra.sensitive_tunnel = true;
-    }
 }
 
 impl fmt::Debug for Matcher {
@@ -593,8 +588,6 @@ impl fmt::Debug for Matcher {
 impl Intercepted {
     pub(crate) fn tunnel_http(&self) -> bool {
         self.extra.tunnel_http
-            || (self.extra.sensitive_tunnel
-                && (self.basic_auth().is_some() || self.custom_headers().is_some()))
     }
 
     pub(crate) fn http_non_tunnel_basic_auth(&self) -> Option<HeaderValue> {

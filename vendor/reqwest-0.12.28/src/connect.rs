@@ -67,6 +67,7 @@ pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, Bo
 pub(crate) type BoxedConnectorLayer =
     BoxCloneSyncServiceLayer<BoxedConnectorService, Unnameable, Conn, BoxError>;
 
+#[derive(Clone)]
 pub(crate) struct ConnectorBuilder {
     inner: Inner,
     proxies: Arc<Vec<ProxyMatcher>>,
@@ -87,12 +88,32 @@ pub(crate) struct ConnectorBuilder {
 }
 
 impl ConnectorBuilder {
+    pub(crate) fn uses_local_transport(&self) -> bool {
+        #[cfg(unix)]
+        if self.unix_socket.is_some() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if self.windows_named_pipe.is_some() {
+            return true;
+        }
+        false
+    }
     pub(crate) fn build(self, layers: Vec<BoxedConnectorLayer>) -> Connector
 where {
+        self.build_fixed(layers, None)
+    }
+
+    pub(crate) fn build_fixed(
+        self,
+        layers: Vec<BoxedConnectorLayer>,
+        fixed: Option<Option<Intercepted>>,
+    ) -> Connector {
         // construct the inner tower service
         let mut base_service = ConnectorService {
             inner: self.inner,
             proxies: self.proxies,
+            fixed,
             verbose: self.verbose,
             #[cfg(feature = "__tls")]
             nodelay: self.nodelay,
@@ -484,6 +505,7 @@ where {
 pub(crate) struct ConnectorService {
     inner: Inner,
     proxies: Arc<Vec<ProxyMatcher>>,
+    fixed: Option<Option<Intercepted>>,
     verbose: verbose::Wrapper,
     /// When there is a single timeout layer and no other layers,
     /// we embed it directly inside our base Service::call().
@@ -1012,6 +1034,18 @@ impl Service<Uri> for ConnectorService {
             ));
         }
 
+        if let Some(fixed) = &self.fixed {
+            return match fixed.clone() {
+                Some(proxy) => Box::pin(with_timeout(
+                    self.clone().connect_via_proxy(dst, proxy),
+                    timeout,
+                )),
+                None => Box::pin(with_timeout(
+                    self.clone().connect_with_maybe_proxy(dst, false),
+                    timeout,
+                )),
+            };
+        }
         for prox in self.proxies.iter() {
             if let Some(intercepted) = prox.intercept(&dst) {
                 return Box::pin(with_timeout(

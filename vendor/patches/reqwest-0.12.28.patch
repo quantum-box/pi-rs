@@ -1,64 +1,32 @@
 --- a/src/proxy.rs
 +++ b/src/proxy.rs
-@@ -67,6 +67,9 @@
- 
- #[derive(Clone)]
- struct Extra {
+@@ -69,0 +70,2 @@
 +    tunnel_http: bool,
 +    dynamic: bool,
-+    sensitive_tunnel: bool,
-     auth: Option<HeaderValue>,
-     misc: Option<HeaderMap>,
- }
-@@ -256,21 +259,32 @@
-     where
-         F: Fn(&Url) -> Option<U> + Send + Sync + 'static,
-     {
+@@ -89,0 +92 @@
++#[derive(Clone)]
+@@ -259 +262 @@
 -        Proxy::new(Intercept::Custom(Custom {
 +        let mut proxy = Proxy::new(Intercept::Custom(Custom {
-             func: Arc::new(move |url| fun(url).map(IntoProxy::into_proxy)),
-             no_proxy: None,
+@@ -262 +265,3 @@
 -        }))
 +        }));
 +        proxy.extra.dynamic = true;
 +        proxy
-     }
- 
-     fn new(intercept: Intercept) -> Proxy {
-         Proxy {
-             extra: Extra {
+@@ -267,0 +273,2 @@
 +                tunnel_http: false,
 +                dynamic: false,
-+                sensitive_tunnel: false,
-                 auth: None,
-                 misc: None,
-             },
-             intercept,
-             no_proxy: None,
-         }
+@@ -273,0 +281,6 @@
 +    }
 +
 +    /// Tunnel HTTP requests through this proxy with CONNECT.
 +    pub fn tunnel_http(mut self, enabled: bool) -> Proxy {
 +        self.extra.tunnel_http = enabled;
 +        self
-     }
- 
-     /// Set the `Proxy-Authorization` header using Basic auth.
-@@ -516,6 +530,9 @@
-         Self {
-             inner: Matcher_::Util(matcher::Matcher::from_system()),
-             extra: Extra {
+@@ -518,0 +532,2 @@
 +                tunnel_http: false,
 +                dynamic: false,
-+                sensitive_tunnel: false,
-                 auth: None,
-                 misc: None,
-             },
-@@ -550,30 +567,17 @@
-         self.maybe_has_http_auth
-     }
- 
+@@ -553,11 +567,0 @@
 -    pub(crate) fn http_non_tunnel_basic_auth(&self, dst: &Uri) -> Option<HeaderValue> {
 -        if let Some(proxy) = self.intercept(dst) {
 -            let scheme = proxy.uri().scheme();
@@ -70,9 +38,7 @@
 -        None
 -    }
 -
-     pub(crate) fn maybe_has_http_custom_headers(&self) -> bool {
-         self.maybe_has_http_custom_headers
-     }
+@@ -567,10 +571,5 @@
 -
 -    pub(crate) fn http_non_tunnel_custom_headers(&self, dst: &Uri) -> Option<HeaderMap> {
 -        if let Some(proxy) = self.intercept(dst) {
@@ -88,16 +54,7 @@
 +impl Matcher {
 +    pub(crate) fn is_dynamic(&self) -> bool {
 +        self.extra.dynamic
-+    }
-+    pub(crate) fn require_sensitive_tunnel(&mut self) {
-+        self.extra.sensitive_tunnel = true;
-     }
- }
- 
-@@ -587,6 +591,28 @@
- }
- 
- impl Intercepted {
+@@ -589,0 +589,20 @@
 +    pub(crate) fn http_non_tunnel_basic_auth(&self) -> Option<HeaderValue> {
 +        let scheme = self.uri().scheme();
 +        if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
@@ -116,19 +73,38 @@
 +
 +    pub(crate) fn tunnel_http(&self) -> bool {
 +        self.extra.tunnel_http
-+            || (self.extra.sensitive_tunnel
-+                && (self.basic_auth().is_some() || self.custom_headers().is_some()))
 +    }
 +
-     pub(crate) fn uri(&self) -> &http::Uri {
-         self.inner.uri()
-     }
 --- a/src/connect.rs
 +++ b/src/connect.rs
-@@ -801,6 +801,42 @@
-         match &self.inner {
-             #[cfg(feature = "default-tls")]
-             Inner::DefaultTls(http, tls) => {
+@@ -69,0 +70 @@
++#[derive(Clone)]
+@@ -89,0 +91,11 @@
++    pub(crate) fn uses_local_transport(&self) -> bool {
++        #[cfg(unix)]
++        if self.unix_socket.is_some() {
++            return true;
++        }
++        #[cfg(target_os = "windows")]
++        if self.windows_named_pipe.is_some() {
++            return true;
++        }
++        false
++    }
+@@ -91,0 +104,8 @@
++        self.build_fixed(layers, None)
++    }
++
++    pub(crate) fn build_fixed(
++        self,
++        layers: Vec<BoxedConnectorLayer>,
++        fixed: Option<Option<Intercepted>>,
++    ) -> Connector {
+@@ -95,0 +116 @@
++            fixed,
+@@ -486,0 +508 @@
++    fixed: Option<Option<Intercepted>>,
+@@ -803,0 +826,36 @@
 +                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
 +                    let inner = hyper_tls::HttpsConnector::from((
 +                        http.clone(),
@@ -165,13 +141,7 @@
 +                        tls_info: false,
 +                    });
 +                }
-                 if dst.scheme() == Some(&Scheme::HTTPS) {
-                     log::trace!("tunneling HTTPS over proxy");
-                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-@@ -843,6 +879,40 @@
-                 tls,
-                 tls_proxy,
-             } => {
+@@ -845,0 +904,34 @@
 +                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
 +                    let inner =
 +                        hyper_rustls::HttpsConnector::from((http.clone(), tls_proxy.clone()));
@@ -206,42 +176,154 @@
 +                        tls_info: false,
 +                    });
 +                }
-                 if dst.scheme() == Some(&Scheme::HTTPS) {
-                     use rustls_pki_types::ServerName;
-                     use std::convert::TryFrom;
-@@ -885,7 +955,11 @@
-                 }
-             }
-             #[cfg(not(feature = "__tls"))]
+@@ -888 +980,5 @@
 -            Inner::Http(_) => (),
 +            Inner::Http(_) => {
 +                if proxy.tunnel_http() && dst.scheme_str() == Some("http") {
 +                    return Err("HTTP CONNECT requires a TLS-enabled connector".into());
 +                }
 +            }
-         }
- 
-         self.connect_with_maybe_proxy(proxy_dst, true).await
+@@ -940,0 +1037,12 @@
++        if let Some(fixed) = &self.fixed {
++            return match fixed.clone() {
++                Some(proxy) => Box::pin(with_timeout(
++                    self.clone().connect_via_proxy(dst, proxy),
++                    timeout,
++                )),
++                None => Box::pin(with_timeout(
++                    self.clone().connect_with_maybe_proxy(dst, false),
++                    timeout,
++                )),
++            };
++        }
 --- a/src/async_impl/client.rs
 +++ b/src/async_impl/client.rs
-@@ -419,6 +419,13 @@
-         if config.auto_sys_proxy {
-             proxies.push(ProxyMatcher::system());
-         }
-+        // A dynamic callback can change between request headers and connection.
-+        // Keep proxy credentials on CONNECT whenever any rule is dynamic.
-+        if proxies.iter().any(ProxyMatcher::is_dynamic) {
-+            for proxy in &mut proxies {
-+                proxy.require_sensitive_tunnel();
-+            }
+@@ -141,0 +142,69 @@
++    routing: Option<Arc<RouteRouting>>,
++}
++
++// A route cache must distinguish credentials as well as proxy addresses.
++// Never derive Debug: keys may contain secret header values.
++#[derive(PartialEq, Eq)]
++struct RouteKey {
++    proxy: Option<String>,
++    auth: Option<Vec<u8>>,
++    headers: Vec<(String, Vec<u8>)>,
++    tunnel: bool,
++}
++
++struct RouteRouting {
++    builder: hyper_util::client::legacy::Builder,
++    connector: crate::connect::ConnectorBuilder,
++    layers: Vec<crate::connect::BoxedConnectorLayer>,
++    proxies: Arc<Vec<ProxyMatcher>>,
++    pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
++}
++
++impl RouteRouting {
++    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
++        let headers: Vec<_> = route
++            .as_ref()
++            .and_then(|p| p.custom_headers())
++            .into_iter()
++            .flat_map(|h| {
++                h.iter()
++                    .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
++            })
++            .collect();
++        let key = RouteKey {
++            proxy: route.as_ref().map(|p| p.uri().to_string()),
++            auth: route
++                .as_ref()
++                .and_then(|p| p.basic_auth())
++                .map(|h| h.as_bytes().to_vec()),
++            headers,
++            tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
++        };
++        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
++            let entry = pools.remove(index).expect("cached route");
++            let client = entry.1.clone();
++            pools.push_back(entry);
++            return client;
 +        }
-         let proxies = Arc::new(proxies);
- 
-         #[allow(unused)]
-@@ -2673,9 +2680,14 @@
-         }
- 
-         for proxy in self.inner.proxies.iter() {
++        // Layer constructors can execute user code. Never call them while the
++        // shared cache mutex is held; recheck after building for racing calls.
++        drop(pools);
++        let client = self.builder.build(
++            self.connector
++                .clone()
++                .build_fixed(self.layers.clone(), Some(route)),
++        );
++        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
++            let entry = pools.remove(index).expect("cached route");
++            let client = entry.1.clone();
++            pools.push_back(entry);
++            return client;
++        }
++        pools.push_back((key, client.clone()));
++        if pools.len() > 32 {
++            pools.pop_front();
++        }
++        client
++    }
+@@ -153 +222,30 @@
+-    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
++    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
++        if let Some(routing) = &self.routing {
++            let route = routing
++                .proxies
++                .iter()
++                .find_map(|proxy| proxy.intercept(req.uri()));
++            if route.as_ref().is_none_or(|proxy| proxy.tunnel_http())
++                || req.uri().scheme() != Some(&Scheme::HTTP)
++            {
++                req.headers_mut().remove(PROXY_AUTHORIZATION);
++            }
++            if req.uri().scheme() == Some(&Scheme::HTTP) {
++                if let Some(proxy) = &route {
++                    if !proxy.tunnel_http() {
++                        if !req.headers().contains_key(PROXY_AUTHORIZATION) {
++                            if let Some(auth) = proxy.basic_auth() {
++                                req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
++                            }
++                        }
++                        if let Some(headers) = proxy.custom_headers() {
++                            for (name, value) in headers {
++                                req.headers_mut().insert(name, value.clone());
++                            }
++                        }
++                    }
++                }
++            }
++            let mut client = routing.client(route);
++            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
++        }
+@@ -1007,0 +1106,11 @@
++        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
++            && !connector_builder.uses_local_transport();
++        let routing = dynamic_routing.then(|| {
++            Arc::new(RouteRouting {
++                builder: builder.clone(),
++                connector: connector_builder.clone(),
++                layers: config.connector_layers.clone(),
++                proxies: proxies.clone(),
++                pools: std::sync::Mutex::new(std::collections::VecDeque::new()),
++            })
++        });
+@@ -1010,0 +1120 @@
++            routing,
+@@ -1097,0 +1208 @@
++                dynamic_routing,
+@@ -2605,2 +2716,4 @@
+-        self.proxy_auth(&uri, &mut headers);
+-        self.proxy_custom_headers(&uri, &mut headers);
++        if !self.inner.dynamic_routing {
++            self.proxy_auth(&uri, &mut headers);
++            self.proxy_custom_headers(&uri, &mut headers);
++        }
+@@ -2676,3 +2789,8 @@
 -            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
 -                headers.insert(PROXY_AUTHORIZATION, header);
 -                break;
@@ -253,13 +335,7 @@
 +                    headers.insert(PROXY_AUTHORIZATION, header);
 +                    break;
 +                }
-             }
-         }
-     }
-@@ -2690,11 +2702,16 @@
-         }
- 
-         for proxy in self.inner.proxies.iter() {
+@@ -2693,5 +2811,10 @@
 -            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
 -                iter.iter().for_each(|(key, value)| {
 -                    headers.insert(key, value.clone());
@@ -275,6 +351,5 @@
 +                    });
 +                    break;
 +                }
-             }
-         }
-     }
+@@ -2925,0 +3049 @@
++    dynamic_routing: bool,

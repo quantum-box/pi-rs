@@ -139,6 +139,75 @@ impl Default for Accepts {
 #[derive(Clone)]
 struct HyperService {
     hyper: HyperClient,
+    routing: Option<Arc<RouteRouting>>,
+}
+
+// A route cache must distinguish credentials as well as proxy addresses.
+// Never derive Debug: keys may contain secret header values.
+#[derive(PartialEq, Eq)]
+struct RouteKey {
+    proxy: Option<String>,
+    auth: Option<Vec<u8>>,
+    headers: Vec<(String, Vec<u8>)>,
+    tunnel: bool,
+}
+
+struct RouteRouting {
+    builder: hyper_util::client::legacy::Builder,
+    connector: crate::connect::ConnectorBuilder,
+    layers: Vec<crate::connect::BoxedConnectorLayer>,
+    proxies: Arc<Vec<ProxyMatcher>>,
+    pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
+}
+
+impl RouteRouting {
+    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
+        let headers: Vec<_> = route
+            .as_ref()
+            .and_then(|p| p.custom_headers())
+            .into_iter()
+            .flat_map(|h| {
+                h.iter()
+                    .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            })
+            .collect();
+        let key = RouteKey {
+            proxy: route.as_ref().map(|p| p.uri().to_string()),
+            auth: route
+                .as_ref()
+                .and_then(|p| p.basic_auth())
+                .map(|h| h.as_bytes().to_vec()),
+            headers,
+            tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
+        };
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
+            let entry = pools.remove(index).expect("cached route");
+            let client = entry.1.clone();
+            pools.push_back(entry);
+            return client;
+        }
+        // Layer constructors can execute user code. Never call them while the
+        // shared cache mutex is held; recheck after building for racing calls.
+        drop(pools);
+        let client = self.builder.build(
+            self.connector
+                .clone()
+                .build_fixed(self.layers.clone(), Some(route)),
+        );
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
+            let entry = pools.remove(index).expect("cached route");
+            let client = entry.1.clone();
+            pools.push_back(entry);
+            return client;
+        }
+        pools.push_back((key, client.clone()));
+        if pools.len() > 32 {
+            pools.pop_front();
+        }
+        client
+    }
 }
 
 impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
@@ -150,7 +219,36 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
         self.hyper.poll_ready(cx).map_err(crate::error::request)
     }
 
-    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
+    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
+        if let Some(routing) = &self.routing {
+            let route = routing
+                .proxies
+                .iter()
+                .find_map(|proxy| proxy.intercept(req.uri()));
+            if route.as_ref().is_none_or(|proxy| proxy.tunnel_http())
+                || req.uri().scheme() != Some(&Scheme::HTTP)
+            {
+                req.headers_mut().remove(PROXY_AUTHORIZATION);
+            }
+            if req.uri().scheme() == Some(&Scheme::HTTP) {
+                if let Some(proxy) = &route {
+                    if !proxy.tunnel_http() {
+                        if !req.headers().contains_key(PROXY_AUTHORIZATION) {
+                            if let Some(auth) = proxy.basic_auth() {
+                                req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
+                            }
+                        }
+                        if let Some(headers) = proxy.custom_headers() {
+                            for (name, value) in headers {
+                                req.headers_mut().insert(name, value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut client = routing.client(route);
+            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
+        }
         let clone = self.hyper.clone();
         let mut inner = std::mem::replace(&mut self.hyper, clone);
         Box::pin(async move { inner.call(req).await.map_err(crate::error::request) })
@@ -416,13 +514,6 @@ impl ClientBuilder {
         let mut proxies = config.proxies;
         if config.auto_sys_proxy {
             proxies.push(ProxyMatcher::system());
-        }
-        // A dynamic callback can change between request headers and connection.
-        // Keep proxy credentials on CONNECT whenever any rule is dynamic.
-        if proxies.iter().any(ProxyMatcher::is_dynamic) {
-            for proxy in &mut proxies {
-                proxy.require_sensitive_tunnel();
-            }
         }
         let proxies = Arc::new(proxies);
 
@@ -1021,9 +1112,21 @@ impl ClientBuilder {
             Some(format!("{:?}", &config.redirect_policy))
         };
 
+        let dynamic_routing = proxies.iter().any(ProxyMatcher::is_dynamic)
+            && !connector_builder.uses_local_transport();
+        let routing = dynamic_routing.then(|| {
+            Arc::new(RouteRouting {
+                builder: builder.clone(),
+                connector: connector_builder.clone(),
+                layers: config.connector_layers.clone(),
+                proxies: proxies.clone(),
+                pools: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            })
+        });
         let hyper_client = builder.build(connector_builder.build(config.connector_layers));
         let hyper_service = HyperService {
             hyper: hyper_client,
+            routing,
         };
 
         let redirect_policy = {
@@ -1111,6 +1214,7 @@ impl ClientBuilder {
                 proxies_maybe_http_auth,
                 proxies_maybe_http_custom_headers,
                 https_only: config.https_only,
+                dynamic_routing,
                 redirect_policy_desc,
             }),
         })
@@ -2650,8 +2754,10 @@ impl Client {
 
         let body = body.unwrap_or_else(Body::empty);
 
-        self.proxy_auth(&uri, &mut headers);
-        self.proxy_custom_headers(&uri, &mut headers);
+        if !self.inner.dynamic_routing {
+            self.proxy_auth(&uri, &mut headers);
+            self.proxy_custom_headers(&uri, &mut headers);
+        }
 
         let builder = hyper::Request::builder()
             .method(method.clone())
@@ -2982,6 +3088,7 @@ struct ClientRef {
     proxies_maybe_http_auth: bool,
     proxies_maybe_http_custom_headers: bool,
     https_only: bool,
+    dynamic_routing: bool,
     redirect_policy_desc: Option<String>,
 }
 

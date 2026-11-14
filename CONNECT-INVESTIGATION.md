@@ -13,11 +13,9 @@ AWS HTTP handler and must be assessed separately.
 * Both reqwest versions choose CONNECT only for HTTPS destinations. Their
   `connector_layer` wraps a service using private URI/connection fields, so a
   downstream layer cannot safely replace the stream or change its proxy flag.
-* HTTP forward proxy authentication and custom proxy headers are injected into
-  the origin request by reqwest. Authenticated dynamic `Proxy::custom` matches
-  use CONNECT even without the opt-in because callback results can change
-  between request construction and connection. This intentionally changes
-  legacy custom proxies that require authenticated forward requests.
+* HTTP forward proxy authentication and custom proxy headers must only reach
+  the selected proxy. A dynamic callback can change between request creation
+  and connection, so those operations must use the same route snapshot.
 * MCP OAuth enforces URL and redirect checks and uses a DNS resolver that
   exempts configured proxy hosts. Any transport replacement must preserve the
   checks on every redirect and avoid treating an origin as a proxy host.
@@ -59,15 +57,43 @@ design: it changes resolver observations and can leak proxy credentials.
   ensure no unbounded background tasks and no replay of request bodies.
 * Model loopback and MCP transport fixtures, followed by cross-platform CI.
 
-Independent review found that forcing every authenticated proxy to tunnel when
-any dynamic rule exists also changes a nonmatching dynamic rule followed by a
-static authenticated forward-only proxy. Two active loopback regressions cover
-this and currently fail. The request-header and connector paths invoke the
-callback independently; preserving both dynamic changes and forward-proxy
-semantics requires a single request-scoped routing decision that survives
-redirects, concurrent requests and connection reuse. A client-wide per-host
-cache is insufficient because it changes callback semantics and can grow or
-become stale. No compatible solution has been implemented yet.
+Independent review found that the previous forced-tunnel approach changed a
+nonmatching dynamic rule followed by a static authenticated forward-only proxy.
+Active loopback regressions cover this in both versions. The current prototype
+selects a route per hop and uses it for headers, connector and a bounded
+route-specific pool. Its network tests and Rustls configurations need public CI
+and independent review before asserting compatibility or security.
+
+### Candidate request-scoped routing
+
+The redirect service wraps `HyperService`, so a routing service immediately
+inside it can evaluate proxy rules once for each redirect hop. The selected
+immutable route must be used both to prepare forward-proxy headers and to
+construct the connector. Separate hyper clients/pools per route are required:
+hyper-util keys its legacy pool by destination origin, so sharing a pool
+between direct and proxied routes can reuse the wrong connection. The route key
+must distinguish the proxy authority, scheme, authentication and custom
+headers without logging or persisting secrets. It must also distinguish direct,
+forward and tunnel connections. Concurrent requests need independent snapshots;
+eviction cannot invalidate a client currently in use.
+
+`ConnectorBuilder` owns the TLS, DNS, timeout and connector-layer configuration,
+and hyper's legacy builder is cloneable. The prototype clones them into
+route-specific clients and retains at most 32 routes. It removes
+`Proxy-Authorization` for direct and tunneled dynamic routes, including when a
+caller explicitly supplied that header. Cache keys currently retain credential
+and proxy-header bytes in memory until eviction; they are not logged or written
+to disk. This retention and its security tradeoff require review. HTTP/3,
+local transports, custom connector layers, cancellation, failed connection
+setup and route changes on redirect still need targeted verification.
+
+The standalone `experiments/proxy_route_pool.rs` models exact route matching,
+bounded LRU eviction and in-flight client ownership. Its three std-only tests
+pass for concurrent selection, different credentials, redirect-hop selection,
+reuse and eviction. It does not use either reqwest version, open sockets, or
+prove the security of the transport. It intentionally retains raw secret bytes
+in memory; a production implementation still needs a retention and zeroization
+design and must preserve exact, collision-free route identity.
 
 The prototype is pending public CI and independent review. The two reqwest
 sources retain their MIT and Apache-2.0 license files. Vendoring is a temporary
