@@ -7838,6 +7838,40 @@ mod tests {
     }
 
     #[test]
+    fn live_share_response_keeps_its_private_journal_key() {
+        let share_id = uuid::Uuid::new_v4();
+        let key = [3; 32];
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id: share_id,
+                journal_key: Some(key),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let snapshot = super::sessions::ShareSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            head: 7,
+            context: super::sessions::ShareContext {
+                system_prompt: "live".into(),
+                tools: vec![],
+            },
+            journal_tag: Some([9; 32]),
+        };
+        let (pending, received) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":share_id,
+                "success":true, "data":snapshot,
+            }))
+            .unwrap();
+        assert_eq!(pending.journal_key, Some(key));
+        assert_eq!(received.unwrap().journal_tag, Some([9; 32]));
+    }
+
+    #[test]
     fn pending_share_keeps_extension_dialog_and_response_correlated() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let share_id = uuid::Uuid::new_v4();
