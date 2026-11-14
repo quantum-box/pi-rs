@@ -37,6 +37,11 @@ jobs:
           persist-credentials: false
       - name: Install supported Rust toolchain
         run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Match the toolchain used by the commands below when constructing the key.
+          cmd-format: rustup run 1.89.0 {0}
       - name: Check formatting
         run: cargo +1.89.0 fmt --all -- --check
       - name: Check all targets
