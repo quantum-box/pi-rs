@@ -6925,6 +6925,83 @@ mod tree_tests {
                 .any(|record| matches!(record.event, Event::Compacted { .. }))
         );
     }
+
+    #[tokio::test]
+    async fn silent_overflow_model_summary_preserves_completed_answer() {
+        struct ModelWithSummary(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Model for ModelWithSummary {
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text(
+                        if first { "answer" } else { "summary" }.into(),
+                    )),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: if first { 1001 } else { 10 },
+                            output_tokens: 2,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let model = ModelWithSummary(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 2,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let answer = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            2,
+            "one turn and one summary request"
+        );
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "summary")));
+        assert!(session.current_messages().iter().any(
+            |message| matches!(message, Message::Assistant { content, .. } if content == "answer")
+        ));
+    }
     #[async_trait::async_trait]
     impl Model for LengthModel {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
