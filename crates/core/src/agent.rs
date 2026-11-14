@@ -2277,7 +2277,16 @@ impl Agent<'_> {
                 metadata: metadata.clone(),
                 usage: usage.clone(),
                 failure,
-                partial: content,
+                // A completed summary must survive interruption between the
+                // billable response and the compaction commit. Turn replies
+                // already use RecordedReply for that purpose.
+                partial: if retain_reply {
+                    content
+                } else {
+                    result
+                        .as_ref()
+                        .map_or(content, |reply| reply.content.clone())
+                },
                 reply: advertised_tools.and_then(|advertised_tools| {
                     result.as_ref().ok().map(|reply| RecordedReply {
                         content: reply.content.clone(),
@@ -6333,6 +6342,10 @@ mod tree_tests {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["reason"], "overflow");
             assert_eq!(events[0]["willRetry"], true);
+            if !provide {
+                assert!(session.records().iter().any(|record| matches!(&record.event,
+                    Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")));
+            }
             assert!(
                 session
                     .records()
