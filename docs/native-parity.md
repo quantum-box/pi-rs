@@ -153,6 +153,8 @@ The native xAI provider uses the pinned Pi Responses catalog and
 separate from OpenAI and ChatGPT. `/login xai` and `pi login xai` also support
 Pi's xAI subscription device authorization, pending and slow-down polling,
 Pi-compatible credentials, five-minute expiry skew, and refresh-token rotation.
+The terminal's device-code prompt can open the verification URL and copy the
+code on confirmation while polling continues; cancellation discards the action.
 `/login xai api-key` retains manual API-key entry. OAuth credentials are accepted
 only for the official xAI Responses endpoint; token requests use the fixed xAI
 authorization host, disable redirects, and never print response bodies. Refresh

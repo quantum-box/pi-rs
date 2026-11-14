@@ -165,7 +165,7 @@ impl Service {
                     ],
                 )
                 .await?;
-            if status.is_success() && json["access_token"].is_string() {
+            if status.is_success() {
                 return credential(json, None);
             }
             match json["error"].as_str() {
@@ -455,6 +455,46 @@ mod tests {
         assert!(requests[3].contains("grant_type=refresh_token"));
         assert!(requests[3].contains("refresh_token=refresh-1"));
     }
+    #[tokio::test]
+    async fn successful_http_response_without_token_fails_without_polling_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in [
+                r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://auth.x.ai/activate","interval":1,"expires_in":10}"#,
+                r#"{"error":"authorization_pending"}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 2048];
+                assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let service = Service {
+            host: Url::parse(&origin).unwrap(),
+            client: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        };
+        let result = service.login(|_, _| {}).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("invalid token response")
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn cancelled_caller_still_saves_rotated_refresh_token() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
