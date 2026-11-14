@@ -1067,6 +1067,32 @@ where
 mod overflow_tests {
     use super::{context_overflow_error, provider_context_overflow};
 
+    #[tokio::test]
+    async fn overflow_stream_respects_json_boundaries_and_limits() {
+        use futures_util::stream;
+        let chunks = stream::iter(vec![
+            Ok::<_, ()>(br#"{"error":{"message":"prompt is "#.as_slice()),
+            Ok(br#"too long"}}"#.as_slice()),
+        ]);
+        assert!(super::provider_context_overflow_stream(chunks, &[]).await);
+        let truncated = stream::iter(vec![Ok::<_, ()>(
+            br#"{"error":{"message":"prompt is too long"#.as_slice(),
+        )]);
+        assert!(!super::provider_context_overflow_stream(truncated, &[]).await);
+        let oversized = vec![b'x'; 64 * 1024 + 1];
+        assert!(
+            !super::provider_context_overflow_stream(
+                stream::iter(vec![Ok::<_, ()>(oversized)]),
+                &[]
+            )
+            .await
+        );
+        let secret = stream::iter(vec![Ok::<_, ()>(b"prompt is too long".as_slice())]);
+        assert!(
+            !super::provider_context_overflow_stream(secret, &["prompt is too long".into()]).await
+        );
+    }
+
     #[test]
     fn provider_overflow_ignores_metadata_secrets_and_rate_limits() {
         use serde_json::json;

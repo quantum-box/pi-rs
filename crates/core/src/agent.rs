@@ -1284,6 +1284,13 @@ impl Agent<'_> {
                         "context overflow and automatic compaction is disabled".into(),
                     ));
                 }
+                if recovery.summary_started {
+                    // A prior process may have sent or completed a billable
+                    // request. Do not silently issue it a second time.
+                    return Err(Error::Model(
+                        "interrupted overflow summary requires reconciliation".into(),
+                    ));
+                }
                 if !recovery.started {
                     commit(
                         session,
@@ -4092,6 +4099,7 @@ struct OverflowRecoveryState {
     request_id: Uuid,
     started: bool,
     compacted: bool,
+    summary_started: bool,
 }
 
 fn overflow_recovery_epoch<'a>(branch: &'a [&'a Record], run_id: Uuid) -> &'a [&'a Record] {
@@ -4138,7 +4146,9 @@ fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRe
             record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. }))) {
             return None;
         }
-        return Some(OverflowRecoveryState { request_id, started: true, compacted: compacted_at.is_some() });
+        let summary_started = following.iter().any(|record| record.run_id == Some(run_id)
+            && matches!(record.event, Event::ModelRequested { .. }));
+        return Some(OverflowRecoveryState { request_id, started: true, compacted: compacted_at.is_some(), summary_started });
     }
     let request_id = branch
         .iter()
@@ -4162,6 +4172,7 @@ fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRe
         request_id,
         started: false,
         compacted: false,
+        summary_started: false,
     })
 }
 
@@ -6468,7 +6479,7 @@ mod tree_tests {
         let mut session = Session::open(&path).unwrap();
         session.set_run_id(Some(run_id));
         let pending = overflow_recovery_state(&session, run_id).unwrap();
-        assert!(pending.started && !pending.compacted);
+        assert!(pending.started && !pending.compacted && pending.summary_started);
         session
             .append(Event::Compacted {
                 summary: "summary".into(),
