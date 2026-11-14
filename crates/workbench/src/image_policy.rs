@@ -477,7 +477,7 @@ mod tests {
         for (deferred, names, explicit, identity, dispatch) in [
             (
                 false,
-                &MULTI[..],
+                MULTI,
                 vec![
                     ("SESSION_ID", "s"),
                     ("X-CLIENT-REQUEST-ID", "r"),
@@ -486,8 +486,8 @@ mod tests {
                 "日本",
                 true,
             ),
-            (false, &MULTI[..], vec![("SESSION_ID", "s")], "日本", false),
-            (false, &MULTI[..], vec![("SESSION_ID", "s")], "café", true),
+            (false, MULTI, vec![("SESSION_ID", "s")], "日本", false),
+            (false, MULTI, vec![("SESSION_ID", "s")], "café", true),
             (
                 false,
                 &["x-session-id"][..],
