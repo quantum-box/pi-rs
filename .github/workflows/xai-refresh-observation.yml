@@ -30,3 +30,5 @@ jobs:
             cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs xai_auth::tests::cancelled_caller_ -- --nocapture
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Reproduce serial workspace suite ordering
+        run: cargo +1.89.0 test --locked --workspace --all-features

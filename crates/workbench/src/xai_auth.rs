@@ -385,7 +385,13 @@ async fn access_at_inner(
             Ok(value.access)
         })();
         #[cfg(test)]
-        report("finished", result.as_ref().err().map(ToString::to_string));
+        {
+            // Include lock cleanup in the observed worker outcome; a stalled
+            // guard drop must not be mistaken for a finished worker.
+            report("release_lock", None);
+            drop(guard);
+            report("finished", result.as_ref().err().map(ToString::to_string));
+        }
         result
     })
     .await
@@ -624,6 +630,7 @@ mod tests {
             }
         };
         assert!(stages.contains(&"exchange"));
+        assert!(stages.contains(&"release_lock"));
         if success {
             assert!(stages.contains(&"save"));
             assert_eq!(observed, None);
