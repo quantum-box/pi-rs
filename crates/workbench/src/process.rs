@@ -99,6 +99,40 @@ pub(super) fn refresh_barrier_cancellable(
     }))
 }
 
+/// Cancels a queued credential exchange when its caller is dropped. Once
+/// admitted, the blocking task retains the barrier through durable persistence.
+pub(super) struct RefreshCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl RefreshCancellation {
+    pub(super) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+    pub(super) fn state(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        self.0.clone()
+    }
+    pub(super) fn enter(state: &std::sync::atomic::AtomicU8) -> Result<RefreshBarrier> {
+        use std::sync::atomic::Ordering;
+        let Some(barrier) = refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
+        else {
+            return Err(Error::Cancelled);
+        };
+        if state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(Error::Cancelled);
+        }
+        Ok(barrier)
+    }
+}
+impl Drop for RefreshCancellation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
     match reason {
         SessionStartReason::Startup => SessionShutdownReason::Quit,

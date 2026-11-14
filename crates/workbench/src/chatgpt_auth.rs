@@ -211,6 +211,30 @@ where
     F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<pi_rs::openai::oauth::Credential>> + Send + 'static,
 {
+    refresh_with_barrier_hook(
+        directory,
+        previous,
+        expected_active,
+        chat_lock,
+        exchange,
+        || {},
+    )
+    .await
+}
+
+async fn refresh_with_barrier_hook<F, Fut, H>(
+    directory: std::path::PathBuf,
+    previous: pi_rs::openai::oauth::Credential,
+    expected_active: Option<pi_rs::openai::oauth::Credential>,
+    chat_lock: std::fs::File,
+    exchange: F,
+    before_barrier: H,
+) -> Result<pi_rs::openai::oauth::Credential>
+where
+    F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<pi_rs::openai::oauth::Credential>> + Send + 'static,
+    H: FnOnce() + Send + 'static,
+{
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     if let Some(expected) = expected_active {
@@ -222,9 +246,12 @@ where
             ));
         }
     }
+    let _cancellation = super::process::RefreshCancellation::new();
+    let state = _cancellation.state();
     tokio::task::spawn_blocking(move || {
         let _chat_lock = chat_lock;
-        let _barrier = super::process::refresh_barrier()?;
+        before_barrier();
+        let _barrier = super::process::RefreshCancellation::enter(&state)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -600,6 +627,49 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_waiting_at_barrier_never_starts_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = fixture(dir.path());
+        let barrier = super::super::process::refresh_barrier().unwrap();
+        let chat_lock = lock_path(dir.path().join("chatgpt-refresh.lock"))
+            .await
+            .unwrap();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(refresh_with_barrier_hook(
+            dir.path().to_owned(),
+            credential,
+            None,
+            chat_lock,
+            move |credential| async move {
+                let _ = started_tx.send(());
+                Ok(credential)
+            },
+            move || {
+                let _ = waiting_tx.send(());
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        drop(barrier);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let auth = super::super::config::read_object(&dir.path().join("auth.json")).unwrap();
+        assert_eq!(
+            auth["openai-chatgpt"]["credential"]["refresh_token"],
+            "old-refresh"
+        );
     }
 
     #[tokio::test]

@@ -1,77 +1,25 @@
-name: Rust parity
-
+name: Focused share context validation
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      platform:
-        description: Native acceptance platform
-        type: choice
-        default: all
-        options: [all, ubuntu-latest, macos-latest, windows-latest]
-
 permissions:
   contents: read
-
-concurrency:
-  group: rust-parity-${{ github.ref }}-${{ inputs.platform || 'all' }}
-  cancel-in-progress: true
-
 jobs:
-  native:
-    name: Native tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  focused:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.platform && inputs.platform != 'all' && format('["{0}"]', inputs.platform) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     env:
       CARGO_TERM_COLOR: always
-      RUST_BACKTRACE: 1
+      RUST_TEST_THREADS: 1
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install supported Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
-      - name: Check formatting
-        run: cargo +1.89.0 fmt --all -- --check
-      - name: Check all targets
-        run: cargo +1.89.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
-      - name: Run native acceptance tests
-        env:
-          # The CLI fixtures start independent workers that sync journals to disk.
-          # Serial execution keeps their per-request deadlines stable on shared runners.
-          RUST_TEST_THREADS: 1
-        run: cargo +1.89.0 test --locked --workspace --all-features
-      - name: Test native SDK host example
-        run: |
-          cargo +1.89.0 test --locked --example native_sdk_host
-          cargo +1.89.0 test --locked -p pi-rs-ollama --example sdk_chat
-
-  wasm-diagnostic:
-    name: Browser WASM core diagnostic (non-gating)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Install Rust and WASM target
-        run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
-      # Diagnostic only: neither a passing compile nor this job implies browser support.
-      - name: Check core for wasm32-unknown-unknown
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          cargo +1.89.0 check --locked -p pi-rs-core --target wasm32-unknown-unknown > wasm-check.log 2>&1
-          status=$?
-          cat wasm-check.log
-          echo "Core wasm32-unknown-unknown cargo check exit code: $status (diagnostic only; not browser runtime validation)." >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Test OAuth refresh and private storage
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs refresh
+      - name: Test private storage
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store

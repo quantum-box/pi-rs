@@ -363,12 +363,14 @@ async fn access_at(
         return Ok(value.access);
     }
     let previous = stored["meta"].clone();
+    let _cancellation = super::process::RefreshCancellation::new();
+    let state = _cancellation.state();
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
+        let _barrier = super::process::RefreshCancellation::enter(&state)?;
         let access = runtime.block_on(service.mint(&value.refresh))?;
         let expires = now().saturating_add(KEY_LIFETIME_MS);
         super::config::update_object_locked(&path, Some(&guard), |data| {
