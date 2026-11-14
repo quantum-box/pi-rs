@@ -1857,6 +1857,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_preserves_child_wake_before_reservation_and_after_recovery() {
+        for recovered in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            registry.register_versioned(
+                "parent",
+                2,
+                true,
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+                Some(Arc::new(|input, checkpoint, _| {
+                    Ok((input.clone(), checkpoint.clone()))
+                })),
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let parent_id = Uuid::from_u128(1);
+            let a = Uuid::from_u128(2);
+            let b = Uuid::from_u128(3);
+            let mut parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                3,
+            );
+            let mut first = task(2, TaskOwner::Task(parent_id), "child", true, 3);
+            let second = task(3, TaskOwner::Task(parent_id), "child", true, 3);
+            first.start().unwrap();
+            first.succeed(json!(null)).unwrap();
+            parent.start().unwrap();
+            parent.wait(WaitFor::TasksAny(vec![b, a])).unwrap();
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&parent),
+                    Save::Create(&first),
+                    Save::Create(&second),
+                ])
+                .unwrap();
+            let waiting = scheduler.ts().load(parent_id).unwrap().unwrap();
+            scheduler.ts().poll_wait(&waiting, 0).unwrap();
+            let ready = scheduler.ts().load(parent_id).unwrap().unwrap();
+            if recovered {
+                scheduler.ts().reserve(&ready).unwrap();
+                let running = scheduler.ts().load(parent_id).unwrap().unwrap();
+                scheduler.ts().recover(&running).unwrap();
+            }
+            let child = scheduler.ts().load(b).unwrap().unwrap();
+            scheduler.ts().update(&child, |t| t.cancel()).unwrap();
+            let ready = scheduler.ts().load(parent_id).unwrap().unwrap();
+            assert!(scheduler.reserve_resolved(&ready).unwrap());
+            let running = scheduler.ts().load(parent_id).unwrap().unwrap();
+            let expected = if recovered { vec![a] } else { vec![b, a] };
+            assert_eq!(running.task.ended_children(), Some(expected.as_slice()));
+            assert_eq!(running.task.definition_version(), 2);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn child_wake_process_death_worker() {

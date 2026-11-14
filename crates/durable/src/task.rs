@@ -202,8 +202,7 @@ impl Task {
         self.definition_version = version;
         self.input = input;
         self.typed_wake = None;
-        self.ended_children = None;
-        self.wake_children = None;
+        // Migration does not consume a child wake or unfreeze a replayed one.
         self.checkpoint = checkpoint;
     }
 

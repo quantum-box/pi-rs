@@ -1860,6 +1860,28 @@ mod tests {
     }
 
     #[test]
+    fn child_wake_serialization_round_trips_and_accepts_legacy_records() {
+        let mut parent = task(1, 3);
+        let child = Uuid::from_u128(2);
+        let legacy = serde_json::to_value(&parent).unwrap();
+        assert!(legacy.get("ended_children").is_none());
+        assert!(legacy.get("wake_children").is_none());
+        assert_eq!(serde_json::from_value::<Task>(legacy).unwrap(), parent);
+
+        parent.set_child_wake(vec![child], vec![child]);
+        let encoded = serde_json::to_value(&parent).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Task>(encoded.clone()).unwrap(),
+            parent
+        );
+        let mut old_wake = encoded;
+        old_wake.as_object_mut().unwrap().remove("wake_children");
+        let restored: Task = serde_json::from_value(old_wake).unwrap();
+        assert_eq!(restored.ended_children(), Some(&[child][..]));
+        assert_eq!(restored.wake_children(), None);
+    }
+
+    #[test]
     fn child_completion_racing_reservation_conflicts_and_retry_refreshes_wake() {
         let db = Store::memory().unwrap();
         let ts = TaskStore::new(&db);
