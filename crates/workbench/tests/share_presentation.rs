@@ -263,7 +263,7 @@ fn terminal_shares_idle_and_during_model_request() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -425,7 +425,7 @@ fn terminal_radius_share_succeeds_without_selected_model_credentials() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
