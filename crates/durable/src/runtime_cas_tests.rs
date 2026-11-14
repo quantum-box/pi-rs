@@ -2762,6 +2762,28 @@ fn managed_anchor_admission_is_fenced_by_parent_abort() {
 }
 
 #[test]
+fn existing_managed_anchor_rejects_admission_during_parent_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let link = h
+        .ensure_managed_subagent(parent, "worker", config.clone(), None)
+        .unwrap();
+    h.request_abort_with_background(parent).unwrap();
+    assert!(h.conversation(link.child).unwrap().abort_requested);
+    assert!(
+        h.ensure_managed_subagent(parent, "worker", config, None)
+            .is_err()
+    );
+    assert!(h.conversation(link.child).unwrap().submissions.is_empty());
+}
+
+#[test]
 fn managed_anchor_races_background_abort_without_stranding_child() {
     for _ in 0..12 {
         let dir = tempfile::tempdir().unwrap();

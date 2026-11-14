@@ -305,6 +305,11 @@ impl Harness {
         let reservation_key = key(parent, name);
         let anchor_key = format!("runtime/subagent-anchor/{parent}/{name}").into_bytes();
         loop {
+            // An existing anchor is reusable, but it does not grant admission
+            // while the parent has an outstanding abort request.
+            if self.conversation(parent)?.abort_requested {
+                return Err(Error::Invalid("parent conversation is aborting".into()));
+            }
             if self.reservation(parent, name)?.is_some() {
                 let link = self.ensure_subagent_restricted(
                     parent,
