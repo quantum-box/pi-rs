@@ -1300,9 +1300,8 @@ impl SessionBuilder {
                 HistoricalModelResolution::Unavailable => {}
             }
         }
-        // Every source of a staged client is checked before the journal is
-        // changed. Matching identities must share the exact host-selected Arc.
-        let mut revoked = false;
+        // Stage every builder binding and reserve the session before any write.
+        // The fallback identity must not replace a different opaque client.
         if let Some((provider, name, client)) = &resolved {
             let same_default = self.model_provider.as_deref() == Some(provider.as_str())
                 && self.model_name == *name;
@@ -1316,66 +1315,37 @@ impl SessionBuilder {
                     "model client changed while resolving {provider}/{name}"
                 )));
             }
-            let (_, was_revoked) = self.registry.commit_resolved_session_model(
-                session.session_id(),
-                provider,
-                name,
-                client.clone(),
-                || {
-                    if model_fallback.is_some() {
-                        session.select_provider_model_atomic(provider, name)?;
-                    }
-                    Ok(())
-                },
-            )?;
-            revoked = was_revoked;
         }
+        let mut bindings = Vec::new();
         for (name, model) in self.branch_models {
-            if revoked {
-                continue;
-            }
-            self.registry
-                .register_session_branch_model(session.session_id(), name, model)?;
+            bindings.push((None, name, model));
         }
         for ((provider, name), model) in self.provider_models {
-            if revoked
-                || resolved
-                    .as_ref()
-                    .is_some_and(|(p, n, _)| p == &provider && n == &name)
-            {
-                continue;
-            }
-            self.registry.register_session_provider_model(
-                session.session_id(),
-                &provider,
-                &name,
-                model,
-            )?;
+            bindings.push((Some(provider), name, model));
         }
-        if revoked {
-            // The durable selection may have succeeded, but a concurrent host
-            // revocation wins; no client is installed or resurrected.
-        } else if let Some(provider) = &self.model_provider {
-            if !resolved
-                .as_ref()
-                .is_some_and(|(p, n, _)| p == provider && n == &self.model_name)
-            {
-                self.registry.register_session_provider_model(
-                    session.session_id(),
-                    provider,
-                    &self.model_name,
-                    self.model.clone(),
-                )?;
-            }
-        } else {
-            self.registry.register_session_branch_model(
-                session.session_id(),
-                self.model_name.clone(),
-                self.model.clone(),
-            )?;
+        bindings.push((
+            self.model_provider.clone(),
+            self.model_name.clone(),
+            self.model.clone(),
+        ));
+        if let Some((provider, name, client)) = &resolved {
+            bindings.push((Some(provider.clone()), name.clone(), client.clone()));
         }
-        if let Some((provider, name, client)) = resolved {
-            let _ = provider;
+        let guarded = resolved
+            .as_ref()
+            .map(|(provider, name, client)| (provider.as_str(), name.as_str(), client));
+        let (_, _revoked) = self.registry.commit_session_model_bindings(
+            session.session_id(),
+            bindings,
+            guarded,
+            || {
+                if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
+                    session.select_provider_model_atomic(provider, name)?;
+                }
+                Ok(())
+            },
+        )?;
+        if let Some((_, name, client)) = resolved {
             self.model = client;
             self.model_name = name;
         }
@@ -4740,12 +4710,67 @@ mod tests {
                 Some("fallback")
             );
             if revoke {
+                assert!(
+                    branch_client(
+                        &session.registry,
+                        session.session_id,
+                        Some("current"),
+                        "shared"
+                    )
+                    .is_none()
+                );
+                assert!(
+                    branch_client(
+                        &session.registry,
+                        session.session_id,
+                        Some("fallback"),
+                        "shared"
+                    )
+                    .is_none()
+                );
                 assert!(session.prompt("no dispatch").await.is_err());
             } else {
                 assert_eq!(session.prompt("test").await.unwrap(), "fallback");
             }
             session.close().await.unwrap();
         }
+    }
+
+    #[test]
+    fn startup_fallback_rejects_other_session_reservation_before_write() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records,
+            writes: writes.clone(),
+            fail_on: usize::MAX,
+        })
+        .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "fallback".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("fallback")),
+            })
+        });
+        let builder = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver);
+        registry
+            .commit_session_model_bindings(id, vec![], None, || {
+                assert!(builder.build(journal).is_err());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

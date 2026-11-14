@@ -717,7 +717,9 @@ For a fallback the SDK commits the chosen identity, clears the thinking level,
 and exposes both identities through `AgentSession::model_fallback`. The SDK
 rejects a fallback before committing if that provider/model already has a
 different client; an existing matching client must be the same `Arc`. A host
-revocation during the write prevents the resolved client from being installed.
+revocation during the write prevents the entire staged client set from being
+installed, and conflicting in-flight registrations are rejected before the
+journal write.
 The durable selection can then exist without a client and requires a new
 authorized registration before dispatch. The SDK
 cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
