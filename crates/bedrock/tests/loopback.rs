@@ -424,6 +424,94 @@ async fn service_errors_include_safe_diagnostics_and_classify_stream_validation(
 }
 
 #[tokio::test]
+async fn quota_throttling_is_permanent_in_response_and_stream() {
+    for streaming in [false, true] {
+        for case in [0, 1, 2, 3, 4] {
+            let permanent = matches!(case, 1 | 2 | 4);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 8192];
+                let _ = socket.read(&mut buffer).await.unwrap();
+                let message = match case {
+                    1 => "account quota exceeded sentinel-private".to_owned(),
+                    2 => format!("{} quota exceeded sentinel-private", "x".repeat(520)),
+                    3 => format!("{}\"code\":13089", "x".repeat(64 * 1024 - 11)),
+                    4 => format!("{} quota exceeded", "x".repeat(64 * 1024)),
+                    _ => "temporary rate limit".to_owned(),
+                };
+                let body = json!({"message":message}).to_string();
+                if streaming {
+                    let frame = Frame::new(bytes::Bytes::from(body))
+                        .add_header(Header::new(
+                            ":message-type",
+                            HeaderValue::String("exception".into()),
+                        ))
+                        .add_header(Header::new(
+                            ":exception-type",
+                            HeaderValue::String("throttlingException".into()),
+                        ))
+                        .add_header(Header::new(
+                            ":content-type",
+                            HeaderValue::String("application/json".into()),
+                        ));
+                    let mut bytes = Vec::new();
+                    write_message_to(&frame, &mut bytes).unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nx-amzn-requestid: billing-123\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&bytes).await.unwrap();
+                } else {
+                    socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nx-amzn-requestid: billing-123\r\nx-amzn-errortype: ThrottlingException\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                }
+            });
+            let config = aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version_latest()
+                .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+                .credentials_provider(aws_credential_types::Credentials::new(
+                    "test",
+                    "sentinel-private",
+                    None,
+                    None,
+                    "test",
+                ))
+                .retry_config(aws_sdk_bedrockruntime::config::retry::RetryConfig::disabled())
+                .endpoint_url(format!("http://{address}"))
+                .build();
+            let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config));
+            let request = ModelRequest {
+                model: "test-model".into(),
+                messages: vec![Message::User {
+                    content: "hi".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let error = match model.stream(request).await {
+                Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+                Err(error) => error,
+            };
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::Model(_)),
+                permanent,
+                "{error:?}"
+            );
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent,
+                "{error:?}"
+            );
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            } else {
+                assert!(error.to_string().contains("billing-123"));
+            }
+            assert!(!error.to_string().contains("sentinel-private"));
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn tool_free_summary_keeps_history_as_text_without_tool_config() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

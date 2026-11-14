@@ -759,3 +759,433 @@ async fn factory_registers_with_owned_sdk_session() {
     assert!(requests[0].tools.iter().all(|spec| spec.name != "write"));
     assert!(requests[1].messages.iter().any(|message| matches!(message, pi_rs::Message::Tool { content, is_error: false, .. } if content.contains("sdk fixture"))));
 }
+
+#[derive(Default)]
+struct ObserveReadOutcome(Mutex<Vec<Outcome>>);
+
+#[async_trait::async_trait]
+impl Extension for ObserveReadOutcome {
+    fn id(&self) -> &str {
+        "read-outcome-observer"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        if call.name == "read" {
+            self.0.lock().unwrap().push(outcome.clone());
+        }
+        Ok(None)
+    }
+    fn after_tool(
+        &self,
+        name: &str,
+        outcome: &Outcome,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ExtensionState>> {
+        if name == "read" {
+            self.0.lock().unwrap().push(outcome.clone());
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn sdk_read_outcomes_remain_compatible_in_hooks_and_observers() {
+    for truncated in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let text = if truncated {
+            "x".repeat(51_201)
+        } else {
+            "sdk fixture".into()
+        };
+        std::fs::write(directory.path().join("note.txt"), text).unwrap();
+        let hook = Arc::new(ObserveReadOutcome::default());
+        let mut session = pi_rs::SessionBuilder::new(Arc::new(Script::default()), "fixture")
+            .extension(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap()
+            .extension(hook.clone())
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let mut events = session.subscribe();
+        assert_eq!(session.prompt("read it").await.unwrap(), "done");
+        let values = hook.0.lock().unwrap().clone();
+        assert_eq!(values.len(), 2);
+        if truncated {
+            assert!(
+                matches!(&values[0], Outcome::SucceededWithDetails { output, details } if output.contains("exceeds 50.0KB") && details["truncation"]["firstLineExceedsLimit"] == true)
+            );
+        } else {
+            assert_eq!(values[0], Outcome::Succeeded("sdk fixture".into()));
+        }
+        assert_eq!(values[0], values[1]);
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let pi_rs::SessionEvent::Record(record) = event
+                && let pi_rs::Event::ToolFinished { outcome, .. } = &record.event
+            {
+                outcomes.push(outcome.clone());
+            }
+        }
+        assert_eq!(outcomes, vec![values[0].clone()]);
+    }
+}
+
+struct ReplaceReadOutcome(bool);
+#[async_trait::async_trait]
+impl Extension for ReplaceReadOutcome {
+    fn id(&self) -> &str {
+        "replace-read-outcome"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        if call.name == "read" {
+            assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+            return Ok(Some(Outcome::Succeeded(
+                if self.0 { "sdk fixture" } else { "replacement" }.into(),
+            )));
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn read_event_metadata_tracks_outcome_without_leaking_stale_content() {
+    for replace in [None, Some(false), Some(true)] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap();
+        if let Some(same) = replace {
+            registry
+                .register(Arc::new(ReplaceReadOutcome(same)))
+                .unwrap();
+        } else {
+            registry
+                .register(Arc::new(ObserveReadOutcome::default()))
+                .unwrap();
+        }
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        let mut committed = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        if let Some(value) = pi_rs::tool_result_event_metadata(*operation_id) {
+                            metadata.push((*operation_id, value));
+                        }
+                        committed.push((*operation_id, outcome.clone()));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let expected = if replace == Some(false) {
+            "replacement"
+        } else {
+            "sdk fixture"
+        };
+        assert_eq!(committed.len(), 1);
+        assert!(pi_rs::tool_result_event_metadata(committed[0].0).is_none());
+        assert_eq!(committed[0].1, Outcome::Succeeded(expected.into()));
+        if replace.is_some() {
+            assert!(metadata.is_empty());
+        } else {
+            assert_eq!(metadata, vec![(committed[0].0, json!("sdk fixture"))]);
+        }
+    }
+}
+
+struct ReadPartialPatch {
+    output: bool,
+    mark_error: bool,
+}
+#[async_trait::async_trait]
+impl Extension for ReadPartialPatch {
+    fn id(&self) -> &str {
+        "read-partial-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        tokio::task::yield_now().await;
+        assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: self.output.then(|| "sdk fixture".into()),
+            details: Some(json!({"patched":true})),
+            is_error: self.mark_error.then_some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn metadata_only_read_patch_preserves_structured_value() {
+    for (replaces_output, mark_error) in [(false, false), (true, false), (false, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(ReadPartialPatch {
+                output: replaces_output,
+                mark_error,
+            }))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        let mut outcomes = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+                        outcomes.push(outcome.clone());
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        if mark_error {
+            assert!(
+                matches!(&outcomes[0], Outcome::TextResult { output, details: Some(details), is_error: true } if output == "sdk fixture" && details["patched"] == true)
+            );
+        } else {
+            assert!(
+                matches!(&outcomes[0], Outcome::SucceededWithDetails { output, details } if output == "sdk fixture" && details["patched"] == true)
+            );
+        }
+        assert_eq!(
+            metadata,
+            vec![if replaces_output {
+                None
+            } else {
+                Some(json!("sdk fixture"))
+            }]
+        );
+    }
+}
+
+struct WrappedReadPatch;
+#[async_trait::async_trait]
+impl Extension for WrappedReadPatch {
+    fn id(&self) -> &str {
+        "wrapped-read-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        _: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        Ok((call.name == "read").then(|| pi_rs::ToolResultPatchV2 {
+            output: None,
+            details: Some(json!({"patched":true})),
+            is_error: None,
+        }))
+    }
+    async fn tool_result_update_with_host(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        _: Arc<dyn pi_rs::ToolHost>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        let _ = self
+            .tool_result_update(call, outcome, context, state)
+            .await?;
+        Ok((call.name == "read").then(|| Outcome::Succeeded("sdk fixture".into())))
+    }
+}
+
+#[tokio::test]
+async fn opaque_host_override_does_not_reuse_patch_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+        .unwrap();
+    registry.register(Arc::new(WrappedReadPatch)).unwrap();
+    let model = Script::default();
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut metadata = Vec::new();
+    agent
+        .run(
+            &mut session,
+            Some("read".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs::Notification::Committed(record) = event
+                    && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
+                {
+                    metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata, vec![None]);
+}
+
+struct PresenceAwareReadHook {
+    replaced: bool,
+    changed: bool,
+}
+#[async_trait::async_trait]
+impl Extension for PresenceAwareReadHook {
+    fn id(&self) -> &str {
+        "presence-aware-read-hook"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_update_with_presence(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Option<Arc<dyn pi_rs::ToolHost>>,
+    ) -> pi_rs::ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        assert!(host.is_some());
+        if call.name != "read" {
+            return Ok((None, None));
+        }
+        assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+        Ok((
+            Some(Outcome::SucceededWithDetails {
+                output: if self.changed {
+                    "changed"
+                } else {
+                    "sdk fixture"
+                }
+                .into(),
+                details: json!({"patched": true}),
+            }),
+            Some(!self.replaced),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn host_hook_with_explicit_output_presence_preserves_or_clears_metadata() {
+    for (replaced, changed) in [(false, false), (true, false), (false, true)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(PresenceAwareReadHook { replaced, changed }))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        agent.run(&mut session, Some("read".into()), &mut inputs, &CancellationToken::new(), &mut |event| {
+            if let pi_rs::Notification::Committed(record) = event
+                && let pi_rs::Event::ToolFinished { operation_id, outcome, .. } = &record.event {
+                assert!(matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["patched"] == true));
+                metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+            }
+        }).await.unwrap();
+        assert_eq!(
+            metadata,
+            vec![if replaced || changed {
+                None
+            } else {
+                Some(json!("sdk fixture"))
+            }]
+        );
+    }
+}

@@ -4818,6 +4818,22 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     }
                     headers.push_str(&line.to_ascii_lowercase());
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut origin_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    origin_headers.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(!origin_headers.contains("proxy-authorization:"));
                 if first.starts_with("GET ") {
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
@@ -4885,10 +4901,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     String::from_utf8_lossy(&stderr)
                 )
             });
-        assert!(
-            request.starts_with("POST http://127.0.0.1:1/"),
-            "{provider}: {request}"
-        );
+        assert!(request.starts_with("POST /"), "{provider}: {request}");
         assert!(
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
@@ -5001,6 +5014,19 @@ fn model_listing_uses_proxy_before_a_model_request() {
     .unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -5037,12 +5063,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("GET http://127.0.0.1:1/v1/models ")
-    );
+    assert!(server.join().unwrap().starts_with("GET /v1/models "));
 }
 
 #[test]
@@ -5058,6 +5079,19 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -5096,7 +5130,7 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new-token");
     let (request, body) = server.join().unwrap();
-    assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+    assert!(request.starts_with("POST /v1/oauth/token "));
     assert!(
         String::from_utf8(body)
             .unwrap()
@@ -5117,6 +5151,19 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();
@@ -5153,10 +5200,7 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    assert!(
-        request.starts_with("POST http://127.0.0.1:1/mcp "),
-        "{request}"
-    );
+    assert!(request.starts_with("POST /mcp "), "{request}");
     assert!(
         headers.contains("authorization: bearer fixture-token"),
         "{headers}"

@@ -454,6 +454,12 @@ impl Model for OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        let error_secrets = pi_rs_core::provider_error_secrets(
+            Some(self.token.as_str()),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        );
         let mut response = self
             .client
             .post(self.endpoint.clone())
@@ -466,6 +472,21 @@ impl Model for OpenAiResponses {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
+            if status.as_u16() == 429 || status.is_server_error() {
+                let info =
+                    pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
+                return Err(if info.permanent {
+                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
+                        response_error(info.recognized_code, Some(status))
+                    } else {
+                        Error::Model("OpenAI account quota or billing limit reached".into())
+                    }
+                } else if info.recognized_code.is_some() {
+                    response_error(info.recognized_code, Some(status))
+                } else {
+                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
+                });
+            }
             let mut bytes = Vec::new();
             while let Ok(Some(chunk)) = response.chunk().await {
                 if bytes.len() + chunk.len() > 64 * 1024 {
@@ -474,6 +495,7 @@ impl Model for OpenAiResponses {
                 bytes.extend_from_slice(&chunk);
             }
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
             return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
@@ -565,7 +587,20 @@ impl Model for OpenAiResponses {
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
                     }
-                    "response.failed" | "error" => Err(response_error(event["response"]["error"]["code"].as_str().or_else(|| event["error"]["code"].as_str()), None))?,
+                    "response.failed" | "error" => {
+                        let error = event["response"].get("error").filter(|error| !error.is_null()).or_else(|| event.get("error")).unwrap_or(&Value::Null);
+                        let safe_error = pi_rs_core::sanitized_provider_error(error, &error_secrets);
+                        let code = safe_error["code"].as_str();
+                        Err(if matches!(code, Some("subscription_sharing_usage_limit_exceeded" | "subscription_sharing_user_not_eligible" | "subscription_sharing_usage_unavailable")) {
+                            response_error(code, None)
+                        } else if pi_rs_core::permanent_provider_error(error, &error_secrets) {
+                            Error::Model("OpenAI account quota or billing limit reached".into())
+                        } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
+                            Error::RetryableModel("OpenAI returned a transient stream error".into())
+                        } else {
+                            response_error(code, None)
+                        })?;
+                    },
                     _ => {}
                 }
             }
@@ -580,6 +615,367 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn http_400_does_not_classify_echoed_credential_as_subscription_code() {
+        use std::io::{Read, Write};
+        const CODE: &str = "subscription_sharing_usage_unavailable";
+        for echo in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = json!({"error":{"code":CODE}}).to_string();
+                write!(socket, "HTTP/1.1 400 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "ordinary-key".into(),
+                "fixture",
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-api-key",
+                    if echo { CODE } else { "other-key" }.parse().unwrap(),
+                );
+                headers
+            });
+            let error = match model.stream(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !echo);
+            assert!(!error.to_string().contains(CODE));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_stream_codes_take_precedence_over_transient_message() {
+        use std::io::{Read, Write};
+        for (code, retryable) in [
+            ("subscription_sharing_usage_limit_exceeded", false),
+            ("subscription_sharing_user_not_eligible", false),
+            ("subscription_sharing_usage_unavailable", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let event = json!({"type":"response.failed","response":{"error":{"code":code,"message":"rate limit exceeded"}}});
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "token".into(),
+                "fixture",
+            )
+            .unwrap();
+            let mut stream = model.stream(request()).await.unwrap();
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("missing error"),
+                }
+            };
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                retryable,
+                "{code}"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_header_error_literals_are_not_classified() {
+        use std::io::{Read, Write};
+        for (name, value) in [("x-api-key", "quota exceeded"), ("x-auth-token", "timeout")] {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let event = json!({"type":"response.failed","response":{"error":{"code":"error","message":value}}});
+                let worker = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(
+                            count != 0 && request.len() + count <= 32 * 1024,
+                            "incomplete request headers"
+                        );
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("{name}: {value}")),
+                        "header missing from fixture request"
+                    );
+                    let body = if streaming {
+                        format!("data: {event}\n\n")
+                    } else {
+                        json!({"error":{"message":value}}).to_string()
+                    };
+                    let status = if streaming { "200 OK" } else { "503 Fixture" };
+                    let content_type = if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                });
+                let model = OpenAiResponses::new_api_provider(
+                    &format!("http://{address}"),
+                    "ordinary-key".into(),
+                    "fixture",
+                )
+                .unwrap()
+                .with_headers({
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(name, value.parse().unwrap());
+                    headers
+                });
+                let request = ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let error = match model.stream(request).await {
+                    Err(error) => error,
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Err(error)) => break error,
+                            Some(Ok(_)) => {}
+                            None => panic!("missing stream error"),
+                        }
+                    },
+                };
+                assert_eq!(
+                    matches!(error, Error::RetryableModel(_)),
+                    !streaming,
+                    "{name} {streaming}"
+                );
+                assert!(!error.to_string().contains(value));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("billing limit reached", true, false),
+            ("rate limit exceeded sk-billing-timeout-secret", false, true),
+            (
+                "request to https://example.invalid failed, reason: unexpected",
+                false,
+                true,
+            ),
+            ("rate---limit", false, false),
+            ("rate:limit sk-billing-timeout-secret", false, true),
+            (
+                "http/2 stream failed sk-billing-timeout-secret",
+                false,
+                true,
+            ),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, false),
+            ("sk-billing-timeout-secret", false, false),
+            ("sk-timeout-secret", false, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type":"response.failed","response":{"error":{"code":"error","message":message,"request_id":"billing-sentinel-secret"}}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "sk-billing-timeout-secret".into(),
+                "fixture",
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-tenant", "billing".parse().unwrap());
+                headers.insert("x-policy", "quota".parse().unwrap());
+                headers.insert("x-plan", "quota exceeded".parse().unwrap());
+                headers.insert("x-routing", "timeout".parse().unwrap());
+                headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers.insert("x-rate", "rate:".parse().unwrap());
+                headers.insert("x-proto", "http/2".parse().unwrap());
+                headers
+            });
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"billing limit reached"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                credential.into(),
+                "fixture",
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-tenant", "billing".parse().unwrap());
+                headers.insert("x-policy", "quota".parse().unwrap());
+                headers.insert("x-plan", "quota exceeded".parse().unwrap());
+                headers
+            });
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let result = model.stream(request()).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            assert!(!error.to_string().contains(credential));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
 
     #[test]
