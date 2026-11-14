@@ -3242,3 +3242,105 @@ async fn task_ordered_runtime_checkpoint_forks_reopen_and_retries_races() {
     let mut h = Harness::open_paused(&path, opts()).unwrap();
     assert!(h.fork_at_application_entry(id, entries[1].id).is_err());
 }
+
+#[tokio::test]
+async fn ordered_cut_rejects_forged_batch_start_and_stale_runtime_version() {
+    use durable_store::{Mutation, Store};
+    use pi_rs_durable::{application_entry::ApplicationEntry, observer::Observer};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    for stale_runtime in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        let db = Store::open(&path).unwrap();
+        let runtime_key = format!("runtime/conversation/{id}").into_bytes();
+        let log_key = format!("durable/application-entries/{id}").into_bytes();
+        let snapshot_prefix = format!("runtime/fork/{id}/");
+        let root = db.get(&runtime_key).unwrap().unwrap();
+        let seq = db
+            .commit_for_version(&runtime_key, root.version)
+            .unwrap()
+            .unwrap();
+        let (_, snapshot_key) = db
+            .runtime_snapshot_at(&runtime_key, snapshot_prefix.as_bytes(), seq)
+            .unwrap()
+            .unwrap();
+        let snapshot = db.get(&snapshot_key).unwrap().unwrap().value;
+        let entry = |kind: &str| ApplicationEntry {
+            id: Uuid::new_v4(),
+            conversation_id: id,
+            author_task_id: Uuid::new_v4(),
+            kind: kind.into(),
+            data: json!(null),
+        };
+        let first = entry("app.first");
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: log_key.clone(),
+                value: serde_json::to_vec(&vec![first.clone()]).unwrap(),
+            }],
+        )
+        .unwrap();
+        let observer = Observer::new(&db, id);
+        if stale_runtime {
+            let append = observer.prepare_append(&json!({})).unwrap();
+            let mut mutations = append.mutations;
+            mutations.extend([
+                Mutation::Put {
+                    key: runtime_key.clone(),
+                    value: root.value.clone(),
+                },
+                Mutation::Put {
+                    key: format!("{snapshot_prefix}{:020}", append.cursor.0).into_bytes(),
+                    value: snapshot.clone(),
+                },
+            ]);
+            db.commit(&append.checks, &mutations).unwrap();
+        }
+        let second = entry("app.second");
+        let entries = vec![first, second.clone()];
+        let first_index = if stale_runtime { 1 } else { 0 };
+        let append = observer.prepare_append(&json!({})).unwrap();
+        let proof = json!({"version": 1, "previous_runtime_version": root.version,
+            "first_index": first_index, "checkpoint_index": 2,
+            "entry_ids": entries[first_index..].iter().map(|e| e.id).collect::<Vec<_>>()});
+        let mut mutations = append.mutations;
+        mutations.extend([
+            Mutation::Put {
+                key: runtime_key.clone(),
+                value: root.value.clone(),
+            },
+            Mutation::Put {
+                key: format!("{snapshot_prefix}{:020}", append.cursor.0).into_bytes(),
+                value: snapshot,
+            },
+            Mutation::Put {
+                key: log_key,
+                value: serde_json::to_vec(&entries).unwrap(),
+            },
+            Mutation::Put {
+                key: format!(
+                    "durable/application-ordered-cut/{id}/{:020}",
+                    append.cursor.0
+                )
+                .into_bytes(),
+                value: serde_json::to_vec(&proof).unwrap(),
+            },
+        ]);
+        db.commit(&append.checks, &mutations).unwrap();
+        assert!(h.fork_at_application_entry(id, second.id).is_err());
+        drop(h);
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        assert!(h.fork_at_application_entry(id, second.id).is_err());
+    }
+}

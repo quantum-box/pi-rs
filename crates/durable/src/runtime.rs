@@ -1006,6 +1006,9 @@ pub(crate) fn prepare_ordered_task_checkpoint(
     let append = observer
         .prepare_append(&event.value)
         .map_err(|_| invalid())?;
+    if head.0.checked_add(1) != Some(append.cursor.0) {
+        return Err(durable_store::Error::Conflict { key }.into());
+    }
     let snapshot_key = format!("{prefix}{:020}", append.cursor.0).into_bytes();
     let order_key = crate::application_entry::ordered_cut_key(id, append.cursor.0);
     let proof = crate::application_entry::OrderedCut {
@@ -2687,6 +2690,27 @@ impl Harness {
                 .store()
                 .commit_for_version(runtime_key.as_bytes(), proof.previous_runtime_version)?
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let immediately_before = self
+                .owner
+                .store()
+                .runtime_snapshot_at(runtime_key.as_bytes(), prefix.as_bytes(), sequence - 1)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let previous_entries = self
+                .owner
+                .store()
+                .application_entries_at(
+                    &crate::application_entry::key(origin),
+                    revision
+                        .checked_sub(1)
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?,
+                )?
+                .map(|entry| {
+                    serde_json::from_slice::<Vec<crate::application_entry::ApplicationEntry>>(
+                        &entry.value,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
             let (_, prior_key) = self
                 .owner
                 .store()
@@ -2705,6 +2729,9 @@ impl Harness {
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             if proof.version != 1
                 || previous_seq >= sequence
+                || immediately_before.0 != previous_seq
+                || proof.first_index != previous_entries.len()
+                || !full.starts_with(&previous_entries)
                 || prior.value != current.value
                 || proof.first_index >= proof.checkpoint_index
                 || proof.checkpoint_index > full.len()
