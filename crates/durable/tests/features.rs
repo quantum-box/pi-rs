@@ -750,10 +750,18 @@ async fn ordered_compaction_crash_child() {
     #[async_trait]
     impl Model for WaitingModel {
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
-            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
-                std::fs::write(format!("{}.running", self.0), b"running").unwrap();
-                Ok(stream::pending().boxed())
-            } else { ModelStub.stream(request).await }
+            ModelStub.stream(request).await
+        }
+        async fn stream_for_summary(
+            &self,
+            request_id: uuid::Uuid,
+            _: uuid::Uuid,
+            _: ModelRequest,
+        ) -> Result<ModelStream, Error> {
+            let temporary = format!("{}.running.tmp", self.0);
+            std::fs::write(&temporary, request_id.to_string()).unwrap();
+            std::fs::rename(temporary, format!("{}.running", self.0)).unwrap();
+            Ok(stream::pending().boxed())
         }
     }
     let mut h = Harness::open_paused(
@@ -782,6 +790,92 @@ async fn ordered_compaction_crash_child() {
     let reset = h.reset(id, Some("after crash".into())).unwrap();
     std::fs::write(format!("{path}.ids"), format!("{id} {operation} {reset}")).unwrap();
     h.resume(&cancel).await.unwrap();
+}
+
+#[tokio::test]
+async fn killed_manual_summary_settles_old_request_before_retry() {
+    use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct RecoveryModel(Mutex<Vec<(&'static str, uuid::Uuid)>>);
+    #[async_trait]
+    impl Model for RecoveryModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            ModelStub.stream(request).await
+        }
+        async fn stream_for_summary(
+            &self,
+            request_id: uuid::Uuid,
+            _: uuid::Uuid,
+            request: ModelRequest,
+        ) -> Result<ModelStream, Error> {
+            self.0.lock().unwrap().push(("summary", request_id));
+            ModelStub.stream(request).await
+        }
+        async fn record_usage(
+            &self,
+            request_id: uuid::Uuid,
+            report: &pi_rs_core::UsageReport,
+        ) -> Result<(), Error> {
+            assert!(matches!(report, pi_rs_core::UsageReport::Unconfirmed));
+            self.0.lock().unwrap().push(("usage", request_id));
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let running = dir.path().join("db.running");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "ordered_compaction_crash_child"])
+        .env("PI_ORDERED_COMPACTION_DB", &path)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !running.exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("summary did not start");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let old_request = uuid::Uuid::parse_str(&std::fs::read_to_string(running).unwrap()).unwrap();
+    let ids = std::fs::read_to_string(dir.path().join("db.ids")).unwrap();
+    let mut ids = ids
+        .split_whitespace()
+        .map(|s| uuid::Uuid::parse_str(s).unwrap());
+    let id = ids.next().unwrap();
+    let operation = ids.next().unwrap();
+    let model = Arc::new(RecoveryModel::default());
+    let mut scheduler = Scheduler::open(
+        &path,
+        Options {
+            model: model.clone(),
+            ..opts()
+        },
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let events = model.0.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], ("usage", old_request));
+        assert_eq!(events[1].0, "summary");
+        assert_ne!(events[1].1, old_request);
+        assert_eq!(events[2], ("usage", events[1].1));
+    }
+    let c = scheduler.conversation(id).unwrap();
+    assert_eq!(c.manual_compactions[0].id, operation);
+    assert_eq!(
+        c.manual_compactions[0].status,
+        ManualCompactionStatus::Stale
+    );
+    scheduler.shutdown().await.unwrap();
 }
 
 #[tokio::test]
