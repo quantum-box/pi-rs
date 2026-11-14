@@ -232,6 +232,17 @@ named children, optionally by name, without creating or scheduling them.
 interruption. Queued inputs count as working, even if a failed run has left them
 waiting for another input. This is a committed snapshot, not a watch.
 
+A host can call `Harness::select_tools` or `Scheduler::select_tools` on a
+settled conversation to persist an exact allowlist of tool names. `None` restores
+the host default; `Some(vec![])` disables every tool. Missing names remain in
+the selection and take effect if later registered. The filter applies to model
+specs, model-issued and nested dispatch, and interrupted-tool recovery. It
+also applies to global and selected extension tools. Forks retain the captured
+selection; independently created named children start unrestricted, while
+history-seeded children inherit the parent snapshot. Set a child selection before
+submitting work. This limits tool dispatch, not other effects of trusted tools,
+hooks, or host APIs.
+
 An embedding host can opt in to a parent-bound `subagent` extension with
 `Scheduler::open_with_subagent_management(path, options, registry, parent, child_config)`.
 Create the parent first with `Harness::open_paused`, then open the scheduler and
@@ -251,17 +262,16 @@ The extension is bound to one parent and rejects selection on other conversation
 including forks; named children start without selected extensions. Do not register
 this tool globally or replace the bound extension with another implementation.
 `ToolContext` does not identify the caller or its owning task. In particular,
-this API cannot verify a caller through independently implemented `ToolHost`s,
-restrict global tools available to a child, or implement ownership-safe stop or
-wait. The host must trust the configured tools and registry. It must also ensure
+this API cannot verify a caller through independently implemented `ToolHost`s
+or implement ownership-safe stop or wait. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is
 provided. Named links are independent, not task-owned background anchors.
 
 This is not the complete upstream background-subagent extension. There is no
-automatic child-tool restriction or ownership tree for these named links. Extension selection can be configured on a settled
-conversation, but does not restrict globally registered tools and is not an
-atomic child admission policy. Named links do not inherit parent extensions.
+automatic child-tool restriction or ownership tree for these named links.
+Tool selection is not an atomic child admission policy and the management
+tool submits children immediately; do not rely on it to create restricted children. Named links do not inherit parent extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.

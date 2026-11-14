@@ -374,6 +374,9 @@ pub struct Conversation {
     /// Stable adapter identity, if provider-body hooks are enabled.
     #[serde(default)]
     pub provider_adapter: Option<String>,
+    /// Enabled tool names; None preserves the host default, Some([]) disables all.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
@@ -893,6 +896,9 @@ impl Harness {
                 },
             );
         }
+        if let Some(allowed) = &c.allowed_tools {
+            tools.retain(|name, _| allowed.contains(name));
+        }
         Ok(tools)
     }
     /// Install a host adapter before resuming any conversation that selected it.
@@ -925,6 +931,27 @@ impl Harness {
         } else {
             None
         };
+        self.save(&c, Expected::Version(version))
+    }
+    /// Persist an exact tool allowlist on a settled conversation. None restores the host default.
+    /// Names are retained even when a tool is not currently registered.
+    pub fn select_tools(&mut self, id: Uuid, names: Option<Vec<String>>) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "tool selection requires a settled conversation".into(),
+            ));
+        }
+        if let Some(names) = &names {
+            let mut seen = std::collections::HashSet::new();
+            if names
+                .iter()
+                .any(|name| name.is_empty() || !seen.insert(name))
+            {
+                return Err(Error::Invalid("empty or duplicate selected tool".into()));
+            }
+        }
+        c.allowed_tools = names;
         self.save(&c, Expected::Version(version))
     }
     /// Select installed names for a settled conversation, preserving their order.
@@ -1280,6 +1307,10 @@ impl Harness {
                     serde_json::to_value(&state.provider_adapter)?,
                 ),
                 (
+                    "pi-rs/runtime/allowed-tools".into(),
+                    serde_json::to_value(&state.allowed_tools)?,
+                ),
+                (
                     "pi-rs/runtime/resets".into(),
                     serde_json::to_value(&state.resets)?,
                 ),
@@ -1514,6 +1545,7 @@ impl Harness {
             queue_modes: QueueModes::default(),
             extensions: vec![],
             provider_adapter: None,
+            allowed_tools: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
@@ -1647,6 +1679,12 @@ impl Harness {
                 .documents
                 .get("pi-rs/runtime/provider-adapter")
                 .map(|v| serde_json::from_value(v.clone()))
+                ),
+                (
+            allowed_tools: point
+                .documents
+                .get("pi-rs/runtime/allowed-tools")
+                .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
@@ -2714,6 +2752,11 @@ impl Harness {
                     let current = if c.extensions.is_empty() {
                         calls
                             .get(index)
+                            .filter(|call| {
+                                c.allowed_tools
+                                    .as_ref()
+                                    .is_none_or(|names| names.contains(&call.name))
+                            })
                             .and_then(|x| self.tools.get(&x.name))
                             .map(|x| x.replay)
                     } else {
@@ -4801,6 +4844,9 @@ impl Scheduler {
     pub fn select_provider_adapter(&mut self, id: Uuid, enabled: bool) -> Result<(), Error> {
         self.harness.select_provider_adapter(id, enabled)
     }
+    pub fn select_tools(&mut self, id: Uuid, names: Option<Vec<String>>) -> Result<(), Error> {
+        self.harness.select_tools(id, names)
+    }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
     }
@@ -5660,6 +5706,7 @@ mod scheduler_tests {
             queue_modes: QueueModes::default(),
             extensions: vec![],
             provider_adapter: None,
+            allowed_tools: None,
             messages: vec![],
             transcript: None,
             submissions: vec![],
@@ -6419,3 +6466,167 @@ mod scheduler_tests {
 #[cfg(test)]
 #[path = "runtime_cas_tests.rs"]
 mod runtime_cas_tests;
+
+#[cfg(test)]
+mod tool_allowlist_tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use pi_rs_core::{ModelEvent, ModelRequest, ModelStream, ToolContext};
+    use std::sync::{Mutex, atomic::AtomicUsize};
+
+    struct RecordingModel(Arc<Mutex<Vec<Vec<String>>>>);
+    #[async_trait::async_trait]
+    impl Model for RecordingModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|t| t.name.clone()).collect());
+            let calls = if request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }))
+            {
+                vec![]
+            } else {
+                vec![ToolCall {
+                    id: "stale".into(),
+                    name: "blocked".into(),
+                    arguments: "{}".into(),
+                }]
+            };
+            Ok(stream::iter(vec![Ok(ModelEvent::Complete { calls, usage: None })]).boxed())
+        }
+    }
+    struct CountingTool(&'static str, Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("ran".into())
+        }
+    }
+    fn opts(seen: Arc<Mutex<Vec<Vec<String>>>>, count: Arc<AtomicUsize>) -> Options {
+        Options {
+            model: Arc::new(RecordingModel(seen)),
+            tools: ["allowed", "blocked"]
+                .into_iter()
+                .map(|name| RegisteredTool {
+                    tool: Arc::new(CountingTool(name, count.clone())),
+                    replay: ReplayPolicy::Safe,
+                })
+                .collect(),
+            restart_limit: 3,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        }
+    }
+    fn config() -> Config {
+        Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn child_selection_persists_and_filters_specs_and_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seen = Arc::new(Mutex::new(vec![]));
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let child = h.ensure_subagent(parent, "child", config()).unwrap().child;
+        h.select_tools(child, Some(vec!["allowed".into(), "not-installed".into()]))
+            .unwrap();
+        assert_eq!(h.conversation(parent).unwrap().allowed_tools, None);
+        let fork = h.fork(child).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().allowed_tools,
+            h.conversation(child).unwrap().allowed_tools
+        );
+        h.select_tools(fork, Some(vec![])).unwrap();
+        assert_ne!(
+            h.conversation(fork).unwrap().allowed_tools,
+            h.conversation(child).unwrap().allowed_tools
+        );
+        assert!(
+            h.select_tools(child, Some(vec!["allowed".into(), "allowed".into()]))
+                .is_err()
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        assert_eq!(
+            h.conversation(child).unwrap().allowed_tools,
+            Some(vec!["allowed".into(), "not-installed".into()])
+        );
+        h.submit_and_run(child, None, "work".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|names| names == &["allowed"])
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(h.conversation(child).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content.contains("unavailable"))
+        ));
+        h.select_tools(child, Some(vec![])).unwrap();
+        assert!(
+            h.resolved_tools(&h.conversation(child).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        h.select_tools(child, None).unwrap();
+        assert_eq!(
+            h.resolved_tools(&h.conversation(child).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_running_tool_is_not_replayed_when_disallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seen = Arc::new(Mutex::new(vec![]));
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut h = Harness::open_paused(&path, opts(seen.clone(), count.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_tools(id, Some(vec![])).unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        c.phase = Phase::ToolRunning {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "blocked".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id: Uuid::new_v4(),
+            replay: ReplayPolicy::Safe,
+            arguments: serde_json::json!({}),
+            restarts: 0,
+            replay_ready: false,
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, opts(seen, count.clone())).unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().phase,
+            Phase::ToolFinished { .. }
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+}
