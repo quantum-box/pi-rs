@@ -214,6 +214,79 @@ fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
     )
 }
 
+// Marked can split a mailbox into plain text plus a link to only its suffix.
+// Rejoin only native-validated mailboxes whose entire extent consists of
+// unchanged text and bare email tokens, never across formatting boundaries.
+fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
+    if frame_expired() {
+        return None;
+    }
+    if !source.contains('@') {
+        return Some(tokens.to_vec());
+    }
+    let mut tokens = tokens.to_vec();
+    for (range, href) in super::render::bare_links(source) {
+        if frame_expired() {
+            return None;
+        }
+        let Some(href) = href.filter(|href| href.starts_with("mailto:")) else {
+            continue;
+        };
+        let mut cursor = 0;
+        let mut first = None;
+        let mut last = None;
+        let mut split_link = false;
+        let mut valid = true;
+        for (index, token) in tokens.iter().enumerate() {
+            if frame_expired() {
+                return None;
+            }
+            let raw = token.get("raw")?.as_str()?;
+            let end = cursor + raw.len();
+            if cursor < range.end && end > range.start {
+                first.get_or_insert((index, cursor));
+                last = Some((index, end));
+                match token.get("type")?.as_str()? {
+                    "text" if token.get("text").and_then(Value::as_str) == Some(raw) => {}
+                    "link"
+                        if token
+                            .get("href")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| s.starts_with("mailto:"))
+                            && token.get("text").and_then(Value::as_str) == Some(raw)
+                            && cursor >= range.start
+                            && end <= range.end =>
+                    {
+                        split_link |= cursor != range.start || end != range.end;
+                    }
+                    _ => valid = false,
+                }
+            }
+            cursor = end;
+        }
+        let (Some((first, start)), Some((last, end))) = (first, last) else {
+            continue;
+        };
+        if !valid || !split_link {
+            continue;
+        }
+        let mut replacement = Vec::new();
+        if start < range.start {
+            let raw = source.get(start..range.start)?;
+            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+        }
+        let raw = source.get(range.clone())?;
+        replacement.push(json!({"type":"link", "raw":raw, "text":raw, "href":href,
+            "tokens":[{"type":"text", "raw":raw, "text":raw}]}));
+        if range.end < end {
+            let raw = source.get(range.end..end)?;
+            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+        }
+        tokens.splice(first..=last, replacement);
+    }
+    Some(tokens)
+}
+
 fn token_nodes(
     tokens: &[Value],
     source: &str,
@@ -224,7 +297,8 @@ fn token_nodes(
 ) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
-    for token in tokens {
+    let tokens = repair_split_mail(tokens, source)?;
+    for token in &tokens {
         if frame_expired() {
             return None;
         }

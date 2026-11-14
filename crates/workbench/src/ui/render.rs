@@ -2028,6 +2028,51 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn marked_strike_preserves_complete_native_mailboxes() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("o'connor@example.com ~~x~~", "mailto:o'connor@example.com"),
+            ("foo/bar@example.com ~~x~~", "mailto:foo%2Fbar@example.com"),
+            ("~~o'connor@example.com~~", "mailto:o'connor@example.com"),
+            ("~~foo/bar@example.com~~", "mailto:foo%2Fbar@example.com"),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                160,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some(expected)),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(
+                        |span| span.hyperlink.as_deref() != Some("mailto:connor@example.com")
+                            && span.hyperlink.as_deref() != Some("mailto:bar@example.com")
+                    ),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
     #[test]
     fn strict_strike_matches_pinned_marked_delimiters_and_code_boundaries() {
         let theme = Theme::system();
