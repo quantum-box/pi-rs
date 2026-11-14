@@ -662,9 +662,21 @@ when reopening, navigating branches, or forking. Context-window queries and
 idle input hooks use that branch's client too. Register clients for historical
 model names with `SessionBuilder::branch_model` or
 `AgentSession::register_branch_model`; an unavailable client is reported
-instead of sending to a different one. Unlike Pi's automatic fallback on
-resume, a host can explicitly call `set_model` or `set_model_with_hooks` to
-select another client. The hook-aware form installs the replacement after
+instead of sending to a different one. An embedding host can opt into
+`SessionBuilder::historical_model_resolver` for provider-qualified selections.
+The synchronous resolver receives the historical provider and model, resolves
+the effective endpoint and credentials from trusted host configuration, and
+returns an exact client, a different provider/model client, or unavailable.
+For a fallback the SDK commits the chosen identity, clears the thinking level,
+and exposes both identities through `AgentSession::model_fallback`. The SDK
+cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
+credentials. Unqualified legacy selections never invoke the resolver, and
+existing exact registrations take precedence. This resolver runs on session
+construction, after recovering interrupted handoffs, not branch navigation or
+fork. Fallback commits a single native selection record even after an imported
+Pi source, using a distinct timestamp so older projections retain the change.
+Hosts can also explicitly call
+`set_model` or `set_model_with_hooks` to select another client. The hook-aware form installs the replacement after
 recovery and before startup hooks and any turns they trigger.
 If a startup-triggered turn fails after that replacement, the model-selection
 notifications are still delivered before the failure is returned.

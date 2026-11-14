@@ -1056,6 +1056,46 @@ fn branch_client(
     }
 }
 
+/// A host-resolved client for a provider-qualified historical selection.
+/// The host must resolve the effective endpoint and credentials from trusted
+/// configuration; the SDK cannot inspect a model client's endpoint.
+pub enum HistoricalModelResolution {
+    /// Use a client for the exact requested provider and model.
+    Historical(Arc<dyn Model>),
+    /// Use a different host-selected provider and model.
+    Fallback {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    /// No usable client is available; retain the existing missing-model error.
+    Unavailable,
+}
+
+/// Describes an automatic fallback without exposing endpoints or credentials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalModelFallback {
+    pub requested_provider: String,
+    pub requested_model: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Resolves from host-owned catalog, endpoint and credential policy. The
+/// callback runs synchronously during session construction and must not block.
+pub trait HistoricalModelResolver: Send + Sync {
+    fn resolve(&self, provider: &str, model: &str) -> Result<HistoricalModelResolution>;
+}
+
+impl<F> HistoricalModelResolver for F
+where
+    F: Fn(&str, &str) -> Result<HistoricalModelResolution> + Send + Sync,
+{
+    fn resolve(&self, provider: &str, model: &str) -> Result<HistoricalModelResolution> {
+        self(provider, model)
+    }
+}
+
 /// Builds an owned local session while retaining the provider-neutral core APIs.
 ///
 /// ```no_run
@@ -1082,6 +1122,7 @@ pub struct SessionBuilder {
     tool_timeout_explicit: bool,
     branch_models: std::collections::BTreeMap<String, Arc<dyn Model>>,
     provider_models: std::collections::BTreeMap<(String, String), Arc<dyn Model>>,
+    historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
 }
 impl SessionBuilder {
     pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
@@ -1095,6 +1136,7 @@ impl SessionBuilder {
             tool_timeout_explicit: false,
             branch_models: Default::default(),
             provider_models: Default::default(),
+            historical_model_resolver: None,
         }
     }
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -1149,6 +1191,13 @@ impl SessionBuilder {
         self.provider_models.insert((provider, name), model);
         Ok(self)
     }
+
+    /// Opt in to host-controlled restoration or fallback for unavailable,
+    /// provider-qualified historical models during session construction.
+    pub fn historical_model_resolver(mut self, resolver: Arc<dyn HistoricalModelResolver>) -> Self {
+        self.historical_model_resolver = Some(resolver);
+        self
+    }
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
         let path = std::path::absolute(path)?;
         let mut session = self.build(Session::open(&path)?)?;
@@ -1162,7 +1211,7 @@ impl SessionBuilder {
     pub fn in_memory(self) -> Result<AgentSession> {
         self.build(Session::with_store(MemoryStore::default())?)
     }
-    pub fn build(mut self, session: Session) -> Result<AgentSession> {
+    pub fn build(mut self, mut session: Session) -> Result<AgentSession> {
         self.registry
             .omit_default_tool_timeout(!self.tool_timeout_explicit);
         if session.host_binding().is_some() {
@@ -1172,6 +1221,49 @@ impl SessionBuilder {
         }
         if self.model_name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
+        }
+        // Session::open already recovers interrupted handoffs, but callers can
+        // also supply a custom store whose temporary branch is still checked out.
+        if self.historical_model_resolver.is_some() {
+            session.recover_tree_trigger_handoff()?;
+        }
+        // Resolve and commit any replacement before changing shared client
+        // registrations, so resolver or journal failures cannot replace them.
+        let mut resolved = None;
+        let mut model_fallback = None;
+        if let Some(resolver) = &self.historical_model_resolver
+            && let Some((Some(provider), name, _)) = session.model_identity_at(session.head())
+            && !(self.model_provider.as_deref() == Some(&provider) && self.model_name == name)
+            && !self
+                .provider_models
+                .contains_key(&(provider.clone(), name.clone()))
+            && branch_client(&self.registry, session.session_id(), Some(&provider), &name).is_none()
+        {
+            match resolver.resolve(&provider, &name)? {
+                HistoricalModelResolution::Historical(client) => {
+                    resolved = Some((provider, name, client));
+                }
+                HistoricalModelResolution::Fallback {
+                    provider: replacement_provider,
+                    model,
+                    client,
+                } => {
+                    if replacement_provider.trim().is_empty() || model.trim().is_empty() {
+                        return Err(Error::Config(
+                            "fallback provider or model name is empty".into(),
+                        ));
+                    }
+                    session.select_provider_model_atomic(&replacement_provider, &model)?;
+                    model_fallback = Some(HistoricalModelFallback {
+                        requested_provider: provider,
+                        requested_model: name,
+                        provider: replacement_provider.clone(),
+                        model: model.clone(),
+                    });
+                    resolved = Some((replacement_provider, model, client));
+                }
+                HistoricalModelResolution::Unavailable => {}
+            }
         }
         for (name, model) in self.branch_models {
             self.registry
@@ -1198,6 +1290,16 @@ impl SessionBuilder {
                 self.model_name.clone(),
                 self.model.clone(),
             )?;
+        }
+        if let Some((provider, name, client)) = resolved {
+            self.registry.register_session_provider_model(
+                session.session_id(),
+                &provider,
+                &name,
+                client.clone(),
+            )?;
+            self.model = client;
+            self.model_name = name;
         }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
@@ -1250,6 +1352,7 @@ impl SessionBuilder {
             closed: false,
             pending_start,
             session_file: None,
+            model_fallback,
         })
     }
 }
@@ -1270,8 +1373,13 @@ pub struct AgentSession {
     closed: bool,
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
+    model_fallback: Option<HistoricalModelFallback>,
 }
 impl AgentSession {
+    /// The fallback chosen while opening this session, if any.
+    pub fn model_fallback(&self) -> Option<&HistoricalModelFallback> {
+        self.model_fallback.as_ref()
+    }
     fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
         if let Some(target) = journal.tree_navigation_target(selected)?
             && let Some((provider, name, _)) = journal.model_identity_at(target)
@@ -3921,6 +4029,142 @@ mod tests {
 
     struct NamedBranchModel(&'static str);
     struct ProviderBranchModel(&'static str);
+    struct SeededStore {
+        records: Arc<Mutex<Vec<crate::Record>>>,
+        writes: Arc<AtomicUsize>,
+        fail_on: usize,
+    }
+    impl crate::SessionStore for SeededStore {
+        fn load(&mut self) -> Result<Vec<crate::Record>> {
+            Ok(self.records.lock().unwrap().clone())
+        }
+        fn append(&mut self, record: &crate::Record) -> Result<()> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on {
+                return Err(Error::Session("fixture append failure".into()));
+            }
+            self.records.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_recovers_custom_store_handoff_before_selecting_model() {
+        for registered in [false, true] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("temporary"), "shared", None)
+                .unwrap();
+            let temporary = original.head();
+            original.checkout(1).unwrap();
+            original
+                .select_provider_model(Some("selected"), "shared", None)
+                .unwrap();
+            let selected = original.head();
+            original
+                .append(crate::Event::TreeTriggerHandoff {
+                    run_id: Uuid::new_v4(),
+                    return_to: selected,
+                })
+                .unwrap();
+            original.checkout(temporary).unwrap();
+            let store = SeededStore {
+                records: Arc::new(Mutex::new(original.records().to_vec())),
+                writes: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+            };
+            let reopened = Session::with_store(store).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let resolver = Arc::new(
+                move |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!((provider, model), ("selected", "shared"));
+                    Ok(HistoricalModelResolution::Historical(Arc::new(
+                        ProviderBranchModel("selected"),
+                    )))
+                },
+            );
+            let mut builder =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+                    .provider("default")
+                    .unwrap();
+            if registered {
+                builder = builder
+                    .provider_branch_model(
+                        "selected",
+                        "shared",
+                        Arc::new(ProviderBranchModel("selected")),
+                    )
+                    .unwrap();
+            }
+            let mut session = builder
+                .historical_model_resolver(resolver)
+                .build(reopened)
+                .unwrap();
+            assert_eq!(session.journal().unwrap().head(), selected);
+            assert!(session.model_fallback().is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!registered));
+            assert_eq!(session.prompt("resumed").await.unwrap(), "selected");
+            session.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn fallback_on_imported_source_is_one_atomic_selection_record() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        original
+            .append(crate::Event::SourceEntry {
+                format: "pi".into(),
+                entry: serde_json::json!({"type":"model_change", "provider":"old", "modelId":"shared"}),
+            })
+            .unwrap();
+        let head = original.head();
+        for fail_on in [1, 2] {
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("new")),
+                })
+            });
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+                .provider("default")
+                .unwrap()
+                .historical_model_resolver(resolver)
+                .build(journal);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), head);
+                assert_eq!(restored.model_provider(), Some("old"));
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(restored.head(), head + 1);
+                assert_eq!(restored.model_provider(), Some("new"));
+                let records = restored.records();
+                assert!(matches!(
+                    records.last().unwrap().event,
+                    crate::Event::ModelSelected { .. }
+                ));
+                assert_ne!(
+                    records[head as usize - 1].timestamp,
+                    records[head as usize].timestamp
+                );
+            }
+        }
+    }
     #[async_trait::async_trait]
     impl Model for ProviderBranchModel {
         async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
@@ -3932,6 +4176,243 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_resolver_restores_exact_historical_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let head = journal.head();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                // The host chooses the endpoint and checks credentials before returning a client.
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("historical"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert_eq!(session.journal().unwrap().head(), head);
+        assert!(session.model_fallback().is_none());
+        assert_eq!(session.prompt("test").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_fallback_records_identity_and_reports_requested_model() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", Some("high"))
+            .unwrap();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("old", "shared"));
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("fallback")),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert_eq!(
+            session.model_fallback(),
+            Some(&HistoricalModelFallback {
+                requested_provider: "old".into(),
+                requested_model: "shared".into(),
+                provider: "new".into(),
+                model: "shared".into()
+            })
+        );
+        assert_eq!(session.journal().unwrap().model_provider(), Some("new"));
+        assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "fallback");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_does_not_override_registered_or_legacy_clients() {
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            panic!("resolver must not run")
+        });
+        let mut qualified = Session::with_store(MemoryStore::default()).unwrap();
+        qualified
+            .select_provider_model(Some("a"), "shared", None)
+            .unwrap();
+        let mut known = SessionBuilder::new(Arc::new(ProviderBranchModel("known")), "shared")
+            .provider("a")
+            .unwrap()
+            .historical_model_resolver(resolver.clone())
+            .build(qualified)
+            .unwrap();
+        assert_eq!(known.prompt("known").await.unwrap(), "known");
+        known.close().await.unwrap();
+        let mut legacy = Session::with_store(MemoryStore::default()).unwrap();
+        legacy.select_model("shared", None).unwrap();
+        let mut old = SessionBuilder::new(Arc::new(ProviderBranchModel("legacy")), "shared")
+            .historical_model_resolver(resolver)
+            .build(legacy)
+            .unwrap();
+        assert_eq!(old.prompt("legacy").await.unwrap(), "legacy");
+        old.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_unavailable_keeps_missing_model_error() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Unavailable)
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("other")), "shared")
+            .provider("other")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.start().await.is_err());
+        assert_eq!(session.journal().unwrap().head(), head);
+        assert!(session.model_fallback().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_endpoint_policy_can_reject_historical_credentials() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let resolver = Arc::new(
+            move |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_eq!((provider, model), ("old", "shared"));
+                let configured_endpoint = "https://untrusted.example";
+                let credential_endpoint = "https://official.example";
+                if configured_endpoint != credential_endpoint {
+                    return Ok(HistoricalModelResolution::Unavailable);
+                }
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("unsafe"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.prompt("do not dispatch").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.journal().unwrap().model_provider(), Some("old"));
+    }
+
+    #[test]
+    fn failed_fallback_journal_write_does_not_replace_shared_client() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut journal = Session::with_store(FailingSelectionStore {
+            inner: MemoryStore::default(),
+            fail: fail.clone(),
+        })
+        .unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let session_id = journal.session_id();
+        let registry = Registry::default();
+        let existing: Arc<dyn Model> = Arc::new(ProviderBranchModel("existing"));
+        registry
+            .register_session_provider_model(session_id, "default", "shared", existing.clone())
+            .unwrap();
+        fail.store(true, Ordering::SeqCst);
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "new".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("fallback")),
+            })
+        });
+        assert!(
+            SessionBuilder::new(Arc::new(ProviderBranchModel("replacement")), "shared")
+                .provider("default")
+                .unwrap()
+                .registry(registry.clone())
+                .historical_model_resolver(resolver)
+                .build(journal)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &registry
+                .provider_branch_config(session_id, "default", "shared")
+                .unwrap()
+                .0,
+            &existing
+        ));
+        assert!(
+            registry
+                .provider_branch_config(session_id, "new", "shared")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolver_failure_or_invalid_fallback_does_not_change_the_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        drop(journal);
+        for invalid in [false, true] {
+            let resolver = Arc::new(
+                move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                    if invalid {
+                        Ok(HistoricalModelResolution::Fallback {
+                            provider: " ".into(),
+                            model: "shared".into(),
+                            client: Arc::new(ProviderBranchModel("invalid")),
+                        })
+                    } else {
+                        Err(Error::Config("host rejected endpoint".into()))
+                    }
+                },
+            );
+            assert!(
+                SessionBuilder::new(Arc::new(ProviderBranchModel("other")), "shared")
+                    .provider("other")
+                    .unwrap()
+                    .historical_model_resolver(resolver)
+                    .open(&path)
+                    .is_err()
+            );
+            assert_eq!(Session::snapshot(&path).unwrap().head(), head);
+            assert_eq!(
+                Session::snapshot(&path).unwrap().model_provider(),
+                Some("old")
+            );
         }
     }
 

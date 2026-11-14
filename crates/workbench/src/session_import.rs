@@ -162,12 +162,14 @@ pub(super) fn branch_selection(
                 let mut change = None;
                 for (i, prior) in branch[..index].iter().enumerate().rev() {
                     if matches!(prior.event, Event::ModelSelected { .. }) {
-                        let derived = i.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi" || format == "pi-rs:thinking-selection"));
+                        let derived = i.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection" || (format == "pi" && parent.timestamp == prior.timestamp && prior.run_id.is_none())));
                         if !derived {
-                            if let Event::ModelSelected { model, provider: Some(provider), .. } = &prior.event && catalog(provider, model) == Some(true) {
+                            if let Event::ModelSelected { model, provider: Some(provider), .. } = &prior.event {
+                                // A native explicit selection is authoritative even when the
+                                // response names a routed physical model and the catalog is absent.
                                 return BranchSelection::Selected { provider: provider.clone(), model: model.clone(), thinking };
                             }
-                            break;
+                            return BranchSelection::Native;
                         }
                     }
                     if let Event::SourceEntry { format, entry } = &prior.event && format == "pi" && entry["type"] == "model_change" {
@@ -1445,6 +1447,57 @@ mod tests {
         args.remember_initial_selection();
         args.restore_session_model(&reopened);
         assert_eq!(args.model, "actual");
+    }
+
+    #[test]
+    fn native_fallback_after_import_survives_routed_response_and_reopen() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"old","modelId":"shared"}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { format, entry } if format == "pi" && entry["type"] == "model_change")).unwrap().id;
+        let mut records = imported.records()[..source as usize].to_vec();
+        let previous = records.last().unwrap();
+        let timestamp = if previous.timestamp.as_deref() == Some("2026-01-01T00:00:00.000Z") {
+            "2026-01-01T00:00:00.000000Z"
+        } else {
+            "2026-01-01T00:00:00.000Z"
+        };
+        let version = previous.version;
+        records.push(Record {
+            id: source + 1,
+            parent: Some(source),
+            version,
+            timestamp: Some(timestamp.into()),
+            run_id: None,
+            event: Event::ModelSelected {
+                provider: Some("ollama".into()),
+                model: "virtual".into(),
+                thinking: None,
+            },
+        });
+        let session = native_completion(
+            Session::from_records(records).unwrap(),
+            "physical",
+            "actual",
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopen.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&reopened, |provider, model| Some(provider == "ollama" && model == "virtual")), BranchSelection::Selected { provider, model, .. } if provider == "ollama" && model == "virtual")
+        );
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| None), BranchSelection::Selected { provider, model, .. } if provider == "ollama" && model == "virtual")
+        );
+        use clap::Parser;
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model = "initial".into();
+        args.remember_initial_selection();
+        args.restore_session_model(&reopened);
+        assert_eq!(args.provider.id(), "ollama");
+        assert_eq!(args.model, "virtual");
     }
 
     #[test]
