@@ -389,6 +389,76 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn legacy_stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = origin.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://user:secret@{}", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let proxy = reqwest::Proxy::custom(move |_| {
+            (calls.fetch_add(1, Ordering::SeqCst) < 3).then(|| proxy_url.clone())
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{target}/test")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with(&format!("GET http://{target}/test HTTP/1.1\r\n")));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dxnlcjpzzwnyzxq=")
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(
+            timeout(Duration::from_millis(250), origin.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn http_proxy_connects_before_request_without_leaking_proxy_credentials() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
