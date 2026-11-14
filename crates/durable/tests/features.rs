@@ -3873,3 +3873,164 @@ fn ordered_config_rejects_active_conversations() {
     assert!(application_entry::list(&db, id).unwrap().is_empty());
     assert_eq!(h.conversation(id).unwrap().config.model, "before");
 }
+
+#[test]
+fn ordered_config_active_race_discards_staged_effects() {
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{Checkpoint, Task, TaskOwner, scheduler::{Handler, Registry, Step}},
+    };
+    use serde_json::json;
+    use std::sync::{Mutex, mpsc};
+    use uuid::Uuid;
+
+    struct Writer {
+        ready: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> { unreachable!() }
+        fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: "after".into(), system_prompt: "".into(), max_output_tokens: 64,
+            }).unwrap();
+            self.ready.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h.create_conversation(Config {
+        model: "before".into(), system_prompt: "".into(), max_output_tokens: 128,
+    }).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register("writer", true, Writer { ready: ready_tx, resume: Mutex::new(resume_rx) });
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let task = Task::new(Uuid::new_v4(), TaskOwner::Conversation(id), Checkpoint {
+        phase: "start".into(), data: json!(null),
+    }, 3).unwrap().registered("writer".into(), true);
+    let task_id = task.id();
+    scheduler.submit(&task).unwrap();
+    let thread = std::thread::spawn(move || { scheduler.tick(0).unwrap(); scheduler });
+    ready_rx.recv().unwrap();
+    h.submit(id, None, "new input".into()).unwrap();
+    resume_tx.send(()).unwrap();
+    let scheduler = thread.join().unwrap();
+    assert_eq!(scheduler.get(task_id).unwrap().unwrap().state(), &pi_rs_durable::task::TaskState::Ready);
+    assert_eq!(h.conversation(id).unwrap().config.model, "before");
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(application_entry::list(&db, id).unwrap().is_empty());
+    assert!(db.list(format!("durable/application-ordered-cut/{id}/").as_bytes()).unwrap().is_empty());
+}
+
+#[test]
+fn successive_ordered_config_changes_keep_each_commit_in_forks() {
+    use pi_rs_durable::{application_entry, document::TaskDocuments, task::{
+        Checkpoint, Task, TaskOwner, scheduler::{Handler, Registry, Step},
+    }};
+    use serde_json::json;
+    use uuid::Uuid;
+    struct Writer;
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> { unreachable!() }
+        fn run_with_documents(&self, task: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+            let model = task.checkpoint().data.as_str().unwrap();
+            docs.append_entry("app.before", json!(model)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: model.into(), system_prompt: model.into(), max_output_tokens: 64,
+            }).unwrap();
+            docs.append_entry("app.after", json!(model)).unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h.create_conversation(Config {
+        model: "initial".into(), system_prompt: "".into(), max_output_tokens: 128,
+    }).unwrap();
+    let mut registry = Registry::default();
+    registry.register("writer", true, Writer);
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    for model in ["first", "second"] {
+        let task = Task::new(Uuid::new_v4(), TaskOwner::Conversation(id), Checkpoint {
+            phase: "start".into(), data: json!(model),
+        }, 3).unwrap().registered("writer".into(), true);
+        scheduler.submit(&task).unwrap();
+        scheduler.tick(0).unwrap();
+    }
+    drop(scheduler);
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let db = durable_store::Store::open(&path).unwrap();
+    let entries = application_entry::list(&db, id).unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(h.conversation(id).unwrap().config.model, "second");
+    for (i, entry) in entries.iter().enumerate() {
+        let fork = h.fork_at_application_entry(id, entry.id).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().config.model, if i < 2 { "first" } else { "second" });
+        assert_eq!(application_entry::list(&db, fork).unwrap(), entries[..=i]);
+    }
+}
+
+#[test]
+fn ordered_config_task_abort_discards_staged_effects() {
+    use pi_rs_durable::{
+        application_entry,
+        document::TaskDocuments,
+        task::{Checkpoint, Task, TaskOwner, scheduler::{Handler, Registry, Step}},
+    };
+    use serde_json::json;
+    use std::sync::{Mutex, mpsc};
+    use uuid::Uuid;
+
+    struct Writer {
+        ready: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Handler for Writer {
+        fn run(&self, _: &Task) -> Result<Step, String> { unreachable!() }
+        fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+            docs.append_entry("app.before", json!(1)).unwrap();
+            docs.configure_runtime_at_checkpoint(Config {
+                model: "after".into(), system_prompt: "".into(), max_output_tokens: 64,
+            }).unwrap();
+            self.ready.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h.create_conversation(Config {
+        model: "before".into(), system_prompt: "".into(), max_output_tokens: 128,
+    }).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register("writer", true, Writer { ready: ready_tx, resume: Mutex::new(resume_rx) });
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    let task = Task::new(Uuid::new_v4(), TaskOwner::Conversation(id), Checkpoint {
+        phase: "start".into(), data: json!(null),
+    }, 3).unwrap().registered("writer".into(), true);
+    let task_id = task.id();
+    scheduler.submit(&task).unwrap();
+    let thread = std::thread::spawn(move || { scheduler.tick(0).unwrap(); scheduler });
+    ready_rx.recv().unwrap();
+    h.request_abort_task(task_id).unwrap();
+    resume_tx.send(()).unwrap();
+    let scheduler = thread.join().unwrap();
+    assert_eq!(scheduler.get(task_id).unwrap().unwrap().state(), &pi_rs_durable::task::TaskState::Ready);
+    assert!(scheduler.get(task_id).unwrap().unwrap().abort_requested());
+    assert_eq!(h.conversation(id).unwrap().config.model, "before");
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(application_entry::list(&db, id).unwrap().is_empty());
+    assert!(db.list(format!("durable/application-ordered-cut/{id}/").as_bytes()).unwrap().is_empty());
+}
