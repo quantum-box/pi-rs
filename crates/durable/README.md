@@ -596,21 +596,25 @@ Legacy in-flight preparations without a generation can finish while the
 conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
-`Scheduler::request_busy_independent_compaction` also accepts a conversation
-while a single model request is running, with no queued inputs or resets. The
-summary must finish before that conversation snapshot changes. Its completed
-result is atomically registered as a pending conversation write and decided at
-the next boundary. Inputs, resets and application writes admitted after the
-marker follow its placement; application writes are held until that boundary.
-A changed context generation or source prefix settles the summary stale.
-Conversation abort withdraws queued inputs but preserves the pending summary
-and application writes. A separately requested operation abort still cancels
-the summary. This does not implement upstream's general ordered inbox: work
-admitted before summary completion changes the selected version and makes the
-summary stale. Recovery requires the matching provider identity.
-`wait_independent_compaction` may return `Running` after the summary worker
-finishes while boundary placement is pending; inspect its status after the
-conversation reaches the boundary.
+`Scheduler::request_busy_independent_compaction` accepts a conversation while
+a single model request is running, with no queued inputs or resets at selection.
+It persists a bounded selection snapshot. If the model is still on that request
+when summarization completes, queued inputs, resets and application writes
+admitted in the meantime are checked against it. A reset preceding the summary
+is placed first and makes the summary stale; queued inputs follow the selected
+writes. The placement ticket records the version at summary admission and
+commits with the conversation's pending marker. Later writes follow that marker.
+The marker and its preceding reset IDs survive reopen. Conversation abort
+withdraws queued inputs but preserves a summary already admitted as a write;
+an explicit operation abort withdraws it. Recovery requires the matching
+provider identity.
+
+This is not a general ordered inbox: changes other than proven admissions, a
+model phase change, or an old operation without a selection checkpoint settle
+conservatively stale. The selection and hook snapshots share a 512 KiB limit, and at
+most 128 preceding resets can be ordered. `wait_independent_compaction` may
+return `Running` while boundary placement is pending; inspect its status after
+the conversation reaches the boundary.
 
 `Scheduler::request_idle_independent_compaction` starts an independent summary
 for an idle conversation. Supply and retain a

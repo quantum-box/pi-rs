@@ -503,7 +503,7 @@ async fn explicit_summary_abort_withdraws_pending_write() {
 }
 
 #[tokio::test]
-async fn admission_before_summary_completion_is_stale() {
+async fn queued_input_before_summary_completion_follows_summary() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(BusyModel::default());
     let mut scheduler = Scheduler::open_with_summary_recovery(
@@ -547,10 +547,14 @@ async fn admission_before_summary_completion_is_stale() {
             .wait_independent_compaction(operation)
             .await
             .unwrap(),
-        IndependentCompactionStatus::Stale
+        IndependentCompactionStatus::Running
     );
     model.release.add_permits(1);
     scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
     assert!(scheduler.conversation(conversation).unwrap().messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "earlier queued")));
     scheduler.shutdown().await.unwrap();
 }
@@ -590,6 +594,461 @@ async fn abort_preserves_reset_and_its_following_write() {
         c.application_writes
             .iter()
             .any(|item| item.id == write && item.placed && item.after_reset == Some(reset))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+async fn pending_summary_fixture(
+    path: &std::path::Path,
+    model: Arc<BusyModel>,
+) -> (Scheduler, uuid::Uuid, uuid::Uuid) {
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        path,
+        busy_options(model.clone()),
+        Default::default(),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    (scheduler, conversation, operation)
+}
+#[tokio::test]
+async fn earlier_application_write_is_preserved_and_summary_places() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&dir.path().join("db"), model.clone()).await;
+    let write = scheduler
+        .submit_write(conversation, None, "early".into(), None)
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    model.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .application_writes
+            .iter()
+            .any(|item| item.id == write && item.placed)
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn earlier_reset_makes_summary_stale_and_later_write_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&dir.path().join("db"), model.clone()).await;
+    let reset = scheduler
+        .reset(conversation, Some("reset first".into()))
+        .unwrap();
+    let early = scheduler
+        .submit_write(conversation, None, "early".into(), None)
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    let later = scheduler
+        .submit_write(conversation, None, "later".into(), None)
+        .unwrap();
+    let before_boundary = scheduler.history_head(conversation).unwrap();
+    model.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    let page = scheduler
+        .history_through(
+            conversation,
+            before_boundary,
+            scheduler.history_head(conversation).unwrap(),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap();
+    let reset_event = page
+        .records
+        .iter()
+        .find(|record| {
+            record.value["resets"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|r| r["id"] == reset.to_string()))
+        })
+        .unwrap();
+    let writes = reset_event.value["application_writes"].as_array().unwrap();
+    assert!(
+        writes
+            .iter()
+            .any(|w| w["id"] == early.to_string() && w["placed"] == true)
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|w| w["id"] == later.to_string() && w["placed"] == false)
+    );
+    let c = scheduler.conversation(conversation).unwrap();
+    assert!(c.resets.iter().any(|r| r.id == reset));
+    assert!(
+        c.application_writes
+            .iter()
+            .any(|w| w.id == early && w.placed && w.after_reset == Some(reset))
+    );
+    assert!(
+        c.application_writes
+            .iter()
+            .any(|w| w.id == later && w.placed && w.after_reset == Some(reset))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn earlier_input_and_pending_summary_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&path, model.clone()).await;
+    scheduler
+        .submit(conversation, None, "queued early".into())
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model),
+        Default::default(),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    let c = scheduler.conversation(conversation).unwrap();
+    let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+    let input = c
+        .messages
+        .iter()
+        .position(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued early"),
+        )
+        .unwrap();
+    assert!(summary < input);
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn abort_before_summary_completion_cancels_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&dir.path().join("db"), model).await;
+    scheduler
+        .submit(conversation, None, "queued early".into())
+        .unwrap();
+    scheduler.abort_and_wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn model_progress_before_summary_completion_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&dir.path().join("db"), model.clone()).await;
+    model.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    let c = scheduler.conversation(conversation).unwrap();
+    assert!(c.messages.iter().any(
+        |m| matches!(m, pi_rs_core::Message::Assistant { content, .. } if content == "busy answer")
+    ));
+    assert!(!c.messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))));
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn interrupted_summary_with_earlier_input_fails_closed_after_model_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&path, model.clone()).await;
+    scheduler
+        .submit(conversation, None, "queued early".into())
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model.clone()),
+        Default::default(),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), model.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        model.summary_started.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    model.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .iter()
+            .any(
+                |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued early")
+            )
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn earlier_reset_order_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&path, model.clone()).await;
+    let reset = scheduler
+        .reset(conversation, Some("reset first".into()))
+        .unwrap();
+    let early = scheduler
+        .submit_write(conversation, None, "early".into(), None)
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    let later = scheduler
+        .submit_write(conversation, None, "later".into(), None)
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model),
+        Default::default(),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    let c = scheduler.conversation(conversation).unwrap();
+    assert!(c.resets.iter().any(|r| r.id == reset));
+    assert!(
+        c.application_writes
+            .iter()
+            .any(|w| w.id == early && w.placed)
+    );
+    assert!(
+        c.application_writes
+            .iter()
+            .any(|w| w.id == later && w.placed)
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn preceding_reset_waits_for_after_run_hook() {
+    use pi_rs_durable::extension::{Context, Extension, GenerationDecision, GenerationEvent, Hook};
+    struct CheckAfterRun(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Hook for CheckAfterRun {
+        async fn generation(
+            &self,
+            event: GenerationEvent,
+            _: &serde_json::Value,
+            ctx: &Context<'_>,
+        ) -> Result<GenerationDecision, String> {
+            if event == GenerationEvent::AfterRun
+                && ctx.snapshot["messages"].to_string().contains("busy answer")
+            {
+                self.0.store(
+                    !ctx.snapshot["messages"].to_string().contains("reset first"),
+                    Ordering::SeqCst,
+                );
+            }
+            Ok(GenerationDecision::Pass)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        dir.path().join("db"),
+        busy_options(model.clone()),
+        Default::default(),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    scheduler
+        .install_extension(Extension {
+            name: "after-run-check".into(),
+            hooks: vec![Arc::new(CheckAfterRun(seen.clone()))],
+            ..Default::default()
+        })
+        .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["after-run-check".into()])
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    scheduler
+        .reset(conversation, Some("reset first".into()))
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    model.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert!(seen.load(Ordering::SeqCst));
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn abort_preserves_summary_after_earlier_reset_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let (mut scheduler, conversation, operation) =
+        pending_summary_fixture(&dir.path().join("db"), model.clone()).await;
+    let reset = scheduler
+        .reset(conversation, Some("reset first".into()))
+        .unwrap();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    scheduler.abort_and_wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .resets
+            .iter()
+            .any(|item| item.id == reset)
     );
     scheduler.shutdown().await.unwrap();
 }

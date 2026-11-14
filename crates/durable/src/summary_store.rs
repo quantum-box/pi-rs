@@ -143,6 +143,10 @@ pub struct Operation {
     #[serde(default)]
     placement_version: Option<u64>,
     #[serde(default)]
+    admission_version: Option<u64>,
+    #[serde(default)]
+    busy_checkpoint: Option<serde_json::Value>,
+    #[serde(default)]
     provider: Option<ProviderIdentity>,
     #[serde(default)]
     auto_place: bool,
@@ -167,6 +171,9 @@ impl Operation {
     }
     pub(crate) fn placement_version(&self) -> Option<u64> {
         self.placement_version
+    }
+    pub(crate) fn busy_checkpoint(&self) -> Option<&serde_json::Value> {
+        self.busy_checkpoint.as_ref()
     }
     pub(crate) fn provider(&self) -> Option<&ProviderIdentity> {
         self.provider.as_ref()
@@ -287,6 +294,8 @@ impl<'a> SummaryStore<'a> {
             state: State::Ready,
             attempts: vec![],
             placement_version: None,
+            admission_version: None,
+            busy_checkpoint: None,
             provider: None,
             auto_place: false,
             hook: None,
@@ -313,6 +322,8 @@ impl<'a> SummaryStore<'a> {
                 state: State::Ready,
                 attempts: vec![],
                 placement_version: None,
+                admission_version: None,
+                busy_checkpoint: None,
                 provider: Some(provider),
                 auto_place: false,
                 hook: None,
@@ -331,7 +342,11 @@ impl<'a> SummaryStore<'a> {
         preparation: Preparation,
         (conversation_key, version): (Vec<u8>, u64),
         provider: ProviderIdentity,
-        (auto_place, hook): (bool, Option<HookCheckpoint>),
+        (auto_place, hook, busy_checkpoint): (
+            bool,
+            Option<HookCheckpoint>,
+            Option<serde_json::Value>,
+        ),
     ) -> Result<(), Error> {
         if id.is_nil() || session_id.is_nil() || version == 0 || !provider.valid() {
             return Err(Error::Identity);
@@ -339,9 +354,17 @@ impl<'a> SummaryStore<'a> {
         if serde_json::to_vec(&preparation)?.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::Limit);
         }
-        if hook.as_ref().is_some_and(|hook| {
-            serde_json::to_vec(hook).map_or(true, |value| value.len() > MAX_HOOK_SNAPSHOT_BYTES)
-        }) {
+        let hook_bytes = hook
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map_or(0, |value| value.len());
+        let busy_bytes = busy_checkpoint
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map_or(0, |value| value.len());
+        if hook_bytes.saturating_add(busy_bytes) > MAX_HOOK_SNAPSHOT_BYTES {
             return Err(Error::Limit);
         }
         let op = Operation {
@@ -355,6 +378,8 @@ impl<'a> SummaryStore<'a> {
             },
             attempts: vec![],
             placement_version: Some(version),
+            admission_version: None,
+            busy_checkpoint,
             provider: Some(provider),
             auto_place,
             hook,
@@ -601,8 +626,9 @@ impl<'a> SummaryStore<'a> {
         self.write(&op, Expected::Version(version))
     }
 
-    /// Commit an immutable placement admission and the pending state together,
-    /// while fencing the exact conversation version selected at preparation.
+    /// Commit a placement ticket and pending state while fencing the observed
+    /// conversation version. A changed version requires a busy checkpoint and
+    /// a conversation marker; the runtime validates the checkpoint before calling.
     /// The ticket's store commit sequence is the durable ordering boundary.
     #[cfg(test)]
     pub(crate) fn admit_placement(
@@ -622,7 +648,8 @@ impl<'a> SummaryStore<'a> {
         marker: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         let mut op = snap.operation.clone();
-        if op.placement_version != Some(conversation_version)
+        if (op.placement_version != Some(conversation_version)
+            && (marker.is_none() || op.busy_checkpoint.is_none()))
             || conversation_key != crate::runtime::Harness::key(op.session_id)
         {
             return Err(Error::State);
@@ -636,6 +663,7 @@ impl<'a> SummaryStore<'a> {
             conversation_version,
             request_id,
         };
+        op.admission_version = Some(conversation_version);
         op.state = State::PlacementPending { request_id, result };
         let key = Self::key(op.id);
         let ticket_key = Self::placement_key(op.id);
@@ -694,7 +722,11 @@ impl<'a> SummaryStore<'a> {
         let ticket: PlacementTicket = serde_json::from_slice(&entry.value)?;
         if ticket.operation != snap.operation.id
             || ticket.conversation != snap.operation.session_id
-            || Some(ticket.conversation_version) != snap.operation.placement_version
+            || Some(ticket.conversation_version)
+                != snap
+                    .operation
+                    .admission_version
+                    .or(snap.operation.placement_version)
             || ticket.request_id != *request_id
         {
             return Err(Error::InvalidRecord);

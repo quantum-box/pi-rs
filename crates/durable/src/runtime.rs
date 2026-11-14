@@ -688,6 +688,8 @@ struct PendingIndependentSummary {
     submissions: usize,
     writes: usize,
     resets: usize,
+    #[serde(default)]
+    resets_before: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -6284,6 +6286,26 @@ impl Harness {
         store
             .placement_ticket(&snap)
             .map_err(|e| Error::Invalid(format!("summary: {e}")))?;
+        if marker.resets_before.len() > SUMMARY_MAX_HISTORY_RECORDS
+            || marker.resets_before.len() > state.pending_resets.len()
+            || !marker
+                .resets_before
+                .iter()
+                .zip(&state.pending_resets)
+                .all(|(id, reset)| *id == reset.id)
+            || marker.writes > state.application_writes.len()
+        {
+            return Err(Error::Invalid(
+                "independent summary ordering is inconsistent".into(),
+            ));
+        }
+        for reset in state
+            .pending_resets
+            .drain(..marker.resets_before.len())
+            .collect::<Vec<_>>()
+        {
+            place_reset_before_writes(state, reset, marker.writes);
+        }
         let placed = state.submissions.len() >= marker.submissions
             && state.application_writes.len() >= marker.writes
             && state.resets.len() == marker.resets
@@ -6354,7 +6376,20 @@ impl Harness {
                 }
                 return Ok(());
             }
+            // Preserve the ordinary after-run hook before applying an earlier
+            // reset on a final boundary. The queued summary remains fenced.
+            let finish_run_before_reset = matches!(
+                c.phase,
+                Phase::Boundary {
+                    answer: Some(_),
+                    ..
+                }
+            ) && c
+                .pending_independent_summary
+                .as_ref()
+                .is_some_and(|marker| !marker.resets_before.is_empty());
             if c.pending_independent_summary.is_some()
+                && !finish_run_before_reset
                 && matches!(
                     c.phase,
                     Phase::Boundary { .. } | Phase::Idle | Phase::FailedIdle
@@ -8486,8 +8521,8 @@ struct SummaryPlacementDriver {
     cancel: CancellationToken,
 }
 impl SummaryPlacementDriver {
-    /// A conservative exact-version decision. Neither a changed conversation
-    /// nor an unbound legacy operation can ever become eligible again.
+    /// Admit a placement against the selected version, or a later version
+    /// proven to contain only admissible inbox changes since a busy snapshot.
     fn place_summary(&mut self, id: Uuid) -> Result<SummaryPlacement, Error> {
         use crate::summary_store::{State, SummaryStore};
         let provider = self
@@ -8534,21 +8569,29 @@ impl SummaryPlacementDriver {
                         return Ok(SummaryPlacement::Queued);
                     }
                 }
-            } else if let Some(version) = snap.operation.placement_version()
+            } else if let Some(version) = current.as_ref().map(|entry| entry.version)
                 && current
                     .as_ref()
-                    .is_some_and(|entry| entry.version == version)
+                    .is_some_and(|entry| entry.value.len() <= SUMMARY_MAX_BATCH_BYTES)
             {
                 let (state, loaded_version) =
                     self.harness.load_for_summary_placement(conversation)?;
                 if loaded_version != version {
                     continue;
                 }
-                let marker = if matches!(state.phase, Phase::ModelRunning { .. })
+                let admissions_proven = if snap.operation.placement_version() == Some(version) {
+                    true
+                } else if let Some(checkpoint) = snap.operation.busy_checkpoint() {
+                    let base: Conversation = serde_json::from_value(checkpoint.clone())?;
+                    admission_only(&base, &state)?
+                } else {
+                    false
+                };
+                let marker = if admissions_proven
+                    && matches!(state.phase, Phase::ModelRunning { .. })
                     && state.active.is_some()
                     && state.pending_independent_summary.is_none()
-                    && state.pending_resets.is_empty()
-                    && !state.submissions.iter().any(|s| s.status == Status::Queued)
+                    && state.pending_resets.len() <= SUMMARY_MAX_HISTORY_RECORDS
                     && !state.abort_requested
                     && result.source_matches(&state.messages)
                     && (if result.has_blocks() {
@@ -8570,6 +8613,11 @@ impl SummaryPlacementDriver {
                             submissions: state.submissions.len(),
                             writes: state.application_writes.len(),
                             resets: state.resets.len(),
+                            resets_before: state
+                                .pending_resets
+                                .iter()
+                                .map(|reset| reset.id)
+                                .collect(),
                         })?;
                     let encoded = serde_json::to_vec(&raw)?;
                     if encoded.len() > SUMMARY_MAX_BATCH_BYTES {
@@ -8583,7 +8631,7 @@ impl SummaryPlacementDriver {
                 };
                 if state.is_working() && marker.is_none() {
                     // The original busy snapshot changed or is no longer eligible.
-                } else {
+                } else if marker.is_some() || snap.operation.placement_version() == Some(version) {
                     let queued = marker.is_some();
                     match store.admit_placement_with_marker(&snap, key.clone(), version, marker) {
                         Ok(()) if queued => return Ok(SummaryPlacement::Queued),
@@ -9921,7 +9969,15 @@ impl Scheduler {
                 preparation.bind_context(generation),
                 (Harness::key(conversation), version),
                 provider,
-                (auto_place, hook),
+                (
+                    auto_place,
+                    hook,
+                    if busy_ok {
+                        Some(serde_json::to_value(&state)?)
+                    } else {
+                        None
+                    },
+                ),
             )
             .map_err(|e| self.summary_store_error(e))?;
         Ok(true)
@@ -10831,6 +10887,14 @@ fn place_round_handoff(c: &mut Conversation) {
 }
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
+    place_reset_before_writes(c, marker, usize::MAX);
+}
+
+fn place_reset_before_writes(
+    c: &mut Conversation,
+    marker: crate::reset::Reset,
+    write_limit: usize,
+) {
     if !c.content_blocks.is_empty() || c.block_reset_proof.is_some() {
         let proof = c.block_reset_proof.get_or_insert_with(|| BlockResetProof {
             previous_context: c.context_generation,
@@ -10850,7 +10914,7 @@ fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     if let Some(message) = marker.message() {
         c.messages.push(message);
     }
-    for write in &mut c.application_writes {
+    for write in c.application_writes.iter_mut().take(write_limit) {
         if !write.withdrawn && write.after_reset == Some(marker.id) {
             write.placed = true;
         }

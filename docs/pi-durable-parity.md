@@ -174,20 +174,21 @@ original audit table below remains a historical baseline.
 **Independent summary accounting checkpoint:** Completed generations are persisted before usage settlement, including invalid summaries whose usage still needs accounting. Per-attempt receipts record successful settlement for both measured generations and interrupted attempts; publication requires all relevant receipts. The private worker transfers a pending checkpoint only after acquiring the per-operation guard. A crash between provider acknowledgement and receipt requires replay with the same request ID and report, so external settlement must be idempotent. See [worker tests](../crates/durable/src/summary_worker_tests.rs).
 
 **Narrow busy independent summary:** A public opt-in accepts a summary while a
-model request is running. If the selected conversation version is still
-current when the result completes, one transaction persists the placement
-ticket and a conversation-owned pending marker. In-flight model saves merge
-the marker; at the next boundary, context-generation and source-prefix checks
-decide placement atomically with the operation status. Inputs, resets and
-application writes admitted after the marker follow it; writes wait for their
-preceding reset. Conversation abort preserves the queued summary and passive
-writes. Pending work survives reopen. Earlier concurrent admissions still make
-the summary stale, and this is not a general ordered inbox. See
+model request is running. A bounded durable selection snapshot proves that any
+intervening changes are admissions before a later conversation version can be
+used for the atomic placement ticket and pending marker. A preceding reset is
+placed first and makes the summary stale; queued inputs follow the writes.
+In-flight model saves merge the marker, and context-generation and source-prefix
+checks guard the atomic settlement. Later writes follow the marker. Conversation
+abort preserves a queued summary and passive writes; explicit operation abort
+withdraws it. Pending work survives reopen. The selection and hook snapshots
+share a 512 KiB limit, and the preceding reset prefix is limited to 128. Other
+changes and old unbound operations fail closed. This is not a general ordered inbox. See
 [public tests](../crates/durable/tests/independent_compaction.rs).
 
 **Independent summary worker and placement:** An opt-in public idle path starts a scheduler-owned independent worker, runs selected `beforeCompact` hooks from a persisted snapshot with operation-scoped memo and optional instructions, settles usage under the per-operation fence, and automatically places or marks its result stale. Conversation graph abort marks running owned summaries and waits for cleanup while preserving an already queued summary write; foreground idle waits include them. Admission still checks the conversation's own phase and queue rather than its owned graph. Placement requires the exact captured conversation version and preserves retained provenance. The recovery constructor installs its adapter and extensions first, scans at most 128 total records of at most 4 MiB each, and resumes matching provider-bound execution and public automatic placement. Hook snapshots are limited to 512 KiB; a missing selected extension blocks execution. Legacy or mismatched identities are blocked; the host must identify the provider, tenant and idempotency namespace correctly. The record limit includes terminal records, public admission rejects a full store, and no retention policy exists. Individual store entries are materialized before size checks. The narrow busy path described above does not yet provide a general ordered inbox. See [public test](../crates/durable/tests/independent_compaction.rs) and [worker tests](../crates/durable/src/summary_worker_tests.rs).
 
-**Independent placement ordering prerequisite:** An eligible completed result is first transitioned to pending placement in the same version-checked transaction that creates its immutable placement ticket. The ticket's store commit sequence can be compared with tracked conversation commits; duplicate admission conflicts and a missing or inconsistent ticket fail closed. A later conversation change still makes the result stale. This does not yet order input, reset and write submission IDs in a shared inbox. See [ticket and recovery tests](../crates/durable/src/summary_worker_tests.rs).
+**Independent placement ordering prerequisite:** An eligible completed result is first transitioned to pending placement in the same version-checked transaction that creates its immutable placement ticket. The ticket's store commit sequence can be compared with tracked conversation commits; duplicate admission conflicts and a missing or inconsistent ticket fail closed. The idle path still treats a later conversation change as stale. This does not yet order input, reset and write submission IDs in a shared inbox. See [ticket and recovery tests](../crates/durable/src/summary_worker_tests.rs).
 
 **Persisted summary placement:** Hook-provided or accounted model summaries enter a durable placement phase before changing the conversation. Placement checks the saved context generation and source prefix and atomically commits either the resulting messages and applied status or a conservative stale status for a tracked manual operation; concurrent admissions force a fresh decision. Abort before that commit takes precedence. An OS-kill test reopens a committed placement checkpoint. This currently runs inside the idle-only conversation phase, rather than through an independently scheduled task and ordered inbox write. A generation change can reject a result even when upstream would retain its target.
 

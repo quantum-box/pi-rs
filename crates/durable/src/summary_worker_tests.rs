@@ -1715,7 +1715,7 @@ async fn creation_rejects_a_changed_conversation_version() {
             preparation,
             (Harness::key(conversation), version),
             identity(),
-            (false, None),
+            (false, None, None),
         ),
         Err(crate::summary_store::Error::Conflict)
     ));
