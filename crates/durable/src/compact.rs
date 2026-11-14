@@ -390,15 +390,24 @@ mod tests {
             let restored: Preparation =
                 serde_json::from_slice(&serde_json::to_vec(&preparation).unwrap()).unwrap();
             assert_eq!(
-                restored.hook_input(crate::extension::CompactionReason::Manual).instructions.as_deref(),
+                restored
+                    .hook_input(crate::extension::CompactionReason::Manual)
+                    .instructions
+                    .as_deref(),
                 instructions
             );
             assert_eq!(restored.request(), preparation.request());
         }
-        assert!(prepare(&[], "m", 100, 0, Some("anything")).unwrap().is_none());
-        assert!(prepare(&[user("only")], "m", 100, 0, Some("anything"))
-            .unwrap()
-            .is_none());
+        assert!(
+            prepare(&[], "m", 100, 0, Some("anything"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepare(&[user("only")], "m", 100, 0, Some("anything"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     struct Stub(Mutex<Option<(Uuid, Uuid, ModelRequest)>>);
