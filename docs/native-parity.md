@@ -196,9 +196,14 @@ the visible URL or email address. OSC 8 hyperlink capability remains open.
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
 include M3 and M3.1-Flash. Pi also lists M2.7 on these endpoints, but MiniMax's
-current regional Messages and standard API references list only M3 and
-M3.1-Flash as supported, so the direct M2.7 entries are withheld until a
-supported route can be established.
+current regional Messages, OpenAI-compatible and standard API references list
+only M3 and M3.1-Flash as supported, so direct M2.7 entries are withheld. Both
+regional model-list FAQs say existing pay-as-you-go users can access M2.7 until
+November 18, 2026, and that subscription requests have routed to M3.1 Flash
+since October 19, 2026; their retired-model tables already list M2.7 as retired.
+The references do not specify a currently supported direct M2.7 route. See the
+[international model list](https://platform.minimax.io/docs/faq/models) and
+[China model list](https://platform.minimax.cn/docs/faq/models).
 
 Budgeted Messages requests use Pi's default level budgets or the selected
 `thinkingBudgets` override and summarized thinking display, subject to the
