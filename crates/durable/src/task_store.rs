@@ -237,9 +237,10 @@ impl<'a> TaskStore<'a> {
                 });
                 delivered = Some(signal);
             }
-            WaitFor::Tasks(ids) => {
+            WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) | WaitFor::TasksFailFast(ids) => {
                 let mut seen = std::collections::HashSet::new();
                 let mut pending = false;
+                let mut ended = false;
                 for id in ids {
                     if !seen.insert(*id) {
                         return Err(Error::InvalidChild);
@@ -250,13 +251,19 @@ impl<'a> TaskStore<'a> {
                     }
                     if !child.task.is_terminal() {
                         pending = true;
+                    } else {
+                        ended = true;
                     }
                     checks.push(Check {
                         key: key(*id),
                         expected: Expected::Version(child.version),
                     });
                 }
-                if pending {
+                if if matches!(condition, WaitFor::TasksAny(_)) {
+                    !ended
+                } else {
+                    pending
+                } {
                     return Ok(WakeResult::Pending);
                 }
             }

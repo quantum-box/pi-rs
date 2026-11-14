@@ -29,6 +29,10 @@ pub enum WaitFor {
     DeadlineMillis(i64),
     Signal(String),
     Tasks(Vec<Uuid>),
+    /// Wake when any direct child ends; an empty set remains pending.
+    TasksAny(Vec<Uuid>),
+    /// Wait for all; a failed child cancels the other listed subtrees.
+    TasksFailFast(Vec<Uuid>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,14 +158,6 @@ impl Task {
     pub(crate) fn yield_ready(&mut self) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Ready;
-        Ok(())
-    }
-
-    pub(crate) fn exhaust_restarts(&mut self) -> Result<(), TransitionError> {
-        if self.state != TaskState::Ready {
-            return Err(TransitionError::InvalidState);
-        }
-        self.state = TaskState::Failed("restart limit exceeded".into());
         Ok(())
     }
 

@@ -3,20 +3,17 @@
 //! The scheduler holds the store's exclusive cooperative owner lock. `tick` runs
 //! at most one invocation synchronously; callers periodically call it again,
 //! including after signals and deadlines. Dropping between ticks is a clean stop.
-//! An interrupted invocation is replayed only when both its stored and current
-//! registrations permit replay. External effects cannot be made atomic with this
+//! Interrupted invocations replay only when both recorded and current policies
+//! allow it. External effects cannot be made atomic with this
 //! store: handlers must be pure or use destination-side idempotency/reconciliation.
 //! A storage error or panic during an invocation requires dropping this scheduler
 //! and reopening it; never assume an unsuccessful commit did not happen.
 //!
-//! Compatibility: this deliberately provides only all-settled direct-child waits,
-//! one signal or one deadline per wait, and caller-driven serial polling. It does
-//! not implement upstream any/fail-fast joins, combined signal/deadline waits,
-//! task cancellation propagation, background children, abort handlers, or the
-//! conversation scheduler integration. Live children block terminal settlement
-//! and recovery of an unsafe/exhausted parent; an operator must reconcile them.
-//! Unlike upstream close, an invocation cannot be interrupted by clean shutdown:
-//! the caller waits for synchronous `tick` to return before dropping the owner.
+//! This scheduler supports direct-child all, any and fail-fast waits. It has no
+//! background tasks, abort handlers, combined waits, or conversation integration.
+//! Cancellation changes durable state only and cannot undo external effects or
+//! interrupt a synchronous handler. Direct TaskStore writers must be fenced.
+//! Terminal success still requires all owned work to be finished.
 
 use crate::task::{Checkpoint, Task, TaskOwner, TaskState, TransitionError, WaitFor};
 use crate::task_store::{self, Save, Signal, TaskStore, WakeResult};
@@ -153,7 +150,7 @@ impl Scheduler {
             .collect()
     }
     /// Opens exclusively and reconciles interrupted invocations. Parked tasks are
-    /// untouched. Missing registrations leave their running records untouched.
+    /// untouched. Missing definitions remain blocked until registered.
     pub fn open(path: impl AsRef<Path>, registry: Registry) -> Result<Self, Error> {
         Self::attach(Arc::new(OwnedStore::open(path)?), registry)
     }
@@ -191,7 +188,10 @@ impl Scheduler {
         Ok(entry)
     }
     fn reconcile(&mut self) -> Result<(), Error> {
-        for item in self.ts().list()? {
+        for listed in self.ts().list()? {
+            let Some(item) = self.ts().load(listed.task.id())? else {
+                continue;
+            };
             if item.task.state() != &TaskState::Running {
                 continue;
             }
@@ -202,20 +202,12 @@ impl Scheduler {
             if item.task.replay_safe() && reg.replay_safe {
                 let exhausted = item.task.restarts().saturating_add(1) >= item.task.restart_limit();
                 if exhausted {
-                    self.ensure_no_live_children(item.task.id())?;
+                    self.finish_failed(&item, "restart limit".into())?;
+                } else {
+                    self.ts().update(&item, |task| task.recover())?;
                 }
-                self.ts().update(&item, |task| {
-                    task.recover()?;
-                    if exhausted {
-                        task.exhaust_restarts()?;
-                    }
-                    Ok(())
-                })?;
             } else {
-                self.ensure_no_live_children(item.task.id())?;
-                self.ts().update(&item, |t| {
-                    t.fail("interrupted: execution outcome requires reconciliation".into())
-                })?;
+                self.finish_failed(&item, "interrupted: execution outcome requires reconciliation".into())?;
             }
         }
         Ok(())
@@ -257,6 +249,11 @@ impl Scheduler {
         self.check()?;
         let mut progress = false;
         for snapshot in self.ts().list()? {
+            if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state() {
+                self.poisoned = true;
+                self.cancel_failed_siblings(&snapshot, ids)?;
+                self.poisoned = false;
+            }
             if matches!(snapshot.task.state(), TaskState::Waiting(_))
                 && matches!(
                     self.ts().poll_wait(&snapshot, now_millis)?,
@@ -311,7 +308,10 @@ impl Scheduler {
                     }
                     children.push(child);
                 }
-                if let WaitFor::Tasks(ref waiting) = condition {
+                if let WaitFor::Tasks(ref waiting)
+                | WaitFor::TasksAny(ref waiting)
+                | WaitFor::TasksFailFast(ref waiting) = condition
+                {
                     let mut seen = std::collections::HashSet::new();
                     for id in waiting {
                         if !seen.insert(*id) {
@@ -332,8 +332,9 @@ impl Scheduler {
                 next.task.succeed(value).map_err(Error::Transition)?;
             }
             Step::Fail(reason) => {
-                self.ensure_no_live_children(next.task.id())?;
-                next.task.fail(reason).map_err(Error::Transition)?;
+                self.finish_failed(&running, reason)?;
+                self.poisoned = false;
+                return Ok(true);
             }
         }
         let mut batch = vec![Save::Update(&next)];
@@ -342,6 +343,98 @@ impl Scheduler {
         self.poisoned = false;
         Ok(true)
     }
+    /// Cancel a task and all of its owned descendants in one transaction.
+    /// This requires exclusive scheduler ownership and cannot interrupt `tick`.
+    pub fn cancel(&mut self, id: Uuid) -> Result<(), Error> {
+        self.check()?;
+        let records = self.ts().list()?;
+        let root = records
+            .iter()
+            .find(|s| s.task.id() == id)
+            .ok_or(Error::Ownership)?;
+        if root.task.is_terminal() {
+            return Err(Error::Transition(TransitionError::InvalidState));
+        }
+        self.poisoned = true;
+        let result = self.cancel_roots(&records, &[id], None);
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+
+    fn cancel_roots(
+        &self,
+        records: &[task_store::StoredTask],
+        roots: &[Uuid],
+        extra: Option<task_store::StoredTask>,
+    ) -> Result<(), Error> {
+        let mut ids: HashSet<Uuid> = roots.iter().copied().collect();
+        loop {
+            let before = ids.len();
+            for record in records {
+                if let TaskOwner::Task(parent) = record.task.owner() {
+                    if ids.contains(parent) {
+                        ids.insert(record.task.id());
+                    }
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        let mut updates = Vec::new();
+        for record in records {
+            if ids.contains(&record.task.id()) && !record.task.is_terminal() {
+                let mut next = record.clone();
+                next.task.cancel().map_err(Error::Transition)?;
+                updates.push(next);
+            }
+        }
+        if let Some(next) = extra {
+            updates.push(next);
+        }
+        let batch: Vec<_> = updates.iter().map(Save::Update).collect();
+        self.ts().save(&batch)?;
+        Ok(())
+    }
+
+    fn finish_failed(&self, parent: &task_store::StoredTask, reason: String) -> Result<(), Error> {
+        let records = self.ts().list()?;
+        let roots: Vec<_> = records
+            .iter()
+            .filter(|s| s.task.owner() == &TaskOwner::Task(parent.task.id()))
+            .map(|s| s.task.id())
+            .collect();
+        let mut next = parent.clone();
+        next.task.fail(reason).map_err(Error::Transition)?;
+        self.cancel_roots(&records, &roots, Some(next))
+    }
+
+    fn cancel_failed_siblings(
+        &self,
+        parent: &task_store::StoredTask,
+        ids: &[Uuid],
+    ) -> Result<(), Error> {
+        let records = self.ts().list()?;
+        let mut seen = HashSet::new();
+        let mut failed = false;
+        for id in ids {
+            let child = records
+                .iter()
+                .find(|s| s.task.id() == *id)
+                .ok_or(Error::Ownership)?;
+            if !seen.insert(*id) || child.task.owner() != &TaskOwner::Task(parent.task.id()) {
+                return Err(Error::Ownership);
+            }
+            failed |= matches!(child.task.state(), TaskState::Failed(_));
+        }
+        if failed {
+            self.cancel_roots(&records, ids, None)?;
+        }
+        Ok(())
+    }
+
     fn ensure_no_live_children(&self, id: Uuid) -> Result<(), Error> {
         if self
             .ts()
@@ -418,6 +511,129 @@ mod tests {
             TaskState::Succeeded(_)
         ));
     }
+
+    #[test]
+    fn any_and_fail_fast_survive_reopen_and_cancel_descendants() {
+        for fail_fast in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tasks.db");
+            let parent = Uuid::from_u128(1);
+            let child1 = Uuid::from_u128(2);
+            let child2 = Uuid::from_u128(3);
+            let grandchild = Uuid::from_u128(4);
+            let s = Scheduler::open(&path, Registry::default()).unwrap();
+            let mut p = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "p",
+                false,
+                2,
+            );
+            p.start().unwrap();
+            p.wait(if fail_fast {
+                WaitFor::TasksFailFast(vec![child1, child2])
+            } else {
+                WaitFor::TasksAny(vec![child1, child2])
+            })
+            .unwrap();
+            let mut c1 = task(2, TaskOwner::Task(parent), "c", false, 2);
+            c1.start().unwrap();
+            c1.fail("failure".into()).unwrap();
+            let c2 = task(3, TaskOwner::Task(parent), "c", false, 2);
+            let gc = task(4, TaskOwner::Task(child2), "c", false, 2);
+            s.ts()
+                .save(&[
+                    Save::Create(&p),
+                    Save::Create(&c1),
+                    Save::Create(&c2),
+                    Save::Create(&gc),
+                ])
+                .unwrap();
+            drop(s);
+            let mut r = Registry::default();
+            r.register("p", false, |_t: &Task| {
+                Ok(Step::Wait {
+                    checkpoint: cp("after"),
+                    condition: WaitFor::Signal("hold".into()),
+                    children: vec![],
+                })
+            });
+            r.register("c", false, |_t: &Task| {
+                Ok(Step::Wait {
+                    checkpoint: cp("hold"),
+                    condition: WaitFor::Signal("hold".into()),
+                    children: vec![],
+                })
+            });
+            let mut s = Scheduler::open(&path, r).unwrap();
+            s.tick(0).unwrap();
+            assert!(matches!(
+                s.get(parent).unwrap().unwrap().state(),
+                TaskState::Waiting(WaitFor::Signal(_))
+            ));
+            if fail_fast {
+                assert_eq!(
+                    s.get(child2).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+                assert_eq!(
+                    s.get(grandchild).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+            } else {
+                assert_eq!(s.get(child2).unwrap().unwrap().state(), &TaskState::Ready);
+                s.cancel(parent).unwrap();
+                assert_eq!(
+                    s.get(child2).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+                assert_eq!(
+                    s.get(grandchild).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+            }
+            drop(s);
+            let s = Scheduler::open(&path, Registry::default()).unwrap();
+            assert_eq!(
+                s.get(child2).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_parent_cancels_running_child_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let s = Scheduler::open(&path, Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "p",
+            false,
+            2,
+        );
+        let mut child = task(2, TaskOwner::Task(parent.id()), "c", true, 2);
+        parent.start().unwrap();
+        child.start().unwrap();
+        s.ts()
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        drop(s);
+        let mut r = Registry::default();
+        r.register("p", false, |_t: &Task| panic!("unsafe parent replayed"));
+        r.register("c", true, |_t: &Task| panic!("cancelled child replayed"));
+        let s = Scheduler::open(&path, r).unwrap();
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        assert_eq!(
+            s.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+    }
+
     #[test]
     fn signal_timer_children_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -489,7 +705,7 @@ mod tests {
         );
     }
     #[test]
-    fn interrupted_unsafe_is_not_replayed_and_safe_is_limited() {
+    fn interrupted_invocations_are_not_replayed_even_if_marked_safe() {
         let dir = tempfile::tempdir().unwrap();
         for safe in [false, true] {
             let path = dir.path().join(format!("{safe}.db"));
@@ -501,7 +717,7 @@ mod tests {
                 TaskOwner::Conversation(Uuid::from_u128(9)),
                 "x",
                 safe,
-                1,
+                3,
             ))
             .unwrap();
             assert!(matches!(s.tick(0), Err(Error::Handler(_))));
