@@ -10,3 +10,10 @@ only `off`. This change does not alter provider-specific request serialization.
 
 The regression uses configured models offline and exercises startup selection,
 cycling, non-reasoning metadata, and an explicit map.
+
+Configured reasoning metadata also drives the Messages request when a Models
+API is absent or restricted. Budgeted thinking is the default unless adaptive
+thinking is explicitly selected. For adaptive thinking, an unmapped `minimal`
+level uses Pi's `low` effort; an explicit `thinkingLevelMap` still wins.
+The loopback fixture checks budgeted and adaptive request bodies without a
+working Models API, including an explicit mapping.

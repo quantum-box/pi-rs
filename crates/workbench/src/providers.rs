@@ -764,10 +764,6 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
-                let gateway = matches!(
-                    args.provider.id(),
-                    "fireworks" | "openrouter" | "vercel-ai-gateway"
-                );
                 let mut client = client
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
@@ -778,16 +774,19 @@ impl Client {
                     client =
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
                     let adaptive = metadata.adaptive_thinking();
-                    if metadata.reasoning == Some(true) && (gateway || adaptive.is_some()) {
+                    if metadata.reasoning == Some(true) {
                         let selected = thinking.unwrap_or("off");
                         let mapped = metadata.mapped_effort(selected);
                         if selected == "off" && mapped == Some(None) {
                             client = client.with_thinking(None);
                         } else {
-                            let effort = mapped
-                                .flatten()
-                                .filter(|_| selected != "off")
-                                .unwrap_or(selected);
+                            let effort = mapped.flatten().filter(|_| selected != "off").unwrap_or(
+                                if adaptive == Some(true) && selected == "minimal" {
+                                    "low"
+                                } else {
+                                    selected
+                                },
+                            );
                             client = client.with_configured_thinking(
                                 effort,
                                 adaptive.unwrap_or(false),
