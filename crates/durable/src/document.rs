@@ -505,7 +505,7 @@ impl<'a> TaskDocuments<'a> {
         Ok(())
     }
     /// Stage an immutable application record with this task as its author.
-    /// Every task ancestor must exist and be active. The returned ID is
+    /// The root conversation and every task ancestor must exist and not be aborting. The returned ID is
     /// provisional until the step commits and can change on replay.
     pub fn append_entry(&mut self, kind: &str, data: Value) -> Result<uuid::Uuid, Error> {
         if kind.is_empty() || kind.starts_with("pi.") {
@@ -542,6 +542,19 @@ impl<'a> TaskDocuments<'a> {
                     }
                 }
             };
+            let key = format!("runtime/conversation/{conversation}").into_bytes();
+            let root = self
+                .store
+                .get(&key)?
+                .ok_or(Error::InvalidApplicationEntry)?;
+            let state: crate::runtime::Conversation = serde_json::from_slice(&root.value)?;
+            if state.id != conversation || state.abort_requested {
+                return Err(Error::InvalidApplicationEntry);
+            }
+            checks.push(Check {
+                key,
+                expected: Expected::Version(root.version),
+            });
             let record = self
                 .store
                 .get(&crate::application_entry::key(conversation))?;
@@ -693,12 +706,116 @@ mod nested_entry_tests {
         .unwrap()
     }
 
+    fn conversation(db: &Store, id: Uuid) {
+        let state = crate::runtime::Harness::empty_conversation(
+            id,
+            crate::runtime::Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 1,
+            },
+        );
+        let key = format!("runtime/conversation/{id}").into_bytes();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&state).unwrap(),
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn root_conversation_fences_both_abort_orderings() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::from_u128(99);
+        let root = task(1, TaskOwner::Conversation(id));
+        let author = task(2, TaskOwner::Task(root.id()));
+        TaskStore::new(&db)
+            .save(&[Save::Create(&root), Save::Create(&author)])
+            .unwrap();
+        assert!(matches!(
+            TaskDocuments::new(&db, &author)
+                .unwrap()
+                .append_entry("app.test", json!(1)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+        conversation(&db, id);
+        let mut docs = TaskDocuments::new(&db, &author).unwrap();
+        let addr = Address {
+            scope: "s".into(),
+            name: "race".into(),
+            key: "".into(),
+        };
+        docs.get(&addr).unwrap();
+        docs.put(&addr, json!({"value": 1}).as_object().unwrap().clone())
+            .unwrap();
+        docs.append_entry("app.test", json!(1)).unwrap();
+        let batch = docs.into_batch().unwrap();
+        let key = format!("runtime/conversation/{id}").into_bytes();
+        let record = db.get(&key).unwrap().unwrap();
+        let mut state: crate::runtime::Conversation =
+            serde_json::from_slice(&record.value).unwrap();
+        state.abort_requested = true;
+        let checks = [Check {
+            key: key.clone(),
+            expected: Expected::Version(record.version),
+        }];
+        let mutations = [Mutation::Put {
+            key,
+            value: serde_json::to_vec(&state).unwrap(),
+        }];
+        db.commit(&checks, &mutations).unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(Documents::new(&db).get(&addr).unwrap().is_none());
+        assert!(crate::application_entry::list(&db, id).unwrap().is_empty());
+        assert!(matches!(
+            TaskDocuments::new(&db, &author)
+                .unwrap()
+                .append_entry("app.test", json!(1)),
+            Err(Error::InvalidApplicationEntry)
+        ));
+
+        let other = Uuid::from_u128(100);
+        conversation(&db, other);
+        let direct = task(4, TaskOwner::Conversation(other));
+        let mut docs = TaskDocuments::new(&db, &direct).unwrap();
+        docs.append_entry("app.test", json!(2)).unwrap();
+        let batch = docs.into_batch().unwrap();
+        let key = format!("runtime/conversation/{other}").into_bytes();
+        let record = db.get(&key).unwrap().unwrap();
+        let mut state: crate::runtime::Conversation =
+            serde_json::from_slice(&record.value).unwrap();
+        state.abort_requested = true;
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        db.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(record.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&state).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(crate::application_entry::list(&db, other).unwrap().len(), 1);
+    }
+
     #[test]
     fn ancestry_checks_fence_atomic_commit_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let db = Store::open(&path).unwrap();
         let ts = TaskStore::new(&db);
+        conversation(&db, Uuid::from_u128(99));
         let root = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
         let middle = task(2, TaskOwner::Task(root.id()));
         let author = task(3, TaskOwner::Task(middle.id()));
@@ -791,6 +908,7 @@ mod nested_entry_tests {
         let path = dir.path().join("db");
         {
             let db = Store::open(&path).unwrap();
+            conversation(&db, Uuid::from_u128(99));
             let root = task(1, TaskOwner::Conversation(Uuid::from_u128(99)));
             let middle = task(2, TaskOwner::Task(root.id()));
             let author = task(3, TaskOwner::Task(middle.id()));
@@ -839,6 +957,7 @@ mod nested_entry_tests {
         let root_id = Uuid::from_u128(99);
         {
             let db = Store::open(&path).unwrap();
+            conversation(&db, root_id);
             let root = task(1, TaskOwner::Conversation(root_id));
             let middle = task(2, TaskOwner::Task(root.id()));
             let author = task(3, TaskOwner::Task(middle.id()));

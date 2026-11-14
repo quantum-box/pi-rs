@@ -105,7 +105,26 @@ fn registry(path: Option<PathBuf>) -> Registry {
     r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
     r
 }
+fn initialize_conversation(path: &std::path::Path) {
+    use durable_store::{Check, Mutation};
+    let db = Store::open(path).unwrap();
+    let id = Uuid::from_u128(2);
+    let key = format!("runtime/conversation/{id}").into_bytes();
+    let value = json!({"id": id, "config": {"model": "test", "system_prompt": "", "max_output_tokens": 1}, "messages": [], "submissions": [], "active": null, "phase": "Idle"});
+    db.commit(
+        &[Check {
+            key: key.clone(),
+            expected: Expected::Missing,
+        }],
+        &[Mutation::Put {
+            key,
+            value: serde_json::to_vec(&value).unwrap(),
+        }],
+    )
+    .unwrap();
+}
 fn initialize(path: &std::path::Path) {
+    initialize_conversation(path);
     let db = Store::open(path).unwrap();
     let mut tx = Transaction::new();
     tx.put(
@@ -734,6 +753,7 @@ fn append_across_steps_with_nested_authors_and_reject_reserved_kinds() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
+    initialize_conversation(&path);
     let mut registry = Registry::default();
     registry.register("parent", true, Append);
     registry.register("child", true, Append);
