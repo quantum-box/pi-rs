@@ -1061,7 +1061,7 @@ async fn lifecycle_hooks_run_in_order() {
     );
 }
 #[tokio::test]
-async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
+async fn invalid_lifecycle_tasks_are_reported_and_skipped() {
     use pi_rs_durable::extension::GenerationEvent;
     for event in [
         GenerationEvent::AfterTools,
@@ -1072,37 +1072,31 @@ async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
         let path = dir.path().join("db");
         let model = Arc::new(FakeModel::default());
         let tool = Arc::new(FakeTool::default());
-        let id;
+        let reports;
         {
             let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
             lifecycle(&mut h, Some(event), None, Arc::default());
-            id = h.create_conversation(config()).unwrap();
+            let id = h.create_conversation(config()).unwrap();
             h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
-            let driver = h.start_tasks(Default::default()).unwrap();
-            let err = h
-                .submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
                 .await
-                .unwrap_err();
+                .unwrap();
+            assert!(matches!(
+                h.conversation(id).unwrap().submissions[0].status,
+                Status::Done { .. }
+            ));
+            reports = h.extension_reports().unwrap();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].phase, format!("{event:?}"));
             assert!(
-                err.to_string().contains("unselected task registration"),
-                "{err}"
+                reports[0].reports[0]
+                    .error
+                    .contains("unselected task registration")
             );
-            driver.shutdown().unwrap();
         }
-        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
-        let c = h.conversation(id).unwrap();
-        assert!(serde_json::to_value(&c).unwrap()["phase"][format!("{event:?}")].is_object());
-        if event == GenerationEvent::AfterRun {
-            assert!(matches!(c.submissions[0].status, Status::Done { .. }));
-        }
-        lifecycle(&mut h, None, None, Arc::default());
-        h.resume_conversation(id, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(matches!(
-            h.conversation(id).unwrap().submissions[0].status,
-            Status::Done { .. }
-        ));
+        let mut h = Harness::open_paused(&path, options(model, tool.clone())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        assert_eq!(h.extension_reports().unwrap(), reports);
         assert_eq!(tool.0.lock().unwrap().len(), 1);
     }
 }
@@ -1988,6 +1982,159 @@ async fn yield_children_choose_first_valid_result_or_queued_input() {
                 .any(|m| matches!(m, Message::User { content } if content == "later review"))
         );
         assert!(matches!(c.submissions[0].status, Status::Done { .. }));
+        driver.shutdown().unwrap();
+    }
+}
+
+struct FailingSection;
+#[async_trait]
+impl Section for FailingSection {
+    fn key(&self) -> &str {
+        "broken"
+    }
+    async fn render(&self, _: &Context<'_>) -> Result<Option<String>, String> {
+        Err("section failed".into())
+    }
+}
+struct ReportingHook;
+#[async_trait]
+impl Hook for ReportingHook {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        Err(format!("{event:?} failed"))
+    }
+    async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+        Err("guard failed".into())
+    }
+    async fn after_tool(
+        &self,
+        _: &HookCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        Err("after failed".into())
+    }
+}
+#[tokio::test]
+async fn extension_failures_are_observable_and_guard_still_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let reports;
+    {
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        h.install_extension(Extension {
+            name: "broken".into(),
+            sections: vec![Arc::new(FailingSection)],
+            hooks: vec![Arc::new(ReportingHook)],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["broken".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        assert!(tool.0.lock().unwrap().is_empty());
+        reports = h.extension_reports().unwrap();
+        for phase in [
+            "section",
+            "before_request",
+            "after_response",
+            "before_tool",
+            "after_tool",
+            "AfterTools",
+            "OnYield",
+            "AfterRun",
+        ] {
+            assert!(
+                reports
+                    .iter()
+                    .any(|batch| batch.phase == phase && batch.reports[0].extension == "broken"),
+                "missing {phase}: {reports:?}"
+            );
+        }
+    }
+    let h = Harness::open_paused(&path, options(model, tool)).unwrap();
+    assert_eq!(h.extension_reports().unwrap(), reports);
+}
+
+#[tokio::test]
+async fn failed_hook_children_are_reported_and_run_continues() {
+    use pi_rs_durable::{
+        extension::GenerationEvent,
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+    };
+    for event in [
+        GenerationEvent::OnYield,
+        GenerationEvent::AfterTools,
+        GenerationEvent::AfterRun,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(
+            dir.path().join("db"),
+            options(
+                Arc::new(FakeModel::default()),
+                Arc::new(FakeTool::default()),
+            ),
+        )
+        .unwrap();
+        let handler: Arc<dyn Handler> =
+            Arc::new(|_: &Task| -> Result<Step, String> { Ok(Step::Fail("task broke".into())) });
+        h.install_extension(Extension {
+            name: "lifecycle".into(),
+            hooks: vec![Arc::new(LifecycleHook {
+                events: Arc::default(),
+                task_event: Some(event),
+                park_event: None,
+                entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            })],
+            tasks: vec![("job".into(), handler.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut registry = Registry::default();
+        assert!(registry.register_shared("job", true, handler));
+        let driver = h.start_tasks(registry).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            if h.extension_reports()
+                .unwrap()
+                .iter()
+                .any(|r| r.phase == "task_failed")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let reports = h.extension_reports().unwrap();
+        let report = reports
+            .iter()
+            .find(|r| r.phase == "task_failed")
+            .expect("task failure");
+        assert_eq!(report.reports[0].extension, "lifecycle");
+        assert!(report.reports[0].error.contains("task broke"));
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
         driver.shutdown().unwrap();
     }
 }

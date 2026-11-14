@@ -311,16 +311,16 @@ fn validate(ext: &Extension) -> Result<(), RegistryError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub extension: String,
-    pub operation: &'static str,
+    pub operation: String,
     pub error: String,
 }
 fn failure(extension: &str, operation: &'static str, error: String) -> Report {
     Report {
         extension: extension.into(),
-        operation,
+        operation: operation.into(),
         error,
     }
 }
@@ -381,6 +381,12 @@ impl Resolved {
             .flat_map(|e| e.tasks.iter())
             .find(|(n, _)| n == name)
             .map(|(_, h)| h.clone())
+    }
+    pub(crate) fn task_owner(&self, name: &str) -> Option<&str> {
+        self.extensions
+            .iter()
+            .find(|e| e.tasks.iter().any(|(kind, _)| kind == name))
+            .map(|e| e.name.as_str())
     }
     /// Later sections replace by key without moving the key's original position.
     pub async fn prompt(
@@ -530,20 +536,18 @@ impl Resolved {
                                 | GenerationEvent::AfterRun
                         ) =>
                     {
-                        if validate_owner
-                            && t.iter()
-                                .any(|task| !e.tasks.iter().any(|(name, _)| name == &task.name))
-                        {
-                            reports.push(failure(
-                                &e.name,
-                                "generation",
-                                "unselected task registration or task owned by another extension"
-                                    .into(),
-                            ));
-                            continue;
+                        if validate_owner {
+                            t.retain(|task| {
+                                let valid = e.tasks.iter().any(|(name, _)| name == &task.name);
+                                if !valid {
+                                    reports.push(failure(&e.name, "generation", format!("unselected task registration or task owned by another extension: {}", task.name)));
+                                }
+                                valid
+                            });
                         }
+                        let has_tasks = !t.is_empty();
                         tasks.append(&mut t);
-                        if event == GenerationEvent::OnYield {
+                        if event == GenerationEvent::OnYield && has_tasks {
                             return (value, None, tasks, reports);
                         }
                     }

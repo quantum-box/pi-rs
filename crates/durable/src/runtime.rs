@@ -382,6 +382,15 @@ pub struct ViewPage {
     pub older: Option<ViewCursor>,
 }
 
+/// A durable, host-readable batch of extension errors for one execution phase.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionReportBatch {
+    pub conversation_id: Uuid,
+    pub operation_id: Uuid,
+    pub phase: String,
+    pub reports: Vec<crate::extension::Report>,
+}
+
 pub struct Harness {
     owner: Arc<OwnedStore>,
     options: Options,
@@ -410,6 +419,52 @@ impl Drop for ResumeGuard {
     }
 }
 impl Harness {
+    /// Read committed extension error batches. Batches remain available after reopening.
+    pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
+        self.owner
+            .store()
+            .list(b"runtime/extension-report/")?
+            .into_iter()
+            .map(|(_, entry)| serde_json::from_slice(&entry.value).map_err(Error::from))
+            .collect()
+    }
+
+    fn record_extension_reports(
+        &self,
+        conversation_id: Uuid,
+        operation_id: Uuid,
+        phase: &str,
+        reports: Vec<crate::extension::Report>,
+    ) -> Result<(), Error> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        let key = format!("runtime/extension-report/{conversation_id}/{operation_id}/{phase}")
+            .into_bytes();
+        let batch = ExtensionReportBatch {
+            conversation_id,
+            operation_id,
+            phase: phase.into(),
+            reports,
+        };
+        match self.owner.store().commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&batch)?,
+            }],
+        ) {
+            Ok(()) | Err(durable_store::Error::Conflict { .. }) => Ok(()),
+            Err(e) => {
+                self.storage_failed.store(true, Ordering::Release);
+                Err(e.into())
+            }
+        }
+    }
+
     /// Opens under exclusive scheduler ownership and resumes all unfinished work.
     /// A cancelled or failed open drops the owner; the next open can recover it.
     pub async fn open(
@@ -2122,11 +2177,7 @@ impl Harness {
         .await
         .ok_or(Error::Interrupted)?;
         self.subagent_store()?;
-        if !reports.is_empty() {
-            return Err(Error::Invalid(format!(
-                "{event:?} hook failed: {reports:?}"
-            )));
-        }
+        self.record_extension_reports(c.id, operation_id, &format!("{event:?}"), reports)?;
         if tasks.is_empty() {
             return Ok(Some((continuation, vec![])));
         }
@@ -2216,7 +2267,7 @@ impl Harness {
                         memo: &memo,
                     };
                     let input = preparation.hook_input(reason);
-                    let (decision, _reports) = fenced_poll(
+                    let (decision, reports) = fenced_poll(
                         selected.before_compact(&input, &context),
                         self.execution_gate.as_ref(),
                         cancel,
@@ -2224,6 +2275,7 @@ impl Harness {
                     .await
                     .ok_or(Error::Interrupted)?;
                     self.subagent_store()?;
+                    self.record_extension_reports(c.id, operation_id, "before_compact", reports)?;
                     match decision {
                         crate::extension::BeforeCompact::Pass => {
                             c.phase = Phase::CompactionReady {
@@ -2450,11 +2502,7 @@ impl Harness {
                         // A callback may swallow a memo error. Never dispatch after
                         // an indeterminate store failure, even in that case.
                         self.subagent_store()?;
-                        if !reports.is_empty() {
-                            return Err(Error::Invalid(format!(
-                                "extension prompt failed: {reports:?}"
-                            )));
-                        }
+                        self.record_extension_reports(c.id, request_id, "section", reports)?;
                         if !sections.is_empty() {
                             if !system_prompt.is_empty() {
                                 system_prompt.push_str("\n\n");
@@ -2499,11 +2547,7 @@ impl Harness {
                             self.failed = true;
                             return Err(Error::Interrupted);
                         }
-                        if !reports.is_empty() {
-                            return Err(Error::Invalid(format!(
-                                "before-request hook failed: {reports:?}"
-                            )));
-                        }
+                        self.record_extension_reports(c.id, request_id, "before_request", reports)?;
                         request.messages =
                             serde_json::from_value(value.get("messages").cloned().ok_or_else(
                                 || Error::Invalid("before-request hook omitted messages".into()),
@@ -2680,7 +2724,7 @@ impl Harness {
                             snapshot: &snapshot,
                             memo: &memo,
                         };
-                        let (_, _, _, _reports) = fenced_poll(
+                        let (_, _, _, reports) = fenced_poll(
                             selected.generation(
                                 crate::extension::GenerationEvent::AfterResponse,
                                 serde_json::to_value(&*response)?,
@@ -2696,6 +2740,7 @@ impl Harness {
                             self.failed = true;
                             return Err(Error::Interrupted);
                         }
+                        self.record_extension_reports(c.id, request_id, "after_response", reports)?;
                     }
                     let usage = response.usage.map_or(UsageReport::Unconfirmed, |usage| {
                         UsageReport::Measured { usage }
@@ -2847,6 +2892,21 @@ impl Harness {
                         if !task.is_terminal() {
                             return Ok(());
                         }
+                        if let crate::task::TaskState::Failed(reason) = task.state() {
+                            let kind = task.kind().unwrap_or("unknown");
+                            let selected = self.selected_extensions(&c)?;
+                            let owner = selected.task_owner(kind).unwrap_or("unknown");
+                            self.record_extension_reports(
+                                c.id,
+                                id,
+                                "task_failed",
+                                vec![crate::extension::Report {
+                                    extension: owner.into(),
+                                    operation: "task_failed".into(),
+                                    error: reason.clone(),
+                                }],
+                            )?;
+                        }
                         if continuation.is_none()
                             && let crate::task::TaskState::Succeeded(value) = task.state()
                             && let Some(text) = value.get("continue").and_then(|v| v.as_str())
@@ -2989,6 +3049,21 @@ impl Harness {
                         }
                         if !task.is_terminal() {
                             return Ok(());
+                        }
+                        if let crate::task::TaskState::Failed(reason) = task.state() {
+                            let kind = task.kind().unwrap_or("unknown");
+                            let selected = self.selected_extensions(&c)?;
+                            let owner = selected.task_owner(kind).unwrap_or("unknown");
+                            self.record_extension_reports(
+                                c.id,
+                                id,
+                                "task_failed",
+                                vec![crate::extension::Report {
+                                    extension: owner.into(),
+                                    operation: "task_failed".into(),
+                                    error: reason.clone(),
+                                }],
+                            )?;
                         }
                         if turns.is_some()
                             && matches!(task.state(), crate::task::TaskState::Succeeded(value)
@@ -3248,6 +3323,12 @@ impl Harness {
                         }
                         return Ok(());
                     }
+                    self.record_extension_reports(
+                        c.id,
+                        operation_id,
+                        "before_tool",
+                        reports.clone(),
+                    )?;
                     let rejection = match decision {
                         crate::extension::BeforeTool::Pass => None,
                         crate::extension::BeforeTool::Block(reason) => {
@@ -3452,7 +3533,7 @@ impl Harness {
                         name: call.name.clone(),
                         arguments,
                     };
-                    let (result, _reports) = fenced_poll(
+                    let (result, reports) = fenced_poll(
                         selected.after_tool(
                             &hook_call,
                             serde_json::Value::String(content.clone()),
@@ -3468,6 +3549,7 @@ impl Harness {
                         self.failed = true;
                         return Err(Error::Interrupted);
                     }
+                    self.record_extension_reports(c.id, operation_id, "after_tool", reports)?;
                     let content = result.as_str().unwrap_or(&content).to_owned();
                     append_tool(&mut c, &calls, index, content)?;
                     c.phase = Phase::Tools {
@@ -3725,6 +3807,10 @@ impl Scheduler {
         }
         scheduler.start_reporter();
         Ok(scheduler)
+    }
+    /// Read the same durable extension error log exposed by the harness.
+    pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
+        self.harness.extension_reports()
     }
     pub fn install_extension(&self, extension: crate::extension::Extension) -> Result<(), Error> {
         self.harness.install_extension(extension)
@@ -4463,6 +4549,37 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+    #[test]
+    fn extension_report_replay_keeps_first_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let path = dir.path().join("db");
+        let conversation = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let report = |error: &str| {
+            vec![crate::extension::Report {
+                extension: "x".into(),
+                operation: "generation".into(),
+                error: error.into(),
+            }]
+        };
+        {
+            let h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            h.record_extension_reports(conversation, operation, "AfterRun", report("first"))
+                .unwrap();
+        }
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        h.record_extension_reports(conversation, operation, "AfterRun", report("second"))
+            .unwrap();
+        let reports = h.extension_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reports[0].error, "first");
     }
     #[test]
     fn legacy_conversation_defaults_and_independent_boundary_selection() {

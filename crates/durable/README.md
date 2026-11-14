@@ -86,8 +86,7 @@ callbacks can run more than once and must memoize or make external effects
 idempotent. Extension tools are conservatively unsafe to replay, and recovery
 with selected extensions also avoids replaying potentially overridden host tools.
 The runtime supports before-request message replacement and observes completed
-responses; hook errors and non-string after-tool replacements have limited
-reporting. After-tools receives the completed round's calls; after-run receives
+responses. Non-string after-tool replacements are ignored without reporting. After-tools receives the completed round's calls; after-run receives
 `{"answer": ...}` after the answer and submission settlement are committed.
 Both run in persistent phases with a stable operation memo and may execute again
 after a crash. Nonempty requests are committed as conversation-owned tasks in
@@ -97,7 +96,7 @@ a task driver and register the exact selected extension handler with
 `Registry::register_shared` and its replay policy; a missing driver leaves the
 hook phase pending, and a mismatched registration fails closed. Reopen with the
 extensions and driver registered to resume. Harness users explicitly resume;
-Scheduler polls waiting phases. Hook errors fail closed. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful nonempty string continuation in creation order; queued input or reset takes precedence. Failed or invalid child outcomes are ignored without reporting. Invalid task requests stop the phase. Provider-body hooks and tool-result terminate controls remain unsupported. Before-tool hooks may sleep on
+Scheduler polls waiting phases. Ordinary hook and section errors are reported and skipped; before-tool errors block dispatch. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful nonempty string continuation in creation order; queued input or reset takes precedence. Failed hook children are reported when observed; invalid child outcomes are ignored without reporting. Unregistered or foreign task requests are reported and skipped. Provider-body hooks and tool-result terminate controls remain unsupported. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
@@ -252,3 +251,18 @@ operation history, observation, fork/rewind, deferred persistence, or automatic
 lifecycle/ownership validation for arbitrary host batches. Existing conversation
 admission commits internally and cannot be composed with this API; task batches
 are low-level records and do not by themselves reserve executors or schedule work.
+
+### Extension error observation
+
+`Harness::extension_reports()` and `Scheduler::extension_reports()` return persisted
+batches with conversation and operation IDs, phase, extension, operation and error.
+The first batch for an operation and phase wins across retries and reopening. This
+is a polling log, not upstream's `onReport` callback: it has no cursor, deletion,
+retention policy, or notification and grows without bound. Hook task failures are
+reported when their parent observes them; general task failures and handler `Err` (which poisons the task driver), storage, host and
+listener errors are not covered. Invalid child decisions, malformed hook values,
+wrapped tools, and some tool execution errors are not yet reported here. A batch is
+committed separately from the phase decision; a crash can rerun hooks and their
+external effects, which require memoization or destination-level idempotency. The
+first recorded batch may differ from a later retry's errors; callback delivery and
+exactly-once external effects are not guaranteed.
