@@ -7283,6 +7283,19 @@ impl EditorResumeWatchdog {
             }
             return Err(error);
         }
+        for descriptor in [ready_pipe[0], ready_pipe[1], alive_pipe[0], alive_pipe[1]] {
+            if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(ready_pipe[0]);
+                    libc::close(ready_pipe[1]);
+                    libc::close(alive_pipe[0]);
+                    libc::close(alive_pipe[1]);
+                }
+                return Err(error);
+            }
+        }
+        let parent = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             let error = std::io::Error::last_os_error();
@@ -7324,7 +7337,7 @@ impl EditorResumeWatchdog {
                         }
                         let mut byte = 0u8;
                         let status = libc::read(alive_pipe[0], (&mut byte as *mut u8).cast(), 1);
-                        if status == 0 {
+                        if status == 0 || libc::getppid() != parent {
                             break;
                         }
                         if libc::tcgetpgrp(fd) == group {
@@ -8003,6 +8016,12 @@ mod tests {
             );
             assert!(libc::WIFSTOPPED(status));
             println!("SUPERVISOR_SAW_STOP");
+            if test_name.contains("supervisor_retains_terminal") {
+                let shell_group = unsafe { libc::getpgrp() };
+                super::set_foreground(0, shell_group).unwrap();
+                std::thread::sleep(Duration::from_millis(1500));
+                assert_eq!(unsafe { libc::tcgetpgrp(0) }, shell_group);
+            }
             if test_name.contains("editor_exits_while_suspended") {
                 let pid_file = std::path::PathBuf::from(&program).with_extension("pid");
                 let pid: libc::pid_t = std::fs::read_to_string(pid_file)
@@ -8305,6 +8324,16 @@ mod tests {
     fn editor_suspend_without_supervisor_resumes_without_sigcont() {
         editor_pty_regression(
             "interactive::tests::editor_suspend_without_supervisor_resumes_without_sigcont",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_supervisor_retains_terminal_until_foreground_resume() {
+        editor_pty_regression(
+            "interactive::tests::editor_supervisor_retains_terminal_until_foreground_resume",
             true,
             false,
         );
