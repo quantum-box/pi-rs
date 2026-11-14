@@ -452,17 +452,19 @@ impl NestedHost {
             ),
         )
         .await;
-        let outcome = if reply.state.is_some() {
+        let has_state = reply.state.is_some();
+        let outcome = if has_state {
             Outcome::Unknown("nested extension state requires reconciliation".into())
         } else {
             reply.outcome
         };
         // An uncertain descendant poisons the ancestor even if a tool ignored it.
-        let outcome = if self.shared.failed.load(Ordering::Acquire) {
-            Outcome::Unknown("nested descendant requires reconciliation".into())
-        } else {
-            outcome
-        };
+        if self.shared.failed.load(Ordering::Acquire) && !has_state {
+            // Leave the intent unresolved: a replay-safe intermediate caller
+            // must be able to revisit its descendants and reattach to a
+            // retained pending reference. Unsafe callers remain non-replayable.
+            return self.fail("nested descendant requires reconciliation");
+        }
         let mut completed = record;
         completed.outcome = Some(outcome.clone());
         let value = match serde_json::to_vec(&completed) {
@@ -998,6 +1000,88 @@ mod tests {
         ) -> Outcome {
             let _ = host.call("fake", json!({})).await;
             Outcome::Succeeded("ignored child".into())
+        }
+    }
+    struct PollingParent(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Tool for PollingParent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "parent".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let _ = host.call("polling", json!({})).await;
+            Outcome::Succeeded("ignored child".into())
+        }
+    }
+    #[tokio::test]
+    async fn uncertain_poll_through_intermediate_respects_replay_policy() {
+        for policy in [ReplayPolicy::Safe, ReplayPolicy::Unsafe] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let root = Uuid::new_v4();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let child = Arc::new(Polling {
+                invoked: AtomicUsize::new(0),
+                mode: AtomicUsize::new(4),
+                ids: Mutex::new(vec![]),
+            });
+            let make = || {
+                NestedHost::new(
+                    Arc::new(OwnedStore::open(&path).unwrap()),
+                    root,
+                    vec![
+                        RegisteredTool {
+                            tool: Arc::new(PollingParent(calls.clone())),
+                            replay: policy,
+                        },
+                        RegisteredTool {
+                            tool: child.clone(),
+                            replay: ReplayPolicy::Unsafe,
+                        },
+                    ],
+                    CancellationToken::new(),
+                    Duration::from_secs(1),
+                    3,
+                )
+                .unwrap()
+            };
+            let h = make();
+            assert!(matches!(
+                h.call("parent", json!({})).await,
+                Outcome::Unknown(_)
+            ));
+            assert!(h.seal_and_inspect().is_err());
+            drop(h);
+            child.mode.store(2, Ordering::SeqCst);
+            let h = make();
+            let result = h.call("parent", json!({})).await;
+            if policy == ReplayPolicy::Safe {
+                assert_eq!(result, Outcome::Succeeded("ignored child".into()));
+                h.seal_and_inspect().unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                let ids = child.ids.lock().unwrap();
+                assert_eq!(ids.len(), 3);
+                assert!(ids.iter().all(|id| *id == ids[0]));
+            } else {
+                assert!(matches!(result, Outcome::Unknown(_)));
+                assert!(h.seal_and_inspect().is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
         }
     }
     #[tokio::test]
