@@ -8250,7 +8250,8 @@ mod scheduler_tests {
         let stop = CancellationToken::new();
         let mut cleanup = harness.worker();
         let cleanup_stop = stop.clone();
-        let task = tokio::spawn(async move { cleanup.drive_owned_cleanup(id, &cleanup_stop).await });
+        let task =
+            tokio::spawn(async move { cleanup.drive_owned_cleanup(id, &cleanup_stop).await });
         tokio::time::timeout(Duration::from_secs(2), polls.acquire())
             .await
             .unwrap()

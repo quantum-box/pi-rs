@@ -141,7 +141,11 @@ mod tests {
         let attached_failures = attached.conversation_controls().worker_errors();
         failures.lock().unwrap().insert(id, "failed".into());
         assert_eq!(
-            attached_failures.lock().unwrap().get(&id).map(String::as_str),
+            attached_failures
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(String::as_str),
             Some("failed")
         );
         assert!(Arc::ptr_eq(&first.worker, &second.worker));
