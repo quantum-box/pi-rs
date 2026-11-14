@@ -991,9 +991,16 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
 // Byte lengths remain unchanged, allowing all parser offsets to index `text`.
 fn protect_bare_links(text: &str, options: Options) -> String {
     let mut plain_ranges = Vec::new();
+    let mut segments = Vec::new();
+    let mut after_table = 0;
     let mut protected = 0usize;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
+            Event::Start(Tag::Table(_)) => {
+                segments.push(after_table..range.start);
+                after_table = range.end;
+            }
+            Event::Start(Tag::TableCell) => segments.push(range),
             Event::Start(Tag::Link { .. } | Tag::Image { .. } | Tag::CodeBlock(_)) => {
                 protected += 1
             }
@@ -1008,30 +1015,35 @@ fn protect_bare_links(text: &str, options: Options) -> String {
             _ => {}
         }
     }
+    segments.push(after_table..text.len());
     let mut bytes = text.as_bytes().to_vec();
     let mut eligible = 0;
-    for (range, _) in bare_links(text) {
-        while eligible < plain_ranges.len() && plain_ranges[eligible].end <= range.start {
-            eligible += 1;
-        }
-        if eligible == plain_ranges.len() || !plain_ranges[eligible].contains(&range.start) {
-            continue;
-        }
-        // Escaped constructs keep their source rendering and do not gain a link.
-        let preceding = text.as_bytes()[..range.start]
-            .iter()
-            .rev()
-            .take_while(|b| **b == b'\\')
-            .count();
-        if preceding % 2 != 0 {
-            continue;
-        }
-        for byte in &mut bytes[range] {
-            if matches!(
-                *byte,
-                b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'\\' | b'&'
-            ) {
-                *byte = b'x';
+    for segment in segments {
+        for (mut range, _) in bare_links(&text[segment.clone()]) {
+            range.start += segment.start;
+            range.end += segment.start;
+            while eligible < plain_ranges.len() && plain_ranges[eligible].end <= range.start {
+                eligible += 1;
+            }
+            if eligible == plain_ranges.len() || !plain_ranges[eligible].contains(&range.start) {
+                continue;
+            }
+            // Escaped constructs keep their source rendering and do not gain a link.
+            let preceding = text.as_bytes()[..range.start]
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\\')
+                .count();
+            if preceding % 2 != 0 {
+                continue;
+            }
+            for byte in &mut bytes[range] {
+                if matches!(
+                    *byte,
+                    b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'\\' | b'&'
+                ) {
+                    *byte = b'x';
+                }
             }
         }
     }
@@ -2238,6 +2250,45 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn bare_links_do_not_change_adjacent_table_cells() {
+        let source = "| A | B | C |\n|---|---|---|\n|https://example.com|**important**|[docs](https://other.example)|\n|https://one.example|https://two.example|end|";
+        let lines = markdown_at_depth(
+            source,
+            &Theme::system(),
+            120,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://example.com"))
+        );
+        assert!(
+            spans.iter().any(|s| s.bold && s.text.contains("important")),
+            "{spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://other.example"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://one.example"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("https://two.example"))
+        );
     }
 
     #[test]
