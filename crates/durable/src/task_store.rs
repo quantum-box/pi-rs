@@ -1120,7 +1120,7 @@ impl<'a> TaskStore<'a> {
                 } {
                     return Ok(WakeResult::Pending);
                 }
-                ended_children = Some(ended);
+                ended_children = Some((ids.clone(), ended));
             }
         }
         if !commit {
@@ -1132,8 +1132,8 @@ impl<'a> TaskStore<'a> {
             None => next.wake(),
         }
         .map_err(Error::Transition)?;
-        if let Some(ended) = ended_children {
-            next.set_ended_children(ended);
+        if let Some((on, ended)) = ended_children {
+            next.set_child_wake(on, ended);
         }
         if let WaitFor::TypedSleep { signals, .. } = condition {
             let wake = match &delivered {
@@ -1156,7 +1156,42 @@ impl<'a> TaskStore<'a> {
     /// Commit Ready -> Running using the snapshot version. Only the winner of
     /// this CAS may execute. Reload before any subsequent update.
     pub fn reserve(&self, snapshot: &StoredTask) -> Result<(), Error> {
-        self.transition(snapshot, Task::start)
+        let mut next = snapshot.clone();
+        let checks = self.refresh_child_wake(&mut next.task)?;
+        next.task.start().map_err(Error::Transition)?;
+        let mut batch = self.prepare_save(&[Save::Update(&next)])?;
+        batch.checks.extend(checks);
+        self.store.commit(&batch.checks, &batch.mutations)?;
+        Ok(())
+    }
+
+    /// Refresh child wake information immediately before reservation; the
+    /// returned checks must commit with the task's Running transition.
+    pub(crate) fn refresh_child_wake(&self, task: &mut Task) -> Result<Vec<Check>, Error> {
+        let Some(ids) = task.wake_children().map(<[Uuid]>::to_vec) else {
+            return Ok(Vec::new());
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut checks = Vec::with_capacity(ids.len());
+        let mut ended = Vec::new();
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(Error::InvalidChild);
+            }
+            let child = self.load(id)?.ok_or(Error::InvalidChild)?;
+            if child.task.owner() != &TaskOwner::Task(task.id()) {
+                return Err(Error::InvalidChild);
+            }
+            if child.task.is_terminal() {
+                ended.push(id);
+            }
+            checks.push(Check {
+                key: key(id),
+                expected: Expected::Version(child.version),
+            });
+        }
+        task.refresh_ended_children(ended);
+        Ok(checks)
     }
 
     /// Commit Running -> Ready after the host has fenced the former executor.
@@ -1822,6 +1857,47 @@ mod tests {
             ts.send_signal(&signal),
             Err(Error::SignalTargetClosed)
         ));
+    }
+
+    #[test]
+    fn child_completion_racing_reservation_conflicts_and_retry_refreshes_wake() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let mut parent = task(1, 3);
+        let mut first = owned(2, 1);
+        let second = owned(3, 1);
+        first.start().unwrap();
+        first.succeed(json!(1)).unwrap();
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksAny(vec![first.id(), second.id()]))
+            .unwrap();
+        ts.save(&[
+            Save::Create(&parent),
+            Save::Create(&first),
+            Save::Create(&second),
+        ])
+        .unwrap();
+        let waiting = ts.load(parent.id()).unwrap().unwrap();
+        ts.poll_wait(&waiting, 0).unwrap();
+        let ready = ts.load(parent.id()).unwrap().unwrap();
+        let mut next = ready.clone();
+        let checks = ts.refresh_child_wake(&mut next.task).unwrap();
+        next.task.start().unwrap();
+        let mut batch = ts.prepare_save(&[Save::Update(&next)]).unwrap();
+        batch.checks.extend(checks);
+        let child = ts.load(second.id()).unwrap().unwrap();
+        ts.update(&child, |t| t.cancel()).unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert_eq!(ts.load(parent.id()).unwrap().unwrap(), ready);
+        ts.reserve(&ready).unwrap();
+        assert_eq!(
+            ts.load(parent.id()).unwrap().unwrap().task.ended_children(),
+            Some(&[first.id(), second.id()][..])
+        );
     }
 
     #[test]

@@ -465,11 +465,22 @@ impl Scheduler {
                 }
             }
         }
+        let child_checks = self.ts().refresh_child_wake(&mut next.task)?;
         next.task
             .start_attempt(Uuid::new_v4())
             .map_err(Error::Transition)?;
         self.poisoned = true;
-        self.ts().save(&[Save::Update(&next)])?;
+        let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+        batch.checks.extend(child_checks);
+        match self.ts().store().commit(&batch.checks, &batch.mutations) {
+            Ok(()) => (),
+            Err(durable_store::Error::Conflict { .. }) => {
+                // No reservation or effects committed; rescan on a CAS miss.
+                self.poisoned = false;
+                return Ok(false);
+            }
+            Err(error) => return Err(task_store::Error::from(error).into()),
+        }
         Ok(true)
     }
     fn reconcile(&mut self) -> Result<(), Error> {
@@ -1854,6 +1865,7 @@ mod tests {
         let parent = Uuid::from_u128(1);
         let a = Uuid::from_u128(2);
         let b = Uuid::from_u128(3);
+        let c = Uuid::from_u128(4);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = observed.clone();
         let mut registry = Registry::default();
@@ -1861,10 +1873,11 @@ mod tests {
             if parent_task.checkpoint().phase == "start" {
                 Ok(Step::Wait {
                     checkpoint: cp("waiting"),
-                    condition: WaitFor::TasksAny(vec![a, b]),
+                    condition: WaitFor::TasksAny(vec![a, b, c]),
                     children: vec![
                         task(2, TaskOwner::Task(parent), "child", true, 3),
                         task(3, TaskOwner::Task(parent), "child", true, 3),
+                        task(4, TaskOwner::Task(parent), "child", true, 3),
                     ],
                 })
             } else {
@@ -1909,19 +1922,22 @@ mod tests {
         ));
         let ready = scheduler.ts().load(parent).unwrap().unwrap();
         assert_eq!(ready.task.ended_children(), Some(&[a][..]));
-        // The private payload is the wake-commit snapshot; a child ending
-        // later is not added to it at reservation (unlike upstream wake.ended).
+        // A child ending after wake but before reservation must be included.
         let second = scheduler.ts().load(b).unwrap().unwrap();
         scheduler.ts().update(&second, |t| t.cancel()).unwrap();
         scheduler.ts().reserve(&ready).unwrap(); // process dies after reservation
+        // The first reservation freezes the wake; later child completion must
+        // not change what a replayed invocation sees.
+        let third = scheduler.ts().load(c).unwrap().unwrap();
+        scheduler.ts().update(&third, |t| t.cancel()).unwrap();
         drop(scheduler);
         let mut scheduler = Scheduler::open(&path, registry).unwrap();
         assert_eq!(
             scheduler.get(parent).unwrap().unwrap().ended_children(),
-            Some(&[a][..])
+            Some(&[a, b][..])
         );
         scheduler.tick(0).unwrap();
-        assert_eq!(*observed.lock().unwrap(), vec![Some(vec![a])]);
+        assert_eq!(*observed.lock().unwrap(), vec![Some(vec![a, b])]);
         assert_eq!(
             scheduler.get(parent).unwrap().unwrap().ended_children(),
             None
