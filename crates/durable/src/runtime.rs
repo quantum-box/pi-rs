@@ -440,7 +440,7 @@ enum ModelFailureDecision {
     Stop,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum TranscriptChange {
     Append(Vec<Message>),
     Replace(Vec<Message>),
@@ -1813,51 +1813,79 @@ impl Harness {
         let mut parts = Vec::new();
         loop {
             let page = transcript.read_with_blocks(&cursor, std::num::NonZeroUsize::MIN)?;
-            for record in page.records {
-                let change: TranscriptChange = serde_json::from_value(record.value)?;
-                let (messages, base, metadata) =
-                    if matches!(&change, TranscriptChange::ReplaceCompacted { .. }) {
-                        (
-                            self.resolved_occurrences(id, cursor.clone())?
-                                .into_iter()
-                                .map(|(m, _)| m)
-                                .collect(),
-                            true,
-                            None,
-                        )
-                    } else {
-                        change.parts()?
-                    };
-                let mut blocks = Vec::new();
-                if let Some(bindings) = record.content_blocks {
-                    let (ids, _, _) = metadata.ok_or(crate::transcript::Error::Corrupt)?;
-                    for binding in bindings {
-                        let index = ids
-                            .iter()
-                            .position(|id| *id == binding.message_id)
-                            .ok_or(crate::transcript::Error::Corrupt)?;
-                        blocks.push((index, binding));
-                    }
-                }
-                parts.push((messages, blocks));
-                if base {
-                    let mut messages = Vec::new();
-                    let mut blocks = std::collections::BTreeMap::new();
-                    for (part, bindings) in parts.into_iter().rev() {
-                        let offset = messages.len();
-                        messages.extend(part);
-                        for (index, binding) in bindings {
-                            blocks.insert(offset + index, binding);
-                        }
-                    }
-                    return Ok((messages, blocks));
-                }
+            let record = page
+                .records
+                .into_iter()
+                .next()
+                .ok_or(crate::transcript::Error::Corrupt)?;
+            let change: TranscriptChange = serde_json::from_value(record.value)?;
+            let base = !matches!(change, TranscriptChange::ReplaceCompacted { .. })
+                && change.clone().parts()?.1;
+            parts.push((cursor.clone(), change, record.content_blocks));
+            if base {
+                break;
             }
             if !page.has_more {
                 return Err(Error::Invalid("transcript has no base".into()));
             }
             cursor = page.next;
         }
+        let mut messages = Vec::new();
+        let mut blocks = std::collections::BTreeMap::new();
+        for (position, change, bindings) in parts.into_iter().rev() {
+            if let TranscriptChange::ReplaceCompacted {
+                messages: next,
+                system_end,
+                first_kept,
+                ..
+            } = &change
+            {
+                if bindings.is_some() {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let resolved = self.resolved_occurrences(id, position)?;
+                if resolved.iter().map(|(m, _)| m).ne(next.iter())
+                    || *system_end > *first_kept
+                    || *first_kept > messages.len()
+                    || next.len() != system_end + 1 + messages.len() - first_kept
+                    || next[..*system_end] != messages[..*system_end]
+                    || next[*system_end + 1..] != messages[*first_kept..]
+                {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                blocks = project_compaction_blocks(&blocks, *system_end, *first_kept)?;
+                for (index, binding) in &blocks {
+                    if resolved
+                        .get(*index)
+                        .and_then(|(_, h)| h.as_ref())
+                        .map(|h| h.id)
+                        != Some(binding.message_id)
+                    {
+                        return Err(crate::transcript::Error::Corrupt.into());
+                    }
+                }
+                messages = next.clone();
+            } else {
+                let (part, base, metadata) = change.parts()?;
+                if base {
+                    messages.clear();
+                    blocks.clear();
+                }
+                let offset = messages.len();
+                if let Some(bindings) = bindings {
+                    let (ids, _, _) = metadata.ok_or(crate::transcript::Error::Corrupt)?;
+                    for binding in bindings {
+                        let index = ids
+                            .iter()
+                            .position(|id| *id == binding.message_id)
+                            .ok_or(crate::transcript::Error::Corrupt)?;
+                        blocks.insert(offset + index, binding);
+                    }
+                }
+                messages.extend(part);
+            }
+        }
+        Ok((messages, blocks))
     }
     fn expand_event(&self, id: Uuid, value: &mut serde_json::Value) -> Result<(), Error> {
         if let Some(reference) = value.get_mut("_transcript").map(std::mem::take) {
@@ -2158,52 +2186,6 @@ impl Harness {
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
-        if let Some(previous) = old
-            && !previous.content_blocks.is_empty()
-        {
-            let unchanged = state.messages.starts_with(&previous.messages)
-                && previous
-                    .content_blocks
-                    .iter()
-                    .all(|(i, b)| state.content_blocks.get(i) == Some(b))
-                && previous.context_generation == state.context_generation
-                && state.resets == previous.resets;
-            let reset = state.block_reset_proof.as_ref().is_some_and(|proof| {
-                proof.previous_context == previous.context_generation
-                    && proof.previous_resets == previous.resets
-                    && proof.previous_messages == previous.messages
-                    && proof.previous_blocks == previous.content_blocks
-                    && !proof.placed_resets.is_empty()
-                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
-                    && state.resets.starts_with(&proof.previous_resets)
-                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
-                    && state.context_generation != previous.context_generation
-                    && state.content_blocks.is_empty()
-                    && state.messages == proof.messages
-            });
-            if !unchanged && !reset {
-                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-            }
-        }
-        let old_len = old.map_or(0, |s| s.messages.len());
-        let mut block_ids = std::collections::HashSet::new();
-        for (&index, binding) in &state.content_blocks {
-            if !matches!(
-                state.messages.get(index),
-                Some(Message::User { content }) if content.is_empty()
-            ) || binding.message_id.is_nil()
-                || !block_ids.insert(binding.message_id)
-                || crate::content::UserContent::from_yield(
-                    serde_json::Value::Array(binding.blocks.clone()),
-                    false,
-                )
-                .is_none()
-                || (index < old_len
-                    && old.and_then(|s| s.content_blocks.get(&index)) != Some(binding))
-            {
-                return Err(Error::Invalid("invalid transcript block binding".into()));
-            }
-        }
         let compacted = old
             .map(|previous| -> Result<Option<(usize, usize)>, Error> {
                 if create
@@ -2231,6 +2213,73 @@ impl Harness {
             })
             .transpose()?
             .flatten();
+        let block_compaction = if let (Some(previous), Some((system_end, first_kept))) =
+            (old, compacted)
+        {
+            let result = match (independent, &previous.phase) {
+                (None, Phase::CompactionPlacement { result, .. }) => Some(result.as_ref()),
+                _ => None,
+            };
+            result.is_some_and(|result| {
+                result.has_blocks()
+                    && result.matches_blocks(
+                        &previous.messages,
+                        &previous.content_blocks,
+                        previous.context_generation,
+                    )
+                    && project_compaction_blocks(&previous.content_blocks, system_end, first_kept)
+                        .is_ok_and(|blocks| blocks == state.content_blocks)
+            })
+        } else {
+            false
+        };
+        if let Some(previous) = old
+            && !previous.content_blocks.is_empty()
+        {
+            let unchanged = state.messages.starts_with(&previous.messages)
+                && previous
+                    .content_blocks
+                    .iter()
+                    .all(|(i, b)| state.content_blocks.get(i) == Some(b))
+                && previous.context_generation == state.context_generation
+                && state.resets == previous.resets;
+            let reset = state.block_reset_proof.as_ref().is_some_and(|proof| {
+                proof.previous_context == previous.context_generation
+                    && proof.previous_resets == previous.resets
+                    && proof.previous_messages == previous.messages
+                    && proof.previous_blocks == previous.content_blocks
+                    && !proof.placed_resets.is_empty()
+                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
+                    && state.resets.starts_with(&proof.previous_resets)
+                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
+                    && state.context_generation != previous.context_generation
+                    && state.content_blocks.is_empty()
+                    && state.messages == proof.messages
+            });
+            if !unchanged && !reset && !block_compaction {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+        }
+        let old_len = old.map_or(0, |s| s.messages.len());
+        let mut block_ids = std::collections::HashSet::new();
+        for (&index, binding) in &state.content_blocks {
+            if !matches!(
+                state.messages.get(index),
+                Some(Message::User { content }) if content.is_empty()
+            ) || binding.message_id.is_nil()
+                || !block_ids.insert(binding.message_id)
+                || crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(binding.blocks.clone()),
+                    false,
+                )
+                .is_none()
+                || (!block_compaction
+                    && index < old_len
+                    && old.and_then(|s| s.content_blocks.get(&index)) != Some(binding))
+            {
+                return Err(Error::Invalid("invalid transcript block binding".into()));
+            }
+        }
         if independent.is_some() && compacted.is_none() {
             return Err(Error::Invalid(
                 "independent compaction proof changed".into(),
@@ -2248,6 +2297,17 @@ impl Harness {
                 return Err(Error::Invalid(
                     "compaction source transcript changed".into(),
                 ));
+            }
+            if block_compaction
+                && previous.content_blocks.iter().any(|(index, binding)| {
+                    source
+                        .get(*index)
+                        .and_then(|(_, history)| history.as_ref())
+                        .map(|history| history.id)
+                        != Some(binding.message_id)
+                })
+            {
+                return Err(crate::transcript::Error::Corrupt.into());
             }
             let summary_id = Uuid::new_v4();
             if created.contains(&summary_id) {
@@ -2392,6 +2452,7 @@ impl Harness {
         let new_blocks: Vec<_> = state
             .content_blocks
             .range(old_len..)
+            .filter(|_| !block_compaction)
             .map(|(&index, binding)| (index, binding.clone()))
             .collect();
         if !new_blocks.is_empty() {
@@ -3951,6 +4012,16 @@ impl Harness {
         c: &Conversation,
         result: &crate::compact::CompactionResult,
     ) -> Result<Option<ResolvedCompactionTarget>, Error> {
+        if result.has_blocks() {
+            return if result.matches_blocks(&c.messages, &c.content_blocks, c.context_generation) {
+                Ok(Some((
+                    result.apply_in_context(&c.messages, c.context_generation)?,
+                    result.retained_range(),
+                )))
+            } else {
+                Ok(None)
+            };
+        }
         let Some(target) = result.retained_target() else {
             return if result.is_stale(&c.messages, c.context_generation) {
                 Ok(None)
@@ -4705,7 +4776,9 @@ impl Harness {
         instructions: Option<&str>,
     ) -> Result<Option<Uuid>, Error> {
         let (mut c, version) = self.load(id)?;
-        if !c.content_blocks.is_empty() {
+        if !c.content_blocks.is_empty()
+            && (!c.extensions.is_empty() || !c.occurrence_epoch_proven || c.transcript.is_none())
+        {
             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
         if !matches!(c.phase, Phase::Idle) || c.active.is_some() || c.abort_requested {
@@ -4722,6 +4795,21 @@ impl Harness {
         )?
         else {
             return Ok(None);
+        };
+        let preparation = if c.content_blocks.is_empty() {
+            preparation
+        } else {
+            let occurrences = self.resolved_occurrences(id, c.transcript.clone().unwrap())?;
+            if c.content_blocks.iter().any(|(index, binding)| {
+                occurrences
+                    .get(*index)
+                    .and_then(|(_, history)| history.as_ref())
+                    .map(|history| history.id)
+                    != Some(binding.message_id)
+            }) {
+                return Err(crate::transcript::Error::Corrupt.into());
+            }
+            preparation.bind_blocks(&c.content_blocks)?
         };
         let preparation = if let Some(source) =
             c.transcript.clone().filter(|_| c.occurrence_epoch_proven)
@@ -5402,6 +5490,7 @@ impl Harness {
                         | Phase::CompactionRunning { .. }
                         | Phase::CompactionPlacement { .. }
                 )
+                && c.active_manual_compaction.is_none()
             {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
@@ -6250,9 +6339,16 @@ impl Harness {
                         }
                     }
                     if c.active_manual_compaction.is_some() {
-                        if let Some((messages, _)) =
+                        if let Some((messages, (system_end, first_kept))) =
                             self.apply_manual_compaction_target(&c, &result)?
                         {
+                            if result.has_blocks() {
+                                c.content_blocks = project_compaction_blocks(
+                                    &c.content_blocks,
+                                    system_end,
+                                    first_kept,
+                                )?;
+                            }
                             c.messages = messages;
                             c.context_generation = Some(Uuid::new_v4());
                             finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
@@ -10149,6 +10245,28 @@ fn unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn project_compaction_blocks(
+    blocks: &std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    system_end: usize,
+    first_kept: usize,
+) -> Result<std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>, Error> {
+    if system_end > first_kept {
+        return Err(crate::transcript::Error::Corrupt.into());
+    }
+    Ok(blocks
+        .iter()
+        .filter_map(|(&index, binding)| {
+            if index < system_end {
+                Some((index, binding.clone()))
+            } else if index >= first_kept {
+                Some((system_end + 1 + index - first_kept, binding.clone()))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
 fn start_overflow_compaction(
     c: &mut Conversation,
     turns: u32,
@@ -10632,12 +10750,6 @@ mod scheduler_tests {
         );
         assert!(h.fork_at_position(id, position).is_err());
         assert!(h.fork_at_application_entry(id, occurrence).is_err());
-        assert!(matches!(
-            h.request_manual_compaction(id, 0, None),
-            Err(Error::Transcript(
-                crate::transcript::Error::UnsupportedContentBlocks
-            ))
-        ));
         let (mut changed, version) = h.load(id).unwrap();
         changed.phase = Phase::ModelReady { turns: 0 };
         h.save(&changed, Expected::Version(version)).unwrap();
@@ -11196,6 +11308,235 @@ mod scheduler_tests {
                 .is_err()
         );
         assert!(errors.lock().unwrap().contains_key(&id));
+    }
+
+    struct BlockSummaryModel(std::sync::Mutex<Vec<ModelRequest>>);
+    #[async_trait::async_trait]
+    impl Model for BlockSummaryModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            panic!("summary route required")
+        }
+        async fn stream_for_summary(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            request: ModelRequest,
+        ) -> Result<ModelStream, pi_rs_core::Error> {
+            self.0.lock().unwrap().push(request);
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("checkpoint".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    fn block_summary_options(model: Arc<BlockSummaryModel>) -> Options {
+        Options {
+            model,
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        }
+    }
+    #[tokio::test]
+    async fn manual_block_compaction_projects_summary_and_preserves_retained_provenance_after_reopen()
+     {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+        let (id, kept_id, before_history, kept, fork);
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.append_user_blocks(
+                id,
+                vec![
+                    json!({"type":"text","text":"old one"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    json!({"type":"text","text":"old two"}),
+                ],
+            )
+            .unwrap();
+            kept = vec![
+                json!({"type":"text","text":"keep one"}),
+                json!({"type":"image","data":"Ymll","mimeType":"image/png"}),
+                json!({"type":"text","text":"keep two","textSignature":"opaque"}),
+            ];
+            kept_id = h.append_user_blocks(id, kept.clone()).unwrap();
+            let c = h.conversation(id).unwrap();
+            before_history = h.resolved_occurrences(id, c.transcript.unwrap()).unwrap();
+            h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        }
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(
+                c.manual_compactions[0].status,
+                ManualCompactionStatus::Applied
+            );
+            assert_eq!(c.content_blocks.len(), 1);
+            assert_eq!(c.content_blocks[&1].message_id, kept_id);
+            assert_eq!(c.content_blocks[&1].blocks, kept);
+            let history = h.resolved_occurrences(id, c.transcript.unwrap()).unwrap();
+            assert_eq!(history[1], before_history[1]);
+            fork = h.fork(id).unwrap();
+            let forked = h.conversation(fork).unwrap();
+            assert_eq!(forked.content_blocks[&1].message_id, kept_id);
+            assert_eq!(
+                h.resolved_occurrences(fork, forked.transcript.unwrap())
+                    .unwrap()[1],
+                before_history[1]
+            );
+        }
+        let h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+        assert_eq!(h.conversation(id).unwrap().content_blocks[&1].blocks, kept);
+        assert_eq!(
+            h.conversation(fork).unwrap().content_blocks[&1].blocks,
+            kept
+        );
+        let calls = model.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            matches!(&calls[0].messages[1], Message::User { content } if content.contains("[User]: old one\nold two") && !content.contains("aGk=") && !content.contains("keep one"))
+        );
+    }
+
+    fn block_placement(h: &mut Harness) -> (Uuid, Uuid, Uuid) {
+        use serde_json::json;
+        let id = h.create_conversation(config()).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+            .unwrap();
+        let kept = h
+            .append_user_blocks(
+                id,
+                vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+            )
+            .unwrap();
+        let operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        let Phase::CompactionHook { preparation, .. } = c.phase else {
+            panic!("missing hook");
+        };
+        let result = preparation
+            .finish(CompletedGeneration {
+                content: "checkpoint".into(),
+                calls: vec![],
+                usage: None,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        c.phase = Phase::CompactionPlacement {
+            result: Box::new(result),
+            resets_before: Some(vec![]),
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        (id, operation, kept)
+    }
+    #[tokio::test]
+    async fn block_compaction_abort_conflicts_with_prepared_placement_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+        let (id, operation, kept);
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            (id, operation, kept) = block_placement(&mut h);
+            let (mut candidate, version) = h.load(id).unwrap();
+            let Phase::CompactionPlacement { result, .. } = candidate.phase.clone() else {
+                panic!("missing result");
+            };
+            let mut stale = candidate.clone();
+            stale.content_blocks.get_mut(&1).unwrap().blocks.clear();
+            assert!(
+                h.apply_manual_compaction_target(&stale, &result)
+                    .unwrap()
+                    .is_none()
+            );
+            let mut stale = candidate.clone();
+            stale.context_generation = Some(Uuid::new_v4());
+            assert!(
+                h.apply_manual_compaction_target(&stale, &result)
+                    .unwrap()
+                    .is_none()
+            );
+            let (messages, (system_end, first_kept)) = h
+                .apply_manual_compaction_target(&candidate, &result)
+                .unwrap()
+                .unwrap();
+            candidate.content_blocks =
+                project_compaction_blocks(&candidate.content_blocks, system_end, first_kept)
+                    .unwrap();
+            candidate.messages = messages;
+            candidate.context_generation = Some(Uuid::new_v4());
+            finish_manual_compaction(&mut candidate, ManualCompactionStatus::Applied).unwrap();
+            candidate.phase = Phase::Idle;
+            let mut forged = candidate.clone();
+            forged.content_blocks.clear();
+            assert!(h.prepare_save(&forged, Expected::Version(version)).is_err());
+            let prepared = h
+                .prepare_save(&candidate, Expected::Version(version))
+                .unwrap();
+            h.request_abort(id).unwrap();
+            assert!(matches!(
+                h.commit_conversation_save(prepared),
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+            ));
+        }
+        let mut h = Harness::open_paused(&path, block_summary_options(model)).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Aborted
+            }
+        );
+        assert_eq!(c.content_blocks[&1].message_id, kept);
+        assert_eq!(c.content_blocks.len(), 2);
+    }
+    #[tokio::test]
+    async fn block_compaction_reset_before_result_is_stale_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+        let (id, operation);
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            (id, operation, _) = block_placement(&mut h);
+            let reset = h.reset(id, Some("replacement".into())).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            let Phase::CompactionPlacement { resets_before, .. } = &mut c.phase else {
+                panic!("missing result");
+            };
+            *resets_before = Some(vec![reset]);
+            h.save(&c, Expected::Version(version)).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, block_summary_options(model)).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Stale
+            }
+        );
+        assert!(c.content_blocks.is_empty());
+        assert_eq!(
+            c.messages,
+            vec![Message::User {
+                content: "replacement".into()
+            }]
+        );
     }
 
     fn placement_model() -> Arc<GatedModel> {

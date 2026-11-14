@@ -1751,7 +1751,7 @@ fn runtime_block_commit_survives_process_exit() {
         h.conversation(fork).unwrap().content_blocks,
         c.content_blocks
     );
-    assert!(h.request_manual_compaction(id, 0, None).is_err());
+    assert_eq!(h.request_manual_compaction(id, 0, None).unwrap(), None);
     drop(h);
     let model = Arc::new(FakeModel {
         calls: AtomicUsize::new(0),
