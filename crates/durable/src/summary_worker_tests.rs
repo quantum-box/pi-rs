@@ -450,8 +450,9 @@ async fn public_idle_compaction_runs_selected_hook_and_rejects_busy_state() {
 
 #[tokio::test]
 async fn independent_hooks_report_errors_and_first_decision_wins() {
+    type HookCalls = Arc<Mutex<Vec<(usize, Option<String>)>>>;
     struct Hook {
-        calls: Arc<Mutex<Vec<(usize, Option<String>)>>>,
+        calls: HookCalls,
         index: usize,
     }
     #[async_trait::async_trait]
