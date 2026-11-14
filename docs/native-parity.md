@@ -177,7 +177,10 @@ recognizes a durable overflow or length stop before its marker is written. It
 restores the branch model before checking the interrupted request's identity;
 queued trigger turns do not overtake an unresolved compaction recovery.
 SDK recovery defers session-start callbacks until recovery succeeds; when
-extensions are registered it requires reconciliation before invoking them.
+extensions are registered it settles known and unconfirmed recovery usage using
+the restored model, then requires reconciliation before invoking them. An
+interrupted hard-overflow summary request is settled as unconfirmed before that
+reconciliation; it is never automatically resent.
 Public startup and prompt paths also reject an unresolved recovery before
 callbacks or queued triggers run. For an ambiguous silent-overflow summary,
 resume retains the answer, settles any started summary request as unconfirmed

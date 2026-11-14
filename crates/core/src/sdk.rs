@@ -2671,12 +2671,6 @@ impl AgentSession {
         if let Some(error) = startup_error {
             return Err(error);
         }
-        if recovery.is_some() && !self.registry.extensions.is_empty() {
-            return Err(Error::Session(
-                "pending compaction recovery requires reconciliation after extensions changed"
-                    .into(),
-            ));
-        }
         if recovery.as_ref().is_some_and(|(_, model, _)| {
             model
                 .as_ref()
@@ -2684,6 +2678,25 @@ impl AgentSession {
         }) {
             return Err(Error::Session(
                 "pending compaction recovery requires its original model".into(),
+            ));
+        }
+        if let Some((run_id, _, _)) = recovery.as_ref()
+            && !self.registry.extensions.is_empty()
+        {
+            let journal = self.journal_async().await;
+            let agent = Agent {
+                model: self.model.as_ref(),
+                model_name: &self.model_name,
+                registry: &self.registry,
+                system_prompt: &self.system_prompt,
+                limits: self.limits.clone(),
+            };
+            agent
+                .settle_recovery_before_hooks(&journal, *run_id)
+                .await?;
+            return Err(Error::Session(
+                "pending compaction recovery requires reconciliation after extensions changed"
+                    .into(),
             ));
         }
         let run_id = recovery.map(|(run_id, _, _)| run_id);
@@ -9296,8 +9309,13 @@ mod tests {
             };
             // Startup would append immediate context; recovery must be
             // classified before this callback can invalidate the summary.
-            let mut guarded = SessionBuilder::new(model.clone(), "default")
-                .branch_model("fixture", model.clone())
+            let guarded_model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
                 .unwrap()
                 .extension(Arc::new(IdleLifecycleMessages))
                 .unwrap()
@@ -9326,6 +9344,24 @@ mod tests {
                     .await
                     .unwrap_err()
                     .to_string()
+                    .contains("settlement unavailable")
+            );
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
                     .contains("reconciliation")
             );
             assert!(
@@ -9337,8 +9373,8 @@ mod tests {
                     .any(|record| matches!(&record.event,
                 Event::CustomMessage { message, .. } if message.custom_type == "lifecycle"))
             );
-            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
-            assert!(model.attempts.lock().unwrap().is_empty());
+            assert_eq!(guarded_model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(guarded_model.attempts.lock().unwrap().len(), 2);
             guarded.close().await.unwrap();
             drop(guarded);
             let mut session = SessionBuilder::new(model.clone(), "default")
@@ -9540,7 +9576,7 @@ mod tests {
                         .set_auto_compaction_enabled(false)
                         .unwrap();
                 }
-                if silent && started {
+                if started {
                     assert!(
                         session
                             .resume()
@@ -9563,6 +9599,16 @@ mod tests {
                             .contains("requires reconciliation")
                     );
                     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        model
+                            .attempts
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed))
+                    );
+                    assert_eq!(model.attempts.lock().unwrap().len(), 2);
                     assert_eq!(
                         session.journal().unwrap().pending_custom_trigger(),
                         Some(trigger)

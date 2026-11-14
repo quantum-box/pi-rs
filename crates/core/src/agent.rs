@@ -274,6 +274,16 @@ pub(crate) struct TreeModelResolution {
 }
 
 impl Agent<'_> {
+    pub(crate) async fn settle_recovery_before_hooks(
+        &self,
+        session: &Session,
+        run_id: Uuid,
+    ) -> Result<()> {
+        for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
+            self.settle_usage(id, &usage, &metadata).await?;
+        }
+        Ok(())
+    }
     fn compaction_tokens(&self, session: &Session) -> CompactionTokens {
         self.limits
             .compaction_tokens
@@ -1249,7 +1259,7 @@ impl Agent<'_> {
         // replayed, so exclude them here to avoid charging them twice.
         let pending_id = pending.as_ref().map(|(id, ..)| *id);
         let mut settled = HashSet::new();
-        for (id, usage, metadata) in durable_overflow_completions(session, run_id) {
+        for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
             self.settle_usage(id, &usage, &metadata).await?;
             settled.insert(id);
         }
@@ -4608,37 +4618,48 @@ fn overflow_recovery_attempted(session: &Session, run_id: Uuid) -> bool {
 
 // Settlement follows durable completion, even when a summary cannot safely be
 // replayed. Do not couple accounting to retention or response validation.
-fn durable_overflow_completions(
+fn durable_recovery_usage(
     session: &Session,
     run_id: Uuid,
 ) -> Vec<(Uuid, UsageReport, ModelMetadata)> {
-    let Some(recovery) = overflow_recovery_state(session, run_id).filter(|state| !state.compacted)
-    else {
-        return Vec::new();
-    };
     let branch = session.branch();
     let epoch = overflow_recovery_epoch(&branch, run_id);
-    let mut ids = vec![recovery.request_id];
-    if let Some(marker) = epoch.iter().rposition(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
+    let mut ids = Vec::new();
+    if let Some(recovery) =
+        overflow_recovery_state(session, run_id).filter(|state| !state.compacted)
+    {
+        ids.push((recovery.request_id, false));
+    }
+    if let Some((id, metadata, _, _)) = pending_reply(session, run_id)
+        && metadata.finish_reason.as_deref() == Some("length")
+        && !ids.iter().any(|(old, _)| *old == id)
+    {
+        ids.push((id, false));
+    }
+    if let Some(marker) = epoch.iter().rposition(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow"))
+        && !epoch[marker + 1..].iter().any(|record| (matches!(&record.event, Event::Compacted { .. }) || matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")))
         && let Some(id) = epoch[marker + 1..].iter().find_map(|record| match &record.event {
-            Event::ModelRequested { request_id: Some(id), .. } if record.run_id == Some(run_id) => Some(*id),
-            _ => None,
-        })
-        && !ids.contains(&id)
-    { ids.push(id); }
+            Event::ModelRequested { request_id: Some(id), .. } if record.run_id == Some(run_id) => Some(*id), _ => None,
+        }) && !ids.iter().any(|(old, _)| *old == id)
+    { ids.push((id, true)); }
     ids.into_iter()
-        .filter_map(|id| {
-            epoch.iter().find_map(|record| match &record.event {
-                Event::ModelFinished {
-                    request_id,
-                    usage,
-                    metadata,
-                    ..
-                } if record.run_id == Some(run_id) && *request_id == id => {
-                    Some((id, usage.clone(), metadata.clone()))
-                }
-                _ => None,
-            })
+        .filter_map(|(id, unconfirmed)| {
+            epoch
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::ModelFinished {
+                        request_id,
+                        usage,
+                        metadata,
+                        ..
+                    } if record.run_id == Some(run_id) && *request_id == id => {
+                        Some((id, usage.clone(), metadata.clone()))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    unconfirmed.then_some((id, UsageReport::Unconfirmed, ModelMetadata::default()))
+                })
         })
         .collect()
 }
