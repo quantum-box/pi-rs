@@ -1021,3 +1021,25 @@ The transcript storage API can append version 2 records with `prepare_append_wit
 `Harness::append_user_blocks` atomically appends a block-bearing user occurrence to an idle conversation. When the selected provider adapter opts into durable blocks, direct and child-task `onYield` continuations can also persist ordered blocks and continue the run. `Conversation::content_blocks` reconstructs each binding by message index on reopen; its occurrence ID is the same ID stored in the transcript change. The core message at that index is an empty placeholder and must not be used as content. The block map is reconstructed from the transcript and is not included in serialized conversation snapshots. Expanded history snapshots expose the map as `content_blocks` when nonempty, indexed into their `messages` array.
 
 The durable provider interface passes bindings indexed into the prepared request, including the leading system message. Before-request hooks receive the map in `content_blocks`; while it is present they must preserve both `messages` and `content_blocks` exactly. Before-provider-request hooks receive the encoded body, subject to adapter validation. The opt-in OpenAI Responses adapter supports ordered text and base64 image blocks and the image `detail` field. Empty arrays and other metadata, including `textSignature`, fail before dispatch rather than being discarded. Adapters without durable support and the core model path reject block-bearing generation. Fork, reset and compaction remain unsupported; a tool handoff that would reset a block-bearing context fails the run while retaining the content. Automatic compaction is skipped for block-bearing contexts and overflow compaction fails closed. Transcript-level forks scan and reject captured block-bearing history, and the legacy transcript reader rejects these records.
+
+### Explicit nested pending-job settlement
+
+When a conversation is blocked, `nested_pending_jobs` exposes the operation ID
+and the last persisted opaque reference for each nested pending job.
+`reconcile_nested_pending` records an authoritative terminal outcome, and
+`cancel_nested_pending` records a host-confirmed remote cancellation as a
+failed outcome. Neither API polls, dispatches, or cancels a remote job. The
+caller must verify the outcome externally. The root ID, nested ID, reference,
+record version, and blocked conversation version fence the update. Identical
+retries are accepted while the same root remains blocked; conflicting outcomes
+are rejected. References are retained in the journal, including after
+settlement. After a storage error, reopen and inspect before retrying.
+
+Settling a nested job does not determine the parent tool's outcome: the host
+must also supply an authoritative parent result with `reconcile`. Parent
+settlement is rejected while any nested operation remains unresolved, including
+intermediate calls and unsafe effects. This is narrower than upstream's
+scheduler-owned nested task settlement: it does not replay an intermediate
+caller or infer its result, and does not offer reconciliation for arbitrary
+interrupted nested calls without a persisted pending reference. Explicit abort
+remains marked until nested work and owned task cleanup are settled.

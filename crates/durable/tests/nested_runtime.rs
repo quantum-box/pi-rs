@@ -1043,11 +1043,21 @@ impl Tool for ProcessPending {
             reference: "process-job".into(),
         }
     }
-    async fn poll(&self, reference: &str, ctx: ToolContext) -> Option<Outcome> {
+    async fn poll(
+        &self,
+        reference: &str,
+        ctx: ToolContext,
+    ) -> Option<Outcome> {
         assert_eq!(reference, "process-job");
-        std::fs::write(self.root.join("poll-id"), ctx.operation_id.to_string()).unwrap();
+        std::fs::write(
+            self.root.join("poll-id"),
+            ctx.operation_id.to_string(),
+        )
+        .unwrap();
         if self.worker {
             std::future::pending().await
+        } else if self.root.join("unknown-poll").exists() {
+            Some(Outcome::Unknown("poll unavailable".into()))
         } else {
             Some(Outcome::Succeeded("done".into()))
         }
@@ -1141,6 +1151,75 @@ async fn killed_nested_poll_reattaches_to_unsafe_job() {
     );
 }
 
+#[tokio::test]
+async fn killed_nested_poll_can_be_explicitly_reconciled_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut worker =
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_poll_kill_worker"])
+            .env("PI_NESTED_POLL_WORKER", root)
+            .spawn()
+            .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !root.join("poll-id").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker never reached polling");
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    std::fs::write(root.join("unknown-poll"), "").unwrap();
+    let id = std::fs::read_to_string(root.join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(
+        root.join("db"),
+        process_options(root, false),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    let (parent, _) = h.blocked(id).unwrap().unwrap();
+    let job = h.nested_pending_jobs(id, parent).unwrap().pop().unwrap();
+    assert_eq!(job.reference, "process-job");
+    assert_eq!(
+        job.operation_id.to_string(),
+        std::fs::read_to_string(root.join("poll-id")).unwrap()
+    );
+    h.reconcile_nested_pending(
+        id,
+        parent,
+        job.operation_id,
+        &job.reference,
+        Outcome::Succeeded("confirmed".into()),
+    )
+    .unwrap();
+    drop(h);
+    let mut h = Harness::open(
+        root.join("db"),
+        process_options(root, false),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    h.reconcile(id, parent, Outcome::Succeeded("parent confirmed".into()))
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    assert_eq!(
+        std::fs::read_to_string(root.join("invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
 struct AbortPolling {
     started: tokio::sync::Semaphore,
     stopped: Arc<tokio::sync::Semaphore>,
@@ -1182,7 +1261,8 @@ impl Tool for AbortPolling {
 }
 
 #[tokio::test]
-async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen() {
+async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen()
+ {
     use pi_rs_durable::runtime::Scheduler;
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
@@ -1235,9 +1315,11 @@ async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen
     let owner = durable_store::owner::OwnedStore::open(&path).unwrap();
     let records = owner.store().list(b"nested/").unwrap();
     assert_eq!(records.len(), 1);
-    let record: Value = serde_json::from_slice(&records[0].1.value).unwrap();
+    let record: Value =
+        serde_json::from_slice(&records[0].1.value).unwrap();
     assert_eq!(
-        serde_json::from_value::<Outcome>(record["outcome"].clone()).unwrap(),
+        serde_json::from_value::<Outcome>(record["outcome"].clone())
+            .unwrap(),
         Outcome::Pending {
             reference: "opaque/\u{0}reference".into(),
         }
@@ -1264,6 +1346,89 @@ async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen
         .is_err()
     );
     assert!(h.conversation(id).unwrap().abort_requested);
+    let jobs = h.nested_pending_jobs(id, parent_operation).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].reference, "opaque/\u{0}reference");
+    let child_id = jobs[0].operation_id;
+    let cancelled = Outcome::Failed("remote cancellation confirmed".into());
+    assert!(
+        h.reconcile_nested_pending(
+            id,
+            parent_operation,
+            child_id,
+            "wrong",
+            cancelled.clone()
+        )
+        .is_err()
+    );
+    h.cancel_nested_pending(
+        id,
+        parent_operation,
+        child_id,
+        &jobs[0].reference,
+        "remote cancellation confirmed".into(),
+    )
+    .unwrap();
+    h.cancel_nested_pending(
+        id,
+        parent_operation,
+        child_id,
+        &jobs[0].reference,
+        "remote cancellation confirmed".into(),
+    )
+    .unwrap();
+    assert!(
+        h.reconcile_nested_pending(
+            id,
+            parent_operation,
+            child_id,
+            &jobs[0].reference,
+            Outcome::Succeeded("conflict".into())
+        )
+        .is_err()
+    );
+    assert!(
+        h.reconcile_nested_pending(
+            id,
+            parent_operation,
+            child_id,
+            &jobs[0].reference,
+            cancelled
+        )
+        .is_err()
+    );
+    drop(h);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.cancel_nested_pending(
+        id,
+        parent_operation,
+        child_id,
+        &jobs[0].reference,
+        "remote cancellation confirmed".into(),
+    )
+    .unwrap();
+    assert!(
+        h.nested_pending_jobs(id, parent_operation)
+            .unwrap()
+            .is_empty()
+    );
+    h.reconcile(
+        id,
+        parent_operation,
+        Outcome::Failed("parent cancelled".into()),
+    )
+    .unwrap();
+    assert!(!h.conversation(id).unwrap().abort_requested);
+    assert!(
+        h.reconcile_nested_pending(
+            id,
+            parent_operation,
+            child_id,
+            &jobs[0].reference,
+            Outcome::Failed("remote cancellation confirmed".into())
+        )
+        .is_err()
+    );
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
     assert_eq!(child.ids.lock().unwrap().len(), 2);
 }
@@ -1303,7 +1468,8 @@ impl Tool for UnknownPoll {
     }
 }
 #[tokio::test]
-async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
+async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen()
+{
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let child = Arc::new(UnknownPoll {
@@ -1343,9 +1509,11 @@ async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
     let owner = durable_store::owner::OwnedStore::open(&path).unwrap();
     let records = owner.store().list(b"nested/").unwrap();
     assert_eq!(records.len(), 1);
-    let record: Value = serde_json::from_slice(&records[0].1.value).unwrap();
+    let record: Value =
+        serde_json::from_slice(&records[0].1.value).unwrap();
     assert_eq!(
-        serde_json::from_value::<Outcome>(record["outcome"].clone()).unwrap(),
+        serde_json::from_value::<Outcome>(record["outcome"].clone())
+            .unwrap(),
         Outcome::Pending {
             reference: "updated-reference".into()
         }
@@ -1353,7 +1521,27 @@ async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
     drop(owner);
     let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
     h.resume_conversation(id, &cancel).await.unwrap();
-    assert!(h.blocked(id).unwrap().is_some());
+    let (root, _) = h.blocked(id).unwrap().unwrap();
+    let job = h.nested_pending_jobs(id, root).unwrap().pop().unwrap();
+    assert_eq!(job.reference, "updated-reference");
+    assert!(
+        h.reconcile(id, root, Outcome::Succeeded("unsafe parent".into()))
+            .is_err()
+    );
+    h.reconcile_nested_pending(
+        id,
+        root,
+        job.operation_id,
+        &job.reference,
+        Outcome::Succeeded("remote done".into()),
+    )
+    .unwrap();
+    drop(h);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.reconcile(id, root, Outcome::Succeeded("parent done".into()))
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
     assert_eq!(child.polled.load(Ordering::SeqCst), 2);
 }

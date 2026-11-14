@@ -37,6 +37,134 @@ struct Record {
     policy: ReplayPolicy,
     operation_id: Uuid,
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<Resolution>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct Resolution {
+    reference: String,
+    outcome: Outcome,
+    #[serde(default)]
+    cancelled: bool,
+}
+
+/// A pending remote job and its stable identity. References are opaque.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingJob {
+    pub operation_id: Uuid,
+    pub reference: String,
+}
+
+pub(crate) fn pending_jobs(
+    store: &durable_store::Store,
+    root: Uuid,
+) -> Result<Vec<PendingJob>, crate::runtime::Error> {
+    let mut jobs = Vec::new();
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if let Some(Outcome::Pending { reference }) = record.outcome {
+            jobs.push(PendingJob {
+                operation_id: record.operation_id,
+                reference,
+            });
+        }
+    }
+    Ok(jobs)
+}
+
+pub(crate) fn resolve_pending(
+    store: &durable_store::Store,
+    conversation_key: Vec<u8>,
+    conversation_version: u64,
+    root: Uuid,
+    operation: Uuid,
+    reference: &str,
+    outcome: Outcome,
+    cancelled: bool,
+) -> Result<(), crate::runtime::Error> {
+    use crate::runtime::Error;
+    if !matches!(
+        outcome,
+        Outcome::Succeeded(_)
+            | Outcome::SucceededWithDetails { .. }
+            | Outcome::Failed(_)
+    ) {
+        return Err(Error::Invalid(
+            "nested reconciliation requires a known terminal outcome"
+                .into(),
+        ));
+    }
+    let mut found = None;
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.operation_id == operation {
+            if found.is_some() {
+                return Err(Error::Invalid(
+                    "duplicate nested operation ID".into(),
+                ));
+            }
+            found = Some((key, entry, record));
+        }
+    }
+    let (key, entry, mut record) = found.ok_or_else(|| {
+        Error::Invalid("nested operation not found".into())
+    })?;
+    let resolution = Resolution {
+        reference: reference.into(),
+        outcome: outcome.clone(),
+        cancelled,
+    };
+    if let Some(existing) = &record.resolution {
+        if *existing != resolution {
+            return Err(Error::Invalid(
+                "conflicting nested resolution".into(),
+            ));
+        }
+        // Check the conversation even on a retry.
+        store.commit(
+            &[
+                Check {
+                    key: conversation_key,
+                    expected: Expected::Version(conversation_version),
+                },
+                Check {
+                    key,
+                    expected: Expected::Version(entry.version),
+                },
+            ],
+            &[],
+        )?;
+        return Ok(());
+    }
+    if record.outcome
+        != Some(Outcome::Pending {
+            reference: reference.into(),
+        })
+    {
+        return Err(Error::Invalid(
+            "nested pending reference or outcome changed".into(),
+        ));
+    }
+    record.outcome = Some(outcome);
+    record.resolution = Some(resolution);
+    store.commit(
+        &[
+            Check {
+                key: conversation_key,
+                expected: Expected::Version(conversation_version),
+            },
+            Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            },
+        ],
+        &[Mutation::Put {
+            key,
+            value: serde_json::to_vec(&record)?,
+        }],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,6 +512,7 @@ impl NestedHost {
                 policy: reg.replay,
                 operation_id: invocation.operation_id,
                 outcome: None,
+                resolution: None,
             };
             let value = match serde_json::to_vec(&record) {
                 Ok(v) => v,
@@ -591,6 +720,31 @@ mod tests {
     use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn stale_conversation_version_cannot_settle_nested_job() {
+        let store = durable_store::Store::memory().unwrap();
+        let root = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let conversation = b"conversation-fence".to_vec();
+        let key = format!("nested/{root}/{root}/00000000000000000000").into_bytes();
+        let record = Record {
+            name: "job".into(), arguments: serde_json::json!({}),
+            prepared: serde_json::json!({}), policy: ReplayPolicy::Unsafe,
+            operation_id: operation,
+            outcome: Some(Outcome::Pending { reference: "opaque".into() }),
+            resolution: None,
+        };
+        store.commit(&[], &[
+            Mutation::Put { key: conversation.clone(), value: vec![1] },
+            Mutation::Put { key: key.clone(), value: serde_json::to_vec(&record).unwrap() },
+        ]).unwrap();
+        let stale = store.get(&conversation).unwrap().unwrap().version;
+        store.commit(&[], &[Mutation::Put { key: conversation.clone(), value: vec![2] }]).unwrap();
+        assert!(resolve_pending(&store, conversation, stale, root, operation, "opaque", Outcome::Succeeded("done".into()), false).is_err());
+        let retained: Record = serde_json::from_slice(&store.get(&key).unwrap().unwrap().value).unwrap();
+        assert_eq!(retained.outcome, record.outcome);
+    }
 
     struct PanicOnDrop;
     impl Drop for PanicOnDrop {

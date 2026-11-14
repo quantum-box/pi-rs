@@ -302,3 +302,9 @@ Scheduler and driver signal delivery is fenced with inspection; direct TaskStore
 writes are outside that protocol. Satisfied waits count as active even when their definition is blocked, and abort
 cleanup candidates may still depend on conversations. Fail-fast sibling cleanup
 is not independently represented. See [snapshot tests](../crates/durable/tests/task_wake_snapshot.rs).
+
+Nested pending-job reconciliation is a pi-rs host API with a narrower boundary
+than upstream's nested task scheduler. A host can record a verified terminal
+result or confirmed cancellation against the exact persisted operation and
+opaque reference, then separately reconcile the parent. It does not infer the
+parent result or reconcile an interrupted nested call lacking a pending reference.

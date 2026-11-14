@@ -7561,6 +7561,78 @@ impl Harness {
         }
         Ok(())
     }
+    /// List nested pending jobs belonging to the currently blocked root operation.
+    pub fn nested_pending_jobs(
+        &self,
+        id: Uuid,
+        root: Uuid,
+    ) -> Result<Vec<crate::nested::PendingJob>, Error> {
+        let (c, _) = self.load(id)?;
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
+        {
+            return Err(Error::Invalid(
+                "conversation is not blocked on this operation".into(),
+            ));
+        }
+        crate::nested::pending_jobs(self.owner.store(), root)
+    }
+    /// Record a terminal observation for a nested pending job. An authoritative
+    /// cancellation should be supplied as a failed outcome by the host after the
+    /// remote cancellation is confirmed. This does not cancel the remote job.
+    pub fn reconcile_nested_pending(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        outcome: Outcome,
+    ) -> Result<(), Error> {
+        let (c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
+        {
+            return Err(Error::Invalid(
+                "conversation is not blocked on this operation".into(),
+            ));
+        }
+        crate::nested::resolve_pending(
+            self.owner.store(),
+            Self::key(id),
+            version,
+            root,
+            operation,
+            reference,
+            outcome,
+            false,
+        )
+    }
+    /// Record confirmation that the remote job was cancelled. This performs no
+    /// remote cancellation; the caller must obtain authoritative confirmation.
+    pub fn cancel_nested_pending(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        reason: String,
+    ) -> Result<(), Error> {
+        let (c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
+        {
+            return Err(Error::Invalid(
+                "conversation is not blocked on this operation".into(),
+            ));
+        }
+        crate::nested::resolve_pending(
+            self.owner.store(),
+            Self::key(id),
+            version,
+            root,
+            operation,
+            reference,
+            Outcome::Failed(reason),
+            true,
+        )
+    }
     /// Supply an authoritative outcome for an interrupted or pending operation.
     pub fn reconcile(
         &mut self,
@@ -7600,7 +7672,7 @@ impl Harness {
         if operation_id != expected {
             return Err(Error::Invalid("operation ID mismatch".into()));
         }
-        if c.abort_requested {
+        {
             let prefix = format!("nested/{operation_id}/");
             for (_, entry) in self.owner.store().list(prefix.as_bytes())? {
                 let record: serde_json::Value = serde_json::from_slice(&entry.value)?;
@@ -8309,6 +8381,36 @@ impl Scheduler {
     }
     pub fn blocked(&self, id: Uuid) -> Result<Option<(Uuid, String)>, Error> {
         self.harness.blocked(id)
+    }
+    pub fn nested_pending_jobs(
+        &self,
+        id: Uuid,
+        root: Uuid,
+    ) -> Result<Vec<crate::nested::PendingJob>, Error> {
+        self.harness.nested_pending_jobs(id, root)
+    }
+    pub fn reconcile_nested_pending(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        outcome: Outcome,
+    ) -> Result<(), Error> {
+        self.harness.reconcile_nested_pending(
+            id, root, operation, reference, outcome,
+        )
+    }
+    pub fn cancel_nested_pending(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        reason: String,
+    ) -> Result<(), Error> {
+        self.harness
+            .cancel_nested_pending(id, root, operation, reference, reason)
     }
     /// Record a known tool outcome and resume the conversation.
     pub fn reconcile(
