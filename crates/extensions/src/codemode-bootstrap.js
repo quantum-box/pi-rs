@@ -80,10 +80,41 @@
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;
     };
+    const record = value => typeof value === "object" && value !== null && !Array.isArray(value);
+    const imageBlock = value => record(value) && value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string";
+    const validateContext = (action, context) => {
+        const name = action === "classify" ? "models.classify()" : "models.generateImages()";
+        if (!record(context)) throw new Error(`${name} expects a context object`);
+        if (action === "classify") {
+            if (!record(context.state)) throw new Error(`${name} context.state must be an object`);
+            if (context.images !== undefined && (!Array.isArray(context.images) || !context.images.every(imageBlock)))
+                throw new Error(`${name} context.images must be an array of image blocks`);
+            if (!record(context.questions) || !Object.keys(context.questions).length)
+                throw new Error(`${name} context.questions must map question IDs to questions`);
+            for (const [id, question] of Object.entries(context.questions)) {
+                if (!record(question) || typeof question.instructions !== "string")
+                    throw new Error(`${name} context.questions.${id} must have string instructions`);
+                const criteria = question.criteria;
+                const strings = values => values.length > 0 && values.every(value => typeof value === "string");
+                const valid = question.type === "choice" ? record(criteria) && strings(Object.values(criteria))
+                    : question.type === "score" ? Array.isArray(criteria) && strings(criteria)
+                    : question.type === "bool" ? record(criteria) && typeof criteria.true === "string" && typeof criteria.false === "string"
+                    : false;
+                if (!valid) throw new Error(`${name} context.questions.${id} has invalid type or criteria`);
+            }
+        } else if (!Array.isArray(context.input) || !context.input.length || !context.input.every(value =>
+            record(value) && ((value.type === "text" && typeof value.text === "string") || imageBlock(value)))) {
+            throw new Error(`${name} context.input must be a non-empty array of text or image blocks`);
+        }
+    };
     const modelOperation = async (action, model, context) => {
-        const { provider = "", id = "" } = model ?? {};
+        if (!record(model) || typeof model.provider !== "string" || typeof model.id !== "string")
+            throw new Error(`models.${action}() expects a model with provider and id strings`);
+        validateContext(action, context);
+        const { provider, id } = model;
         const reply = JSON.parse(await callModel(JSON.stringify({ action, provider, id, context })));
-        return reply.ok ? reply.value : { provider, model: id, stopReason: "error", errorMessage: reply.error, ...(action === "classify" ? { answers: {} } : { output: [] }) };
+        if (!reply.ok) throw new Error(reply.error);
+        return reply.value;
     };
     globalThis.models = Object.freeze({
         getModelsOfType: (type, provider) => listModels(type, provider, false),

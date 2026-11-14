@@ -75,7 +75,8 @@ fn image_url(image: &pi_rs::ImageContent) -> String {
 pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Value, bool)> {
     let state = context
         .get("state")
-        .ok_or_else(|| Error::Config("classifier context requires state".into()))?;
+        .filter(|state| state.is_object())
+        .ok_or_else(|| Error::Config("classifier context.state must be an object".into()))?;
     let questions = context["questions"]
         .as_object()
         .filter(|questions| !questions.is_empty() && questions.len() <= 256)
