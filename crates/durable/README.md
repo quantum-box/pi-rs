@@ -75,8 +75,9 @@ hook phase pending, and a mismatched registration fails closed. Reopen with the
 extensions and driver registered to resume. Harness users explicitly resume;
 Scheduler polls waiting phases. Hook errors fail closed. Failed child outcomes
 are currently ignored, as are after-tools terminate decisions, and invalid
-requests stop the phase instead of upstream's report-and-skip behavior. Provider-body and on-yield hooks are not integrated, and this
-runtime does not support terminate-round decisions. Before-tool hooks may sleep on
+requests stop the phase instead of upstream's report-and-skip behavior. onYield
+supports string continuations in a persisted phase, but not hook-created tasks.
+Provider-body hooks and terminate-round decisions are not integrated. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
