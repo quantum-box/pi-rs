@@ -228,7 +228,7 @@ fn malformed_frame_does_not_advance_commit_cursor() {
     use durable_store::Mutation;
     let store = Store::memory().unwrap();
     let docs = Documents::new(&store);
-    let (_, mut watch) = docs.watch_commits().unwrap();
+    let (initial, mut watch) = docs.watch_commits().unwrap();
     store
         .commit(
             &[],
@@ -239,6 +239,6 @@ fn malformed_frame_does_not_advance_commit_cursor() {
         )
         .unwrap();
     assert!(watch.poll(1).is_err());
-    assert_eq!(watch.cursor(), 0);
+    assert_eq!(watch.cursor(), initial.revision);
     assert!(watch.poll(1).is_err());
 }
