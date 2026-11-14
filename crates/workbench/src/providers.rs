@@ -775,6 +775,11 @@ impl Client {
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
                     let adaptive = metadata.adaptive_thinking();
                     if metadata.reasoning == Some(true) {
+                        // Messages-compatible gateways need not implement Anthropic's
+                        // Models API. Keep their configured capabilities local.
+                        if args.provider.id() != "anthropic" {
+                            client = client.with_context_probe(false);
+                        }
                         let selected = thinking.unwrap_or("off");
                         let mapped = metadata.mapped_effort(selected);
                         if selected == "off" && mapped == Some(None) {

@@ -3825,6 +3825,9 @@ levels when model discovery is unavailable or omits thinking capability. When th
 capability, its supported modes and levels drive both selection and requests;
 explicit adaptive or thinking-level-map overrides remain authoritative. Other
 discovered model metadata, including output limits, is retained with overrides.
+Automatic thinking discovery for configured Anthropic Messages-compatible models
+is restricted to the Anthropic provider; other gateways retain their declared
+capabilities without an additional Models API probe.
 
 ### Native Anthropic authorization header checkpoint
 

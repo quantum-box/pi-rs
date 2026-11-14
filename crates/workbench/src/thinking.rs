@@ -36,6 +36,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     }
     let configured = metadata.as_ref().and_then(|model| model.levels(adapter));
     let discover_first = adapter == super::providers::Adapter::Anthropic
+        && args.provider.id() == "anthropic"
         && args.allow_model_probes()
         && metadata.as_ref().is_some_and(|model| {
             model.reasoning == Some(true)
