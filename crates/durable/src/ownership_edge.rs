@@ -7,6 +7,7 @@ use crate::{
 };
 use durable_store::{Check, Entry, Expected, Mutation, Store};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/conversation-owner/";
@@ -34,10 +35,11 @@ pub struct StoredEdge {
 
 /// Include all checks and mutations unchanged in one `Store::commit`. Do not
 /// add conflicting writes to these keys or replace either endpoint with a
-/// different identity or ownership in the same transaction. The prepared
-/// mutations advance the task record version so an abort traversal that read
-/// the task before this edge was created cannot commit using that snapshot.
-/// On an uncertain commit outcome, reopen and inspect the records before retrying.
+/// different identity or ownership in the same transaction. Do not compose
+/// another ownership edge or modify ownership records in the same transaction:
+/// checks see the pre-commit state. Re-prepare after a conflict. The mutations
+/// advance the task version to fence abort traversals. On an uncertain commit
+/// outcome, reopen and inspect the records before retrying.
 pub struct PreparedEdge {
     pub checks: Vec<Check>,
     pub mutations: Vec<Mutation>,
@@ -104,7 +106,7 @@ impl<'a> EdgeStore<'a> {
     /// expected owner is checked against the task record. The child must already
     /// exist; its actual identity and both endpoint versions are checked. A
     /// concurrent change or another owner of this child makes commit conflict.
-    /// This only rejects a direct conversation self-edge, not longer cycles.
+    /// The entire owner chain, including background edges, is fenced at commit.
     pub fn prepare_create(&self, edge: &Edge) -> Result<PreparedEdge, Error> {
         let task = TaskStore::new(self.store)
             .load(edge.task)?
@@ -127,21 +129,23 @@ impl<'a> EdgeStore<'a> {
             return Err(Error::Invalid);
         }
         let key = edge_key(edge.child);
+        let mut checks = owner_chain_checks(self.store, edge.task, edge.child)?;
+        checks.extend([
+            Check {
+                key: task_store::key(edge.task),
+                expected: Expected::Version(task.version),
+            },
+            Check {
+                key: child_key,
+                expected: Expected::Version(child_entry.version),
+            },
+            Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            },
+        ]);
         Ok(PreparedEdge {
-            checks: vec![
-                Check {
-                    key: task_store::key(edge.task),
-                    expected: Expected::Version(task.version),
-                },
-                Check {
-                    key: child_key,
-                    expected: Expected::Version(child_entry.version),
-                },
-                Check {
-                    key: key.clone(),
-                    expected: Expected::Missing,
-                },
-            ],
+            checks,
             mutations: vec![
                 Mutation::Put {
                     key: task_store::key(edge.task),
@@ -172,4 +176,65 @@ pub(crate) fn reject_foreground_children(
         }
     }
     Ok(false)
+}
+
+/// Follow owners upwards. A missing conversation edge is a root and must be
+/// checked as missing, so a concurrent edge insertion invalidates the result.
+pub(crate) fn owner_chain_checks(
+    store: &Store,
+    task: Uuid,
+    child: Uuid,
+) -> Result<Vec<Check>, Error> {
+    let mut checks = Vec::new();
+    let mut seen_tasks = HashSet::new();
+    let mut seen_conversations = HashSet::new();
+    let mut next = TaskOwner::Task(task);
+    loop {
+        match next {
+            TaskOwner::Task(id) => {
+                if !seen_tasks.insert(id) {
+                    return Err(Error::Invalid);
+                }
+                let stored = TaskStore::new(store).load(id)?.ok_or(Error::Invalid)?;
+                checks.push(Check {
+                    key: task_store::key(id),
+                    expected: Expected::Version(stored.version),
+                });
+                next = stored.task.owner().clone();
+            }
+            TaskOwner::Conversation(id) => {
+                if id == child || !seen_conversations.insert(id) {
+                    return Err(Error::Invalid);
+                }
+                let key = edge_key(id);
+                match store.get(&key)? {
+                    Some(entry) => {
+                        let stored = decode(&key, entry)?;
+                        checks.push(Check {
+                            key,
+                            expected: Expected::Version(stored.version),
+                        });
+                        let owner = TaskStore::new(store)
+                            .load(stored.edge.task)?
+                            .ok_or(Error::Invalid)?;
+                        if owner.task.owner() != &stored.edge.task_owner {
+                            return Err(Error::Invalid);
+                        }
+                        checks.push(Check {
+                            key: task_store::key(stored.edge.task),
+                            expected: Expected::Version(owner.version),
+                        });
+                        next = TaskOwner::Task(stored.edge.task);
+                    }
+                    None => {
+                        checks.push(Check {
+                            key,
+                            expected: Expected::Missing,
+                        });
+                        return Ok(checks);
+                    }
+                }
+            }
+        }
+    }
 }

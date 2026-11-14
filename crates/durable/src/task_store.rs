@@ -38,6 +38,8 @@ pub enum Error {
     SignalTargetClosed,
     #[error("invalid owner checkpoint key or child task")]
     InvalidOwnedBatch,
+    #[error("task ownership cannot be changed")]
+    OwnerChanged,
 }
 
 /// A task and the storage version that must be supplied for its next update.
@@ -141,7 +143,16 @@ impl<'a> TaskStore<'a> {
         for save in tasks {
             let (task, expected) = match save {
                 Save::Create(task) => (*task, Expected::Missing),
-                Save::Update(stored) => (&stored.task, Expected::Version(stored.version)),
+                Save::Update(stored) => {
+                    if let Some(current) = self.load(stored.task.id())? {
+                        if current.version == stored.version
+                            && current.task.owner() != stored.task.owner()
+                        {
+                            return Err(Error::OwnerChanged);
+                        }
+                    }
+                    (&stored.task, Expected::Version(stored.version))
+                }
             };
             let key = key(task.id());
             if !seen.insert(key.clone()) {

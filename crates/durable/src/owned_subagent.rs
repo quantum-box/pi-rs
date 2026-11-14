@@ -212,7 +212,13 @@ impl Harness {
                 child_state.admit_initial_input(initial.id, initial.content.clone());
             }
             let mut prepared = self.prepare_save(&child_state, Expected::Missing)?;
-            let checks = [
+            let mut checks =
+                ownership_edge::owner_chain_checks(store, task, child).map_err(|e| match e {
+                    ownership_edge::Error::Store(e) => Error::from(e),
+                    ownership_edge::Error::Json(e) => Error::from(e),
+                    _ => invalid(),
+                })?;
+            checks.extend([
                 Check {
                     key: tk.clone(),
                     expected: Expected::Version(snapshot.version),
@@ -225,7 +231,7 @@ impl Harness {
                     key: ek.clone(),
                     expected: Expected::Missing,
                 },
-            ];
+            ]);
             let mutations = [
                 Mutation::Put {
                     key: tk,
@@ -1068,8 +1074,17 @@ mod tests {
             child: parent,
             mode: Mode::Foreground,
         };
-        let prepared = EdgeStore::new(store).prepare_create(&edge).unwrap();
-        store.commit(&prepared.checks, &prepared.mutations).unwrap();
+        assert!(EdgeStore::new(store).prepare_create(&edge).is_err());
+        // Simulate a corrupt legacy store to exercise defensive abort traversal.
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(parent),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
         h.request_abort(parent).unwrap();
         assert!(h.conversation(child).unwrap().abort_requested);
         assert!(

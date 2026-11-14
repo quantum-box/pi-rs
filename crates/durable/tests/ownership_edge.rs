@@ -77,9 +77,8 @@ fn atomic_composition_conflicts_and_reopen() {
         tasks.save(&[Save::Create(&t)]).unwrap();
         let edges = EdgeStore::new(&db);
         let a = edges.prepare_create(&first).unwrap();
-        let b = edges.prepare_create(&second).unwrap();
-        let mut checks = [a.checks, b.checks].concat();
-        let mut mutations = [a.mutations, b.mutations].concat();
+        let mut checks = a.checks;
+        let mut mutations = a.mutations;
         checks.push(Check {
             key: b"checkpoint".to_vec(),
             expected: Expected::Version(42),
@@ -97,6 +96,8 @@ fn atomic_composition_conflicts_and_reopen() {
         assert!(db.get(b"checkpoint").unwrap().is_none());
         checks.pop();
         db.commit(&checks, &mutations).unwrap();
+        let b = edges.prepare_create(&second).unwrap();
+        db.commit(&b.checks, &b.mutations).unwrap();
         assert!(matches!(
             db.commit(&checks, &mutations),
             Err(durable_store::Error::Conflict { .. })
@@ -122,6 +123,158 @@ fn atomic_composition_conflicts_and_reopen() {
     ));
     assert_eq!(edges.get(child).unwrap().unwrap().edge, first);
     assert_eq!(db.get(b"checkpoint").unwrap().unwrap().value, b"committed");
+}
+
+#[test]
+fn indirect_cycles_across_task_and_background_edges_are_rejected_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (a, b, c) = {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        (
+            h.create_conversation(config()).unwrap(),
+            h.create_conversation(config()).unwrap(),
+            h.create_conversation(config()).unwrap(),
+        )
+    };
+    let ta = task(a);
+    let nested = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Task(ta.id()),
+        ta.checkpoint().clone(),
+        1,
+    )
+    .unwrap();
+    let tb = task(b);
+    let tc = task(c);
+    {
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db)
+            .save(&[
+                Save::Create(&ta),
+                Save::Create(&nested),
+                Save::Create(&tb),
+                Save::Create(&tc),
+            ])
+            .unwrap();
+        for edge in [
+            Edge {
+                task: nested.id(),
+                task_owner: nested.owner().clone(),
+                child: b,
+                mode: Mode::Background,
+            },
+            Edge {
+                task: tb.id(),
+                task_owner: tb.owner().clone(),
+                child: c,
+                mode: Mode::Foreground,
+            },
+        ] {
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+        }
+    }
+    let db = Store::open(&path).unwrap();
+    let closing = Edge {
+        task: tc.id(),
+        task_owner: tc.owner().clone(),
+        child: a,
+        mode: Mode::Foreground,
+    };
+    assert!(matches!(
+        EdgeStore::new(&db).prepare_create(&closing),
+        Err(pi_rs_durable::ownership_edge::Error::Invalid)
+    ));
+    assert!(EdgeStore::new(&db).get(a).unwrap().is_none());
+}
+
+#[test]
+fn concurrently_prepared_opposite_edges_cannot_both_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (a, b) = {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        (
+            h.create_conversation(config()).unwrap(),
+            h.create_conversation(config()).unwrap(),
+        )
+    };
+    let db = Store::open(&path).unwrap();
+    let ta = task(a);
+    let tb = task(b);
+    TaskStore::new(&db)
+        .save(&[Save::Create(&ta), Save::Create(&tb)])
+        .unwrap();
+    let ab = Edge {
+        task: ta.id(),
+        task_owner: ta.owner().clone(),
+        child: b,
+        mode: Mode::Foreground,
+    };
+    let ba = Edge {
+        task: tb.id(),
+        task_owner: tb.owner().clone(),
+        child: a,
+        mode: Mode::Background,
+    };
+    let first = EdgeStore::new(&db).prepare_create(&ab).unwrap();
+    let second = EdgeStore::new(&db).prepare_create(&ba).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = [first, second]
+        .into_iter()
+        .map(|batch| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Store::open(path).unwrap();
+                barrier.wait();
+                db.commit(&batch.checks, &batch.mutations)
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(durable_store::Error::Conflict { .. })))
+            .count(),
+        1
+    );
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    let edges = EdgeStore::new(&db);
+    let loser = if edges.get(b).unwrap().is_some() {
+        &ba
+    } else {
+        &ab
+    };
+    assert!(matches!(
+        edges.prepare_create(loser),
+        Err(pi_rs_durable::ownership_edge::Error::Invalid)
+    ));
+}
+
+#[test]
+fn task_store_rejects_replacing_an_owner() {
+    let db = Store::memory().unwrap();
+    let tasks = TaskStore::new(&db);
+    let original = task(Uuid::new_v4());
+    tasks.save(&[Save::Create(&original)]).unwrap();
+    let mut replacement = tasks.load(original.id()).unwrap().unwrap();
+    replacement.task = Task::new(
+        original.id(),
+        TaskOwner::Conversation(Uuid::new_v4()),
+        original.checkpoint().clone(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        tasks.save(&[Save::Update(&replacement)]),
+        Err(pi_rs_durable::task_store::Error::OwnerChanged)
+    ));
+    assert_eq!(tasks.load(original.id()).unwrap().unwrap().task, original);
 }
 
 #[test]

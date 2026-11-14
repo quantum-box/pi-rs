@@ -161,9 +161,16 @@ Task cleanup waits until each foreground child conversation has settled its abor
 including that conversation's foreground tasks. `Scheduler::abort_and_wait` joins
 workers for the entire affected foreground scope. Standalone task-driver aborts
 still reject foreground conversation children because they cannot drive or cancel
-their workers. Cyclic ownership can prevent cleanup from making progress; callers
-must avoid cycles. A blocked uncertain operation requires reconciliation, and a
-task driver must be running to drain tasks.
+their workers. A blocked uncertain operation requires reconciliation, and a task
+driver must be running to drain tasks.
+
+Task-to-conversation edge preparation and owned-subagent admission reject owner
+cycles by checking the persisted owner chain, including background links. Versions
+and absent root edges are checked in the transaction, so concurrent changes require
+fresh preparation. Prepared edges must be committed one at a time without other
+ownership changes; raw store writes must preserve immutable ownership. Existing
+corrupt cycles are rejected on traversal, not repaired. Background remains an
+abort/idle boundary, not a break in ownership identity.
 Current limits and differences from upstream Pi Durable:
 
 - Historical forks accept safe committed observation snapshots, including during runs,
