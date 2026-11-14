@@ -86,6 +86,10 @@ pub struct Task {
     delivered_signal: Option<Uuid>,
     #[serde(default)]
     typed_wake: Option<TypedWake>,
+    /// Terminal direct children observed by the most recent child wait. Kept
+    /// across reservation and replay until the next progress or settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ended_children: Option<Vec<Uuid>>,
     /// Registration identity; absent on records created by the standalone API.
     #[serde(default)]
     kind: Option<String>,
@@ -136,6 +140,7 @@ impl Task {
             restart_limit,
             delivered_signal: None,
             typed_wake: None,
+            ended_children: None,
             kind: None,
             replay_safe: false,
             abort_requested: false,
@@ -193,6 +198,7 @@ impl Task {
         self.definition_version = version;
         self.input = input;
         self.typed_wake = None;
+        self.ended_children = None;
         self.checkpoint = checkpoint;
     }
 
@@ -216,6 +222,7 @@ impl Task {
             self.restarts = 0;
         }
         self.typed_wake = None;
+        self.ended_children = None;
         if matches!(self.state, TaskState::Waiting(_)) {
             self.state = TaskState::Ready;
         }
@@ -248,6 +255,15 @@ impl Task {
 
     pub(crate) fn set_typed_wake(&mut self, wake: TypedWake) {
         self.typed_wake = Some(wake);
+    }
+
+    #[allow(dead_code)] // Private until the tool wake API is integrated.
+    pub(crate) fn ended_children(&self) -> Option<&[Uuid]> {
+        self.ended_children.as_deref()
+    }
+
+    pub(crate) fn set_ended_children(&mut self, ended: Vec<Uuid>) {
+        self.ended_children = Some(ended);
     }
 
     pub fn delivered_signal(&self) -> Option<Uuid> {
@@ -303,6 +319,7 @@ impl Task {
         self.checkpoint = checkpoint;
         self.restarts = 0;
         self.typed_wake = None;
+        self.ended_children = None;
         Ok(())
     }
 
@@ -333,6 +350,7 @@ impl Task {
         }
         self.delivered_signal = None;
         self.typed_wake = None;
+        self.ended_children = None;
         self.state = TaskState::Waiting(condition);
         self.attempt_id = None;
         Ok(())
@@ -358,6 +376,7 @@ impl Task {
         self.state = TaskState::Succeeded(result);
         self.attempt_id = None;
         self.typed_wake = None;
+        self.ended_children = None;
         Ok(())
     }
 
@@ -366,6 +385,7 @@ impl Task {
         self.state = TaskState::Failed(reason);
         self.attempt_id = None;
         self.typed_wake = None;
+        self.ended_children = None;
         Ok(())
     }
 
@@ -375,6 +395,7 @@ impl Task {
         }
         self.state = TaskState::Failed("abort restart limit".into());
         self.typed_wake = None;
+        self.ended_children = None;
         Ok(())
     }
 
@@ -389,6 +410,7 @@ impl Task {
         self.state = TaskState::Cancelled;
         self.attempt_id = None;
         self.typed_wake = None;
+        self.ended_children = None;
         Ok(())
     }
 

@@ -1847,6 +1847,88 @@ mod tests {
     }
 
     #[test]
+    fn child_wake_payload_survives_reservation_recovery_and_reaches_handler() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let parent = Uuid::from_u128(1);
+        let a = Uuid::from_u128(2);
+        let b = Uuid::from_u128(3);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let mut registry = Registry::default();
+        registry.register("parent", true, move |parent_task: &Task| {
+            if parent_task.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![a, b]),
+                    children: vec![
+                        task(2, TaskOwner::Task(parent), "child", true, 3),
+                        task(3, TaskOwner::Task(parent), "child", true, 3),
+                    ],
+                })
+            } else {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(parent_task.ended_children().map(<[Uuid]>::to_vec));
+                Ok(Step::Wait {
+                    checkpoint: cp("after"),
+                    condition: WaitFor::Signal("hold".into()),
+                    children: vec![],
+                })
+            }
+        });
+        registry.register("child", true, |task: &Task| {
+            if task.id() == Uuid::from_u128(2) {
+                Ok(Step::Succeed(serde_json::json!("done")))
+            } else {
+                Ok(Step::Wait {
+                    checkpoint: cp("hold"),
+                    condition: WaitFor::Signal("hold".into()),
+                    children: vec![],
+                })
+            }
+        });
+        let mut scheduler = Scheduler::open(&path, registry.clone()).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                3,
+            ))
+            .unwrap();
+        scheduler.tick(0).unwrap(); // parent creates and waits for its children
+        scheduler.tick(0).unwrap(); // first child finishes
+        let waiting = scheduler.ts().load(parent).unwrap().unwrap();
+        assert!(matches!(
+            scheduler.ts().poll_wait(&waiting, 0).unwrap(),
+            WakeResult::Woken { .. }
+        ));
+        let ready = scheduler.ts().load(parent).unwrap().unwrap();
+        assert_eq!(ready.task.ended_children(), Some(&[a][..]));
+        // The private payload is the wake-commit snapshot; a child ending
+        // later is not added to it at reservation (unlike upstream wake.ended).
+        let second = scheduler.ts().load(b).unwrap().unwrap();
+        scheduler.ts().update(&second, |t| t.cancel()).unwrap();
+        scheduler.ts().reserve(&ready).unwrap(); // process dies after reservation
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(
+            scheduler.get(parent).unwrap().unwrap().ended_children(),
+            Some(&[a][..])
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![Some(vec![a])]);
+        assert_eq!(
+            scheduler.get(parent).unwrap().unwrap().ended_children(),
+            None
+        );
+    }
+
+    #[test]
     fn any_and_fail_fast_survive_reopen_and_cancel_descendants() {
         for fail_fast in [false, true] {
             let dir = tempfile::tempdir().unwrap();

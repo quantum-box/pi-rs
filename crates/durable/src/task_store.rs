@@ -922,6 +922,7 @@ impl<'a> TaskStore<'a> {
         }];
         let mut mutations = Vec::new();
         let mut delivered = None;
+        let mut ended_children = None;
         match condition {
             WaitFor::DeadlineMillis(deadline) => {
                 if now_millis < *deadline {
@@ -1093,7 +1094,7 @@ impl<'a> TaskStore<'a> {
             WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) | WaitFor::TasksFailFast(ids) => {
                 let mut seen = std::collections::HashSet::new();
                 let mut pending = false;
-                let mut ended = false;
+                let mut ended = Vec::new();
                 for id in ids {
                     if !seen.insert(*id) {
                         return Err(Error::InvalidChild);
@@ -1105,7 +1106,7 @@ impl<'a> TaskStore<'a> {
                     if !child.task.is_terminal() {
                         pending = true;
                     } else {
-                        ended = true;
+                        ended.push(*id);
                     }
                     checks.push(Check {
                         key: key(*id),
@@ -1113,12 +1114,13 @@ impl<'a> TaskStore<'a> {
                     });
                 }
                 if if matches!(condition, WaitFor::TasksAny(_)) {
-                    !ended
+                    ended.is_empty()
                 } else {
                     pending
                 } {
                     return Ok(WakeResult::Pending);
                 }
+                ended_children = Some(ended);
             }
         }
         if !commit {
@@ -1130,6 +1132,9 @@ impl<'a> TaskStore<'a> {
             None => next.wake(),
         }
         .map_err(Error::Transition)?;
+        if let Some(ended) = ended_children {
+            next.set_ended_children(ended);
+        }
         if let WaitFor::TypedSleep { signals, .. } = condition {
             let wake = match &delivered {
                 Some(signal) => {
@@ -1817,6 +1822,54 @@ mod tests {
             ts.send_signal(&signal),
             Err(Error::SignalTargetClosed)
         ));
+    }
+
+    #[test]
+    fn child_wake_records_only_ended_children_and_abort_clears_it() {
+        for all in [false, true] {
+            let db = Store::memory().unwrap();
+            let ts = TaskStore::new(&db);
+            let mut parent = task(1, 3);
+            let mut first = owned(2, 1);
+            let mut second = owned(3, 1);
+            first.start().unwrap();
+            first.succeed(json!(1)).unwrap();
+            if all {
+                second.cancel().unwrap();
+            }
+            parent.start().unwrap();
+            let ids = vec![second.id(), first.id()];
+            parent
+                .wait(if all {
+                    WaitFor::Tasks(ids)
+                } else {
+                    WaitFor::TasksAny(ids)
+                })
+                .unwrap();
+            ts.save(&[
+                Save::Create(&parent),
+                Save::Create(&first),
+                Save::Create(&second),
+            ])
+            .unwrap();
+            let waiting = ts.load(parent.id()).unwrap().unwrap();
+            assert!(matches!(
+                ts.poll_wait(&waiting, 0).unwrap(),
+                WakeResult::Woken { .. }
+            ));
+            let ready = ts.load(parent.id()).unwrap().unwrap();
+            let expected = if all {
+                vec![second.id(), first.id()]
+            } else {
+                vec![first.id()]
+            };
+            assert_eq!(ready.task.ended_children(), Some(expected.as_slice()));
+            ts.update(&ready, |t| t.request_abort()).unwrap();
+            assert_eq!(
+                ts.load(parent.id()).unwrap().unwrap().task.ended_children(),
+                None
+            );
+        }
     }
 
     #[test]
