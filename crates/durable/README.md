@@ -212,3 +212,17 @@ structured outputs, diagnostics, streaming and file mutation queue. It does
 not install tools automatically, provide an environment abstraction, or add
 exactly-once execution. The optional dependency pulls in the workbench and its
 dependencies.
+
+The native `before_compact` extension hook runs on manual, threshold and
+provider-overflow compaction after message-range selection. The first decline
+or summary wins; a hook error is skipped. The hook's task-scoped memo survives
+interruption and reopening, and the selected range and operation identity are
+persisted before invocation. Hook-supplied summaries bypass model usage.
+
+This is a partial upstream durable hook: the host selects message ranges rather
+than upstream entry records, so it exposes messages and a message index rather
+than entry IDs or head markers. Manual compaction currently has no instructions
+argument. Hook errors are collected by the extension dispatcher but the harness
+has no `onReport` callback and currently discards those reports. Empty hook
+summaries are rejected by the existing compaction validation. Compaction is
+still subject to the host's existing idle/manual and context-selection limits.

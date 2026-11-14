@@ -150,6 +150,18 @@ pub fn prepare(
 }
 
 impl Preparation {
+    pub(crate) fn hook_input(
+        &self,
+        reason: crate::extension::CompactionReason,
+    ) -> crate::extension::CompactionInput {
+        crate::extension::CompactionInput {
+            reason,
+            messages: self.source[self.system_end..self.first_kept].to_vec(),
+            first_kept: self.first_kept,
+            instructions: None,
+        }
+    }
+
     /// Exact, tool-free request to persist alongside caller-provided identities.
     pub fn request(&self) -> &ModelRequest {
         &self.request

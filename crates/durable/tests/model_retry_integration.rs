@@ -207,3 +207,56 @@ async fn overflow_compaction_can_resume_successfully() {
     );
     s.shutdown().await.unwrap();
 }
+
+struct OverflowHook(Arc<Mutex<Vec<pi_rs_durable::extension::CompactionReason>>>);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for OverflowHook {
+    async fn before_compact(
+        &self,
+        input: &pi_rs_durable::extension::CompactionInput,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeCompact, String> {
+        self.0.lock().unwrap().push(input.reason);
+        Ok(pi_rs_durable::extension::BeforeCompact::Summary(
+            "overflow hook".into(),
+        ))
+    }
+}
+#[tokio::test]
+async fn overflow_compaction_uses_hook_summary() {
+    use pi_rs_core::CancellationToken;
+    use pi_rs_durable::{
+        extension::{CompactionReason, Extension},
+        runtime::Harness,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options(model(0, ""))).unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.submit_and_run(id, None, "previous".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let next = model(1, "context length exceeded");
+    let seen = Arc::new(Mutex::new(vec![]));
+    let mut h = Harness::open_paused(&path, options(next.clone())).unwrap();
+    h.install_extension(Extension {
+        name: "overflow".into(),
+        hooks: vec![Arc::new(OverflowHook(seen.clone()))],
+        ..Default::default()
+    })
+    .unwrap();
+    h.select_extensions(id, vec!["overflow".into()]).unwrap();
+    h.submit_and_run(id, None, "current".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![CompactionReason::Overflow]);
+    assert_eq!(next.summaries.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[1].status,
+        Status::Done { .. }
+    ));
+}

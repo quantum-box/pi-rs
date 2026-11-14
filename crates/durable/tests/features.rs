@@ -554,3 +554,198 @@ async fn fork_drops_queued_reset_and_unplaced_write() {
         .unwrap();
     assert!(h.conversation(child).unwrap().application_writes[0].placed);
 }
+
+struct CompactHook {
+    decision: pi_rs_durable::extension::BeforeCompact,
+    seen: Arc<std::sync::Mutex<Vec<pi_rs_durable::extension::CompactionReason>>>,
+    wait: bool,
+    fail: bool,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for CompactHook {
+    async fn before_compact(
+        &self,
+        input: &pi_rs_durable::extension::CompactionInput,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeCompact, String> {
+        assert!(!input.messages.is_empty());
+        self.seen.lock().unwrap().push(input.reason);
+        let value = ctx
+            .memo
+            .get_or_insert(
+                "compact-test",
+                serde_json::json!(if self.fail { 99 } else { 42 }),
+            )
+            .await?;
+        assert_eq!(value, serde_json::json!(42));
+        if self.wait {
+            std::future::pending::<()>().await;
+        }
+        if self.fail {
+            return Err("hook error".into());
+        }
+        Ok(self.decision.clone())
+    }
+}
+fn compact_extension(
+    hooks: Vec<Arc<dyn pi_rs_durable::extension::Hook>>,
+) -> pi_rs_durable::extension::Extension {
+    pi_rs_durable::extension::Extension {
+        name: "compact".into(),
+        hooks,
+        ..Default::default()
+    }
+}
+fn hook(
+    decision: pi_rs_durable::extension::BeforeCompact,
+    seen: &Arc<std::sync::Mutex<Vec<pi_rs_durable::extension::CompactionReason>>>,
+    wait: bool,
+    fail: bool,
+) -> Arc<dyn pi_rs_durable::extension::Hook> {
+    Arc::new(CompactHook {
+        decision,
+        seen: seen.clone(),
+        wait,
+        fail,
+    })
+}
+#[tokio::test]
+async fn before_compact_replays_memo_after_cancellation_and_first_decision_wins() {
+    use pi_rs_durable::extension::{BeforeCompact, CompactionReason};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_extension(compact_extension(vec![hook(
+            BeforeCompact::Pass,
+            &seen,
+            true,
+            false,
+        )]))
+        .unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.select_extensions(id, vec!["compact".into()]).unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "latest".into(), &cancel)
+            .await
+            .unwrap();
+        assert!(h.request_compaction(id, 0).unwrap());
+        let stop = CancellationToken::new();
+        let trigger = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        assert!(h.resume(&stop).await.is_err());
+    }
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_extension(compact_extension(vec![
+            hook(BeforeCompact::Pass, &seen, false, true),
+            hook(
+                BeforeCompact::Summary("hook checkpoint".into()),
+                &seen,
+                false,
+                false,
+            ),
+            hook(BeforeCompact::Decline, &seen, false, false),
+        ]))
+        .unwrap();
+        h.resume(&cancel).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert!(c.messages.iter().any(
+            |m| matches!(m, Message::User { content } if content.contains("hook checkpoint"))
+        ));
+    }
+    assert_eq!(*seen.lock().unwrap(), vec![CompactionReason::Manual; 3]);
+}
+
+#[tokio::test]
+async fn before_compact_decline_preserves_messages() {
+    use pi_rs_durable::extension::BeforeCompact;
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let mut h = Harness::open_paused(dir.path().join("db"), opts()).unwrap();
+    h.install_extension(compact_extension(vec![hook(
+        BeforeCompact::Decline,
+        &seen,
+        false,
+        false,
+    )]))
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["compact".into()]).unwrap();
+    h.submit_and_run(id, None, "old".into(), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(id, None, "latest".into(), &cancel)
+        .await
+        .unwrap();
+    let before = h.conversation(id).unwrap().messages;
+    assert!(h.request_compaction(id, 0).unwrap());
+    h.resume(&cancel).await.unwrap();
+    assert_eq!(h.conversation(id).unwrap().messages, before);
+}
+
+#[tokio::test]
+async fn before_compact_runs_for_automatic_threshold() {
+    use pi_rs_durable::extension::{BeforeCompact, CompactionReason};
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let model = Arc::new(SmallModel {
+        summaries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let options = Options {
+        model: model.clone(),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    h.install_extension(compact_extension(vec![hook(
+        BeforeCompact::Summary("automatic hook summary".into()),
+        &seen,
+        false,
+        false,
+    )]))
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "small".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["compact".into()]).unwrap();
+    h.submit_and_run(id, None, "x".repeat(14_000), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(id, None, "latest".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![CompactionReason::Threshold]);
+    assert_eq!(model.summaries.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(h.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::User { content } if content.contains("automatic hook summary"))
+    ));
+}

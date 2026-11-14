@@ -155,8 +155,36 @@ pub struct HookTask {
     pub input: Value,
 }
 
+/// The selected message range; entry identifiers are not available in this host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionInput {
+    pub reason: CompactionReason,
+    pub messages: Vec<pi_rs_core::Message>,
+    pub first_kept: usize,
+    pub instructions: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+    Overflow,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BeforeCompact {
+    Pass,
+    Decline,
+    Summary(String),
+}
+
 #[async_trait]
 pub trait Hook: Send + Sync {
+    async fn before_compact(
+        &self,
+        _input: &CompactionInput,
+        _ctx: &Context<'_>,
+    ) -> Result<BeforeCompact, String> {
+        Ok(BeforeCompact::Pass)
+    }
     async fn before_tool(
         &self,
         _call: &ToolCall,
@@ -387,6 +415,24 @@ impl Resolved {
             parts.push(format!("<instructions>\n{text}\n</instructions>"));
         }
         (parts.join("\n\n"), reports)
+    }
+    /// First decision wins; ordinary hook errors are collected and skipped.
+    pub async fn before_compact(
+        &self,
+        input: &CompactionInput,
+        ctx: &Context<'_>,
+    ) -> (BeforeCompact, Vec<Report>) {
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(h.before_compact(input, ctx)).await {
+                    Ok(BeforeCompact::Pass) => (),
+                    Ok(decision) => return (decision, reports),
+                    Err(err) => reports.push(failure(&e.name, "before_compact", err)),
+                }
+            }
+        }
+        (BeforeCompact::Pass, reports)
     }
     /// Any hook failure stops dispatch; a host must also validate a sleep and
     /// re-run the complete chain on wake before dispatching.

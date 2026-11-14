@@ -166,6 +166,11 @@ enum Phase {
     RetryWait {
         turns: u32,
     },
+    CompactionHook {
+        preparation: Box<crate::compact::Preparation>,
+        operation_id: Uuid,
+        reason: crate::extension::CompactionReason,
+    },
     CompactionReady {
         preparation: Box<crate::compact::Preparation>,
         restarts: u32,
@@ -1396,9 +1401,10 @@ impl Harness {
         else {
             return Ok(false);
         };
-        c.phase = Phase::CompactionReady {
+        c.phase = Phase::CompactionHook {
             preparation: Box::new(preparation),
-            restarts: 0,
+            operation_id: Uuid::new_v4(),
+            reason: crate::extension::CompactionReason::Manual,
         };
         c.compaction_return_turns = None;
         self.save(&c, Expected::Version(version))?;
@@ -2194,6 +2200,56 @@ impl Harness {
                         other => other?,
                     }
                 }
+                Phase::CompactionHook {
+                    preparation,
+                    operation_id,
+                    reason,
+                } => {
+                    let selected = self.selected_extensions(&c)?;
+                    let snapshot = serde_json::to_value(&c)?;
+                    let memo = self.extension_memo(operation_id)?;
+                    let context = crate::extension::Context {
+                        snapshot: &snapshot,
+                        memo: &memo,
+                    };
+                    let input = preparation.hook_input(reason);
+                    let (decision, _reports) = fenced_poll(
+                        selected.before_compact(&input, &context),
+                        self.execution_gate.as_ref(),
+                        cancel,
+                    )
+                    .await
+                    .ok_or(Error::Interrupted)?;
+                    self.subagent_store()?;
+                    match decision {
+                        crate::extension::BeforeCompact::Pass => {
+                            c.phase = Phase::CompactionReady {
+                                preparation,
+                                restarts: 0,
+                            }
+                        }
+                        crate::extension::BeforeCompact::Decline => {
+                            c.phase = c
+                                .compaction_return_turns
+                                .take()
+                                .map_or(Phase::Idle, |turns| Phase::ModelReady { turns })
+                        }
+                        crate::extension::BeforeCompact::Summary(summary) => {
+                            let result = (*preparation).finish(CompletedGeneration {
+                                content: summary,
+                                calls: vec![],
+                                usage: None,
+                                metadata: Default::default(),
+                            })?;
+                            c.messages = result.apply(&c.messages)?;
+                            c.phase = c
+                                .compaction_return_turns
+                                .take()
+                                .map_or(Phase::Idle, |turns| Phase::ModelReady { turns });
+                        }
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
                 Phase::CompactionReady {
                     preparation,
                     restarts,
@@ -2350,9 +2406,10 @@ impl Harness {
                                         None,
                                     )? {
                                         c.compaction_return_turns = Some(turns);
-                                        c.phase = Phase::CompactionReady {
+                                        c.phase = Phase::CompactionHook {
                                             preparation: Box::new(preparation),
-                                            restarts: 0,
+                                            operation_id: Uuid::new_v4(),
+                                            reason: crate::extension::CompactionReason::Threshold,
                                         };
                                         self.save(&c, Expected::Version(version))?;
                                         continue;
@@ -4163,9 +4220,10 @@ fn start_overflow_compaction(
         None,
     )? {
         c.compaction_return_turns = Some(turns);
-        c.phase = Phase::CompactionReady {
+        c.phase = Phase::CompactionHook {
             preparation: Box::new(preparation),
-            restarts: 0,
+            operation_id: Uuid::new_v4(),
+            reason: crate::extension::CompactionReason::Overflow,
         };
     } else {
         finish_failure(c, reason);
