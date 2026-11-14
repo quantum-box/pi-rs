@@ -1161,6 +1161,7 @@ theme's syntax roles, and unknown languages use its plain code-block color.
 Paragraphs are separated from following code blocks as well. TypeScript and
 TSX fences use Syntect's JavaScript grammar as a fallback, so shared syntax is
 highlighted but TypeScript-specific tokens can differ from Pi's highlighter.
+Empty fenced blocks retain one indented content row.
 Wrapped list content keeps its indentation. Quotes render borders and quote
 styling on every continuation line, including nested quotes and narrow terminals.
 User messages also render Markdown, retaining their original ordered and

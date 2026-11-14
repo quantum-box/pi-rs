@@ -1084,7 +1084,10 @@ fn markdown_at_depth(
                     let syntax = SYNTAXES.find_syntax_by_token(syntax_language);
                     let mut highlighter =
                         syntax.map(|syntax| HighlightLines::new(syntax, &SYNTAX_THEME));
-                    for line in code_text.split_inclusive('\n') {
+                    for line in code_text
+                        .split_inclusive('\n')
+                        .chain(code_text.is_empty().then_some(""))
+                    {
                         let display_line = line.strip_suffix('\n').unwrap_or(line);
                         let terminated;
                         let input = if line.ends_with('\n') {
@@ -1357,6 +1360,34 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_fenced_code_has_one_indented_content_row() {
+        for language in ["", "rust", "unknown-language"] {
+            for content in ["", "\n"] {
+                let source = format!("before\n\n```{language}\n{content}```\n\nafter");
+                let theme = Theme::system();
+                let lines = markdown(&source, &theme, 80);
+                let rendered: Vec<String> = lines
+                    .iter()
+                    .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                    .collect();
+                assert_eq!(
+                    rendered,
+                    [
+                        "before",
+                        "",
+                        &format!("```{language}"),
+                        "  ",
+                        "```",
+                        "",
+                        "after"
+                    ],
+                    "{source:?}"
+                );
+                assert_eq!(lines[3].spans[0].color, theme.color("mdCodeBlock"));
+            }
+        }
+    }
     #[test]
     fn fenced_code_separates_following_blocks_without_trailing_blank_line() {
         for source in ["```\ncode\n```\nnext", "```\ncode\n```\n\nnext"] {
