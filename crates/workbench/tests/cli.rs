@@ -2455,6 +2455,77 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
     assert!(replies[4]["data"]["sessionFile"].is_string());
 }
 
+// A nonblocking listener may produce nonblocking accepted sockets. Each
+// fixture connection is read with a bounded blocking timeout, independently
+// of the listener and of any idle peers on the same port.
+fn read_rpc_model_fixture_request(socket: &TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut reader = BufReader::new(socket.try_clone()?);
+    let mut request = String::new();
+    if reader.read_line(&mut request)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "missing request",
+        ));
+    }
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value
+                .trim()
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok((request, body))
+}
+
+#[test]
+fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
+    use std::sync::mpsc;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut line = String::new();
+    assert_eq!(
+        reader.read_line(&mut line).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(reader);
+    let (ready, started) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        ready.send(()).unwrap();
+        done.send(read_rpc_model_fixture_request(&socket)).unwrap();
+    });
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        finished.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    client
+        .write_all(b"POST /api/show HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    let (request, body) = finished
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(request, "POST /api/show HTTP/1.1\r\n");
+    assert_eq!(body, b"{}");
+}
+
 #[test]
 fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     use std::sync::{
@@ -2470,13 +2541,15 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let endpoint = format!(
-        "http://{}/v1/chat/completions",
-        listener.local_addr().unwrap()
-    );
+    let fixture_address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{}/v1/chat/completions", fixture_address);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let (accepted, acceptance) = mpsc::channel();
     let server = std::thread::spawn(move || {
+        let mut connections = Vec::new();
         while !stopped.load(Ordering::Relaxed) {
             let (mut socket, _) = match listener.accept() {
                 Ok(pair) => pair,
@@ -2486,47 +2559,51 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
                 }
                 Err(e) => panic!("{e}"),
             };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
+            let _ = accepted.send(());
+            let observed = observed.clone();
+            connections.push(std::thread::spawn(move || {
+                let (request, request_body) = match read_rpc_model_fixture_request(&socket) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(format!("fixture read failed: {error}"));
+                        return;
+                    }
+                };
+                observed.lock().unwrap().push(request.clone());
+                let body = if request.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"}]}"#
+                } else if request.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if request.starts_with("POST /api/show ") {
+                    let body: Value = serde_json::from_slice(&request_body).unwrap();
+                    match body["model"].as_str() {
+                        Some("dynamic") => r#"{"capabilities":["vision"]}"#,
+                        Some("configured") => r#"{"capabilities":[]}"#,
+                        _ => panic!("unexpected model request: {body}"),
+                    }
+                } else {
+                    panic!("unexpected request {request}")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
                 .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || line.is_empty() {
-                continue;
-            }
-            let request = line.clone();
-            let mut length = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut request_body = vec![0; length];
-            reader.read_exact(&mut request_body).unwrap();
-            let body = if request.starts_with("GET /v1/models ") {
-                r#"{"data":[{"id":"dynamic"}]}"#
-            } else if request.starts_with("GET /api/ps ") {
-                r#"{"models":[]}"#
-            } else if request.starts_with("POST /api/show ") {
-                r#"{"capabilities":["vision"]}"#
-            } else {
-                panic!("unexpected request {request}")
-            };
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+            }));
+        }
+        for connection in connections {
+            connection.join().unwrap();
         }
     });
+    // Keep one accepted connection idle while the real discovery proceeds.
+    // A serial fixture would wait for this peer and miss the probe deadline.
+    let idle = TcpStream::connect(fixture_address).unwrap();
+    acceptance.recv_timeout(Duration::from_secs(3)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
         .args([
@@ -2574,12 +2651,15 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         }
     };
     let models = request(json!({"type":"get_available_models", "id":"models"}));
+    drop(idle);
     assert!(
         models["models"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"])),
+        "models: {models}; fixture requests: {:?}",
+        requests.lock().unwrap()
     );
     assert!(
         models["models"]
