@@ -222,23 +222,36 @@ pub(super) fn image_payload(entry: &Entry, context: &Value) -> Result<Value> {
     )
 }
 
-pub(super) fn image_output(body: &Value) -> Result<Vec<Value>> {
+pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> {
     let choices = body["choices"]
         .as_array()
         .ok_or_else(|| Error::Model("image provider response is missing its choices".into()))?;
     let Some(choice) = choices.first() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let Some(message) = choice.get("message").filter(|message| message.is_object()) else {
         return Err(Error::Model(
             "image provider response is missing its message".into(),
         ));
     };
-    let mut blocks = Vec::new();
     if let Some(content) = message["content"].as_str().filter(|text| !text.is_empty()) {
         blocks.push(json!({"type":"text","text":content}));
     }
-    for image in message["images"].as_array().into_iter().flatten() {
+    // Pi treats a missing or null images field as empty. Strings are iterable
+    // in JavaScript, but their characters have no image_url and are ignored.
+    let images = match message.get("images") {
+        None | Some(Value::Null | Value::String(_)) => &[][..],
+        Some(Value::Array(images)) => images.as_slice(),
+        Some(_) => {
+            return Err(Error::Model(
+                "image provider returned invalid images".into(),
+            ));
+        }
+    };
+    for image in images {
+        if image.is_null() {
+            return Err(Error::Model("image provider returned a null image".into()));
+        }
         let Some((mime_type, data)) = image["image_url"]
             .as_str()
             .or_else(|| image["image_url"]["url"].as_str())
@@ -247,11 +260,19 @@ pub(super) fn image_output(body: &Value) -> Result<Vec<Value>> {
         else {
             continue;
         };
+        // Upstream ignores data URLs that do not have a nonempty MIME type and payload.
+        if mime_type.is_empty()
+            || mime_type.contains(';')
+            || data.is_empty()
+            || data.contains(['\n', '\r'])
+        {
+            continue;
+        }
         let value = json!({"type":"image","mimeType":mime_type,"data":data});
         parse_image(&value)?;
         blocks.push(value);
     }
-    Ok(blocks)
+    Ok(())
 }
 
 pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
@@ -295,10 +316,14 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
     let output_cost = cost.output * output as f64 / 1_000_000.0;
     let read_cost = cost.cache_read * cache_read as f64 / 1_000_000.0;
     let write_cost = cost.cache_write * cache_write as f64 / 1_000_000.0;
-    Some(json!({
+    let mut result = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
         "cost":{"input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
             "total":input_cost+output_cost+read_cost+write_cost},
-    }))
+    });
+    if matches!(entry.api, Api::OpenRouterImages) {
+        result["cost"]["totalFromProvider"] = json!(false);
+    }
+    Some(result)
 }

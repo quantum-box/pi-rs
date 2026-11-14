@@ -387,8 +387,9 @@ impl Catalogue {
                     })?
                 };
                 let mut headers = BTreeMap::new();
-                let inherit_headers = !matches!(api, Api::WorkersAiSystemOne)
-                    || key_endpoint.as_ref() == Some(&endpoint);
+                // Provider headers can carry credentials under arbitrary names. Bind
+                // all of them to the provider's resolved endpoint, just like its key.
+                let inherit_headers = key_endpoint.as_ref() == Some(&endpoint);
                 for (inherited, header, value) in inherited
                     .into_iter()
                     .map(|(header, value)| (true, header, value))
@@ -746,13 +747,17 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        let result = if has_images && self.args.settings.block_model_images() {
-            Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
-        } else if let Some(model) = catalogue.0.iter().find(|model| {
+        let model = catalogue.0.iter().find(|model| {
             model.api.kind() == kind
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
-        }) {
+        });
+        if let Some(model) = model {
+            initialize_image_result(model, &mut data);
+        }
+        let result = if has_images && self.args.settings.block_model_images() {
+            Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
+        } else if let Some(model) = model {
             let operation = self.perform(model, &args["context"], &keys, &mut data);
             tokio::select! {
                 biased;
@@ -774,6 +779,18 @@ impl Tool for Operations {
             data,
             attachments: vec![],
         }
+    }
+}
+
+fn initialize_image_result(entry: &Entry, data: &mut Value) {
+    if matches!(entry.api, Api::OpenRouterImages) && data.get("timestamp").is_none() {
+        data["api"] = json!(entry.api);
+        data["timestamp"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        );
     }
 }
 
@@ -837,6 +854,7 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
+        initialize_image_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
@@ -886,13 +904,15 @@ impl Operations {
         let body = send_model_request(&self.client, request, entry.api).await?;
         let body: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
-        data["api"] = json!(entry.api);
-        data["timestamp"] = json!(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        );
+        if !matches!(entry.api, Api::OpenRouterImages) {
+            data["api"] = json!(entry.api);
+            data["timestamp"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            );
+        }
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -907,10 +927,14 @@ impl Operations {
                     classifier_answers(&context["questions"], &result_body["answers"])?
             }
             Api::OpenRouterImages => {
-                data["output"] = json!(image_output(&body)?);
                 if let Some(id) = body["id"].as_str() {
                     data["responseId"] = json!(id);
                 }
+                // Keep accepted blocks if a later image fails native validation.
+                let output = data["output"]
+                    .as_array_mut()
+                    .expect("image operation output is initialized as an array");
+                image_output(&body, output)?;
             }
         }
         Ok(())
@@ -1001,18 +1025,191 @@ mod tests {
         assert!(request.starts_with(b"POST /v1/chat/completions "));
     }
 
+    #[tokio::test]
+    async fn openrouter_image_partial_results_keep_response_metadata() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHILD: &str = "PI_RS_IMAGE_RESULT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "operation_models::tests::openrouter_image_partial_results_keep_response_metadata"])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let valid_image = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let cases = [
+            (json!({"choices":[{}]}), vec![], true),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":{"image_url":"data:image/png;base64,YQ=="}}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[{"image_url":"data:image/png;base64,aW1hZ2U="},null]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":null}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":"invalid"}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                    {"image_url":"data:image/png;base64,%%%"}
+                ]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":"https://example.org/image.png"},
+                    {"image_url":"data:;base64,YQ=="},
+                    {"image_url":"data:image/png;base64,"},
+                    {"image_url":"data:image/png;base64,aW1hZ2U="},
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}}
+                ]}}]}),
+                vec![
+                    json!({"type":"text","text":"caption"}),
+                    valid_image.clone(),
+                    valid_image,
+                ],
+                false,
+            ),
+        ];
+        for (mut body, expected_output, fails) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            body["id"] = json!("image-response");
+            body["usage"] = json!({"prompt_tokens":12, "completion_tokens":34});
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                assert_ne!(stream.read(&mut bytes).await.unwrap(), 0);
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-key", "models":[{
+                "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+            }]}});
+            let profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":config}))
+                    .unwrap();
+            let mut args = Cli::parse_from(["pi"]);
+            args.model_profiles = profiles;
+            let operation = Operations {
+                args,
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                }),
+            ).await.unwrap();
+            let Outcome::Structured { data, .. } = outcome else {
+                panic!("expected structured result")
+            };
+            assert_eq!(data["stopReason"], if fails { "error" } else { "stop" });
+            assert_eq!(data.get("errorMessage").is_some(), fails);
+            assert_eq!(data["api"], "openrouter-images");
+            assert!(data["timestamp"].as_u64().unwrap() > 0);
+            assert_eq!(data["responseId"], "image-response");
+            assert_eq!(data["usage"]["totalTokens"], 46);
+            assert_eq!(data["usage"]["cost"]["totalFromProvider"], false);
+            assert_eq!(data["output"], json!(expected_output));
+            server.await.unwrap();
+        }
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+            operation_id: uuid::Uuid::new_v4(), cancellation,
+        }).await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_early_error_retains_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let entry = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let mut data = json!({"stopReason":"stop", "output":[]});
+        assert!(
+            operation
+                .perform(
+                    entry,
+                    &json!({"input":[]}),
+                    &Keys::parse(&json!({})),
+                    &mut data
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
     #[test]
     fn openrouter_image_choices_validate_nonempty_responses() {
-        assert_eq!(
-            image_output(&json!({"choices":[]})).unwrap(),
-            Vec::<Value>::new()
-        );
-        assert!(image_output(&json!({})).is_err());
-        assert!(image_output(&json!({"choices":[{}]})).is_err());
-        assert_eq!(
-            image_output(&json!({"choices":[{"message":{"content":"description"}}]})).unwrap(),
-            vec![json!({"type":"text","text":"description"})]
-        );
+        let mut output = Vec::new();
+        image_output(&json!({"choices":[]}), &mut output).unwrap();
+        assert!(output.is_empty());
+        assert!(image_output(&json!({}), &mut output).is_err());
+        assert!(image_output(&json!({"choices":[{}]}), &mut output).is_err());
+        image_output(
+            &json!({"choices":[{"message":{"content":"description"}}]}),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, vec![json!({"type":"text","text":"description"})]);
     }
     #[test]
     fn openrouter_image_usage_keeps_reported_cache_counts() {
@@ -1316,8 +1513,122 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn operation_provider_headers_never_cross_model_endpoints() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn fixture(listener: tokio::net::TcpListener, response: &'static str) -> String {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase()
+        }
+
+        for (kind, api, route, response, context) in [
+            (
+                "image",
+                "openrouter-images",
+                "chat/completions",
+                r#"{"choices":[]}"#,
+                json!({"input":[{"type":"text","text":"draw"}]}),
+            ),
+            (
+                "classifier",
+                "typesafe-system-one",
+                "systemone",
+                r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#,
+                json!({"state":"test","questions":{"ok":{"type":"bool","instructions":"decide","criteria":{"true":"yes","false":"no"}}}}),
+            ),
+        ] {
+            let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let alternate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let primary_base = format!("http://{}/v1", primary.local_addr().unwrap());
+            let alternate_base = format!("http://{}/v1", alternate.local_addr().unwrap());
+            let primary_server = tokio::spawn(fixture(primary, response));
+            let alternate_server = tokio::spawn(fixture(alternate, response));
+            let config = json!({"relay":{"baseUrl":primary_base, "apiKey":"provider-key", "headers":{"Authorization":"Bearer provider-secret", "X-Provider-Secret":"secret-value", "X-Shared":"provider-value"}, "models":[
+                {"type":kind,"id":"primary","api":api,"baseUrl":format!("{primary_base}/"),"input":["text"]},
+                {"type":kind,"id":"alternate","api":api,"baseUrl":alternate_base,"input":["text"],"headers":{"X-Model-Secret":"model-value","X-Shared":"model-value"}}
+            ]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            for id in ["primary", "alternate"] {
+                let entry = catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "relay" && entry.model.id == id)
+                    .unwrap();
+                assert!(entry.endpoint.path().ends_with(route));
+                let keys = if id == "alternate" {
+                    Keys::parse(
+                        &json!({"relay":{"type":"api_key","key":"destination-key","endpoint":entry.endpoint.as_str()}}),
+                    )
+                } else {
+                    Keys::parse(&json!({}))
+                };
+                let mut data = json!({"output":[]});
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    operation.perform(entry, &context, &keys, &mut data),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let primary = tokio::time::timeout(Duration::from_secs(5), primary_server)
+                .await
+                .unwrap()
+                .unwrap();
+            let alternate = tokio::time::timeout(Duration::from_secs(5), alternate_server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(primary.contains("authorization: bearer provider-secret"));
+            assert!(primary.contains("x-provider-secret: secret-value"));
+            assert!(primary.contains("x-shared: provider-value"));
+            assert!(alternate.contains("authorization: bearer destination-key"));
+            assert!(alternate.contains("x-model-secret: model-value"));
+            assert!(alternate.contains("x-shared: model-value"));
+            assert!(!alternate.contains("provider-secret"));
+            assert!(!alternate.contains("secret-value"));
+            assert!(!alternate.contains("provider-value"));
+            assert!(!alternate.contains("provider-key"));
+        }
+    }
+
     #[test]
-    fn workers_ai_header_scope_does_not_change_other_apis() {
+    fn operation_provider_headers_are_scoped_for_every_api() {
         let config = json!({"relay":{"baseUrl":"https://provider.example/ai", "headers":{"X-Provider":"value"}, "models":[
             {"type":"classifier", "id":"workers", "api":"cloudflare-workers-ai-system-one", "baseUrl":"https://other.example/ai", "headers":{"X-Model":"kept"}},
             {"type":"classifier", "id":"system", "api":"typesafe-system-one", "baseUrl":"https://other.example/ai"}
@@ -1335,7 +1646,7 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay" && entry.model.id == "system")
             .unwrap();
-        assert_eq!(system.model.headers["x-provider"], "value");
+        assert!(!system.model.headers.contains_key("x-provider"));
     }
     #[test]
     fn workers_ai_classifier_honors_image_format_override() {

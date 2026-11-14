@@ -3159,6 +3159,18 @@ total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
 
+### OpenRouter image result checkpoint
+
+Image results record their API and creation timestamp even when request
+validation fails. Response IDs and measured usage survive malformed choices,
+and accepted text and images survive an error in a later image block. Empty
+choices succeed. Usage estimates identify their total as locally calculated.
+Non-data URLs and structurally incomplete data URLs are ignored. Unlike Pi,
+pi-rs validates generated image MIME types and base64 before exposing them and
+retains its response-size limit. Provider-level operation headers are bound to
+the provider endpoint, including for classifiers; model headers apply to their
+own endpoint. No live OpenRouter account was used.
+
 ### Chat model connection and compatibility
 
 Configured chat models can select their own endpoint and request headers.
