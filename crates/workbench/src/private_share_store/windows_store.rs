@@ -36,7 +36,12 @@ fn digest<T: Serialize>(key: &[u8; 32], domain: &str, value: &T) -> io::Result<[
 }
 fn name_for(key: &[u8; 32], path: &Path, id: uuid::Uuid, suffix: &str) -> io::Result<String> {
     let path: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let digest = digest(key, "share-session-windows-v1", &(path, id))?;
+    // Every identity at the same pathname shares one generation boundary.
+    let digest = if matches!(suffix, "lock" | "generation" | "anchor") {
+        digest(key, "share-path-windows-v2", &path)?
+    } else {
+        digest(key, "share-session-windows-v1", &(path, id))?
+    };
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(format!("{hex}.{suffix}"))
 }
@@ -424,6 +429,33 @@ mod tests {
         let generation = store.begin(&path, binding.clone()).unwrap();
         drop(generation);
         assert_eq!(store.read(&path, &binding).unwrap(), None);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn different_session_ids_at_same_path_share_generation() {
+        let root = std::env::temp_dir().join(format!("pi-share-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let first = Binding {
+            session_id: uuid::Uuid::new_v4(),
+            head: 1,
+            journal_digest: [1; 32],
+            provenance_digest: [2; 32],
+        };
+        let mut second = first.clone();
+        second.session_id = uuid::Uuid::new_v4();
+        store
+            .begin(&path, second.clone())
+            .unwrap()
+            .publish(second.clone(), json!({"old":true}))
+            .unwrap();
+        let lease = store.try_begin(&path, first).unwrap();
+        assert_eq!(store.read(&path, &second).unwrap(), None);
+        drop(lease);
+        assert_eq!(store.read(&path, &second).unwrap(), None);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

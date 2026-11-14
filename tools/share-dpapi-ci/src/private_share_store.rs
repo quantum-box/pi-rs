@@ -204,7 +204,13 @@ mod unix {
         suffix: &str,
     ) -> io::Result<CString> {
         let path = session_path.as_os_str().as_bytes();
-        let digest = keyed_digest(key, "share-session-v1", &(path, id))?;
+        // Locks and generation records must cover every session identity that
+        // can appear at this pathname, including a journal replaced at runtime.
+        let digest = if matches!(suffix, "lock" | "generation" | "anchor") {
+            keyed_digest(key, "share-path-v2", &path)?
+        } else {
+            keyed_digest(key, "share-session-v1", &(path, id))?
+        };
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         CString::new(format!("{hex}.{suffix}"))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cache name"))
