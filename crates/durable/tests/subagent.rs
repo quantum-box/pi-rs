@@ -291,7 +291,7 @@ async fn crash_after_answer_reports_shared_answer_once_and_retries_receipt() {
     scheduler.shutdown().await.unwrap();
     // Simulate a crash after parent admission but before reporter receipt.
     let db = Store::open(&path).unwrap();
-    let records = db.list(b"runtime/subagent-report/").unwrap();
+    let records = db.list(b"runtime/subagent-report-v2/").unwrap();
     assert_eq!(records.len(), 2);
     for (key, entry) in records {
         let mut record: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
@@ -313,7 +313,7 @@ async fn crash_after_answer_reports_shared_answer_once_and_retries_receipt() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let db = Store::open(&path).unwrap();
-            let records = db.list(b"runtime/subagent-report/").unwrap();
+            let records = db.list(b"runtime/subagent-report-v2/").unwrap();
             if records.iter().all(|(_, e)| {
                 serde_json::from_slice::<serde_json::Value>(&e.value).unwrap()["delivered"] == true
             }) {

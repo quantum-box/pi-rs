@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) const REPORT_REQUEST_PREFIX: &str = "__pi_rs_subagent_report/";
-const REPORTS: &[u8] = b"runtime/subagent-report/";
+const LEGACY_REPORTS: &[u8] = b"runtime/subagent-report/";
+const REPORTS: &[u8] = b"runtime/subagent-report-v2/";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
@@ -107,7 +108,7 @@ fn key(parent: Uuid, name: &str) -> Vec<u8> {
     key
 }
 fn reporter_key(parent: Uuid, request_id: &str) -> Vec<u8> {
-    let mut key = format!("runtime/subagent-report/{parent}/").into_bytes();
+    let mut key = format!("runtime/subagent-report-v2/{parent}/").into_bytes();
     key.extend_from_slice(request_id.as_bytes());
     key
 }
@@ -632,11 +633,11 @@ impl Harness {
         }
         let link = self.ensure_subagent_restricted(parent, name, config, history, allowed_tools)?;
         let k = reporter_key(parent, &request_id);
-        // Older databases keyed intents by child. Preserve their parent-wide
-        // identity when upgrading, including retired and delivered records.
-        for (old_key, entry) in self.subagent_store()?.list(REPORTS)? {
+        // Older databases keyed intents by child or parent in a shared namespace.
+        // Preserve their identity, including retired and delivered records.
+        for (_old_key, entry) in self.subagent_store()?.list(LEGACY_REPORTS)? {
             let old: Reporter = serde_json::from_slice(&entry.value)?;
-            if old.link.parent == parent && old.request_id == request_id && old_key != k {
+            if old.link.parent == parent && old.request_id == request_id {
                 if old.link != link {
                     return Err(Error::Invalid(
                         "reporter operation ID already belongs to another child".into(),
@@ -716,10 +717,24 @@ impl Harness {
     }
     pub(crate) fn pending_reporters(&self) -> Result<Vec<(Vec<u8>, Reporter)>, Error> {
         let mut result = Vec::new();
-        for (key, entry) in self.subagent_store()?.list(REPORTS)? {
+        let store = self.subagent_store()?;
+        let mut entries = store.list(LEGACY_REPORTS)?;
+        entries.extend(store.list(REPORTS)?);
+        for (key, entry) in entries {
             let reporter: Reporter = serde_json::from_slice(&entry.value)?;
+            let legacy_parent = format!(
+                "runtime/subagent-report/{}/{}",
+                reporter.link.parent, reporter.request_id
+            )
+            .into_bytes();
+            let legacy_child = format!(
+                "runtime/subagent-report/{}/{}",
+                reporter.link.child, reporter.request_id
+            )
+            .into_bytes();
             if key != reporter_key(reporter.link.parent, &reporter.request_id)
-                && key != reporter_key(reporter.link.child, &reporter.request_id)
+                && key != legacy_parent
+                && key != legacy_child
             {
                 return Err(Error::Invalid("invalid reporter key".into()));
             }

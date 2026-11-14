@@ -2949,6 +2949,113 @@ fn reporter_operation_ids_are_unique_per_parent() {
     );
 }
 
+#[test]
+fn legacy_child_key_does_not_block_nested_parent_operation() {
+    use crate::subagent::ReportedInput;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let input = || ReportedInput {
+        history: false,
+        request_id: "same".into(),
+        content: "hello".into(),
+        mode: InputMode::FollowUp,
+    };
+    let (link, first) = h
+        .submit_subagent_reported(parent, "one", config.clone(), input())
+        .unwrap();
+    let store = h.owner.store();
+    let records = store.list(b"runtime/subagent-report-v2/").unwrap();
+    let (key, entry) = &records[0];
+    let legacy = format!("runtime/subagent-report/{}/same", link.child).into_bytes();
+    store
+        .commit(
+            &[
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                },
+                Check {
+                    key: legacy.clone(),
+                    expected: Expected::Missing,
+                },
+            ],
+            &[
+                Mutation::Delete { key: key.clone() },
+                Mutation::Put {
+                    key: legacy,
+                    value: entry.value.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        h.submit_subagent_reported(parent, "one", config.clone(), input())
+            .unwrap()
+            .1,
+        first
+    );
+    assert!(
+        h.submit_subagent_reported(parent, "other", config.clone(), input())
+            .is_err()
+    );
+    let (nested, _) = h
+        .submit_subagent_reported(link.child, "nested", config, input())
+        .unwrap();
+    assert_eq!(h.conversation(nested.child).unwrap().submissions.len(), 1);
+    assert_eq!(h.pending_reporters().unwrap().len(), 2);
+}
+
+#[test]
+fn concurrent_reporter_ids_with_different_names_have_one_winner() {
+    use crate::subagent::ReportedInput;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|name| {
+            let mut worker = h.worker();
+            let barrier = barrier.clone();
+            let config = config.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                worker.submit_subagent_reported(
+                    parent,
+                    name,
+                    config,
+                    ReportedInput {
+                        history: false,
+                        request_id: "same".into(),
+                        content: "hello".into(),
+                        mode: InputMode::FollowUp,
+                    },
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(h.pending_reporters().unwrap().len(), 1);
+    let admitted: usize = ["one", "two"]
+        .into_iter()
+        .filter_map(|n| h.subagent(parent, n).unwrap())
+        .map(|l| h.conversation(l.child).unwrap().submissions.len())
+        .sum();
+    assert_eq!(admitted, 1);
+}
+
 #[tokio::test]
 async fn stale_reporter_retires_on_reopen_and_later_requests_work() {
     use crate::subagent::{ReportedInput, generation_check};
@@ -2985,6 +3092,10 @@ async fn stale_reporter_retires_on_reopen_and_later_requests_work() {
     h.resume_conversation(link.child, &CancellationToken::new())
         .await
         .unwrap();
+    assert!(
+        h.submit_subagent_reported(parent, "worker", config.clone(), input("old"))
+            .is_err()
+    );
     let (_, new_id) = h
         .submit_subagent_reported(parent, "worker", config, input("new"))
         .unwrap();

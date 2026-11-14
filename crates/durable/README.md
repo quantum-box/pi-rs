@@ -281,7 +281,8 @@ parent atomically with graph marks. Reporter intents are bound to that generatio
 stale intents are retired on replay, and child and report admissions check it in
 their storage commit. Normal aborts do not advance it. Reporter operation IDs are
 unique per parent, including across named children and after an abort; use a new
-ID for a new request.
+ID for a new request. New reporter records use a separate key namespace from
+older child-keyed and parent-keyed records, which remain readable on reopen.
 
 `Scheduler::submit_subagent_reported` persists a reporter intent before child
 admission. The background scheduler resumes pending intents after reopening,
