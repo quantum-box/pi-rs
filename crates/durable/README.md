@@ -688,8 +688,8 @@ storage errors still poison the scheduler and require reopening; storage errors
 can have an unknown outcome. The reservation is a separate durable commit,
 so a crash can leave the old checkpoint running. External effects require their
 own idempotency or reconciliation. Unlike upstream's transaction callback,
-this synchronous task callback has no entries, general session transaction,
-or arbitrary task creation. It uses optimistic checks rather than the upstream
+this synchronous task callback supports conversation-owned application entries
+(described below), but has no general session transaction or arbitrary task creation. It uses optimistic checks rather than the upstream
 Session mutation line and does not expose mutable Chord drafts. Upstream commits writes
 through `runtime.commit()` and documents replay-safe tool recovery on restart;
 this scheduler additionally gates whole-handler conflict retries on its recorded
@@ -745,8 +745,11 @@ durable change log: short-lived changes can be missed and missing-migration and
 migration callback failures share `MigrationFailed` (with diagnostic text).
 
 Parity limitations: the standalone scheduler uses host-driven ticks and both
-schedulers replace the whole registry. Unlike upstream, there is no report callback,
-task-graph integration, or host wake notification for blocked changes. The synchronous callback uses Rust `Result` and a structured
+schedulers replace the whole registry. Unlike upstream, report coverage and
+task-graph integration are incomplete. The driver exposes coalesced wake hints
+and a readiness snapshot (described below), rather than upstream wake-state
+notifications; extension-error subscriptions cover only a subset of reports.
+The synchronous callback uses Rust `Result` and a structured
 `Checkpoint` rather than upstream's JavaScript task types and JSON checkpoint;
 panics are not converted into migration failure reports. Explicit aborts of
 blocked definitions wait for owned children, then persist an orphan diagnostic
