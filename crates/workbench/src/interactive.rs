@@ -7318,6 +7318,20 @@ impl EditorJobSupervisor {
                 return Err(error);
             }
         }
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+            || limit.rlim_cur > libc::c_int::MAX as libc::rlim_t
+        {
+            let error = std::io::Error::other("could not bound supervisor file descriptors");
+            unsafe {
+                libc::close(response[0]);
+                libc::close(response[1]);
+                libc::close(control[0]);
+                libc::close(control[1]);
+            }
+            return Err(error);
+        }
+        let max_fd = limit.rlim_cur as libc::c_int;
         let parent = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -7333,8 +7347,13 @@ impl EditorJobSupervisor {
         if pid == 0 {
             // After fork from a multithreaded parent, call only libc and _exit.
             unsafe {
-                libc::close(response[0]);
-                libc::close(control[1]);
+                // Do not retain unrelated worker pipes, sockets, or terminal
+                // descriptors while the shell holds a stopped job.
+                for fd in 0..max_fd {
+                    if fd != response[1] && fd != control[0] && fd != tty {
+                        libc::close(fd);
+                    }
+                }
                 let ready = u8::from(libc::setpgid(0, 0) == 0);
                 libc::write(response[1], (&ready as *const u8).cast(), 1);
                 let mut command = 0u8;
@@ -8031,6 +8050,33 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_supervisor_does_not_hold_unrelated_pipes() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let supervisor = super::EditorJobSupervisor::start(0, unsafe { libc::getpgrp() }).unwrap();
+        unsafe {
+            libc::close(pipe[1]);
+        }
+        let mut byte = 0u8;
+        let mut poll = libc::pollfd {
+            fd: pipe[0],
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, 2000) };
+        assert!(ready > 0, "supervisor retained unrelated pipe");
+        assert_eq!(
+            unsafe { libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1) },
+            0
+        );
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        drop(supervisor);
     }
 
     #[cfg(unix)]
