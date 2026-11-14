@@ -86,10 +86,10 @@ fn minimax_m27_catalog_and_budgeted_messages_work_offline() {
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
-                if let Some((key, value)) = line.split_once(':') {
-                    if key.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().unwrap();
-                    }
+                if let Some((key, value)) = line.split_once(':')
+                    && key.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
                 }
                 headers.push_str(&line.to_ascii_lowercase());
             }
