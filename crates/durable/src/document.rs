@@ -460,7 +460,12 @@ impl Transaction {
         for check in &batch.checks {
             if checks.insert(check.key.clone()) {
                 unique.push(check.clone());
-            } else if !self.checks.iter().chain(unique.iter()).any(|existing| existing == check) {
+            } else if !self
+                .checks
+                .iter()
+                .chain(unique.iter())
+                .any(|existing| existing == check)
+            {
                 return Err(Error::InvalidBatch);
             }
             local_checks.insert(check.key.clone());
@@ -483,7 +488,8 @@ impl Transaction {
         if batch.checks.iter().any(|check| {
             graph_key(&check.key)
                 && check.expected == Expected::Missing
-                && ((self.checked.contains(&check.key) && writes.contains(&check.key)
+                && ((self.checked.contains(&check.key)
+                    && writes.contains(&check.key)
                     && !self.written.contains(&check.key))
                     || self.written.contains(&check.key))
         }) {
@@ -842,12 +848,18 @@ mod nested_entry_tests {
     fn transaction_coalesces_identical_checks_but_rejects_conflicts() {
         let mut tx = Transaction::new();
         let batch = |expected| OwnedBatch {
-            checks: vec![Check { key: b"owner".to_vec(), expected }],
+            checks: vec![Check {
+                key: b"owner".to_vec(),
+                expected,
+            }],
             mutations: vec![],
         };
         tx.append(batch(Expected::Missing)).unwrap();
         tx.append(batch(Expected::Missing)).unwrap();
-        assert!(matches!(tx.append(batch(Expected::Version(1))), Err(Error::InvalidBatch)));
+        assert!(matches!(
+            tx.append(batch(Expected::Version(1))),
+            Err(Error::InvalidBatch)
+        ));
         tx.commit(&Store::memory().unwrap()).unwrap();
     }
 
@@ -858,16 +870,30 @@ mod nested_entry_tests {
         let a = task(1, TaskOwner::Task(Uuid::from_u128(2)));
         let b = task(2, TaskOwner::Task(a.id()));
         for reverse in [false, true] {
-            let first = ts.prepare_save(&[Save::Create(if reverse { &b } else { &a })]).unwrap();
-            let second = ts.prepare_save(&[Save::Create(if reverse { &a } else { &b })]).unwrap();
+            let first = ts
+                .prepare_save(&[Save::Create(if reverse { &b } else { &a })])
+                .unwrap();
+            let second = ts
+                .prepare_save(&[Save::Create(if reverse { &a } else { &b })])
+                .unwrap();
             let mut tx = Transaction::new();
             tx.append(first).unwrap();
             assert!(matches!(tx.append(second), Err(Error::InvalidBatch)));
             tx.commit(&db).unwrap();
-            assert!(ts.load(if reverse { b.id() } else { a.id() }).unwrap().is_some());
+            assert!(
+                ts.load(if reverse { b.id() } else { a.id() })
+                    .unwrap()
+                    .is_some()
+            );
             // Start the next ordering against the same empty graph.
             let id = if reverse { b.id() } else { a.id() };
-            db.commit(&[], &[Mutation::Delete { key: crate::task_store::key(id) }]).unwrap();
+            db.commit(
+                &[],
+                &[Mutation::Delete {
+                    key: crate::task_store::key(id),
+                }],
+            )
+            .unwrap();
         }
     }
 
@@ -878,8 +904,10 @@ mod nested_entry_tests {
         let a = task(1, TaskOwner::Task(Uuid::from_u128(3)));
         let b = task(2, TaskOwner::Task(Uuid::from_u128(3)));
         let mut tx = Transaction::new();
-        tx.append(ts.prepare_save(&[Save::Create(&a)]).unwrap()).unwrap();
-        tx.append(ts.prepare_save(&[Save::Create(&b)]).unwrap()).unwrap();
+        tx.append(ts.prepare_save(&[Save::Create(&a)]).unwrap())
+            .unwrap();
+        tx.append(ts.prepare_save(&[Save::Create(&b)]).unwrap())
+            .unwrap();
         tx.commit(&db).unwrap();
         assert_eq!(ts.list().unwrap().len(), 2);
     }
@@ -888,15 +916,28 @@ mod nested_entry_tests {
     fn transaction_rejects_cross_component_missing_edge_in_both_orders() {
         let key = crate::ownership_edge::edge_key(Uuid::from_u128(7));
         for write_first in [false, true] {
-            let check = Check { key: key.clone(), expected: Expected::Missing };
-            let read = || OwnedBatch { checks: vec![check.clone()], mutations: vec![] };
+            let check = Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            };
+            let read = || OwnedBatch {
+                checks: vec![check.clone()],
+                mutations: vec![],
+            };
             let write = || OwnedBatch {
                 checks: vec![check.clone()],
-                mutations: vec![Mutation::Put { key: key.clone(), value: vec![] }],
+                mutations: vec![Mutation::Put {
+                    key: key.clone(),
+                    value: vec![],
+                }],
             };
             let mut tx = Transaction::new();
-            tx.append(if write_first { write() } else { read() }).unwrap();
-            assert!(matches!(tx.append(if write_first { read() } else { write() }), Err(Error::InvalidBatch)));
+            tx.append(if write_first { write() } else { read() })
+                .unwrap();
+            assert!(matches!(
+                tx.append(if write_first { read() } else { write() }),
+                Err(Error::InvalidBatch)
+            ));
         }
     }
 

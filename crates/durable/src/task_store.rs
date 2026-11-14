@@ -433,7 +433,9 @@ impl<'a> TaskStore<'a> {
                         let parent = self.load(id)?;
                         checks.push(Check {
                             key: key(id),
-                            expected: parent.as_ref().map_or(Expected::Missing, |p| Expected::Version(p.version)),
+                            expected: parent
+                                .as_ref()
+                                .map_or(Expected::Missing, |p| Expected::Version(p.version)),
                         });
                         match parent {
                             Some(parent) => next = parent.task.owner().clone(),
@@ -449,7 +451,9 @@ impl<'a> TaskStore<'a> {
                     let entry = self.store.get(&key)?;
                     checks.push(Check {
                         key: key.clone(),
-                        expected: entry.as_ref().map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                        expected: entry
+                            .as_ref()
+                            .map_or(Expected::Missing, |e| Expected::Version(e.version)),
                     });
                     match entry {
                         None => return Ok(checks),
@@ -459,7 +463,8 @@ impl<'a> TaskStore<'a> {
                             let owner = if let Some(owner) = created.get(&edge.edge.task) {
                                 (*owner).clone()
                             } else {
-                                let owner = self.load(edge.edge.task)?.ok_or(Error::InvalidOwnership)?;
+                                let owner =
+                                    self.load(edge.edge.task)?.ok_or(Error::InvalidOwnership)?;
                                 checks.push(Check {
                                     key: self::key(edge.edge.task),
                                     expected: Expected::Version(owner.version),
@@ -1265,9 +1270,13 @@ mod tests {
         Task::new(
             Uuid::from_u128(id),
             TaskOwner::Task(Uuid::from_u128(parent)),
-            Checkpoint { phase: "first".into(), data: json!({}) },
+            Checkpoint {
+                phase: "first".into(),
+                data: json!({}),
+            },
             3,
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1289,19 +1298,35 @@ mod tests {
             db.commit(&second.checks, &second.mutations),
             Err(durable_store::Error::Conflict { .. })
         ));
-        assert!(matches!(ts.save(&[Save::Create(&b)]), Err(Error::InvalidOwnership)));
+        assert!(matches!(
+            ts.save(&[Save::Create(&b)]),
+            Err(Error::InvalidOwnership)
+        ));
         assert!(ts.load(b.id()).unwrap().is_none());
         let registered_b = b.clone().registered("job".into(), true);
         assert!(matches!(
-            ts.commit_owned_tasks(&TaskOwner::Task(a.id()), b"checkpoint", Expected::Missing, b"value", &[registered_b]),
+            ts.commit_owned_tasks(
+                &TaskOwner::Task(a.id()),
+                b"checkpoint",
+                Expected::Missing,
+                b"value",
+                &[registered_b]
+            ),
             Err(Error::InvalidOwnership)
         ));
         assert!(db.get(b"checkpoint").unwrap().is_none());
 
         let child = owned(3, 1).registered("job".into(), true);
-        assert!(ts.commit_owned_tasks(
-            &TaskOwner::Task(a.id()), b"checkpoint", Expected::Missing, b"value", &[child]
-        ).is_ok());
+        assert!(
+            ts.commit_owned_tasks(
+                &TaskOwner::Task(a.id()),
+                b"checkpoint",
+                Expected::Missing,
+                b"value",
+                &[child]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1318,12 +1343,19 @@ mod tests {
             child: conversation,
             mode: Mode::Background,
         };
-        db.commit(&[], &[Mutation::Put {
-            key: edge_key(conversation),
-            value: serde_json::to_vec(&edge).unwrap(),
-        }]).unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: edge_key(conversation),
+                value: serde_json::to_vec(&edge).unwrap(),
+            }],
+        )
+        .unwrap();
         let child = task(1, 3);
-        assert!(matches!(ts.save(&[Save::Create(&child)]), Err(Error::InvalidOwnership)));
+        assert!(matches!(
+            ts.save(&[Save::Create(&child)]),
+            Err(Error::InvalidOwnership)
+        ));
         assert!(ts.load(child.id()).unwrap().is_none());
     }
 
