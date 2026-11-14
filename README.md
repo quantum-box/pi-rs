@@ -4,6 +4,18 @@ An embeddable Rust agent loop with streaming model responses, tools, an
 append-only session journal, and native Rust extensions. The workbench offers
 an interactive terminal, print and JSON output, and a JSONL control interface.
 
+For native Rust embedding, including a Tauri host example and the current
+browser-WASM limitations, see [the SDK embedding guide](docs/sdk-embedding.md).
+
+To try a native SDK session with a local Ollama server:
+
+```sh
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-ollama --example sdk_chat
+```
+
+Set `PI_RS_EXAMPLE_MODEL` to select a different installed model.
+
 ## Interactive terminal
 
 ```sh
