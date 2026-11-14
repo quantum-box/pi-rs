@@ -2291,8 +2291,9 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Boundary { turns, answer } => {
-                    if !c.pending_resets.is_empty() && answer.is_some() {
-                        let answer = answer.expect("checked above");
+                    if !c.pending_resets.is_empty()
+                        && let Some(answer) = answer.clone()
+                    {
                         finish_answer(&mut c, answer.clone());
                         c.phase = Phase::AfterRun {
                             answer,
