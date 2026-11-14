@@ -1042,6 +1042,9 @@ notice explaining why the image was omitted, including for injected read
 operations. Programmatic callers receive that text rather than an image.
 Unsupported inline formats such as BMP are converted to PNG even with image
 resizing disabled; conversion and resize failures have distinct notices.
+Conversion preserves image orientation; resizing operates on decoded pixels
+without applying the source byte limit to an intermediate encoding. Supported
+inline formats pass through without decoding when resizing is disabled.
 The native 20 MiB source limit, cancellation and filesystem errors remain
 separate failures. When an injected backend only implements `read_file`, its
 whole response is buffered before the 20 MiB check; bounded transfer requires

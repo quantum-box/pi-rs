@@ -2224,12 +2224,12 @@ impl CodingTool {
             let prepared = if supported {
                 crate::image_profile::normalize_cancellable(reader, profile, cancellation)
             } else {
-                let png = match crate::image_profile::convert_to_png_cancellable(
+                let image = match crate::image_profile::decode_source_cancellable(
                     reader,
                     crate::image_profile::MAX_IMAGE_SOURCE_BYTES,
                     cancellation,
                 ) {
-                    Ok(png) => png,
+                    Ok(image) => image,
                     Err(Error::Config(message))
                         if message.starts_with("cannot prepare model image:") =>
                     {
@@ -2240,11 +2240,7 @@ impl CodingTool {
                     }
                     Err(error) => return Err(error),
                 };
-                crate::image_profile::normalize_cancellable(
-                    image::ImageReader::with_format(Cursor::new(png), image::ImageFormat::Png),
-                    profile,
-                    cancellation,
-                )
+                crate::image_profile::prepare_pixels_cancellable(image, profile, cancellation)
             };
             let prepared = match prepared {
                 Ok(prepared) => prepared,
@@ -2337,6 +2333,12 @@ impl CodingTool {
                 return Err(Error::Config(
                     "image exceeds the 6 MiB original image limit".into(),
                 ));
+            }
+            if self.unrestricted {
+                return Ok(json!({"content":[
+                    {"type":"text", "text":format!("Read image file [{mime_type}]")},
+                    {"type":"image", "mimeType":mime_type, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}
+                ]}));
             }
             let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
                 .into_dimensions()
@@ -4159,6 +4161,152 @@ mod tests {
                 .unwrap()
                 .tool_content(),
                 "plain"
+            );
+        }
+    }
+
+    #[test]
+    fn oriented_tiff_is_applied_with_and_without_resizing() {
+        // Little-endian TIFF: two RGB pixels with orientation 6 (90° clockwise).
+        let mut tiff = b"II\x2a\0\x08\0\0\0".to_vec();
+        let entries: [(u16, u16, u32, u32); 11] = [
+            (256, 4, 1, 2),
+            (257, 4, 1, 1),
+            (258, 3, 3, 146),
+            (259, 3, 1, 1),
+            (262, 3, 1, 2),
+            (273, 4, 1, 152),
+            (274, 3, 1, 6),
+            (277, 3, 1, 3),
+            (278, 4, 1, 1),
+            (279, 4, 1, 6),
+            (284, 3, 1, 1),
+        ];
+        tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, ty, count, value) in entries {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&ty.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&[8, 0, 8, 0, 8, 0, 255, 0, 0, 0, 255, 0]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oriented.tiff");
+        std::fs::write(&path, tiff).unwrap();
+        for auto_resize in [true, false] {
+            let tool = CodingTool {
+                root: dir.path().to_path_buf(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize,
+                    profile: None,
+                    model_supports_images: None,
+                },
+            };
+            let value = tool.read_image(&path).unwrap().unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value["content"][1]["data"].as_str().unwrap())
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            assert_eq!(image.dimensions(), (1, 2));
+            assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+            assert_eq!(image.get_pixel(0, 1).0, [0, 255, 0]);
+        }
+    }
+
+    #[test]
+    fn converted_image_can_exceed_source_limit_before_resize() {
+        let (width, height) = (2048, 3413);
+        let mut state = 0x12345678u32;
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let image = image::RgbImage::from_raw(width, height, pixels).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bmp");
+        image.save(&path).unwrap();
+        assert!(
+            path.metadata().unwrap().len() < crate::image_profile::MAX_IMAGE_SOURCE_BYTES as u64
+        );
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            png.len() > crate::image_profile::MAX_IMAGE_SOURCE_BYTES,
+            "PNG size: {}",
+            png.len()
+        );
+        drop(png);
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_width: Some(32),
+                    max_height: Some(32),
+                    ..Default::default()
+                }),
+                model_supports_images: None,
+            },
+        };
+        let value = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn no_resize_passes_through_corrupt_inline_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.gif");
+        let bytes = b"GIF89a broken";
+        std::fs::write(&path, bytes).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: false,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let value = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(value["content"][0]["text"], "Read image file [image/gif]");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["content"][1]["data"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+        for (format, bytes) in [
+            (
+                image::ImageFormat::Png,
+                b"\x89PNG\r\n\x1a\nbroken".as_slice(),
+            ),
+            (image::ImageFormat::Jpeg, b"\xff\xd8\xffbroken".as_slice()),
+            (image::ImageFormat::Gif, b"GIF89a broken".as_slice()),
+            (
+                image::ImageFormat::WebP,
+                b"RIFF\0\0\0\0WEBPbroken".as_slice(),
+            ),
+        ] {
+            let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+            let value = tool.process_image(&path, reader, format, None).unwrap();
+            assert_eq!(value["content"][1]["mimeType"], format.to_mime_type());
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(value["content"][1]["data"].as_str().unwrap())
+                    .unwrap(),
+                bytes
             );
         }
     }
