@@ -48,9 +48,15 @@ when `NO_PROXY` selects a direct connection. Embedders using the original
 hostnames too; `HttpOptionsWithProxyHosts` enables private DNS proxy hosts.
 Lowercase environment variables take precedence, and explicit
 environment values take precedence over the setting. Proxy URL credentials are
-not displayed in the settings list. Other network surfaces need integration;
-for plain HTTP origins reqwest uses forward-proxy requests, while upstream Pi
-uses CONNECT tunneling.
+not displayed in the settings list. Workbench-configured reqwest proxies use
+CONNECT for HTTP as well as HTTPS origins, matching Pi. Externally supplied
+authenticated forward-only proxies retain forward behavior. Proxy decisions are captured per request and route-specific connection pools prevent
+credentials from following a request onto another route. Caller-provided forward
+proxy authorization is bound to the first route across redirects. Caller-provided proxy
+authorization is removed for direct and local-socket requests, and passed only
+to the selected proxy for CONNECT. It overrides configured basic authentication;
+configured proxy-specific headers retain their existing precedence. HTTP/3 rejects matched proxy routes rather
+than bypassing them. Other network surfaces need integration.
 
 The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates
