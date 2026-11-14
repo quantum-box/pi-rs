@@ -5411,6 +5411,26 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn historical_fork_publish_rejects_oversized_record_without_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut snapshot = Session::with_store(MemoryStore::default()).unwrap();
+        snapshot
+            .append(crate::Event::SourceEntry {
+                format: "fixture".into(),
+                entry: serde_json::json!({"data":"x".repeat(16 * 1024 * 1024)}),
+            })
+            .unwrap();
+        assert!(snapshot.publish_and_bind_snapshot(&path).is_err());
+        assert!(!path.exists());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "fork.jsonl.lock")
+        );
+    }
+
     #[tokio::test]
     async fn historical_fallback_fork_preflights_before_hooks_and_publication() {
         struct CountingForkHook(Arc<AtomicUsize>);

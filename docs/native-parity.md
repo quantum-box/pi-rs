@@ -753,6 +753,10 @@ the committed record and reports the successful transition, while subsequent
 dispatch fails closed until an authorized client is registered. Persistent
 forks recover pending handoffs and validate their complete snapshot before
 publishing and retain the locked published file handle.
+Failures before publication remove the temporary snapshot and do not replace a
+destination. As with existing journal export, a directory-sync failure after
+the atomic publish can leave the complete destination in place; callers should
+inspect it before retrying.
 Construction fallback commits a single native selection record even after an
 imported Pi source, using a distinct timestamp so older projections retain the
 change. Older journals remain readable; journals containing the new transition
