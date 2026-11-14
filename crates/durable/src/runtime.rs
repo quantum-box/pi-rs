@@ -1397,8 +1397,10 @@ impl Harness {
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
-                    for (original, current) in
-                        base.application_writes.iter().zip(&latest.application_writes)
+                    for (original, current) in base
+                        .application_writes
+                        .iter()
+                        .zip(&latest.application_writes)
                     {
                         if !original.withdrawn
                             && current.withdrawn

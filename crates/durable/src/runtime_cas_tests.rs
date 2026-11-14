@@ -3327,13 +3327,22 @@ fn withdrawn_write_retry_ignores_replacement_kind_and_legacy_json_defaults() {
     let write = owner
         .submit_write(id, Some("key".into()), "app.note".into(), None)
         .unwrap();
-    assert_eq!(owner.withdraw_submission(id, write).unwrap(), WithdrawResult::Aborted);
+    assert_eq!(
+        owner.withdraw_submission(id, write).unwrap(),
+        WithdrawResult::Aborted
+    );
     for kind in ["", "pi.reserved"] {
         assert_eq!(
-            owner.submit_write(id, Some("key".into()), kind.into(), None).unwrap(),
+            owner
+                .submit_write(id, Some("key".into()), kind.into(), None)
+                .unwrap(),
             write
         );
-        assert!(owner.submit_write(id, Some("other".into()), kind.into(), None).is_err());
+        assert!(
+            owner
+                .submit_write(id, Some("other".into()), kind.into(), None)
+                .is_err()
+        );
     }
     let current = owner.conversation(id).unwrap();
     let mut legacy = serde_json::to_value(&current.application_writes[0]).unwrap();
@@ -3342,7 +3351,8 @@ fn withdrawn_write_retry_ignores_replacement_kind_and_legacy_json_defaults() {
     assert!(!restored.withdrawn);
     assert!(!restored.placed);
     let roundtrip: ApplicationWrite =
-        serde_json::from_value(serde_json::to_value(&current.application_writes[0]).unwrap()).unwrap();
+        serde_json::from_value(serde_json::to_value(&current.application_writes[0]).unwrap())
+            .unwrap();
     assert!(roundtrip.withdrawn && !roundtrip.placed);
 }
 
@@ -3376,8 +3386,16 @@ fn withdrawal_of_new_write_survives_stale_worker_placing_its_reset() {
     worker.save(&stale, Expected::Version(version)).unwrap();
     let state = owner.conversation(id).unwrap();
     assert!(state.resets.iter().any(|r| r.id == reset));
-    let removed = state.application_writes.iter().find(|w| w.id == withdrawn).unwrap();
-    let placed = state.application_writes.iter().find(|w| w.id == kept).unwrap();
+    let removed = state
+        .application_writes
+        .iter()
+        .find(|w| w.id == withdrawn)
+        .unwrap();
+    let placed = state
+        .application_writes
+        .iter()
+        .find(|w| w.id == kept)
+        .unwrap();
     assert!(removed.withdrawn && !removed.placed);
     assert!(!placed.withdrawn && placed.placed);
 }

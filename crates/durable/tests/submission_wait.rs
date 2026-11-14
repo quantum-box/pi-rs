@@ -197,7 +197,10 @@ async fn withdrawn_write_settles_across_reopen_and_other_writes_follow_resets() 
     );
     started.notified().await;
     release.notify_one();
-    assert_eq!(wait(&s, c, kept).await.unwrap(), SubmissionSettlement::Write);
+    assert_eq!(
+        wait(&s, c, kept).await.unwrap(),
+        SubmissionSettlement::Write
+    );
     let state = s.conversation(c).unwrap();
     let w = state
         .application_writes
