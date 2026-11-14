@@ -1236,10 +1236,12 @@ struct ModelCacheKey {
 struct ModelCacheScope {
     provider: String,
     endpoint: String,
+    discovery_endpoint: String,
     adapter: String,
     profiles_revision: String,
     auth_revision: String,
     credential_hash: Option<String>,
+    discovery_credential_hash: Option<String>,
 }
 
 struct ModelImageEntry {
@@ -1287,30 +1289,42 @@ fn next_model_generation(args: &Cli) -> u64 {
 fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Option<ModelCacheKey> {
     use sha2::{Digest, Sha256};
     let endpoint = args.model_endpoint_for(provider, Some(model));
+    let discovery_endpoint = args.model_endpoint_for(provider, None);
     let credential = args.model_credential_for(provider, endpoint);
+    let discovery_credential = args.model_credential_for(provider, discovery_endpoint);
     // Resolving a command, OAuth credential, or dynamic header merely to make a
     // cache key can run external code and may yield a different account than
     // the request. Do not reuse capabilities when identity is unknowable.
     if credential
         .as_ref()
         .is_some_and(super::model_auth::Credential::requires_resolution)
+        || discovery_credential
+            .as_ref()
+            .is_some_and(super::model_auth::Credential::requires_resolution)
         || args
             .model_profiles
             .header_settings(provider, endpoint, Some(model))
             .has_dynamic_values()
+        || args
+            .model_profiles
+            .header_settings(provider, discovery_endpoint, None)
+            .has_dynamic_values()
     {
         return None;
     }
-    let credential_hash = credential.and_then(|credential| {
+    let digest = |credential: super::model_auth::Credential| {
         credential
             .literal()
             .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
-    });
+    };
+    let credential_hash = credential.and_then(digest);
+    let discovery_credential_hash = discovery_credential.and_then(digest);
     Some(ModelCacheKey {
         model: model.to_owned(),
         scope: ModelCacheScope {
             provider: provider.id().to_owned(),
             endpoint: endpoint.to_owned(),
+            discovery_endpoint: discovery_endpoint.to_owned(),
             adapter: args
                 .model_profiles
                 .model_adapter(provider, model)
@@ -1319,6 +1333,7 @@ fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Optio
             profiles_revision: args.model_profiles.revision().to_owned(),
             auth_revision: args.model_keys.revision().to_owned(),
             credential_hash,
+            discovery_credential_hash,
         },
     })
 }
@@ -1831,6 +1846,51 @@ mod tests {
         }}));
         let xai = args.model_profiles.provider("xai").unwrap();
         assert!(model_cache_key(&args, &xai, "dynamic").is_none());
+    }
+
+    #[test]
+    fn discovery_dynamic_header_cannot_be_hidden_by_model_override() {
+        for provider_value in ["!echo account", "${ACCOUNT}"] {
+            let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                    "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                    "headers":{"X-Account":provider_value},
+                    "modelOverrides":{"dynamic":{"headers":{"X-Account":"fixed"}}}
+                }}}))
+                .unwrap();
+            let provider = args.model_profiles.provider("relay").unwrap();
+            let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+            assert!(
+                !args
+                    .model_profiles
+                    .header_settings(&provider, endpoint, Some("dynamic"))
+                    .has_dynamic_values()
+            );
+            assert!(
+                args.model_profiles
+                    .header_settings(&provider, args.model_endpoint_for(&provider, None), None)
+                    .has_dynamic_values()
+            );
+            assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+            let known = pi_rs::ollama::ModelDetails {
+                images: Some(true),
+                ..Default::default()
+            };
+            remember_model_images(
+                &args,
+                &provider,
+                "dynamic",
+                Some(&known),
+                next_model_generation(&args),
+            );
+            assert!(
+                model_value(&args, &provider, "dynamic")
+                    .get("input")
+                    .is_none()
+            );
+            assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+        }
     }
 
     #[test]

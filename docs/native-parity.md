@@ -317,9 +317,10 @@ catalog. Cached capabilities are scoped to the
 provider, model, endpoint, adapter, profile, and credential identity. The
 cache has bounded entries and scope watermarks; eviction prevents older
 in-flight results from reviving discarded state. Credentials requiring
-external resolution and dynamic request headers disable capability reuse,
-because their effective account cannot be safely identified without executing
-them again. The native `images` field remains available for existing clients.
+external resolution and dynamic model or discovery request headers disable
+capability reuse, because their effective account cannot be safely identified
+without executing them again. The native `images` field remains available for
+existing clients.
 
 `set_model` checks the exact model ID against the selected provider's
 configured or discovered catalog before saving the selection. A missing
