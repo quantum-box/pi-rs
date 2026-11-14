@@ -115,6 +115,176 @@ impl Service {
     }
 }
 
+const DEVICE_AUTH_URL: &str = "https://auth.meta.com/oidc/device/authorization/";
+const DEVICE_TOKEN_URL: &str = "https://auth.meta.com/oidc/device/token/";
+const CLIENT_ID: &str = "1031625952748946";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+#[derive(Clone)]
+struct DeviceService {
+    authorization: reqwest::Url,
+    token: reqwest::Url,
+    mint: Service,
+}
+impl DeviceService {
+    fn new(settings: &super::config::Settings) -> Result<Self> {
+        Ok(Self {
+            authorization: reqwest::Url::parse(DEVICE_AUTH_URL).expect("constant URL"),
+            token: reqwest::Url::parse(DEVICE_TOKEN_URL).expect("constant URL"),
+            mint: Service::new(settings)?,
+        })
+    }
+    async fn post(
+        &self,
+        url: &reqwest::Url,
+        form: &[(&str, &str)],
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let mut encoded = reqwest::Url::parse("https://localhost/").unwrap();
+        encoded.query_pairs_mut().extend_pairs(form.iter().copied());
+        let mut response = self
+            .mint
+            .client
+            .post(url.clone())
+            .header("accept", "application/json")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(encoded.query().unwrap_or_default().to_owned())
+            .send()
+            .await
+            .map_err(|_| error("device request failed"))?;
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| error("device response failed"))?
+        {
+            if body.len().saturating_add(chunk.len()) > 65536 {
+                return Err(error("device response too large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    }
+    async fn login(&self, announce: impl Fn(&reqwest::Url, &str)) -> Result<Credential> {
+        let (status, device) = self
+            .post(&self.authorization, &[("client_id", CLIENT_ID)])
+            .await?;
+        if !status.is_success() {
+            return Err(error(&format!("device authorization failed ({status})")));
+        }
+        let device_code = device["device_code"]
+            .as_str()
+            .filter(|s| super::model_auth::valid_key(s))
+            .ok_or_else(|| error("invalid device authorization response"))?;
+        let user_code = device["user_code"]
+            .as_str()
+            .filter(|s| super::model_auth::valid_key(s))
+            .ok_or_else(|| error("invalid device authorization response"))?;
+        let verification = ["verification_uri_complete", "verification_uri"]
+            .iter()
+            .filter_map(|key| device[*key].as_str())
+            .find_map(verification_url)
+            .ok_or_else(|| error("invalid verification URL"))?;
+        announce(&verification, user_code);
+        let mut interval =
+            poll_duration(device["interval"].as_f64(), 5.0).max(Duration::from_secs(1));
+        let expires = device["expires_in"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| poll_duration(Some(v), 900.0));
+        let poll = async {
+            loop {
+                tokio::time::sleep(interval).await;
+                let (status, json) = self
+                    .post(
+                        &self.token,
+                        &[
+                            ("grant_type", DEVICE_GRANT),
+                            ("device_code", device_code),
+                            ("client_id", CLIENT_ID),
+                        ],
+                    )
+                    .await?;
+                if status.is_success()
+                    && let Some(identity) = json["access_token"]
+                        .as_str()
+                        .filter(|s| super::model_auth::valid_key(s))
+                {
+                    let access = self.mint.mint(identity).await?;
+                    return Ok(Credential {
+                        kind: "oauth".into(),
+                        access,
+                        refresh: identity.into(),
+                        expires: now().saturating_add(KEY_LIFETIME_MS),
+                    });
+                }
+                match json["error"].as_str() {
+                    Some("authorization_pending") => {}
+                    Some("slow_down") => {
+                        interval = json["interval"]
+                            .as_f64()
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .map(|v| poll_duration(Some(v), 5.0).max(Duration::from_secs(1)))
+                            .unwrap_or(interval.saturating_add(Duration::from_secs(5)))
+                    }
+                    Some("access_denied") => return Err(error("login denied")),
+                    Some("expired_token") => {
+                        return Err(error("device authorization expired; restart login"));
+                    }
+                    _ => return Err(error(&format!("device token request failed ({status})"))),
+                }
+            }
+        };
+        match expires {
+            Some(deadline) => tokio::time::timeout(deadline, poll)
+                .await
+                .map_err(|_| error("device authorization expired; restart login"))?,
+            None => poll.await,
+        }
+    }
+}
+fn poll_duration(value: Option<f64>, default: f64) -> Duration {
+    Duration::from_secs_f64(
+        value
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(default)
+            .min(86400.0),
+    )
+}
+fn verification_url(value: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+pub(super) async fn login(
+    settings: &super::config::Settings,
+    announce: impl Fn(&reqwest::Url, &str),
+) -> Result<()> {
+    let path = super::config::agent_dir().join("auth.json");
+    let previous = {
+        let guard = super::auth_lock::acquire_async(&path).await?;
+        let value = super::config::read_object_unlocked(&path)?
+            .get("meta")
+            .cloned();
+        guard.check()?;
+        value
+    };
+    let credential = DeviceService::new(settings)?.login(announce).await?;
+    let guard = super::auth_lock::acquire_async(&path).await?;
+    super::config::update_object_locked(&path, Some(&guard), |data| {
+        if data.get("meta") != previous.as_ref() {
+            return Err(error("credentials changed during login"));
+        }
+        data.insert("meta".into(), serde_json::to_value(&credential)?);
+        Ok(())
+    })
+}
+
 async fn access_at(
     path: PathBuf,
     service: Service,
@@ -244,6 +414,97 @@ mod tests {
             },
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn device_login_polls_then_mints_a_separate_inference_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let responses = [
+                (
+                    "200 OK",
+                    r#"{"device_code":"device-secret","user_code":"CODE","verification_uri":"https://auth.meta.com/device","verification_uri_complete":"https://auth.meta.com/device?code=CODE","interval":0.01,"expires_in":10}"#,
+                ),
+                ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
+                ("200 OK", r#"{"access_token":"identity-secret"}"#),
+                ("200 OK", r#"{"api_key":"inference-key"}"#),
+            ];
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let service = DeviceService {
+            authorization: reqwest::Url::parse(&format!("{base}/oidc/device/authorization/"))
+                .unwrap(),
+            token: reqwest::Url::parse(&format!("{base}/oidc/device/token/")).unwrap(),
+            mint: Service {
+                url: reqwest::Url::parse(&format!("{base}/muse-code/key")).unwrap(),
+                client,
+            },
+        };
+        let credential = service
+            .login(|url, code| {
+                assert_eq!(url.as_str(), "https://auth.meta.com/device?code=CODE");
+                assert_eq!(code, "CODE");
+            })
+            .await
+            .unwrap();
+        assert_eq!(credential.access, "inference-key");
+        assert_eq!(credential.refresh, "identity-secret");
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("POST /oidc/device/authorization/ "));
+        assert!(requests[0].contains("client_id=1031625952748946"));
+        assert!(requests[1].starts_with("POST /oidc/device/token/ "));
+        assert!(requests[1].contains("device_code=device-secret"));
+        assert!(
+            requests[2]
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code")
+        );
+        assert!(
+            requests[3]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer identity-secret")
+        );
+        assert!(requests[3].ends_with("{}"));
+    }
+    #[test]
+    fn verification_urls_do_not_accept_unsafe_schemes_or_credentials() {
+        assert!(verification_url("javascript:alert(1)").is_none());
+        assert!(verification_url("http://127.0.0.1/").is_none());
+        assert!(verification_url("https://user@auth.meta.com/").is_none());
+        assert!(verification_url("https://auth.meta.com/device").is_some());
     }
 
     #[tokio::test]

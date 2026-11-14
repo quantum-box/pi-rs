@@ -2908,6 +2908,10 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("meta") => start_meta_login(view, &args.settings),
+        "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
+            edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
+        }
         "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
             start_kimi_login(view, &args.settings)
         }
@@ -2983,6 +2987,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "meta · Subscription OAuth".into(),
+                            selection: Selection::LoginMeta,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -5577,6 +5588,22 @@ fn start_kimi_logout(view: &mut View) {
     ));
 }
 
+fn start_meta_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to Meta",
+        "Meta login cancelled",
+        move |sender| async move {
+            super::meta_auth::login(&settings, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Meta".into()])
+        },
+    ));
+}
+
 fn start_kimi_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     view.remote_task = Some(RemoteTask::start(
@@ -6631,6 +6658,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),

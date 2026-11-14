@@ -138,9 +138,13 @@ when it expires or has less than five minutes remaining, the identity token is
 used only at Meta's fixed key-mint endpoint, and the new 24-hour key is stored
 under the auth lock. Concurrent refreshes recheck the stored expiry. OAuth
 credentials are accepted only for the official Meta Responses endpoint, and
-redirects are disabled for the mint request. pi-rs does not yet provide Meta's
-device login; sign in with Pi first. Live Meta account login, key minting and
-inference have not been verified.
+redirects are disabled for the mint request. `/login meta` starts Meta's
+device flow, displays the verification URL and code, and saves credentials
+only after key minting succeeds; `/login meta api-key` retains manual API-key
+entry. Device and mint destinations are fixed, redirects are disabled, and a
+changed credential aborts the final save. Verification links must use HTTPS;
+unlike Pi, HTTP verification links are rejected. Live Meta account login,
+key minting and inference have not been verified.
 
 ### xAI Responses checkpoint
 
