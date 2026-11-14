@@ -4270,7 +4270,7 @@ pub(super) async fn run(
             dirty = true;
         }
         if let Some(editor) = &mut external_editor {
-            if let Some(status) = editor.child.try_wait()? {
+            if let Some(status) = editor.poll()? {
                 let editor = external_editor.take().expect("active editor");
                 let result = editor.result(status);
                 let target = editor.target;
@@ -7216,10 +7216,14 @@ struct RunningExternalEditor {
     _foreground: Option<EditorForeground>,
 }
 
+#[cfg(all(test, unix))]
+static EDITOR_JOB_RESUMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(unix)]
 struct EditorForeground {
     tty: std::fs::File,
     previous: libc::pid_t,
+    baseline: libc::termios,
 }
 
 #[cfg(unix)]
@@ -7244,10 +7248,72 @@ fn set_foreground(fd: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result
 }
 
 #[cfg(unix)]
+impl EditorForeground {
+    fn prepare() -> std::io::Result<Option<Self>> {
+        use std::os::fd::AsRawFd;
+        let tty = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            Ok(tty) => tty,
+            Err(_) => return Ok(None),
+        };
+        let previous = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if previous < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut baseline = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut baseline) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(Self {
+            tty,
+            previous,
+            baseline,
+        }))
+    }
+
+    fn suspend_and_resume(&self, editor_group: libc::pid_t) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = self.tty.as_raw_fd();
+        let mut editor_settings = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut editor_settings) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        set_foreground(fd, self.previous)?;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.baseline) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Suspend the whole Pi job so its parent shell regains control. SIGSTOP
+        // also works when Pi's process group is orphaned or SIGTSTP is ignored.
+        if unsafe { libc::kill(0, libc::SIGSTOP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The shell foregrounds Pi before continuing it. Restore the editor's
+        // terminal state before handing input back to the stopped editor.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        set_foreground(fd, editor_group)?;
+        if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        #[cfg(test)]
+        EDITOR_JOB_RESUMES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl Drop for EditorForeground {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
-        let _ = set_foreground(self.tty.as_raw_fd(), self.previous);
+        let fd = self.tty.as_raw_fd();
+        let _ = set_foreground(fd, self.previous);
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &self.baseline);
+        }
     }
 }
 
@@ -7264,6 +7330,8 @@ impl RunningExternalEditor {
         };
         let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
         file.write_all(text.as_bytes())?;
+        #[cfg(unix)]
+        let foreground = EditorForeground::prepare()?;
         let mut process = std::process::Command::new(program);
         process.args(arguments).arg(file.path());
         #[cfg(unix)]
@@ -7275,44 +7343,22 @@ impl RunningExternalEditor {
             .spawn()
             .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
         #[cfg(unix)]
-        let foreground = {
+        if let Some(foreground) = &foreground {
             use std::os::fd::AsRawFd;
-            let result = (|| -> std::io::Result<Option<EditorForeground>> {
-                let tty = match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/tty")
-                {
-                    Ok(tty) => tty,
-                    Err(_) => return Ok(None),
-                };
-                let previous = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
-                if previous < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                set_foreground(tty.as_raw_fd(), child.id() as libc::pid_t)?;
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT);
-                }
-                Ok(Some(EditorForeground { tty, previous }))
-            })();
-            match result {
-                Ok(value) => value,
-                Err(error) => {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        return Ok(Self {
-                            child,
-                            file,
-                            target,
-                            _foreground: None,
-                        });
-                    }
+            if let Err(error) =
+                set_foreground(foreground.tty.as_raw_fd(), child.id() as libc::pid_t)
+            {
+                if !matches!(child.try_wait(), Ok(Some(_))) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error.into());
                 }
+            } else {
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT);
+                }
             }
-        };
+        }
         Ok(Self {
             child,
             file,
@@ -7320,6 +7366,32 @@ impl RunningExternalEditor {
             #[cfg(unix)]
             _foreground: foreground,
         })
+    }
+
+    fn poll(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        if let Some(foreground) = &self._foreground {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id() as libc::id_t,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG,
+                )
+            };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted
+                    && error.raw_os_error() != Some(libc::ECHILD)
+                {
+                    return Err(error.into());
+                }
+            } else if unsafe { info.si_pid() } != 0 {
+                foreground.suspend_and_resume(self.child.id() as libc::pid_t)?;
+            }
+        }
+        Ok(self.child.try_wait()?)
     }
 
     fn cancel(&mut self) {
@@ -7697,6 +7769,209 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    fn editor_pty_regression(test_name: &str, suspend: bool) {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "PI_RS_EDITOR_JOB_CONTROL_TEST";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut baseline) }, 0);
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::fs::read(editor.file.path()).unwrap() != b"started" {
+                assert!(Instant::now() < deadline, "editor did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if suspend {
+                let mut announced = false;
+                loop {
+                    if editor.poll().unwrap().is_some() {
+                        break;
+                    }
+                    if !announced
+                        && super::EDITOR_JOB_RESUMES.load(std::sync::atomic::Ordering::SeqCst) > 0
+                    {
+                        assert_eq!(
+                            unsafe { libc::tcgetpgrp(0) },
+                            editor.child.id() as libc::pid_t
+                        );
+                        let mut resumed: libc::termios = unsafe { std::mem::zeroed() };
+                        assert_eq!(unsafe { libc::tcgetattr(0, &mut resumed) }, 0);
+                        assert_eq!(resumed.c_lflag & (libc::ECHO | libc::ICANON), 0);
+                        println!("EDITOR_RESUMED");
+                        announced = true;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "editor did not finish after resume"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                editor.cancel();
+            }
+            drop(editor);
+            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
+            assert_eq!(
+                restored.c_lflag, baseline.c_lflag,
+                "terminal local flags were not restored"
+            );
+            assert_eq!(
+                restored.c_iflag, baseline.c_iflag,
+                "terminal input flags were not restored"
+            );
+            assert_eq!(restored.c_oflag, baseline.c_oflag);
+            assert_eq!(restored.c_cflag, baseline.c_cflag);
+            assert_eq!(restored.c_cc, baseline.c_cc);
+            println!("PARENT_FINISHED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nstty -echo -icanon\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut output = Vec::new();
+        let mut sent = false;
+        let mut resumed = false;
+        loop {
+            let mut bytes = [0; 1024];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if suspend
+                && !sent
+                && output
+                    .windows(b"EDITOR_READY".len())
+                    .any(|part| part == b"EDITOR_READY")
+            {
+                master.write_all(&[26]).unwrap();
+                sent = true;
+            }
+            if suspend && sent && !resumed {
+                let mut status = 0;
+                let rc = unsafe {
+                    libc::waitpid(
+                        child.id() as libc::pid_t,
+                        &mut status,
+                        libc::WUNTRACED | libc::WNOHANG,
+                    )
+                };
+                if rc > 0 && libc::WIFSTOPPED(status) {
+                    unsafe {
+                        libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
+                    }
+                    // Wait for the child to confirm it restored editor foreground.
+                    let until = Instant::now() + Duration::from_secs(3);
+                    while !output
+                        .windows(b"EDITOR_RESUMED".len())
+                        .any(|part| part == b"EDITOR_RESUMED")
+                    {
+                        let mut bytes = [0; 1024];
+                        if let Ok(n) = master.read(&mut bytes) {
+                            output.extend_from_slice(&bytes[..n]);
+                        }
+                        assert!(
+                            Instant::now() < until,
+                            "editor was not foregrounded after resume: {}",
+                            String::from_utf8_lossy(&output)
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    master.write_all(&[3]).unwrap();
+                    resumed = true;
+                } else if rc > 0 {
+                    panic!(
+                        "child exited before stopping: {}",
+                        String::from_utf8_lossy(&output)
+                    );
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut bytes = [0; 1024];
+                if let Ok(n) = master.read(&mut bytes) {
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                assert!(
+                    status.success() && (!suspend || resumed),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert!(String::from_utf8_lossy(&output).contains("PARENT_FINISHED"));
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("editor PTY timed out: {}", String::from_utf8_lossy(&output));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_editor_suspends_and_resumes_parent_job() {
+        editor_pty_regression(
+            "interactive::tests::stopped_editor_suspends_and_resumes_parent_job",
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_editor_restores_original_termios() {
+        editor_pty_regression(
+            "interactive::tests::cancelled_editor_restores_original_termios",
+            false,
+        );
     }
 
     #[cfg(unix)]
