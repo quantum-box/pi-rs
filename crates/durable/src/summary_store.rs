@@ -465,10 +465,7 @@ impl<'a> SummaryStore<'a> {
     /// Bounded discovery is all-or-nothing: if the store exceeds its work or
     /// payload budget no executor is started by this scan. Terminal records
     /// count toward the limit, so callers can never silently skip older work.
-    pub(crate) fn discover(
-        &self,
-        provider: &ProviderIdentity,
-    ) -> Result<Discovery, Error> {
+    pub(crate) fn discover(&self, provider: &ProviderIdentity) -> Result<Discovery, Error> {
         if !provider.valid() {
             return Err(Error::Identity);
         }
