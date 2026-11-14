@@ -1917,6 +1917,7 @@ impl Harness {
         id: Uuid,
         mut after_load: F,
     ) -> Result<Uuid, Error> {
+        let mut attempts = 0;
         let (mut state, revision) = loop {
             let (state, version) = self.load(id)?;
             after_load();
@@ -1930,6 +1931,10 @@ impl Harness {
                 .is_some_and(|entry| entry.version == version)
             {
                 break (state, revision);
+            }
+            attempts += 1;
+            if attempts == FORK_DOCUMENT_ATTEMPTS {
+                return Err(durable_store::Error::Conflict { key: Self::key(id) }.into());
             }
         };
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)

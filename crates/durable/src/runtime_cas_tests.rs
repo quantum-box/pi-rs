@@ -1773,6 +1773,31 @@ fn interior_entry_fork_requires_proven_stable_state_and_valid_context() {
 }
 
 #[test]
+fn current_fork_returns_conflict_when_parent_keeps_changing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let mut writer = h.worker();
+    let mut calls = 0;
+    let result = h.fork_with_load_hook(parent, || {
+        calls += 1;
+        let (state, version) = writer.load(parent).unwrap();
+        writer.save(&state, Expected::Version(version)).unwrap();
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert_eq!(calls, FORK_DOCUMENT_ATTEMPTS);
+}
+
+#[test]
 fn current_fork_retries_when_parent_changes_before_document_snapshot() {
     use crate::document::Address;
     let dir = tempfile::tempdir().unwrap();
