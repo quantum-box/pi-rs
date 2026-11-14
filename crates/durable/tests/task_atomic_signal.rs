@@ -725,12 +725,17 @@ fn signal_commit_process_child() {
         return;
     };
     let path = std::path::PathBuf::from(path);
-    setup(&path, Some(100));
+    setup(&path, Some(60_000));
     let results = Arc::new(Mutex::new(vec![]));
     let mut scheduler = Scheduler::open(&path, registry(&path, 0, results.clone())).unwrap();
     scheduler.submit(&task(1, "sender")).unwrap();
     assert!(scheduler.tick(99).unwrap());
     assert_eq!(*results.lock().unwrap(), vec![SignalResult::Delivered]);
+    assert_eq!(
+        scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().checkpoint().phase,
+        "done",
+        "staged delivery did not commit"
+    );
     println!("SIGNAL_COMMITTED_BEFORE_WAIT_POLL");
     std::io::stdout().flush().unwrap();
     loop {
@@ -814,13 +819,13 @@ fn committed_typed_signal_survives_process_death_before_wait_poll() {
             Some(SignalState::Value(json!(1)))
         );
         assert_eq!(
-            ts.deliver_signal_at(receiver, &token, "a", json!(1), 100)
+            ts.deliver_signal_at(receiver, &token, "a", json!(1), 60_000)
                 .unwrap(),
             SignalResult::Duplicate
         );
         // A value committed before the deadline wins even when polling after it.
         assert!(matches!(
-            ts.poll_wait(&ts.load(receiver).unwrap().unwrap(), 100)
+            ts.poll_wait(&ts.load(receiver).unwrap().unwrap(), 60_000)
                 .unwrap(),
             WakeResult::Woken { signal: Some(_) }
         ));
@@ -837,7 +842,7 @@ fn committed_typed_signal_survives_process_death_before_wait_poll() {
         Some(SignalState::Value(json!(1)))
     );
     assert_eq!(
-        ts.deliver_signal_at(receiver, &token, "a", json!(2), 101)
+        ts.deliver_signal_at(receiver, &token, "a", json!(2), 60_001)
             .unwrap(),
         SignalResult::Duplicate
     );

@@ -338,7 +338,7 @@ impl Harness {
                     false,
                     allowed_tools.clone(),
                 )?;
-                self.anchor_subagent(parent, name)?;
+                self.anchor_subagent_impl(parent, name, true)?;
                 return Ok(link);
             }
             // Abort snapshots the task graph under this gate. Hold it until
@@ -454,6 +454,15 @@ impl Harness {
     /// including after reopening. The anchor succeeds immediately while retaining its
     /// ownership edge. Stopping child work leaves it reusable. A storage error requires reopen.
     pub fn anchor_subagent(&mut self, parent: Uuid, name: &str) -> Result<Uuid, Error> {
+        self.anchor_subagent_impl(parent, name, false)
+    }
+
+    fn anchor_subagent_impl(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        admission: bool,
+    ) -> Result<Uuid, Error> {
         use crate::ownership_edge::{self, Edge, Mode};
         use crate::task::{Checkpoint, Task, TaskOwner};
         use crate::task_store::{self, TaskStore};
@@ -465,6 +474,14 @@ impl Harness {
         loop {
             let link = self.subagent(parent, name)?.ok_or(Error::NotFound)?;
             let store = self.subagent_store()?;
+            if admission {
+                let parent_key = format!("runtime/conversation/{parent}");
+                let entry = store.get(parent_key.as_bytes())?.ok_or(Error::NotFound)?;
+                let state: Conversation = serde_json::from_slice(&entry.value)?;
+                if state.id != parent || state.abort_requested {
+                    return Err(Error::Invalid("parent conversation is aborting".into()));
+                }
+            }
             if let Some(entry) = store.get(&anchor_key)? {
                 let id: Uuid = serde_json::from_slice(&entry.value)?;
                 let task = TaskStore::new(store)

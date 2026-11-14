@@ -2931,7 +2931,7 @@ fn managed_anchor_creation_waits_for_abort_graph_gate() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for existing in [false, true] {
+    for existing in 0..3 {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
         let config = Config {
@@ -2940,8 +2940,12 @@ fn managed_anchor_creation_waits_for_abort_graph_gate() {
             max_output_tokens: 10,
         };
         let parent = h.create_conversation(config.clone()).unwrap();
-        if existing {
-            h.ensure_subagent(parent, "worker", config.clone()).unwrap();
+        if existing > 0 {
+            h.ensure_subagent(parent, "worker", config.clone())
+                .unwrap();
+        }
+        if existing == 2 {
+            h.anchor_subagent(parent, "worker").unwrap();
         }
         let owner = h.owner.clone();
         let gate = owner.task_gate().lock().unwrap();
@@ -2971,14 +2975,15 @@ fn managed_anchor_creation_waits_for_abort_graph_gate() {
                 .is_err()
         );
         thread.join().unwrap();
-        assert!(
+        assert_eq!(
             owner
                 .store()
                 .list(format!("runtime/subagent-anchor/{parent}/").as_bytes())
                 .unwrap()
-                .is_empty()
+                .len(),
+            usize::from(existing == 2)
         );
-        if !existing {
+        if existing == 0 {
             assert!(h.subagent(parent, "worker").unwrap().is_none());
         }
     }
