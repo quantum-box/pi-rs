@@ -5073,6 +5073,37 @@ fn branch_excerpt(entry: Message) -> String {
 
 thread_local! {
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Metadata associated with the committed record currently being observed.
+#[doc(hidden)]
+pub fn record_event_metadata(record_id: u64) -> Option<serde_json::Value> {
+    RECORD_EVENT_METADATA.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|(id, _)| *id == record_id)
+            .and_then(|(_, value)| value.clone())
+    })
+}
+
+fn with_record_event_metadata<T>(
+    id: u64,
+    value: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            RECORD_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    RECORD_EVENT_METADATA.with(|stack| stack.borrow_mut().push((id, value)));
+    let _guard = Pop;
+    f()
 }
 
 /// Returns transient result metadata only while the matching committed-record
@@ -5109,6 +5140,35 @@ fn with_tool_result_event_metadata<T>(
 #[cfg(test)]
 mod metadata_scope_tests {
     use super::*;
+
+    #[test]
+    fn committed_compaction_exposes_only_its_metadata_to_live_observer() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let expected = serde_json::json!({"fromExtension":true,"details":{"origin":"fixture"}});
+        let mut observed = None;
+        commit_compaction_record(
+            &mut session,
+            Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+            Some(expected.clone()),
+            &mut |event| {
+                if let Notification::Committed(record) = event {
+                    assert!(record_event_metadata(record.id + 1).is_none());
+                    observed = record_event_metadata(record.id);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, Some(expected));
+        assert!(record_event_metadata(session.head()).is_none());
+    }
 
     #[test]
     fn metadata_scope_is_correlated_nested_and_unwind_safe() {
@@ -5154,12 +5214,15 @@ fn commit_compaction_record(
     metadata: Option<serde_json::Value>,
     observer: &mut Observer<'_>,
 ) -> Result<()> {
+    let notify_metadata = metadata.clone();
     let record = if let Some(metadata) = metadata {
         session.append_with_record_metadata(event, metadata)?
     } else {
         session.append(event)?
     };
-    observer(Notification::Committed(record));
+    with_record_event_metadata(record.id, notify_metadata, || {
+        observer(Notification::Committed(record))
+    });
     Ok(())
 }
 

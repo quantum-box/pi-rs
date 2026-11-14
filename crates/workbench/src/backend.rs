@@ -319,9 +319,10 @@ impl SessionSnapshot {
         }
         self.records.push(record.clone());
         self.share_records.push(Arc::new(record.clone()));
-        self.entries
-            .as_mut()
-            .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
+        let metadata = pi_rs::record_event_metadata(record.id);
+        self.entries.as_mut().map_or_else(Vec::new, |cursor| {
+            cursor.appended(&self.records, metadata.as_ref())
+        })
     }
 }
 

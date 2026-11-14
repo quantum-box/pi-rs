@@ -592,6 +592,28 @@ impl Session {
         })
     }
 
+    /// Restore records together with their atomic auxiliary metadata.
+    pub fn from_records_with_metadata(
+        records: Vec<Record>,
+        metadata: BTreeMap<u64, serde_json::Value>,
+    ) -> Result<Self> {
+        Self::with_store(MemoryStore { records, metadata })
+    }
+
+    /// Restore serialized native records, preserving auxiliary metadata.
+    pub fn from_serialized_records(values: Vec<serde_json::Value>) -> Result<Self> {
+        let mut records = Vec::with_capacity(values.len());
+        let mut metadata = BTreeMap::new();
+        for value in values {
+            let stored: PersistedRecord = serde_json::from_value(value)?;
+            if let Some(extra) = stored.metadata {
+                metadata.insert(stored.record.id, extra);
+            }
+            records.push(stored.record);
+        }
+        Self::from_records_with_metadata(records, metadata)
+    }
+
     pub fn with_store(mut store: impl SessionStore + 'static) -> Result<Self> {
         let mut records = store.load()?;
         let record_metadata = store.load_record_metadata()?;
@@ -3446,6 +3468,13 @@ mod record_metadata_tests {
         session.export_jsonl(&export).unwrap();
         let exported = Session::snapshot(&export).unwrap();
         assert_eq!(exported.record_metadata(id), Some(&metadata));
+        let values = std::fs::read_to_string(&export)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let imported = Session::from_serialized_records(values).unwrap();
+        assert_eq!(imported.record_metadata(id), Some(&metadata));
         let fork_path = directory.path().join("fork.jsonl");
         let fork = session.fork_to(id, &fork_path).unwrap();
         assert_eq!(fork.record_metadata(id), Some(&metadata));
