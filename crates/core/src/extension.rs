@@ -510,6 +510,37 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
+/// Prepared model-summary compaction, before an extension or model supplies its summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPreparation {
+    pub branch_entries: Vec<crate::Record>,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub reason: crate::CompactionReason,
+    pub will_retry: bool,
+    pub custom_instructions: Option<String>,
+}
+
+/// An extension-provided compaction replaces the model-generated summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCompaction {
+    pub summary: String,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub usage: Option<crate::Usage>,
+    pub details: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeSummaryCompactionResult {
+    #[serde(default)]
+    pub cancel: bool,
+    pub compaction: Option<ExtensionCompaction>,
+}
+
 /// A hook's reported change status. The host tracks mutable access separately;
 /// this status never proves that assistant messages were left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1324,6 +1355,21 @@ pub trait Extension: Send + Sync {
         _outcome: &Outcome,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
+        Ok(None)
+    }
+
+    /// Whether this extension participates in pre-summary compaction.
+    fn handles_before_summary_compaction(&self) -> bool {
+        false
+    }
+
+    /// Called before requesting a model-generated summary.
+    async fn before_summary_compaction(
+        &self,
+        _preparation: &CompactionPreparation,
+        _state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<BeforeSummaryCompactionResult>> {
         Ok(None)
     }
 

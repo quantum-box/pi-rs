@@ -124,6 +124,15 @@ their potentially incomplete arguments; the model receives those results and
 may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+Native extensions can opt into a pre-summary compaction hook for manual and
+threshold compaction. A supplied summary bypasses the summary model, carries
+optional details and usage into the journal, and emits the normal lifecycle
+notification; cancellation leaves the branch unchanged. Executable extensions
+negotiate this hook before receiving the new request. Existing post-summary
+compaction hooks continue to run. Unlike Pi, the native hook must retain at
+least the prepared recent context and uses native numeric journal IDs; native
+summary size and timeout limits still apply. Automatic overflow recovery and
+full Pi preparation payload compatibility remain separate gaps.
 
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed

@@ -2668,7 +2668,7 @@ impl Agent<'_> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         self.commit_compaction_with_host::<AgentInput>(
-            session, compaction, &states, None, None, cancel, observer, None,
+            session, compaction, &states, None, None, None, cancel, observer, None,
         )
         .await
         .map(|_| ())
@@ -2689,6 +2689,7 @@ impl Agent<'_> {
             session,
             compaction,
             &states,
+            None,
             None,
             None,
             cancel,
@@ -2751,6 +2752,7 @@ impl Agent<'_> {
             &states,
             None,
             Some(retention),
+            None,
             cancel,
             observer,
             None,
@@ -3387,8 +3389,9 @@ impl Agent<'_> {
     ) -> Result<u32> {
         let reason = scope.reason;
         let cancellation = scope.cancellation;
+        let from_extension = std::sync::atomic::AtomicBool::new(false);
         let result = self
-            .summarize_prefix_inner(session, states, scope, observer, inputs)
+            .summarize_prefix_inner(session, states, scope, observer, inputs, &from_extension)
             .await;
         let event = match &result {
             Ok((_, from_extension)) => crate::LifecycleEvent::SessionCompact {
@@ -3403,7 +3406,17 @@ impl Agent<'_> {
                 reason,
                 will_retry: false,
             },
-            Err(error) => compaction_failed_event(reason, error, cancellation),
+            Err(error) => {
+                let mut event = compaction_failed_event(reason, error, cancellation);
+                if let crate::LifecycleEvent::SessionCompactFailed {
+                    from_extension: value,
+                    ..
+                } = &mut event
+                {
+                    *value = from_extension.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                event
+            }
         };
         let idle = session.current_run_id().is_none();
         let notification = crate::lifecycle::notify_session_with_host(
@@ -3436,15 +3449,21 @@ impl Agent<'_> {
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
+        from_extension: &std::sync::atomic::AtomicBool,
     ) -> Result<(u32, bool)> {
         let SummaryScope {
             retention,
             instructions,
             output_limit: limit,
             cancellation: cancel,
-            reason: _,
+            reason,
         } = scope;
-        if limit == 0 || self.limits.model_requests == 0 {
+        let has_pre_summary_hook = self
+            .registry
+            .extensions
+            .iter()
+            .any(|extension| extension.handles_before_summary_compaction());
+        if !has_pre_summary_hook && (limit == 0 || self.limits.model_requests == 0) {
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -3452,6 +3471,97 @@ impl Agent<'_> {
             return Err(Error::Config(
                 "Nothing to compact (session too small)".into(),
             ));
+        }
+        let preparation = crate::CompactionPreparation {
+            branch_entries: if has_pre_summary_hook {
+                session.branch().into_iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            first_kept_entry: before,
+            tokens_before: if has_pre_summary_hook {
+                session.context_usage_estimate().tokens
+            } else {
+                0
+            },
+            reason,
+            will_retry: false,
+            custom_instructions: instructions.map(str::to_owned),
+        };
+        let mut supplied = None;
+        for extension in self
+            .registry
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_before_summary_compaction())
+        {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.before_summary_compaction(&preparation, states.get(extension.id()), host),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            match result {
+                Ok(Some(result)) if result.cancel => return Err(Error::Cancelled),
+                Ok(Some(result)) => supplied = result.compaction,
+                Ok(None) => {}
+                Err(message) => observer(Notification::ExtensionLifecycleError {
+                    extension: extension.id(),
+                    event: "session_before_compact",
+                    message: &message,
+                }),
+            }
+        }
+        if let Some(result) = supplied {
+            from_extension.store(true, std::sync::atomic::Ordering::Relaxed);
+            let boundary = result.first_kept_entry.ok_or_else(|| {
+                Error::Config("extension compaction requires a retained branch entry".into())
+            })?;
+            if !preparation
+                .branch_entries
+                .iter()
+                .any(|entry| entry.id == boundary)
+                || before.is_some_and(|minimum| boundary > minimum)
+                || !has_summary_prefix(session, Some(boundary))
+            {
+                return Err(Error::Config(
+                    "invalid extension compaction retention boundary".into(),
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let retained = RetentionPlan {
+                boundary: Some(boundary),
+                ..retention
+            };
+            self.commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary: result.summary.clone(),
+                    keep_turns: retained.keep_turns,
+                },
+                states,
+                result.usage.map(|usage| (usage, None)),
+                Some(retained),
+                Some(&result),
+                cancel,
+                observer,
+                inputs,
+            )
+            .await?;
+            return Ok((0, true));
+        }
+        if limit == 0 || self.limits.model_requests == 0 {
+            return Err(Error::Budget);
         }
         let (mut request, transformed) = self
             .request(
@@ -3542,6 +3652,7 @@ impl Agent<'_> {
                 states,
                 billing,
                 Some(retention),
+                None,
                 cancel,
                 observer,
                 inputs,
@@ -3589,6 +3700,7 @@ impl Agent<'_> {
         states: &ExtensionStates,
         billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
         minimum_retention: Option<RetentionPlan>,
+        extension_result: Option<&crate::ExtensionCompaction>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
@@ -3656,11 +3768,16 @@ impl Agent<'_> {
         }
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
-        let tokens_before = session.context_usage_estimate().tokens;
-        let from_extension = original_summary != compaction.summary;
+        let tokens_before = extension_result.map_or_else(
+            || session.context_usage_estimate().tokens,
+            |result| result.tokens_before,
+        );
+        let from_extension = extension_result.is_some() || original_summary != compaction.summary;
         commit(
             session,
             Event::Compacted {
+                details: extension_result.and_then(|result| result.details.clone()),
+                from_extension,
                 summary: compaction.summary,
                 system_prompt: None,
                 retain_from,
@@ -3725,6 +3842,8 @@ impl Agent<'_> {
         commit(
             session,
             Event::Compacted {
+                details: None,
+                from_extension,
                 summary: compaction.summary,
                 system_prompt: None,
                 retain_from,
@@ -5345,6 +5464,147 @@ mod tree_tests {
     }
 
     struct NoModel;
+
+    struct ProvidedCompaction {
+        cancel: bool,
+        invalid: bool,
+        events: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Extension for ProvidedCompaction {
+        fn id(&self) -> &str {
+            "provided-compaction"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &crate::CompactionPreparation,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            assert!(preparation.branch_entries.len() >= 2);
+            Ok(Some(crate::BeforeSummaryCompactionResult {
+                cancel: self.cancel,
+                compaction: Some(crate::ExtensionCompaction {
+                    summary: "extension summary".into(),
+                    first_kept_entry: if self.invalid {
+                        Some(u64::MAX)
+                    } else {
+                        preparation.first_kept_entry
+                    },
+                    tokens_before: 123,
+                    usage: None,
+                    details: Some(serde_json::json!({"origin":"hook"})),
+                }),
+            }))
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_summary_commits_or_rejects_before_model_for_each_reason() {
+        for reason in [
+            crate::CompactionReason::Manual,
+            crate::CompactionReason::Threshold,
+        ] {
+            for (cancel, invalid) in [(false, false), (true, false), (false, true)] {
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(ProvidedCompaction {
+                        cancel,
+                        invalid,
+                        events: events.clone(),
+                    }))
+                    .unwrap();
+                let agent = Agent {
+                    model: &NoModel,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits::default(),
+                };
+                let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+                for text in ["old", "recent"] {
+                    session
+                        .append(Event::User {
+                            content: text.into(),
+                            input_id: None,
+                        })
+                        .unwrap();
+                    if text == "old" {
+                        session
+                            .append(Event::Assistant {
+                                content: "response".into(),
+                                invocations: vec![],
+                                usage: None,
+                                request_id: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                let retention = RetentionPlan::turns(&session, 1);
+                let before = session.records().len();
+                let token = CancellationToken::new();
+                let result = if matches!(reason, crate::CompactionReason::Manual) {
+                    agent
+                        .summarize(&mut session, 1, &token, &mut |_| {})
+                        .await
+                        .map(|()| 0)
+                } else {
+                    agent
+                        .summarize_prefix::<AgentInput>(
+                            &mut session,
+                            &ExtensionStates::new(),
+                            SummaryScope {
+                                retention,
+                                instructions: None,
+                                output_limit: 0,
+                                cancellation: &token,
+                                reason,
+                            },
+                            &mut |_| {},
+                            None,
+                        )
+                        .await
+                };
+                if cancel || invalid {
+                    assert!(result.is_err());
+                    assert_eq!(session.records().len(), before);
+                    let events = events.lock().unwrap();
+                    assert_eq!(events.last().unwrap()["type"], "session_compact_failed");
+                    assert_eq!(events.last().unwrap()["aborted"], cancel);
+                } else {
+                    assert_eq!(result.unwrap(), 0);
+                    assert!(
+                        matches!(&session.records().last().unwrap().event, Event::Compacted { summary, details: Some(details), from_extension: true, retain_from, tokens_before: Some(123), .. } if summary == "extension summary" && details["origin"] == "hook" && *retain_from == retention.boundary)
+                    );
+                    let events = events.lock().unwrap();
+                    assert_eq!(events.last().unwrap()["type"], "session_compact");
+                    assert_eq!(events.last().unwrap()["fromExtension"], true);
+                }
+            }
+        }
+    }
 
     struct CompactionFailureObserver(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
     #[async_trait::async_trait]

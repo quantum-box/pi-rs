@@ -645,6 +645,8 @@ impl Cursor {
             Event::Compacted {
                 summary,
                 retain_from,
+                details,
+                from_extension,
                 ..
             } => {
                 let first = retain_from
@@ -654,6 +656,12 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
+                if let Some(details) = details {
+                    entry["details"] = details.clone();
+                }
+                if *from_extension {
+                    entry["fromHook"] = json!(true);
+                }
                 add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }

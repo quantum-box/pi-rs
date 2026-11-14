@@ -348,6 +348,10 @@ pub enum Event {
     Compacted {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        from_extension: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         system_prompt: Option<Box<CompactedSystemPrompt>>,
         retain_from: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3844,6 +3848,8 @@ mod system_checkpoint_tests {
         let previous = session.head();
         session
             .append(Event::Compacted {
+                details: None,
+                from_extension: false,
                 summary: "summary".into(),
                 system_prompt: Some(Box::new(CompactedSystemPrompt {
                     content: "snapshot".into(),
