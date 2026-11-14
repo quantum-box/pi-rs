@@ -3135,7 +3135,9 @@ startup failure, pending project trust, or standalone `pi share`, Radius uploads
 continue without metadata rather than reconstructing it from stale settings.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
-locks and validates the captured version before publication. Preparing metadata does not block
+locks and validates the captured version before publication. Transient streaming
+events do not invalidate it, and prompt and tool metadata are retained by
+reference while the worker locks are held. Preparing metadata does not block
 the terminal event loop; extension dialogs remain interactive. PTY and loopback checks covered idle and
 in-flight sharing; live Radius acceptance remains open.
 
