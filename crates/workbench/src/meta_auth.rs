@@ -61,11 +61,17 @@ struct Service {
 }
 impl Service {
     fn new(settings: &super::config::Settings) -> Result<Self> {
+        Self::with_proxies(settings, super::http_proxy::configured(settings)?)
+    }
+    fn with_proxies(
+        settings: &super::config::Settings,
+        proxies: Vec<reqwest::Proxy>,
+    ) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30));
-        for proxy in super::http_proxy::configured(settings)? {
+        for proxy in proxies {
             builder = builder.proxy(proxy);
         }
         if let Some(timeout) = settings.http_idle_timeout() {
@@ -417,6 +423,13 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (Service, tokio::task::JoinHandle<String>) {
+        server_with_delay(status, body, Duration::ZERO).await
+    }
+    async fn server_with_delay(
+        status: &'static str,
+        body: &'static str,
+        delay: Duration,
+    ) -> (Service, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = reqwest::Url::parse(&format!(
             "http://{}/muse-code/key",
@@ -447,20 +460,14 @@ mod tests {
                     }
                 }
             }
+            tokio::time::sleep(delay).await;
             socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             String::from_utf8(request).unwrap()
         });
-        (
-            Service {
-                url,
-                client: reqwest::Client::builder()
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap(),
-            },
-            task,
-        )
+        let mut service =
+            Service::with_proxies(&super::super::config::Settings::default(), vec![]).unwrap();
+        service.url = url;
+        (service, task)
     }
 
     async fn device_login_fixture(delayed_response: usize, delay: Duration) {
@@ -512,7 +519,8 @@ mod tests {
         });
         // Exercise the same timeout and redirect configuration used in production;
         // only destinations are replaced with the isolated loopback fixture.
-        let mut mint = Service::new(&super::super::config::Settings::default()).unwrap();
+        let mut mint =
+            Service::with_proxies(&super::super::config::Settings::default(), vec![]).unwrap();
         mint.url = reqwest::Url::parse(&format!("{base}/muse-code/key")).unwrap();
         let service = DeviceService {
             authorization: reqwest::Url::parse(&format!("{base}/oidc/device/authorization/"))
@@ -716,6 +724,27 @@ mod tests {
         assert!(!message.contains("identity-secret"));
         assert_eq!(std::fs::read(path).unwrap(), before);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_production_30_second_request_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        fixture(&path, 1);
+        let (service, server) = server_with_delay(
+            "200 OK",
+            r#"{"api_key":"minted-key"}"#,
+            Duration::from_secs(16),
+        )
+        .await;
+        assert_eq!(
+            access_at(path.clone(), service, None, false).await.unwrap(),
+            "minted-key"
+        );
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer identity-secret"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["meta"]["access"], "minted-key");
     }
 
     #[tokio::test]
