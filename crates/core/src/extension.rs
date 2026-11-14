@@ -15,6 +15,20 @@ type BranchModels = BTreeMap<
     (Arc<dyn crate::Model>, Option<crate::Limits>),
 >;
 
+type ReservedBranchModel = (Uuid, String, String);
+struct BranchModelReservation {
+    reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
+    key: ReservedBranchModel,
+}
+impl Drop for BranchModelReservation {
+    fn drop(&mut self) {
+        self.reserved
+            .write()
+            .expect("branch reservations")
+            .remove(&self.key);
+    }
+}
+
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultPatch {
@@ -1406,6 +1420,7 @@ pub struct Registry {
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
     branch_models: Arc<RwLock<BranchModels>>,
+    branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
 
 impl Registry {
@@ -1435,6 +1450,13 @@ impl Registry {
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.contains_key(&(session_id, String::new(), String::new())) {
+            return Err(Error::Config("session models are being resolved".into()));
+        }
         self.branch_models
             .write()
             .expect("branch models")
@@ -1451,6 +1473,71 @@ impl Registry {
     ) -> Result<()> {
         self.register_session_provider_model_with_limits(session_id, provider, name, model, None)
     }
+    /// Reserve the entire session while startup commits and installs its
+    /// complete staged model set. A concurrent revocation wins as a unit.
+    pub(crate) fn commit_session_model_bindings<T>(
+        &self,
+        session_id: Uuid,
+        bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
+        guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        if bindings.iter().any(|(provider, name, _)| {
+            name.trim().is_empty() || provider.as_ref().is_some_and(|p| p.trim().is_empty())
+        }) {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let key = (session_id, String::new(), String::new());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            if reservations
+                .keys()
+                .any(|(owner, _, _)| *owner == session_id)
+            {
+                return Err(Error::Config("session models are being resolved".into()));
+            }
+            if let Some((provider, name, client)) = guarded
+                && self
+                    .branch_models
+                    .read()
+                    .expect("branch models")
+                    .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {provider}/{name}"
+                )));
+            }
+            reservations.insert(key.clone(), false);
+        }
+        let _reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key,
+        };
+        let result = commit()?;
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        let revoked = reservations.get(&_reservation.key) == Some(&true);
+        if !revoked {
+            let mut models = self.branch_models.write().expect("branch models");
+            for (provider, name, client) in bindings {
+                let guarded_binding =
+                    guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
+                let key = (Some(session_id), provider, name);
+                if guarded_binding {
+                    models.entry(key).or_insert((client, None));
+                } else {
+                    models.insert(key, (client, None));
+                }
+            }
+        }
+        Ok((result, revoked))
+    }
     /// Register a session-specific provider client and its effective run limits.
     pub fn register_session_provider_model_with_limits(
         &self,
@@ -1462,6 +1549,15 @@ impl Registry {
     ) -> Result<()> {
         if provider.trim().is_empty() || name.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.contains_key(&(session_id, provider.to_owned(), name.to_owned()))
+            || reservations.contains_key(&(session_id, String::new(), String::new()))
+        {
+            return Err(Error::Config("model client is being resolved".into()));
         }
         self.branch_models.write().expect("branch models").insert(
             (Some(session_id), Some(provider.to_owned()), name.to_owned()),
@@ -1493,6 +1589,10 @@ impl Registry {
             .map(|(model, _)| model.clone())
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
         let mut models = self.branch_models.write().expect("branch models");
         let copies: Vec<_> = models
             .iter()
@@ -1500,11 +1600,28 @@ impl Registry {
             .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
             .collect();
         for (provider, name, model) in copies {
+            if reservations.contains_key(&(destination, String::new(), String::new())) {
+                continue;
+            }
+            if provider.as_ref().is_some_and(|provider| {
+                reservations.contains_key(&(destination, provider.clone(), name.clone()))
+            }) {
+                continue;
+            }
             models.insert((Some(destination), provider, name), model);
         }
     }
     /// Remove recovery clients for a session before rebuilding its host configuration.
     pub fn remove_session_branch_models(&self, session_id: Uuid) {
+        let mut reservations = self
+            .branch_reservations
+            .write()
+            .expect("branch reservations");
+        for ((owner, _, _), revoked) in reservations.iter_mut() {
+            if *owner == session_id {
+                *revoked = true;
+            }
+        }
         self.branch_models
             .write()
             .expect("branch models")
@@ -2082,6 +2199,7 @@ impl Registry {
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
             branch_models: self.branch_models.clone(),
+            branch_reservations: self.branch_reservations.clone(),
         })
     }
 
