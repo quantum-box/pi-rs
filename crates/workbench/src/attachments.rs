@@ -26,7 +26,7 @@ pub fn expand(
         if metadata.is_file() && metadata.len() == 0 {
             continue;
         }
-        let (content, attached) = tools.read_attachment(&path)?;
+        let (content, attached) = tools.read_attachment_lossy(&path)?;
         let name = path
             .to_string_lossy()
             .replace('&', "&amp;")
@@ -75,6 +75,104 @@ mod tests {
         assert!(!text.contains("empty.md"));
         assert!(text.ends_with("note.md\">\ntext\n</file>\nprompt"));
     }
+    #[test]
+    fn malformed_utf8_text_attachments_use_replacement_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.txt"),
+            b"\xef\xbb\xbfhello \xffworld\xe2\x82",
+        )
+        .unwrap();
+        let (text, images) = expand(
+            &["@broken.txt".into(), "summarize".into()],
+            directory.path(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(images.is_empty());
+        assert!(text.ends_with("broken.txt\">\nhello \u{fffd}world\u{fffd}\n</file>\nsummarize"));
+    }
+
+    #[test]
+    fn corrupt_detected_image_retains_image_omission() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.png"),
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR",
+        )
+        .unwrap();
+        let (text, images) = expand(&["@broken.png".into()], directory.path(), true, None).unwrap();
+        assert!(images.is_empty());
+        assert!(text.contains("[Image omitted:"), "{text}");
+        assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn short_and_animated_png_are_decoded_as_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let short = b"\x89PNG\r\n\x1a\ncorrupt";
+        std::fs::write(directory.path().join("short.png"), short).unwrap();
+        let mut animated = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        animated.extend_from_slice(&[0; 17]); // IHDR data and CRC
+        animated.extend_from_slice(b"\0\0\0\x08acTL");
+        std::fs::write(directory.path().join("animated.png"), &animated).unwrap();
+        for (name, bytes) in [
+            ("short.png", short.as_slice()),
+            ("animated.png", animated.as_slice()),
+        ] {
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn image_extensions_do_not_make_text_or_partial_png_an_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let signature = b"\x89PNG\r\n\x1a\n";
+        for size in 1..signature.len() {
+            let name = format!("partial-{size}.png");
+            let bytes = &signature[..size];
+            std::fs::write(directory.path().join(&name), bytes).unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+        for name in ["note.png", "note.jpg", "note.webp"] {
+            std::fs::write(directory.path().join(name), "ordinary text").unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(text.contains("ordinary text"));
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn malformed_text_still_obeys_aggregate_input_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = vec![b'a'; 8 * 1024 * 1024];
+        bytes.push(0xff);
+        std::fs::write(directory.path().join("large.txt"), bytes).unwrap();
+        let error = expand(&["@large.txt".into()], directory.path(), true, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attachments exceed the 8 MiB input limit")
+        );
+    }
+
     #[test]
     fn attachments_use_reader_filename_fallbacks_and_file_urls() {
         let directory = tempfile::tempdir().unwrap();
