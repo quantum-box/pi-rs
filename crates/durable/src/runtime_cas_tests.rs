@@ -1380,6 +1380,9 @@ fn admission_tasks_are_atomic_idempotent_and_recoverable() {
         .unwrap();
     for task in [
         make(Uuid::new_v4(), "job").registered("job".into(), false),
+        make(Uuid::new_v4(), "job")
+            .registered_versioned("job".into(), true, 2, serde_json::Value::Null)
+            .unwrap(),
         Task::new(
             Uuid::new_v4(),
             TaskOwner::Conversation(other),
