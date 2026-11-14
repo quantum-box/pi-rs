@@ -788,6 +788,20 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn worker_configuration_does_not_capture_prompt_file_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let prompt = directory.path().join("system.txt");
+        std::fs::write(&prompt, "first prompt").unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().to_owned();
+        args.system_prompt = Some(prompt.clone());
+        let before = super::configuration(&args);
+        std::fs::write(&prompt, "different prompt").unwrap();
+        let after = super::configuration(&args);
+        assert_eq!(before, after);
+    }
+
     #[cfg(unix)]
     #[test]
     fn rpc_transition_wait_and_worker_shutdown_respond_to_cancellation() {

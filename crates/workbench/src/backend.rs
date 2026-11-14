@@ -1821,6 +1821,50 @@ mod share_context_tests {
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
 
     #[test]
+    fn equal_session_head_does_not_identify_live_share_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "before runtime refresh".into(),
+            tools: Vec::new(),
+        }));
+        let before = snapshot.share_snapshot().unwrap();
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "after runtime refresh".into(),
+            tools: vec![pi_rs::ToolSpec {
+                name: "dynamic_tool".into(),
+                description: "changed without a journal entry".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+        }));
+        let after = snapshot.share_snapshot().unwrap();
+        assert_eq!(before.session_id, after.session_id);
+        assert_eq!(before.head, after.head);
+        assert_ne!(before.context.system_prompt, after.context.system_prompt);
+        assert_ne!(before.context.tools.len(), after.context.tools.len());
+    }
+
+    #[test]
+    fn equal_session_id_and_head_do_not_identify_journal_content() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let mut altered = session.records().to_vec();
+        match &mut altered.last_mut().unwrap().event {
+            Event::User { content, .. } => *content = "different".into(),
+            _ => panic!("expected a user record"),
+        }
+        let altered = Session::from_records(altered).unwrap();
+        assert_eq!(session.session_id(), altered.session_id());
+        assert_eq!(session.head(), altered.head());
+        assert_ne!(
+            serde_json::to_vec(session.records()).unwrap(),
+            serde_json::to_vec(altered.records()).unwrap()
+        );
+    }
+
+    #[test]
     fn stalled_share_reader_does_not_delay_runtime_shutdown() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
