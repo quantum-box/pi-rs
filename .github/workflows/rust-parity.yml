@@ -25,6 +25,8 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
       - name: Test live share capture
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
+      - name: Test standalone share runtime tools
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_uses_reconstructed_runtime_tools
       - name: Test Radius cached context export
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_upload_uses_reopened_journal_bound_cached_context
       - name: Test unavailable cache RPC startup

@@ -582,15 +582,15 @@ async fn standalone_share_snapshot_with_runtime(
             )
             .await?;
         let base = runtime.share_base();
-        let (system_prompt, tools) =
-            source.effective_system_context(&base.system_prompt, base.tools);
+        let (system_prompt, _) =
+            source.effective_system_context(&base.system_prompt, base.tools.clone());
         Ok(super::sessions::ShareSnapshot {
             session_id: source.session_id(),
             head: source.head(),
             journal_tag: None,
             context: super::sessions::ShareContext {
                 system_prompt,
-                tools,
+                tools: base.tools,
             },
         })
     }
@@ -1183,6 +1183,72 @@ mod standalone_share_tests {
             );
             assert_eq!(std::fs::read(path).unwrap(), original);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_share_uses_reconstructed_runtime_tools_not_old_declarations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let seed = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: pi_rs::Event::SystemCheckpoint {
+                content: "historical session prompt".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        });
+        drop(seed);
+        let source = Session::from_records(records).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--tools",
+            "read",
+        ])
+        .unwrap();
+        args.workspace = directory.path().to_owned();
+        args.session = path.clone();
+        let runtime = configure(&args, false).await.unwrap();
+        let base = runtime.share_base();
+        assert!(base.tools.iter().any(|tool| tool.name == "read"));
+        assert!(
+            source
+                .effective_system_context(&base.system_prompt, base.tools)
+                .1
+                .is_empty()
+        );
+        let copy = Session::from_records(source.records().to_vec()).unwrap();
+        let snapshot = standalone_share_snapshot_with_runtime(&args, &source, copy, runtime)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.context.system_prompt, "historical session prompt");
+        assert!(
+            snapshot
+                .context
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
