@@ -473,6 +473,23 @@ exactly-once external effects are not guaranteed.
 
 ### Generic task definition versions
 
+Generic task `Handler` implementations can override `run_with_documents` to
+read and stage JSON documents through `TaskDocuments`. For `Continue`, `Wait`,
+and `Succeed`, all document reads (including missing and read-only addresses),
+document writes, the task transition and any children in `Wait` commit in one
+checked batch. Reads must precede writes, and each written address must have
+been read and may be written once. The default method calls the existing `run`.
+`Fail` and abort handlers do not commit staged documents. Children can only be
+created through `Wait` and remain subject to its ownership and registration
+checks. A concurrent document or task change can conflict: the scheduler returns
+an error and must be dropped and reopened; a replay-safe invocation may then run
+again. The reservation is a separate durable commit, so recovery can see the
+old checkpoint in running state. Handler effects outside the store need their
+own idempotency. A storage error can have an unknown outcome; inspect recovered
+state before acting. This is not upstream's general asynchronous transaction:
+there are no entries, read-your-writes, consistent multi-document snapshot,
+automatic conflict retry, or arbitrary task creation in this callback.
+
 Generic `Task` records carry a positive definition version, JSON input, and a
 checkpoint. Older records without these fields read as version 1 with null input.
 Use `registered_versioned` and `Registry::register_versioned` to create tasks

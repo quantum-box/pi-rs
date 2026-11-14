@@ -205,6 +205,27 @@ pub struct AdmissionDocuments<'a> {
     writes: HashMap<Address, Option<Map<String, Value>>>,
     tasks: Vec<crate::task::Task>,
 }
+
+/// Checked document reads and writes staged by one task invocation.
+/// Reads must precede writes; all reads are validated when the step commits.
+pub struct TaskDocuments<'a>(AdmissionDocuments<'a>);
+impl<'a> TaskDocuments<'a> {
+    pub(crate) fn new(store: &'a Store) -> Self {
+        Self(AdmissionDocuments::new(store))
+    }
+    pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
+        self.0.get(address)
+    }
+    pub fn put(&mut self, address: &Address, value: Map<String, Value>) -> Result<(), Error> {
+        self.0.put(address, value)
+    }
+    pub fn delete(&mut self, address: &Address) -> Result<(), Error> {
+        self.0.delete(address)
+    }
+    pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
+        self.0.into_batch()
+    }
+}
 impl<'a> AdmissionDocuments<'a> {
     pub(crate) fn new(store: &'a Store) -> Self {
         Self {

@@ -30,6 +30,15 @@ use uuid::Uuid;
 /// derived from task ID and checkpoint, and reconcile uncertain results externally.
 pub trait Handler: Send + Sync {
     fn run(&self, task: &Task) -> Result<Step, String>;
+    /// Stage checked documents alongside a successful step. The default keeps
+    /// existing handlers unchanged. Implementations must be replay-safe.
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        _documents: &mut crate::document::TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        self.run(task)
+    }
 }
 impl<F> Handler for F
 where
@@ -174,6 +183,8 @@ pub enum Error {
     Owner(#[from] OwnerError),
     #[error(transparent)]
     Store(#[from] task_store::Error),
+    #[error(transparent)]
+    Document(#[from] crate::document::Error),
     #[error("task transition: {0:?}")]
     Transition(TransitionError),
     #[error("unknown or mismatched task registration")]
@@ -601,7 +612,8 @@ impl Scheduler {
             .load(snapshot.task.id())?
             .ok_or(Error::Ownership)?;
         drop(gate);
-        let result = handler.run(&running.task);
+        let mut documents = crate::document::TaskDocuments::new(owner.store());
+        let result = handler.run_with_documents(&running.task, &mut documents);
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         // An abort can commit while the synchronous handler is running. Its
         // output (including proposed children) must never cross that fence.
@@ -674,12 +686,18 @@ impl Scheduler {
         }
         let mut batch = vec![Save::Update(&next)];
         batch.extend(children.iter().map(Save::Create));
-        match self.ts().save(&batch) {
+        let mut transaction = crate::document::Transaction::new();
+        transaction.append(documents.into_batch()?)?;
+        transaction.append(self.ts().prepare_save(&batch)?)?;
+        match transaction.commit(owner.store()) {
             Ok(()) => {}
-            Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+            Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
                 let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
                 if !current.task.abort_requested() {
-                    return Err(Error::Ownership);
+                    return Err(
+                        crate::document::Error::Store(durable_store::Error::Conflict { key })
+                            .into(),
+                    );
                 }
                 self.ts().update(&current, |task| task.yield_ready())?;
             }
