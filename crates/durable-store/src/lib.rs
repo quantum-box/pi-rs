@@ -30,6 +30,8 @@ pub struct Check {
 pub enum Expected {
     Missing,
     Version(u64),
+    /// Document key has no mutations after this history boundary.
+    DocumentUnchangedSince(u64),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
@@ -355,6 +357,24 @@ impl Store {
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
                 Expected::Version(v) => version == Some(v),
+                Expected::DocumentUnchangedSince(revision) => {
+                    if !check.key.starts_with(b"durable/document/") {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let current: u64 = tx.query_row(
+                        "SELECT revision FROM durable_document_history_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if revision > current {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let changed: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM durable_document_history WHERE key=?1 AND revision>?2)",
+                        params![check.key, revision], |r| r.get(0),
+                    )?;
+                    !changed
+                }
             };
             if !matches {
                 return Err(Error::Conflict {

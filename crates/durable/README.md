@@ -536,8 +536,11 @@ Generic task `Handler` implementations can override `run_with_documents` to
 read and stage JSON documents through `TaskDocuments`. For `Continue`, `Wait`,
 and `Succeed`, all document reads (including missing and read-only addresses),
 document writes, the task transition and any children in `Wait` commit in one
-checked batch. Reads must precede writes, and each written address must have
-been read and may be written once. The default method calls the existing `run`.
+checked batch. Each invocation captures one immutable document revision before the handler runs.
+Reads use that revision and see staged writes and deletes; writes require a prior
+read and can be replaced. Staged new documents report version zero; existing
+staged documents retain their original version until commit. Every read address
+is checked for any intervening mutation, including create/delete cycles. The default method calls the existing `run`.
 `Fail` and abort handlers do not commit staged documents. Children can only be
 created through `Wait` and remain subject to its ownership and registration
 checks. A checked document conflict rolls back the entire batch. A replay-safe
@@ -550,8 +553,9 @@ storage errors still poison the scheduler and require reopening; storage errors
 can have an unknown outcome. The reservation is a separate durable commit,
 so a crash can leave the old checkpoint running. External effects require their
 own idempotency or reconciliation. Unlike upstream's transaction callback,
-this synchronous task callback has no entries, read-your-writes, consistent
-multi-document snapshot, or arbitrary task creation. Upstream commits writes
+this synchronous task callback has no entries, general session transaction,
+or arbitrary task creation. It uses optimistic checks rather than the upstream
+Session mutation line and does not expose mutable Chord drafts. Upstream commits writes
 through `runtime.commit()` and documents replay-safe tool recovery on restart;
 this scheduler additionally gates whole-handler conflict retries on its recorded
 and current replay policies.

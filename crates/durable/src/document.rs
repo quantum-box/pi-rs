@@ -345,24 +345,73 @@ pub struct AdmissionDocuments<'a> {
     tasks: Vec<crate::task::Task>,
 }
 
-/// Checked document reads and writes staged by one task invocation.
-/// Reads must precede writes; all reads are validated when the step commits.
-pub struct TaskDocuments<'a>(AdmissionDocuments<'a>);
+/// Checked document operations at one invocation-wide immutable revision.
+/// Staged values are visible to later reads. A staged new document has version
+/// zero; existing staged documents retain their original version until commit.
+pub struct TaskDocuments<'a> {
+    store: &'a Store,
+    revision: u64,
+    reads: HashMap<Address, Option<Document>>,
+    writes: HashMap<Address, Option<Map<String, Value>>>,
+}
 impl<'a> TaskDocuments<'a> {
-    pub(crate) fn new(store: &'a Store) -> Self {
-        Self(AdmissionDocuments::new(store))
+    pub(crate) fn new(store: &'a Store) -> Result<Self, Error> {
+        Ok(Self {
+            store,
+            revision: store.document_snapshot()?,
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+        })
     }
     pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
-        self.0.get(address)
+        if let Some(value) = self.writes.get(address) {
+            return Ok(value.as_ref().map(|value| Document {
+                value: value.clone(),
+                version: self.reads[address].as_ref().map_or(0, |doc| doc.version),
+            }));
+        }
+        if let Some(value) = self.reads.get(address) {
+            return Ok(value.clone());
+        }
+        let value = Documents::new(self.store).get_at(address, self.revision)?;
+        self.reads.insert(address.clone(), value.clone());
+        Ok(value)
     }
     pub fn put(&mut self, address: &Address, value: Map<String, Value>) -> Result<(), Error> {
-        self.0.put(address, value)
+        self.write(address, Some(value))
     }
     pub fn delete(&mut self, address: &Address) -> Result<(), Error> {
-        self.0.delete(address)
+        self.write(address, None)
+    }
+    fn write(&mut self, address: &Address, value: Option<Map<String, Value>>) -> Result<(), Error> {
+        if !self.reads.contains_key(address) {
+            return Err(Error::UnreadOrWritten);
+        }
+        self.writes.insert(address.clone(), value);
+        Ok(())
     }
     pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
-        self.0.into_batch()
+        let mut batch = OwnedBatch {
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        };
+        for address in self.reads.keys() {
+            let key = address.storage_key()?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::DocumentUnchangedSince(self.revision),
+            });
+            if let Some(value) = self.writes.get(address) {
+                batch.mutations.push(match value {
+                    Some(value) => Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(value)?,
+                    },
+                    None => Mutation::Delete { key },
+                });
+            }
+        }
+        Ok(batch)
     }
 }
 impl<'a> AdmissionDocuments<'a> {

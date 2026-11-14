@@ -249,3 +249,269 @@ fn child_creation_conflict_is_not_treated_as_document_retry() {
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn invocation_snapshot_read_your_writes_and_stale_rollback_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize(&path);
+    let handler_path = path.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    struct SnapshotWork {
+        path: PathBuf,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Handler for SnapshotWork {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                // The revision was captured before entering the handler, even before its first read.
+                let db = Store::open(&self.path).unwrap();
+                let old = Documents::new(&db).get(&address("write")).unwrap().unwrap();
+                let mut tx = Transaction::new();
+                tx.put(
+                    &address("write"),
+                    Expected::Version(old.version),
+                    json!({"n": 9}).as_object().unwrap(),
+                )
+                .unwrap();
+                tx.put(
+                    &address("dependency"),
+                    Expected::Missing,
+                    json!({"n": 9}).as_object().unwrap(),
+                )
+                .unwrap();
+                tx.commit(&db).unwrap();
+            }
+            assert_eq!(
+                docs.get(&address("write")).unwrap().unwrap().value["n"],
+                if first { 0 } else { 9 }
+            );
+            docs.put(
+                &address("write"),
+                json!({"n": 2}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            assert_eq!(docs.get(&address("write")).unwrap().unwrap().value["n"], 2);
+            assert_eq!(
+                docs.get(&address("dependency"))
+                    .unwrap()
+                    .map(|d| d.value["n"].clone()),
+                if first { None } else { Some(json!(9)) }
+            );
+            docs.put(
+                &address("dependency"),
+                json!({"n": 3}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            if first {
+                assert_eq!(
+                    docs.get(&address("dependency")).unwrap().unwrap().version,
+                    0
+                );
+            }
+            docs.delete(&address("dependency")).unwrap();
+            assert!(docs.get(&address("dependency")).unwrap().is_none());
+            docs.put(
+                &address("dependency"),
+                json!({"n": 4}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            Ok(Step::Continue(cp("next")))
+        }
+    }
+    let make_registry = || {
+        let mut r = Registry::default();
+        r.register(
+            "parent",
+            true,
+            SnapshotWork {
+                path: handler_path.clone(),
+                calls: observed.clone(),
+            },
+        );
+        r
+    };
+    let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+    scheduler.submit(&parent()).unwrap();
+    scheduler.tick(0).unwrap();
+    assert_eq!(
+        scheduler.get(parent().id()).unwrap().unwrap().checkpoint(),
+        &cp("start")
+    );
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        9
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("dependency"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        9
+    );
+    drop(db);
+    let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .load(parent().id())
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint(),
+        &cp("next")
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        2
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("dependency"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        4
+    );
+}
+
+#[test]
+fn missing_document_create_delete_race_conflicts() {
+    struct Aba(PathBuf);
+    impl Handler for Aba {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            assert!(docs.get(&address("dependency")).unwrap().is_none());
+            let db = Store::open(&self.0).unwrap();
+            let mut tx = Transaction::new();
+            tx.put(
+                &address("dependency"),
+                Expected::Missing,
+                json!({}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(&db).unwrap();
+            let version = Documents::new(&db)
+                .get(&address("dependency"))
+                .unwrap()
+                .unwrap()
+                .version;
+            let mut tx = Transaction::new();
+            tx.delete(&address("dependency"), version).unwrap();
+            tx.commit(&db).unwrap();
+            docs.get(&address("write")).unwrap();
+            docs.put(
+                &address("write"),
+                json!({"n": 5}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            Ok(Step::Continue(cp("next")))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize(&path);
+    let mut r = Registry::default();
+    r.register("parent", true, Aba(path.clone()));
+    let mut scheduler = Scheduler::open(&path, r).unwrap();
+    scheduler.submit(&parent()).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .load(parent().id())
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint(),
+        &cp("start")
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        0
+    );
+}
+
+#[test]
+fn failed_step_discards_staged_documents_after_reopen() {
+    struct Fail;
+    impl Handler for Fail {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&address("write")).unwrap();
+            docs.put(
+                &address("write"),
+                json!({"n": 10}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            assert_eq!(docs.get(&address("write")).unwrap().unwrap().value["n"], 10);
+            Ok(Step::Fail("failed".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize(&path);
+    let mut r = Registry::default();
+    r.register("parent", true, Fail);
+    let mut scheduler = Scheduler::open(&path, r).unwrap();
+    scheduler.submit(&parent()).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    assert!(matches!(
+        TaskStore::new(&db)
+            .load(parent().id())
+            .unwrap()
+            .unwrap()
+            .task
+            .state(),
+        TaskState::Failed(_)
+    ));
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        0
+    );
+}
