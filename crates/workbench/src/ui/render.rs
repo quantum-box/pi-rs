@@ -1705,6 +1705,7 @@ fn markdown_at_depth(
                     .last()
                     .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
                 span.bold = heading > 0;
+                span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
             Event::SoftBreak => {
@@ -1790,6 +1791,22 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_code_in_strikethrough_inherits_strikethrough() {
+        let theme = Theme::system();
+        let lines = markdown("~~deleted `code`~~ and `plain`", &theme, 80);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        let code = spans.iter().find(|span| span.text == "code").unwrap();
+        assert!(code.strikethrough);
+        assert_eq!(code.color, theme.color("mdCode"));
+        assert!(
+            !spans
+                .iter()
+                .find(|span| span.text == "plain")
+                .unwrap()
+                .strikethrough
+        );
+    }
     #[test]
     fn markdown_requires_double_tildes_for_strikethrough() {
         let theme = Theme::system();
