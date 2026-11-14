@@ -85,6 +85,9 @@ impl Dialog {
     pub fn set_error(&mut self, error: String) {
         self.error = Some(error);
     }
+    pub fn external_editor_text(&self) -> &str {
+        &self.editor.text
+    }
     pub fn external_editor_requested(&self, key: KeyEvent, keys: &Keys) -> bool {
         matches!(self.request, UiRequest::Editor { .. })
             && !keys.matches("tui.select.cancel", key)
