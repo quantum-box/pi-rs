@@ -1622,7 +1622,7 @@ impl BashOperations for LocalBashOperations {
             task.abort();
         }
         process.finished = true;
-        Ok(status.expect("shell status observed").code())
+        Ok(Some(exit_code(status.expect("shell status observed"))))
     }
 }
 
@@ -2841,12 +2841,6 @@ impl CodingTool {
                 "Command aborted",
             )));
         }
-        if self.unrestricted && result.status.code().is_none() {
-            return Err(Error::Config(shell_status(
-                &result.output.result_display(),
-                "Command terminated without an exit code",
-            )));
-        }
         Ok(result)
     }
     async fn shell_stream(
@@ -3328,7 +3322,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        128 + status.signal().unwrap_or(0)
+        status.signal().map_or(1, |signal| 128 + signal)
     }
     #[cfg(not(unix))]
     {
@@ -3457,15 +3451,30 @@ mod tests {
             assert_eq!(structured_content["truncated"], false);
             assert!(structured_content["wall_time_seconds"].as_f64().is_some());
         }
-        let terminated = tool
-            .bash(
-                &serde_json::json!({"command":"kill -TERM $$"}),
-                &pi_rs::CancellationToken::new(),
-            )
-            .await;
-        assert!(
-            matches!(terminated, pi_rs::Outcome::Failed(ref message) if message.contains("Command terminated without an exit code"))
-        );
+        for (signal, code) in [("TERM", 143), ("KILL", 137)] {
+            let terminated = tool
+                .bash(
+                    &serde_json::json!({"command":format!("printf partial; kill -{signal} $$")}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                structured_content,
+                is_error,
+                ..
+            } = terminated
+            else {
+                panic!("signal termination must return a structured result")
+            };
+            assert_eq!(
+                output,
+                format!("partial\n\nCommand exited with code {code}")
+            );
+            assert!(is_error);
+            assert_eq!(structured_content["output"], "partial");
+            assert_eq!(structured_content["exit_code"], code);
+        }
     }
 
     #[test]
