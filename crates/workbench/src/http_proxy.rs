@@ -389,7 +389,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn legacy_stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
+    async fn stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -399,15 +399,14 @@ mod tests {
         use tokio::time::{Duration, timeout};
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = origin.local_addr().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_url = format!("http://user:secret@{}", listener.local_addr().unwrap());
-        let count = Arc::new(AtomicUsize::new(0));
-        let calls = count.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
         let proxy = reqwest::Proxy::custom(move |_| {
-            (calls.fetch_add(1, Ordering::SeqCst) < 3).then(|| proxy_url.clone())
+            (counter.fetch_add(1, Ordering::SeqCst) == 0)
+                .then_some("http://user:secret@127.0.0.1:1")
         });
         let server = tokio::spawn(async move {
-            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -444,18 +443,77 @@ mod tests {
         .unwrap();
         assert!(response.status().is_success());
         let request = server.await.unwrap();
-        assert!(request.starts_with(&format!("GET http://{target}/test HTTP/1.1\r\n")));
+        assert!(request.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(
-            request
+            !request
                 .to_ascii_lowercase()
-                .contains("proxy-authorization: basic dxnlcjpzzwnyzxq=")
+                .contains("proxy-authorization:")
         );
-        assert_eq!(count.load(Ordering::SeqCst), 3);
-        assert!(
-            timeout(Duration::from_millis(250), origin.accept())
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_stateful_proxy_callback_does_not_leak_credentials_to_direct_origin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = origin.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let proxy = reqwest_mcp::Proxy::custom(move |_| {
+            (counter.fetch_add(1, Ordering::SeqCst) == 0)
+                .then_some("http://user:secret@127.0.0.1:1")
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
                 .await
-                .is_err()
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{target}/test")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
         );
+        assert!(calls.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
@@ -756,6 +814,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_origin_uses_tls_proxy_and_keeps_auth_out_of_tunnel() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("https://user:pass@{}", listener.local_addr().unwrap());
+        let proxy = proxies(Some(&proxy_url), None, "").unwrap().pop().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let cert = rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/bedrock-proxy-tls/server.der").to_vec(),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    include_bytes!("../tests/fixtures/bedrock-proxy-tls/server-key.der").to_vec(),
+                ),
+            );
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+            let tls = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                socket,
+            );
+            let mut tls = BufReader::new(tls);
+            let mut connect = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                connect.push_str(&line);
+            }
+            assert!(connect.starts_with("CONNECT origin.invalid:80 HTTP/1.1\r\n"));
+            assert!(
+                connect
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnz")
+            );
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let mut origin = String::new();
+            loop {
+                let mut line = String::new();
+                tls.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                origin.push_str(&line);
+            }
+            assert!(origin.starts_with("GET /test HTTP/1.1\r\n"));
+            assert!(!origin.to_ascii_lowercase().contains("proxy-authorization:"));
+            tls.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let cert = reqwest::Certificate::from_pem(include_bytes!(
+            "../tests/fixtures/bedrock-proxy-tls/ca.pem"
+        ))
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(cert)
+            .build()
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/test").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn bypassed_http_request_does_not_receive_proxy_credentials() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -810,6 +957,89 @@ mod tests {
         assert!(response.status().is_success());
         let request = server.await.unwrap();
         assert!(request.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_from_proxy_to_no_proxy_does_not_leak_auth() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = origin.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        let proxy = proxies(Some(&proxy_url), None, &address.to_string())
+            .unwrap()
+            .pop()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut connect = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                connect.push_str(&line);
+            }
+            assert!(connect.starts_with("CONNECT origin.invalid:80 HTTP/1.1\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{address}/end\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.get("http://origin.invalid/start").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /end HTTP/1.1\r\n"));
         assert!(
             !request
                 .to_ascii_lowercase()

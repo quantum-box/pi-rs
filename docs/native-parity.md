@@ -49,9 +49,10 @@ hostnames too; `HttpOptionsWithProxyHosts` enables private DNS proxy hosts.
 Lowercase environment variables take precedence, and explicit
 environment values take precedence over the setting. Proxy URL credentials are
 not displayed in the settings list. Workbench-configured reqwest proxies use
-CONNECT for HTTP as well as HTTPS origins, matching Pi; externally supplied
-SDK proxy objects retain their existing behavior. Other network surfaces need
-integration.
+CONNECT for HTTP as well as HTTPS origins, matching Pi. Authenticated dynamic
+`Proxy::custom` HTTP proxies also use CONNECT to prevent callback changes from
+exposing proxy credentials to a direct origin; such proxies must accept CONNECT.
+Other network surfaces need integration.
 
 The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates

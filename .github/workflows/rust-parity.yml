@@ -20,6 +20,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  vendored-reqwest:
+    name: Vendored reqwest integrity and RustSec
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify upstream archives and exact patches
+        run: python3 vendor/verify-reqwest.py
+      - name: Install cargo-audit
+        run: cargo +stable install cargo-audit --version 0.21.2 --locked
+      - name: Audit vendored registry versions
+        run: cargo +stable audit --file vendor/reqwest-audit.lock
+
   native:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

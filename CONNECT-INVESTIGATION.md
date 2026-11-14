@@ -14,8 +14,10 @@ AWS HTTP handler and must be assessed separately.
   `connector_layer` wraps a service using private URI/connection fields, so a
   downstream layer cannot safely replace the stream or change its proxy flag.
 * HTTP forward proxy authentication and custom proxy headers are injected into
-  the origin request by reqwest. A CONNECT implementation must move those
-  headers to the CONNECT request, and must not forward them to the origin.
+  the origin request by reqwest. Authenticated dynamic `Proxy::custom` matches
+  use CONNECT even without the opt-in because callback results can change
+  between request construction and connection. This intentionally changes
+  legacy custom proxies that require authenticated forward requests.
 * MCP OAuth enforces URL and redirect checks and uses a DNS resolver that
   exempts configured proxy hosts. Any transport replacement must preserve the
   checks on every redirect and avoid treating an origin as a proxy host.

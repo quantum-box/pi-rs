@@ -419,6 +419,13 @@ impl ClientBuilder {
         if config.auto_sys_proxy {
             proxies.push(ProxyMatcher::system());
         }
+        // A dynamic callback can change between request headers and connection.
+        // Keep proxy credentials on CONNECT whenever any rule is dynamic.
+        if proxies.iter().any(ProxyMatcher::is_dynamic) {
+            for proxy in &mut proxies {
+                proxy.require_sensitive_tunnel();
+            }
+        }
         let proxies = Arc::new(proxies);
 
         #[allow(unused)]

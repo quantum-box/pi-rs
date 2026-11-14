@@ -68,6 +68,8 @@ pub struct NoProxy {
 #[derive(Clone)]
 struct Extra {
     tunnel_http: bool,
+    dynamic: bool,
+    sensitive_tunnel: bool,
     auth: Option<HeaderValue>,
     misc: Option<HeaderMap>,
 }
@@ -257,16 +259,20 @@ impl Proxy {
     where
         F: Fn(&Url) -> Option<U> + Send + Sync + 'static,
     {
-        Proxy::new(Intercept::Custom(Custom {
+        let mut proxy = Proxy::new(Intercept::Custom(Custom {
             func: Arc::new(move |url| fun(url).map(IntoProxy::into_proxy)),
             no_proxy: None,
-        }))
+        }));
+        proxy.extra.dynamic = true;
+        proxy
     }
 
     fn new(intercept: Intercept) -> Proxy {
         Proxy {
             extra: Extra {
                 tunnel_http: false,
+                dynamic: false,
+                sensitive_tunnel: false,
                 auth: None,
                 misc: None,
             },
@@ -525,6 +531,8 @@ impl Matcher {
             inner: Matcher_::Util(matcher::Matcher::from_system()),
             extra: Extra {
                 tunnel_http: false,
+                dynamic: false,
+                sensitive_tunnel: false,
                 auth: None,
                 misc: None,
             },
@@ -564,6 +572,15 @@ impl Matcher {
     }
 }
 
+impl Matcher {
+    pub(crate) fn is_dynamic(&self) -> bool {
+        self.extra.dynamic
+    }
+    pub(crate) fn require_sensitive_tunnel(&mut self) {
+        self.extra.sensitive_tunnel = true;
+    }
+}
+
 impl fmt::Debug for Matcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.inner {
@@ -592,6 +609,8 @@ impl Intercepted {
 
     pub(crate) fn tunnel_http(&self) -> bool {
         self.extra.tunnel_http
+            || (self.extra.sensitive_tunnel
+                && (self.basic_auth().is_some() || self.custom_headers().is_some()))
     }
 
     pub(crate) fn uri(&self) -> &http::Uri {

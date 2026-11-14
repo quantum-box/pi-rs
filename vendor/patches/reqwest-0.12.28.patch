@@ -1,0 +1,280 @@
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -67,6 +67,9 @@
+ 
+ #[derive(Clone)]
+ struct Extra {
++    tunnel_http: bool,
++    dynamic: bool,
++    sensitive_tunnel: bool,
+     auth: Option<HeaderValue>,
+     misc: Option<HeaderMap>,
+ }
+@@ -256,21 +259,32 @@
+     where
+         F: Fn(&Url) -> Option<U> + Send + Sync + 'static,
+     {
+-        Proxy::new(Intercept::Custom(Custom {
++        let mut proxy = Proxy::new(Intercept::Custom(Custom {
+             func: Arc::new(move |url| fun(url).map(IntoProxy::into_proxy)),
+             no_proxy: None,
+-        }))
++        }));
++        proxy.extra.dynamic = true;
++        proxy
+     }
+ 
+     fn new(intercept: Intercept) -> Proxy {
+         Proxy {
+             extra: Extra {
++                tunnel_http: false,
++                dynamic: false,
++                sensitive_tunnel: false,
+                 auth: None,
+                 misc: None,
+             },
+             intercept,
+             no_proxy: None,
+         }
++    }
++
++    /// Tunnel HTTP requests through this proxy with CONNECT.
++    pub fn tunnel_http(mut self, enabled: bool) -> Proxy {
++        self.extra.tunnel_http = enabled;
++        self
+     }
+ 
+     /// Set the `Proxy-Authorization` header using Basic auth.
+@@ -516,6 +530,9 @@
+         Self {
+             inner: Matcher_::Util(matcher::Matcher::from_system()),
+             extra: Extra {
++                tunnel_http: false,
++                dynamic: false,
++                sensitive_tunnel: false,
+                 auth: None,
+                 misc: None,
+             },
+@@ -550,30 +567,17 @@
+         self.maybe_has_http_auth
+     }
+ 
+-    pub(crate) fn http_non_tunnel_basic_auth(&self, dst: &Uri) -> Option<HeaderValue> {
+-        if let Some(proxy) = self.intercept(dst) {
+-            let scheme = proxy.uri().scheme();
+-            if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
+-                return proxy.basic_auth().cloned();
+-            }
+-        }
+-
+-        None
+-    }
+-
+     pub(crate) fn maybe_has_http_custom_headers(&self) -> bool {
+         self.maybe_has_http_custom_headers
+     }
+-
+-    pub(crate) fn http_non_tunnel_custom_headers(&self, dst: &Uri) -> Option<HeaderMap> {
+-        if let Some(proxy) = self.intercept(dst) {
+-            let scheme = proxy.uri().scheme();
+-            if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
+-                return proxy.custom_headers().cloned();
+-            }
+-        }
+-
+-        None
++}
++
++impl Matcher {
++    pub(crate) fn is_dynamic(&self) -> bool {
++        self.extra.dynamic
++    }
++    pub(crate) fn require_sensitive_tunnel(&mut self) {
++        self.extra.sensitive_tunnel = true;
+     }
+ }
+ 
+@@ -587,6 +591,28 @@
+ }
+ 
+ impl Intercepted {
++    pub(crate) fn http_non_tunnel_basic_auth(&self) -> Option<HeaderValue> {
++        let scheme = self.uri().scheme();
++        if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
++            return self.basic_auth().cloned();
++        }
++        None
++    }
++
++    pub(crate) fn http_non_tunnel_custom_headers(&self) -> Option<HeaderMap> {
++        let scheme = self.uri().scheme();
++        if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
++            return self.custom_headers().cloned();
++        }
++        None
++    }
++
++    pub(crate) fn tunnel_http(&self) -> bool {
++        self.extra.tunnel_http
++            || (self.extra.sensitive_tunnel
++                && (self.basic_auth().is_some() || self.custom_headers().is_some()))
++    }
++
+     pub(crate) fn uri(&self) -> &http::Uri {
+         self.inner.uri()
+     }
+--- a/src/connect.rs
++++ b/src/connect.rs
+@@ -801,6 +801,42 @@
+         match &self.inner {
+             #[cfg(feature = "default-tls")]
+             Inner::DefaultTls(http, tls) => {
++                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
++                    let inner = hyper_tls::HttpsConnector::from((
++                        http.clone(),
++                        tokio_native_tls::TlsConnector::from(tls.clone()),
++                    ));
++                    let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
++                        proxy_dst.clone(),
++                        inner,
++                    );
++                    if let Some(auth) = auth.clone() {
++                        tunnel = tunnel.with_auth(auth);
++                    }
++                    if let Some(headers) = misc.clone() {
++                        tunnel = tunnel.with_headers(headers.clone());
++                    }
++                    if let Some(ua) = self.user_agent.clone() {
++                        let mut headers = http::HeaderMap::new();
++                        headers.insert(http::header::USER_AGENT, ua);
++                        tunnel = tunnel.with_headers(headers);
++                    }
++                    // hyper-util defaults absent ports to 443, including HTTP.
++                    let target = if dst.port().is_none() {
++                        let authority = format!("{}:80", dst.host().ok_or("no host in url")?);
++                        let mut parts = dst.clone().into_parts();
++                        parts.authority = Some(authority.parse()?);
++                        Uri::from_parts(parts)?
++                    } else {
++                        dst.clone()
++                    };
++                    let io = tunnel.call(target).await?;
++                    return Ok(Conn {
++                        inner: self.verbose.wrap(io),
++                        is_proxy: false,
++                        tls_info: false,
++                    });
++                }
+                 if dst.scheme() == Some(&Scheme::HTTPS) {
+                     log::trace!("tunneling HTTPS over proxy");
+                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+@@ -843,6 +879,40 @@
+                 tls,
+                 tls_proxy,
+             } => {
++                if proxy.tunnel_http() && dst.scheme() == Some(&Scheme::HTTP) {
++                    let inner =
++                        hyper_rustls::HttpsConnector::from((http.clone(), tls_proxy.clone()));
++                    let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
++                        proxy_dst.clone(),
++                        inner,
++                    );
++                    if let Some(auth) = auth.clone() {
++                        tunnel = tunnel.with_auth(auth);
++                    }
++                    if let Some(headers) = misc.clone() {
++                        tunnel = tunnel.with_headers(headers.clone());
++                    }
++                    if let Some(ua) = self.user_agent.clone() {
++                        let mut headers = http::HeaderMap::new();
++                        headers.insert(http::header::USER_AGENT, ua);
++                        tunnel = tunnel.with_headers(headers);
++                    }
++                    // hyper-util defaults absent ports to 443, including HTTP.
++                    let target = if dst.port().is_none() {
++                        let authority = format!("{}:80", dst.host().ok_or("no host in url")?);
++                        let mut parts = dst.clone().into_parts();
++                        parts.authority = Some(authority.parse()?);
++                        Uri::from_parts(parts)?
++                    } else {
++                        dst.clone()
++                    };
++                    let io = tunnel.call(target).await?;
++                    return Ok(Conn {
++                        inner: self.verbose.wrap(io),
++                        is_proxy: false,
++                        tls_info: false,
++                    });
++                }
+                 if dst.scheme() == Some(&Scheme::HTTPS) {
+                     use rustls_pki_types::ServerName;
+                     use std::convert::TryFrom;
+@@ -885,7 +955,11 @@
+                 }
+             }
+             #[cfg(not(feature = "__tls"))]
+-            Inner::Http(_) => (),
++            Inner::Http(_) => {
++                if proxy.tunnel_http() && dst.scheme_str() == Some("http") {
++                    return Err("HTTP CONNECT requires a TLS-enabled connector".into());
++                }
++            }
+         }
+ 
+         self.connect_with_maybe_proxy(proxy_dst, true).await
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -419,6 +419,13 @@
+         if config.auto_sys_proxy {
+             proxies.push(ProxyMatcher::system());
+         }
++        // A dynamic callback can change between request headers and connection.
++        // Keep proxy credentials on CONNECT whenever any rule is dynamic.
++        if proxies.iter().any(ProxyMatcher::is_dynamic) {
++            for proxy in &mut proxies {
++                proxy.require_sensitive_tunnel();
++            }
++        }
+         let proxies = Arc::new(proxies);
+ 
+         #[allow(unused)]
+@@ -2673,9 +2680,14 @@
+         }
+ 
+         for proxy in self.inner.proxies.iter() {
+-            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
+-                headers.insert(PROXY_AUTHORIZATION, header);
+-                break;
++            if let Some(matched) = proxy.intercept(dst) {
++                if matched.tunnel_http() {
++                    break;
++                }
++                if let Some(header) = matched.http_non_tunnel_basic_auth() {
++                    headers.insert(PROXY_AUTHORIZATION, header);
++                    break;
++                }
+             }
+         }
+     }
+@@ -2690,11 +2702,16 @@
+         }
+ 
+         for proxy in self.inner.proxies.iter() {
+-            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
+-                iter.iter().for_each(|(key, value)| {
+-                    headers.insert(key, value.clone());
+-                });
+-                break;
++            if let Some(matched) = proxy.intercept(dst) {
++                if matched.tunnel_http() {
++                    break;
++                }
++                if let Some(iter) = matched.http_non_tunnel_custom_headers() {
++                    iter.iter().for_each(|(key, value)| {
++                        headers.insert(key, value.clone());
++                    });
++                    break;
++                }
+             }
+         }
+     }
