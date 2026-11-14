@@ -959,6 +959,39 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         scheduler.view(id, limit).unwrap().tool_progress,
         Some(State::Running(Some(json!({"text":"working"}))))
     );
+    let first = scheduler
+        .tool_progress_events(
+            attempt.attempt_id,
+            pi_rs_durable::observer::Cursor(0),
+            limit,
+        )
+        .unwrap();
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(
+        first.records[0].value["attempt"]["attempt_id"],
+        json!(attempt.attempt_id)
+    );
+    assert_eq!(
+        first.records[0].value["attempt"]["operation_id"],
+        json!(attempt.operation_id)
+    );
+    assert_eq!(
+        first.records[0].value["state"],
+        json!({"state":"running","partial":{"text":"working"}})
+    );
+    let live_host = tool.host.lock().unwrap().as_ref().unwrap().clone();
+    live_host
+        .report_progress(json!({"text":"later"}))
+        .await
+        .unwrap();
+    drop(live_host);
+    let second = scheduler
+        .tool_progress_events(attempt.attempt_id, first.next, limit)
+        .unwrap();
+    assert_eq!(
+        second.records[0].value["state"],
+        json!({"state":"running","partial":{"text":"later"}})
+    );
     let error = scheduler.abort_and_wait(id).await.unwrap_err();
     assert!(error.to_string().contains("abort cleanup remains pending"));
     let host = tool.host.lock().unwrap().take().unwrap();
@@ -966,11 +999,30 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     drop(host);
     scheduler.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
+    drop(store);
+    let reopened = Scheduler::open(&path, opts()).unwrap();
+    let terminal = reopened
+        .tool_progress_events(attempt.attempt_id, second.next, limit)
+        .unwrap();
+    assert_eq!(terminal.records.len(), 1);
+    assert_eq!(
+        terminal.records[0].value["state"],
+        json!({"state":"aborted","partial":{"text":"later"}})
+    );
+    assert!(
+        reopened
+            .tool_progress_events(attempt.attempt_id, terminal.next, limit)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    reopened.shutdown().await.unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
     let snapshot =
         pi_rs_durable::tool_progress::Snapshot::load(&store, attempt.attempt_id).unwrap();
     assert_eq!(
         snapshot.state(),
-        &State::Aborted(Some(json!({"text":"working"})))
+        &State::Aborted(Some(json!({"text":"later"})))
     );
 }
 
@@ -1024,6 +1076,21 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         .unwrap()
         .forget();
     let second = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let limit = std::num::NonZeroUsize::new(10).unwrap();
+    let old = scheduler
+        .tool_progress_events(first.attempt_id, pi_rs_durable::observer::Cursor(0), limit)
+        .unwrap();
+    assert_eq!(old.records.len(), 2);
+    assert_eq!(old.records[0].value["state"]["state"], "running");
+    assert_eq!(old.records[1].value["state"]["state"], "aborted");
+    let fresh = scheduler
+        .tool_progress_events(second.attempt_id, pi_rs_durable::observer::Cursor(0), limit)
+        .unwrap();
+    assert_eq!(fresh.records.len(), 1);
+    assert_eq!(
+        fresh.records[0].value["attempt"]["attempt_id"],
+        json!(second.attempt_id)
+    );
     assert_ne!(first.attempt_id, second.attempt_id);
     assert_eq!(first.operation_id, second.operation_id);
     tool.release.add_permits(1);
@@ -1036,6 +1103,18 @@ async fn replay_seals_old_attempt_and_completion_seals_fresh_progress() {
         .await
         .unwrap();
     drop(late);
+    let done = scheduler
+        .tool_progress_events(second.attempt_id, fresh.next, limit)
+        .unwrap();
+    assert_eq!(done.records.len(), 1);
+    assert_eq!(done.records[0].value["state"]["state"], "completed");
+    assert!(
+        scheduler
+            .tool_progress_events(first.attempt_id, old.next, limit)
+            .unwrap()
+            .records
+            .is_empty()
+    );
     scheduler.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     assert_eq!(

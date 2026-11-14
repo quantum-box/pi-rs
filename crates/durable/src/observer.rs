@@ -88,11 +88,24 @@ impl Append {
 pub struct Observer<'a> {
     store: &'a Store,
     stream: Uuid,
+    prefix: &'static [u8],
 }
 
 impl<'a> Observer<'a> {
     pub fn new(store: &'a Store, stream: Uuid) -> Self {
-        Self { store, stream }
+        Self {
+            store,
+            stream,
+            prefix: PREFIX,
+        }
+    }
+
+    pub(crate) fn tool_progress(store: &'a Store, stream: Uuid) -> Self {
+        Self {
+            store,
+            stream,
+            prefix: b"durable/tool-progress-events/",
+        }
     }
 
     /// Capture the current committed head for a finite reconnect catch-up.
@@ -101,7 +114,7 @@ impl<'a> Observer<'a> {
     pub fn head(&self) -> Result<Cursor, Error> {
         Ok(Cursor(
             self.store
-                .get(&head_key(self.stream))?
+                .get(&head_key_with(self.prefix, self.stream))?
                 .map(|entry| decode_head(&entry.value))
                 .transpose()?
                 .unwrap_or(0),
@@ -147,7 +160,7 @@ impl<'a> Observer<'a> {
     /// Prepare one record. Commit these checks and mutations together, without
     /// modifying them, optionally alongside unrelated host checks and mutations.
     pub fn prepare_append(&self, value: &Value) -> Result<Append, Error> {
-        let head_key = head_key(self.stream);
+        let head_key = head_key_with(self.prefix, self.stream);
         let head = self.store.get(&head_key)?;
         let sequence = match &head {
             Some(entry) => decode_head(&entry.value)?,
@@ -155,7 +168,7 @@ impl<'a> Observer<'a> {
         }
         .checked_add(1)
         .ok_or(Error::SequenceExhausted)?;
-        let record_key = record_key(self.stream, sequence);
+        let record_key = record_key_with(self.prefix, self.stream, sequence);
         Ok(Append {
             checks: vec![
                 Check {
@@ -183,12 +196,12 @@ impl<'a> Observer<'a> {
 
     /// Read up to `limit` records strictly after `after` from one snapshot.
     pub fn read(&self, after: Cursor, limit: NonZeroUsize) -> Result<Page, Error> {
-        let mut prefix = stream_prefix(self.stream);
+        let mut prefix = stream_prefix_with(self.prefix, self.stream);
         prefix.push(b'r');
         let (head, entries) = self.store.page_with_metadata(
-            &head_key(self.stream),
+            &head_key_with(self.prefix, self.stream),
             &prefix,
-            &record_key(self.stream, after.0),
+            &record_key_with(self.prefix, self.stream, after.0),
             limit.get().saturating_add(1),
         )?;
         let head = head
@@ -253,19 +266,19 @@ impl<'a> Observer<'a> {
     }
 }
 
-fn stream_prefix(id: Uuid) -> Vec<u8> {
-    let mut key = PREFIX.to_vec();
+fn stream_prefix_with(prefix: &[u8], id: Uuid) -> Vec<u8> {
+    let mut key = prefix.to_vec();
     key.extend_from_slice(id.as_bytes());
     key.push(b'/');
     key
 }
-fn head_key(id: Uuid) -> Vec<u8> {
-    let mut key = stream_prefix(id);
+fn head_key_with(prefix: &[u8], id: Uuid) -> Vec<u8> {
+    let mut key = stream_prefix_with(prefix, id);
     key.push(b'h');
     key
 }
-fn record_key(id: Uuid, sequence: u64) -> Vec<u8> {
-    let mut key = stream_prefix(id);
+fn record_key_with(prefix: &[u8], id: Uuid, sequence: u64) -> Vec<u8> {
+    let mut key = stream_prefix_with(prefix, id);
     key.push(b'r');
     key.extend_from_slice(&sequence.to_be_bytes());
     key
@@ -467,7 +480,7 @@ mod tests {
         db.commit(
             &[],
             &[Mutation::Delete {
-                key: record_key(Uuid::nil(), 1),
+                key: record_key_with(PREFIX, Uuid::nil(), 1),
             }],
         )
         .unwrap();

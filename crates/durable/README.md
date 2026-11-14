@@ -114,10 +114,24 @@ Callbacks are fenced by the conversation phase and attempt identity, and progres
 is sealed atomically with the corresponding transition. Legacy running attempts
 without an identity do not report durable progress until replay creates one.
 
+`Harness::tool_progress_events` and `Scheduler::tool_progress_events` poll a
+separate, per-attempt stream of committed replacement states and its terminal
+seal. Obtain the attempt UUID from the conversation view, start at `Cursor(0)`,
+and persist `next` after processing each bounded page. Every record includes
+`conversation_id`, `attempt` (operation and attempt IDs), and `state`. Reopen and
+resume with the same attempt UUID and cursor; replay creates a different stream.
+The cursor is exclusive and delivery is at least once if processing precedes
+cursor persistence. Progress and its event, including abort/completion, commit
+atomically under the existing attempt fence. Old attempts predating this feature
+are not backfilled. This log is unbounded on disk, stores whole replacement
+partials (up to the existing 1 MiB limit), and has no cross-attempt ordering,
+notifications, or automatic discovery of later attempts; use conversation views or
+history to discover attempts. It is not upstream's Chord operation stream.
+
 This pull API does not provide upstream's watch operations, `from`, automatic
 min/max window maintenance, or transcript entries for reset and compaction
-markers. Progress updates alone do not appear in observation history; poll the
-view for them. Message count and record reads are bounded, but a stored batch
+markers. Progress updates alone do not appear in conversation observation history;
+poll the view or the per-attempt stream for them. Message count and record reads are bounded, but a stored batch
 (especially a replacement), message, and conversation metadata can each be
 arbitrarily large and are decoded in full. Bytes, metadata copying and peak
 memory are therefore not independently bounded. Existing history and execution

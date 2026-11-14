@@ -647,6 +647,15 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
                     key,
                     expected: Expected::Version(entry.version),
                 });
+                let event =
+                    crate::observer::Observer::tool_progress(store, self.attempt.attempt_id)
+                        .prepare_append(&serde_json::json!({
+                            "conversation_id": self.conversation,
+                            "attempt": self.attempt,
+                            "state": snapshot.state(),
+                        }))?;
+                batch.checks.extend(event.checks);
+                batch.mutations.extend(event.mutations);
                 match store.commit(&batch.checks, &batch.mutations) {
                     Ok(()) => Ok(true),
                     Err(durable_store::Error::Conflict { .. }) => Ok(false),
@@ -1622,6 +1631,24 @@ impl Harness {
                     };
                     checks.extend(prepared.checks);
                     mutations.extend(prepared.mutations);
+                    let terminal = if complete {
+                        crate::tool_progress::State::Completed
+                    } else if let crate::tool_progress::State::Running(partial) = snapshot.state() {
+                        crate::tool_progress::State::Aborted(partial.clone())
+                    } else {
+                        unreachable!()
+                    };
+                    let event = crate::observer::Observer::tool_progress(
+                        self.owner.store(),
+                        attempt.attempt_id,
+                    )
+                    .prepare_append(&serde_json::json!({
+                        "conversation_id": state.id,
+                        "attempt": attempt,
+                        "state": terminal,
+                    }))?;
+                    checks.extend(event.checks);
+                    mutations.extend(event.mutations);
                 }
             }
         }
@@ -2592,6 +2619,21 @@ impl Harness {
             next,
             has_more,
         })
+    }
+
+    /// Poll committed replacement and terminal events for one attempt. Cursors
+    /// are exclusive and scoped to this attempt and database.
+    pub fn tool_progress_events(
+        &self,
+        attempt_id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.subagent_store()?;
+        Ok(
+            crate::observer::Observer::tool_progress(self.owner.store(), attempt_id)
+                .read(after, limit)?,
+        )
     }
 
     /// Read committed snapshots after a cursor. Earlier cursors may be
@@ -5746,6 +5788,14 @@ impl Scheduler {
     }
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.harness.view(id, limit)
+    }
+    pub fn tool_progress_events(
+        &self,
+        attempt_id: Uuid,
+        after: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.harness.tool_progress_events(attempt_id, after, limit)
     }
     pub fn watch_view(
         &self,
