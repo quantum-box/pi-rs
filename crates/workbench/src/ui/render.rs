@@ -1817,6 +1817,33 @@ mod tests {
     }
 
     #[test]
+    fn marked_strike_normalizes_crlf_and_bare_cr() {
+        let theme = Theme::system();
+        for source in [
+            "~~`a\r\nb`~~",
+            "~~`a\rb`~~",
+            "- ~~`a\r\n  b`~~",
+            "- ~~`a\r  b`~~",
+        ] {
+            let lines = markdown(source, &theme, 120);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text == "a b" && span.strikethrough),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| !span.text.contains('\r')),
+                "{source:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn marked_table_autolink_does_not_consume_next_cell() {
         let theme = Theme::system();
         for source in [

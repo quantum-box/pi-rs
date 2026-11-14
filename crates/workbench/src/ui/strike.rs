@@ -353,6 +353,31 @@ enum Container {
     Item(usize),
 }
 
+// Marked normalizes CRLF and bare CR before block and inline tokenization.
+fn normalize_newlines(source: &str) -> (String, Vec<usize>) {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if byte == b'\r' {
+            if bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            output.push(b'\n');
+        } else {
+            output.push(byte);
+        }
+        offsets.push(index);
+    }
+    (
+        String::from_utf8(output).expect("only ASCII newlines changed"),
+        offsets,
+    )
+}
+
 // Marked's block lexer removes container prefixes before inline lexing. Keep
 // byte boundaries into the original document for rendering and link guards.
 fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(String, Vec<usize>)> {
@@ -492,9 +517,11 @@ fn inline_run(
     }
     // Marked's block table lexer removes a backslash before each pipe before
     // handing a cell to its inline lexer, including inside code spans.
-    let Some((source, offsets)) = normalize_continuations(source, containers) else {
+    let (source, newline_offsets) = normalize_newlines(source);
+    let Some((source, offsets)) = normalize_continuations(&source, containers) else {
         return nodes;
     };
+    let offsets: Vec<usize> = offsets.into_iter().map(|i| newline_offsets[i]).collect();
     let (source, offsets) = if cell_end.is_some() {
         let (source, mapped) = unescape_with_offsets(&source, b"|");
         (source, mapped.into_iter().map(|i| offsets[i]).collect())
@@ -612,6 +639,13 @@ mod tests {
         assert_eq!(offsets, [0, 1, 2, 2, 3, 4]);
         let large = format!("a\n{}b", "\t".repeat(MAX_RUN_BYTES / 4));
         assert!(normalize_continuations(&large, &[Container::Item(2)]).is_none());
+    }
+
+    #[test]
+    fn normalized_newlines_preserve_original_byte_boundaries() {
+        let (text, offsets) = normalize_newlines("é\r\nx\ry");
+        assert_eq!(text, "é\nx\ny");
+        assert_eq!(offsets, [0, 1, 2, 4, 5, 6, 7]);
     }
 
     #[test]
