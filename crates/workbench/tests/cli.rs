@@ -848,10 +848,25 @@ fn minimax_regional_providers_use_the_messages_adapter() {
 
 #[test]
 fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
-    for (provider, model, level, preferred) in [
-        ("minimax", "MiniMax-M2.7", "low", 2048_u64),
-        ("minimax-cn", "MiniMax-M2.7-highspeed", "high", 16384_u64),
-        ("minimax", "MiniMax-M2.7", "off", 0_u64),
+    for (provider, model, level, preferred, request_limit, run_limit) in [
+        (
+            "minimax",
+            "MiniMax-M2.7",
+            "low",
+            2048_u64,
+            2048_u32,
+            8192_u32,
+        ),
+        (
+            "minimax-cn",
+            "MiniMax-M2.7-highspeed",
+            "high",
+            16384,
+            10000,
+            3000,
+        ),
+        ("minimax", "MiniMax-M2.7", "high", 16384, 10000, 10000),
+        ("minimax", "MiniMax-M2.7", "off", 0, 2048, 8192),
     ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -886,6 +901,7 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
             reader.read_exact(&mut bytes).unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["model"], model);
+            assert_eq!(body["max_tokens"], request_limit.min(run_limit));
             if level == "off" {
                 assert_eq!(body["thinking"]["type"], "disabled");
             } else {
@@ -921,6 +937,10 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
                 model,
                 "--thinking",
                 level,
+                "--max-output-tokens",
+                &request_limit.to_string(),
+                "--output-budget",
+                &run_limit.to_string(),
                 "--api-key",
                 "fixture",
                 "--endpoint",

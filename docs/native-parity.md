@@ -199,8 +199,14 @@ catalogs include M3 and M3.1-Flash reasoning, image, context and pricing
 metadata; the same Anthropic-compatible streaming adapter is used for both
 regions. MiniMax M2.7 and M2.7-highspeed use the pinned text-only catalog and
 budgeted thinking levels, including Pi's interleaved-thinking header. Native
-thinking budgets stay within the agent's configured output-token ceiling; Pi
-can expand an explicitly requested ceiling to accommodate thinking.
+thinking budgets stay within the agent's configured output-token ceiling. Pi's
+simple API treats its requested maximum as an answer budget and adds thinking
+tokens (bounded by model and context capacity). In pi-rs the adapter receives
+only the hard ceiling: the smaller of the per-request limit and remaining run
+budget, possibly lowered by a context extension. Expanding it would exceed a
+host or extension limit; there is no separate answer budget and headroom to
+expand. Raising both `--max-output-tokens` and `--output-budget` permits a larger
+thinking budget within those limits.
 Budgeted Messages requests use Pi's default level budgets and summarized
 thinking display, subject to that native ceiling.
 
