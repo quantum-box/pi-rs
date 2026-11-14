@@ -540,8 +540,10 @@ persisted before invocation. Hook-supplied summaries bypass model usage.
 
 This is a partial upstream durable hook: the host selects message ranges rather
 than upstream entry records, so it exposes messages and a message index rather
-than entry IDs or head markers. Manual compaction currently has no instructions
-argument. Hook errors are retained in the extension report log and available through the
+than entry IDs or head markers. `request_compaction_with_instructions` persists
+optional manual instructions for the summary request and hook, including across
+recovery; `request_compaction` remains the instruction-free convenience API.
+Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
 still subject to the host's existing idle/manual and context-selection limits.

@@ -19,6 +19,8 @@ pub struct Preparation {
     system_end: usize,
     first_kept: usize,
     request: ModelRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
 }
 
 /// Result retains the exact preparation and usage/metadata for the host to commit.
@@ -141,7 +143,7 @@ pub fn prepare(
         transcript
     );
     Ok(Some(Preparation {
-        source: messages.to_vec(), system_end, first_kept,
+        source: messages.to_vec(), system_end, first_kept, instructions: instructions.map(str::to_owned),
         request: ModelRequest {
             model: model.into(), max_output_tokens, tools: vec![],
             messages: vec![Message::System { content: "You are a context summarization assistant. Do not continue the conversation; output only the summary.".into() }, Message::User { content: prompt }],
@@ -158,7 +160,7 @@ impl Preparation {
             reason,
             messages: self.source[self.system_end..self.first_kept].to_vec(),
             first_kept: self.first_kept,
-            instructions: None,
+            instructions: self.instructions.clone(),
         }
     }
 
@@ -350,6 +352,33 @@ mod tests {
         let mut tools = completed("bad");
         tools.calls.push(call("x"));
         assert!(prep(&h).finish(tools).is_err());
+    }
+
+    #[test]
+    fn instructions_survive_serialization_and_old_preparations_load() {
+        let p = prepare(&history(), "m", 100, 0, Some("keep test names"))
+            .unwrap()
+            .unwrap();
+        let restored: Preparation =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .hook_input(crate::extension::CompactionReason::Manual)
+                .instructions
+                .as_deref(),
+            Some("keep test names")
+        );
+        assert!(
+            matches!(&restored.request().messages[1], Message::User { content } if content.contains("keep test names"))
+        );
+        let mut old = serde_json::to_value(&p).unwrap();
+        old.as_object_mut().unwrap().remove("instructions");
+        let old: Preparation = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            old.hook_input(crate::extension::CompactionReason::Manual)
+                .instructions,
+            None
+        );
     }
 
     struct Stub(Mutex<Option<(Uuid, Uuid, ModelRequest)>>);

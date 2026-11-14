@@ -3073,6 +3073,16 @@ impl Harness {
         id: Uuid,
         keep_recent_tokens: usize,
     ) -> Result<bool, Error> {
+        self.request_compaction_with_instructions(id, keep_recent_tokens, None)
+    }
+    /// Commit an idle manual compaction with optional instructions for the
+    /// summary and before-compact hooks. The instructions survive recovery.
+    pub fn request_compaction_with_instructions(
+        &mut self,
+        id: Uuid,
+        keep_recent_tokens: usize,
+        instructions: Option<&str>,
+    ) -> Result<bool, Error> {
         let (mut c, version) = self.load(id)?;
         if !matches!(c.phase, Phase::Idle) || c.active.is_some() {
             return Err(Error::Invalid(
@@ -3084,7 +3094,7 @@ impl Harness {
             c.config.model.clone(),
             c.config.max_output_tokens,
             keep_recent_tokens,
-            None,
+            instructions,
         )?
         else {
             return Ok(false);

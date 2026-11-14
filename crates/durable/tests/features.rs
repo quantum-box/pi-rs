@@ -214,6 +214,61 @@ async fn compaction_is_durable_and_old_snapshots_remain_observable() {
 }
 
 #[tokio::test]
+async fn manual_compaction_instructions_survive_reopen() {
+    use pi_rs_durable::extension::{BeforeCompact, CompactionInput, Context, Hook};
+    struct Capture(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    #[async_trait]
+    impl Hook for Capture {
+        async fn before_compact(
+            &self,
+            input: &CompactionInput,
+            _: &Context<'_>,
+        ) -> Result<BeforeCompact, String> {
+            self.0.lock().unwrap().push(input.instructions.clone());
+            Ok(BeforeCompact::Pass)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_extension(compact_extension(vec![Arc::new(Capture(seen.clone()))]))
+            .unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "latest".into(), &cancel)
+            .await
+            .unwrap();
+        h.select_extensions(id, vec!["compact".into()]).unwrap();
+        assert!(
+            h.request_compaction_with_instructions(id, 0, Some("keep test names"))
+                .unwrap()
+        );
+    }
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        h.install_extension(compact_extension(vec![Arc::new(Capture(seen.clone()))]))
+            .unwrap();
+        h.resume(&cancel).await.unwrap();
+        assert!(h.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::User { content } if content.contains("summary of prior work"))
+        ));
+    }
+    assert_eq!(*seen.lock().unwrap(), vec![Some("keep test names".into())]);
+}
+
+#[tokio::test]
 async fn fork_copies_settled_context_but_not_submissions() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
