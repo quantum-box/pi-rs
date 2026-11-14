@@ -45,8 +45,7 @@ fn jsonl_session_id_can_be_opened_by_session_and_resume() {
     assert!(!root.path().join("work.jsonl").exists());
 }
 
-#[test]
-fn rpc_worker_starts_when_share_store_is_unavailable() {
+fn assert_rpc_worker_starts_with_unavailable_store(root: &std::path::Path, home: &std::path::Path) {
     struct Reap(std::process::Child);
     impl Drop for Reap {
         fn drop(&mut self) {
@@ -54,15 +53,9 @@ fn rpc_worker_starts_when_share_store_is_unavailable() {
             let _ = self.0.wait();
         }
     }
-    let root = tempfile::tempdir().unwrap();
-    let home = root.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    // An existing non-directory deterministically makes cache initialization fail
-    // on Unix and Windows without changing other configuration behavior.
-    std::fs::write(home.join("share-context-v1"), b"unavailable").unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(root.path())
-        .env("PI_RS_HOME", &home)
+        .current_dir(root)
+        .env("PI_RS_HOME", home)
         .args([
             "--offline",
             "--no-session",
@@ -115,10 +108,42 @@ fn rpc_worker_starts_when_share_store_is_unavailable() {
     }
     assert!(reader.is_finished(), "worker output did not close");
     reader.join().unwrap();
+}
+
+#[test]
+fn rpc_worker_starts_when_share_store_is_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("share-context-v1"), b"unavailable").unwrap();
+    assert_rpc_worker_starts_with_unavailable_store(root.path(), &home);
     assert_eq!(
         std::fs::read(home.join("share-context-v1")).unwrap(),
         b"unavailable"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_worker_starts_when_agent_directory_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = Restore(home.clone());
+    assert_rpc_worker_starts_with_unavailable_store(root.path(), &home);
+    assert!(!home.join("share-context-v1").exists());
 }
 
 #[test]

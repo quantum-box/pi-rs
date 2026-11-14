@@ -28,4 +28,4 @@ jobs:
       - name: Test Radius cached context export
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_upload_uses_reopened_journal_bound_cached_context
       - name: Test unavailable cache RPC startup
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli rpc_worker_starts_when_share_store_is_unavailable
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --test cli rpc_worker_starts_when_
