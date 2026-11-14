@@ -1943,11 +1943,29 @@ impl Agent<'_> {
             });
         let matching = branch.iter().any(|record| matches!(&record.event,
             Event::ModelRequested { request_id: Some(id), model, .. } if *id == request_id && model == self.model_name));
-        let completed = branch.iter().any(|record| matches!(&record.event,
-            Event::ModelFinished { request_id: id, failure: None, metadata, .. } if *id == request_id && metadata.finish_reason.as_deref() != Some("length")));
+        let completion = branch.iter().find_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id: id,
+                failure: None,
+                metadata,
+                ..
+            } if *id == request_id && metadata.finish_reason.as_deref() != Some("length") => {
+                Some(metadata)
+            }
+            _ => None,
+        });
         let already_started = branch[index + 1..].iter().any(|record| matches!(&record.event,
             Event::SourceEntry { format, entry } if format == "pi-rs:silent-overflow" && entry["requestId"] == request_id.to_string()));
-        if !matching || !completed {
+        // Native Anthropic usage includes cache writes in input_tokens. Pi's
+        // overflow check counts input plus cache reads, excluding writes.
+        if !matching
+            || completion.is_none_or(|metadata| {
+                usage
+                    .input_tokens
+                    .saturating_sub(metadata.cache_creation_input_tokens.unwrap_or(0))
+                    <= u64::from(window)
+            })
+        {
             return;
         }
         if already_started {
@@ -6685,13 +6703,17 @@ mod tree_tests {
         output: u64,
     }
 
-    struct SilentOverflowModel(std::sync::atomic::AtomicUsize);
+    struct SilentOverflowModel(std::sync::atomic::AtomicUsize, Option<u64>);
     #[async_trait::async_trait]
     impl Model for SilentOverflowModel {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Metadata(ModelMetadata {
+                    cache_creation_input_tokens: self.1,
+                    ..Default::default()
+                })),
                 Ok(ModelEvent::Complete {
                     calls: vec![],
                     usage: Some(Usage {
@@ -6713,7 +6735,7 @@ mod tree_tests {
                 seen: seen.clone(),
             }))
             .unwrap();
-        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0));
+        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0), None);
         let agent = Agent {
             model: &model,
             model_name: "fixture",
@@ -6766,6 +6788,71 @@ mod tree_tests {
         assert!(session.current_messages().iter().any(
             |message| matches!(message, Message::Assistant { content, .. } if content == "answer")
         ));
+    }
+
+    #[tokio::test]
+    async fn silent_overflow_excludes_cache_write_tokens() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0), Some(1));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 1,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
     }
     #[async_trait::async_trait]
     impl Model for LengthModel {
