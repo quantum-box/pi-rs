@@ -7281,11 +7281,14 @@ fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
     let Some((program, arguments)) = parts.split_first() else {
         return Err(Error::Config("external editor is empty".into()));
     };
-    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    file.write_all(editor.text.as_bytes())?;
+    // Keep the directory, rather than an open file handle, alive while the
+    // editor runs. Editors on Windows may require exclusive access to the file.
+    let directory = external_editor_directory()?;
+    let path = directory.path().join("prompt.md");
+    std::fs::write(&path, editor.text.as_bytes())?;
     if !std::process::Command::new(program)
         .args(arguments)
-        .arg(file.path())
+        .arg(&path)
         .status()?
         .success()
     {
@@ -7293,9 +7296,21 @@ fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
             "external editor exited unsuccessfully".into(),
         ));
     }
-    let bytes = std::fs::read(file.path())?;
+    let bytes = std::fs::read(&path)?;
     editor.replace(external_editor_text(&bytes));
     Ok(())
+}
+
+fn external_editor_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("pi-editor-");
+    // Match mkdtemp's private directory on Unix: the draft can contain secrets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
 }
 
 fn external_editor_text(bytes: &[u8]) -> String {
@@ -7554,6 +7569,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn external_editor_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = super::external_editor_directory().unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn external_editor_round_trip_updates_only_after_success() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -7572,6 +7599,49 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
         assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
         assert_eq!(editor.text, "edited\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_editor_allows_exclusive_open_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("editor test.ps1");
+        let marker = dir.path().join("draft-path.txt");
+        let command = format!(
+            "powershell.exe -NoProfile -NonInteractive -File \"{}\" \"{}\"",
+            script.display(),
+            marker.display()
+        );
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        for (exit, replacement) in [(0, "edited"), (1, "corrupted")] {
+            std::fs::write(
+                &script,
+                format!(
+                    r#"param([string]$marker, [string]$draft)
+$ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllText($marker, $draft)
+$file = [System.IO.File]::Open($draft, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {{
+    $file.SetLength(0)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("{replacement}`n")
+    $file.Write($bytes, 0, $bytes.Length)
+}} finally {{ $file.Dispose() }}
+exit {exit}
+"#
+                ),
+            )
+            .unwrap();
+            let result = super::run_external_editor(&command, &mut editor);
+            assert_eq!(result.is_ok(), exit == 0);
+            assert_eq!(editor.text, "edited");
+            let path = std::path::PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(!path.exists(), "temporary draft survived editor exit");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "temporary directory survived editor exit"
+            );
+        }
     }
 
     #[test]
