@@ -4290,10 +4290,11 @@ impl Agent<'_> {
                 usage_metadata,
             },
             from_extension.then(|| {
-                serde_json::json!({
-                    "fromExtension": true,
-                    "details": extension_result.and_then(|result| result.details.clone()),
-                })
+                let mut metadata = serde_json::json!({"fromExtension": true});
+                if let Some(details) = extension_result.and_then(|result| result.details.clone()) {
+                    metadata["details"] = details;
+                }
+                metadata
             }),
             observer,
         )?;

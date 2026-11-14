@@ -453,10 +453,11 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
-                serde_json::json!({
-                    "details": entry.get("details"),
-                    "fromExtension": entry["fromHook"] == true,
-                })
+                let mut metadata = serde_json::json!({"fromExtension": entry["fromHook"] == true});
+                if let Some(details) = entry.get("details") {
+                    metadata["details"] = details.clone();
+                }
+                metadata
             });
         importer.append(
             &mut branch,

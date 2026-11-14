@@ -658,8 +658,7 @@ impl Cursor {
                 if let Some(metadata) = live_metadata
                     .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
                 {
-                    if let Some(details) = metadata.get("details").filter(|value| !value.is_null())
-                    {
+                    if let Some(details) = metadata.get("details") {
                         entry["details"] = details.clone();
                     }
                     if metadata["fromExtension"] == true {
@@ -922,6 +921,13 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["fromHook"], true);
         assert_eq!(entries[0]["details"]["origin"], "hook");
+        for metadata in [
+            json!({"fromExtension":true}),
+            json!({"fromExtension":true,"details":null}),
+        ] {
+            let entries = Cursor::default().appended(&records, Some(&metadata));
+            assert_eq!(entries[0].get("details"), metadata.get("details"));
+        }
     }
 
     #[test]
