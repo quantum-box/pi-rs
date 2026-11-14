@@ -181,7 +181,11 @@ intervening changes retain the original submission and write identities and
 configuration; the context generation and selected source prefix must also
 match. Append-only model progress and fenced model restarts can therefore use a
 later conversation version for the atomic placement ticket and pending marker
-while the model is running or at idle. A preceding reset is
+while the model is running, in on-yield or after-run hooks, or at idle.
+A summary completing while hook-owned tasks are parked remains unsupported. On-yield decisions are checkpointed before inbox
+selection; an admission race does not rerun a completed hook. A crash before
+the checkpoint can replay it, so external effects require memo/idempotency.
+A preceding reset is
 placed first and makes the summary stale; queued inputs follow the writes.
 In-flight model saves merge the marker, and context-generation and source-prefix
 checks guard the atomic settlement. Later writes follow the marker. Conversation

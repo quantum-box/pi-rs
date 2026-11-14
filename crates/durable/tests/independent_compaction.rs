@@ -1149,11 +1149,12 @@ async fn unfinished_summary_recovers_after_conversation_becomes_idle() {
     scheduler.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn summary_does_not_place_during_after_run_hook() {
+async fn summary_waits_for_after_run_hook() {
     use pi_rs_durable::extension::{Context, Extension, GenerationDecision, GenerationEvent, Hook};
     struct GateAfterRun {
         started: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicUsize,
     }
     #[async_trait::async_trait]
     impl Hook for GateAfterRun {
@@ -1166,6 +1167,7 @@ async fn summary_does_not_place_during_after_run_hook() {
             if event == GenerationEvent::AfterRun
                 && ctx.snapshot["messages"].to_string().contains("busy answer")
             {
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 self.started.add_permits(1);
                 self.release.acquire().await.unwrap().forget();
             }
@@ -1177,6 +1179,7 @@ async fn summary_does_not_place_during_after_run_hook() {
     let hook = Arc::new(GateAfterRun {
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut scheduler = Scheduler::open_with_summary_recovery(
         dir.path().join("db"),
@@ -1232,10 +1235,396 @@ async fn summary_does_not_place_during_after_run_hook() {
             .wait_independent_compaction(operation)
             .await
             .unwrap(),
-        IndependentCompactionStatus::Stale
+        IndependentCompactionStatus::Running
     );
     assert!(!scheduler.conversation(conversation).unwrap().messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))));
+    scheduler
+        .submit(conversation, None, "queued after run".into())
+        .unwrap();
+    scheduler
+        .reset(conversation, Some("after-run reset".into()))
+        .unwrap();
     hook.release.add_permits(1);
     scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    let c = scheduler.conversation(conversation).unwrap();
+    assert!(c.messages.iter().any(
+        |m| matches!(m, pi_rs_core::Message::User { content } if content == "after-run reset")
+    ));
+    assert!(c.messages.iter().any(
+        |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued after run")
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+struct YieldGate {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+    effects: AtomicUsize,
+    after_run_saw_summary: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for YieldGate {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &serde_json::Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::AfterRun
+            && value["answer"] == "busy answer"
+            && ctx.snapshot["messages"]
+                .to_string()
+                .contains("busy checkpoint")
+        {
+            self.after_run_saw_summary.store(true, Ordering::SeqCst);
+        }
+        if event == GenerationEvent::OnYield && value["answer"] == "busy answer" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.memo.get("effect").await?.is_none() {
+                ctx.memo
+                    .get_or_insert("effect", serde_json::json!(true))
+                    .await?;
+                self.effects.fetch_add(1, Ordering::SeqCst);
+            }
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            return Ok(GenerationDecision::Continue(serde_json::json!("follow-on")));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+fn yield_registry(hook: Arc<YieldGate>) -> pi_rs_durable::extension::Registry {
+    let mut registry = pi_rs_durable::extension::Registry::default();
+    registry
+        .install(pi_rs_durable::extension::Extension {
+            name: "yield-gate".into(),
+            hooks: vec![hook],
+            ..Default::default()
+        })
+        .unwrap();
+    registry
+}
+async fn yield_hook_fixture(
+    path: &std::path::Path,
+    model: Arc<BusyModel>,
+    hook: Arc<YieldGate>,
+    earlier_reset: bool,
+) -> (Scheduler, uuid::Uuid, uuid::Uuid) {
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        path,
+        busy_options(model.clone()),
+        yield_registry(hook.clone()),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["yield-gate".into()])
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    model.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    if earlier_reset {
+        scheduler
+            .reset(conversation, Some("reset before summary".into()))
+            .unwrap();
+    }
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    (scheduler, conversation, operation)
+}
+fn yield_gate() -> Arc<YieldGate> {
+    Arc::new(YieldGate {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        effects: AtomicUsize::new(0),
+        after_run_saw_summary: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+#[tokio::test]
+async fn summary_during_on_yield_preserves_one_hook_decision_and_inbox_order() {
+    for mode in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(BusyModel::default());
+        let hook = yield_gate();
+        let (mut scheduler, conversation, operation) =
+            yield_hook_fixture(&dir.path().join("db"), model, hook.clone(), false).await;
+        if mode == 1 {
+            scheduler
+                .submit(conversation, None, "queued".into())
+                .unwrap();
+        }
+        if mode == 2 {
+            scheduler
+                .reset(conversation, Some("reset after".into()))
+                .unwrap();
+        }
+        hook.release.add_permits(1);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+        if mode != 0 {
+            assert!(!hook.after_run_saw_summary.load(Ordering::SeqCst));
+        }
+        let c = scheduler.conversation(conversation).unwrap();
+        let follow = c
+            .messages
+            .iter()
+            .any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "follow-on"));
+        assert_eq!(follow, mode == 0);
+        if mode == 1 {
+            let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+            let queued = c
+                .messages
+                .iter()
+                .position(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"),
+                )
+                .unwrap();
+            assert!(summary < queued);
+        }
+        if mode == 2 {
+            assert!(c.messages.iter().any(
+                |m| matches!(m, pi_rs_core::Message::User { content } if content == "reset after")
+            ));
+        }
+        scheduler.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn summary_and_memoized_on_yield_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(BusyModel::default());
+    let hook = yield_gate();
+    let (scheduler, conversation, operation) =
+        yield_hook_fixture(&path, model.clone(), hook.clone(), false).await;
+    scheduler.shutdown().await.unwrap();
+    hook.release.add_permits(1);
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model),
+        yield_registry(hook.clone()),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+    let c = scheduler.conversation(conversation).unwrap();
+    let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+    let follow = c
+        .messages
+        .iter()
+        .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "follow-on"))
+        .unwrap();
+    assert!(summary < follow);
+    scheduler.shutdown().await.unwrap();
+}
+
+struct AfterRunReplayGate {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+    effects: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for AfterRunReplayGate {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &serde_json::Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::AfterRun && value["answer"] == "busy answer" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.memo.get("effect").await?.is_none() {
+                ctx.memo
+                    .get_or_insert("effect", serde_json::json!(true))
+                    .await?;
+                self.effects.fetch_add(1, Ordering::SeqCst);
+            }
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+fn after_run_registry(hook: Arc<AfterRunReplayGate>) -> pi_rs_durable::extension::Registry {
+    let mut registry = pi_rs_durable::extension::Registry::default();
+    registry
+        .install(pi_rs_durable::extension::Extension {
+            name: "after-run-replay".into(),
+            hooks: vec![hook],
+            ..Default::default()
+        })
+        .unwrap();
+    registry
+}
+#[tokio::test]
+async fn summary_and_memoized_after_run_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(BusyModel::default());
+    let hook = Arc::new(AfterRunReplayGate {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        effects: AtomicUsize::new(0),
+    });
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model.clone()),
+        after_run_registry(hook.clone()),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["after-run-replay".into()])
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    model.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    scheduler
+        .submit(conversation, None, "queued".into())
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    hook.release.add_permits(1);
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        busy_options(model),
+        after_run_registry(hook.clone()),
+        None,
+        busy_provider(),
+    )
+    .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+    let c = scheduler.conversation(conversation).unwrap();
+    let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+    let queued = c
+        .messages
+        .iter()
+        .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"))
+        .unwrap();
+    assert!(summary < queued);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn earlier_reset_precedes_summary_during_on_yield() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(BusyModel::default());
+    let hook = yield_gate();
+    let (mut scheduler, conversation, operation) =
+        yield_hook_fixture(&dir.path().join("db"), model, hook.clone(), true).await;
+    hook.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    let c = scheduler.conversation(conversation).unwrap();
+    assert!(c.messages.iter().any(
+        |m| matches!(m, pi_rs_core::Message::User { content } if content == "reset before summary")
+    ));
+    assert!(
+        !c.messages
+            .iter()
+            .any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "follow-on"))
+    );
     scheduler.shutdown().await.unwrap();
 }

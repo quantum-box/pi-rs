@@ -320,6 +320,12 @@ enum Phase {
         answer: String,
         operation_id: Uuid,
     },
+    /// A completed on-yield decision, persisted before checking the inbox.
+    YieldDecision {
+        turns: u32,
+        answer: String,
+        continuation: Option<crate::content::UserContent>,
+    },
     YieldTasksWaiting {
         turns: u32,
         answer: String,
@@ -6578,23 +6584,27 @@ impl Harness {
                 }
                 return Ok(());
             }
-            // Preserve the ordinary after-run hook before applying an earlier
-            // reset on a final boundary. The queued summary remains fenced.
-            let finish_run_before_reset = matches!(
-                c.phase,
+            // A completed run's final boundary follows its after-run hook.
+            // A yield continuation still places pending writes before resuming.
+            let finish_run_before_summary = match &c.phase {
                 Phase::Boundary {
-                    answer: Some(_),
-                    ..
+                    answer: Some(_), ..
+                } => true,
+                Phase::YieldDecision { continuation, .. } => {
+                    continuation.is_none()
+                        || !c.pending_resets.is_empty()
+                        || c.submissions.iter().any(|s| s.status == Status::Queued)
                 }
-            ) && c
-                .pending_independent_summary
-                .as_ref()
-                .is_some_and(|marker| !marker.resets_before.is_empty());
+                _ => false,
+            };
             if c.pending_independent_summary.is_some()
-                && !finish_run_before_reset
+                && !finish_run_before_summary
                 && matches!(
                     c.phase,
-                    Phase::Boundary { .. } | Phase::Idle | Phase::FailedIdle
+                    Phase::Boundary { .. }
+                        | Phase::YieldDecision { .. }
+                        | Phase::Idle
+                        | Phase::FailedIdle
                 )
             {
                 match self.consume_independent_summary(&mut c, version) {
@@ -6606,7 +6616,10 @@ impl Harness {
             if c.pending_independent_summary.is_none()
                 && matches!(
                     c.phase,
-                    Phase::Boundary { .. } | Phase::Idle | Phase::FailedIdle
+                    Phase::Boundary { .. }
+                        | Phase::YieldDecision { .. }
+                        | Phase::Idle
+                        | Phase::FailedIdle
                 )
             {
                 let preceding_reset = c.resets.last().map(|reset| reset.id);
@@ -7461,29 +7474,14 @@ impl Harness {
                             })
                         }
                     });
-                    if let Some(message) = continuation.filter(|_| {
-                        c.pending_resets.is_empty()
-                            && !c.submissions.iter().any(|s| s.status == Status::Queued)
-                    }) {
-                        let durable = self.supports_blocks(&c);
-                        Self::append_yield(&mut c, message, durable);
-                        c.auto_compaction_attempted = false;
-                        c.phase = Phase::ModelReady { turns: 0 };
-                    } else {
-                        c.phase = Phase::Boundary {
-                            turns,
-                            answer: Some(answer),
-                        };
-                    }
-                    // The inbox must be checked atomically with the decision.
-                    let merge = self.merge_admissions;
-                    self.merge_admissions = false;
-                    let result = self.save(&c, Expected::Version(version));
-                    self.merge_admissions = merge;
-                    match result {
-                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                        other => other?,
-                    }
+                    c.phase = Phase::YieldDecision {
+                        turns,
+                        answer,
+                        continuation,
+                    };
+                    // Merge admissions into the saved decision, without rerunning
+                    // the hook when a summary or input races its completion.
+                    self.save(&c, Expected::Version(version))?;
                 }
                 Phase::YieldTasksWaiting {
                     turns,
@@ -7534,6 +7532,18 @@ impl Harness {
                             continuation = Some(message);
                         }
                     }
+                    c.phase = Phase::YieldDecision {
+                        turns,
+                        answer,
+                        continuation,
+                    };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::YieldDecision {
+                    turns,
+                    answer,
+                    continuation,
+                } => {
                     if let Some(message) = continuation.filter(|_| {
                         c.pending_resets.is_empty()
                             && !c.submissions.iter().any(|s| s.status == Status::Queued)
@@ -7548,6 +7558,7 @@ impl Harness {
                             answer: Some(answer),
                         };
                     }
+                    // Recheck the inbox atomically with the continuation decision.
                     let merge = self.merge_admissions;
                     self.merge_admissions = false;
                     let result = self.save(&c, Expected::Version(version));
@@ -8810,9 +8821,16 @@ impl SummaryPlacementDriver {
                     false
                 };
                 let marker = if admissions_proven
-                    && (matches!(state.phase, Phase::ModelRunning { .. }) && state.active.is_some()
-                        || matches!(state.phase, Phase::Idle | Phase::FailedIdle)
-                            && state.active.is_none())
+                    && (matches!(
+                        state.phase,
+                        Phase::ModelRunning { .. }
+                            | Phase::OnYield { .. }
+                            | Phase::YieldDecision { .. }
+                    ) && state.active.is_some()
+                        || matches!(
+                            state.phase,
+                            Phase::Idle | Phase::FailedIdle | Phase::AfterRun { .. }
+                        ) && state.active.is_none())
                     && state.pending_independent_summary.is_none()
                     && state.pending_resets.len() <= SUMMARY_MAX_HISTORY_RECORDS
                     && !state.abort_requested
@@ -10829,6 +10847,7 @@ pub(crate) async fn drive_scheduled<'a>(
                 | Phase::ToolGateSleeping { .. }
                 | Phase::HookTasksWaiting { .. }
                 | Phase::YieldTasksWaiting { .. }
+                | Phase::YieldDecision { .. }
                 | Phase::OnYield { .. }
                 | Phase::AfterTools { .. }
                 | Phase::AfterRun { .. } => true,
