@@ -782,7 +782,9 @@ impl Model for Ollama {
         }
         let error_secrets = pi_rs_core::provider_error_secrets(
             self.token.as_deref(),
-            self.headers.values().filter_map(|v| v.to_str().ok()),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
         );
         let builder = self
             .authenticate(self.client.post(self.endpoint.clone()))
@@ -1165,6 +1167,81 @@ struct CallDelta {
 
 #[cfg(test)]
 mod content_tests {
+    #[tokio::test]
+    async fn auth_header_error_literals_are_not_classified() {
+        use std::io::{Read, Write};
+        for (name, value) in [("x-api-key", "quota exceeded"), ("x-auth-token", "timeout")] {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let event = json!({"error":{"code":"error","message":value}});
+                let worker = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(
+                            count != 0 && request.len() + count <= 32 * 1024,
+                            "incomplete request headers"
+                        );
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("{name}: {value}")),
+                        "header missing from fixture request"
+                    );
+                    let body = if streaming {
+                        format!("data: {event}\n\n")
+                    } else {
+                        json!({"error":{"message":value}}).to_string()
+                    };
+                    let status = if streaming { "200 OK" } else { "503 Fixture" };
+                    let content_type = if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                });
+                let model = Ollama::new(&format!("http://{address}"), Some("ordinary-key".into()))
+                    .unwrap()
+                    .with_headers({
+                        let mut headers = reqwest::header::HeaderMap::new();
+                        headers.insert(name, value.parse().unwrap());
+                        headers
+                    });
+                let request = ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let error = match model.stream(request).await {
+                    Err(error) => error,
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Err(error)) => break error,
+                            Some(Ok(_)) => {}
+                            None => panic!("missing stream error"),
+                        }
+                    },
+                };
+                assert_eq!(
+                    matches!(error, Error::RetryableModel(_)),
+                    !streaming,
+                    "{name} {streaming}"
+                );
+                assert!(!error.to_string().contains(value));
+                worker.join().unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn quota_stream_error_ignores_metadata_and_redacts() {
         use std::io::{Read, Write};

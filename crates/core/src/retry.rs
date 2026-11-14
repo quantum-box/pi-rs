@@ -77,13 +77,13 @@ where
 #[doc(hidden)]
 pub fn provider_error_secrets<'a>(
     token: Option<&'a str>,
-    headers: impl Iterator<Item = &'a str>,
+    headers: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Vec<String> {
     let mut secrets = Vec::new();
     if let Some(token) = token.filter(|token| !token.is_empty()) {
         secrets.push(token.to_owned());
     }
-    for value in headers {
+    for (name, value) in headers {
         if value.is_empty() {
             continue;
         }
@@ -93,13 +93,30 @@ pub fn provider_error_secrets<'a>(
         {
             secrets.push(value.to_owned());
             secrets.push(credential.trim_start_matches([' ', '\t']).to_owned());
-        } else if should_mask_provider_secret(value) {
+        } else if is_provider_auth_header(name) || should_mask_provider_secret(value) {
             secrets.push(value.to_owned());
         }
     }
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     secrets
+}
+
+// Header sensitivity flags can be set on routing headers too. Use the
+// conventional authentication names so those values are always redacted.
+fn is_provider_auth_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "api-key"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-access-token"
+            | "x-goog-api-key"
+    ) || name.ends_with("-api-key")
+        || name.ends_with("-auth-token")
 }
 
 fn mask_provider_secrets(text: &str, secrets: &[String]) -> String {
@@ -686,7 +703,7 @@ mod quota_tests {
         ));
         let secrets = provider_error_secrets(
             Some("sk-provider-billing-secret"),
-            ["Bearer header-quota exceeded-secret"].into_iter(),
+            [("x-custom", "Bearer header-quota exceeded-secret")].into_iter(),
         );
         for message in [
             "rate limit",
@@ -737,8 +754,10 @@ mod quota_tests {
             let value = serde_json::json!({"error":{"message":message}});
             let baseline = retryable_provider_error(&value, &[]);
             assert!(baseline, "fixture must be a Pi transient: {message}");
-            let secrets =
-                provider_error_secrets(Some("sk-provider-billing-secret"), [*message].into_iter());
+            let secrets = provider_error_secrets(
+                Some("sk-provider-billing-secret"),
+                [("x-custom", *message)].into_iter(),
+            );
             assert!(
                 retryable_provider_error(&value, &secrets),
                 "header collision: {message}"
@@ -772,13 +791,14 @@ mod quota_tests {
             "Bearer  sk-billing-timeout-secret",
             "bEaReR\t\t sk-billing-timeout-secret",
         ] {
-            let secrets = provider_error_secrets(None, [header].into_iter());
+            let secrets = provider_error_secrets(None, [("x-custom", header)].into_iter());
             let echo = serde_json::json!("sk-billing-timeout-secret");
             assert!(!permanent_provider_error(&echo, &secrets));
             assert!(!retryable_provider_error(&echo, &secrets));
         }
         for credential in ["sk-billing-timeout-secret", "sk-timeout-secret", "timeout"] {
-            let secrets = provider_error_secrets(Some(credential), ["timeout"].into_iter());
+            let secrets =
+                provider_error_secrets(Some(credential), [("x-custom", "timeout")].into_iter());
             let echo = serde_json::json!({"error":{"message":credential}});
             assert!(!permanent_provider_error(&echo, &secrets), "{credential}");
             assert!(!retryable_provider_error(&echo, &secrets), "{credential}");
@@ -789,8 +809,14 @@ mod quota_tests {
                 assert!(!permanent_provider_error(&actual, &secrets));
             }
         }
-        let secrets =
-            provider_error_secrets(None, ["timeout", "sk-billing-timeout-secret"].into_iter());
+        let secrets = provider_error_secrets(
+            None,
+            [
+                ("x-custom", "timeout"),
+                ("x-custom", "sk-billing-timeout-secret"),
+            ]
+            .into_iter(),
+        );
         assert!(retryable_provider_error(
             &serde_json::json!("timeout"),
             &secrets
@@ -806,10 +832,49 @@ mod quota_tests {
     }
 
     #[test]
+    fn auth_header_values_are_masked_even_if_they_match_errors() {
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-auth-token",
+            "x-custom-api-key",
+        ] {
+            for value in ["quota exceeded", "timeout"] {
+                let secrets = provider_error_secrets(None, [(name, value)].into_iter());
+                assert!(
+                    !permanent_provider_error(&serde_json::json!(value), &secrets),
+                    "{name} {value}"
+                );
+                assert!(
+                    !retryable_provider_error(&serde_json::json!(value), &secrets),
+                    "{name} {value}"
+                );
+            }
+        }
+        let routing = provider_error_secrets(
+            None,
+            [("x-tenant", "quota exceeded"), ("x-routing", "timeout")].into_iter(),
+        );
+        assert!(permanent_provider_error(
+            &serde_json::json!("quota exceeded"),
+            &routing
+        ));
+        assert!(retryable_provider_error(
+            &serde_json::json!("timeout"),
+            &routing
+        ));
+    }
+
+    #[test]
     fn ordinary_header_values_do_not_hide_quota_markers() {
         let headers = ["billing", "quota", "quota exceeded", "BILLING"];
-        let secrets =
-            provider_error_secrets(Some("sk-provider-billing-secret"), headers.into_iter());
+        let secrets = provider_error_secrets(
+            Some("sk-provider-billing-secret"),
+            headers.into_iter().map(|value| ("x-custom", value)),
+        );
         for message in ["billing limit reached", "quota exceeded"] {
             let value = serde_json::json!({"error":{"message": message}});
             assert!(permanent_provider_error(&value, &secrets), "{message}");
@@ -828,7 +893,7 @@ mod quota_tests {
     fn partial_transient_headers_do_not_hide_errors_or_expose_credentials() {
         let secrets = provider_error_secrets(
             Some("sk-billing-timeout-secret"),
-            ["rate:", "http/2"].into_iter(),
+            [("x-custom", "rate:"), ("x-custom", "http/2")].into_iter(),
         );
         for message in ["rate:limit", "http/2 stream failed"] {
             let value = serde_json::json!({"error":{"message": format!("{message} sk-billing-timeout-secret")}});
