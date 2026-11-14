@@ -221,8 +221,14 @@ Current limits and differences from upstream Pi Durable:
   the host after reopening. Duplicate historical typed keys fail typed reads.
   `TaskStore::deliver_signal` and `Scheduler::deliver_signal` return upstream-shaped
   delivered, duplicate, invalid, closed, or not-found outcomes. The older
-  `send_signal` retains its receipt idempotency semantics. Expiry, typed
-  deadline-or-signal sleeps and general transactional delivery remain missing.
+  `WaitFor::TypedSleep` persists ordered typed keys and an optional deadline.
+  A wake consumes the first available key; a deadline expires empty keys atomically
+  with the wake. `read_typed_signal_state` distinguishes expired keys from values,
+  and `Task::typed_wake` persists signal, expired, or time wake reasons. A delivery
+  to an expired key returns closed. `deliver_signal` uses wall time; deterministic
+  hosts should use `deliver_signal_at` with the same clock as scheduler ticks.
+  The older `send_signal` retains receipt idempotency semantics and reports
+  an expired typed key as an error. General transactional delivery remains missing.
   Storage errors can have uncertain outcomes. Same-ID retries remain successful
   after task termination,
   while a new ID is rejected for a terminal task. Existing stores with

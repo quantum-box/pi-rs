@@ -30,6 +30,11 @@ pub enum WaitFor {
     Signal(String),
     /// Wait for one namespaced signal key, independent of its value version.
     TypedSignal(crate::task_store::SignalKey),
+    /// Typed keys to wake on, optionally bounded by an absolute deadline.
+    TypedSleep {
+        until_millis: Option<i64>,
+        signals: Vec<crate::task_store::SignalKey>,
+    },
     /// Wake on the first matching signal or when the absolute deadline passes.
     Sleep {
         until_millis: Option<i64>,
@@ -40,6 +45,14 @@ pub enum WaitFor {
     TasksAny(Vec<Uuid>),
     /// Wait for all; a failed child cancels the other listed subtrees.
     TasksFailFast(Vec<Uuid>),
+}
+
+/// Durable wake reason for a typed sleep.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypedWake {
+    Signal(crate::task_store::SignalKey),
+    Expired,
+    Time,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +80,8 @@ pub struct Task {
     restart_limit: u32,
     #[serde(default)]
     delivered_signal: Option<Uuid>,
+    #[serde(default)]
+    typed_wake: Option<TypedWake>,
     /// Registration identity; absent on records created by the standalone API.
     #[serde(default)]
     kind: Option<String>,
@@ -115,6 +130,7 @@ impl Task {
             restarts: 0,
             restart_limit,
             delivered_signal: None,
+            typed_wake: None,
             kind: None,
             replay_safe: false,
             abort_requested: false,
@@ -171,6 +187,7 @@ impl Task {
     pub(crate) fn migrate(&mut self, version: u32, input: Value, checkpoint: Checkpoint) {
         self.definition_version = version;
         self.input = input;
+        self.typed_wake = None;
         self.checkpoint = checkpoint;
     }
 
@@ -220,6 +237,14 @@ impl Task {
 
     /// Signal receipt associated with the most recently completed wait. It is
     /// retained across recovery and cleared when a new wait is registered.
+    pub fn typed_wake(&self) -> Option<&TypedWake> {
+        self.typed_wake.as_ref()
+    }
+
+    pub(crate) fn set_typed_wake(&mut self, wake: TypedWake) {
+        self.typed_wake = Some(wake);
+    }
+
     pub fn delivered_signal(&self) -> Option<Uuid> {
         self.delivered_signal
     }
@@ -274,7 +299,21 @@ impl Task {
         {
             return Err(TransitionError::InvalidWait);
         }
+        if let WaitFor::TypedSleep {
+            until_millis,
+            signals,
+        } = &condition
+            && ((until_millis.is_none() && signals.is_empty())
+                || until_millis.is_some_and(|time| time < 0)
+                || signals
+                    .iter()
+                    .enumerate()
+                    .any(|(i, key)| signals[..i].contains(key)))
+        {
+            return Err(TransitionError::InvalidWait);
+        }
         self.delivered_signal = None;
+        self.typed_wake = None;
         self.state = TaskState::Waiting(condition);
         Ok(())
     }

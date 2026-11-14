@@ -467,6 +467,20 @@ impl Scheduler {
         self.check()?;
         Ok(self.ts().deliver_signal(task_id, token, key, value)?)
     }
+    /// Deliver with an explicit clock value, matching `tick`'s time source.
+    pub fn deliver_signal_at(
+        &self,
+        task_id: Uuid,
+        token: &task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+    ) -> Result<task_store::SignalResult, Error> {
+        self.check()?;
+        Ok(self
+            .ts()
+            .deliver_signal_at(task_id, token, key, value, now_millis)?)
+    }
     pub fn signal_receipt(&self, task_id: Uuid, signal_id: Uuid) -> Result<Option<Signal>, Error> {
         self.check()?;
         Ok(self.ts().signal(task_id, signal_id)?)

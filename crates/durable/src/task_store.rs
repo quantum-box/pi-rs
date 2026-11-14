@@ -195,6 +195,14 @@ struct TypedSignal {
 }
 
 /// Outcome of delivering a typed signal to a task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalState {
+    Value(Value),
+    Expired,
+}
+
+/// Outcome of delivering a typed signal to a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalResult {
@@ -234,6 +242,8 @@ pub struct Signal {
     pub name: String,
     pub payload: Value,
     consumed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     typed: Option<TypedSignal>,
 }
@@ -246,6 +256,7 @@ impl Signal {
             name,
             payload,
             consumed: false,
+            expired: false,
             typed: None,
         }
     }
@@ -266,6 +277,7 @@ impl Signal {
             name: token.name.clone(),
             payload,
             consumed: false,
+            expired: false,
             typed: Some(TypedSignal {
                 key,
                 version: token.version,
@@ -348,10 +360,23 @@ impl<'a> TaskStore<'a> {
                     (&stored.task, Expected::Version(stored.version))
                 }
             };
-            if let TaskState::Waiting(WaitFor::TypedSignal(wait_key)) = task.state() {
+            let wait_keys: &[SignalKey] = match task.state() {
+                TaskState::Waiting(WaitFor::TypedSignal(k)) => std::slice::from_ref(k),
+                TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) => signals,
+                _ => &[],
+            };
+            if !wait_keys.is_empty() {
+                let revision_key = signal_revision_key(task.id());
+                let revision = self.store.get(&revision_key)?;
+                checks.push(Check {
+                    key: revision_key,
+                    expected: revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                });
                 for (_, entry) in self.store.list(&signal_task_prefix(task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
-                    if signal.typed_key() == Some(wait_key) && signal.consumed {
+                    if signal.typed_key().is_some_and(|k| wait_keys.contains(k))
+                        && (signal.consumed || signal.expired)
+                    {
                         return Err(Error::SignalKeyConsumed);
                     }
                 }
@@ -461,6 +486,9 @@ impl<'a> TaskStore<'a> {
         loop {
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
+                if old.expired {
+                    return Err(Error::SignalKeyConsumed);
+                }
                 if old.id == fresh.id
                     && old.task_id == fresh.task_id
                     && old.name == fresh.name
@@ -486,6 +514,9 @@ impl<'a> TaskStore<'a> {
                 for (_, entry) in self.store.list(&signal_task_prefix(signal.task_id))? {
                     let old: Signal = serde_json::from_slice(&entry.value)?;
                     if old.typed_key() == Some(typed_key) {
+                        if old.expired {
+                            return Err(Error::SignalKeyConsumed);
+                        }
                         if old.payload != fresh.payload || old.typed != fresh.typed {
                             return Err(Error::SignalKeyMismatch);
                         }
@@ -520,6 +551,7 @@ impl<'a> TaskStore<'a> {
                     }
                 }
             }
+            fresh.expired = fresh.typed_key().is_some_and(|key| matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if crate::runtime::wall_time_millis() >= *deadline && signals.contains(key)));
             match self.store.commit(
                 &[
                     Check {
@@ -547,6 +579,7 @@ impl<'a> TaskStore<'a> {
                     },
                 ],
             ) {
+                Ok(()) if fresh.expired => return Err(Error::SignalKeyConsumed),
                 Ok(()) => return Ok(()),
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => return Err(e.into()),
@@ -556,13 +589,31 @@ impl<'a> TaskStore<'a> {
 
     /// Deliver a typed value, returning the upstream-style status. The generated
     /// receipt ID is an internal detail; retries deduplicate by task, kind and key.
-    /// Schema-bearing tokens validate the payload; deadline expiry is not implemented.
+    /// Schema-bearing tokens validate the payload. Uses the wall clock.
     pub fn deliver_signal(
         &self,
         task_id: Uuid,
         token: &SignalToken,
         key_text: &str,
         value: Value,
+    ) -> Result<SignalResult, Error> {
+        self.deliver_signal_at(
+            task_id,
+            token,
+            key_text,
+            value,
+            crate::runtime::wall_time_millis(),
+        )
+    }
+
+    /// Deliver with an explicit clock value, for deterministic hosts and tests.
+    pub fn deliver_signal_at(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key_text: &str,
+        value: Value,
+        now_millis: i64,
     ) -> Result<SignalResult, Error> {
         let receipt_id = Uuid::new_v4();
         loop {
@@ -583,14 +634,22 @@ impl<'a> TaskStore<'a> {
                 };
             let revision_key = signal_revision_key(task_id);
             let revision = self.store.get(&revision_key)?;
-            let mut found = false;
+            let mut found = None;
             for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
                 if old.typed_key() == signal.typed_key() {
-                    found = true;
+                    found = Some(if old.expired {
+                        SignalResult::Closed
+                    } else {
+                        SignalResult::Duplicate
+                    });
                     break;
                 }
             }
+            let expired = found.is_none()
+                && matches!(target.task.state(), TaskState::Waiting(WaitFor::TypedSleep { until_millis: Some(deadline), signals }) if now_millis >= *deadline && signals.contains(signal.typed_key().unwrap()));
+            let mut signal = signal;
+            signal.expired = expired;
             let receipt_key = signal_key(task_id, receipt_id);
             let checks = [
                 Check {
@@ -607,7 +666,7 @@ impl<'a> TaskStore<'a> {
                     expected: Expected::Missing,
                 },
             ];
-            let mutations = if found {
+            let mutations = if found.is_some() {
                 vec![]
             } else {
                 vec![
@@ -623,11 +682,11 @@ impl<'a> TaskStore<'a> {
             };
             match self.store.commit(&checks, &mutations) {
                 Ok(()) => {
-                    return Ok(if found {
-                        SignalResult::Duplicate
+                    return Ok(found.unwrap_or(if expired {
+                        SignalResult::Closed
                     } else {
                         SignalResult::Delivered
-                    });
+                    }));
                 }
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => return Err(e.into()),
@@ -666,12 +725,42 @@ impl<'a> TaskStore<'a> {
         }
         found
             .map(|signal| {
+                if signal.expired {
+                    return Err(Error::SignalKeyConsumed);
+                }
                 token.read_value(
                     signal.payload,
                     signal.typed.expect("typed key matched").version,
                 )
             })
             .transpose()
+    }
+
+    /// Read a typed key including its durable expiry state.
+    pub fn read_typed_signal_state(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key: impl Into<String>,
+    ) -> Result<Option<SignalState>, Error> {
+        let key = token.key(key)?;
+        let mut found = None;
+        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+            let signal: Signal = serde_json::from_slice(&entry.value)?;
+            if signal.typed_key() == Some(&key) {
+                if found.is_some() {
+                    return Err(Error::SignalKeyMismatch);
+                }
+                found = Some(if signal.expired {
+                    SignalState::Expired
+                } else {
+                    SignalState::Value(
+                        token.read_value(signal.payload, signal.typed.expect("matched").version)?,
+                    )
+                });
+            }
+        }
+        Ok(found)
     }
 
     /// Reevaluate a persisted wait using the supplied wall-clock Unix milliseconds.
@@ -726,7 +815,7 @@ impl<'a> TaskStore<'a> {
                 for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
                     if signal.typed_key() == Some(key) {
-                        if signal.consumed {
+                        if signal.consumed || signal.expired {
                             return Err(Error::SignalKeyConsumed);
                         }
                         if found.is_none() {
@@ -747,6 +836,81 @@ impl<'a> TaskStore<'a> {
                     value: serde_json::to_vec(&signal)?,
                 });
                 delivered = Some(signal);
+            }
+            WaitFor::TypedSleep {
+                until_millis,
+                signals,
+            } => {
+                let revision_key = signal_revision_key(snapshot.task.id());
+                let revision = self.store.get(&revision_key)?;
+                checks.push(Check {
+                    key: revision_key.clone(),
+                    expected: revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                });
+                let mut records = Vec::new();
+                for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
+                    let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if signal.typed_key().is_some_and(|key| signals.contains(key)) {
+                        records.push((k, entry.version, signal));
+                    }
+                }
+                if records.iter().any(|(_, _, s)| s.consumed) {
+                    return Err(Error::SignalKeyConsumed);
+                }
+                let selected = signals.iter().find_map(|key| {
+                    records
+                        .iter()
+                        .position(|(_, _, s)| !s.expired && s.typed_key() == Some(key))
+                });
+                if let Some(index) = selected {
+                    let (k, version, mut signal) = records.swap_remove(index);
+                    signal.consumed = true;
+                    checks.push(Check {
+                        key: k.clone(),
+                        expected: Expected::Version(version),
+                    });
+                    mutations.push(Mutation::Put {
+                        key: k,
+                        value: serde_json::to_vec(&signal)?,
+                    });
+                    delivered = Some(signal);
+                } else if until_millis.is_some_and(|deadline| now_millis >= deadline) {
+                    for key in signals {
+                        if records.iter().any(|(_, _, s)| s.typed_key() == Some(key)) {
+                            continue;
+                        }
+                        let id = Uuid::new_v4();
+                        let signal = Signal {
+                            id,
+                            task_id: snapshot.task.id(),
+                            name: key.signal.clone(),
+                            payload: Value::Null,
+                            consumed: false,
+                            expired: true,
+                            typed: Some(TypedSignal {
+                                key: key.clone(),
+                                version: 1,
+                            }),
+                        };
+                        let k = signal_key(snapshot.task.id(), id);
+                        checks.push(Check {
+                            key: k.clone(),
+                            expected: Expected::Missing,
+                        });
+                        mutations.push(Mutation::Put {
+                            key: k,
+                            value: serde_json::to_vec(&signal)?,
+                        });
+                    }
+                    if !signals.is_empty() {
+                        mutations.push(Mutation::Put {
+                            key: revision_key,
+                            value: vec![],
+                        });
+                    }
+                } else {
+                    return Ok(WakeResult::Pending);
+                }
             }
             WaitFor::Sleep {
                 until_millis,
@@ -821,6 +985,16 @@ impl<'a> TaskStore<'a> {
             None => next.wake(),
         }
         .map_err(Error::Transition)?;
+        if let WaitFor::TypedSleep { signals, .. } = condition {
+            let wake = match &delivered {
+                Some(signal) => {
+                    crate::task::TypedWake::Signal(signal.typed_key().expect("typed wake").clone())
+                }
+                None if signals.is_empty() => crate::task::TypedWake::Time,
+                None => crate::task::TypedWake::Expired,
+            };
+            next.set_typed_wake(wake);
+        }
         mutations.push(Mutation::Put {
             key: key(next.id()),
             value: serde_json::to_vec(&next)?,
