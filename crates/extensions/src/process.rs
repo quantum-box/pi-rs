@@ -45,6 +45,7 @@ struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
+    compaction_overflow_reason_v1: bool,
     text_result_v2: bool,
     structured_text_result: bool,
 }
@@ -371,6 +372,8 @@ struct Description {
     #[serde(default)]
     before_summary_compaction_v1: bool,
     #[serde(default)]
+    compaction_overflow_reason_v1: bool,
+    #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
     user_bash_hook_host_calls: bool,
@@ -657,6 +660,7 @@ impl ExecutableExtension {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
+            compaction_overflow_reason_v1: false,
             text_result_v2: false,
             structured_text_result: false,
         };
@@ -667,6 +671,8 @@ impl ExecutableExtension {
             description,
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
+        extension.endpoint.compaction_overflow_reason_v1 =
+            extension.description.compaction_overflow_reason_v1;
         extension.endpoint.text_result_v2 = extension.description.text_result_v2;
         extension.endpoint.structured_text_result = extension.description.structured_text_result;
         extension.apply_flags(&mut BTreeMap::new())?;
@@ -2568,6 +2574,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
 ) -> ExtensionResult<T> {
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
     if let ProtocolRequest::Lifecycle {
         event: LifecycleEvent::ToolExecutionEnd { result, .. },
         ..
@@ -2954,6 +2961,27 @@ impl Drop for CancelOnDrop {
 
 /// Select the field naming advertised by the executable. Older v1 executables
 /// never advertised this capability and must keep receiving the v1 names.
+// Older executable peers deserialize a closed CompactionReason enum. Project
+// the new automatic reason to their existing threshold value on both transports.
+fn project_overflow_reason(request: &mut ProtocolRequest, supported: bool) {
+    if supported {
+        return;
+    }
+    let reason = match request {
+        ProtocolRequest::Lifecycle {
+            event:
+                LifecycleEvent::SessionCompact { reason, .. }
+                | LifecycleEvent::SessionCompactFailed { reason, .. },
+            ..
+        } => reason,
+        ProtocolRequest::BeforeSummaryCompaction { preparation, .. } => &mut preparation.reason,
+        _ => return,
+    };
+    if matches!(*reason, pi_rs_core::CompactionReason::Overflow) {
+        *reason = pi_rs_core::CompactionReason::Threshold;
+    }
+}
+
 fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<Value> {
     let mut value = serde_json::to_value(request).map_err(|error| error.to_string())?;
     if pi_fields {
@@ -3030,9 +3058,10 @@ fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<V
 
 fn call<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
-    request: ProtocolRequest,
+    mut request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
     let presence_response = matches!(
         &request,
         ProtocolRequest::ToolResult {
@@ -3347,6 +3376,7 @@ async fn dispatch_inner(
             tree_hook_host_calls: true,
             compaction_hook_host_calls: true,
             before_summary_compaction_v1: extension.handles_before_summary_compaction(),
+            compaction_overflow_reason_v1: true,
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -3991,6 +4021,60 @@ mod tests {
         .unwrap();
         assert!(!description.pi_lifecycle_fields);
         assert!(!description.before_summary_compaction_v1);
+        assert!(!description.compaction_overflow_reason_v1);
+    }
+
+    #[test]
+    fn overflow_reason_is_negotiated_for_legacy_executables() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyReason {
+            Manual,
+            Threshold,
+        }
+        for supported in [false, true] {
+            let mut event = ProtocolRequest::Lifecycle {
+                event: LifecycleEvent::SessionCompactFailed {
+                    reason: pi_rs_core::CompactionReason::Overflow,
+                    error_message: None,
+                    aborted: false,
+                    will_retry: false,
+                    from_extension: false,
+                },
+                state: None,
+            };
+            project_overflow_reason(&mut event, supported);
+            let event = serde_json::to_value(event).unwrap();
+            assert_eq!(
+                event["event"]["reason"],
+                if supported { "overflow" } else { "threshold" }
+            );
+            if !supported {
+                assert_eq!(
+                    serde_json::from_value::<LegacyReason>(event["event"]["reason"].clone())
+                        .unwrap(),
+                    LegacyReason::Threshold
+                );
+            }
+            let mut pre = ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: None,
+                    tokens_before: 0,
+                    reason: pi_rs_core::CompactionReason::Overflow,
+                    will_retry: true,
+                    custom_instructions: None,
+                },
+                state: None,
+            };
+            project_overflow_reason(&mut pre, supported);
+            let pre = serde_json::to_value(pre).unwrap();
+            assert_eq!(
+                pre["preparation"]["reason"],
+                if supported { "overflow" } else { "threshold" }
+            );
+            assert_eq!(pre["preparation"]["willRetry"], true);
+        }
     }
 
     struct PreSummaryFixture;
@@ -4032,6 +4116,7 @@ mod tests {
         )
         .unwrap();
         assert!(descriptor.before_summary_compaction_v1);
+        assert!(descriptor.compaction_overflow_reason_v1);
         let result = dispatch_with_host(
             fixture,
             ProtocolRequest::BeforeSummaryCompaction {
@@ -4069,6 +4154,7 @@ mod tests {
                 path: PathBuf::from("nonexistent-pre-summary-executable"),
                 flags: None,
                 pi_lifecycle_fields: false,
+                compaction_overflow_reason_v1: false,
                 text_result_v2: false,
                 structured_text_result: false,
             },

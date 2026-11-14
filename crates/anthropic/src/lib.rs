@@ -675,6 +675,19 @@ async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Re
         Ok(response)
     } else {
         let message = format!("Anthropic returned HTTP {status}");
+        if status.as_u16() == 413 {
+            return Err(Error::Model("413 request too large".into()));
+        }
+        if matches!(status.as_u16(), 400 | 422) {
+            let overflow =
+                pi_rs_core::provider_context_overflow_stream(response.bytes_stream(), secrets)
+                    .await;
+            return Err(Error::Model(if overflow {
+                "context window exceeded".into()
+            } else {
+                message
+            }));
+        }
         if (matches!(status.as_u16(), 408 | 429) || status.is_server_error())
             && is_permanent_quota(response, secrets).await
         {
@@ -1470,6 +1483,8 @@ impl Model for Anthropic {
                             Error::Model("Anthropic account quota or billing limit reached".into())
                         } else if matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error") {
                             Error::RetryableModel("Anthropic returned a transient stream error".into())
+                        } else if pi_rs_core::provider_context_overflow(&value["error"], &error_secrets) {
+                            Error::Model("context window exceeded".into())
                         } else {
                             Error::Model("Anthropic returned a stream error".into())
                         })?;
@@ -1500,6 +1515,61 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overflow_http_classification_is_bounded_and_hides_credentials() {
+        use std::io::{Read, Write};
+        for (status, body, overflow) in [
+            (400, r#"{"error":{"message":"prompt is too long"}}"#, true),
+            (
+                400,
+                r#"{"error":{"message":"other"},"request_id":"context_length_exceeded"}"#,
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"prompt is too long secret-token"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit: too many tokens"}}"#,
+                false,
+            ),
+            (413, r#"{"error":{"message":"other"}}"#, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0_u8; 2048];
+                socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::new().get(format!("http://{address}/")),
+                    &["secret-token".into()],
+                ))
+                .unwrap_err();
+            let message = error.to_string();
+            assert_eq!(
+                message.contains("context window exceeded")
+                    || message.contains("413 request too large"),
+                overflow,
+                "{message}"
+            );
+            assert!(!message.contains("secret-token"));
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn rate_limit_response_classification_and_redaction() {
         use std::io::{Read, Write};

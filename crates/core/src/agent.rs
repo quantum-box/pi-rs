@@ -1241,7 +1241,8 @@ impl Agent<'_> {
         let mut runtime_registry = self.registry.clone();
         let mut runtime_prompt = self.system_prompt.to_owned();
         let mut budget = self.limits.output_tokens_per_run;
-        let mut compacted = false;
+        let mut compacted =
+            overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
         let mut retry_attempt = 0;
         let lifecycle = crate::lifecycle::enabled(self.registry);
         let mut turn_index = completed_run_turns(session, run_id);
@@ -1271,6 +1272,73 @@ impl Agent<'_> {
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
+            }
+            // A recorded provider overflow survives process interruption. The
+            // marker is committed before compaction so recovery is attempted at
+            // most once, including after reopening the journal.
+            if let Some(recovery) = overflow_recovery_state(session, run_id)
+                && !recovery.compacted
+            {
+                if !session.auto_compaction_control().enabled() {
+                    return Err(Error::Model(
+                        "context overflow and automatic compaction is disabled".into(),
+                    ));
+                }
+                if !recovery.started {
+                    commit(
+                        session,
+                        Event::SourceEntry {
+                            format: "pi-rs:overflow-recovery".into(),
+                            entry: serde_json::json!({"requestId": recovery.request_id}),
+                        },
+                        observer,
+                    )?;
+                }
+                let retention = configured_retention(
+                    session,
+                    active.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )?;
+                let model_summary_available =
+                    budget > 1 && next_request_index < active.limits.model_requests;
+                let summary_limit = if model_summary_available {
+                    active
+                        .limits
+                        .output_tokens_per_request
+                        .min(512)
+                        .min(budget / 2)
+                } else {
+                    0
+                };
+                let Some((spent, provided)) = active
+                    .summarize_prefix(
+                        session,
+                        &states,
+                        SummaryScope {
+                            retention,
+                            instructions: None,
+                            output_limit: summary_limit,
+                            cancellation: cancel,
+                            reason: crate::CompactionReason::Overflow,
+                            will_retry: true,
+                            skip_without_model: false,
+                        },
+                        observer,
+                        Some(followups),
+                    )
+                    .await?
+                else {
+                    return Err(Error::Budget);
+                };
+                budget -= spent;
+                states = session.extension_states();
+                compacted = true;
+                // A recovered length-stop reply was intentionally omitted.
+                pending = None;
+                if provided {
+                    next_request_index -= 1;
+                }
+                continue;
             }
             let turn_start = |recovered| crate::LifecycleEvent::TurnStart {
                 run_id,
@@ -1477,6 +1545,7 @@ impl Agent<'_> {
                                 output_limit: summary_limit,
                                 cancellation: cancel,
                                 reason: crate::CompactionReason::Threshold,
+                                will_retry: false,
                                 skip_without_model: !exceeds && !model_summary_available,
                             },
                             observer,
@@ -1509,7 +1578,7 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                let result = active
+                let attempt = active
                     .reply(
                         session,
                         request,
@@ -1519,8 +1588,16 @@ impl Agent<'_> {
                         observer,
                         Some(followups),
                     )
-                    .await?
-                    .outcome;
+                    .await?;
+                let result = attempt.outcome;
+                if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
+                    && crate::retry::context_overflow_error(message)
+                    && session.auto_compaction_control().enabled()
+                    && request_index + 1 < active.limits.model_requests
+                    && !overflow_recovery_attempted(session, run_id)
+                {
+                    continue;
+                }
                 let control = session.retry_control();
                 let settings = control.settings();
                 if let Err(Error::RetryableModel(message)) = &result
@@ -1565,10 +1642,6 @@ impl Agent<'_> {
                 }
                 (reply, advertised, allowance)
             };
-            let finished = reply.invocations.is_empty();
-            let answer = finished.then(|| reply.content.clone());
-            let invocations = reply.invocations.clone();
-            let truncated = reply.truncated;
             let output_tokens = reply
                 .usage
                 .map_or(u64::from(allowance), |usage| usage.output_tokens);
@@ -1576,6 +1649,31 @@ impl Agent<'_> {
                 return Err(Error::Budget);
             }
             budget -= output_tokens as u32;
+            let recoverable_length = reply.truncated
+                && reply.usage.is_some_and(|usage| {
+                    usage.output_tokens < u64::from(active.limits.output_tokens_per_request)
+                });
+            if recoverable_length
+                && session.auto_compaction_control().enabled()
+                && request_index + 1 < active.limits.model_requests
+                && !overflow_recovery_attempted(session, run_id)
+            {
+                // The completed attempt is durable in ModelFinished but never
+                // becomes a model-visible assistant/tool message.
+                commit(
+                    session,
+                    Event::SourceEntry {
+                        format: "pi-rs:overflow-recovery".into(),
+                        entry: serde_json::json!({"requestId": reply.request_id, "kind": "length"}),
+                    },
+                    observer,
+                )?;
+                continue;
+            }
+            let finished = reply.invocations.is_empty();
+            let answer = finished.then(|| reply.content.clone());
+            let invocations = reply.invocations.clone();
+            let truncated = reply.truncated;
             commit(
                 session,
                 Event::Assistant {
@@ -2134,6 +2232,18 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        if retain_reply && result.is_err() {
+            let is_overflow = matches!(&result,
+                Err(Error::Model(message) | Error::RetryableModel(message))
+                    if crate::retry::context_overflow_error(message));
+            // Persist only the host's classification, never provider error text.
+            // A provider-supplied reason must not forge this recovery marker.
+            if is_overflow {
+                metadata.finish_reason = Some("pi-rs:context-overflow".into());
+            } else if metadata.finish_reason.as_deref() == Some("pi-rs:context-overflow") {
+                metadata.finish_reason = None;
+            }
+        }
         let (usage, failure) = match &result {
             Ok(reply) => (
                 reply.usage.map_or(
@@ -3418,6 +3528,7 @@ impl Agent<'_> {
                 output_limit: limit,
                 cancellation: cancel,
                 reason: crate::CompactionReason::Manual,
+                will_retry: false,
                 skip_without_model: false,
             },
             observer,
@@ -3436,6 +3547,7 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<Option<(u32, bool)>> {
         let reason = scope.reason;
+        let will_retry = scope.will_retry;
         let cancellation = scope.cancellation;
         let from_extension = std::sync::atomic::AtomicBool::new(false);
         let result = self
@@ -3455,7 +3567,7 @@ impl Agent<'_> {
                 ),
                 from_extension: *from_extension,
                 reason,
-                will_retry: false,
+                will_retry,
             },
             Ok(None) => unreachable!("skipped above"),
             Err(error) => {
@@ -3516,6 +3628,7 @@ impl Agent<'_> {
             output_limit: limit,
             cancellation: cancel,
             reason,
+            will_retry,
             skip_without_model,
         } = scope;
         let has_pre_summary_hook = self
@@ -3545,7 +3658,7 @@ impl Agent<'_> {
                 0
             },
             reason,
-            will_retry: false,
+            will_retry,
             custom_instructions: instructions.map(str::to_owned),
         };
         let mut supplied = None;
@@ -3591,6 +3704,7 @@ impl Agent<'_> {
                 .any(|entry| entry.id == boundary)
                 || before.is_some_and(|minimum| boundary > minimum)
                 || !has_summary_prefix(session, Some(boundary))
+                || !complete_compaction_boundary(&session.branch(), boundary)
             {
                 return Err(Error::Config(
                     "invalid extension compaction retention boundary".into(),
@@ -3809,8 +3923,28 @@ impl Agent<'_> {
         }
         let retain_from = match minimum_retention {
             Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            Some(retention) if extension_result.is_some() => {
+                // A legacy hook may request more turns, but cannot advance the
+                // extension's boundary and discard content it did not summarize.
+                match (
+                    retention.boundary,
+                    retain_from(&session.branch(), compaction.keep_turns),
+                ) {
+                    (Some(original), Some(recomputed)) => Some(original.min(recomputed)),
+                    (Some(original), None) => Some(original),
+                    (None, recomputed) => recomputed,
+                }
+            }
             _ => retain_from(&session.branch(), compaction.keep_turns),
         };
+        if extension_result.is_some()
+            && retain_from
+                .is_some_and(|boundary| !complete_compaction_boundary(&session.branch(), boundary))
+        {
+            return Err(Error::Config(
+                "compaction would split a message or tool exchange".into(),
+            ));
+        }
         let mut changes = ExtensionStates::new();
         for extension in &self.registry.extensions {
             let (sender, incoming) = mpsc::channel(32);
@@ -3952,6 +4086,130 @@ fn model_conversation_entries(
         .into_iter()
         .filter(|(source, _)| !excluded.contains(source))
         .collect()
+}
+
+struct OverflowRecoveryState {
+    request_id: Uuid,
+    started: bool,
+    compacted: bool,
+}
+
+fn overflow_recovery_epoch<'a>(branch: &'a [&'a Record], run_id: Uuid) -> &'a [&'a Record] {
+    let start = branch
+        .iter()
+        .rposition(|record| {
+            record.run_id == Some(run_id)
+                && match &record.event {
+                    Event::User { .. } | Event::UserWithImages { .. } => true,
+                    Event::ModelFinished {
+                        metadata,
+                        failure: None,
+                        reply: Some(_),
+                        ..
+                    } => metadata.finish_reason.as_deref() != Some("length"),
+                    _ => false,
+                }
+        })
+        .map_or(0, |index| index + 1);
+    &branch[start..]
+}
+
+fn overflow_recovery_attempted(session: &Session, run_id: Uuid) -> bool {
+    let branch = session.branch();
+    overflow_recovery_epoch(&branch, run_id).iter().any(|record| record.run_id == Some(run_id)
+        && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
+}
+
+fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRecoveryState> {
+    let full_branch = session.branch();
+    let branch = overflow_recovery_epoch(&full_branch, run_id);
+    if let Some((marker_index, marker)) = branch.iter().enumerate().rev().find(|(_, record)| {
+        record.run_id == Some(run_id)
+            && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery")
+    }) {
+        let Event::SourceEntry { entry, .. } = &marker.event else { unreachable!() };
+        let request_id = Uuid::parse_str(entry["requestId"].as_str()?).ok()?;
+        let following = &branch[marker_index + 1..];
+        let compacted_at = following.iter().position(|record| record.run_id == Some(run_id)
+            && matches!(record.event, Event::Compacted { .. }));
+        // Summary requests may occur before compaction; only later requests
+        // indicate that the interrupted turn has actually resumed.
+        if compacted_at.is_some_and(|index| following[index + 1..].iter().any(|record|
+            record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. }))) {
+            return None;
+        }
+        return Some(OverflowRecoveryState { request_id, started: true, compacted: compacted_at.is_some() });
+    }
+    let request_id = branch
+        .iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+        .find_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                failure: Some(_),
+                ..
+            } if metadata.finish_reason.as_deref() == Some("pi-rs:context-overflow") => {
+                Some(Some(*request_id))
+            }
+            Event::ModelRequested { .. }
+            | Event::Assistant { .. }
+            | Event::ModelFinished { .. } => Some(None),
+            _ => None,
+        })??;
+    Some(OverflowRecoveryState {
+        request_id,
+        started: false,
+        compacted: false,
+    })
+}
+
+// A cut can occur on an internal record. It must not separate legacy image
+// attachments from their user message or an assistant tool call from its result.
+fn complete_compaction_boundary(branch: &[&Record], boundary: u64) -> bool {
+    let mut last_plain_user = None;
+    let mut calls = HashMap::new();
+    let mut results = HashMap::new();
+    for record in branch {
+        match &record.event {
+            Event::User { .. }
+            | Event::CustomMessage { .. }
+            | Event::CustomMessageDelivered { .. }
+            | Event::BranchSummary { .. }
+            | Event::CompactionSummaryMessage { .. } => {
+                last_plain_user = Some(record.id);
+            }
+            Event::BashExecution { execution } if !execution.exclude_from_context => {
+                last_plain_user = Some(record.id);
+            }
+            Event::UserImages { .. } => {
+                if last_plain_user
+                    .take()
+                    .is_some_and(|user| user < boundary && record.id >= boundary)
+                {
+                    return false;
+                }
+            }
+            Event::UserWithImages { .. } => last_plain_user = None,
+            Event::Assistant { invocations, .. } => {
+                last_plain_user = None;
+                for invocation in invocations {
+                    calls.insert(invocation.operation_id, record.id);
+                }
+            }
+            Event::ToolFinished { operation_id, .. }
+            | Event::ToolReconciled { operation_id, .. } => {
+                results.insert(*operation_id, record.id);
+            }
+            _ => {}
+        }
+    }
+    calls.into_iter().all(|(operation, call)| {
+        results
+            .get(&operation)
+            .is_none_or(|result| (call < boundary) == (*result < boundary))
+    })
 }
 
 fn has_summary_prefix(session: &Session, boundary: Option<u64>) -> bool {
@@ -4143,6 +4401,7 @@ struct SummaryScope<'a> {
     output_limit: u32,
     cancellation: &'a CancellationToken,
     reason: crate::CompactionReason,
+    will_retry: bool,
     skip_without_model: bool,
 }
 
@@ -4168,6 +4427,7 @@ fn compaction_failed_event(
         let prefix = match reason {
             crate::CompactionReason::Manual => "Compaction failed",
             crate::CompactionReason::Threshold => "Auto-compaction failed",
+            crate::CompactionReason::Overflow => "Context overflow recovery failed",
         };
         format!("{prefix}: {error}")
     });
@@ -4754,6 +5014,9 @@ fn pending_reply(
                 return reply
                     .as_ref()
                     .map(|reply| (*request_id, metadata.clone(), usage.clone(), reply.clone()));
+            }
+            Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" => {
+                return None;
             }
             Event::Assistant { .. }
             | Event::User { .. }
@@ -5731,6 +5994,7 @@ mod tree_tests {
                                 output_limit: 0,
                                 cancellation: &token,
                                 reason,
+                                will_retry: false,
                                 skip_without_model: false,
                             },
                             &mut |_| {},
@@ -5837,6 +6101,403 @@ mod tree_tests {
                     && event["reason"] == "threshold"
                     && event["fromExtension"] == true)
         );
+    }
+
+    struct OverflowSummaryHook {
+        provide: bool,
+        seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Extension for OverflowSummaryHook {
+        fn id(&self) -> &str {
+            "overflow-summary"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &crate::CompactionPreparation,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(preparation).unwrap());
+            Ok(self.provide.then(|| crate::BeforeSummaryCompactionResult {
+                cancel: false,
+                compaction: Some(crate::ExtensionCompaction {
+                    summary: "safe summary".into(),
+                    first_kept_entry: preparation.first_kept_entry,
+                    tokens_before: preparation.tokens_before,
+                    usage: None,
+                    details: None,
+                }),
+            }))
+        }
+    }
+    struct OverflowModel {
+        calls: std::sync::atomic::AtomicUsize,
+        always_fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for OverflowModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 || self.always_fail {
+                return Err(Error::Model(
+                    "prompt is too long: private-fixture-secret".into(),
+                ));
+            }
+            let summary = request.messages.iter().any(|message| matches!(message,
+                Message::User { content } if content.starts_with("Summarize only this older conversation")));
+            let text = if summary { "model summary" } else { "answer" };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text(text.into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn explicit_overflow_compacts_and_retries_once_without_exposing_failure() {
+        for (provide, always_fail) in [(true, false), (false, false), (true, true)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(OverflowSummaryHook {
+                    provide,
+                    seen: seen.clone(),
+                }))
+                .unwrap();
+            let model = OverflowModel {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                always_fail,
+            };
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: if provide { 2 } else { 3 },
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            if always_fail {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+            }
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                if provide { 2 } else { 3 }
+            );
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["reason"], "overflow");
+            assert_eq!(events[0]["willRetry"], true);
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            assert!(
+                !serde_json::to_string(session.records())
+                    .unwrap()
+                    .contains("private-fixture-secret")
+            );
+        }
+    }
+
+    struct LengthModel {
+        calls: std::sync::atomic::AtomicUsize,
+        output: u64,
+    }
+    #[async_trait::async_trait]
+    impl Model for LengthModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let events = if first {
+                vec![
+                    ModelEvent::Text("partial".into()),
+                    ModelEvent::Metadata(ModelMetadata {
+                        finish_reason: Some("length".into()),
+                        ..Default::default()
+                    }),
+                    ModelEvent::Complete {
+                        calls: if self.output == 1 {
+                            vec![crate::ToolCall {
+                                id: "untrusted".into(),
+                                name: "not_advertised".into(),
+                                arguments: "{}".into(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        usage: Some(Usage {
+                            input_tokens: 4,
+                            output_tokens: self.output,
+                        }),
+                    },
+                ]
+            } else {
+                vec![
+                    ModelEvent::Text("answer".into()),
+                    ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    },
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+    #[tokio::test]
+    async fn recoverable_length_is_omitted_before_compaction_and_retry() {
+        for (output, expected_calls) in [(1, 2), (16, 1)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(OverflowSummaryHook {
+                    provide: true,
+                    seen: seen.clone(),
+                }))
+                .unwrap();
+            let model = LengthModel {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                output,
+            };
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: 2,
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let answer = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(model.calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(answer, if output == 1 { "answer" } else { "partial" });
+            assert_eq!(seen.lock().unwrap().len(), usize::from(output == 1));
+            if output == 1 {
+                assert!(session.operations().is_empty());
+                assert!(
+                    !session
+                        .current_messages()
+                        .iter()
+                        .any(|message| matches!(message,
+                    Message::Assistant { content, .. } if content == "partial"))
+                );
+                assert!(
+                    session
+                        .records()
+                        .iter()
+                        .any(|record| matches!(&record.event,
+                    Event::ModelFinished { reply: Some(reply), .. } if reply.content == "partial"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn length_recovery_marker_blocks_replaying_the_truncated_reply() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("length".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Measured {
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                    },
+                },
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: "partial".into(),
+                    invocations: vec![],
+                    advertised_tools: vec![],
+                    max_output_tokens: 16,
+                }),
+            })
+            .unwrap();
+        assert!(pending_reply(&session, run_id).is_some());
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id,"kind":"length"}),
+            })
+            .unwrap();
+        assert!(pending_reply(&session, run_id).is_none());
+        let state = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(state.started && !state.compacted);
+    }
+
+    #[test]
+    fn overflow_recovery_marker_survives_reopen_and_summary_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("pi-rs:context-overflow".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Failed),
+                partial: "partial".into(),
+                reply: None,
+            })
+            .unwrap();
+        let pending = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(!pending.started && !pending.compacted);
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        let summary_request = Uuid::new_v4();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(summary_request),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id: summary_request,
+                metadata: Default::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        let pending = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(pending.started && !pending.compacted);
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                details: None,
+                from_extension: true,
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        assert!(overflow_recovery_state(&session, run_id).unwrap().compacted);
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(Uuid::new_v4()),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            })
+            .unwrap();
+        assert!(overflow_recovery_state(&session, run_id).is_none());
+        assert!(overflow_recovery_attempted(&session, run_id));
     }
 
     struct LegacyCompaction(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
@@ -6364,6 +7025,7 @@ mod tree_tests {
                         output_limit: 0,
                         cancellation: &token,
                         reason: crate::CompactionReason::Threshold,
+                        will_retry: false,
                         skip_without_model: false,
                     },
                     &mut |_| {},

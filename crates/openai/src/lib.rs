@@ -472,6 +472,9 @@ impl Model for OpenAiResponses {
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
             if status.as_u16() == 429 || status.is_server_error() {
                 let info =
                     pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
@@ -496,6 +499,9 @@ impl Model for OpenAiResponses {
             }
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
+            if pi_rs_core::provider_context_overflow(&body, &[]) {
+                return Err(Error::Model("context window exceeded".into()));
+            }
             return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
@@ -597,6 +603,8 @@ impl Model for OpenAiResponses {
                             Error::Model("OpenAI account quota or billing limit reached".into())
                         } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                             Error::RetryableModel("OpenAI returned a transient stream error".into())
+                        } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
+                            Error::Model("context window exceeded".into())
                         } else {
                             response_error(code, None)
                         })?;

@@ -934,3 +934,189 @@ mod quota_tests {
         ));
     }
 }
+
+// Pi's context-overflow detection excludes throttling before matching provider
+// messages. This returns only a boolean and never emits provider error text.
+pub(crate) fn context_overflow_error(message: &str) -> bool {
+    // Bedrock diagnostics can contain provider-controlled request IDs. Those
+    // are metadata, not evidence about the error itself.
+    let message = if message.starts_with("Bedrock error") {
+        message
+            .rsplit_once(": request id: ")
+            .map_or(message, |(error, _)| error)
+    } else {
+        message
+    };
+    static EXCLUDED: std::sync::OnceLock<regex::RegexSet> = std::sync::OnceLock::new();
+    static OVERFLOW: std::sync::OnceLock<regex::RegexSet> = std::sync::OnceLock::new();
+    let excluded = EXCLUDED.get_or_init(|| {
+        regex::RegexSet::new([
+            r"(?i)^(throttling error|service unavailable):",
+            r"(?i)rate limit",
+            r"(?i)too many requests",
+        ])
+        .expect("static non-overflow patterns")
+    });
+    if excluded.is_match(message) {
+        return false;
+    }
+    OVERFLOW.get_or_init(|| regex::RegexSet::new([
+        r"(?i)prompt (?:is )?too long",
+        r"(?i)prompt exceeds max length",
+        r"(?i)request_too_large",
+        r"(?i)input is too long for requested model",
+        r"(?i)exceeds the context window",
+        r"(?i)exceeds (?:the )?(?:model'?s )?maximum context length(?: of [0-9,]+ tokens?|\s*\([0-9,]+\))",
+        r"(?i)context window exceeded",
+        r"(?i)input token count.*exceeds the maximum",
+        r"(?i)maximum prompt length is [0-9]+",
+        r"(?i)reduce the length of the messages",
+        r"(?i)maximum context length is [0-9]+ tokens",
+        r"(?i)exceeds (?:the )?maximum allowed input length of [0-9,]+ tokens?",
+        r"(?i)input \([0-9]+ tokens\) is longer than the model'?s context length \([0-9]+ tokens\)",
+        r"(?i)exceeds the limit of [0-9]+",
+        r"(?i)exceeds the available context size",
+        r"(?i)greater than the context length",
+        r"(?i)context window exceeds limit",
+        r"(?i)exceeded model token limit",
+        r"(?i)too large for model with [0-9]+ maximum context length",
+        r"(?i)prompt has [0-9,]+ tokens?, but the configured context size is [0-9,]+ tokens?",
+        r"(?i)model_context_window_exceeded",
+        r"(?i)prompt too long; exceeded (?:max )?context length",
+        r"(?i)range of input length should be",
+        r"(?i)context[_ ]length[_ ]exceeded",
+        r"(?i)too many tokens",
+        r"(?i)token limit exceeded",
+        r"(?i)^(?:[A-Za-z0-9_ -]+ API error \(413\):|413(?:\s|:|$))",
+    ]).expect("static overflow patterns")).is_match(message)
+}
+
+/// Recognize an overflow only in the provider error itself, after removing
+/// configured secrets. Request IDs and other envelope metadata are ignored.
+#[doc(hidden)]
+pub fn provider_context_overflow(value: &serde_json::Value, secrets: &[String]) -> bool {
+    if permanent_provider_error(value, secrets) {
+        return false;
+    }
+    let value = sanitized_provider_error(value, secrets);
+    let error = value.get("error").unwrap_or(&value);
+    if let Some(text) = error.as_str() {
+        return context_overflow_error(text);
+    }
+    let Some(object) = error.as_object() else {
+        return false;
+    };
+    if ["type", "code"]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .any(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("rate_limit")
+                || value.contains("too_many_requests")
+                || value.contains("throttl")
+        })
+    {
+        return false;
+    }
+    let fields = ["message", "code", "type", "errorMessage"]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    context_overflow_error(&fields)
+}
+
+/// Inspect only a bounded, time-limited error body. No response text is
+/// returned or logged, and incomplete or unrecognized input fails closed.
+#[doc(hidden)]
+pub async fn provider_context_overflow_stream<S, B, E>(stream: S, secrets: &[String]) -> bool
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        futures_util::pin_mut!(stream);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => return false,
+            };
+            if bytes.len().saturating_add(chunk.as_ref().len()) > 64 * 1024 {
+                return false;
+            }
+            bytes.extend_from_slice(chunk.as_ref());
+        }
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => provider_context_overflow(&value, secrets),
+            Err(_) => {
+                let text = String::from_utf8_lossy(&bytes);
+                if text.trim_start().starts_with(['{', '[']) {
+                    return false;
+                }
+                context_overflow_error(&mask_provider_secrets(&text, secrets))
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::{context_overflow_error, provider_context_overflow};
+
+    #[test]
+    fn provider_overflow_ignores_metadata_secrets_and_rate_limits() {
+        use serde_json::json;
+        assert!(provider_context_overflow(
+            &json!({"error":{"message":"prompt is too long"}}),
+            &[]
+        ));
+        assert!(!provider_context_overflow(
+            &json!({"error":{"message":"unrelated"},"request_id":"prompt is too long"}),
+            &[]
+        ));
+        assert!(!provider_context_overflow(
+            &json!({"error":{"message":"prompt is too long"}}),
+            &["prompt is too long".into()]
+        ));
+        assert!(!provider_context_overflow(
+            &json!({"error":{"type":"rate limit", "message":"too many tokens"}}),
+            &[]
+        ));
+        assert!(!provider_context_overflow(
+            &json!({"error":{"type":"rate_limit_error", "message":"too many tokens"}}),
+            &[]
+        ));
+        assert!(!provider_context_overflow(
+            &json!({"error":{"message":"quota exceeded: too many tokens"}}),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn pi_overflow_patterns_exclude_rate_limits_and_body_statuses() {
+        for message in [
+            "prompt is too long: 213462 tokens > 200000 maximum",
+            "Input length (265330) exceeds model's maximum context length (262144)",
+            "The input token count 1196265 exceeds the maximum number of tokens allowed",
+            "context_length_exceeded",
+            "Anthropic API error (413): request too large",
+            "413 status code (no body)",
+        ] {
+            assert!(context_overflow_error(message), "{message}");
+        }
+        for message in [
+            "Throttling error: too many tokens; retry later",
+            "rate limit: too many tokens",
+            "too many requests: context window exceeded",
+            "error body mentions 413 but is unrelated",
+            "temporary network failure",
+            "Bedrock error: ValidationException: invalid request: request id: context_length_exceeded",
+        ] {
+            assert!(!context_overflow_error(message), "{message}");
+        }
+    }
+}

@@ -139,8 +139,11 @@ compaction hooks continue to run. An extension-provided summary does not consume
 a model request, so threshold compaction can use it even when only the turn's
 final model request remains. A declined optional hook preserves that request and
 does not emit a failed-compaction event. Unlike Pi, the native hook must retain at
-least the prepared recent context and uses native numeric journal IDs; native
-summary size and timeout limits still apply. Automatic overflow recovery and
+least the prepared recent context and uses native numeric journal IDs; cuts that
+split a user message from its legacy image records or a tool call from its
+result are rejected. Later legacy hook changes can retain more history, but
+cannot move an extension-provided boundary forward. Native summary size and
+timeout limits still apply. Automatic overflow recovery and
 full Pi preparation payload compatibility remain separate gaps.
 
 Native extensions can opt into tool execution start, update and end events,
