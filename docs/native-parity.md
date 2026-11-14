@@ -297,9 +297,16 @@ characters as Pi does. Incomplete JSON and non-object values produce a tool
 error containing the received arguments. The original model response remains
 in the journal; subsequent model requests use the repaired object.
 
-`get_tree` sorts siblings by timestamp in chronological order, including
-imported timestamps with UTC offsets. Siblings with the same instant retain
-append order. Entries whose parent is missing or points to themselves appear as
+When all sibling timestamps are valid, `get_tree` sorts them in chronological
+order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
+interpreted at UTC midnight as in Pi, including day overflow within 1–31.
+For mixed invalid dates, the comparator is not transitive, so
+chronological order and equal-instant append order are not guaranteed. The
+native implementation reproduces Node 22/24 V8 natural runs, insertion,
+run-stack collapse and galloping merges. Mixed lists of 3–10,000 entries were
+compared with Node 22.23.4 and 24.22.1; other JavaScript engines and versions
+may behave differently. Other JavaScript date parsing edge cases
+remain open. Entries whose parent is missing or points to themselves appear as
 roots.
 
 During manual compaction, an RPC `abort` response waits for the compaction
@@ -399,8 +406,10 @@ remaining feature rows above still need their own acceptance checks.
 ### Faithful terminal checkpoint
 
 Markdown lists preserve the reference spacing between items in loose lists
-with direct text paragraphs, including nested lists, while tight lists remain
-compact. Lists containing only block elements still need comparison.
+with direct text paragraphs, including nested lists, and between block-only
+items separated by blank lines, including within blockquotes. Tight lists remain
+compact; blank lines inside fenced code do not loosen the enclosing list. Other block-only looseness and
+layout cases still need comparison.
 
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
@@ -1119,7 +1128,12 @@ context or starting a new session clears the ambiguity. Google text and tool-cal
 
 The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
-prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
+prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
+malformed UTF-8 in text attachments is decoded with replacement characters.
+For CLI attachments, image detection does not infer a format from the file
+extension. Malformed PNG headers and animated PNGs detected within the first
+4,100 bytes are treated as text, matching Pi's PNG sniffing; other format
+classification continues to use the native reader.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
@@ -4233,10 +4247,12 @@ non-null content. Other specialized message variants remain open.
 ### RPC truncated JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
-initial object property names, unfinished unescaped strings, and missing values.
-Offsets and columns in these diagnostics count UTF-16 units. Other malformed
-JSON, escaped unfinished strings and carriage-return position handling retain
-the native parser's diagnostics; full malformed-input parity remains open.
+initial object property names, unfinished strings with complete escapes
+(including lone surrogate escapes), and
+missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
+counted as line breaks. Other malformed JSON, including incomplete escapes,
+retains the native parser's diagnostics; full malformed-input parity remains
+open.
 
 ### Shell execution transcript checkpoint
 
@@ -4250,6 +4266,16 @@ tool styling and preview limits, so a long output may hide its status until expa
 Shell transcript rendering strips terminal escape sequences and normalizes line
 endings, including for imported and extension-provided output; journal and
 model-context text retain the original bytes.
+
+### Compaction retention token estimate
+
+Token-based compaction retention uses the projected Pi message estimate,
+including assistant thinking and structured tool-result blocks, when choosing
+a cut point or complete turns. Context edits replace the original estimate.
+A branch-local index shares reasoning and latest edits across message estimates;
+a 2,500-turn regression covers long histories and context usage.
+The separate native model-request safety budget retains its existing
+conservative estimate. Other token-estimator differences remain open.
 
 ### Model listing search checkpoint
 
@@ -4272,3 +4298,19 @@ unrelated metadata, incomplete numeric values and undelimited numbers are ignore
 Known credentials and configured header values are redacted before error fields
 are classified, including for stream errors.
 Other provider adapters still need equivalent quota classification.
+
+### Bedrock quota retry classification
+
+Bedrock service and stream exceptions stop agent retries when their redacted
+error message or code contains Pi's account quota or billing exhaustion
+markers, even if AWS categorizes the exception as transient throttling. The model receives a
+fixed limit message; ordinary throttling remains retryable even if its request
+ID contains a marker. Classification scans the full SDK error message with a
+fixed-size rolling window and redacts secrets before matching. This uses bounded
+additional memory; scan time depends on message length and configured secrets.
+AWS SDK retries before an exception reaches
+the agent remain governed by the configured SDK policy.
+
+Pi's non-chat System One provider-level policy retries transient HTTP status
+codes including 429 without classifying the response body; native keeps that
+separate policy.

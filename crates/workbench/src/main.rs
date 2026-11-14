@@ -115,7 +115,7 @@ struct Cli {
     #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
-    thinking_profile: Option<(String, Vec<String>)>,
+    thinking_profile: Option<(String, Vec<String>, Option<bool>)>,
     #[arg(skip)]
     initial_images: Vec<pi_rs::ImageContent>,
     #[arg(skip)]

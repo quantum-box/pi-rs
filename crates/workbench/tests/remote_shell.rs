@@ -516,6 +516,42 @@ async fn local_shell_operations_factory_streams_and_applies_exit_status() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn local_shell_operations_project_signal_as_exit_code() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_bash_tool(
+        root.path(),
+        ShellConfig::default(),
+        pi_rs_workbench::coding::create_local_bash_operations(None),
+    )
+    .unwrap();
+    for (signal, code) in [("TERM", 143), ("KILL", 137)] {
+        let outcome = tool
+            .invoke(
+                json!({"command": format!("printf before; kill -{signal} $$")}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await;
+        let Outcome::TextResultWithStructuredContent {
+            output,
+            structured_content,
+            is_error,
+            ..
+        } = outcome
+        else {
+            panic!("expected a structured shell result")
+        };
+        assert_eq!(output, format!("before\n\nCommand exited with code {code}"));
+        assert!(is_error);
+        assert_eq!(structured_content["output"], "before");
+        assert_eq!(structured_content["exit_code"], code);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn local_operations_stop_when_output_channel_is_full() {
     use std::collections::BTreeMap;
     for timed in [false, true] {

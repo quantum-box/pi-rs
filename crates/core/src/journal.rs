@@ -756,6 +756,7 @@ impl Session {
 
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
+        let token_index = crate::tokens::SourceTokenIndex::new(self, &branch);
         let entries = conversation_entries_unrepaired(&branch, self.operations());
         let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
         let invalidated_at = branch
@@ -821,9 +822,7 @@ impl Session {
                 entries[index + 1..]
                     .iter()
                     .fold(0_u64, |tokens, (source, message)| {
-                        tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                            self, *source, message,
-                        ))
+                        tokens.saturating_add(token_index.estimate(*source, message))
                     });
             // Pi estimates each system delta that follows the measured reply.
             let trailing_tokens = branch
@@ -853,9 +852,7 @@ impl Session {
             })
             .saturating_add(crate::tokens::estimate_system_tokens(&branch));
         let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                self, *source, message,
-            ))
+            tokens.saturating_add(token_index.estimate(*source, message))
         });
         crate::ContextUsageEstimate {
             tokens,
