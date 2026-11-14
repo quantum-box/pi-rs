@@ -34,8 +34,10 @@ pub mod state;
 pub mod streamed_output;
 pub mod subagent;
 pub mod subagent_management;
-#[allow(dead_code)] // Storage foundation; no independent worker is connected yet.
+#[allow(dead_code)] // Private operation storage, not a public admission API.
 mod summary_store;
+#[allow(dead_code)] // Private worker until placement and admission are integrated.
+mod summary_worker;
 pub mod task;
 pub mod task_driver;
 pub mod task_scheduler;

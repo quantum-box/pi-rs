@@ -45,6 +45,10 @@ type ResolvedOccurrences = (
 );
 type ResolvedCompactionTarget = (Vec<Message>, (usize, usize));
 
+#[cfg(test)]
+#[path = "summary_worker_tests.rs"]
+mod summary_worker_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("owner: {0}")]
@@ -7857,6 +7861,12 @@ pub struct Scheduler {
     reporter: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
+    summary_tasks: HashMap<Uuid, SummaryTask>,
+}
+
+struct SummaryTask {
+    cancel: CancellationToken,
+    join: tokio::task::JoinHandle<Result<(), crate::summary_worker::Error>>,
 }
 
 impl Scheduler {
@@ -8172,6 +8182,7 @@ impl Scheduler {
             worker_errors: harness.owner.conversation_controls().worker_errors(),
             harness,
             tasks: HashMap::new(),
+            summary_tasks: HashMap::new(),
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
@@ -8717,6 +8728,132 @@ impl Scheduler {
         });
         self.tasks.entry(id).or_default().push(task);
     }
+
+    // These methods deliberately remain private: placement and public busy
+    // admission are not yet integrated. The caller persists the preparation.
+    #[allow(dead_code)]
+    fn schedule_summary(&mut self, id: Uuid) -> Result<(), Error> {
+        if self.harness.storage_failed.load(Ordering::Acquire) {
+            return Err(Error::Failed);
+        }
+        if self.summary_tasks.contains_key(&id) {
+            return Err(Error::Invalid("summary already scheduled".into()));
+        }
+        crate::summary_store::SummaryStore::new(self.harness.owner.store())
+            .get(id)
+            .map_err(|e| self.summary_store_error(e))?
+            .ok_or(Error::NotFound)?;
+        let cancel = self.cancel.child_token();
+        let owner = self.harness.owner.clone();
+        let model = self.harness.options.model.clone();
+        let worker_cancel = cancel.clone();
+        let root = self.cancel.clone();
+        let storage_failed = self.harness.storage_failed.clone();
+        let join = tokio::spawn(async move {
+            let result = crate::summary_worker::run(owner, model, id, worker_cancel).await;
+            if matches!(
+                &result,
+                Err(crate::summary_worker::Error::Store(
+                    crate::summary_store::Error::Store(_)
+                ))
+            ) {
+                storage_failed.store(true, Ordering::Release);
+                root.cancel();
+            }
+            result
+        });
+        self.summary_tasks.insert(id, SummaryTask { cancel, join });
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn wait_summary(&mut self, id: Uuid) -> Result<(), Error> {
+        let Some(task) = self.summary_tasks.get_mut(&id) else {
+            return Err(Error::NotFound);
+        };
+        let result = (&mut task.join).await;
+        self.summary_tasks.remove(&id);
+        result
+            .map_err(|e| Error::Invalid(format!("summary task: {e}")))?
+            .map_err(|e| Error::Invalid(e.to_string()))
+    }
+
+    #[allow(dead_code)]
+    async fn abort_summary(&mut self, id: Uuid) -> Result<(), Error> {
+        use crate::summary_store::{Error as StoreError, State, SummaryStore};
+        if self.harness.storage_failed.load(Ordering::Acquire) {
+            return Err(Error::Failed);
+        }
+        let store = SummaryStore::new(self.harness.owner.store());
+        let mut marked = false;
+        for _ in 0..8 {
+            let snap = store
+                .get(id)
+                .map_err(|e| self.summary_store_error(e))?
+                .ok_or(Error::NotFound)?;
+            match snap.operation.state() {
+                State::Aborting { .. } | State::Aborted => {
+                    marked = true;
+                    break;
+                }
+                State::Completed { .. } => {
+                    return Err(Error::Invalid("summary already completed".into()));
+                }
+                _ => match store.begin_abort(id, snap.version) {
+                    Ok(()) => {
+                        marked = true;
+                        break;
+                    }
+                    Err(StoreError::Conflict) => continue,
+                    Err(e) => return Err(self.summary_store_error(e)),
+                },
+            }
+        }
+        if !marked {
+            return Err(Error::Invalid("summary abort conflicted".into()));
+        }
+        let mut worker_error = None;
+        if let Some(task) = self.summary_tasks.get_mut(&id) {
+            task.cancel.cancel();
+            match (&mut task.join).await {
+                Ok(Ok(()))
+                | Ok(Err(crate::summary_worker::Error::Interrupted))
+                | Ok(Err(crate::summary_worker::Error::Store(
+                    StoreError::Conflict | StoreError::State,
+                ))) => (),
+                Ok(Err(e)) => worker_error = Some(e.to_string()),
+                Err(e) => worker_error = Some(format!("summary task: {e}")),
+            }
+            self.summary_tasks.remove(&id);
+        }
+        if self.harness.storage_failed.load(Ordering::Acquire) {
+            return Err(Error::Failed);
+        }
+        // The prior task has joined before recovery takes the same fence.
+        crate::summary_worker::run(
+            self.harness.owner.clone(),
+            self.harness.options.model.clone(),
+            id,
+            self.cancel.child_token(),
+        )
+        .await
+        .map_err(|e| match e {
+            crate::summary_worker::Error::Store(error) => self.summary_store_error(error),
+            other => Error::Invalid(other.to_string()),
+        })?;
+        if let Some(error) = worker_error {
+            return Err(Error::Invalid(error));
+        }
+        Ok(())
+    }
+
+    fn summary_store_error(&self, error: crate::summary_store::Error) -> Error {
+        if matches!(error, crate::summary_store::Error::Store(_)) {
+            self.harness.storage_failed.store(true, Ordering::Release);
+            self.cancel.cancel();
+        }
+        Error::Invalid(format!("summary: {error}"))
+    }
     /// Most recent background reporter failure, if any. Reopen after storage errors.
     pub fn reporter_error(&self) -> Option<String> {
         self.reporter_error
@@ -8855,6 +8992,17 @@ impl Scheduler {
         self.cancel.cancel();
         self.reporter_cancel.cancel();
         let mut error = None;
+        for task in std::mem::take(&mut self.summary_tasks).into_values() {
+            match task.join.await {
+                Ok(Ok(())) | Ok(Err(crate::summary_worker::Error::Interrupted)) => (),
+                Ok(Err(e)) => {
+                    error.get_or_insert(Error::Invalid(e.to_string()));
+                }
+                Err(e) => {
+                    error.get_or_insert(Error::Invalid(format!("summary task: {e}")));
+                }
+            }
+        }
         if let Some(reporter) = self.reporter.take()
             && let Err(e) = reporter.await
         {

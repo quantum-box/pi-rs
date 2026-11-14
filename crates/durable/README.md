@@ -596,6 +596,11 @@ Legacy in-flight preparations without a generation can finish while the
 conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
+An internal scheduler-owned summary worker can execute a persisted preparation,
+settle usage, and recover or abort when explicitly scheduled by operation ID.
+It does not discover operations automatically on reopen, apply their results,
+or expose busy compaction admission. Usage settlement requires the model's
+request-ID idempotence contract; interrupted attempts are reported unconfirmed.
 Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
