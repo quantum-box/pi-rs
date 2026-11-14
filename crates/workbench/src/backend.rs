@@ -1824,19 +1824,28 @@ mod share_context_tests {
     fn equal_session_head_does_not_identify_live_share_context() {
         let session = Session::with_store(MemoryStore::default()).unwrap();
         let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
-        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
-            system_prompt: "before runtime refresh".into(),
-            tools: Vec::new(),
-        }));
+        let mut summary = false;
+        let before_registry = Registry::default();
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "before runtime refresh",
+                registry: &before_registry,
+            },
+            &mut summary,
+        );
         let before = snapshot.share_snapshot().unwrap();
-        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
-            system_prompt: "after runtime refresh".into(),
-            tools: vec![pi_rs::ToolSpec {
-                name: "dynamic_tool".into(),
-                description: "changed without a journal entry".into(),
-                parameters: serde_json::json!({"type":"object"}),
-            }],
-        }));
+        let root = tempfile::tempdir().unwrap();
+        let mut after_registry = Registry::default();
+        after_registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "after runtime refresh",
+                registry: &after_registry,
+            },
+            &mut summary,
+        );
         let after = snapshot.share_snapshot().unwrap();
         assert_eq!(before.session_id, after.session_id);
         assert_eq!(before.head, after.head);

@@ -87,4 +87,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 [target.'cfg(windows)'.dependencies]
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security_Cryptography"] }

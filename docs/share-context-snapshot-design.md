@@ -99,10 +99,14 @@ legacy misses. macOS extended ACLs are rejected; unverified Unix ACL semantics
 fail closed. Tests include a killed process,
 concurrent generations, old format, symlink substitution, and access modes.
 
-The prototype is not connected to live sessions or standalone sharing. The
-caller must still provide and revalidate complete provenance, Windows storage
-is not implemented, the protection must receive independent review, and
-a safe legacy reconstruction path remains unresolved. In particular, a
+The prototype provides `begin_and_initialize`, which refuses to poll the
+initializer if invalidation fails and keeps an unsuccessful initialization
+dirty. It is not connected to live sessions or standalone sharing. The caller
+must still provide and revalidate complete provenance. Windows DPAPI primitives
+have been cross-compiled, but an owner-only, reparse-safe Windows store and
+Windows runtime tests are not implemented. DPAPI alone cannot prevent a stale
+ciphertext or lock-file replay. The protection needs independent review, and a
+safe legacy reconstruction path remains unresolved. In particular, a
 session/head keyed sidecar would produce misleading or unsafe results.
 
 ## Legacy supervisor and credential broker candidate

@@ -380,6 +380,24 @@ mod unix {
             })
         }
 
+        /// Invalidate before polling runtime initialization. Failure to
+        /// invalidate prevents the initializer from running at all. Dropping
+        /// this future or an initializer error leaves the generation dirty.
+        pub async fn begin_and_initialize<F, Fut, T>(
+            &self,
+            path: &Path,
+            binding: Binding,
+            initialize: F,
+        ) -> pi_rs::Result<(Generation<'_>, T)>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = pi_rs::Result<T>>,
+        {
+            let generation = self.begin(path, binding)?;
+            let runtime = initialize().await?;
+            Ok((generation, runtime))
+        }
+
         /// A missing, busy, mismatched, malformed, or old-format entry is a
         /// cache miss. Caller determines how to reconstruct a legacy session.
         pub fn read(&self, path: &Path, binding: &Binding) -> io::Result<Option<Value>> {
@@ -448,6 +466,7 @@ mod unix {
         /// Publish only after the live runtime has settled and the caller has
         /// independently revalidated the complete binding and journal.
         pub fn publish(self, binding: Binding, context: Value) -> io::Result<()> {
+            secure_dir(&self.store.directory)?;
             if binding.session_id != self.binding.session_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -484,6 +503,8 @@ mod unix {
                 secure_file(&file)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
+                secure_file(&file)?;
+                secure_dir(&self.store.directory)?;
                 // SAFETY: both names refer to the same verified directory.
                 if unsafe {
                     libc::renameat(
@@ -512,6 +533,9 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{Generation, Store};
+
+#[cfg(windows)]
+pub mod windows_private;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -814,6 +838,74 @@ mod tests {
         assert!(store.read(path, &binding).unwrap().is_none());
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_invalidation_never_starts_runtime_initialization() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        let store = Store::open(root.path()).unwrap();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let started = AtomicBool::new(false);
+        let result = store
+            .begin_and_initialize(path, binding.clone(), || async {
+                started.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!started.load(Ordering::SeqCst));
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            store.read(path, &binding).unwrap(),
+            Some(serde_json::json!({"prompt":"old"}))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_runtime_initialization_leaves_generation_invalidated() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        let store = Store::open(root.path()).unwrap();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        let result = store
+            .begin_and_initialize(path, binding.clone(), || async {
+                Err::<(), _>(pi_rs::Error::Config("fixture startup failed".into()))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(store.read(path, &binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn unsafe_directory_change_during_generation_prevents_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        let store = Store::open(root.path()).unwrap();
+        let generation = store.begin(path, binding.clone()).unwrap();
+        let directory = root.path().join("share-context-v1");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            generation
+                .publish(binding.clone(), serde_json::json!({"prompt":"secret"}))
+                .is_err()
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(store.read(path, &binding).unwrap().is_none());
     }
 
