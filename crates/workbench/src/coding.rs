@@ -5906,7 +5906,18 @@ mod tests {
             WAIT_TIMEOUT,
             "child must be running before timeout"
         );
-        let result = shell.await.expect("shell task panicked");
+        let result = match tokio::time::timeout(Duration::from_secs(35), &mut shell).await {
+            Ok(result) => result.expect("shell task panicked"),
+            Err(_) => {
+                cancellation.cancel();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                if stopped.is_err() {
+                    shell.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                }
+                panic!("shell did not finish within the outer deadline after child readiness");
+            }
+        };
         assert!(
             matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 20 seconds")),
             "expected the configured timeout"
