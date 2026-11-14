@@ -1935,7 +1935,15 @@ async fn execute(
         output(json!({"type":"imported","path":args.session}));
         return Ok(());
     }
-    let mut session = Session::open(&args.session)?;
+    let mut session = Session::open(&args.session).map_err(|error| {
+        if matches!(&command, Command::Share) {
+            Error::Config(format!(
+                "Cannot prepare share from the session; live context is unavailable: {error}"
+            ))
+        } else {
+            error
+        }
+    })?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),

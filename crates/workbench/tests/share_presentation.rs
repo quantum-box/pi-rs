@@ -460,6 +460,57 @@ fn share_context_tracks_idle_and_inflight_worker() {
         active["data"]["context"]["tools"],
         request["request"]["tools"]
     );
+    // An active worker owns the journal lock. The standalone CLI currently
+    // cannot ask it for context and must not contact Radius in this state.
+    let radius = TcpListener::bind("127.0.0.1:0").unwrap();
+    radius.set_nonblocking(true).unwrap();
+    let radius_url = format!("http://{}/v1/artifacts", radius.local_addr().unwrap());
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", radius_url)
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            &endpoint,
+            "--session",
+        ])
+        .arg(root.path().join("session.jsonl"))
+        .arg("share")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut standalone = KillOnDrop(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while standalone.0.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "standalone share did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!standalone.0.wait().unwrap().success());
+    let mut error = String::new();
+    standalone
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(error.contains("live context is unavailable"), "{error}");
+    assert!(
+        matches!(radius.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Radius was contacted"
+    );
     release.send(()).unwrap();
     let settled = receive(&rx, |event| {
         assert_ne!(event["type"], "error", "model request error: {event}");
