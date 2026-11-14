@@ -167,6 +167,7 @@ fn conflicting_task_prevents_document_commit() {
     let tasks = TaskStore::new(&db);
     tasks.save(&[Save::Create(&task)]).unwrap();
     let a = address("rollback");
+    let before = Documents::new(&db).snapshot().unwrap();
     let mut tx = Transaction::new();
     tx.put(&a, Expected::Missing, &object(1)).unwrap();
     tx.append(tasks.prepare_save(&[Save::Create(&task)]).unwrap())
@@ -176,5 +177,101 @@ fn conflicting_task_prevents_document_commit() {
         Err(Error::Store(durable_store::Error::Conflict { .. }))
     ));
     assert!(Documents::new(&db).get(&a).unwrap().is_none());
+    assert_eq!(Documents::new(&db).snapshot().unwrap(), before);
+    assert!(Documents::new(&db).get_at(&a, before).unwrap().is_none());
     assert_eq!(tasks.load(task.id()).unwrap().unwrap().task, task);
+}
+
+#[test]
+fn historical_snapshots_survive_updates_delete_recreate_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (a, b) = (address("history-a"), address("history-b"));
+    let db = Store::open(&path).unwrap();
+    let docs = Documents::new(&db);
+    let empty = docs.snapshot().unwrap();
+    let mut tx = Transaction::new();
+    tx.put(&a, Expected::Missing, &object(1)).unwrap();
+    tx.put(&b, Expected::Missing, &object(2)).unwrap();
+    tx.commit(&db).unwrap();
+    let first = docs.snapshot().unwrap();
+    let old_a = docs.get(&a).unwrap().unwrap();
+    let old_b = docs.get(&b).unwrap().unwrap();
+    let mut tx = Transaction::new();
+    tx.delete(&a, old_a.version).unwrap();
+    tx.put(&b, Expected::Version(old_b.version), &object(3))
+        .unwrap();
+    tx.commit(&db).unwrap();
+    let deleted = docs.snapshot().unwrap();
+    let mut tx = Transaction::new();
+    tx.put(&a, Expected::Missing, &object(4)).unwrap();
+    tx.commit(&db).unwrap();
+    let recreated = docs.snapshot().unwrap();
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    let docs = Documents::new(&db);
+    assert_eq!(docs.get_at(&a, empty).unwrap(), None);
+    assert_eq!(docs.get_at(&a, first).unwrap(), Some(old_a.clone()));
+    assert_eq!(docs.get_at(&b, first).unwrap(), Some(old_b));
+    assert_eq!(docs.get_at(&a, deleted).unwrap(), None);
+    assert_eq!(docs.get_at(&b, deleted).unwrap().unwrap().value, object(3));
+    assert_eq!(
+        docs.get_at(&a, recreated).unwrap().unwrap().value,
+        object(4)
+    );
+    assert!(docs.get_at(&a, recreated + 1).is_err());
+    let mut stale = Transaction::new();
+    stale
+        .put(&a, Expected::Version(old_a.version), &object(5))
+        .unwrap();
+    assert!(stale.commit(&db).is_err());
+    assert_eq!(docs.snapshot().unwrap(), recreated);
+}
+
+#[test]
+fn snapshots_are_atomic_across_competing_multi_document_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Store::open(&path).unwrap();
+    let (a, b) = (address("atomic-a"), address("atomic-b"));
+    let mut tx = Transaction::new();
+    tx.put(&a, Expected::Missing, &object(0)).unwrap();
+    tx.put(&b, Expected::Missing, &object(0)).unwrap();
+    tx.commit(&db).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let path2 = path.clone();
+    let a2 = a.clone();
+    let b2 = b.clone();
+    let barrier2 = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        let db = Store::open(path2).unwrap();
+        barrier2.wait();
+        for n in 1..=50 {
+            let docs = Documents::new(&db);
+            let mut tx = Transaction::new();
+            tx.put(
+                &a2,
+                Expected::Version(docs.get(&a2).unwrap().unwrap().version),
+                &object(n),
+            )
+            .unwrap();
+            tx.put(
+                &b2,
+                Expected::Version(docs.get(&b2).unwrap().unwrap().version),
+                &object(n),
+            )
+            .unwrap();
+            tx.commit(&db).unwrap();
+        }
+    });
+    barrier.wait();
+    for _ in 0..100 {
+        let docs = Documents::new(&db);
+        let snapshot = docs.snapshot().unwrap();
+        assert_eq!(
+            docs.get_at(&a, snapshot).unwrap().unwrap().value,
+            docs.get_at(&b, snapshot).unwrap().unwrap().value
+        );
+    }
+    writer.join().unwrap();
 }

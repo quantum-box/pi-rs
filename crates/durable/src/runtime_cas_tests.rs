@@ -784,6 +784,7 @@ fn document_admissions_compete_retry_and_reopen() {
         name: "counter".into(),
         key: "".into(),
     };
+    let initial_snapshot = Documents::new(owner.owner.store()).snapshot().unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let attempts = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..2)
@@ -822,6 +823,17 @@ fn document_admissions_compete_retry_and_reopen() {
     let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     assert_ne!(ids[0], ids[1]);
     assert!(attempts.load(Ordering::SeqCst) >= 3);
+    let docs = Documents::new(owner.owner.store());
+    let final_snapshot = docs.snapshot().unwrap();
+    assert_eq!(final_snapshot, initial_snapshot + 2);
+    assert!(docs.get_at(&address, initial_snapshot).unwrap().is_none());
+    assert_eq!(
+        docs.get_at(&address, initial_snapshot + 1)
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        1
+    );
     assert_eq!(
         Documents::new(owner.owner.store())
             .get(&address)

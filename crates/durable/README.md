@@ -359,6 +359,21 @@ sequence numbers. Addresses are caller-defined and do not enforce ownership.
 Raw prepared batches are trusted and must respect reserved namespaces and JSON
 invariants. Do not perform external effects while preparing a batch.
 
+`Documents::snapshot` captures a database-local document revision; `get_at`
+reads an address at that boundary, including across updates, deletes, recreation,
+and reopen. All document mutations in one store commit share a revision, and
+failed commits leave no history. CAS versions remain distinct from revisions.
+A first open with this version seeds revision 0 from existing live documents;
+earlier changes and deleted values cannot be recovered. Snapshots are valid only
+for the same database, are not authorization tokens, and must not be fabricated.
+History is retained indefinitely. Older binaries writing the database after
+migration bypass history and are incompatible. Raw writes to the reserved
+namespace are recorded but still must obey document invariants.
+
+These snapshots are not yet associated atomically with conversation entries or
+fork cuts, and `get_at` requires a known address: this does not implement
+historical document inheritance, enumeration, or upstream Chord transactions.
+
 `Harness::submit_with_documents` and `Scheduler::submit_with_documents` admit input, document changes, and optional tasks staged with `AdmissionDocuments::create_task` in
 the same durable commit as the conversation, transcript and observation updates.
 Its callback reads documents before staging any writes; every read, including

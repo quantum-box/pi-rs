@@ -58,9 +58,19 @@ impl<'a> Documents<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self { store }
     }
+    /// Capture a store-wide document boundary, reusable after reopen.
+    pub fn snapshot(&self) -> Result<u64, Error> {
+        Ok(self.store.document_snapshot()?)
+    }
+    /// Read one address at a previously captured document boundary.
+    pub fn get_at(&self, address: &Address, snapshot: u64) -> Result<Option<Document>, Error> {
+        Self::decode(self.store.document_at(&address.storage_key()?, snapshot)?)
+    }
     pub fn get(&self, address: &Address) -> Result<Option<Document>, Error> {
-        self.store
-            .get(&address.storage_key()?)?
+        Self::decode(self.store.get(&address.storage_key()?)?)
+    }
+    fn decode(entry: Option<durable_store::Entry>) -> Result<Option<Document>, Error> {
+        entry
             .map(|entry| {
                 let value = serde_json::from_slice::<Value>(&entry.value)?;
                 let Value::Object(value) = value else {

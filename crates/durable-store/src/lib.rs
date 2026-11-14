@@ -41,6 +41,7 @@ pub enum Error {
     Storage(rusqlite::Error),
     LockPoisoned,
     VersionExhausted,
+    InvalidSnapshot,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,6 +50,7 @@ impl fmt::Display for Error {
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
+            Self::InvalidSnapshot => write!(f, "snapshot is newer than document history"),
         }
     }
 }
@@ -90,6 +92,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0));
             INSERT OR IGNORE INTO durable_store_meta(id, version) VALUES(1, 0);
             CREATE TABLE IF NOT EXISTS durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;")?;
+        // Seed existing live documents once. Earlier overwritten/deleted values cannot
+        // be recovered. Both the seed and its marker are committed atomically.
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_document_history_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
+            CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
+            INSERT INTO durable_document_history(key, revision, value, version)
+                SELECT key, 0, value, version FROM durable_store_entries
+                WHERE substr(key, 1, 17)=CAST('durable/document/' AS BLOB)
+                AND NOT EXISTS (SELECT 1 FROM durable_document_history_meta WHERE id=1);
+            INSERT OR IGNORE INTO durable_document_history_meta(id, revision) VALUES(1, 0);
+            COMMIT;")?;
         Ok(Self {
             connection: Mutex::new(conn),
         })
@@ -171,6 +184,43 @@ impl Store {
         tx.commit()?;
         Ok((metadata, rows))
     }
+    /// Capture a document history boundary. Every document mutation in one
+    /// commit shares a boundary; subsequent reads at it are immutable.
+    pub fn document_snapshot(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Read a document as of a captured history boundary. This does not accept
+    /// arbitrary store keys and does not promise history from before migration.
+    pub fn document_at(&self, key: &[u8], revision: u64) -> Result<Option<Entry>, Error> {
+        if !key.starts_with(b"durable/document/") {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let row: Option<(Option<Vec<u8>>, Option<u64>)> = conn.query_row(
+            "SELECT value, version FROM durable_document_history WHERE key=?1 AND revision<=?2 ORDER BY revision DESC LIMIT 1",
+            params![key, revision], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        match row {
+            Some((Some(value), Some(version))) => Ok(Some(Entry { value, version })),
+            Some((None, None)) | None => Ok(None),
+            _ => Err(Error::Storage(rusqlite::Error::InvalidQuery)),
+        }
+    }
+
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
@@ -194,6 +244,26 @@ impl Store {
                 });
             }
         }
+        let document_changed = mutations.iter().any(|mutation| match mutation {
+            Mutation::Put { key, .. } | Mutation::Delete { key } => {
+                key.starts_with(b"durable/document/")
+            }
+        });
+        let revision = if document_changed {
+            let previous: i64 = tx.query_row(
+                "SELECT revision FROM durable_document_history_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let next = previous.checked_add(1).ok_or(Error::VersionExhausted)?;
+            tx.execute(
+                "UPDATE durable_document_history_meta SET revision=?1 WHERE id=1",
+                [next],
+            )?;
+            Some(next)
+        } else {
+            None
+        };
         for mutation in mutations {
             match mutation {
                 Mutation::Put { key, value } => {
@@ -213,6 +283,14 @@ impl Store {
                     tx.execute("DELETE FROM durable_store_entries WHERE key=?1", [key])?;
                 }
             }
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            if key.starts_with(b"durable/document/") {
+                // Upsert accommodates raw batches that mutate the same key more
+                // than once: the snapshot represents the final committed state.
+                tx.execute("INSERT INTO durable_document_history(key,revision,value,version) VALUES(?1,?2,(SELECT value FROM durable_store_entries WHERE key=?1),(SELECT version FROM durable_store_entries WHERE key=?1)) ON CONFLICT(key,revision) DO UPDATE SET value=excluded.value,version=excluded.version", params![key, revision])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -228,4 +306,40 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod document_history_tests {
+    use super::*;
+
+    #[test]
+    fn migrates_existing_live_documents_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let key = b"durable/document/legacy";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES(1, 7); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID;").unwrap();
+            conn.execute(
+                "INSERT INTO durable_store_entries VALUES (?1, ?2, 7)",
+                params![key, b"legacy".as_slice()],
+            )
+            .unwrap();
+        }
+        let db = Store::open(&path).unwrap();
+        assert_eq!(db.document_snapshot().unwrap(), 0);
+        assert_eq!(db.document_at(key, 0).unwrap().unwrap().version, 7);
+        db.commit(
+            &[Check {
+                key: key.to_vec(),
+                expected: Expected::Version(7),
+            }],
+            &[Mutation::Delete { key: key.to_vec() }],
+        )
+        .unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert_eq!(db.document_at(key, 0).unwrap().unwrap().value, b"legacy");
+        assert!(db.document_at(key, 1).unwrap().is_none());
+    }
 }
