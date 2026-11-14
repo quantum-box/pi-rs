@@ -2548,7 +2548,8 @@ impl Agent<'_> {
                 } else {
                     match &result {
                         Ok(reply)
-                            if !reply.truncated
+                            if self.registry.extensions.is_empty()
+                                && !reply.truncated
                                 && reply.invocations.is_empty()
                                 && !reply.content.trim().is_empty()
                                 && reply.content.len() <= 64 * 1024 =>
@@ -6750,8 +6751,9 @@ mod tree_tests {
             assert_eq!(events[0]["reason"], "overflow");
             assert_eq!(events[0]["willRetry"], true);
             if !provide {
-                assert!(session.records().iter().any(|record| matches!(&record.event,
-                    Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")));
+                assert!(!session.records().iter().any(|record| matches!(&record.event,
+                    Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
+                    "unredacted summaries must not bypass extension hooks");
             }
             assert!(
                 session
@@ -7400,6 +7402,44 @@ mod tree_tests {
         );
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unhooked_successful_summary_is_saved_for_crash_recovery() {
+        let registry = Registry::default();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::User {
+                content: "summary request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        agent
+            .reply::<AgentInput>(
+                &mut session,
+                request,
+                false,
+                false,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event,
+            Event::ModelFinished { failure: None, reply: None, partial, .. } if partial == "answer")));
     }
 
     #[tokio::test]
