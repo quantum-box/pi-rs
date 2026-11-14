@@ -4313,7 +4313,9 @@ The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
 platform-default precedence, ignoring blank configured values and empty
 environment values. On successful return it decodes UTF-8 with replacement,
 strips one leading BOM and removes exactly one final LF. Failed editors leave
-the draft unchanged. Native shell-style command splitting remains supported.
+the draft unchanged. As in Pi, the temporary draft is closed before the editor
+launches, allowing editors that require exclusive file access. Native shell-style
+command splitting remains supported.
 
 ### Editor kill ring checkpoint
 
