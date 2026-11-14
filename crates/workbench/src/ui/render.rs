@@ -871,11 +871,28 @@ fn safe_hyperlink(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(char::is_control)
 }
 
+// Parser formatting can split a local part across text events. Do not link a
+// trailing fragment if the original source immediately continues the address.
+fn has_email_prefix(text: &str, start: usize) -> bool {
+    let mut has_content = false;
+    for c in text[..start].chars().rev() {
+        if c.is_alphanumeric()
+            || unicode_normalization::char::is_combining_mark(c)
+            || "!#$%&'*+-/=?^_`{|}~.\"’".contains(c)
+        {
+            has_content |= !matches!(c, '*' | '_' | '~');
+        } else {
+            break;
+        }
+    }
+    has_content
+}
+
 // Pi's GFM tokenizer links bare URLs and emails, but stops URLs at CJK
 // punctuation. Explicit Markdown links are handled separately by the parser.
 fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
     static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?:(?i:https?://|ftp://)|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*|[A-Za-z0-9._+-]+@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+").unwrap()
+        regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+|(?:(?i:https?://|ftp://)|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*"#).unwrap()
     });
     static CJK_PUNCT: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"[\p{P}&&[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}\p{scx=Bopomofo}]]|[，．：；！？（）［］｛｝“”‘’…—]").unwrap()
@@ -886,7 +903,7 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
         let start = found.start();
         let mut end = found.end();
         let candidate = &text[start..end];
-        let email = !candidate.contains("://") && !candidate.starts_with("www.");
+        let email = candidate.contains('@') && !candidate.contains("://");
         // Marked can match only the suffix after an omitted local-part
         // character (e.g. o'connor@example.com). Never link a different
         // recipient; leave the whole address as text instead.
@@ -896,7 +913,9 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
                     || unicode_normalization::char::is_combining_mark(c)
                     || matches!(
                         c,
-                        '!' | '#'
+                        '.' | '"'
+                            | '!'
+                            | '#'
                             | '$'
                             | '%'
                             | '&'
@@ -966,14 +985,37 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
                 }
                 end -= last.len_utf8();
             }
-        } else if text[end..].starts_with(['-', '_']) {
-            offset = found.end();
-            continue;
+        } else {
+            let suffix = &text[end..];
+            let domain_continues = |c: char| {
+                c.is_alphanumeric()
+                    || unicode_normalization::char::is_combining_mark(c)
+                    || matches!(c, '-' | '_')
+            };
+            if suffix.chars().next().is_some_and(domain_continues)
+                || suffix
+                    .strip_prefix('.')
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(domain_continues)
+            {
+                offset = found.end();
+                continue;
+            }
         }
         if end > start {
             let label = &text[start..end];
             let href = if email {
-                format!("mailto:{label}")
+                let (local, domain) = label.rsplit_once('@').expect("email candidate");
+                let mut encoded = String::new();
+                for b in local.bytes() {
+                    if b.is_ascii_alphanumeric() || b"-._~!$'()*+,;".contains(&b) {
+                        encoded.push(char::from(b));
+                    } else {
+                        use std::fmt::Write as _;
+                        write!(encoded, "%{b:02X}").expect("write to String");
+                    }
+                }
+                format!("mailto:{encoded}@{domain}")
             } else if label.starts_with("www.") {
                 format!("http://{label}")
             } else {
@@ -1024,6 +1066,19 @@ fn protect_bare_links(text: &str, options: Options) -> String {
             range.end += segment.start;
             while eligible < plain_ranges.len() && plain_ranges[eligible].end <= range.start {
                 eligible += 1;
+            }
+            // Markdown delimiters may also be valid email local-part
+            // characters. When the parser has identified them as opening
+            // formatting, begin the address at the first text inside it.
+            if eligible < plain_ranges.len()
+                && range.start < plain_ranges[eligible].start
+                && plain_ranges[eligible].start < range.end
+                && text[range.clone()].contains('@')
+                && text[range.start..plain_ranges[eligible].start]
+                    .bytes()
+                    .all(|byte| matches!(byte, b'*' | b'_' | b'~'))
+            {
+                range.start = plain_ranges[eligible].start;
             }
             if eligible == plain_ranges.len() || !plain_ranges[eligible].contains(&range.start) {
                 continue;
@@ -1471,13 +1526,18 @@ fn markdown_at_depth(
                         && displayed == &text[range.clone()]
                     {
                         let mut cursor = 0;
-                        for (range, url) in bare_links(displayed) {
-                            if cursor < range.start {
+                        for (link_range, url) in bare_links(displayed) {
+                            if url.starts_with("mailto:")
+                                && has_email_prefix(text, range.start + link_range.start)
+                            {
+                                continue;
+                            }
+                            if cursor < link_range.start {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..range.start]);
+                                plain.text = clean(&displayed[cursor..link_range.start]);
                                 spans.push(plain);
                             }
-                            let label = &displayed[range.clone()];
+                            let label = &displayed[link_range.clone()];
                             let mut link = span.clone();
                             link.text = clean(label);
                             link.color = theme.color("mdLink");
@@ -1488,11 +1548,11 @@ fn markdown_at_depth(
                             spans.push(link);
                             if (!hyperlinks || !safe_hyperlink(&url))
                                 && label != url
-                                && url.strip_prefix("mailto:") != Some(label)
+                                && !url.starts_with("mailto:")
                             {
                                 spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
                             }
-                            cursor = range.end;
+                            cursor = link_range.end;
                         }
                         if cursor < displayed.len() {
                             span.text = clean(&displayed[cursor..]);
@@ -2292,22 +2352,32 @@ mod tests {
     }
 
     #[test]
-    fn bare_email_never_links_a_partial_local_part() {
+    fn bare_emails_preserve_complete_local_parts() {
         let theme = Theme::system();
-        for address in [
-            "o'connor@example.com",
-            "foo!bar@example.com",
-            "foo%bar@example.com",
-            "foo/bar@example.com",
-            "o’connor@example.com",
-            "éconnor@example.com",
-            "e\u{301}connor@example.com",
+        for (address, target) in [
+            ("o'connor@example.com", "mailto:o'connor@example.com"),
+            ("foo!bar@example.com", "mailto:foo!bar@example.com"),
+            ("foo%bar@example.com", "mailto:foo%25bar@example.com"),
+            ("foo/bar@example.com", "mailto:foo%2Fbar@example.com"),
+            (
+                "a!#$%&'*+-/=?^_`{|}~.z@example.com",
+                "mailto:a!%23$%25%26'*+-%2F%3D%3F%5E_%60%7B%7C%7D~.z@example.com",
+            ),
+            (
+                "\"quoted local\"@example.com",
+                "mailto:%22quoted%20local%22@example.com",
+            ),
+            ("\"a@b\"@example.com", "mailto:%22a%40b%22@example.com"),
+            (
+                "\"a\\\"b\"@example.com",
+                "mailto:%22a%5C%22b%22@example.com",
+            ),
         ] {
             for hyperlinks in [false, true] {
                 let lines = markdown_at_depth(
                     address,
                     &theme,
-                    100,
+                    160,
                     0,
                     super::super::mermaid::Mermaid::Off,
                     hyperlinks,
@@ -2315,36 +2385,72 @@ mod tests {
                 );
                 let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
                 assert_eq!(
-                    spans
-                        .iter()
-                        .map(|span| span.text.as_str())
-                        .collect::<String>(),
-                    address
+                    spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+                    address,
+                    "{address}: {spans:?}"
                 );
                 assert!(
-                    spans
-                        .iter()
-                        .all(|span| span.hyperlink.is_none() && !span.underline),
+                    spans.iter().any(|s| s.underline
+                        && if hyperlinks {
+                            s.hyperlink.as_deref() == Some(target)
+                        } else {
+                            s.hyperlink.is_none()
+                        }),
                     "{address}: {spans:?}"
                 );
             }
         }
-        let lines = markdown_at_depth(
-            "**first.last+tag@example.com**",
-            &theme,
-            100,
-            0,
-            super::super::mermaid::Mermaid::Off,
-            true,
-            false,
-        );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .any(|span| span.bold
-                    && span.hyperlink.as_deref() == Some("mailto:first.last+tag@example.com"))
-        );
+        for address in [
+            "o’connor@example.com",
+            "éconnor@example.com",
+            "e\u{301}connor@example.com",
+            "foo..bar@example.com",
+            "é*foo*bar@example.com",
+            "user@example.comé",
+            "user@example.com.中国",
+        ] {
+            let lines = markdown_at_depth(
+                address,
+                &theme,
+                100,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.hyperlink.is_none()),
+                "{address}: {lines:?}"
+            );
+        }
+        for (source, target) in [
+            (
+                "**first.last+tag@example.com**",
+                "mailto:first.last+tag@example.com",
+            ),
+            ("**o'co*nor@example.com**", "mailto:o'co*nor@example.com"),
+            ("**o'*co*nor@example.com**", "mailto:o'*co*nor@example.com"),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                100,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.bold && span.hyperlink.as_deref() == Some(target)),
+                "{source}: {lines:?}"
+            );
+        }
     }
 
     #[test]
