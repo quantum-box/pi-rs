@@ -7288,6 +7288,7 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
 fn complete_input(args: &Cli, view: &mut View) {
     enum CompletionSource {
         Builtin,
+        Skill,
         Prompt(Option<String>),
         Other,
     }
@@ -7374,6 +7375,13 @@ fn complete_input(args: &Cli, view: &mut View) {
             let text = format!("/{name}");
             if text.starts_with(word) && !candidates.iter().any(|(candidate, _)| candidate == &text)
             {
+                if name
+                    .strip_prefix("skill:")
+                    .is_some_and(|skill| view.resources.skills.contains_key(skill))
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                    continue;
+                }
                 let description = match (&prompt.argument_hint, prompt.description.is_empty()) {
                     (Some(hint), false) => format!("{hint} — {}", prompt.description),
                     (Some(hint), true) => hint.clone(),
@@ -7391,7 +7399,7 @@ fn complete_input(args: &Cli, view: &mut View) {
                 if text.starts_with(word)
                     && !candidates.iter().any(|(candidate, _)| candidate == &text)
                 {
-                    candidates.push((text, CompletionSource::Other));
+                    candidates.push((text, CompletionSource::Skill));
                 }
             }
         }
@@ -7408,7 +7416,9 @@ fn complete_input(args: &Cli, view: &mut View) {
                 .map(|(text, source)| {
                     let description = match source {
                         CompletionSource::Prompt(description) => description,
-                        CompletionSource::Builtin | CompletionSource::Other => None,
+                        CompletionSource::Builtin
+                        | CompletionSource::Skill
+                        | CompletionSource::Other => None,
                     };
                     (text, description)
                 })
@@ -8454,6 +8464,71 @@ mod tests {
         );
         assert!(
             matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/model")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_completion_wins_over_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        let skill = directory.path().join("skills/review");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\n---\nSkill body",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("skill:review.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nWrong body",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("skill:reviewer.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--no-skills",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+            "--skill",
+            skill.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        assert!(
+            view.resources
+                .expand("/skill:review")
+                .unwrap()
+                .contains("Skill body")
+        );
+        view.editor.replace("/skill:rev".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/skill:review"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
         );
     }
 
