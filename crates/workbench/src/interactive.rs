@@ -869,6 +869,16 @@ impl View {
             .map(|(_, dialog)| dialog)
             .or_else(|| self.dialogs.front())
     }
+    fn dialog_mut(&mut self) -> Option<&mut crate::ui::dialog::Dialog> {
+        if let Some((_, dialog)) = &mut self.local_editor {
+            Some(dialog)
+        } else {
+            self.dialogs.front_mut()
+        }
+    }
+    fn cancel_extension_dialog(&mut self, id: &Value) {
+        self.dialogs.retain(|dialog| json!(dialog.id) != *id);
+    }
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -2079,7 +2089,7 @@ impl View {
             .dialog()
             .and_then(|dialog| dialog.cursor(width, body_height));
         if let Some(dialog) = self.dialog() {
-            lines = dialog.render(theme, width, body_height);
+            lines = dialog.render(theme, width, body_height, keys);
             if !hardware_cursor
                 && let Some((row, column)) = dialog_cursor
                 && let Some(line) = lines.get_mut(row)
@@ -2514,7 +2524,7 @@ impl View {
             .dialog()
             .and_then(|dialog| dialog.cursor(width, dialog_height));
         if let Some(dialog) = self.dialog() {
-            active = dialog.render(theme, width, dialog_height);
+            active = dialog.render(theme, width, dialog_height, keys);
             if !hardware_cursor
                 && let Some((row, column)) = dialog_cursor
                 && let Some(line) = active.get_mut(row)
@@ -3985,8 +3995,7 @@ pub(super) async fn run(
                     continue;
                 }
                 if value["type"] == "extension_ui_cancelled" {
-                    view.dialogs
-                        .retain(|dialog| json!(dialog.id) != value["id"]);
+                    view.cancel_extension_dialog(&value["id"]);
                     dirty = true;
                     continue;
                 }
@@ -4503,6 +4512,13 @@ pub(super) async fn run(
                         }
                         continue;
                     }
+                }
+                if view
+                    .dialog()
+                    .is_some_and(|dialog| dialog.external_editor_requested(key, &keys))
+                {
+                    open_external_editor(&args, &mut view, &mut _terminal, true)?;
+                    continue;
                 }
                 if let Some((mut editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
@@ -5143,20 +5159,7 @@ pub(super) async fn run(
                     }
                     "app.exit" => break,
                     "app.editor.external" => {
-                        if args.tui_mode == Some(TuiMode::Regular) {
-                            view.finish_regular()?;
-                        }
-                        drop(_terminal.take());
-                        let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
-                        if view.graphics.enabled() {
-                            images::query_cell_size()?;
-                        }
-                        view.graphics.reset();
-                        if let Err(error) = result {
-                            view.append(&error.to_string());
-                        }
-                        view.regular.redraw = true;
+                        open_external_editor(&args, &mut view, &mut _terminal, false)?;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
                     "app.model.select" if !is_busy(&worker) => {
@@ -7139,6 +7142,32 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+fn open_external_editor(
+    args: &Cli,
+    view: &mut View,
+    terminal: &mut Option<Terminal>,
+    dialog: bool,
+) -> Result<()> {
+    if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()?;
+    }
+    drop(terminal.take());
+    if dialog {
+        if let Some(dialog) = view.dialog_mut() {
+            dialog.external_edit(|editor| external_editor(args, editor));
+        }
+    } else if let Err(error) = external_editor(args, &mut view.editor) {
+        view.append(&error.to_string());
+    }
+    *terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    if view.graphics.enabled() {
+        images::query_cell_size()?;
+    }
+    view.graphics.reset();
+    view.regular.redraw = true;
+    Ok(())
+}
+
 fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
     let command = external_editor_command(
         args.settings.string("externalEditor"),
@@ -7172,15 +7201,18 @@ fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
     };
     let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
     file.write_all(editor.text.as_bytes())?;
-    if !std::process::Command::new(program)
+    let status = std::process::Command::new(program)
         .args(arguments)
         .arg(file.path())
-        .status()?
-        .success()
-    {
-        return Err(Error::Config(
-            "external editor exited unsuccessfully".into(),
-        ));
+        .status()
+        .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
+    if !status.success() {
+        let exit = status
+            .code()
+            .map_or_else(|| status.to_string(), |code| format!("code {code}"));
+        return Err(Error::Config(format!(
+            "External editor exited with {exit}; prompt unchanged"
+        )));
     }
     let bytes = std::fs::read(file.path())?;
     editor.replace(external_editor_text(&bytes));
@@ -7404,6 +7436,25 @@ mod tests {
         assert_eq!(super::external_editor_text(b""), "");
     }
 
+    #[test]
+    fn external_editor_dialog_cancellation_removes_only_correlated_request() {
+        let id = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        let mut view = super::View::default();
+        view.ui_request(&json!({"type":"extension_ui_request","id":id,"method":"editor","title":"Edit","prefill":"original"})).unwrap();
+        view.ui_request(
+            &json!({"type":"extension_ui_request","id":next,"method":"editor","title":"Next"}),
+        )
+        .unwrap();
+        view.dialog_mut().unwrap().external_edit(|draft| {
+            draft.replace("edited".into());
+            Ok(())
+        });
+        view.cancel_extension_dialog(&json!(id));
+        assert_eq!(view.dialogs.len(), 1);
+        assert_eq!(view.dialogs.front().unwrap().id, next);
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_editor_round_trip_updates_only_after_success() {
@@ -7424,6 +7475,46 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
         assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
         assert_eq!(editor.text, "edited\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_from_extension_dialog() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277dialog\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dialog = super::super::ui::dialog::Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: Some("initial".into()),
+                timeout: None,
+            },
+        );
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        std::fs::write(&program, "#!/bin/sh\nprintf bad > \"$1\"\nexit 1\n").unwrap();
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        let keys = super::Keys::default();
+        assert_eq!(
+            dialog.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Some(pi_rs::UiResponse::Text("dialog".into()))
+        );
+        assert_eq!(
+            dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+            Some(pi_rs::UiResponse::Cancelled)
+        );
     }
 
     #[test]

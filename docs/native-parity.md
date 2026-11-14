@@ -4136,6 +4136,11 @@ platform-default precedence, ignoring blank configured values and empty
 environment values. On successful return it decodes UTF-8 with replacement,
 strips one leading BOM and removes exactly one final LF. Failed editors leave
 the draft unchanged. Native shell-style command splitting remains supported.
+Multiline extension editor dialogs and local multiline editors use the same
+external-editor action and configured keybinding. Editor failures remain
+visible in the dialog without submitting or losing its draft; Escape cancels
+the dialog, and extension cancellation still removes the correlated request.
+The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint
 

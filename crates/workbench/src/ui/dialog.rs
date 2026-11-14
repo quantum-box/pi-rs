@@ -19,6 +19,7 @@ pub struct Dialog {
     selected: usize,
     scroll_max: Cell<usize>,
     error: Option<String>,
+    external_error: Option<String>,
     masked: bool,
 }
 impl Dialog {
@@ -56,6 +57,7 @@ impl Dialog {
             selected: 0,
             scroll_max: Cell::new(0),
             error: None,
+            external_error: None,
             masked: false,
         }
     }
@@ -82,6 +84,34 @@ impl Dialog {
     }
     pub fn set_error(&mut self, error: String) {
         self.error = Some(error);
+    }
+    pub fn external_editor_requested(&self, key: KeyEvent, keys: &Keys) -> bool {
+        matches!(self.request, UiRequest::Editor { .. })
+            && !keys.matches("tui.select.cancel", key)
+            && keys.matches("app.editor.external", key)
+    }
+    pub fn external_edit(&mut self, run: impl FnOnce(&mut Editor) -> Result<()>) {
+        if !matches!(self.request, UiRequest::Editor { .. }) {
+            return;
+        }
+        let mut draft = Editor::default();
+        draft.replace(self.editor.text.clone());
+        match run(&mut draft) {
+            Ok(())
+                if self
+                    .request
+                    .accepts_response(&UiResponse::Text(draft.text.clone())) =>
+            {
+                self.editor.replace(draft.text);
+                self.external_error = None;
+            }
+            Ok(()) => {
+                self.external_error =
+                    Some("External editor result exceeds 1 MiB; draft unchanged".into())
+            }
+            Err(Error::Config(message)) => self.external_error = Some(message),
+            Err(error) => self.external_error = Some(error.to_string()),
+        }
     }
     pub fn paste(&mut self, text: &str) {
         if matches!(
@@ -233,9 +263,11 @@ impl Dialog {
             width,
         );
         let heading_height = self.heading_height(width, height);
-        let offset = prefix
-            .len()
-            .saturating_sub(height.saturating_sub(heading_height + 1).max(1));
+        let offset = prefix.len().saturating_sub(
+            height
+                .saturating_sub(heading_height + 1 + usize::from(self.external_error.is_some()))
+                .max(1),
+        );
         let column = prefix
             .last()
             .map_or(0, |line| {
@@ -250,10 +282,12 @@ impl Dialog {
             column,
         ))
     }
-    pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
+    pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
         let mut lines = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
         lines.truncate(self.heading_height(width, height));
-        let available = height.saturating_sub(lines.len() + 1).max(1);
+        let available = height
+            .saturating_sub(lines.len() + 1 + usize::from(self.external_error.is_some()))
+            .max(1);
         match &self.request {
             UiRequest::Select { options, .. } => {
                 let start = self.selected.saturating_sub(available.saturating_sub(1));
@@ -350,7 +384,11 @@ impl Dialog {
             _ => {}
         }
         let hint = match &self.request {
-            UiRequest::Editor { .. } => Cow::Borrowed("Ctrl+S save · Esc cancel"),
+            UiRequest::Editor { .. } => Cow::Owned(format!(
+                "Ctrl+S save · {} external editor · {} cancel",
+                keys.hint("app.editor.external"),
+                keys.hint("tui.select.cancel")
+            )),
             UiRequest::Custom { actions, .. } => {
                 let keys = actions
                     .iter()
@@ -368,6 +406,13 @@ impl Dialog {
             }
             _ => Cow::Borrowed("Enter confirm · Esc cancel"),
         };
+        if let Some(error) = &self.external_error {
+            lines.extend(
+                wrap(&[Span::themed(error, theme, "warning")], width)
+                    .into_iter()
+                    .take(1),
+            );
+        }
         lines.push(Line::themed(&hint, theme, "dim"));
         lines.truncate(height);
         lines
@@ -377,6 +422,110 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_editor_shortcut_is_scoped_remappable_and_cancel_first() {
+        let mut keys = Keys::default();
+        let editor = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        let input = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Input {
+                title: "Secret".into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(editor.external_editor_requested(ctrl_g, &keys));
+        assert!(!input.external_editor_requested(ctrl_g, &keys));
+        keys.set_test_binding("app.editor.external", "ctrl+e");
+        assert!(!editor.external_editor_requested(ctrl_g, &keys));
+        assert!(editor.external_editor_requested(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &keys
+        ));
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let lines = editor.render(&theme, 100, 8, &keys);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("Ctrl+E external editor"))
+        );
+        keys.set_test_binding("app.editor.external", "escape");
+        assert!(
+            !editor
+                .external_editor_requested(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys)
+        );
+    }
+
+    #[test]
+    fn external_editor_failure_and_oversize_keep_dialog_open_and_draft() {
+        let keys = Keys::default();
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: Some("original".into()),
+                timeout: None,
+            },
+        );
+        dialog.external_edit(|draft| {
+            draft.replace("discarded".into());
+            Err(Error::Config("editor failed".into()))
+        });
+        assert_eq!(dialog.editor.text, "original");
+        assert!(
+            dialog
+                .external_error
+                .as_deref()
+                .unwrap()
+                .contains("editor failed")
+        );
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let lines = dialog.render(&theme, 100, 8, &keys);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("editor failed"))
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("external editor"))
+        );
+        dialog.external_edit(|draft| {
+            draft.replace("x".repeat(1024 * 1024 + 1));
+            Ok(())
+        });
+        assert_eq!(dialog.editor.text, "original");
+        assert!(dialog.external_error.as_deref().unwrap().contains("1 MiB"));
+        dialog.external_edit(|draft| {
+            draft.replace("edited".into());
+            Ok(())
+        });
+        assert!(dialog.external_error.is_none());
+        assert_eq!(
+            dialog.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Some(UiResponse::Text("edited".into()))
+        );
+        assert_eq!(
+            dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+            Some(UiResponse::Cancelled)
+        );
+    }
     #[test]
     fn editor_dialog_coalesces_typed_words_but_not_paste() {
         let keys = Keys::default();
@@ -443,7 +592,7 @@ mod tests {
         );
         dialog.set_error("Invalid value for this setting".into());
         let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
-        let lines = dialog.render(&theme, 12, 8);
+        let lines = dialog.render(&theme, 12, 8, &Keys::default());
         let (row, column) = dialog.cursor(12, 8).unwrap();
         assert!(row >= 2 && row < lines.len());
         assert_eq!(column, 6);
