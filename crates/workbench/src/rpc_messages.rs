@@ -758,7 +758,7 @@ mod tests {
             {"type":"text","text":"after"}
         ]);
         let outcome = pi_rs::Outcome::StructuredWithDetails {
-            data: json!({"content":blocks,"duration":3}),
+            data: json!({"content":blocks,"structuredContent":{"answer":42},"duration":3}),
             attachments: vec![],
             details: json!({"source":"fixture"}),
         };
@@ -784,6 +784,7 @@ mod tests {
             Projection::default().message(std::slice::from_ref(&record), &record, &message, false);
         assert_eq!(value["content"], blocks);
         assert_eq!(value["nativeData"]["duration"], 3);
+        assert_eq!(value["structuredContent"], json!({"answer":42}));
         assert_eq!(value["details"]["source"], "fixture");
     }
 

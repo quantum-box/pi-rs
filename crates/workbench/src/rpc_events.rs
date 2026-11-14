@@ -585,6 +585,9 @@ pub(super) fn tool_event_result_value(
         return result;
     }
     result["content"] = json!(content);
+    if let Some(structured_content) = data.get("structuredContent") {
+        result["structuredContent"] = structured_content.clone();
+    }
     if !rejected.is_empty() {
         result["nativeRejectedBlocks"] = json!(rejected);
     }
@@ -599,6 +602,14 @@ pub(super) fn tool_event_result_value(
     }
     if !native.is_empty() {
         result["nativeData"] = Value::Object(native);
+    }
+    if let Some(fields) = envelope.as_object() {
+        let mut extra = fields.clone();
+        extra.remove("data");
+        extra.remove("attachments");
+        if !extra.is_empty() {
+            result["nativeEnvelope"] = Value::Object(extra);
+        }
     }
     result
 }
@@ -647,7 +658,7 @@ mod streaming_tool_tests {
             {"type":"image","mimeType":"image/jpeg","data":"cGhvdG8="}
         ]);
         let outcome = Outcome::StructuredWithDetails {
-            data: json!({"content":blocks,"wall_time_seconds":1.25}),
+            data: json!({"content":blocks,"structuredContent":{"answer":42},"wall_time_seconds":1.25}),
             attachments: vec![pi_rs::AttachmentRef {
                 id: "asset".into(),
                 media_type: "image/png".into(),
@@ -686,6 +697,7 @@ mod streaming_tool_tests {
         assert_eq!(end["result"]["content"], blocks);
         assert_eq!(message["message"]["content"], blocks);
         assert_eq!(end["result"]["details"], json!({"code":42}));
+        assert_eq!(end["result"]["structuredContent"], json!({"answer":42}));
         assert_eq!(end["result"]["nativeData"]["wall_time_seconds"], 1.25);
         assert_eq!(end["result"]["nativeAttachments"][0]["id"], "asset");
         assert_eq!(
@@ -782,6 +794,48 @@ mod streaming_tool_tests {
         assert_eq!(
             message["nativeRejectedBlocks"],
             result["nativeRejectedBlocks"]
+        );
+    }
+
+    #[test]
+    fn multimodal_legacy_envelope_preserves_structured_content_and_extra_fields() {
+        let envelope = json!({
+            "data": {
+                "content": [
+                    {"type":"text","text":"before"},
+                    {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
+                    {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                    {"type":"text","text":"after"}
+                ],
+                "structuredContent": {"answer":42},
+                "otherData": true
+            },
+            "attachments": [],
+            "extra": {"origin":"legacy"}
+        });
+        let result = tool_event_result_value(&envelope.to_string(), None, None);
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
+        assert_eq!(
+            result["nativeData"]["structuredContent"],
+            json!({"answer":42})
+        );
+        assert_eq!(result["nativeData"]["otherData"], true);
+        assert_eq!(
+            result["nativeEnvelope"],
+            json!({"extra":{"origin":"legacy"}})
+        );
+        assert_eq!(
+            result["content"],
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                {"type":"text","text":"after"}
+            ])
+        );
+        assert_eq!(result["nativeRejectedBlocks"][0]["index"], 1);
+        assert_eq!(
+            result["nativeRejectedBlocks"][0]["block"],
+            envelope["data"]["content"][1]
         );
     }
 
