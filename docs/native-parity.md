@@ -2079,10 +2079,13 @@ exit code, rounded wall time and the full-output path when truncated. Text sent
 to the model remains the display result; nonzero exits retain their error flag
 and truncation details. Timeout and cancellation remain error results without
 structured content. A text-replacing extension patch drops the now-stale
-structured value; metadata-only in-process patches preserve it. Existing
-native executable protocols receive a compatible text result and retain
-structured data when the returned text is unchanged; those protocols cannot
-distinguish a same-text replacement from a metadata-only update.
+structured value; metadata-only in-process patches preserve it. Executables
+advertising `structured_text_result` receive the structured outcome and
+preserve that distinction through the returned outcome. Older executable
+protocols receive a compatible text result; any returned replacement drops
+the structured value because those protocols cannot distinguish a same-text
+replacement from a metadata-only update. Legacy failure replacements retain
+existing error details.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count

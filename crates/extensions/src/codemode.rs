@@ -625,6 +625,11 @@ fn tool_value(outcome: Outcome) -> Value {
             output: value,
             is_error: false,
             ..
+        }
+        | Outcome::TextResultWithStructuredContent {
+            output: value,
+            is_error: false,
+            ..
         } => {
             json!({"ok":true,"value":value})
         }
@@ -1281,7 +1286,7 @@ mod tests {
                 true
             }
             fn tools(&self) -> Vec<ToolSpec> {
-                ["recovered", "failed"]
+                ["recovered", "failed", "structured"]
                     .into_iter()
                     .map(|name| ToolSpec {
                         name: name.into(),
@@ -1291,6 +1296,14 @@ mod tests {
                     .collect()
             }
             async fn call(&self, name: &str, _: Value) -> Outcome {
+                if name == "structured" {
+                    return Outcome::TextResultWithStructuredContent {
+                        output: "structured success".into(),
+                        details: None,
+                        structured_content: json!({"private":"secret"}),
+                        is_error: false,
+                    };
+                }
                 Outcome::TextResult {
                     output: if name == "recovered" {
                         "exact success"
@@ -1304,7 +1317,7 @@ mod tests {
             }
         }
         let reply = ScriptTool { timeout: Some(Duration::from_secs(2)) }.invoke_transaction(
-            json!({"code":"text(await tools.recovered({})); try { await tools.failed({}); } catch (e) { text(e.message); }"}),
+            json!({"code":"text(await tools.recovered({})); text(await tools.structured({})); try { await tools.failed({}); } catch (e) { text(e.message); }"}),
             ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() }, None, Arc::new(PatchedHost)).await;
         let Outcome::Structured { data, .. } = reply.outcome else {
             panic!("script should succeed")
@@ -1312,6 +1325,7 @@ mod tests {
         assert_eq!(data["isError"], false);
         let output = data["content"].to_string();
         assert!(output.contains("exact success"));
+        assert!(output.contains("structured success"));
         assert!(output.contains("exact failure"));
         assert!(!output.contains("Tool failed:"));
         assert!(!output.contains("private"));

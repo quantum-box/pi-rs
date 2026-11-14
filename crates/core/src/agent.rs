@@ -5315,8 +5315,6 @@ mod tree_tests {
         .apply(&shell)
         .unwrap();
         assert!(matches!(replaced, Outcome::TextResult { .. }));
-        let projected = shell.protocol_text_result();
-        assert_eq!(shell.restore_structured_text_result(projected), shell);
         let round_trip: Outcome =
             serde_json::from_slice(&serde_json::to_vec(&shell).unwrap()).unwrap();
         assert_eq!(round_trip, shell);

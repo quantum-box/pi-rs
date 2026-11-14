@@ -868,32 +868,6 @@ impl Outcome {
         }
     }
 
-    /// Keep structured data when a protocol hook leaves the text unchanged.
-    pub fn restore_structured_text_result(&self, updated: Self) -> Self {
-        if let (
-            Self::TextResultWithStructuredContent {
-                output,
-                structured_content,
-                ..
-            },
-            Self::TextResult {
-                output: new_output,
-                details,
-                is_error,
-            },
-        ) = (self, &updated)
-            && output == new_output
-        {
-            return Self::TextResultWithStructuredContent {
-                output: new_output.clone(),
-                details: details.clone(),
-                structured_content: structured_content.clone(),
-                is_error: *is_error,
-            };
-        }
-        updated
-    }
-
     pub fn tool_content(&self) -> String {
         match self {
             Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
