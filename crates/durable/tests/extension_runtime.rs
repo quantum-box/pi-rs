@@ -1782,8 +1782,13 @@ async fn terminate_crash_worker() {
     let Ok(path) = std::env::var("PI_TERMINATE_CRASH_DB") else {
         return;
     };
-    let handler: Arc<dyn Handler> =
-        Arc::new(|_: &Task| Ok(Step::Succeed(json!({"terminate": true}))));
+    let release = format!("{path}.release");
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        while !std::path::Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(Step::Succeed(json!({"terminate": true})))
+    });
     let mut h = Harness::open_paused(
         &path,
         options(
@@ -1815,6 +1820,7 @@ async fn terminate_crash_worker() {
         .unwrap()
         .parse()
         .unwrap();
+    std::fs::write(format!("{path}.release"), "").unwrap();
     for _ in 0..500 {
         if driver.get(child).unwrap().unwrap().is_terminal() {
             std::fs::write(format!("{path}.ready"), id.to_string()).unwrap();
