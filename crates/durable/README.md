@@ -86,11 +86,12 @@ Conversation abort atomically marks owned task descendants and fences new
 admissions. Cleanup runs child-first after restart when a task driver or
 scheduler is attached. Synchronous handlers cannot be interrupted and cleanup
 can replay after a crash; external effects require idempotency and reconciliation.
-All conversation-owned generic tasks are currently included because upstream
-foreground/background ownership boundaries are not yet represented.
+Conversation abort skips tasks explicitly marked as background and their
+descendants; subagent conversations are not yet part of that ownership graph.
 Current limits and differences from upstream Pi Durable:
 
-- Historical fork currently accepts settled snapshots, not every upstream entry.
+- Historical forks accept safe committed observation snapshots, including during runs,
+  but not every upstream entry or incomplete tool batch.
   Automatic compaction uses a known context window or provider overflow; manual
   compaction still requires an idle conversation. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
@@ -101,7 +102,7 @@ Current limits and differences from upstream Pi Durable:
   tolerate replay after a crash; a missing handler produces a failed record.
   Handler steps run synchronously, so an abort request waits for the active step
   and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
-  cleanup. Conversation abort marks all conversation-owned generic descendants;
+  cleanup. Conversation abort marks foreground conversation-owned task descendants;
   separate subagent conversations are not included. Shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
