@@ -70,6 +70,9 @@ pub struct Task {
     /// Durable cancellation intent; retained on terminal records.
     #[serde(default)]
     abort_requested: bool,
+    /// Conversation-owned background tasks form an ordinary abort boundary.
+    #[serde(default)]
+    background: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +82,7 @@ pub enum TransitionError {
     UnchangedCheckpoint,
     SelfOwned,
     InvalidWait,
+    BackgroundChild,
 }
 
 impl Task {
@@ -102,7 +106,24 @@ impl Task {
             kind: None,
             replay_safe: false,
             abort_requested: false,
+            background: false,
         })
+    }
+
+    /// Mark a conversation-owned task as background before registration.
+    pub fn background(mut self) -> Result<Self, TransitionError> {
+        if !matches!(self.owner, TaskOwner::Conversation(_)) {
+            return Err(TransitionError::BackgroundChild);
+        }
+        if self.state != TaskState::Ready {
+            return Err(TransitionError::InvalidState);
+        }
+        self.background = true;
+        Ok(self)
+    }
+
+    pub fn is_background(&self) -> bool {
+        self.background
     }
 
     /// Bind a new task to a registered implementation and its persisted replay policy.

@@ -1574,6 +1574,9 @@ impl Harness {
         loop {
             let before = ids.len();
             for record in &records {
+                if record.task.is_background() {
+                    continue;
+                }
                 if record.task.owner() == &TaskOwner::Conversation(id)
                     || matches!(record.task.owner(), TaskOwner::Task(parent) if ids.contains(parent))
                 {
@@ -4347,6 +4350,104 @@ mod scheduler_tests {
         latest.phase = Phase::ModelReady { turns: 0 };
         assert!(!admission_only(&base, &latest).unwrap());
     }
+    #[test]
+    fn conversation_abort_stops_at_persisted_background_task() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let make = |owner| {
+            Task::new(
+                Uuid::new_v4(),
+                owner,
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                3,
+            )
+            .unwrap()
+        };
+        let foreground = make(TaskOwner::Conversation(conversation));
+        let background = make(TaskOwner::Conversation(conversation))
+            .background()
+            .unwrap();
+        let child = make(TaskOwner::Task(background.id()));
+        assert!(child.clone().background().is_err());
+        TaskStore::new(h.owner.store())
+            .save(&[
+                Save::Create(&foreground),
+                Save::Create(&background),
+                Save::Create(&child),
+            ])
+            .unwrap();
+        h.request_abort(conversation).unwrap();
+        drop(h);
+
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let store = TaskStore::new(h.owner.store());
+        assert!(
+            store
+                .load(foreground.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(
+            store
+                .load(background.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .is_background()
+        );
+        assert!(
+            !store
+                .load(background.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(
+            !store
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        let mut tasks =
+            crate::task_scheduler::Scheduler::attach(h.owner.clone(), Default::default()).unwrap();
+        tasks.request_abort(background.id()).unwrap();
+        assert!(
+            store
+                .load(background.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(
+            store
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
     #[test]
     fn transcript_observation_retains_abort_state_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
