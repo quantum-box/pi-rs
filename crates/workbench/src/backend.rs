@@ -143,7 +143,8 @@ enum Request {
     GetShareContext {
         id: Option<serde_json::Value>,
         session: PathBuf,
-        journal_key: [u8; 32],
+        #[serde(default)]
+        journal_key: Option<[u8; 32]>,
     },
     ReadSession {
         request: serde_json::Value,
@@ -1694,7 +1695,7 @@ fn read_requests(
                             active,
                             snapshot,
                             slots,
-                            Some(journal_key),
+                            journal_key,
                             move || Session::snapshot(session).ok(),
                         )
                         .await
@@ -1963,6 +1964,21 @@ mod share_context_tests {
         assert_eq!(before.head, after.head);
         assert_ne!(before.context.system_prompt, after.context.system_prompt);
         assert_ne!(before.context.tools.len(), after.context.tools.len());
+    }
+
+    #[test]
+    fn legacy_worker_share_request_without_journal_key_still_parses() {
+        let request: Request = serde_json::from_value(json!({
+            "type":"get_share_context", "id":"legacy", "session":"session.jsonl"
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::GetShareContext {
+                journal_key: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
