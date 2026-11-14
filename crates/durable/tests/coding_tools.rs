@@ -38,7 +38,7 @@ async fn call(tools: &[RegisteredTool], name: &str, args: Value) -> Outcome {
         &invocation,
         &cancel,
         Duration::from_secs(5),
-        |schema, args| jsonschema::is_valid(schema, args),
+        jsonschema::is_valid,
     )
     .await
     .unwrap();
