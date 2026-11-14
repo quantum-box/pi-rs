@@ -26,11 +26,9 @@ async fn serializes_same_operation_but_not_other_operations() {
         tx.send(()).unwrap();
     });
     ready.await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut rx)
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut rx)
+        .await
+        .is_err());
     let cancelled_owner = owner.clone();
     let cancelled_waiter = tokio::spawn(async move { cancelled_owner.summary_guard(id).await });
     tokio::task::yield_now().await;
