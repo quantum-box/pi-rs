@@ -446,6 +446,104 @@ async fn killed_process_recovers_unsafe_call_without_reexecution() {
 }
 
 #[tokio::test]
+async fn killed_unsafe_tool_requires_reconciliation_even_if_now_replay_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("child_crash_during_dispatched_tool")
+        .env("PI_DURABLE_CRASH_ROOT", root)
+        .env_remove("PI_DURABLE_CRASH_SAFE")
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !root.join("marker").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    ready.expect("child never reached tool dispatch");
+    assert!(!status.success());
+
+    let id = std::fs::read_to_string(root.join("id"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let opts = || {
+        let mut opts = options(model.clone(), tool.clone(), ReplayPolicy::Safe);
+        opts.uncertain_policy = UncertainPolicy::RequireReconciliation;
+        opts
+    };
+    let cancel = CancellationToken::new();
+    let path = root.join("crash.sqlite");
+    let h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let (operation, _) = h.blocked(id).unwrap().expect("must await reconciliation");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    );
+    drop(h);
+
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    assert_eq!(h.blocked(id).unwrap().unwrap().0, operation);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    h.reconcile(id, operation, Outcome::Succeeded("confirmed effect".into()))
+        .unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    h.resume(&cancel).await.unwrap();
+    let conversation = h.conversation(id).unwrap();
+    assert_eq!(
+        conversation.submissions[0].status,
+        Status::Done {
+            answer: "finished".into()
+        }
+    );
+    let results: Vec<_> = conversation
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::Tool { .. }))
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(
+        serde_json::to_string(results[0])
+            .unwrap()
+            .contains("confirmed effect")
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    drop(h);
+
+    let h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "finished".into()
+        }
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn killed_process_replay_gets_new_persisted_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
