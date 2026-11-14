@@ -25,6 +25,8 @@ pub enum Error {
     ReadAfterWrite,
     #[error("document must be read before writing, and written at most once")]
     UnreadOrWritten,
+    #[error("duplicate task in admission")]
+    DuplicateTask,
 }
 
 /// An application-defined address. Components are encoded unambiguously;
@@ -155,6 +157,7 @@ pub struct AdmissionDocuments<'a> {
     store: &'a Store,
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    tasks: Vec<crate::task::Task>,
 }
 impl<'a> AdmissionDocuments<'a> {
     pub(crate) fn new(store: &'a Store) -> Self {
@@ -162,6 +165,7 @@ impl<'a> AdmissionDocuments<'a> {
             store,
             reads: HashMap::new(),
             writes: HashMap::new(),
+            tasks: Vec::new(),
         }
     }
     pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
@@ -180,6 +184,17 @@ impl<'a> AdmissionDocuments<'a> {
     }
     pub fn delete(&mut self, address: &Address) -> Result<(), Error> {
         self.write(address, None)
+    }
+    /// Stage a conversation-owned registered task for the admission commit.
+    pub fn create_task(&mut self, task: crate::task::Task) -> Result<(), Error> {
+        if self.tasks.iter().any(|existing| existing.id() == task.id()) {
+            return Err(Error::DuplicateTask);
+        }
+        self.tasks.push(task);
+        Ok(())
+    }
+    pub(crate) fn take_tasks(&mut self) -> Vec<crate::task::Task> {
+        std::mem::take(&mut self.tasks)
     }
     fn write(&mut self, address: &Address, value: Option<Map<String, Value>>) -> Result<(), Error> {
         if !self.reads.contains_key(address) || self.writes.contains_key(address) {

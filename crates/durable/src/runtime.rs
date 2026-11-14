@@ -2127,7 +2127,7 @@ impl Harness {
         }
         self.submit_internal_with_options(id, request_id, content, options, &mut |_| Ok(()))
     }
-    /// Atomically admit a new input with checked custom document changes.
+    /// Atomically admit a new input with checked documents and registered tasks.
     /// The callback may run again after a conflict and must have no external
     /// effects. Duplicate IDs and rejected inputs never invoke it.
     pub fn submit_with_documents(
@@ -2257,9 +2257,10 @@ impl Harness {
                 self.merge_admissions = merge;
                 return Err(error.into());
             }
+            let tasks = documents.take_tasks();
             let batch = documents.into_batch();
             let result = match batch {
-                Ok(batch) => self.save_composed_locked(
+                Ok(batch) if tasks.is_empty() => self.save_composed_locked(
                     &c,
                     Expected::Version(version),
                     None,
@@ -2267,6 +2268,26 @@ impl Harness {
                     &[],
                     Some(&batch),
                 ),
+                Ok(batch) => {
+                    let driver = self
+                        .task_driver
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
+                    match driver {
+                        Some(driver) => driver.with_admission(&tasks, id, || {
+                            self.save_composed_locked(
+                                &c,
+                                Expected::Version(version),
+                                None,
+                                &tasks,
+                                &[],
+                                Some(&batch),
+                            )
+                        }),
+                        None => Err(Error::Invalid("task driver is not running".into())),
+                    }
+                }
                 Err(error) => Err(error.into()),
             };
             self.merge_admissions = merge;

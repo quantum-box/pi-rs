@@ -1311,3 +1311,230 @@ fn malformed_entry_metadata_fails_closed() {
         .is_err()
     );
 }
+
+#[test]
+fn admission_tasks_are_atomic_idempotent_and_recoverable() {
+    use crate::document::{Address, Documents};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::{Registry, Step};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let addr = Address {
+        scope: "s".into(),
+        name: "admission".into(),
+        key: "".into(),
+    };
+    let make = |task_id, kind: &str| {
+        Task::new(
+            task_id,
+            TaskOwner::Conversation(id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered(kind.into(), true)
+    };
+    let mut registry = Registry::default();
+    registry.register("job", true, |_: &Task| {
+        Ok(Step::Succeed(serde_json::json!(null)))
+    });
+    let driver = h.start_tasks(registry).unwrap();
+    let bad_id = Uuid::new_v4();
+    let invalid = h.submit_with_documents(
+        id,
+        Some("bad".into()),
+        "hello".into(),
+        AdmissionOptions::default(),
+        |tx| {
+            tx.get(&addr)?;
+            tx.put(&addr, serde_json::Map::new())?;
+            tx.create_task(make(bad_id, "unknown"))
+        },
+    );
+    assert!(invalid.is_err());
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(h.owner.store())
+            .get(&addr)
+            .unwrap()
+            .is_none()
+    );
+    assert!(driver.get(bad_id).unwrap().is_none());
+    let other = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    for task in [
+        make(Uuid::new_v4(), "job").registered("job".into(), false),
+        Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(other),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!(null),
+            },
+            4,
+        )
+        .unwrap()
+        .registered("job".into(), true),
+    ] {
+        assert!(
+            h.submit_with_documents(
+                id,
+                None,
+                "input".into(),
+                AdmissionOptions::default(),
+                |tx| tx.create_task(task.clone())
+            )
+            .is_err()
+        );
+    }
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    let task_id = Uuid::new_v4();
+    let sid = h
+        .submit_with_documents(
+            id,
+            Some("ok".into()),
+            "hello".into(),
+            AdmissionOptions::default(),
+            |tx| {
+                tx.get(&addr)?;
+                tx.put(
+                    &addr,
+                    serde_json::json!({"value": 1}).as_object().unwrap().clone(),
+                )?;
+                tx.create_task(make(task_id, "job"))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        h.submit_with_documents(
+            id,
+            Some("ok".into()),
+            "".into(),
+            AdmissionOptions::default(),
+            |_| panic!("duplicate callback")
+        )
+        .unwrap(),
+        sid
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 1);
+    assert_eq!(
+        Documents::new(h.owner.store())
+            .get(&addr)
+            .unwrap()
+            .unwrap()
+            .value["value"],
+        1
+    );
+    let mut registry = Registry::default();
+    registry.register("job", true, |_: &Task| {
+        Ok(Step::Succeed(serde_json::json!(null)))
+    });
+    let mut scheduler = h.attach_tasks(registry).unwrap();
+    for _ in 0..5 {
+        if scheduler.get(task_id).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        scheduler.tick(0).unwrap();
+    }
+    assert!(matches!(
+        scheduler.get(task_id).unwrap().unwrap().state(),
+        crate::task::TaskState::Succeeded(_)
+    ));
+}
+
+#[test]
+fn admission_task_racing_conversation_abort_rolls_back() {
+    use crate::document::{Address, Documents};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::{Registry, Step};
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    // Ensure abort leaves a durable abort mark.
+    h.submit(id, None, "active".into()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("job", true, |_: &Task| {
+        Ok(Step::Succeed(serde_json::json!(null)))
+    });
+    let driver = h.start_tasks(registry).unwrap();
+    let addr = Address {
+        scope: "s".into(),
+        name: "race".into(),
+        key: "".into(),
+    };
+    let task_id = Uuid::new_v4();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let mut worker = h.worker();
+    let address = addr.clone();
+    let thread = std::thread::spawn(move || {
+        let mut first = true;
+        worker.submit_with_documents(
+            id,
+            Some("race".into()),
+            "input".into(),
+            AdmissionOptions::default(),
+            |tx| {
+                tx.get(&address)?;
+                tx.put(&address, serde_json::Map::new())?;
+                tx.create_task(
+                    Task::new(
+                        task_id,
+                        TaskOwner::Conversation(id),
+                        Checkpoint {
+                            phase: "initial".into(),
+                            data: serde_json::json!(null),
+                        },
+                        4,
+                    )
+                    .unwrap()
+                    .registered("job".into(), true),
+                )?;
+                if first {
+                    first = false;
+                    ready_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                }
+                Ok(())
+            },
+        )
+    });
+    ready_rx.recv().unwrap();
+    h.request_abort(id).unwrap();
+    go_tx.send(()).unwrap();
+    assert!(thread.join().unwrap().is_err());
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 1);
+    assert!(
+        Documents::new(h.owner.store())
+            .get(&addr)
+            .unwrap()
+            .is_none()
+    );
+    assert!(driver.get(task_id).unwrap().is_none());
+    driver.shutdown().unwrap();
+}

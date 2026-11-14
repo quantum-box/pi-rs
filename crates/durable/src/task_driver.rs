@@ -366,6 +366,54 @@ fn fail_cleanup(shared: &Shared, error: String) {
 }
 
 impl Shared {
+    pub(crate) fn with_admission<T>(
+        &self,
+        tasks: &[Task],
+        conversation: Uuid,
+        f: impl FnOnce() -> Result<T, crate::runtime::Error>,
+    ) -> Result<T, crate::runtime::Error> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        if state.stop
+            || tasks.iter().any(|task| {
+                task.kind()
+                    .and_then(|kind| self.policies.get(kind))
+                    .copied()
+                    != Some(task.replay_safe())
+                    || task.owner() != &TaskOwner::Conversation(conversation)
+                    || task.state() != &TaskState::Ready
+                    || task.abort_requested()
+            })
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "invalid or unregistered admission task".into(),
+            ));
+        }
+        let _gate = self
+            .owner
+            .task_gate()
+            .lock()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        let store = TaskStore::new(self.owner.store());
+        for task in tasks {
+            if store
+                .load(task.id())
+                .map_err(|e| crate::runtime::Error::Invalid(format!("task lookup: {e}")))?
+                .is_some()
+            {
+                return Err(crate::runtime::Error::Invalid(
+                    "admission task ID already exists".into(),
+                ));
+            }
+        }
+        let result = f();
+        if result.is_ok() {
+            self.wake.notify_one();
+        }
+        result
+    }
     pub(crate) fn policy_for(
         &self,
         name: &str,

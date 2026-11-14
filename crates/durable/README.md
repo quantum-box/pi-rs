@@ -334,7 +334,7 @@ sequence numbers. Addresses are caller-defined and do not enforce ownership.
 Raw prepared batches are trusted and must respect reserved namespaces and JSON
 invariants. Do not perform external effects while preparing a batch.
 
-`Harness::submit_with_documents` and `Scheduler::submit_with_documents` admit one new input and document changes in
+`Harness::submit_with_documents` and `Scheduler::submit_with_documents` admit input, document changes, and optional tasks staged with `AdmissionDocuments::create_task` in
 the same durable commit as the conversation, transcript and observation updates.
 Its callback reads documents before staging any writes; every read, including
 missing or read-only values, is checked at commit. Write only addresses read in
@@ -343,12 +343,17 @@ deterministic and have no external effects. Duplicate request IDs return the
 original submission without running the callback, and rejections do not write.
 A failed storage commit can have an unknown outcome: reopen and reconcile using
 a request ID. This API does not schedule the input; call `resume` as usual.
+Tasks must be ready, owned by the admitted conversation, and registered with
+the running task driver with the same replay policy. The driver wakes only
+after the commit. An abort racing admission is serialized with task creation;
+an already aborting conversation cannot admit tasks. Task IDs must be fresh.
 
 This is a synchronous, bounded API, not upstream `Session.commit` or
 Chord: it has no upstream-style draft transactions, general transaction snapshot reads, definitions,
 operation history, observation, fork/rewind, deferred persistence, or automatic
-lifecycle/ownership validation for arbitrary host batches. Admission callbacks cannot compose arbitrary task batches; task batches
-are low-level records and do not by themselves reserve executors or schedule work.
+lifecycle/ownership validation for arbitrary host batches. Admission supports
+conversation-owned generic tasks, not arbitrary task batches or task-owned
+children; those still require their respective scheduler ownership paths.
 
 ### Extension error observation
 
