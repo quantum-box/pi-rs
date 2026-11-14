@@ -929,8 +929,12 @@ and narrow-width visibility. Native completion still opens on explicit Tab and
 inserts a sole match directly, rather than reproducing Pi's continuously displayed
 autocomplete.
 When a prompt template has no explicit description, its first nonblank line
-uses ECMAScript whitespace rules and the first 60 UTF-16 code units, as in Pi;
-an unmatched surrogate at the cutoff displays as the UTF-8 replacement character.
+uses ECMAScript whitespace rules and the first 60 UTF-16 code units, as in Pi.
+If the cutoff splits a surrogate pair, Rust's UTF-8 strings replace the unpaired
+surrogate with U+FFFD. Pi retains the unpaired UTF-16 unit and RPC `get_commands`
+serializes it as a `\ud83d`-style JSON escape, so that boundary is not RPC
+parity; native RPC returns U+FFFD. Prompt bodies and explicit descriptions are
+not truncated.
 Declared `SKILL.md` files with missing descriptions report both the
 description problem and any invalid name diagnostics; unreadable skill files
 also report their source path. Empty-description checks use ECMAScript whitespace

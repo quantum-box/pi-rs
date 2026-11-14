@@ -156,6 +156,21 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     std::fs::create_dir_all(prompts.join("nested")).unwrap();
     std::fs::write(prompts.join("nested/deep.md"), "Nested").unwrap();
     std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    std::fs::write(
+        prompts.join("unicode-space.md"),
+        "---\nother: value\n---\n\u{0085}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-bom.md"),
+        "---\nother: value\n---\n\u{feff}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-cut.md"),
+        format!("{}😀tail", "x".repeat(59)),
+    )
+    .unwrap();
     std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
     std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
     std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
@@ -202,6 +217,17 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
+    for (name, expected) in [
+        ("unicode-space", "\u{0085}".to_owned()),
+        ("unicode-bom", "visible".to_owned()),
+        ("unicode-cut", format!("{}�...", "x".repeat(59))),
+    ] {
+        let command = commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap();
+        assert_eq!(command["description"], expected, "{name}");
+    }
     let builtin = commands
         .iter()
         .find(|command| command["sourceInfo"]["path"] == "builtin:plan-mode")

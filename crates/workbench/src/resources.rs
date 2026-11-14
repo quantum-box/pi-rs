@@ -598,7 +598,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter(&read(path)?)?;
+    let (metadata, body) = frontmatter_with_trim(&read(path)?, true)?;
     let description = metadata
         .description
         .filter(|description| !description.is_empty())
@@ -627,6 +627,10 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
 }
 
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
+    frontmatter_with_trim(text, false)
+}
+
+fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
     let normalized = text
         .trim_start_matches('\u{feff}')
         .replace("\r\n", "\n")
@@ -659,7 +663,16 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
             .and_then(|v| v.as_bool())
             == Some(true),
     };
-    Ok((metadata, normalized[end + 4..].trim().into()))
+    let body = &normalized[end + 4..];
+    Ok((
+        metadata,
+        if prompt {
+            body.trim_matches(is_prompt_space)
+        } else {
+            body.trim()
+        }
+        .into(),
+    ))
 }
 fn context_file(
     directory: &Path,
@@ -1644,6 +1657,35 @@ mod tests {
             Some("first line second line\n")
         );
         assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn prompt_frontmatter_body_uses_ecmascript_trim_without_changing_skill_trim() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            (
+                "---\nother: value\n---\n\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}",
+            ),
+            (
+                "---\nother: value\n---\n\u{feff}\nvisible\n\u{feff}",
+                "visible",
+                "visible",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        assert_eq!(
+            frontmatter("---\nother: value\n---\n\u{0085}body\u{0085}")
+                .unwrap()
+                .1,
+            "body"
+        );
     }
 
     #[test]
