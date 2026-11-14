@@ -872,6 +872,10 @@ counted separately. Because replies and markers have no request IDs, a missing
 old marker can be confused with a new one, and duplicate or reordered old color
 replies after completion cannot be attributed reliably. Pi also relies on ordered
 DA1 replies, but uses a shorter timeout and accepts late replies.
+On an appearance notification, native invalidates the previous foreground and
+background so configured light/dark pairs switch immediately even when the
+requery is incomplete. Pi instead continues to prefer a previously reported
+background until fresh colors arrive. The last complete palette is retained.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom

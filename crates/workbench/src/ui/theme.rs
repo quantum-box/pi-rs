@@ -47,9 +47,14 @@ impl PaletteState {
 
 #[cfg(any(unix, windows))]
 pub fn reset_terminal_background() {
+    invalidate_terminal_default_colors();
+    clear_terminal_palette();
+}
+
+#[cfg(any(unix, windows))]
+pub fn invalidate_terminal_default_colors() {
     TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
     TERMINAL_FOREGROUND.store(0, Ordering::Relaxed);
-    clear_terminal_palette();
 }
 
 #[cfg(any(unix, windows))]
@@ -581,6 +586,52 @@ mod tests {
         assert!(!terminal_is_dark([117, 117, 117], Some([0, 0, 0])));
         assert!(!terminal_is_dark([255, 255, 255], Some([255, 255, 255])));
         assert!(terminal_is_dark([0, 0, 0], Some([0, 0, 0])));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_changes_theme_pair_while_requery_is_incomplete() {
+        const CHILD: &str = "PI_RS_THEME_APPEARANCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::theme::tests::appearance_changes_theme_pair_while_requery_is_incomplete",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 10, 20);
+        }
+        let saved = TERMINAL_PALETTE.lock().unwrap().current;
+        let theme = |setting| {
+            Theme::load(setting, &[], std::path::Path::new("."), false, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(theme("light/dark"), "dark");
+        invalidate_terminal_default_colors();
+        assert!(set_appearance(false));
+        begin_terminal_palette_query();
+        for index in 0..8 {
+            assert!(!set_terminal_palette(index, index, 30, 40));
+        }
+        assert_eq!(theme("light/dark"), "light");
+        assert_eq!(theme("dark"), "dark");
+        assert_eq!(TERMINAL_PALETTE.lock().unwrap().current, saved);
+        // A foreground reply without a fresh background must not restore stale appearance.
+        assert!(!set_terminal_color(true, 0, 0, 0));
+        assert_eq!(theme("light/dark"), "light");
+        assert!(!set_terminal_color(false, 255, 255, 255));
+        assert_eq!(theme("light/dark"), "light");
+        assert_eq!(TERMINAL_PALETTE.lock().unwrap().current, saved);
     }
 
     #[test]

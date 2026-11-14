@@ -4300,6 +4300,7 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
+                        crate::ui::theme::invalidate_terminal_default_colors();
                         if let Some(terminal) = &mut _terminal {
                             terminal.query_terminal_colors()?;
                         }
