@@ -7233,3 +7233,176 @@ fn bedrock_uses_configured_provider_and_model_headers() {
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("route-secret"));
 }
+
+#[tokio::test]
+async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as AsyncListener;
+    use tokio::process::Command as AsyncCommand;
+
+    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> (String, usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut first = String::new();
+            assert_ne!(
+                reader.read_line(&mut first).await.unwrap(),
+                0,
+                "missing request line"
+            );
+            let mut total = first.len();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader.read_line(&mut line).await.unwrap(),
+                    0,
+                    "incomplete request headers"
+                );
+                total += line.len();
+                assert!(total <= 64 * 1024, "headers too large");
+                if line == "\r\n" {
+                    break;
+                }
+                assert!(
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                );
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length <= 64 * 1024, "body too large");
+            (first, length)
+        })
+        .await
+        .expect("fixture header deadline")
+    }
+
+    for (bypass, explicit_metadata) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let base = format!("http://{origin_addr}");
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpProxy":format!("http://localhost:{proxy_port}")}).to_string(),
+        )
+        .unwrap();
+        let mut oauth = json!({"clientRegistration":"dcr"});
+        if explicit_metadata {
+            oauth["authServerMetadataUrl"] = json!(format!("{base}/metadata"));
+        }
+        std::fs::write(
+            root.path().join("mcp.json"),
+            json!({"mcpServers":{"fixture":{"url":format!("{base}/mcp"),"oauth":oauth}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (selected, unused) = if bypass {
+            (origin, proxy)
+        } else {
+            (proxy, origin)
+        };
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let Ok(Ok((socket, _))) =
+                    tokio::time::timeout(Duration::from_secs(5), selected.accept()).await
+                else {
+                    break;
+                };
+                let mut socket = tokio::io::BufReader::new(socket);
+                let (mut first, mut length) = headers(&mut socket).await;
+                if !bypass {
+                    assert_eq!(first, format!("CONNECT {origin_addr} HTTP/1.1\r\n"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    (first, length) = headers(&mut socket).await;
+                }
+                let mut body = vec![0; length];
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body),
+                )
+                .await
+                .expect("fixture body deadline")
+                .unwrap();
+                let registration = first.starts_with("POST /register ");
+                let metadata = first.starts_with("GET /metadata ")
+                    || first.contains("/.well-known/oauth-authorization-server")
+                    || first.contains("/.well-known/openid-configuration");
+                let issuer = if first.contains("oauth-authorization-server/mcp") {
+                    format!("{server_base}/mcp")
+                } else {
+                    server_base.clone()
+                };
+                requests.push(first);
+                let (status, body) = if metadata {
+                    ("200 OK", json!({"issuer":issuer,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if registration {
+                    ("400 Bad Request", "{}".to_owned())
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                if registration {
+                    break;
+                }
+            }
+            requests
+        });
+        let mut command = AsyncCommand::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("NO_PROXY")
+            .env("no_proxy", if bypass { "127.0.0.1" } else { "" })
+            .args(["mcp", "login", "fixture"])
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .expect("login exceeded fixture deadline")
+            .unwrap();
+        assert!(!output.status.success(), "fixture rejects registration");
+        let requests = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests.iter().any(|line| if explicit_metadata {
+                line.starts_with("GET /metadata ")
+            } else {
+                line.starts_with("GET /.well-known/")
+            }),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            requests
+                .last()
+                .is_some_and(|line| line.starts_with("POST /register ")),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unused.accept())
+                .await
+                .is_err(),
+            "unexpected route"
+        );
+    }
+}

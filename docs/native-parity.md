@@ -41,10 +41,11 @@ sharing, OpenRouter OAuth, and MCP HTTP connections honor `httpProxy`, the
 HTTP(S) proxy environment variables, and `no_proxy`/`NO_PROXY` domain, wildcard,
 and port exclusions. MCP OAuth discovery, explicit metadata, dynamic registration,
 authorization-code exchange, refresh, login, scope upgrades, and reconnects use
-the same settings. A loopback regression checks that OAuth discovery, explicit
-metadata, registration, code exchange and refresh reach an excluded origin directly
-without connecting to the configured proxy; another verifies registration and
-both token grants through a CONNECT proxy. To prevent proxy DNS exemptions from bypassing address checks,
+the same settings. A loopback CLI test exercises the actual workbench `httpProxy`
+adapter and `no_proxy` for discovery, explicit metadata and dynamic registration.
+Client-level loopback tests also cover code exchange and refresh through a CONNECT
+proxy and through a supplied `NoProxy` exclusion; no browser or live credentials
+are used. To prevent proxy DNS exemptions from bypassing address checks,
 OAuth requests and redirects to a configured proxy hostname are rejected, even
 when `NO_PROXY` selects a direct connection. Embedders using the original
 `HttpOptions` without proxy hostname information apply DNS filtering to proxy
