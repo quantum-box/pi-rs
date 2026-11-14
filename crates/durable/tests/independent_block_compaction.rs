@@ -303,8 +303,8 @@ impl pi_rs_durable::model::ProviderAdapter for BusyBlockAdapter {
     }
 }
 #[tokio::test]
-async fn public_busy_block_summary_places_or_becomes_stale() {
-    for stale in [false, true] {
+async fn public_busy_block_summary_places_before_later_queued_input() {
+    for queued in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let model = model(1);
@@ -359,18 +359,14 @@ async fn public_busy_block_summary_places_or_becomes_stale() {
             s.wait_independent_compaction(op).await.unwrap(),
             IndependentCompactionStatus::Running
         );
-        if stale {
+        if queued {
             s.submit(id, None, "queued".into()).unwrap();
         }
         adapter.release.add_permits(2);
         s.wait(id).await.unwrap();
         assert_eq!(
             s.independent_compaction_status(op).unwrap(),
-            if stale {
-                IndependentCompactionStatus::Stale
-            } else {
-                IndependentCompactionStatus::Applied
-            }
+            IndependentCompactionStatus::Applied
         );
         let c = s.conversation(id).unwrap();
         assert!(
@@ -380,7 +376,12 @@ async fn public_busy_block_summary_places_or_becomes_stale() {
         );
         assert!(c.messages.iter().any(|m| matches!(m, pi_rs_core::Message::Assistant { content, .. } if content == "busy answer")));
         assert_eq!(seen.lock().unwrap().len(), 1);
-        assert_eq!(c.content_blocks.len(), if stale { 2 } else { 1 });
+        assert_eq!(c.content_blocks.len(), 1);
+        if queued {
+            assert!(c.messages.iter().any(
+                |message| matches!(message, pi_rs_core::Message::User { content } if content == "queued")
+            ));
+        }
         s.shutdown().await.unwrap();
     }
 }
