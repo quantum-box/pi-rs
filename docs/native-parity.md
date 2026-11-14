@@ -3132,7 +3132,9 @@ and accepted text and images survive an error in a later image block. Empty
 choices succeed. Usage estimates identify their total as locally calculated.
 Non-data URLs and structurally incomplete data URLs are ignored. Unlike Pi,
 pi-rs validates generated image MIME types and base64 before exposing them and
-retains its response-size limit. No live OpenRouter account was used.
+retains its response-size limit. Provider-level operation headers are bound to
+the provider endpoint, including for classifiers; model headers apply to their
+own endpoint. No live OpenRouter account was used.
 
 ### Chat model connection and compatibility
 

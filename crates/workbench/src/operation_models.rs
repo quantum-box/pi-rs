@@ -387,8 +387,9 @@ impl Catalogue {
                     })?
                 };
                 let mut headers = BTreeMap::new();
-                let inherit_headers = !matches!(api, Api::WorkersAiSystemOne)
-                    || key_endpoint.as_ref() == Some(&endpoint);
+                // Provider headers can carry credentials under arbitrary names. Bind
+                // all of them to the provider's resolved endpoint, just like its key.
+                let inherit_headers = key_endpoint.as_ref() == Some(&endpoint);
                 for (inherited, header, value) in inherited
                     .into_iter()
                     .map(|(header, value)| (true, header, value))
@@ -1512,8 +1513,122 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn operation_provider_headers_never_cross_model_endpoints() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn fixture(listener: tokio::net::TcpListener, response: &'static str) -> String {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase()
+        }
+
+        for (kind, api, route, response, context) in [
+            (
+                "image",
+                "openrouter-images",
+                "chat/completions",
+                r#"{"choices":[]}"#,
+                json!({"input":[{"type":"text","text":"draw"}]}),
+            ),
+            (
+                "classifier",
+                "typesafe-system-one",
+                "systemone",
+                r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#,
+                json!({"state":"test","questions":{"ok":{"type":"bool","instructions":"decide","criteria":{"true":"yes","false":"no"}}}}),
+            ),
+        ] {
+            let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let alternate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let primary_base = format!("http://{}/v1", primary.local_addr().unwrap());
+            let alternate_base = format!("http://{}/v1", alternate.local_addr().unwrap());
+            let primary_server = tokio::spawn(fixture(primary, response));
+            let alternate_server = tokio::spawn(fixture(alternate, response));
+            let config = json!({"relay":{"baseUrl":primary_base, "apiKey":"provider-key", "headers":{"Authorization":"Bearer provider-secret", "X-Provider-Secret":"secret-value", "X-Shared":"provider-value"}, "models":[
+                {"type":kind,"id":"primary","api":api,"baseUrl":format!("{primary_base}/"),"input":["text"]},
+                {"type":kind,"id":"alternate","api":api,"baseUrl":alternate_base,"input":["text"],"headers":{"X-Model-Secret":"model-value","X-Shared":"model-value"}}
+            ]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            for id in ["primary", "alternate"] {
+                let entry = catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "relay" && entry.model.id == id)
+                    .unwrap();
+                assert!(entry.endpoint.path().ends_with(route));
+                let keys = if id == "alternate" {
+                    Keys::parse(
+                        &json!({"relay":{"type":"api_key","key":"destination-key","endpoint":entry.endpoint.as_str()}}),
+                    )
+                } else {
+                    Keys::parse(&json!({}))
+                };
+                let mut data = json!({"output":[]});
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    operation.perform(entry, &context, &keys, &mut data),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let primary = tokio::time::timeout(Duration::from_secs(5), primary_server)
+                .await
+                .unwrap()
+                .unwrap();
+            let alternate = tokio::time::timeout(Duration::from_secs(5), alternate_server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(primary.contains("authorization: bearer provider-secret"));
+            assert!(primary.contains("x-provider-secret: secret-value"));
+            assert!(primary.contains("x-shared: provider-value"));
+            assert!(alternate.contains("authorization: bearer destination-key"));
+            assert!(alternate.contains("x-model-secret: model-value"));
+            assert!(alternate.contains("x-shared: model-value"));
+            assert!(!alternate.contains("provider-secret"));
+            assert!(!alternate.contains("secret-value"));
+            assert!(!alternate.contains("provider-value"));
+            assert!(!alternate.contains("provider-key"));
+        }
+    }
+
     #[test]
-    fn workers_ai_header_scope_does_not_change_other_apis() {
+    fn operation_provider_headers_are_scoped_for_every_api() {
         let config = json!({"relay":{"baseUrl":"https://provider.example/ai", "headers":{"X-Provider":"value"}, "models":[
             {"type":"classifier", "id":"workers", "api":"cloudflare-workers-ai-system-one", "baseUrl":"https://other.example/ai", "headers":{"X-Model":"kept"}},
             {"type":"classifier", "id":"system", "api":"typesafe-system-one", "baseUrl":"https://other.example/ai"}
@@ -1531,7 +1646,7 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay" && entry.model.id == "system")
             .unwrap();
-        assert_eq!(system.model.headers["x-provider"], "value");
+        assert!(!system.model.headers.contains_key("x-provider"));
     }
     #[test]
     fn workers_ai_classifier_honors_image_format_override() {
