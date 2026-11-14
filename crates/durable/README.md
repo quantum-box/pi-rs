@@ -1071,3 +1071,15 @@ operation ID and reference, and abort stops local polling while retaining
 pending jobs for host reconciliation. The parent remains live while waiting;
 this is not upstream's independently scheduled child tasks or a parked parent.
 Ordinary nested calls and `call_batch` retain their existing serial behavior.
+
+The private `nested_suspension` storage prototype records a versioned parent
+identity, checkpoint, bounded snapshot of pending job IDs and opaque references,
+abort marker, and active or retired executor ID in one record. Its prepared
+retire, claim, abort, and dependent-write checks use the record version to fence
+stale transitions. The pending set is the immutable snapshot at suspension; this
+prototype does not yet record individual job completion or wake the parent.
+The caller must independently stop and join an executor before recording its
+retirement, and compose these checks with authoritative conversation, task and
+abort fences in the same transaction. The record is not an executor lease and
+is not connected to live execution: it does not park or release a worker, start
+pollers, transfer ownership, or cancel external jobs.

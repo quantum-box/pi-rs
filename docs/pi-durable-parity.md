@@ -315,3 +315,12 @@ The opt-in bounded keyed nested batch admits calls sequentially and polls their
 persisted pending jobs concurrently, preserving key and operation identity over
 reopen. It is not upstream's independent task admission or parked parent: the
 conversation worker remains active and abort requires local polling to stop.
+
+A private versioned nested-suspension record now persists a bounded immutable
+snapshot of pending job identities and opaque references with a checkpoint,
+abort marker, and executor state. Conditional retirement, claim, and abort
+transitions fence stale snapshots and claim-dependent writes. This is only a
+storage prerequisite: retirement requires external proof that the old executor
+stopped, and future integration must atomically compose conversation, task and
+abort fences. It does not park a parent, release its worker, own or poll jobs,
+or provide upstream task wake semantics.
