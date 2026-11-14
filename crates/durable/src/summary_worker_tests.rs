@@ -142,6 +142,413 @@ async fn started(model: &TestModel) {
         .forget();
 }
 
+fn placement_conversation(scheduler: &mut Scheduler) -> Uuid {
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    let (mut state, version) = scheduler.harness.load(id).unwrap();
+    state.messages.extend([
+        Message::User {
+            content: "old".into(),
+        },
+        Message::User {
+            content: "recent".into(),
+        },
+    ]);
+    scheduler
+        .harness
+        .save(&state, Expected::Version(version))
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn completed_summary_places_once_after_reopen_and_preserves_occurrence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let before = scheduler.harness.conversation(conversation).unwrap();
+    let occurrence = scheduler
+        .harness
+        .resolved_occurrences(conversation, before.transcript.unwrap())
+        .unwrap()[1]
+        .1
+        .clone();
+    let id = Uuid::new_v4();
+    assert!(
+        scheduler
+            .create_independent_summary(id, conversation, 64, 0)
+            .unwrap()
+    );
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    let after = scheduler.harness.conversation(conversation).unwrap();
+    assert_eq!(after.messages.len(), 2);
+    assert!(
+        matches!(&after.messages[0], Message::User { content } if content.contains("<summary>\nsummary"))
+    );
+    assert!(matches!(&after.messages[1], Message::User { content } if content == "recent"));
+    let retained = scheduler
+        .harness
+        .resolved_occurrences(conversation, after.transcript.unwrap())
+        .unwrap()[1]
+        .1
+        .clone();
+    assert_eq!(retained, occurrence);
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, opts(model)).unwrap();
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn placement_kill_child() {
+    let Ok(dir) = std::env::var("PI_SUMMARY_PLACEMENT_KILL_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    let mut scheduler = Scheduler::open(dir.join("db"), opts(TestModel::new(1))).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    std::fs::write(dir.join("ids"), format!("{id} {conversation}")).unwrap();
+    std::fs::write(dir.join("ready"), b"ready").unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn killed_completed_worker_places_once_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::summary_worker_tests::placement_kill_child",
+        ])
+        .env("PI_SUMMARY_PLACEMENT_KILL_DIR", dir.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !dir.path().join("ready").exists() {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("summary child did not complete");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let ids = std::fs::read_to_string(dir.path().join("ids")).unwrap();
+    let mut ids = ids
+        .split_whitespace()
+        .map(|id| Uuid::parse_str(id).unwrap());
+    let id = ids.next().unwrap();
+    let conversation = ids.next().unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(TestModel::new(0))).unwrap();
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_context_is_terminally_stale_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let (mut state, version) = scheduler.harness.load(conversation).unwrap();
+    state.messages.push(Message::User {
+        content: "new history".into(),
+    });
+    scheduler
+        .harness
+        .save(&state, Expected::Version(version))
+        .unwrap();
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages,
+        state.messages
+    );
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, opts(model)).unwrap();
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages,
+        state.messages
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn competing_results_have_one_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(2);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    scheduler
+        .create_independent_summary(first, conversation, 64, 0)
+        .unwrap();
+    scheduler
+        .create_independent_summary(second, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(first).unwrap();
+    scheduler.schedule_summary(second).unwrap();
+    scheduler.wait_summary(first).await.unwrap();
+    scheduler.wait_summary(second).await.unwrap();
+    assert_eq!(
+        scheduler.place_summary(first).unwrap(),
+        SummaryPlacement::Placed
+    );
+    let messages = scheduler
+        .harness
+        .conversation(conversation)
+        .unwrap()
+        .messages;
+    assert_eq!(
+        scheduler.place_summary(second).unwrap(),
+        SummaryPlacement::Stale
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages,
+        messages
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn staged_placement_loses_to_concurrent_conversation_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(1);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let State::Completed { result, .. } = snap.operation.state() else {
+        panic!("expected completed")
+    };
+    let (mut candidate, version) = scheduler
+        .harness
+        .load_for_summary_placement(conversation)
+        .unwrap();
+    candidate.messages = result
+        .apply_in_context(&candidate.messages, candidate.context_generation)
+        .unwrap();
+    candidate.context_generation = Some(Uuid::new_v4());
+    let mut batch = scheduler
+        .harness
+        .prepare_conversation_save_inner(
+            &candidate,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            Some(result),
+        )
+        .unwrap();
+    let (checks, mutations) = store.placement_batch(&snap, true).unwrap();
+    batch
+        .extend(PreparedConversationSave {
+            owner,
+            checks,
+            mutations,
+        })
+        .unwrap();
+    let (mut changed, version) = scheduler.harness.load(conversation).unwrap();
+    changed.messages.push(Message::User {
+        content: "raced".into(),
+    });
+    scheduler
+        .harness
+        .save(&changed, Expected::Version(version))
+        .unwrap();
+    assert!(matches!(
+        scheduler.harness.commit_conversation_save(batch),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(matches!(
+        state(&scheduler, id).operation.state(),
+        State::Completed { .. }
+    ));
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages,
+        changed.messages
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn creation_rejects_a_changed_conversation_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let (mut state, version) = scheduler
+        .harness
+        .load_for_summary_placement(conversation)
+        .unwrap();
+    let preparation = crate::compact::prepare(&state.messages, "test", 64, 0, None)
+        .unwrap()
+        .unwrap()
+        .bind_context(state.context_generation.unwrap());
+    state.messages.push(Message::User {
+        content: "raced".into(),
+    });
+    scheduler
+        .harness
+        .save(&state, Expected::Version(version))
+        .unwrap();
+    let id = Uuid::new_v4();
+    let store = SummaryStore::new(scheduler.harness.owner.store());
+    assert!(matches!(
+        store.create_bound(
+            id,
+            conversation,
+            preparation,
+            Harness::key(conversation),
+            version
+        ),
+        Err(crate::summary_store::Error::Conflict)
+    ));
+    assert!(store.get(id).unwrap().is_none());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_over_limit_is_rejected_without_creating_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(0);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let owner = scheduler.harness.owner.clone();
+    let (mut state, version) = scheduler.harness.load(conversation).unwrap();
+    let transcript = crate::transcript::Transcript::new(owner.store(), conversation);
+    for _ in 0..SUMMARY_MAX_HISTORY_RECORDS {
+        let (batch, cursor) = transcript
+            .prepare_write(
+                &serde_json::to_value(TranscriptChange::Append(vec![])).unwrap(),
+                false,
+            )
+            .unwrap();
+        owner
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .unwrap();
+        state.transcript = Some(cursor);
+    }
+    state.messages.clear();
+    let key = Harness::key(conversation);
+    owner
+        .store()
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&state).unwrap(),
+            }],
+        )
+        .unwrap();
+    let id = Uuid::new_v4();
+    assert!(matches!(
+        scheduler.create_independent_summary(id, conversation, 64, 0),
+        Err(Error::Invalid(_))
+    ));
+    assert!(SummaryStore::new(owner.store()).get(id).unwrap().is_none());
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn scheduler_executes_and_replays_lost_settlement_ack() {
     let dir = tempfile::tempdir().unwrap();

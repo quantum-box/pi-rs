@@ -94,6 +94,16 @@ pub enum Error {
 // Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
 const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 const FORK_DOCUMENT_FENCE: &[u8] = b"durable/document-fork-revision";
+// Independent placement intentionally rejects histories requiring more work.
+const SUMMARY_MAX_HISTORY_RECORDS: usize = 128;
+const SUMMARY_MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+const SUMMARY_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryPlacement {
+    Placed,
+    Stale,
+}
 
 fn retry_document_fork(mut attempt: impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
     for remaining in (0..FORK_DOCUMENT_ATTEMPTS).rev() {
@@ -1624,6 +1634,97 @@ impl Harness {
             .insert(id, (entry.version, state.clone()));
         Ok((state, entry.version))
     }
+
+    // Preflight the complete immutable chain before using the existing
+    // provenance resolver, whose general-purpose interface is unbounded.
+    fn load_for_summary_placement(&self, id: Uuid) -> Result<(Conversation, u64), Error> {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        let entry = self
+            .owner
+            .store()
+            .get(&Self::key(id))?
+            .ok_or(Error::NotFound)?;
+        let mut bytes = entry.value.len();
+        if bytes > SUMMARY_MAX_HISTORY_BYTES {
+            return Err(Error::Invalid(
+                "independent summary history exceeds placement limits".into(),
+            ));
+        }
+        let mut state: Conversation = serde_json::from_slice(&entry.value)?;
+        let Some(mut cursor) = state.transcript.clone() else {
+            return Err(Error::Invalid(
+                "independent summary requires a transcript".into(),
+            ));
+        };
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut records = 0usize;
+        loop {
+            let mut page = transcript.read_with_blocks(&cursor, std::num::NonZeroUsize::MIN)?;
+            let Some(record) = page.records.pop() else {
+                break;
+            };
+            records += 1;
+            bytes = bytes.saturating_add(serde_json::to_vec(&record.value)?.len());
+            if let Some(blocks) = &record.content_blocks {
+                bytes = bytes.saturating_add(serde_json::to_vec(blocks)?.len());
+            }
+            if records > SUMMARY_MAX_HISTORY_RECORDS || bytes > SUMMARY_MAX_HISTORY_BYTES {
+                return Err(Error::Invalid(
+                    "independent summary history exceeds placement limits".into(),
+                ));
+            }
+            let change: TranscriptChange = serde_json::from_value(record.value)?;
+            let origin = match &change {
+                TranscriptChange::AppendV2 { origin, commit, .. }
+                | TranscriptChange::AppendV3 { origin, commit, .. }
+                | TranscriptChange::AppendV4 { origin, commit, .. }
+                | TranscriptChange::ReplaceV2 { origin, commit, .. }
+                | TranscriptChange::ReplaceCompacted { origin, commit, .. } => {
+                    Some((*origin, *commit))
+                }
+                _ => None,
+            };
+            if let Some((origin, commit)) = origin {
+                let after = commit
+                    .checked_sub(1)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let page = crate::observer::Observer::new(self.owner.store(), origin)
+                    .read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+                if let Some(record) = page.records.first() {
+                    bytes = bytes.saturating_add(serde_json::to_vec(&record.value)?.len());
+                }
+                let key = format!("runtime/fork/{origin}/{commit:020}");
+                if let Some(snapshot) = self.owner.store().get(key.as_bytes())? {
+                    bytes = bytes.saturating_add(snapshot.value.len());
+                }
+                if bytes > SUMMARY_MAX_HISTORY_BYTES {
+                    return Err(Error::Invalid(
+                        "independent summary history exceeds placement limits".into(),
+                    ));
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        if bytes > SUMMARY_MAX_HISTORY_BYTES {
+            return Err(Error::Invalid(
+                "independent summary history exceeds placement limits".into(),
+            ));
+        }
+        self.hydrate(&mut state)?;
+        self.loaded
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .insert(id, (entry.version, state.clone()));
+        Ok((state, entry.version))
+    }
     fn hydrate(&self, state: &mut Conversation) -> Result<(), Error> {
         if let Some(cursor) = &state.transcript {
             let (messages, blocks) = self.read_transcript_blocks(state.id, cursor.clone())?;
@@ -1989,6 +2090,18 @@ impl Harness {
         children: &[crate::task::Task],
         abort_tasks: &[crate::task_store::StoredTask],
     ) -> Result<PreparedConversationSave, Error> {
+        self.prepare_conversation_save_inner(state, expected, wake, children, abort_tasks, None)
+    }
+
+    fn prepare_conversation_save_inner(
+        &self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+        independent: Option<&crate::compact::CompactionResult>,
+    ) -> Result<PreparedConversationSave, Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -2049,22 +2162,30 @@ impl Harness {
                 {
                     return Ok(None);
                 }
-                let Phase::CompactionPlacement { result, .. } = &previous.phase else {
-                    return Ok(None);
+                let result = match (independent, &previous.phase) {
+                    (Some(result), _) => result,
+                    (None, Phase::CompactionPlacement { result, .. }) => result,
+                    _ => return Ok(None),
                 };
-                let applied = if previous.active_manual_compaction.is_some() {
-                    self.apply_manual_compaction_target(previous, result)?
-                } else {
-                    result
-                        .apply_in_context(&previous.messages, previous.context_generation)
-                        .ok()
-                        .map(|messages| (messages, result.retained_range()))
-                };
+                let applied =
+                    if independent.is_none() && previous.active_manual_compaction.is_some() {
+                        self.apply_manual_compaction_target(previous, result)?
+                    } else {
+                        result
+                            .apply_in_context(&previous.messages, previous.context_generation)
+                            .ok()
+                            .map(|messages| (messages, result.retained_range()))
+                    };
                 Ok(applied
                     .and_then(|(messages, range)| (messages == state.messages).then_some(range)))
             })
             .transpose()?
             .flatten();
+        if independent.is_some() && compacted.is_none() {
+            return Err(Error::Invalid(
+                "independent compaction proof changed".into(),
+            ));
+        }
         let change = if let Some((system_end, first_kept)) = compacted {
             let previous = old.unwrap();
             let (source, created) =
@@ -8732,6 +8853,146 @@ impl Scheduler {
     // These methods deliberately remain private: placement and public busy
     // admission are not yet integrated. The caller persists the preparation.
     #[allow(dead_code)]
+    fn create_independent_summary(
+        &self,
+        id: Uuid,
+        conversation: Uuid,
+        max_output_tokens: u32,
+        keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        let (state, version) = self.harness.load_for_summary_placement(conversation)?;
+        if state.is_working() || state.abort_requested || !state.content_blocks.is_empty() {
+            return Err(Error::Invalid(
+                "conversation is not eligible for independent placement".into(),
+            ));
+        }
+        let generation = state
+            .context_generation
+            .ok_or_else(|| Error::Invalid("conversation lacks context identity".into()))?;
+        let Some(preparation) = crate::compact::prepare(
+            &state.messages,
+            &state.config.model,
+            max_output_tokens,
+            keep_recent_tokens,
+            None,
+        )?
+        else {
+            return Ok(false);
+        };
+        crate::summary_store::SummaryStore::new(self.harness.owner.store())
+            .create_bound(
+                id,
+                conversation,
+                preparation.bind_context(generation),
+                Harness::key(conversation),
+                version,
+            )
+            .map_err(|e| self.summary_store_error(e))?;
+        Ok(true)
+    }
+
+    /// A conservative exact-version decision. Neither a changed conversation
+    /// nor an unbound legacy operation can ever become eligible again.
+    #[allow(dead_code)]
+    fn place_summary(&mut self, id: Uuid) -> Result<SummaryPlacement, Error> {
+        use crate::summary_store::{State, SummaryStore};
+        for _ in 0..8 {
+            let owner = self.harness.owner.clone();
+            let store = SummaryStore::new(owner.store());
+            let snap = store
+                .get(id)
+                .map_err(|e| self.summary_store_error(e))?
+                .ok_or(Error::NotFound)?;
+            let result = match snap.operation.state() {
+                State::Placed { .. } => return Ok(SummaryPlacement::Placed),
+                State::Stale { .. } => return Ok(SummaryPlacement::Stale),
+                State::Completed { result, .. } => result,
+                _ => return Err(Error::Invalid("summary is not completed".into())),
+            };
+            let conversation = snap.operation.session_id();
+            let key = Harness::key(conversation);
+            let current = owner.store().get(&key)?;
+            let observed = current
+                .as_ref()
+                .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+            let mut placement = None;
+            if current.as_ref().map(|entry| entry.version) == snap.operation.placement_version()
+                && snap.operation.placement_version().is_some()
+            {
+                let (mut state, version) = self.harness.load_for_summary_placement(conversation)?;
+                if observed != Expected::Version(version) {
+                    continue;
+                }
+                if !state.is_working()
+                    && !state.abort_requested
+                    && state.content_blocks.is_empty()
+                    && result.source_matches(&state.messages)
+                    && !result.is_stale(&state.messages, state.context_generation)
+                {
+                    state.messages =
+                        result.apply_in_context(&state.messages, state.context_generation)?;
+                    state.context_generation = Some(Uuid::new_v4());
+                    placement = Some(self.harness.prepare_conversation_save_inner(
+                        &state,
+                        Expected::Version(version),
+                        None,
+                        &[],
+                        &[],
+                        Some(result),
+                    )?);
+                }
+            }
+            let placed = placement.is_some();
+            let (checks, mutations) = store
+                .placement_batch(&snap, placed)
+                .map_err(|e| self.summary_store_error(e))?;
+            let mut batch = placement.unwrap_or_else(|| PreparedConversationSave {
+                owner: owner.clone(),
+                checks: vec![Check {
+                    key,
+                    expected: observed,
+                }],
+                mutations: vec![],
+            });
+            batch.extend(PreparedConversationSave {
+                owner,
+                checks,
+                mutations,
+            })?;
+            let bytes = batch
+                .mutations
+                .iter()
+                .map(|m| match m {
+                    Mutation::Put { key, value } => key.len().saturating_add(value.len()),
+                    Mutation::Delete { key } => key.len(),
+                })
+                .fold(0usize, usize::saturating_add);
+            if bytes > SUMMARY_MAX_BATCH_BYTES
+                || batch.checks.len() > 64
+                || batch.mutations.len() > 64
+            {
+                return Err(Error::Invalid(
+                    "independent summary placement batch exceeds limits".into(),
+                ));
+            }
+            match self.harness.commit_conversation_save(batch) {
+                Ok(()) => {
+                    return Ok(if placed {
+                        SummaryPlacement::Placed
+                    } else {
+                        SummaryPlacement::Stale
+                    });
+                }
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Invalid(
+            "independent summary placement conflicted repeatedly".into(),
+        ))
+    }
+
+    #[allow(dead_code)]
     fn schedule_summary(&mut self, id: Uuid) -> Result<(), Error> {
         if self.harness.storage_failed.load(Ordering::Acquire) {
             return Err(Error::Failed);
@@ -8796,7 +9057,7 @@ impl Scheduler {
                     marked = true;
                     break;
                 }
-                State::Completed { .. } => {
+                State::Completed { .. } | State::Placed { .. } | State::Stale { .. } => {
                     return Err(Error::Invalid("summary already completed".into()));
                 }
                 _ => match store.begin_abort(id, snap.version) {

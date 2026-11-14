@@ -598,9 +598,14 @@ These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
 An internal scheduler-owned summary worker can execute a persisted preparation,
 settle usage, and recover or abort when explicitly scheduled by operation ID.
-It does not discover operations automatically on reopen, apply their results,
-or expose busy compaction admission. Usage settlement requires the model's
-request-ID idempotence contract; interrupted attempts are reported unconfirmed.
+An internal placement call accepts only an idle context at the exact version
+captured at preparation; a change settles the operation stale. The context edit
+and terminal status commit together. Placement limits transcript records and
+processed payload sizes, but the storage API still materializes individual
+entries before their sizes can be checked. Operations are not automatically
+discovered on reopen, and busy compaction admission is not exposed. Usage
+settlement requires the model's request-ID idempotence contract; interrupted
+attempts are reported unconfirmed.
 Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is

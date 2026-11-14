@@ -63,6 +63,12 @@ pub enum State {
         request_id: Uuid,
         result: Box<CompactionResult>,
     },
+    Placed {
+        request_id: Uuid,
+    },
+    Stale {
+        request_id: Uuid,
+    },
     Aborting {
         owner: Option<Uuid>,
         #[serde(default)]
@@ -96,6 +102,8 @@ pub struct Operation {
     preparation: Preparation,
     state: State,
     attempts: Vec<Attempt>,
+    #[serde(default)]
+    placement_version: Option<u64>,
 }
 impl Operation {
     pub fn id(&self) -> Uuid {
@@ -112,6 +120,9 @@ impl Operation {
     }
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+    pub(crate) fn placement_version(&self) -> Option<u64> {
+        self.placement_version
     }
 
     /// Derive the exact report to replay from the durable checkpoint. Once an
@@ -180,8 +191,86 @@ impl<'a> SummaryStore<'a> {
             preparation,
             state: State::Ready,
             attempts: vec![],
+            placement_version: None,
         };
         self.write(&op, Expected::Missing)
+    }
+
+    /// Atomically bind a preparation to the exact conversation version whose
+    /// context was inspected by the caller. The conversation key is reserved by
+    /// the runtime and is checked again at placement.
+    pub(crate) fn create_bound(
+        &self,
+        id: Uuid,
+        session_id: Uuid,
+        preparation: Preparation,
+        conversation_key: Vec<u8>,
+        version: u64,
+    ) -> Result<(), Error> {
+        if id.is_nil() || session_id.is_nil() || version == 0 {
+            return Err(Error::Identity);
+        }
+        if serde_json::to_vec(&preparation)?.len() > MAX_PAYLOAD_BYTES {
+            return Err(Error::Limit);
+        }
+        let op = Operation {
+            id,
+            session_id,
+            preparation,
+            state: State::Ready,
+            attempts: vec![],
+            placement_version: Some(version),
+        };
+        let key = Self::key(id);
+        self.store
+            .commit(
+                &[
+                    Check {
+                        key: key.clone(),
+                        expected: Expected::Missing,
+                    },
+                    Check {
+                        key: conversation_key,
+                        expected: Expected::Version(version),
+                    },
+                ],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&op)?,
+                }],
+            )
+            .map_err(|error| match error {
+                durable_store::Error::Conflict { .. } => Error::Conflict,
+                other => Error::Store(other),
+            })
+    }
+
+    /// Prepare a terminal placement decision for the host's atomic transaction.
+    pub(crate) fn placement_batch(
+        &self,
+        snap: &Snapshot,
+        placed: bool,
+    ) -> Result<(Vec<Check>, Vec<Mutation>), Error> {
+        let mut op = snap.operation.clone();
+        let State::Completed { request_id, .. } = op.state else {
+            return Err(Error::State);
+        };
+        op.state = if placed {
+            State::Placed { request_id }
+        } else {
+            State::Stale { request_id }
+        };
+        let key = Self::key(op.id);
+        Ok((
+            vec![Check {
+                key: key.clone(),
+                expected: Expected::Version(snap.version),
+            }],
+            vec![Mutation::Put {
+                key,
+                value: serde_json::to_vec(&op)?,
+            }],
+        ))
     }
     pub fn get(&self, id: Uuid) -> Result<Option<Snapshot>, Error> {
         let Some(entry) = self.store.get(&Self::key(id))? else {

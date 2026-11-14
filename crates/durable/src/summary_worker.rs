@@ -48,7 +48,10 @@ pub(crate) async fn run(
             observed_active = true;
         }
         match snap.operation.state() {
-            State::Completed { .. } | State::Aborted => return Ok(()),
+            State::Completed { .. }
+            | State::Placed { .. }
+            | State::Stale { .. }
+            | State::Aborted => return Ok(()),
             State::Reserved { owner: old, .. } | State::Running { owner: old, .. } => {
                 store.recover(id, snap.version, *old)?;
             }
