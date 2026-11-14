@@ -106,6 +106,15 @@ reopening. This does not atomically attach a conversation or document view,
 produce Chord operations, or include changes absent from the observer log; record
 bytes and retained history are unbounded. Compare upstream's [watch contract](https://github.com/earendil-works/pi/blob/17d6ca759a070c377147f6d76b72dab9a3ba42a3/packages/durable/docs/spec.md).
 
+**Conversation history replay checkpoint:** `Harness` and `Scheduler` expose
+`history_head` and `history_through` for finite, paged replay of expanded
+conversation snapshots. Persist the conversation ID, boundary and last
+processed cursor to resume after reopening; then use `watch_history` from the
+last processed cursor. Cursors are conversation-scoped, including across forks,
+and numerical cursor values do not authenticate their origin. This replays only
+the retained snapshot log, not Chord operations or every document change. Page
+counts are bounded, but snapshot bytes, expansion work and retained history are not.
+
 **Historical subsequent checkpoint:** Busy reset queues at safe boundaries, provider-overflow compaction and persisted bounded exponential retry were added. A host can attach a background generic task driver to the conversation store, with direct-child all/any/fail-fast waits and local descendant cancellation. A persistent subagent link can resume child admission. Task lifecycle/abort ownership is not yet integrated with conversation execution, reset ordering and tool handoff are incomplete, and subagent links do not yet supply automatic answer reporting or ownership-aware abort.
 
 **Named background anchor (subsequently automated for managed sends):** `Harness::anchor_subagent` atomically attaches an immediately succeeded background task and foreground child edge to an existing named link. It is idempotent across process reopen, isolates ordinary parent abort, and allows background-inclusive parent abort to reach the child. Existing stop and reporter behavior is unchanged. Managed sends now create the anchor automatically; automatic cleanup orchestration remains unsupported. Explicit background-inclusive parent abort traverses terminal anchors and their child conversations. Its waiting form reports a missing or stopped task driver even while conversation cleanup is waiting on live tasks; persisted abort marks remain available for a later retry.

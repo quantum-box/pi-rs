@@ -2945,6 +2945,29 @@ impl Harness {
         }
         Ok(page)
     }
+    /// Capture a conversation-scoped boundary for finite history replay.
+    pub fn history_head(&self, id: Uuid) -> Result<crate::observer::Cursor, Error> {
+        self.load(id)?;
+        Ok(crate::observer::Observer::new(self.owner.store(), id).head()?)
+    }
+
+    /// Replay expanded snapshots through a previously captured history head.
+    /// Persist both cursors with the conversation ID when resuming after restart.
+    pub fn history_through(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        through: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.load(id)?;
+        let mut page = crate::observer::Observer::new(self.owner.store(), id)
+            .read_through(after, through, limit)?;
+        for record in &mut page.records {
+            self.expand_event(id, &mut record.value)?;
+        }
+        Ok(page)
+    }
     /// Persist a reset; busy conversations place it at the next safe boundary.
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
@@ -6383,6 +6406,18 @@ impl Scheduler {
         limit: std::num::NonZeroUsize,
     ) -> Result<crate::observer::Page, Error> {
         self.harness.history(id, after, limit)
+    }
+    pub fn history_head(&self, id: Uuid) -> Result<crate::observer::Cursor, Error> {
+        self.harness.history_head(id)
+    }
+    pub fn history_through(
+        &self,
+        id: Uuid,
+        after: crate::observer::Cursor,
+        through: crate::observer::Cursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::observer::Page, Error> {
+        self.harness.history_through(id, after, through, limit)
     }
     pub fn reset(&mut self, id: Uuid, handoff: Option<String>) -> Result<Uuid, Error> {
         let marker = self.harness.reset(id, handoff)?;

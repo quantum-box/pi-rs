@@ -36,6 +36,108 @@ fn opts() -> Options {
         uncertain_policy: UncertainPolicy::InterruptedResult,
     }
 }
+
+#[tokio::test]
+async fn bounded_conversation_history_reopens_and_forks_at_captured_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    let boundary;
+    let first;
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "before boundary".into(), &cancel)
+            .await
+            .unwrap();
+        boundary = h.history_head(id).unwrap();
+        first = h
+            .history_through(id, Cursor(0), boundary, NonZeroUsize::MIN)
+            .unwrap();
+        assert!(first.has_more);
+        h.submit_and_run(id, None, "after boundary".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let mut cursor = first.next;
+    let mut records = first.records;
+    loop {
+        let page = h
+            .history_through(id, cursor, boundary, NonZeroUsize::MIN)
+            .unwrap();
+        cursor = page.next;
+        records.extend(page.records);
+        if !page.has_more {
+            break;
+        }
+    }
+    assert_eq!(cursor, boundary);
+    assert_eq!(
+        records,
+        h.history(id, Cursor(0), NonZeroUsize::new(records.len()).unwrap())
+            .unwrap()
+            .records
+    );
+    let last = &records.last().unwrap().value;
+    assert!(last["messages"].to_string().contains("before boundary"));
+    assert!(!last.to_string().contains("after boundary"));
+    assert!(last.get("_transcript").is_none());
+    let child = h.fork_at(id, boundary).unwrap();
+    assert!(
+        h.conversation(child)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "before boundary"))
+    );
+    assert!(
+        !h.conversation(child)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "after boundary"))
+    );
+    let live = h
+        .watch_history(
+            id,
+            cursor,
+            NonZeroUsize::new(100).unwrap(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        live.records
+            .iter()
+            .any(|r| r.value.to_string().contains("after boundary"))
+    );
+    assert!(
+        h.history_through(id, Cursor(boundary.0 + 1), boundary, NonZeroUsize::MIN)
+            .is_err()
+    );
+    assert!(
+        h.history_through(
+            id,
+            Cursor(0),
+            Cursor(h.history_head(id).unwrap().0 + 1),
+            NonZeroUsize::MIN
+        )
+        .is_err()
+    );
+    assert!(
+        h.history_through(child, Cursor(0), Cursor(u64::MAX), NonZeroUsize::MIN)
+            .is_err()
+    );
+    assert!(h.history_head(uuid::Uuid::new_v4()).is_err());
+}
 #[tokio::test]
 async fn compaction_is_durable_and_old_snapshots_remain_observable() {
     let dir = tempfile::tempdir().unwrap();
