@@ -1515,7 +1515,7 @@ fn slice_tree_spans(
     if width == 0 {
         return Vec::new();
     }
-    let mut end = start.saturating_add(width);
+    let end = start.saturating_add(width);
     let mut column = 0usize;
     let mut result = Vec::new();
     for span in spans {
@@ -1523,11 +1523,7 @@ fn slice_tree_spans(
         piece.text.clear();
         for grapheme in span.text.graphemes(true) {
             let next = column.saturating_add(grapheme.width());
-            if column < start && next > start {
-                // Start at the next complete grapheme and use the freed
-                // column for content rather than emitting half a character.
-                end = end.saturating_add(next - start);
-            } else if column >= start && column < end && next <= end {
+            if column >= start && column < end && next <= end {
                 piece.text.push_str(grapheme);
             }
             column = next;
@@ -2188,7 +2184,7 @@ mod tests {
         let sliced = slice_tree_spans(&[span], 2, 4);
         assert_eq!(
             sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
-            "本e\u{301}z"
+            "本e\u{301}"
         );
         assert!(
             sliced
@@ -2202,7 +2198,7 @@ mod tests {
         let sliced = slice_tree_spans(&[first, second], 1, 4);
         assert_eq!(
             sliced.iter().map(|s| s.text.as_str()).collect::<String>(),
-            "本ab"
+            "本a"
         );
         assert!(
             sliced
