@@ -1,8 +1,11 @@
 //! Provider-neutral generation adapter. Persistence and retry policy belong to the caller.
 //!
-//! Progress is ephemeral: only a successful `CompletedGeneration` is suitable for
-//! committing. In particular, tool-call deltas must never be executed. A `length`
+//! Progress is separate from completed output; `progress` provides optional durable
+//! snapshots. Tool-call deltas must never be executed. A `length`
 //! finish reason means the caller must fail the calls rather than execute them.
+
+#[path = "progress.rs"]
+pub mod progress;
 
 use std::{collections::HashSet, future::Future};
 
@@ -35,6 +38,8 @@ pub enum GenerationProgress {
     Text(String),
     Reasoning(String),
     ToolCallDelta(ToolCallDelta),
+    /// Latest provider metadata, a replacement rather than a delta.
+    Metadata(ModelMetadata),
 }
 
 /// The authoritative result of a completed stream, suitable for durable storage.
@@ -132,7 +137,33 @@ where
 pub async fn collect_generation<O, F>(
     opening: O,
     cancel: &CancellationToken,
+    progress: F,
+) -> Result<CompletedGeneration>
+where
+    O: Future<Output = Result<ModelStream>>,
+    F: FnMut(GenerationProgress),
+{
+    collect_generation_inner(opening, cancel, progress, false).await
+}
+
+/// Collect with metadata progress events for an opt-in durable snapshot sink.
+pub async fn collect_generation_with_metadata<O, F>(
+    opening: O,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<CompletedGeneration>
+where
+    O: Future<Output = Result<ModelStream>>,
+    F: FnMut(GenerationProgress),
+{
+    collect_generation_inner(opening, cancel, progress, true).await
+}
+
+async fn collect_generation_inner<O, F>(
+    opening: O,
+    cancel: &CancellationToken,
     mut progress: F,
+    metadata_events: bool,
 ) -> Result<CompletedGeneration>
 where
     O: Future<Output = Result<ModelStream>>,
@@ -168,7 +199,12 @@ where
             Some(Ok(ModelEvent::ToolCallDelta(delta))) => {
                 progress(GenerationProgress::ToolCallDelta(delta))
             }
-            Some(Ok(ModelEvent::Metadata(update))) => metadata = update,
+            Some(Ok(ModelEvent::Metadata(update))) => {
+                metadata = update.clone();
+                if metadata_events {
+                    progress(GenerationProgress::Metadata(update));
+                }
+            }
             Some(Ok(ModelEvent::Complete { calls, usage })) => {
                 if calls.len() > 64 {
                     return Err(Error::Model("too many tool calls".into()));
