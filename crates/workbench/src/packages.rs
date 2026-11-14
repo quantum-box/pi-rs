@@ -1839,6 +1839,23 @@ fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
     }
 }
 
+// Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
+// process-wrap child so cancellation also signals its still-live group.
+struct PackageChildGuard {
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    finished: bool,
+}
+
+impl Drop for PackageChildGuard {
+    fn drop(&mut self) {
+        // Once the direct child has been reaped, its numeric process group ID
+        // can be reused. Do not signal that ID after ownership is lost.
+        if !self.finished && self.child.id().is_some() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
 async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
@@ -1851,19 +1868,23 @@ async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(process_wrap::tokio::KillOnDrop);
-    let mut child = wrapped.spawn()?;
-    let stdout = child.stdout().take().expect("stdout");
-    let stderr = child.stderr().take().expect("stderr");
+    let mut child = PackageChildGuard {
+        child: wrapped.spawn()?,
+        finished: false,
+    };
+    let stdout = child.child.stdout().take().expect("stdout");
+    let stderr = child.child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
             tokio::try_join!(
-                async { child.wait().await.map_err(Error::from) },
+                async { child.child.wait().await.map_err(Error::from) },
                 capture(stdout, 8 * 1024 * 1024),
                 capture(stderr, 64 * 1024)
             )
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
+    child.finished = true;
     if !status.success() {
         return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
@@ -1932,6 +1953,39 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_package_command_terminates_its_running_process_group() {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        let leaked = root.path().join("leaked");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c")
+            .arg("(i=0; while [ ! -f \"$3\" ] && [ \"$i\" -lt 200 ]; do i=$((i+1)); sleep 0.05; done; if [ -f \"$3\" ]; then printf leaked > \"$1\"; fi) & printf ready > \"$2\"; wait")
+            .arg("sh").arg(&leaked).arg(&ready).arg(&release);
+        let task = tokio::spawn(run(command, "test"));
+        let _cleanup = AbortOnDrop(task.abort_handle());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("package child did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::write(release, b"release").unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!leaked.exists(), "package descendant survived cancellation");
+    }
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");

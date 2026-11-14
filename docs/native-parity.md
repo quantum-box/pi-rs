@@ -912,6 +912,10 @@ packages indexed by older versions gain their declared themes without a build.
 An explicit Pi `package.json` resource list contributes themes only and prevents
 previously cached native resources from being loaded. Unreadable local manifests
 are skipped instead of falling back to cached resources.
+When an in-progress package command is cancelled, the host requests termination
+of its process group (or Windows job) while the direct child is still owned. This
+does not impose a deadline on all share context preparation or cover processes
+that have detached from that group.
 
 ### System prompt checkpoint
 
