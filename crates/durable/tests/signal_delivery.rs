@@ -30,6 +30,19 @@ fn statuses_follow_task_then_key_precedence_and_survive_consumption() {
         R::NotFound
     );
     store.save(&[Save::Create(&task(id))]).unwrap();
+    let checked = SignalToken::with_schema("checked", 1, json!({"type": "string"})).unwrap();
+    assert_eq!(
+        store
+            .deliver_signal(id, &checked, "schema", json!(1))
+            .unwrap(),
+        R::Invalid
+    );
+    assert_eq!(
+        store
+            .deliver_signal(id, &checked, "schema", json!("ok"))
+            .unwrap(),
+        R::Delivered
+    );
     assert_eq!(
         store.deliver_signal(id, &token, "", json!(1)).unwrap(),
         R::Invalid

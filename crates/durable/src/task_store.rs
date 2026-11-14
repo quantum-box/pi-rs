@@ -556,7 +556,7 @@ impl<'a> TaskStore<'a> {
 
     /// Deliver a typed value, returning the upstream-style status. The generated
     /// receipt ID is an internal detail; retries deduplicate by task, kind and key.
-    /// Schema validation and deadline expiry are not implemented.
+    /// Schema-bearing tokens validate the payload; deadline expiry is not implemented.
     pub fn deliver_signal(
         &self,
         task_id: Uuid,
@@ -575,7 +575,12 @@ impl<'a> TaskStore<'a> {
             if key_text.is_empty() {
                 return Ok(SignalResult::Invalid);
             }
-            let signal = Signal::new_typed(receipt_id, task_id, token, key_text, value.clone())?;
+            let signal =
+                match Signal::new_typed(receipt_id, task_id, token, key_text, value.clone()) {
+                    Ok(signal) => signal,
+                    Err(Error::InvalidSignalPayload) => return Ok(SignalResult::Invalid),
+                    Err(error) => return Err(error),
+                };
             let revision_key = signal_revision_key(task_id);
             let revision = self.store.get(&revision_key)?;
             let mut found = false;
