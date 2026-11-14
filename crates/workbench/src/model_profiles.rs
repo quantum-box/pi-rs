@@ -62,6 +62,12 @@ impl RequestHeaders {
         self.values.values().any(|value| value.starts_with('!'))
     }
 
+    pub fn has_dynamic_values(&self) -> bool {
+        self.values
+            .values()
+            .any(|value| value.starts_with('!') || value.contains('$'))
+    }
+
     pub fn static_headers(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(self.values.len());
         for (name, value) in &self.values {

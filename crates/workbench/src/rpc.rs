@@ -1176,7 +1176,9 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     if value.get("input").is_some() {
         return value;
     }
-    let key = model_cache_key(args, provider, model);
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return value;
+    };
     let images = args
         .rpc_model_images
         .lock()
@@ -1219,17 +1221,18 @@ fn model_value_without_cache(args: &Cli, provider: &super::Provider, model: &str
 #[derive(Default)]
 pub(super) struct ModelImageCache {
     generation: u64,
+    eviction_floor: u64,
     entries: std::collections::BTreeMap<ModelCacheKey, ModelImageEntry>,
     completed: std::collections::BTreeMap<ModelCacheScope, u64>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ModelCacheKey {
     scope: ModelCacheScope,
     model: String,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ModelCacheScope {
     provider: String,
     endpoint: String,
@@ -1244,6 +1247,34 @@ struct ModelImageEntry {
     images: Option<bool>,
 }
 
+const MAX_MODEL_IMAGE_ENTRIES: usize = 1024;
+const MAX_MODEL_IMAGE_SCOPES: usize = 128;
+
+impl ModelImageCache {
+    fn evict(&mut self) {
+        while self.entries.len() > MAX_MODEL_IMAGE_ENTRIES {
+            let (key, generation) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.generation)
+                .map(|(key, entry)| (key.clone(), entry.generation))
+                .expect("nonempty cache");
+            self.entries.remove(&key);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+        while self.completed.len() > MAX_MODEL_IMAGE_SCOPES {
+            let (scope, generation) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, generation)| *generation)
+                .map(|(scope, generation)| (scope.clone(), *generation))
+                .expect("nonempty cache");
+            self.completed.remove(&scope);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+    }
+}
+
 fn next_model_generation(args: &Cli) -> u64 {
     let mut cache = args.rpc_model_images.lock().unwrap();
     cache.generation = cache
@@ -1253,17 +1284,29 @@ fn next_model_generation(args: &Cli) -> u64 {
     cache.generation
 }
 
-fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> ModelCacheKey {
+fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Option<ModelCacheKey> {
     use sha2::{Digest, Sha256};
     let endpoint = args.model_endpoint_for(provider, Some(model));
-    let credential_hash = args
-        .model_credential_for(provider, endpoint)
-        .and_then(|credential| {
-            credential
-                .literal()
-                .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
-        });
-    ModelCacheKey {
+    let credential = args.model_credential_for(provider, endpoint);
+    // Resolving a command, OAuth credential, or dynamic header merely to make a
+    // cache key can run external code and may yield a different account than
+    // the request. Do not reuse capabilities when identity is unknowable.
+    if credential
+        .as_ref()
+        .is_some_and(super::model_auth::Credential::requires_resolution)
+        || args
+            .model_profiles
+            .header_settings(provider, endpoint, Some(model))
+            .has_dynamic_values()
+    {
+        return None;
+    }
+    let credential_hash = credential.and_then(|credential| {
+        credential
+            .literal()
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+    });
+    Some(ModelCacheKey {
         model: model.to_owned(),
         scope: ModelCacheScope {
             provider: provider.id().to_owned(),
@@ -1277,7 +1320,7 @@ fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Model
             auth_revision: args.model_keys.revision().to_owned(),
             credential_hash,
         },
-    }
+    })
 }
 
 fn remember_model_images(
@@ -1287,8 +1330,13 @@ fn remember_model_images(
     details: Option<&pi_rs::ollama::ModelDetails>,
     generation: u64,
 ) {
-    let key = model_cache_key(args, provider, model);
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return;
+    };
     let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
     if cache
         .completed
         .get(&key.scope)
@@ -1309,6 +1357,7 @@ fn remember_model_images(
                 images: details.and_then(|details| details.images),
             },
         );
+        cache.evict();
     }
 }
 
@@ -1320,9 +1369,15 @@ fn complete_model_catalog(
     models: &[String],
     generation: u64,
 ) {
-    let scope = model_cache_key(args, provider, "").scope;
+    let Some(key) = model_cache_key(args, provider, "") else {
+        return;
+    };
+    let scope = key.scope;
     let models: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
     let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
     if cache
         .completed
         .get(&scope)
@@ -1340,6 +1395,7 @@ fn complete_model_catalog(
         }
     }
     cache.completed.insert(scope, generation);
+    cache.evict();
 }
 
 fn available_models(
@@ -1706,6 +1762,123 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_command_credentials_never_reuse_dynamic_capabilities() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_file = directory.path().join("token");
+        std::fs::write(&key_file, "first-key").unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                "apiKey":format!("!cat {}", shell_words::quote(key_file.to_str().unwrap()))
+            }}}))
+            .unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+        let credential = args.model_credential_for(&provider, endpoint).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(credential.resolve()).unwrap(), "first-key");
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        std::fs::write(&key_file, "second-key").unwrap();
+        assert_eq!(
+            runtime.block_on(credential.resolve()).unwrap(),
+            "second-key"
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn dynamic_header_and_oauth_credentials_disable_capability_reuse() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"!echo account"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"${ACCOUNT}"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({"xai":{
+            "type":"oauth", "access":"access", "refresh":"refresh", "expires":123
+        }}));
+        let xai = args.model_profiles.provider("xai").unwrap();
+        assert!(model_cache_key(&args, &xai, "dynamic").is_none());
+    }
+
+    #[test]
+    fn model_capability_cache_eviction_is_bounded_and_blocks_stale_completions() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let old = next_model_generation(&args);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        for index in 0..=MAX_MODEL_IMAGE_ENTRIES {
+            let generation = next_model_generation(&args);
+            remember_model_images(
+                &args,
+                &provider,
+                &format!("model-{index}"),
+                None,
+                generation,
+            );
+        }
+        assert!(args.rpc_model_images.lock().unwrap().entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        assert!(
+            model_value(&args, &provider, "evicted")
+                .get("input")
+                .is_none()
+        );
+        let first = args.clone();
+        for index in 0..=MAX_MODEL_IMAGE_SCOPES {
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":format!("https://example.invalid/{index}")}}})).unwrap();
+            let generation = next_model_generation(&args);
+            complete_model_catalog(&args, &provider, &[], generation);
+        }
+        let cache = args.rpc_model_images.lock().unwrap();
+        assert!(cache.completed.len() <= MAX_MODEL_IMAGE_SCOPES);
+        assert!(cache.entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        let floor = cache.eviction_floor;
+        drop(cache);
+        assert!(old < floor);
+        remember_model_images(&first, &provider, "late", Some(&known), old);
+        assert!(
+            model_value(&first, &provider, "late")
+                .get("input")
+                .is_none()
+        );
+    }
 
     #[test]
     fn discovery_results_use_own_capabilities_and_ignore_older_writes() {
