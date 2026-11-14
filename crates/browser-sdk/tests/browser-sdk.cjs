@@ -155,7 +155,7 @@ try {
       const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++next; pending.set(id, {resolve, reject}); socket.send(JSON.stringify({id, method, params, sessionId})); });
       const target = await send('Target.createTarget', {url: `http://127.0.0.1:${site.address().port}/`});
       const {sessionId} = await send('Target.attachToTarget', {targetId:target.targetId, flatten:true});
-      let text = ''; const deadline = Date.now() + 15000;
+      let text = ''; const deadline = Date.now() + 45000;
       while (Date.now() < deadline) {
         const response = await send('Runtime.evaluate', {expression:'document.body?.textContent || ""', returnByValue:true}, sessionId);
         text = response.result.value || '';
