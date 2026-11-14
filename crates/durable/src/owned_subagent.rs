@@ -94,6 +94,7 @@ impl Harness {
         self.admit_task_owned_subagent(task, owner, name, config, mode, None, allowed_tools)
     }
     /// Atomically create a restricted child and queue its first input.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_task_owned_subagent_restricted(
         &mut self,
         task: Uuid,
@@ -118,6 +119,7 @@ impl Harness {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn admit_task_owned_subagent(
         &mut self,
         task: Uuid,
@@ -271,6 +273,7 @@ impl Scheduler {
     }
 
     /// Commit a restricted child and initial input before scheduling it.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_task_owned_subagent_restricted(
         &mut self,
         task: Uuid,
