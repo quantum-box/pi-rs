@@ -3759,13 +3759,23 @@ impl Harness {
                     } else {
                         None
                     };
-                    match recover_tool(
-                        replay,
-                        current,
-                        n,
-                        self.options.restart_limit,
-                        self.options.uncertain_policy,
-                    ) {
+                    // A panic can be indexed before the blocked phase is committed,
+                    // including while nested calls are being sealed. Never replay it.
+                    let panic_key = format!(
+                        "runtime/extension-report/{id}/{operation_id}/tool_execution_panic"
+                    );
+                    let panicked = self.owner.store().get(panic_key.as_bytes())?.is_some();
+                    match if panicked {
+                        ToolRecovery::Reconcile
+                    } else {
+                        recover_tool(
+                            replay,
+                            current,
+                            n,
+                            self.options.restart_limit,
+                            self.options.uncertain_policy,
+                        )
+                    } {
                         ToolRecovery::Replay => {
                             c.phase = Phase::ToolRunning {
                                 turns,
@@ -3780,7 +3790,7 @@ impl Harness {
                         }
                         ToolRecovery::Reconcile => {
                             c.phase = Phase::Blocked {
-                                tool_panicked: false,
+                                tool_panicked: panicked,
                                 turns,
                                 calls,
                                 index,
@@ -5502,7 +5512,17 @@ impl Harness {
                                                 Err(())
                                             }
                                         });
-                                        match host.seal_and_wait().await {
+                                        // Record before awaiting detached nested calls or observing
+                                        // cancellation. Recovery uses this identity as a replay barrier.
+                                        let panic_report = if tool_panicked {
+                                            self.record_tool_panic(c.id, operation_id)
+                                        } else {
+                                            Ok(())
+                                        };
+                                        // Even a failed report write must seal the nested host.
+                                        let inspection = host.seal_and_wait().await;
+                                        panic_report?;
+                                        match inspection {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
                                                 None => {
@@ -5731,9 +5751,20 @@ impl Harness {
             }
         }
     }
-    // The blocked phase is committed before reporting, so a report write or listener
-    // failure cannot cause tool redispatch. Reopen and reconciliation also repair
-    // a crash between the phase commit and the separately indexed report.
+    // The report also serves as a recovery barrier before the blocked phase
+    // is committed. Indexing is idempotent across restart and reconciliation.
+    fn record_tool_panic(&self, id: Uuid, operation_id: Uuid) -> Result<(), Error> {
+        self.record_extension_reports(
+            id,
+            operation_id,
+            "tool_execution_panic",
+            vec![crate::extension::Report {
+                extension: "runtime".into(),
+                operation: "tool_execution_panic".into(),
+                error: "tool execution panicked; outcome requires reconciliation".into(),
+            }],
+        )
+    }
     fn report_blocked_tool_panic(&self, c: &Conversation) -> Result<(), Error> {
         if let Phase::Blocked {
             tool_panicked: true,
@@ -5741,16 +5772,7 @@ impl Harness {
             ..
         } = &c.phase
         {
-            self.record_extension_reports(
-                c.id,
-                *operation_id,
-                "tool_execution_panic",
-                vec![crate::extension::Report {
-                    extension: "runtime".into(),
-                    operation: "tool_execution_panic".into(),
-                    error: "tool execution panicked; outcome requires reconciliation".into(),
-                }],
-            )?;
+            self.record_tool_panic(c.id, *operation_id)?;
         }
         Ok(())
     }
@@ -7637,6 +7659,75 @@ mod scheduler_tests {
             assert_eq!(reports.len(), 1);
             assert_eq!(reports[0].operation_id, operation);
             assert_eq!(reports[0].phase, "tool_execution_panic");
+        }
+    }
+
+    #[test]
+    fn indexed_panic_prevents_replay_before_blocked_phase_commit() {
+        struct SafeTool;
+        #[async_trait::async_trait]
+        impl Tool for SafeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "tool".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+                panic!("recovery must not dispatch")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let opts = || {
+            let mut opts = options(model.clone());
+            opts.tools.push(RegisteredTool {
+                tool: Arc::new(SafeTool),
+                replay: ReplayPolicy::Safe,
+            });
+            opts
+        };
+        let operation = Uuid::new_v4();
+        let id;
+        let cursor;
+        {
+            let mut h = Harness::open_paused(&path, opts()).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            let (mut c, version) = h.load(id).unwrap();
+            c.phase = Phase::ToolRunning {
+                turns: 0,
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "tool".into(),
+                    arguments: "{}".into(),
+                }],
+                index: 0,
+                operation_id: operation,
+                replay: ReplayPolicy::Safe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: false,
+            };
+            h.save(&c, Expected::Version(version)).unwrap();
+            h.record_tool_panic(id, operation).unwrap();
+            cursor = h.subscribe_extension_reports().unwrap().read(0, 10).unwrap()[0].cursor;
+        }
+        for _ in 0..2 {
+            let h = Harness::open_paused(&path, opts()).unwrap();
+            assert!(matches!(
+                h.load(id).unwrap().0.phase,
+                Phase::Blocked { tool_panicked: true, operation_id, .. } if operation_id == operation
+            ));
+            let sub = h.subscribe_extension_reports().unwrap();
+            assert!(sub.read(cursor, 10).unwrap().is_empty());
+            assert_eq!(sub.read(0, 10).unwrap().len(), 1);
         }
     }
 

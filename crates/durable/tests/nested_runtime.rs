@@ -863,3 +863,66 @@ async fn tool_panic_report_is_redacted_deduplicated_and_never_redispatches() {
     assert_eq!(h.extension_reports().unwrap(), reports);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+struct CancelThenPanic {
+    cancel: CancellationToken,
+    count: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for CancelThenPanic {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.cancel.cancel();
+        panic!("sensitive panic payload")
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_panic_preserves_report_and_prevents_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![RegisteredTool {
+            tool: Arc::new(CancelThenPanic {
+                cancel: cancel.clone(),
+                count: count.clone(),
+            }),
+            replay: ReplayPolicy::Safe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open(&db, opts.clone(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    assert!(
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .is_err()
+    );
+    drop(h);
+    let fresh = CancellationToken::new();
+    let mut h = Harness::open(&db, opts, &fresh).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    h.resume_conversation(id, &fresh).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let reports = h.extension_reports().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(!serde_json::to_string(&reports).unwrap().contains("sensitive"));
+}

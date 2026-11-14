@@ -689,15 +689,17 @@ unacknowledged batch; external side effects require idempotency or an atomic
 host-side checkpoint. Separate consumers maintain their own cursors.
 
 A caught model-issued tool execution panic is reported with a fixed, redacted
-message after its uncertain outcome is durably blocked. The operation ID and
-phase deduplicate the report across reopen and reconciliation; a crash before
-indexing is repaired when the blocked conversation is resumed or reconciled.
+message as soon as the panic is caught, before waiting for nested calls. Its
+operation ID and phase deduplicate the report across reopen and reconciliation.
+Recovery treats the committed report as a replay barrier even if the blocked
+phase was not saved yet. A legacy blocked phase missing its report is repaired
+on reopen or reconciliation.
 The report does not include the panic payload, tool name, arguments, or output.
 It is attributed to `runtime`, not an extension; nested tool panics and other
 tool failures are not covered. Rust’s process-wide panic hook may independently
 log the panic payload; this report does not control that hook. A report storage
-failure requires reopening; the blocked operation still requires authoritative
-reconciliation.
+failure requires reopening. If the report could not be committed before a crash,
+recovery cannot distinguish that panic from an ordinary interrupted dispatch.
 
 A new batch and its ordered index commit atomically; concurrent commits are
 serialized by the store. Legacy batches are indexed when a subscription opens,
