@@ -164,10 +164,12 @@ pub(super) fn branch_selection(
                     if matches!(prior.event, Event::ModelSelected { .. }) {
                         let derived = i.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection" || (format == "pi" && parent.timestamp == prior.timestamp && prior.run_id.is_none())));
                         if !derived {
-                            if let Event::ModelSelected { model, provider: Some(provider), .. } = &prior.event && catalog(provider, model) == Some(true) {
+                            if let Event::ModelSelected { model, provider: Some(provider), .. } = &prior.event {
+                                // A native explicit selection is authoritative even when the
+                                // response names a routed physical model and the catalog is absent.
                                 return BranchSelection::Selected { provider: provider.clone(), model: model.clone(), thinking };
                             }
-                            break;
+                            return BranchSelection::Native;
                         }
                     }
                     if let Event::SourceEntry { format, entry } = &prior.event && format == "pi" && entry["type"] == "model_change" {
@@ -1469,7 +1471,7 @@ mod tests {
             timestamp: Some(timestamp.into()),
             run_id: None,
             event: Event::ModelSelected {
-                provider: Some("router".into()),
+                provider: Some("ollama".into()),
                 model: "virtual".into(),
                 thinking: None,
             },
@@ -1484,8 +1486,18 @@ mod tests {
         session.export_jsonl(&path).unwrap();
         let reopened = read(&path).unwrap();
         assert!(
-            matches!(branch_selection(&reopened, |provider, model| Some(provider == "router" && model == "virtual")), BranchSelection::Selected { provider, model, .. } if provider == "router" && model == "virtual")
+            matches!(branch_selection(&reopened, |provider, model| Some(provider == "ollama" && model == "virtual")), BranchSelection::Selected { provider, model, .. } if provider == "ollama" && model == "virtual")
         );
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| None), BranchSelection::Selected { provider, model, .. } if provider == "ollama" && model == "virtual")
+        );
+        use clap::Parser;
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model = "initial".into();
+        args.remember_initial_selection();
+        args.restore_session_model(&reopened);
+        assert_eq!(args.provider.id(), "ollama");
+        assert_eq!(args.model, "virtual");
     }
 
     #[test]
