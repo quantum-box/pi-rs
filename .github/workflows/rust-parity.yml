@@ -17,6 +17,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install 1.89.0 --profile minimal
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_mint_caller_still_persists_new_key -- --test-threads=1
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs share_readiness_wait_is_bounded_and_reports_closed_worker
       - run: cargo +1.89.0 test --locked -p pi-rs-core --lib share_open_
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation standalone_share_rejects_incomplete_journal_without_repair_or_upload
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation standalone_radius_share_includes_live_metadata_without_changing_journal

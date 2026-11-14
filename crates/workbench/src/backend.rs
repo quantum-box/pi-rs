@@ -514,6 +514,22 @@ where
         .map(|(snapshot, _)| snapshot)
 }
 
+// Bound only the wait for an already-running worker to publish readiness.
+// This is not a deadline for runtime configuration or credential refresh.
+async fn wait_for_share_readiness(ready: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while !*ready.borrow_and_update() {
+            ready
+                .changed()
+                .await
+                .map_err(|_| Error::Config("Share context initialization stopped".into()))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::Config("Share context initialization timed out".into()))?
+}
+
 async fn share_snapshot_and_journal_background<F>(
     active: Arc<Mutex<ControlState>>,
     snapshot: Arc<Mutex<SessionSnapshot>>,
@@ -1759,10 +1775,9 @@ fn read_requests(
                             );
                             return;
                         }
-                        while !*ready.borrow_and_update() {
-                            if ready.changed().await.is_err() {
-                                return;
-                            }
+                        if let Err(error) = wait_for_share_readiness(&mut ready).await {
+                            control_response("get_share_context", id, Err(error));
+                            return;
                         }
                         let captured = share_snapshot_and_journal_background(
                             active,
@@ -2017,6 +2032,19 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[tokio::test(start_paused = true)]
+    async fn share_readiness_wait_is_bounded_and_reports_closed_worker() {
+        let (sender, mut ready) = tokio::sync::watch::channel(false);
+        let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
+        assert!(result.to_string().contains("timed out"));
+        sender.send_replace(true);
+        wait_for_share_readiness(&mut ready).await.unwrap();
+        let (sender, mut ready) = tokio::sync::watch::channel(false);
+        drop(sender);
+        let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
+        assert!(result.to_string().contains("stopped"));
+    }
 
     #[test]
     fn equal_session_head_does_not_identify_live_share_context() {
