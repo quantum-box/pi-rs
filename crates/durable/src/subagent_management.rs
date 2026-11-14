@@ -213,6 +213,16 @@ impl Tool for Management {
                         _ => InputMode::FollowUp,
                     },
                 };
+                if let Err(e) = harness.ensure_managed_subagent(
+                    self.parent,
+                    &name,
+                    self.config.clone(),
+                    self.allowed_tools.clone(),
+                ) {
+                    return Outcome::Unknown(format!(
+                        "subagent admission may have committed: {e}; reconcile before retrying"
+                    ));
+                }
                 match harness.submit_subagent_reported_restricted(
                     self.parent,
                     &name,
@@ -278,6 +288,77 @@ mod tests {
             operation_id: id,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_sends_share_one_persistent_anchor_and_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: None,
+        };
+        let args = json!({"action":"send", "name":"worker", "message":"hello"});
+        let (a, b) = tokio::join!(
+            tool.invoke(args.clone(), context(Uuid::new_v4())),
+            tool.invoke(args, context(Uuid::new_v4()))
+        );
+        assert!(matches!(a, Outcome::Succeeded(_)) && matches!(b, Outcome::Succeeded(_)));
+        let (child, anchor) = {
+            let mut h = tool.harness.lock().unwrap();
+            let child = h.subagent(parent, "worker").unwrap().unwrap().child;
+            let anchor = h.anchor_subagent(parent, "worker").unwrap();
+            let store = h.subagent_store().unwrap();
+            assert_eq!(
+                store
+                    .list(format!("runtime/subagent-anchor/{parent}/").as_bytes())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(store.list(b"durable/conversation-owner/").unwrap().len(), 1);
+            assert_eq!(h.conversation(child).unwrap().submissions.len(), 2);
+            (child, anchor)
+        };
+        drop(tool);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+        h.request_abort(parent).unwrap();
+        assert!(!h.conversation(child).unwrap().abort_requested);
+        h.request_abort_with_background(parent).unwrap();
+        assert!(h.conversation(child).unwrap().abort_requested);
+    }
+
+    #[tokio::test]
+    async fn managed_send_upgrades_existing_explicit_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let child = h.ensure_subagent(parent, "worker", config()).unwrap().child;
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: None,
+        };
+        assert!(matches!(
+            tool.invoke(
+                json!({"action":"send","name":"worker","message":"hello"}),
+                context(Uuid::new_v4())
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+        let mut h = tool.harness.lock().unwrap();
+        assert_eq!(h.subagent(parent, "worker").unwrap().unwrap().child, child);
+        let anchor = h.anchor_subagent(parent, "worker").unwrap();
+        assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+        h.request_abort_with_background(parent).unwrap();
+        assert!(h.conversation(child).unwrap().abort_requested);
     }
 
     #[tokio::test]
@@ -690,7 +771,10 @@ mod tests {
         let mut h = Harness::open_paused(&path, options()).unwrap();
         let parent = h.create_conversation(config()).unwrap();
         let other = h.create_conversation(config()).unwrap();
-        let child = h.ensure_subagent(parent, "worker", config()).unwrap().child;
+        let child = h
+            .ensure_managed_subagent(parent, "worker", config(), None)
+            .unwrap()
+            .child;
         let other_child = h.ensure_subagent(other, "worker", config()).unwrap().child;
         let anchor = h.anchor_subagent(parent, "worker").unwrap();
         assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);

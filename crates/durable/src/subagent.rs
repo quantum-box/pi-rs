@@ -284,6 +284,142 @@ impl Harness {
         }
         Ok(link)
     }
+    /// Create managed reservations, their child and background boundary in one commit.
+    /// Existing explicit reservations are upgraded before any managed submission.
+    pub(crate) fn ensure_managed_subagent(
+        &mut self,
+        parent: Uuid,
+        name: &str,
+        config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Link, Error> {
+        use crate::ownership_edge::{self, Edge, Mode};
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store;
+        crate::runtime::validate_allowed_tools(&allowed_tools)?;
+        if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
+            return Err(Error::Invalid(
+                "subagent key, model and output limit required".into(),
+            ));
+        }
+        let reservation_key = key(parent, name);
+        let anchor_key = format!("runtime/subagent-anchor/{parent}/{name}").into_bytes();
+        loop {
+            if self.reservation(parent, name)?.is_some() {
+                let link = self.ensure_subagent_restricted(
+                    parent,
+                    name,
+                    config.clone(),
+                    false,
+                    allowed_tools.clone(),
+                )?;
+                self.anchor_subagent(parent, name)?;
+                return Ok(link);
+            }
+            let store = self.subagent_store()?;
+            let parent_key = format!("runtime/conversation/{parent}").into_bytes();
+            let parent_entry = store.get(&parent_key)?.ok_or(Error::NotFound)?;
+            let parent_state: Conversation = serde_json::from_slice(&parent_entry.value)?;
+            if parent_state.id != parent || parent_state.abort_requested {
+                return Err(Error::Invalid("parent conversation is aborting".into()));
+            }
+            let link = Link {
+                parent,
+                key: name.into(),
+                child: Uuid::new_v4(),
+                config: config.clone(),
+            };
+            let reservation = Reservation {
+                link: link.clone(),
+                history: false,
+                allowed_tools: allowed_tools.clone(),
+                seed: None,
+            };
+            let mut child = Harness::empty_conversation(link.child, config.clone());
+            child.allowed_tools = allowed_tools.clone();
+            let id = Uuid::new_v4();
+            let owner = TaskOwner::Conversation(parent);
+            let mut task = Task::new(
+                id,
+                owner.clone(),
+                Checkpoint {
+                    phase: "subagent-anchor".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .and_then(Task::background)
+            .map_err(|e| Error::Invalid(format!("anchor task: {e:?}")))?;
+            task.start()
+                .and_then(|()| task.succeed(serde_json::Value::Null))
+                .map_err(|e| Error::Invalid(format!("anchor completion: {e:?}")))?;
+            let edge = Edge {
+                task: id,
+                task_owner: owner.clone(),
+                child: link.child,
+                mode: Mode::Foreground,
+            };
+            let edge_key = ownership_edge::edge_key(link.child);
+            let task_key = task_store::key(id);
+            let mut prepared = self.prepare_save(&child, Expected::Missing)?;
+            prepared.checks.extend(
+                ownership_edge::owner_chain_from(store, owner, link.child)
+                    .map_err(|e| Error::Invalid(format!("anchor owner chain: {e}")))?,
+            );
+            prepared.checks.extend([
+                Check {
+                    key: parent_key.clone(),
+                    expected: Expected::Version(parent_entry.version),
+                },
+                Check {
+                    key: reservation_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: anchor_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: edge_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: task_key.clone(),
+                    expected: Expected::Missing,
+                },
+            ]);
+            prepared.mutations.extend([
+                Mutation::Put {
+                    key: parent_key,
+                    value: parent_entry.value,
+                },
+                Mutation::Put {
+                    key: reservation_key.clone(),
+                    value: serde_json::to_vec(&reservation)?,
+                },
+                Mutation::Put {
+                    key: anchor_key.clone(),
+                    value: serde_json::to_vec(&id)?,
+                },
+                Mutation::Put {
+                    key: edge_key,
+                    value: serde_json::to_vec(&edge)?,
+                },
+                Mutation::Put {
+                    key: task_key,
+                    value: serde_json::to_vec(&task)?,
+                },
+            ]);
+            match store.commit(&prepared.checks, &prepared.mutations) {
+                Ok(()) => return Ok(link),
+                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(e) => {
+                    self.subagent_storage_failed();
+                    return Err(e.into());
+                }
+            }
+        }
+    }
     /// Attach a persistent background ownership boundary to an existing named child.
     /// The task and edge are committed atomically. Retrying returns the same task,
     /// including after reopening. The anchor succeeds immediately while retaining its
@@ -319,6 +455,12 @@ impl Harness {
                     return Err(Error::Invalid("invalid subagent anchor".into()));
                 }
                 return Ok(id);
+            }
+            let parent_key = format!("runtime/conversation/{parent}").into_bytes();
+            let parent_entry = store.get(&parent_key)?.ok_or(Error::NotFound)?;
+            let parent_state: Conversation = serde_json::from_slice(&parent_entry.value)?;
+            if parent_state.id != parent || parent_state.abort_requested {
+                return Err(Error::Invalid("parent conversation is aborting".into()));
             }
             let child_key = format!("runtime/conversation/{}", link.child).into_bytes();
             let child_entry = store.get(&child_key)?.ok_or(Error::NotFound)?;
@@ -356,6 +498,10 @@ impl Harness {
                 .map_err(|e| Error::Invalid(format!("anchor owner chain: {e}")))?;
             checks.extend([
                 Check {
+                    key: parent_key.clone(),
+                    expected: Expected::Version(parent_entry.version),
+                },
+                Check {
                     key: anchor_key.clone(),
                     expected: Expected::Missing,
                 },
@@ -377,6 +523,10 @@ impl Harness {
                 },
             ]);
             let mutations = [
+                Mutation::Put {
+                    key: parent_key,
+                    value: parent_entry.value,
+                },
                 Mutation::Put {
                     key: anchor_key.clone(),
                     value: serde_json::to_vec(&id)?,

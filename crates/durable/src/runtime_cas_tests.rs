@@ -2647,3 +2647,204 @@ async fn abort_wins_over_stale_failure_and_preserves_later_admissions() {
         Status::Done { .. }
     ));
 }
+
+#[test]
+fn concurrent_managed_first_admissions_and_interrupted_delivery_reopen() {
+    use crate::subagent::ReportedInput;
+    use crate::task_store::TaskStore;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = owner.create_conversation(config.clone()).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let mut worker = owner.worker();
+            let barrier = barrier.clone();
+            let config = config.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                worker
+                    .ensure_managed_subagent(parent, "worker", config, None)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let links: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(links.iter().all(|link| link == &links[0]));
+    let child = links[0].child;
+    let anchor = owner.anchor_subagent(parent, "worker").unwrap();
+    assert!(matches!(
+        TaskStore::new(owner.owner.store())
+            .load(anchor)
+            .unwrap()
+            .unwrap()
+            .task
+            .state(),
+        crate::task::TaskState::Succeeded(serde_json::Value::Null)
+    ));
+    assert_eq!(
+        owner
+            .owner
+            .store()
+            .list(b"durable/conversation-owner/")
+            .unwrap()
+            .len(),
+        1
+    );
+    // Simulate termination after atomic creation and before reporter admission.
+    drop(owner);
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        owner
+            .ensure_managed_subagent(parent, "worker", config.clone(), None)
+            .unwrap()
+            .child,
+        child
+    );
+    assert_eq!(owner.anchor_subagent(parent, "worker").unwrap(), anchor);
+    let submit = |h: &mut Harness| {
+        h.submit_subagent_reported(
+            parent,
+            "worker",
+            config.clone(),
+            ReportedInput {
+                history: false,
+                request_id: "same".into(),
+                content: "hello".into(),
+                mode: InputMode::FollowUp,
+            },
+        )
+        .unwrap()
+        .1
+    };
+    assert_eq!(submit(&mut owner), submit(&mut owner));
+    assert_eq!(owner.conversation(child).unwrap().submissions.len(), 1);
+}
+
+#[test]
+fn managed_anchor_admission_is_fenced_by_parent_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    h.submit(parent, None, "work".into()).unwrap();
+    h.request_abort_with_background(parent).unwrap();
+    assert!(h.conversation(parent).unwrap().abort_requested);
+    assert!(
+        h.ensure_managed_subagent(parent, "worker", config, None)
+            .is_err()
+    );
+    assert!(h.subagent(parent, "worker").unwrap().is_none());
+    assert!(
+        h.owner
+            .store()
+            .list(b"durable/conversation-owner/")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        h.owner
+            .store()
+            .list(b"runtime/subagent-anchor/")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn managed_anchor_races_background_abort_without_stranding_child() {
+    for _ in 0..12 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let config = Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let parent = h.create_conversation(config.clone()).unwrap();
+        h.submit(parent, None, "work".into()).unwrap();
+        let mut admission = h.worker();
+        let mut abort = h.worker();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other = barrier.clone();
+        let thread = std::thread::spawn(move || {
+            other.wait();
+            admission.ensure_managed_subagent(parent, "worker", config, None)
+        });
+        barrier.wait();
+        abort.request_abort_with_background(parent).unwrap();
+        match thread.join().unwrap() {
+            Ok(link) => assert!(h.conversation(link.child).unwrap().abort_requested),
+            Err(_) => assert!(h.subagent(parent, "worker").unwrap().is_none()),
+        }
+    }
+}
+
+#[test]
+fn managed_anchor_kill_helper() {
+    let Ok(path) = std::env::var("PI_RS_ANCHOR_KILL_DB") else {
+        return;
+    };
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let child = h
+        .ensure_managed_subagent(parent, "worker", config, None)
+        .unwrap()
+        .child;
+    let anchor = h.anchor_subagent(parent, "worker").unwrap();
+    std::fs::write(
+        format!("{path}.pending"),
+        format!("{parent} {child} {anchor}"),
+    )
+    .unwrap();
+    std::fs::rename(format!("{path}.pending"), format!("{path}.ready")).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn managed_anchor_survives_process_kill_before_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let ready = dir.path().join("db.ready");
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::runtime_cas_tests::managed_anchor_kill_helper",
+        ])
+        .env("PI_RS_ANCHOR_KILL_DB", &path)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        assert!(process.try_wait().unwrap().is_none(), "helper exited early");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let contents = std::fs::read_to_string(ready).expect("helper did not commit in time");
+    let ids: Vec<Uuid> = contents
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.subagent(ids[0], "worker").unwrap().unwrap().child, ids[1]);
+    assert_eq!(h.anchor_subagent(ids[0], "worker").unwrap(), ids[2]);
+    assert!(h.conversation(ids[1]).unwrap().submissions.is_empty());
+}
