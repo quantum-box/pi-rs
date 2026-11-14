@@ -91,6 +91,35 @@ async fn bounded_conversation_history_reopens_and_forks_at_captured_cursor() {
     assert!(!last.to_string().contains("after boundary"));
     assert!(last.get("_transcript").is_none());
     let child = h.fork_at(id, boundary).unwrap();
+    let child_head = h.history_head(child).unwrap();
+    assert_eq!(child_head, Cursor(1));
+    let child_history = h
+        .history_through(child, Cursor(0), child_head, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(child_history.next, child_head);
+    assert!(!child_history.has_more);
+    assert!(
+        child_history.records[0]
+            .value
+            .to_string()
+            .contains("before boundary")
+    );
+    assert!(
+        !child_history.records[0]
+            .value
+            .to_string()
+            .contains("after boundary")
+    );
+    assert!(
+        h.history_through(child, Cursor(0), boundary, NonZeroUsize::MIN)
+            .is_err()
+    );
+    let empty = h
+        .history_through(child, Cursor(0), Cursor(0), NonZeroUsize::MIN)
+        .unwrap();
+    assert!(empty.records.is_empty());
+    assert_eq!(empty.next, Cursor(0));
+    assert!(!empty.has_more);
     assert!(
         h.conversation(child)
             .unwrap()
@@ -1591,6 +1620,13 @@ async fn unified_history_requires_explicit_legacy_boundary() {
         })
         .unwrap();
     assert!(h.unified_history_start(id, false).is_err());
+    let head = h.history_head(id).unwrap();
+    assert_ne!(head, Cursor(0));
+    let history = h
+        .history_through(id, Cursor(0), head, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(history.next, head);
+    assert!(!history.has_more);
     let cursor = h.unified_history_start(id, true).unwrap();
     assert!(
         !h.unified_history(&cursor, NonZeroUsize::MIN)

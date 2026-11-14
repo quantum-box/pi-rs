@@ -410,6 +410,53 @@ mod tests {
     }
 
     #[test]
+    fn bounded_pages_keep_the_captured_head_while_another_writer_commits() {
+        let db = Arc::new(Store::memory().unwrap());
+        let id = Uuid::new_v4();
+        let observer = Observer::new(&db, id);
+        for n in 1..=4 {
+            append(&observer, json!(n));
+        }
+        let boundary = observer.head().unwrap();
+        let rendezvous = Arc::new(Barrier::new(2));
+        let writer = {
+            let db = Arc::clone(&db);
+            let rendezvous = Arc::clone(&rendezvous);
+            std::thread::spawn(move || {
+                let observer = Observer::new(&db, id);
+                for n in 5..=8 {
+                    rendezvous.wait();
+                    append(&observer, json!(n));
+                    rendezvous.wait();
+                }
+            })
+        };
+        let mut cursor = Cursor(0);
+        for n in 1..=4 {
+            rendezvous.wait();
+            let page = observer.read_through(cursor, boundary, limit(1)).unwrap();
+            rendezvous.wait();
+            assert_eq!(page.records.len(), 1);
+            assert_eq!(page.records[0].value, json!(n));
+            assert_eq!(page.next, Cursor(n));
+            assert_eq!(page.has_more, n < 4);
+            cursor = page.next;
+        }
+        writer.join().unwrap();
+        assert_eq!(cursor, boundary);
+        let live = observer.read(cursor, limit(10)).unwrap();
+        assert_eq!(
+            live.records
+                .iter()
+                .map(|r| r.value.clone())
+                .collect::<Vec<_>>(),
+            vec![json!(5), json!(6), json!(7), json!(8)]
+        );
+        assert_eq!(live.next, Cursor(8));
+        assert!(!live.has_more);
+    }
+
+    #[test]
     fn concurrent_append_conflicts_and_host_batch_is_atomic() {
         let db = Arc::new(Store::memory().unwrap());
         let barrier = Arc::new(Barrier::new(2));
