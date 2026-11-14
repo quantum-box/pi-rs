@@ -3133,8 +3133,9 @@ the active context. The metadata is not written to the journal, and the 128 MiB 
 it. Gist sharing continues to export HTML. When runtime metadata is unavailable, including missing model credentials,
 startup failure, pending project trust, or standalone `pi share`, Radius uploads
 continue without metadata rather than reconstructing it from stale settings.
-Preparing metadata does not block the terminal event loop; extension dialogs
-remain interactive. PTY and loopback checks covered idle and
+Idle journal reads run on a blocking worker, while active shares use the in-memory
+snapshot; only one disk read can be outstanding. Preparing metadata does not block
+the terminal event loop; extension dialogs remain interactive. PTY and loopback checks covered idle and
 in-flight sharing; live Radius acceptance remains open.
 
 ### Native Codemode model operations

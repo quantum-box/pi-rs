@@ -325,6 +325,34 @@ fn snapshot_for_share(
     snapshot.share_snapshot()
 }
 
+async fn share_snapshot_background<F>(
+    active: Arc<Mutex<ControlState>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    read: F,
+) -> Result<super::sessions::ShareSnapshot>
+where
+    F: FnOnce() -> Option<Session> + Send + 'static,
+{
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| Error::Config("Share context is already being read".into()))?;
+    tokio::task::spawn_blocking(move || {
+        // A stuck filesystem read retains the sole permit, so repeated shares
+        // cannot exhaust the worker's blocking pool. Active runs already have
+        // a current in-memory snapshot and never need a disk read here.
+        let _permit = permit;
+        let idle = {
+            let state = active.lock().expect("worker control");
+            state.token.is_none() && state.queued == 0
+        };
+        let current = if idle { read() } else { None };
+        snapshot_for_share(&active, &snapshot, current)
+    })
+    .await
+    .map_err(|_| Error::Config("Share context reader stopped".into()))?
+}
+
 struct ShellRunner {
     tools: Arc<CodingTools>,
     cwd: std::path::PathBuf,
@@ -1391,6 +1419,7 @@ fn read_requests(
         lifecycle_timeout,
         trace,
     });
+    let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1435,16 +1464,19 @@ fn read_requests(
                     let mut ready = share_ready.clone();
                     let snapshot = snapshot.clone();
                     let active = active.clone();
+                    let slots = share_slots.clone();
                     runtime.spawn(async move {
                         while !*ready.borrow_and_update() {
                             if ready.changed().await.is_err() {
                                 return;
                             }
                         }
-                        // Refresh frontend edits to the same journal only while idle.
-                        let current = Session::snapshot(&session).ok();
                         let result =
-                            snapshot_for_share(&active, &snapshot, current).and_then(|snapshot| {
+                            share_snapshot_background(active, snapshot, slots, move || {
+                                Session::snapshot(session).ok()
+                            })
+                            .await
+                            .and_then(|snapshot| {
                                 serde_json::to_value(snapshot).map_err(Into::into)
                             });
                         control_response("get_share_context", id, result);
@@ -1677,6 +1709,103 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_share_disk_read_does_not_block_worker_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        });
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let read = tokio::spawn(share_snapshot_background(
+            active.clone(),
+            snapshot.clone(),
+            slots.clone(),
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .ok()?;
+                Some(stale)
+            },
+        ));
+        started_rx.await.unwrap();
+        // This runs on the same single-thread runtime while the filesystem
+        // reader is paused; a second read fails immediately without spawning.
+        let rejected =
+            share_snapshot_background(active.clone(), snapshot.clone(), slots.clone(), || {
+                panic!("reader must not start")
+            })
+            .await;
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("already being read")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            {
+                active.lock().unwrap().token = Some(CancellationToken::new());
+            }
+            tokio::task::yield_now().await;
+            session
+                .append_user_with_images("model progressed".into(), vec![], None)
+                .unwrap();
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        })
+        .await
+        .unwrap();
+        let head = session.head();
+        release_tx.send(()).unwrap();
+        let result = read.await.unwrap().unwrap();
+        assert_eq!(result.head, head);
+        session
+            .append_user_with_images("next event".into(), vec![], None)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .lock()
+                .unwrap()
+                .record(session.records().last().unwrap())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_share_uses_memory_without_reading_disk() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        });
+        let result = share_snapshot_background(
+            Arc::new(Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            })),
+            Arc::new(Mutex::new(initial)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            || panic!("active share must not read the disk"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "live");
+    }
 
     #[test]
     fn delayed_share_disk_read_cannot_rewind_settled_worker_snapshot() {
