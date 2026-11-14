@@ -180,10 +180,15 @@ fn windows_shell_path(value: &str) -> String {
     if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
         return value.into();
     }
-    let drive = value
-        .strip_prefix("/mnt/")
-        .or_else(|| value.strip_prefix("/cygdrive/"))
-        .unwrap_or(&value[1..]);
+    let path = &value[1..];
+    let drive = ["mnt/", "cygdrive/"]
+        .into_iter()
+        .find_map(|prefix| {
+            path.get(..prefix.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                .map(|_| &path[prefix.len()..])
+        })
+        .unwrap_or(path);
     let bytes = drive.as_bytes();
     if bytes.first().is_some_and(u8::is_ascii_alphabetic)
         && (bytes.len() == 1 || bytes.get(1) == Some(&b'/'))
@@ -291,14 +296,33 @@ mod tests {
         for (input, expected) in [
             ("/c/Users/name", "C:\\Users\\name"),
             ("/mnt/d/file", "D:\\file"),
+            ("/MNT/c/Work/a", "C:\\Work\\a"),
+            ("/MNT/z", "Z:\\"),
             ("/cygdrive/e/folder/file", "E:\\folder\\file"),
+            ("/CyGdRiVe/d/file", "D:\\file"),
             ("/c", "C:\\"),
             ("//host/share", "//host/share"),
             ("/usr/share", "/usr/share"),
+            ("/mnt/case/foo", "/mnt/case/foo"),
+            ("/MNT/c/a\\b", "/MNT/c/a\\b"),
+            ("/é/c", "/é/c"),
             ("/c/mixed\\path", "/c/mixed\\path"),
         ] {
             assert_eq!(windows_shell_path(input), expected);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_tool_input_normalizes_mixed_case_shell_prefixes() {
+        assert_eq!(
+            input("@/MnT/c/notes\u{202f}file.txt", None).unwrap(),
+            Path::new("C:\\notes file.txt")
+        );
+        assert_eq!(
+            input("/CYGDRIVE/d/notes.txt", None).unwrap(),
+            Path::new("D:\\notes.txt")
+        );
     }
 
     #[test]
