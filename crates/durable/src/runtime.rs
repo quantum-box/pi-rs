@@ -15,6 +15,7 @@ use durable_store::{
     owner::{OwnedStore, OwnerError},
 };
 use futures_util::FutureExt;
+pub use pi_rs_core::QueueMode;
 use pi_rs_core::{
     CancellationToken, ExtensionState, Invocation, Message, Model, Outcome, Tool, ToolCall,
     ToolSpec, UsageReport,
@@ -264,10 +265,28 @@ enum TranscriptChange {
     Replace(Vec<Message>),
 }
 
+/// Delivery selection at durable conversation boundaries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QueueModes {
+    pub steering_mode: QueueMode,
+    pub follow_up_mode: QueueMode,
+}
+impl Default for QueueModes {
+    fn default() -> Self {
+        Self {
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: Uuid,
     pub config: Config,
+    #[serde(default)]
+    pub queue_modes: QueueModes,
     /// Installed extension names in execution order. Older conversations select none.
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -622,6 +641,10 @@ impl Harness {
                 tool_states: state.tool_states.clone(),
                 documents: HashMap::from([
                     (
+                        "pi-rs/runtime/queue-modes".into(),
+                        serde_json::to_value(state.queue_modes)?,
+                    ),
+                    (
                         "pi-rs/runtime/extensions".into(),
                         serde_json::to_value(&state.extensions)?,
                     ),
@@ -717,6 +740,9 @@ impl Harness {
                             "conversation changed during execution; reopen before retry".into(),
                         ));
                     }
+                    // Settings changes can race external model/tool calls. Preserve the
+                    // newest values; boundary commits retry selection separately.
+                    state.queue_modes = latest.queue_modes;
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
@@ -785,6 +811,21 @@ impl Harness {
         }
         Ok(())
     }
+    /// Persist delivery modes, including while a run is active. Each boundary reads the latest values.
+    pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
+        loop {
+            let (mut state, version) = self.load(id)?;
+            state.queue_modes = modes;
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                other => return other,
+            }
+        }
+    }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.create_conversation_with_id(Uuid::new_v4(), config)
     }
@@ -799,6 +840,7 @@ impl Harness {
         let state = Conversation {
             id,
             config,
+            queue_modes: QueueModes::default(),
             extensions: vec![],
             messages: vec![],
             transcript: None,
@@ -916,6 +958,12 @@ impl Harness {
         let state = Conversation {
             id: Uuid::new_v4(),
             config: point.config,
+            queue_modes: point
+                .documents
+                .get("pi-rs/runtime/queue-modes")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
             extensions: point
                 .documents
                 .get("pi-rs/runtime/extensions")
@@ -1749,36 +1797,7 @@ impl Harness {
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     }
-                    let mut steer = false;
-                    let mut follow = false;
-                    for s in &mut c.submissions {
-                        if s.status != Status::Queued {
-                            continue;
-                        }
-                        let selected = match c
-                            .input_modes
-                            .get(&s.id)
-                            .copied()
-                            .unwrap_or(InputMode::FollowUp)
-                        {
-                            InputMode::Steer if !steer => {
-                                steer = true;
-                                true
-                            }
-                            InputMode::FollowUp if !follow => {
-                                follow = true;
-                                true
-                            }
-                            _ => false,
-                        };
-                        if selected {
-                            s.status = Status::Running;
-                            c.active.get_or_insert(s.id);
-                            c.messages.push(Message::User {
-                                content: s.content.clone(),
-                            });
-                        }
-                    }
+                    place_queued(&mut c, true);
                     if c.active.is_none() {
                         return Ok(());
                     }
@@ -2305,57 +2324,19 @@ impl Harness {
                         for marker in std::mem::take(&mut c.pending_resets) {
                             place_reset(&mut c, marker);
                         }
-                        // Select one steer and one follow-up, in admission order.
-                        let mut steer = false;
-                        let mut follow = false;
-                        for submission in &mut c.submissions {
-                            if submission.status != Status::Queued {
-                                continue;
-                            }
-                            let selected = match c
-                                .input_modes
-                                .get(&submission.id)
-                                .copied()
-                                .unwrap_or(InputMode::FollowUp)
-                            {
-                                InputMode::Steer if !steer => {
-                                    steer = true;
-                                    true
-                                }
-                                InputMode::FollowUp if !follow => {
-                                    follow = true;
-                                    true
-                                }
-                                _ => false,
-                            };
-                            if selected {
-                                submission.status = Status::Running;
-                                c.active.get_or_insert(submission.id);
-                                c.messages.push(Message::User {
-                                    content: submission.content.clone(),
-                                });
-                            }
-                        }
+                        place_queued(&mut c, true);
                         if c.active.is_some() {
                             c.phase = Phase::ModelReady { turns: 0 };
                         }
-                    } else if let Some(i) = c.submissions.iter().position(|s| {
-                        s.status == Status::Queued
-                            && c.input_modes.get(&s.id) == Some(&InputMode::Steer)
-                    }) {
-                        let submission = &mut c.submissions[i];
-                        submission.status = Status::Running;
-                        c.messages.push(Message::User {
-                            content: submission.content.clone(),
-                        });
-                        c.auto_compaction_attempted = false;
-                        c.phase = Phase::ModelReady { turns };
                     } else if let Some(answer) = answer {
                         finish_answer(&mut c, answer.clone());
                         c.phase = Phase::AfterRun {
                             answer,
                             operation_id: Uuid::new_v4(),
                         };
+                    } else if place_queued(&mut c, false) {
+                        c.auto_compaction_attempted = false;
+                        c.phase = Phase::ModelReady { turns };
                     } else {
                         c.phase = Phase::ModelReady { turns };
                     }
@@ -3111,6 +3092,9 @@ impl Scheduler {
     pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
         self.harness.select_extensions(id, names)
     }
+    pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
+        self.harness.set_queue_modes(id, modes)
+    }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.harness.create_conversation(config)
     }
@@ -3577,6 +3561,8 @@ fn conversation_lock(
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
     let mut old = serde_json::to_value(base)?;
     let mut new = serde_json::to_value(latest)?;
+    old.as_object_mut().and_then(|v| v.remove("queue_modes"));
+    new.as_object_mut().and_then(|v| v.remove("queue_modes"));
     let old_submissions = old
         .as_object_mut()
         .and_then(|v| v.remove("submissions"))
@@ -3667,6 +3653,39 @@ fn append_tool(
     c.auto_compaction_attempted = false;
     Ok(())
 }
+// Final boundaries select each mode independently; post-tool boundaries select only steers.
+fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
+    let mut steer = false;
+    let mut follow = false;
+    let mut placed = false;
+    for submission in &mut c.submissions {
+        if submission.status != Status::Queued {
+            continue;
+        }
+        let mode = c
+            .input_modes
+            .get(&submission.id)
+            .copied()
+            .unwrap_or(InputMode::FollowUp);
+        let (seen, setting) = match mode {
+            InputMode::Steer => (&mut steer, c.queue_modes.steering_mode),
+            InputMode::FollowUp if final_boundary => (&mut follow, c.queue_modes.follow_up_mode),
+            InputMode::FollowUp => continue,
+        };
+        if *seen && setting == QueueMode::OneAtATime {
+            continue;
+        }
+        *seen = true;
+        placed = true;
+        submission.status = Status::Running;
+        c.active.get_or_insert(submission.id);
+        c.messages.push(Message::User {
+            content: submission.content.clone(),
+        });
+    }
+    placed
+}
+
 fn finish_answer(c: &mut Conversation, answer: String) {
     let answer_id = Uuid::new_v4();
     c.active = None;
@@ -3761,10 +3780,54 @@ mod scheduler_tests {
         }
     }
     #[test]
+    fn legacy_conversation_defaults_and_independent_boundary_selection() {
+        let json = serde_json::json!({
+            "id": Uuid::new_v4(), "config": config(), "messages": [],
+            "submissions": [], "active": null, "phase": "Idle"
+        });
+        let mut c: Conversation = serde_json::from_value(json).unwrap();
+        assert_eq!(c.queue_modes, QueueModes::default());
+        c.queue_modes = QueueModes {
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::OneAtATime,
+        };
+        for (content, mode) in [
+            ("f1", InputMode::FollowUp),
+            ("s1", InputMode::Steer),
+            ("f2", InputMode::FollowUp),
+            ("s2", InputMode::Steer),
+        ] {
+            let id = Uuid::new_v4();
+            c.input_modes.insert(id, mode);
+            c.submissions.push(Submission {
+                id,
+                request_id: None,
+                content: content.into(),
+                status: Status::Queued,
+            });
+        }
+        assert!(place_queued(&mut c, true));
+        let contents: Vec<_> = c
+            .submissions
+            .iter()
+            .filter(|s| s.status == Status::Running)
+            .map(|s| s.content.as_str())
+            .collect();
+        assert_eq!(contents, ["f1", "s1", "s2"]);
+        assert_eq!(c.submissions[2].status, Status::Queued);
+        let encoded = serde_json::to_value(c.queue_modes).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"steeringMode":"all", "followUpMode":"one-at-a-time"})
+        );
+    }
+
+    #[test]
     fn conflict_merge_rejects_non_admission_state_changes() {
         let base = Conversation {
             id: Uuid::new_v4(),
             config: config(),
+            queue_modes: QueueModes::default(),
             extensions: vec![],
             messages: vec![],
             transcript: None,

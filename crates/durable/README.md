@@ -147,3 +147,14 @@ conversation. Reporter receipts and answer IDs are retained and scanned without
 a retention policy.
 Full upstream semantics require ownership/background boundaries and corresponding
 task, tool and reporting integration.
+
+### Durable queue delivery modes
+
+`Harness::set_queue_modes` and `Scheduler::set_queue_modes` persist a
+conversation's `QueueModes { steering_mode, follow_up_mode }`. Both default to
+`QueueMode::OneAtATime`, including when reading older conversation records.
+Set either independently to `QueueMode::All` to place all queued inputs of
+that kind at the next eligible boundary. Post-tool boundaries select steers;
+final boundaries select both kinds in admission order, after queued resets
+and writes. Changes made during a run apply at the next boundary. Forks retain
+the selections.

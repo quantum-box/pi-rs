@@ -174,6 +174,8 @@ fn reporter_crash_worker() {
         .unwrap();
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let parent = h.create_conversation(config()).unwrap();
+    let child = h.ensure_subagent(parent, "reader", config()).unwrap().child;
+    h.submit(child, None, "bootstrap".into()).unwrap();
     let (link, first) = h
         .submit_subagent_reported(
             parent,

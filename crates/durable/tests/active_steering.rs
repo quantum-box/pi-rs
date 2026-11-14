@@ -179,22 +179,16 @@ async fn steering_waits_for_all_tools_and_drains_one_at_a_time_before_followup()
     acquire(&model.started).await;
     assert_eq!(
         users(&model.requests.lock().unwrap()[2]),
-        ["initial", "steer-a", "steer-b"]
-    );
-    model.release.add_permits(1);
-    acquire(&model.started).await;
-    assert_eq!(
-        users(&model.requests.lock().unwrap()[3]),
-        ["initial", "steer-a", "steer-b", "follow"]
+        ["initial", "steer-a", "follow", "steer-b"]
     );
     model.release.add_permits(1);
     s.wait(id).await.unwrap();
     let c = s.conversation(id).unwrap();
-    for sid in [initial, a, b] {
+    for sid in [initial, a] {
         assert_eq!(
             c.submissions.iter().find(|x| x.id == sid).unwrap().status,
             Status::Done {
-                answer: "answer3".into()
+                answer: "answer2".into()
             }
         );
     }
@@ -205,7 +199,13 @@ async fn steering_waits_for_all_tools_and_drains_one_at_a_time_before_followup()
             .unwrap()
             .status,
         Status::Done {
-            answer: "answer4".into()
+            answer: "answer3".into()
+        }
+    );
+    assert_eq!(
+        c.submissions.iter().find(|x| x.id == b).unwrap().status,
+        Status::Done {
+            answer: "answer3".into()
         }
     );
     s.shutdown().await.unwrap();
@@ -307,5 +307,65 @@ async fn old_conversation_snapshot_without_mode_map_deserializes() {
     value.as_object_mut().unwrap().remove("input_modes");
     let restored: pi_rs_durable::runtime::Conversation = serde_json::from_value(value).unwrap();
     assert_eq!(restored.id, id);
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn all_modes_persist_and_select_batches_at_boundaries() {
+    use pi_rs_durable::runtime::{QueueMode, QueueModes};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let mut s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    let modes = QueueModes {
+        steering_mode: QueueMode::All,
+        follow_up_mode: QueueMode::All,
+    };
+    s.set_queue_modes(id, modes).unwrap();
+    s.shutdown().await.unwrap();
+    let mut s = Scheduler::open(&path, opts(model.clone(), tool.clone())).unwrap();
+    assert_eq!(s.conversation(id).unwrap().queue_modes, modes);
+    s.set_queue_modes(id, QueueModes::default()).unwrap();
+    s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    s.set_queue_modes(id, modes).unwrap();
+    for (content, mode) in [
+        ("follow-a", InputMode::FollowUp),
+        ("steer-a", InputMode::Steer),
+        ("follow-b", InputMode::FollowUp),
+        ("steer-b", InputMode::Steer),
+    ] {
+        s.submit_with_mode(id, None, content.into(), mode).unwrap();
+    }
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    assert_eq!(
+        users(&model.requests.lock().unwrap()[1]),
+        ["initial", "steer-a", "steer-b"]
+    );
+    model.release.add_permits(1);
+    acquire(&model.started).await;
+    assert_eq!(
+        users(&model.requests.lock().unwrap()[2]),
+        ["initial", "steer-a", "steer-b", "follow-a", "follow-b"]
+    );
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let c = s.conversation(id).unwrap();
+    assert_eq!(
+        c.submissions[1].status,
+        Status::Done {
+            answer: "answer3".into()
+        }
+    );
+    assert_eq!(
+        c.submissions[3].status,
+        Status::Done {
+            answer: "answer3".into()
+        }
+    );
     s.shutdown().await.unwrap();
 }
