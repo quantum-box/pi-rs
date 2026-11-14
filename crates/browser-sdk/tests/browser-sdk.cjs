@@ -49,6 +49,12 @@ try {
   let recovered = await BrowserSession.open('bad', base + '/gateway', 'test-model', '', 1500); await recovered.close(); recovered.free();
   let session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
   await reject(BrowserSession.open('test', base + '/gateway', 'test-model', '', 1500), 'already open');
+  const frame = document.createElement('iframe'); frame.src = '/contend'; document.body.append(frame);
+  const lockResult = await new Promise(resolve => {
+    function onMessage(event) { if (event.source === frame.contentWindow) { window.removeEventListener('message', onMessage); resolve(event.data); } }
+    window.addEventListener('message', onMessage);
+  });
+  frame.remove(); assert(lockResult === 'locked', 'other browser context acquired session');
   assert(await session.prompt('first') === 'answer one', 'first answer');
   let messages = JSON.parse(session.messages());
   assert(messages.some(m => m.content === 'first') && messages.some(m => m.content === 'answer one'), 'saved messages');
@@ -88,6 +94,11 @@ try {
 } catch(e) { document.body.textContent = 'FAIL ' + String(e) + ' ' + (e.stack || ''); }
 </script></body>`;
   const site = http.createServer((req, res) => {
+    if (req.url === '/contend') {
+      res.setHeader('content-type', 'text/html');
+      res.end(`<!doctype html><script type="module">import init,{BrowserSession} from '/pkg/pi_rs_browser_sdk.js'; try { await init(); const session = await BrowserSession.open('test', ${JSON.stringify(origin)} + '/gateway', 'test-model', '', 1500); await session.close(); session.free(); parent.postMessage('unexpected', location.origin); } catch (e) { parent.postMessage(String(e).includes('already open') ? 'locked' : String(e), location.origin); }</script>`);
+      return;
+    }
     if (req.url === '/cancel-started') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(requests.some(r => r.messages.some(m => m.content === 'cancel me')))); return; }
     if (req.url === '/') { res.setHeader('content-type', 'text/html'); res.end(html); return; }
     const name = path.basename(req.url);
