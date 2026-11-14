@@ -850,4 +850,135 @@ mod tests {
         assert_eq!(scheduler.subagent_status(parent, None).unwrap().len(), 1);
         scheduler.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn default_management_excludes_global_subagent_and_persists_selection() {
+        use crate::{recovery::ReplayPolicy, runtime::RegisteredTool};
+        struct Named(&'static str);
+        #[async_trait]
+        impl Tool for Named {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("unexpected tool execution")
+            }
+        }
+        struct Inspect;
+        #[async_trait]
+        impl Model for Inspect {
+            async fn stream(&self, req: ModelRequest) -> Result<ModelStream, Error> {
+                use pi_rs_core::{Message, ToolCall};
+                let names: Vec<_> = req.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"read"));
+                let parent = req
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::User { content } if content == "start"));
+                if parent {
+                    assert!(names.contains(&"subagent"));
+                    if !req
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m, Message::Tool { .. }))
+                    {
+                        return Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                            calls: vec![ToolCall {
+                                id: "delegate".into(),
+                                name: "subagent".into(),
+                                arguments:
+                                    json!({"action":"send","name":"worker","message":"hello"})
+                                        .to_string(),
+                            }],
+                            usage: None,
+                        })])
+                        .boxed());
+                    }
+                } else {
+                    assert!(!names.contains(&"subagent"));
+                }
+                Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                })])
+                .boxed())
+            }
+        }
+        let opts = || {
+            let mut o = options();
+            o.model = Arc::new(Inspect);
+            for name in ["subagent", "read"] {
+                o.tools.push(RegisteredTool {
+                    tool: Arc::new(Named(name)),
+                    replay: ReplayPolicy::Safe,
+                });
+            }
+            o
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        drop(h);
+        let mut scheduler = Scheduler::open_with_subagent_management(
+            &path,
+            opts(),
+            Default::default(),
+            parent,
+            config(),
+        )
+        .unwrap();
+        scheduler
+            .select_extensions(parent, vec![extension_name(parent)])
+            .unwrap();
+        scheduler.submit(parent, None, "start".into()).unwrap();
+        let child = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let statuses = scheduler.subagent_status(parent, Some("worker")).unwrap();
+                if let Some(status) = statuses.first() {
+                    if scheduler
+                        .conversation(status.link.child)
+                        .is_ok_and(|c| !c.submissions.is_empty())
+                    {
+                        break status.link.child;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(
+                scheduler.conversation(child).unwrap().submissions[0].status,
+                crate::runtime::Status::Done { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scheduler.conversation(child).unwrap().allowed_tools,
+            Some(vec!["read".into()])
+        );
+        scheduler.shutdown().await.unwrap();
+        let scheduler = Scheduler::open_with_subagent_management(
+            &path,
+            opts(),
+            Default::default(),
+            parent,
+            config(),
+        )
+        .unwrap();
+        assert_eq!(
+            scheduler.conversation(child).unwrap().allowed_tools,
+            Some(vec!["read".into()])
+        );
+        scheduler.shutdown().await.unwrap();
+    }
 }

@@ -261,12 +261,21 @@ Create the parent first with `Harness::open_paused`, then open the scheduler and
 select `subagent_management::extension_name(parent)` on that settled parent,
 preserving any other selected extensions. On reopen use the same constructor,
 parent and child configuration: the extension must be installed before recovery.
-For restricted children use `Scheduler::open_with_restricted_subagent_management`
-with an explicit child allowlist, including on reopen. `None` retains the existing
-unrestricted behavior; `Some(vec![])` disables all child tools. The bound selection
-is recorded per named child, and changing it for an existing name is rejected.
-The tool exposes `status` (upstream's name, optionally filtered by name), its
-existing alias `list`, `stop`, and `send` (optional `follow_up` or `steer` mode).
+By default, new managed children receive an allowlist of the global tool names
+registered in `options` at scheduler open, excluding `subagent`. This mirrors the
+upstream examples' removal of their subagent extension to prevent recursive
+delegation. Named children also start without selected extensions. The allowlist
+is captured, so tools added later, including extension tools selected later, are
+not automatically enabled. Reopen with the same tool names: a changed default
+selection is rejected when sending to an existing named child. Existing children
+created without a restriction retain their selection; to keep sending to them,
+use `open_with_restricted_subagent_management` with `None` (the legacy policy).
+That constructor and `open_with_provider_and_subagent_management` use the explicit
+selection supplied by the host: `None` is unrestricted, while `Some(vec![])`
+disables all child tools. The bound selection is recorded per named child, and
+changing it for an existing name is rejected. The restriction is by tool name,
+not by extension identity, and trusted tools may have effects outside dispatch.
+The tool exposes `status` (or its alias `list`), `stop`, and `send` (optional `follow_up` or `steer` mode).
 A send creates the named child if needed and queues its answer as a parent
 follow-up. Calls with the same persisted operation ID reuse the first message,
 child and reporter; a new operation ID is a new send. `stop` addresses only a
@@ -294,9 +303,8 @@ the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is
 provided. Named links are independent, not task-owned background anchors.
 
-This is not the complete upstream background-subagent extension. There is no
-default child-tool restriction or ownership tree for these named links. Explicit
-restrictions are opt-in. Named children do not inherit parent management extensions.
+This is not the complete upstream background-subagent extension. Named links do
+not form an ownership tree, and named children do not inherit parent management extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.

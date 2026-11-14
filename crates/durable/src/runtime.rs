@@ -721,6 +721,18 @@ pub(crate) fn validate_allowed_tools(names: &Option<Vec<String>>) -> Result<(), 
     Ok(())
 }
 
+pub(crate) fn default_subagent_tools(options: &Options) -> Vec<String> {
+    let mut allowed: Vec<_> = options
+        .tools
+        .iter()
+        .map(|t| t.tool.spec().name)
+        .filter(|name| name != "subagent")
+        .collect();
+    allowed.sort();
+    allowed.dedup();
+    allowed
+}
+
 impl Harness {
     /// Read committed extension error batches. Batches remain available after reopening.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
@@ -5054,7 +5066,8 @@ impl Scheduler {
     ) -> Result<Self, Error> {
         Self::open_configured(path, options, registry, None, Some(adapter))
     }
-    /// Open with a parent-bound, opt-in background subagent extension installed before recovery.
+    /// Open with parent-bound management; new children exclude the `subagent` tool.
+    /// Other registered tool names are captured as an allowlist at open time.
     pub fn open_with_subagent_management(
         path: impl AsRef<Path>,
         options: Options,
@@ -5062,11 +5075,12 @@ impl Scheduler {
         parent: Uuid,
         child_config: Config,
     ) -> Result<Self, Error> {
+        let allowed = default_subagent_tools(&options);
         Self::open_configured(
             path,
             options,
             registry,
-            Some((parent, child_config, None)),
+            Some((parent, child_config, Some(allowed))),
             None,
         )
     }
