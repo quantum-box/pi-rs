@@ -244,7 +244,7 @@
 +    pub struct Unnameable(pub(super) Uri, pub(super) Option<Option<Intercepted>>);
 --- a/src/async_impl/client.rs
 +++ b/src/async_impl/client.rs
-@@ -141,0 +142,71 @@
+@@ -141,0 +142,81 @@
 +    routing: Option<Arc<RouteRouting>>,
 +}
 +
@@ -260,6 +260,10 @@
 +    tunnel: bool,
 +}
 +
++// One instance per redirect chain; the policy reattaches it to every hop.
++#[derive(Clone, Default)]
++pub(crate) struct ProxyAuthBinding(Arc<std::sync::Mutex<Option<RouteKey>>>);
++
 +struct RouteRouting {
 +    builder: hyper_util::client::legacy::Builder,
 +    connector: crate::connect::Connector,
@@ -267,8 +271,8 @@
 +    pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
 +}
 +
-+impl RouteRouting {
-+    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
++impl RouteKey {
++    fn for_route(route: &Option<crate::proxy::Intercepted>) -> Self {
 +        let headers: Vec<_> = route
 +            .as_ref()
 +            .and_then(|p| p.custom_headers())
@@ -278,7 +282,7 @@
 +                    .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
 +            })
 +            .collect();
-+        let key = RouteKey {
++        RouteKey {
 +            proxy: route.as_ref().map(|p| p.uri().to_string()),
 +            auth: route
 +                .as_ref()
@@ -291,7 +295,13 @@
 +                .map(|(user, pass)| (user.as_bytes().to_vec(), pass.as_bytes().to_vec())),
 +            headers,
 +            tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
-+        };
++        }
++    }
++}
++
++impl RouteRouting {
++    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
++        let key = RouteKey::for_route(&route);
 +        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
 +        if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
 +            let entry = pools.remove(index).expect("cached route");
@@ -316,7 +326,7 @@
 +        }
 +        client
 +    }
-@@ -153 +224,32 @@
+@@ -153 +234,43 @@
 -    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +        if let Some(routing) = &self.routing {
@@ -324,6 +334,17 @@
 +                .proxies
 +                .iter()
 +                .find_map(|proxy| proxy.intercept(req.uri()));
++            if let Some(binding) = req.extensions().get::<ProxyAuthBinding>().cloned() {
++                let key = RouteKey::for_route(&route);
++                let mut initial = binding.0.lock().unwrap_or_else(|e| e.into_inner());
++                match &*initial {
++                    Some(original) if *original != key => {
++                        req.headers_mut().remove(PROXY_AUTHORIZATION);
++                    }
++                    None => *initial = Some(key),
++                    _ => {}
++                }
++            }
 +            let forward_proxy = req.uri().scheme() == Some(&Scheme::HTTP)
 +                && route.as_ref().is_some_and(|proxy| {
 +                    !proxy.tunnel_http()
@@ -350,7 +371,7 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -156,0 +259,35 @@
+@@ -156,0 +280,35 @@
 +    }
 +}
 +
@@ -386,7 +407,7 @@
 +        }
 +        let mut inner = self.inner.clone();
 +        Box::pin(async move { inner.call(request).await })
-@@ -1008 +1145,12 @@
+@@ -1008 +1166,12 @@
 -        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
 +        let local_transport = connector_builder.uses_local_transport();
 +        let dynamic_routing = !proxies.is_empty() && !local_transport;
@@ -400,18 +421,18 @@
 +            })
 +        });
 +        let hyper_client = builder.build(connector);
-@@ -1010,0 +1159 @@
+@@ -1010,0 +1180 @@
 +            routing,
-@@ -1059 +1208,4 @@
+@@ -1059 +1229,4 @@
 -                        let h3_service = H3Client::new(h3_connector, config.pool_idle_timeout);
 +                        let h3_service = H3ProxyGuard {
 +                            inner: H3Client::new(h3_connector, config.pool_idle_timeout),
 +                            proxies: proxies.clone(),
 +                        };
-@@ -1097,0 +1250,2 @@
+@@ -1097,0 +1271,2 @@
 +                dynamic_routing,
 +                local_transport,
-@@ -2605,2 +2759,8 @@
+@@ -2605,2 +2780,8 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
 +        // Local sockets bypass proxy selection and must never inherit proxy
@@ -422,7 +443,7 @@
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2676,3 +2836,8 @@
+@@ -2676,3 +2857,8 @@
 -            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
 -                headers.insert(PROXY_AUTHORIZATION, header);
 -                break;
@@ -434,7 +455,7 @@
 +                    headers.insert(PROXY_AUTHORIZATION, header);
 +                    break;
 +                }
-@@ -2693,5 +2858,10 @@
+@@ -2693,5 +2879,10 @@
 -            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
 -                iter.iter().for_each(|(key, value)| {
 -                    headers.insert(key, value.clone());
@@ -450,12 +471,21 @@
 +                    });
 +                    break;
 +                }
-@@ -2918 +3088 @@
+@@ -2918 +3109 @@
 -    h3_client: Option<LayeredService<H3Client>>,
 +    h3_client: Option<LayeredService<H3ProxyGuard>>,
-@@ -2925,0 +3096,2 @@
+@@ -2925,0 +3117,2 @@
 +    dynamic_routing: bool,
 +    local_transport: bool,
-@@ -2998 +3170 @@
+@@ -2998 +3191 @@
 -    H3(LayeredFuture<H3Client>),
 +    H3(LayeredFuture<H3ProxyGuard>),
+--- a/src/redirect.rs
++++ b/src/redirect.rs
+@@ -269,0 +270 @@
++    proxy_auth_binding: Option<async_impl::client::ProxyAuthBinding>,
+@@ -278,0 +280 @@
++            proxy_auth_binding: None,
+@@ -336,0 +339,2 @@
++        let binding = self.proxy_auth_binding.get_or_insert_with(Default::default);
++        req.extensions_mut().insert(binding.clone());

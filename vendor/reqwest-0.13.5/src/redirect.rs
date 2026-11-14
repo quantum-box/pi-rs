@@ -268,6 +268,7 @@ pub(crate) struct TowerRedirectPolicy {
     referer: bool,
     urls: Vec<Url>,
     https_only: bool,
+    proxy_auth_binding: Option<async_impl::client::ProxyAuthBinding>,
 }
 
 impl TowerRedirectPolicy {
@@ -277,6 +278,7 @@ impl TowerRedirectPolicy {
             referer: false,
             urls: Vec::new(),
             https_only: false,
+            proxy_auth_binding: None,
         }
     }
 
@@ -335,6 +337,8 @@ impl TowerPolicy<async_impl::body::Body, crate::Error> for TowerRedirectPolicy {
     }
 
     fn on_request(&mut self, req: &mut http::Request<async_impl::body::Body>) {
+        let binding = self.proxy_auth_binding.get_or_insert_with(Default::default);
+        req.extensions_mut().insert(binding.clone());
         if let Ok(next_url) = Url::parse(&req.uri().to_string()) {
             remove_sensitive_headers(req.headers_mut(), &next_url, &self.urls);
             if self.referer {

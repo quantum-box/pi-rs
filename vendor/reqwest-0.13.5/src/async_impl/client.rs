@@ -154,6 +154,10 @@ struct RouteKey {
     tunnel: bool,
 }
 
+// One instance per redirect chain; the policy reattaches it to every hop.
+#[derive(Clone, Default)]
+pub(crate) struct ProxyAuthBinding(Arc<std::sync::Mutex<Option<RouteKey>>>);
+
 struct RouteRouting {
     builder: hyper_util::client::legacy::Builder,
     connector: crate::connect::Connector,
@@ -161,8 +165,8 @@ struct RouteRouting {
     pools: std::sync::Mutex<std::collections::VecDeque<(RouteKey, HyperClient)>>,
 }
 
-impl RouteRouting {
-    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
+impl RouteKey {
+    fn for_route(route: &Option<crate::proxy::Intercepted>) -> Self {
         let headers: Vec<_> = route
             .as_ref()
             .and_then(|p| p.custom_headers())
@@ -172,7 +176,7 @@ impl RouteRouting {
                     .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
             })
             .collect();
-        let key = RouteKey {
+        RouteKey {
             proxy: route.as_ref().map(|p| p.uri().to_string()),
             auth: route
                 .as_ref()
@@ -185,7 +189,13 @@ impl RouteRouting {
                 .map(|(user, pass)| (user.as_bytes().to_vec(), pass.as_bytes().to_vec())),
             headers,
             tunnel: route.as_ref().is_some_and(|p| p.tunnel_http()),
-        };
+        }
+    }
+}
+
+impl RouteRouting {
+    fn client(&self, route: Option<crate::proxy::Intercepted>) -> HyperClient {
+        let key = RouteKey::for_route(&route);
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = pools.iter().position(|(candidate, _)| *candidate == key) {
             let entry = pools.remove(index).expect("cached route");
@@ -227,6 +237,17 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
                 .proxies
                 .iter()
                 .find_map(|proxy| proxy.intercept(req.uri()));
+            if let Some(binding) = req.extensions().get::<ProxyAuthBinding>().cloned() {
+                let key = RouteKey::for_route(&route);
+                let mut initial = binding.0.lock().unwrap_or_else(|e| e.into_inner());
+                match &*initial {
+                    Some(original) if *original != key => {
+                        req.headers_mut().remove(PROXY_AUTHORIZATION);
+                    }
+                    None => *initial = Some(key),
+                    _ => {}
+                }
+            }
             let forward_proxy = req.uri().scheme() == Some(&Scheme::HTTP)
                 && route.as_ref().is_some_and(|proxy| {
                     !proxy.tunnel_http()

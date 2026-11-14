@@ -51,7 +51,8 @@ environment values take precedence over the setting. Proxy URL credentials are
 not displayed in the settings list. Workbench-configured reqwest proxies use
 CONNECT for HTTP as well as HTTPS origins, matching Pi. Externally supplied
 authenticated forward-only proxies retain forward behavior. Proxy decisions are captured per request and route-specific connection pools prevent
-credentials from following a request onto another route. Caller-provided proxy
+credentials from following a request onto another route. Caller-provided forward
+proxy authorization is bound to the first route across redirects. Caller-provided proxy
 authorization is removed for direct, local-socket and tunneled requests; configure
 tunnel credentials on the proxy itself. HTTP/3 rejects matched proxy routes rather
 than bypassing them. Other network surfaces need integration.

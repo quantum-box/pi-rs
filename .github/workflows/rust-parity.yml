@@ -59,6 +59,10 @@ jobs:
             cp -R "vendor/reqwest-$version" "$RUNNER_TEMP/reqwest-$version"
             cargo +stable check --manifest-path "$RUNNER_TEMP/reqwest-$version/Cargo.toml" --lib --features http3
           done
+      - name: Test HTTP/3 proxy isolation on QUIC loopback
+        env:
+          RUSTFLAGS: --cfg reqwest_unstable
+        run: cargo +stable test --locked --manifest-path fixtures/reqwest-http3/Cargo.toml
 
   native:
     name: Native tests (${{ matrix.os }})

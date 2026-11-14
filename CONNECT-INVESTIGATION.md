@@ -110,3 +110,8 @@ bypass proxy headers, and direct and tunneled requests discard caller-provided
 proxy authorization; configure CONNECT credentials on the proxy. HTTP/3 fails
 closed when a proxy matches, because its connector does not implement proxy
 routing. These changes are pending public CI and independent review.
+
+Caller-provided forward proxy authorization is bound to the first route in a
+redirect chain. A change of route removes that authorization before applying
+any credentials configured for the newly selected proxy; the same route keeps
+the caller header. This behavior is pending public CI and independent review.

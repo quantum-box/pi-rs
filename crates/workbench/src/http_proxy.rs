@@ -388,6 +388,62 @@ pub(super) async fn test_proxy(
 mod tests {
     use super::*;
 
+    macro_rules! redirect_proxy_auth_binding {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                async fn receive(listener: &TcpListener, response: &'static [u8]) -> String {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap();
+                        if line == "\r\n" || line.is_empty() { break; }
+                        request.push_str(&line);
+                    }
+                    socket.write_all(response).await.unwrap();
+                    request
+                }
+                let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a_address = a.local_addr().unwrap();
+                let b_address = b.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let first = receive(&a, b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let second = receive(&a, b"HTTP/1.1 302 Found\r\nLocation: /different\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let third = receive(&b, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    (first, second, third)
+                });
+                let count = Arc::new(AtomicUsize::new(0));
+                let calls = count.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let address = if calls.fetch_add(1, Ordering::SeqCst) < 2 { a_address } else { b_address };
+                    Some(format!("http://{address}"))
+                });
+                let client = $client::Client::builder().no_proxy().proxy(proxy).build().unwrap();
+                let response = timeout(Duration::from_secs(10), client.get("http://origin.invalid/first")
+                    .header("proxy-authorization", "Basic c2VjcmV0").send()).await.unwrap().unwrap();
+                assert!(response.status().is_success());
+                let (first, second, third) = server.await.unwrap();
+                for request in [first, second] {
+                    assert!(request.to_ascii_lowercase().contains("proxy-authorization: basic c2vjcmv0"), "{request}");
+                }
+                assert!(!third.to_ascii_lowercase().contains("proxy-authorization"), "{third}");
+                assert_eq!(count.load(Ordering::SeqCst), 3);
+            }
+        };
+    }
+    redirect_proxy_auth_binding!(redirect_keeps_caller_auth_bound_to_original_proxy, reqwest);
+    redirect_proxy_auth_binding!(
+        mcp_redirect_keeps_caller_auth_bound_to_original_proxy,
+        reqwest_mcp
+    );
+
     macro_rules! static_proxy_security {
         ($tunnel:ident, $ordered:ident, $local:ident, $client:ident) => {
             #[tokio::test]
