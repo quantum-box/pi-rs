@@ -178,6 +178,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_anthropic_reasoning_without_map_supports_default_levels() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({
+            "providers": {"anthropic": {"models": [
+                {"id":"custom-reasoning", "reasoning":true},
+                {"id":"custom-plain", "reasoning":false},
+                {"id":"custom-mapped", "reasoning":true,
+                 "thinkingLevelMap":{"off":null, "medium":null, "xhigh":"high"}}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("anthropic").unwrap();
+        args.model = "custom-reasoning".into();
+        args.thinking = Some("high".into());
+        adjust(&mut args);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert_eq!(
+            available(&mut args),
+            ["off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("minimal"));
+
+        args.model = "custom-plain".into();
+        assert_eq!(available(&mut args), ["off"]);
+        args.model = "custom-mapped".into();
+        assert_eq!(available(&mut args), ["minimal", "low", "high", "xhigh"]);
+    }
+
+    #[test]
     fn vercel_reasoning_model_retains_offline_thinking_level() {
         use clap::Parser;
         let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
