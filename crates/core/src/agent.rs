@@ -6511,6 +6511,95 @@ mod tree_tests {
         assert!(overflow_recovery_attempted(&session, run_id));
     }
 
+    #[tokio::test]
+    async fn interrupted_overflow_summary_is_not_resent_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow-interrupted.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("pi-rs:context-overflow".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Failed),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(Uuid::new_v4()),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            })
+            .unwrap();
+        drop(session);
+
+        let mut session = Session::open(&path).unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let error = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted overflow summary requires reconciliation"),
+            "{error}"
+        );
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            0,
+            "must not resend a potentially billable request"
+        );
+    }
+
     struct LegacyCompaction(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
     impl crate::Extension for LegacyCompaction {
         fn id(&self) -> &str {
