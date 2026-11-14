@@ -890,6 +890,11 @@ fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
 
 // Pi's GFM tokenizer links bare URLs and emails, but stops URLs at CJK
 // punctuation. Explicit Markdown links are handled separately by the parser.
+#[cfg(test)]
+thread_local! {
+    static BARE_LINK_SEARCHES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
     static EMAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+"#).unwrap()
@@ -908,11 +913,21 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
         if next_web.is_none_or(|cached: Option<regex::Match<'_>>| {
             cached.is_some_and(|m| m.start() < offset)
         }) {
+            #[cfg(test)]
+            BARE_LINK_SEARCHES.with(|counts| {
+                let (web, mail) = counts.get();
+                counts.set((web + 1, mail));
+            });
             next_web = Some(URL.find_at(text, offset));
         }
         if next_mail.is_none_or(|cached: Option<regex::Match<'_>>| {
             cached.is_some_and(|m| m.start() < offset)
         }) {
+            #[cfg(test)]
+            BARE_LINK_SEARCHES.with(|counts| {
+                let (web, mail) = counts.get();
+                counts.set((web, mail + 1));
+            });
             next_mail = Some(EMAIL.find_at(text, offset));
         }
         let web = next_web.flatten();
@@ -2489,11 +2504,12 @@ mod tests {
 
     #[test]
     fn long_link_lists_keep_every_target() {
-        for (item, expected) in [
-            ("user@example.com", "mailto:user@example.com"),
-            ("https://example.com", "https://example.com"),
+        for (item, expected, absent_is_web) in [
+            ("user@example.com", "mailto:user@example.com", true),
+            ("https://example.com", "https://example.com", false),
         ] {
             let source = vec![item; 512].join(" ");
+            BARE_LINK_SEARCHES.with(|counts| counts.set((0, 0)));
             let links = bare_links(&source);
             assert_eq!(links.len(), 512);
             assert!(
@@ -2501,6 +2517,8 @@ mod tests {
                     .iter()
                     .all(|(_, target)| target.as_deref() == Some(expected))
             );
+            let (web, mail) = BARE_LINK_SEARCHES.with(|counts| counts.get());
+            assert_eq!(if absent_is_web { web } else { mail }, 1, "{item}");
         }
     }
 
