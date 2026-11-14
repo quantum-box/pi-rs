@@ -356,6 +356,29 @@ fn concurrent_same_request_wins_before_busy_rejection() {
 }
 
 #[test]
+fn duplicate_input_is_returned_before_content_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let original = owner
+        .submit(id, Some("request".into()), "hello".into())
+        .unwrap();
+    assert_eq!(
+        owner
+            .submit(id, Some("request".into()), " ".into())
+            .unwrap(),
+        original
+    );
+    assert!(owner.submit(id, Some("new".into()), " ".into()).is_err());
+}
+
+#[test]
 fn concurrent_writes_deduplicate_and_merge_with_execution() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

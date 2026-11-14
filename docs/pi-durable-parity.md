@@ -24,9 +24,7 @@ P0 means recovery/effect safety or fundamental execution semantics; P1 means cor
 conversation helper now support optional busy and idle rejection for input,
 with request-ID deduplication before the policy check and version-checked
 admission under contention. Busy means an active run, even when queued input
-remains after a failed run. Unlike upstream, runtime input validation still
-precedes deduplication, and arbitrary host transactions / `submit(tx, draft)`
-are not supported. See the admission concurrency and recovery tests in
+remains after a failed run. Duplicate input request IDs are resolved before content validation. Arbitrary host transactions / `submit(tx, draft)` are not supported. See the admission concurrency and recovery tests in
 [`runtime_cas_tests.rs`](../crates/durable/src/runtime_cas_tests.rs). The
 original audit table below remains a historical baseline.
 **Write-submission checkpoint:** The experimental runtime accepts display-only application entries through `submit_write`, persists them immediately while busy, and delays placement behind queued resets. Request IDs deduplicate within the conversation and cannot be reused across input and write types. Entries are exposed in `Conversation.application_writes` and observer snapshots with a placement flag and preceding reset ID. This is a narrower API than upstream: model messages, head edits, stale-head handling, generic entry transactions and write withdrawal are not implemented. Current forks and historical snapshots created after this change inherit application entries at the selected point, but not their request IDs. Queued writes are exposed as pending records, not placed transcript entries; observers must filter `placed`. The runtime still stores snapshots rather than an upstream ordered entry stream.

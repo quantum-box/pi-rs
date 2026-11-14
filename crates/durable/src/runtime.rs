@@ -1160,9 +1160,6 @@ impl Harness {
         content: String,
         options: AdmissionOptions,
     ) -> Result<Uuid, Error> {
-        if content.trim().is_empty() {
-            return Err(Error::Invalid("empty input".into()));
-        }
         loop {
             let (mut c, version) = self.load(id)?;
             if request_id.as_ref().is_some_and(|key| {
@@ -1181,6 +1178,9 @@ impl Harness {
                     .find(|s| s.request_id.as_ref() == Some(key))
             {
                 return Ok(s.id);
+            }
+            if content.trim().is_empty() {
+                return Err(Error::Invalid("empty input".into()));
             }
             let busy = c.active.is_some();
             if busy && options.reject_when_busy {
