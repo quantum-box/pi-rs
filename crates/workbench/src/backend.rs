@@ -580,6 +580,9 @@ async fn run_worker(
         &initial_session,
         args.mode == Some(super::OutputMode::Rpc),
     )));
+    // Session::open creates and exclusively locks a missing journal. Release
+    // that handle before the worker tries to open the same session.
+    drop(initial_session);
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
