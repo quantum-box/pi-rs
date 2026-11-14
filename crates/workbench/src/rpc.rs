@@ -2104,6 +2104,7 @@ fn forward_event(
 ) -> Result<()> {
     let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
                 event["command"].as_str(),
@@ -2246,6 +2247,99 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
     emit(value)
 }
 
+// The worker sends split UTF-16 units separately because JSON Value and Rust
+// String cannot carry an unpaired surrogate. Only this RPC response uses that
+// trusted sidecar; normal text and literal U+FFFD never act as sentinels.
+fn command_catalog_json(mut event: Value) -> Result<Vec<u8>> {
+    let Some(data) = event.get_mut("data").and_then(Value::as_object_mut) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let sidecar = data.remove("_pi_rs_prompt_surrogates");
+    let Some(entries) = sidecar.as_ref().and_then(Value::as_array) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let mut units = std::collections::BTreeMap::new();
+    for entry in entries {
+        if let (Some(index), Some(unit)) = (entry[0].as_u64(), entry[1].as_u64())
+            && (0xd800..=0xdbff).contains(&unit)
+            && let Ok(index) = usize::try_from(index)
+        {
+            units.insert(index, unit as u16);
+        }
+    }
+    fn object<W: Write>(
+        out: &mut W,
+        map: &serde_json::Map<String, Value>,
+        mut special: impl FnMut(&mut W, &str, &Value) -> Result<bool>,
+    ) -> Result<()> {
+        write!(out, "{{")?;
+        for (index, (key, value)) in map.iter().enumerate() {
+            if index > 0 {
+                write!(out, ",")?;
+            }
+            serde_json::to_writer(&mut *out, key)?;
+            write!(out, ":")?;
+            if !special(out, key, value)? {
+                serde_json::to_writer(&mut *out, value)?;
+            }
+        }
+        write!(out, "}}")?;
+        Ok(())
+    }
+    let mut output = Vec::new();
+    if let Some(root) = event.as_object() {
+        object(&mut output, root, |out, key, value| {
+            let Some(data) = (key == "data").then(|| value.as_object()).flatten() else {
+                return Ok(false);
+            };
+            object(out, data, |out, key, value| {
+                let Some(commands) = (key == "commands").then(|| value.as_array()).flatten() else {
+                    return Ok(false);
+                };
+                write!(out, "[")?;
+                for (index, command) in commands.iter().enumerate() {
+                    if index > 0 {
+                        write!(out, ",")?;
+                    }
+                    let unit = units.get(&index).filter(|_| command["source"] == "prompt");
+                    if let (Some(unit), Some(map)) = (unit, command.as_object()) {
+                        object(out, map, |out, key, value| {
+                            let Some(prefix) = (key == "description")
+                                .then(|| value.as_str())
+                                .flatten()
+                                .and_then(|s| s.strip_suffix("�..."))
+                            else {
+                                return Ok(false);
+                            };
+                            let mut quoted = serde_json::to_string(prefix)?;
+                            quoted.pop();
+                            write!(out, "{quoted}\\u{unit:04x}...\"")?;
+                            Ok(true)
+                        })?;
+                    } else {
+                        serde_json::to_writer(&mut *out, command)?;
+                    }
+                }
+                write!(out, "]")?;
+                Ok(true)
+            })?;
+            Ok(true)
+        })?;
+    } else {
+        output = serde_json::to_vec(&event)?;
+    }
+    Ok(output)
+}
+
+fn emit_command_catalog(event: Value) -> Result<()> {
+    let encoded = command_catalog_json(event)?;
+    let mut output = std::io::stdout().lock();
+    output.write_all(&encoded)?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
 fn emit(value: Value) -> Result<()> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{value}")?;
@@ -2257,6 +2351,26 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn command_catalog_encodes_only_recorded_surrogates() {
+        let event = json!({"type":"response", "command":"get_commands", "id":"�\\ud83d", "data":{
+            "commands":[
+                {"source":"prompt", "description":"literal �..."},
+                {"source":"prompt", "description":"quote\"\\�prefix�..."},
+                {"source":"prompt", "description":"second �..."},
+                {"source":"extension", "description":"extension �..."}
+            ],
+            "_pi_rs_prompt_surrogates":[[1, 0xd83d], [2, 0xd840], [3, 0xd83d]]
+        }});
+        let output = String::from_utf8(command_catalog_json(event).unwrap()).unwrap();
+        assert!(output.contains(r#""description":"literal �...""#));
+        assert!(output.contains(r#""description":"quote\"\\�prefix\ud83d...""#));
+        assert!(output.contains(r#""description":"second \ud840...""#));
+        assert!(output.contains(r#""description":"extension �...""#));
+        assert!(output.contains(r#""id":"�\\ud83d""#));
+        assert!(!output.contains("_pi_rs_prompt_surrogates"));
+    }
 
     #[test]
     fn rpc_session_identity_survives_import_export_and_fork() {

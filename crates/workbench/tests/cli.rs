@@ -172,6 +172,16 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     )
     .unwrap();
     std::fs::write(
+        prompts.join("replacement-cut.md"),
+        format!("{}�tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-before-cut.md"),
+        format!("{}�😀tail", "x".repeat(58)),
+    )
+    .unwrap();
+    std::fs::write(
         prompts.join("two-boms.md"),
         "\u{feff}\u{feff}---\ndescription: not frontmatter\n---\nbody",
     )
@@ -203,8 +213,11 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
+            // serde_json rejects unpaired surrogate escapes; preserve the raw
+            // wire line for exact assertions and normalize only for inspection.
+            let normalized = line.replace("\\ud83d", "\\ufffd");
             if sender
-                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .send((line, serde_json::from_str::<Value>(&normalized).unwrap()))
                 .is_err()
             {
                 break;
@@ -213,12 +226,16 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     });
     writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
     input.flush().unwrap();
-    let response = loop {
-        let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    let (wire, response) = loop {
+        let (wire, event) = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
         if event["id"] == "commands" {
-            break event;
+            break (wire, event);
         }
     };
+    assert!(wire.contains(&format!("{}\\ud83d...", "x".repeat(59))));
+    assert!(wire.contains(&format!("{}�\\ud83d...", "x".repeat(58))));
+    assert!(wire.contains(&format!("{}�...", "x".repeat(59))));
+    assert!(!wire.contains("_pi_rs_prompt_surrogates"));
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
