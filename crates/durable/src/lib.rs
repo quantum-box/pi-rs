@@ -17,6 +17,7 @@ pub mod reset;
 pub mod retry_policy;
 pub mod runtime;
 pub mod state;
+pub mod subagent;
 pub mod task;
 pub mod task_driver;
 pub mod task_scheduler;

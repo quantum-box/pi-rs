@@ -74,7 +74,7 @@ pub struct Options {
     pub uncertain_policy: UncertainPolicy,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub model: String,
     pub system_prompt: String,
@@ -302,6 +302,19 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
         }
     }
+    pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
+        if self.failed
+            || self.dirty.load(Ordering::Acquire)
+            || self.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        Ok(self.owner.store())
+    }
+    pub(crate) fn subagent_storage_failed(&mut self) {
+        self.failed = true;
+        self.storage_failed.store(true, Ordering::Release);
+    }
     fn key(id: Uuid) -> Vec<u8> {
         format!("runtime/conversation/{id}").into_bytes()
     }
@@ -440,10 +453,16 @@ impl Harness {
         Ok(())
     }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
+        self.create_conversation_with_id(Uuid::new_v4(), config)
+    }
+    pub(crate) fn create_conversation_with_id(
+        &mut self,
+        id: Uuid,
+        config: Config,
+    ) -> Result<Uuid, Error> {
         if config.model.is_empty() || config.max_output_tokens == 0 {
             return Err(Error::Invalid("model and output limit required".into()));
         }
-        let id = Uuid::new_v4();
         let state = Conversation {
             id,
             config,
@@ -1699,6 +1718,9 @@ impl Scheduler {
     }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.harness.create_conversation(config)
+    }
+    pub(crate) fn subagent_harness(&mut self) -> &mut Harness {
+        &mut self.harness
     }
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork(id)

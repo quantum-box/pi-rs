@@ -48,7 +48,7 @@ Current limits and differences from upstream Pi Durable:
   Automatic compaction requires a known context window; provider overflow retry
   and concurrent compaction remain unsupported. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
-  There is no built-in subagent or automatic conversation/task ownership tree.
+  The subagent link primitive does not provide an automatic conversation/task ownership tree.
 - Generic task waits support one deadline, one signal, or direct-child
   all/any/fail-fast joins. Combined waits and abort handlers are not yet
   implemented. Local cancellation propagates through descendants, but cannot
@@ -68,3 +68,17 @@ Current limits and differences from upstream Pi Durable:
 
 The design and planned parity work are in `docs/pi-durable-design.md`. Upstream
 reference: `earendil-works/pi` commit `827383a15262905f82e418483825a49dbb1adbf5`.
+
+`subagent` provides a persistent parent/key link to a separate conversation and
+idempotent admission using a caller-supplied request ID. A reservation is written
+before conversation creation; retry `ensure_subagent` after reopening to finish
+an interrupted creation. Children start empty with explicit configuration, not
+as copies of the parent. Reusing a key with different configuration is rejected.
+The scheduler resumes admitted conversations after restart. A link alone does not
+schedule work. This is a host primitive, not the upstream background-subagent
+extension: there is no automatic answer reporter, child-tool restriction, status
+command, or ownership-aware abort. Parent cancellation does not propagate to a
+child; the runtime has no per-conversation abort API. Implementing upstream
+semantics requires runtime ownership/background boundaries, targeted abort with
+executor fencing, and durable reporter/answer-deduplication transactions. The
+host must supply those integrations and reconcile external effects.
