@@ -4322,3 +4322,26 @@ the agent remain governed by the configured SDK policy.
 Pi's non-chat System One provider-level policy retries transient HTTP status
 codes including 429 without classifying the response body; native keeps that
 separate policy.
+
+### Provider quota retry classification
+
+Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
+recognize permanent account, billing and quota exhaustion in structured error
+message, code and type fields for retryable HTTP statuses and stream errors.
+Recognized transient stream errors, including Gemini errors without a numeric
+code, remain retryable after permanent-limit checks. OpenAI response codes are
+classified only after known credentials are masked.
+JSON metadata such as request IDs does not affect classification. Known request
+credentials, Bearer tokens and conventional authentication-header values are
+masked before classification, even when they equal quota or transient terms.
+Other configured header values are masked
+when distinguishable from those terms; ambiguous header values remain
+classifiable because an echo cannot be distinguished from a provider error.
+Diagnostics remain fixed and do not include provider bodies. Transient stream
+matching follows the pinned Pi patterns. OpenAI subscription
+codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
+seconds. Complete error fields preceding a truncated later JSON field remain
+classifiable; incomplete values and unrelated metadata are ignored. Failed or
+timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or
+returned. Bedrock typed SDK errors and non-chat operations retain their separate
+policies.
