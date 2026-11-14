@@ -168,6 +168,9 @@ struct Cli {
     no_session: bool,
     #[arg(long, hide = true)]
     ephemeral_worker_session: bool,
+    /// Internal frontend worker: terminal interrupts are handled by the parent.
+    #[arg(long, hide = true)]
+    terminal_managed_worker: bool,
     /// Print the final answer and exit.
     #[arg(short = 'p', long)]
     print: bool,
@@ -1301,15 +1304,28 @@ fn main() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> i32 {
-    // Register before parsing or starting any operation, including auth commands.
+    // Terminal-owned workers receive the same foreground-group SIGINT as the
+    // frontend and editor. Their parent handles terminal interrupts and sends
+    // explicit cancel/shutdown commands; do not independently stop the worker.
+    let argv: Vec<_> = std::env::args_os().collect();
+    let terminal_managed = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--terminal-managed-worker");
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = signal_tx.send(());
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if !terminal_managed {
+                let _ = signal_tx.send(());
+                break;
+            }
         }
     });
     tokio::task::yield_now().await;
-    let argv: Vec<_> = std::env::args_os().collect();
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {

@@ -606,6 +606,103 @@ static EXTERNAL_EDITOR_ACTIVE: std::sync::atomic::AtomicBool =
 static TERMINAL_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(all(test, unix))]
+static TERMINAL_SIGNAL_READER_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    writer.set_nonblocking(true)?;
+    // Capture the editor state in the signal handler, not later on the reader
+    // thread. write(2) is async-signal-safe and the stream stays registered
+    // for the lifetime of the process.
+    let id = unsafe {
+        signal_hook_registry::register(libc::SIGINT, move || {
+            if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+                let byte = [1_u8];
+                libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
+            }
+            #[cfg(test)]
+            TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+        })
+    }?;
+    if let Err(error) = std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let mut buffer = [0_u8; 64];
+            loop {
+                #[cfg(test)]
+                while TERMINAL_SIGNAL_READER_PAUSED.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        notify.notify_one();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    {
+        signal_hook_registry::unregister(id);
+        return Err(error.into());
+    }
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(windows)]
+static WINDOWS_TERMINAL_NOTIFY: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Weak<tokio::sync::Notify>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn terminal_console_signal(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    if event != windows_sys::Win32::System::Console::CTRL_C_EVENT {
+        return 0;
+    }
+    if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+        if let Some(notify) = WINDOWS_TERMINAL_NOTIFY
+            .get()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade))
+        {
+            notify.notify_one();
+        }
+    }
+    #[cfg(test)]
+    TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    1
+}
+
+#[cfg(windows)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let slot = WINDOWS_TERMINAL_NOTIFY.get_or_init(Default::default);
+    *slot.lock().expect("terminal notification lock") = Some(std::sync::Arc::downgrade(&notify));
+    // Console control callbacks run on a Windows-created thread, so the state
+    // is sampled when the event is delivered rather than by a later Tokio poll.
+    if unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(terminal_console_signal), 1)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -7865,6 +7962,7 @@ mod tests {
             return;
         }
         super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(true, Ordering::SeqCst);
         super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new())).unwrap();
         unsafe {
             libc::kill(libc::getpid(), libc::SIGINT);
@@ -7876,6 +7974,12 @@ mod tests {
         }
         assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
         super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst),
+            "editor SIGINT was processed after the editor closed"
+        );
         unsafe {
             libc::kill(libc::getpid(), libc::SIGINT);
         }
@@ -7886,6 +7990,42 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_signal_uses_editor_state_at_delivery() {
+        use std::sync::atomic::Ordering;
+        const CHILD: &str = "PI_RS_EDITOR_CONSOLE_SIGNAL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::console_signal_uses_editor_state_at_delivery",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        assert!(crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
     }
 
     #[cfg(unix)]

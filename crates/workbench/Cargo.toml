@@ -88,10 +88,13 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = "0.5"
 
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"
+
 [target.'cfg(windows)'.dependencies]
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

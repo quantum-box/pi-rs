@@ -4305,8 +4305,11 @@ request is cancelled while the job is in the background, terminal restoration
 and TUI redraw wait until the job is foregrounded. Correlated cancellation
 terminates and reaps the direct editor process; Unix editor descendants are not
 guaranteed to terminate. On Windows the job object also terminates wrapper
-descendants. Interrupts received while an editor is active do not disable
-subsequent terminal interrupt handling.
+descendants. Terminal-owned workers leave terminal SIGINT handling to the
+frontend, which sends explicit cancel or shutdown controls; this prevents an
+editor interrupt from independently stopping an active backend. The frontend
+samples editor activity when the interrupt is delivered, so a delayed signal
+notification does not cancel the session after the editor closes.
 The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint

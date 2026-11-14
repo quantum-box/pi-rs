@@ -2860,3 +2860,106 @@ fn bedrock_login_selects_profile_chain_and_logout() {
         serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
     assert!(auth.get("amazon-bedrock").is_none());
 }
+
+#[test]
+fn external_editor_ctrl_c_does_not_cancel_active_backend_shell() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let editor = root.path().join("editor");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ntrap 'printf done > \"$PI_RS_HOME/editor-done\"; exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    // Declare the process guard first so the PTY master closes before the
+    // guard waits, including on assertion failure.
+    let mut process: Process;
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("EDITOR", &editor)
+        .env("TERM", "xterm-256color")
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--offline",
+            "--model",
+            "fixture",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    process = Process(command.spawn().unwrap());
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master
+        .write_all(b"!echo WORKER_ACTIVE; while [ ! -f allow-worker ]; do sleep .1; done; echo survived > worker-marker\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("WORKER_ACTIVE"));
+    master.write_all(&[7]).unwrap();
+    output_until(&mut master, |text| text.contains("EDITOR_READY"));
+    master.write_all(&[3]).unwrap();
+    let editor_done = root.path().join("home/editor-done");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !editor_done.exists() && Instant::now() < deadline {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        editor_done.exists(),
+        "editor did not observe terminal Ctrl+C"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(root.path().join("allow-worker"), "go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !root.path().join("worker-marker").exists() && Instant::now() < deadline {
+        let mut bytes = [0; 8192];
+        let _ = master.read(&mut bytes);
+        assert!(process.0.try_wait().unwrap().is_none(), "frontend exited");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = root.path().join("worker-marker").exists();
+    // Closing the PTY before waiting prevents terminal teardown from blocking
+    // the test's process guard on platforms that drain an open master.
+    drop(master);
+    let _ = process.0.kill();
+    let _ = process.0.wait();
+    assert!(survived, "editor Ctrl+C cancelled active worker operation");
+}

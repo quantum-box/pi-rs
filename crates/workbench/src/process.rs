@@ -280,6 +280,24 @@ impl Worker {
             };
         }
 
+        if args.mode != Some(super::OutputMode::Rpc) {
+            command.arg("--terminal-managed-worker");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // Protect the startup interval before the worker installs its
+                // listener; a caught disposition is installed immediately in
+                // run_cli, before starting any child processes.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
         command
             .args(operation)
             .stdin(Stdio::piped())
