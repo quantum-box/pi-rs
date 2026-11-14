@@ -187,6 +187,14 @@ Current limits and differences from upstream Pi Durable:
   and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
   cleanup. Conversation abort marks foreground conversation-owned task descendants;
   foreground task-owned subagent conversations are included. Shutdown waits for an in-flight step.
+- Standalone task signals also support `SignalToken::new(name, version)`,
+  `Signal::new_typed`, and `WaitFor::TypedSignal(token.key(key)?)`. The stored
+  signal carries its positive version; waits match kind and key regardless of
+  version. Typed and legacy named waits do not consume each other's signals.
+  Legacy records and UUID-scoped idempotency remain supported. Unlike upstream,
+  these are JSON values without schema validation or migration; multiple receipt
+  IDs can use one key, and keys neither expire nor enforce one wait per key.
+  Typed keys are not supported in deadline-or-signal sleeps.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

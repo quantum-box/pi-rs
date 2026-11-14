@@ -28,6 +28,8 @@ pub struct Checkpoint {
 pub enum WaitFor {
     DeadlineMillis(i64),
     Signal(String),
+    /// Wait for one namespaced signal key, independent of its value version.
+    TypedSignal(crate::task_store::SignalKey),
     /// Wake on the first matching signal or when the absolute deadline passes.
     Sleep {
         until_millis: Option<i64>,

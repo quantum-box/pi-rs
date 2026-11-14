@@ -40,6 +40,66 @@ pub enum Error {
     InvalidOwnedBatch,
     #[error("task ownership cannot be changed")]
     OwnerChanged,
+    #[error("signal name, version, or key is invalid")]
+    InvalidSignalToken,
+}
+
+/// Identity and value version of a signal kind. Payload schemas and migration
+/// are the caller's responsibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalToken {
+    name: String,
+    version: u32,
+}
+
+/// Upstream-shaped signal kind and wait key; versions do not affect matching.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalKey {
+    signal: String,
+    key: String,
+}
+
+impl SignalToken {
+    pub fn new(name: impl Into<String>, version: u32) -> Result<Self, Error> {
+        let name = name.into();
+        if name.is_empty() || name.contains('/') || version == 0 {
+            return Err(Error::InvalidSignalToken);
+        }
+        Ok(Self { name, version })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn key(&self, key: impl Into<String>) -> Result<SignalKey, Error> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err(Error::InvalidSignalToken);
+        }
+        Ok(SignalKey {
+            signal: self.name.clone(),
+            key,
+        })
+    }
+}
+
+impl SignalKey {
+    pub fn signal(&self) -> &str {
+        &self.signal
+    }
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TypedSignal {
+    key: SignalKey,
+    version: u32,
 }
 
 /// A task and the storage version that must be supplied for its next update.
@@ -71,6 +131,8 @@ pub struct Signal {
     pub name: String,
     pub payload: Value,
     consumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    typed: Option<TypedSignal>,
 }
 
 impl Signal {
@@ -81,7 +143,36 @@ impl Signal {
             name,
             payload,
             consumed: false,
+            typed: None,
         }
+    }
+    /// Construct a versioned signal. IDs retain their existing task-scoped
+    /// deduplication semantics; multiple IDs may use the same signal key.
+    pub fn new_typed(
+        id: Uuid,
+        task_id: Uuid,
+        token: &SignalToken,
+        key: impl Into<String>,
+        payload: Value,
+    ) -> Result<Self, Error> {
+        let key = token.key(key)?;
+        Ok(Self {
+            id,
+            task_id,
+            name: token.name.clone(),
+            payload,
+            consumed: false,
+            typed: Some(TypedSignal {
+                key,
+                version: token.version,
+            }),
+        })
+    }
+    pub fn typed_key(&self) -> Option<&SignalKey> {
+        self.typed.as_ref().map(|typed| &typed.key)
+    }
+    pub fn typed_version(&self) -> Option<u32> {
+        self.typed.as_ref().map(|typed| typed.version)
     }
     pub fn is_consumed(&self) -> bool {
         self.consumed
@@ -262,6 +353,7 @@ impl<'a> TaskStore<'a> {
                     && old.task_id == fresh.task_id
                     && old.name == fresh.name
                     && old.payload == fresh.payload
+                    && old.typed == fresh.typed
                 {
                     return Ok(());
                 }
@@ -338,7 +430,30 @@ impl<'a> TaskStore<'a> {
                 let mut found = None;
                 for (k, entry) in self.store.list(&prefix)? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
-                    if !signal.consumed && signal.name == *name {
+                    if !signal.consumed && signal.typed.is_none() && signal.name == *name {
+                        found = Some((k, entry.version, signal));
+                        break;
+                    }
+                }
+                let Some((k, version, mut signal)) = found else {
+                    return Ok(WakeResult::Pending);
+                };
+                signal.consumed = true;
+                checks.push(Check {
+                    key: k.clone(),
+                    expected: Expected::Version(version),
+                });
+                mutations.push(Mutation::Put {
+                    key: k,
+                    value: serde_json::to_vec(&signal)?,
+                });
+                delivered = Some(signal);
+            }
+            WaitFor::TypedSignal(key) => {
+                let mut found = None;
+                for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
+                    let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if !signal.consumed && signal.typed_key() == Some(key) {
                         found = Some((k, entry.version, signal));
                         break;
                     }
@@ -372,7 +487,8 @@ impl<'a> TaskStore<'a> {
                 let mut found = None;
                 for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
-                    if !signal.consumed && signals.contains(&signal.name) {
+                    if !signal.consumed && signal.typed.is_none() && signals.contains(&signal.name)
+                    {
                         found = Some((k, entry.version, signal));
                         break;
                     }
