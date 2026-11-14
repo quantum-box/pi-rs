@@ -3,57 +3,105 @@
 use std::sync::Arc;
 
 use pi_rs_core::{AgentSession, Model, SessionBuilder, SessionControl};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
-struct AppState {
+pub struct AppState {
     session: Mutex<AgentSession>,
     control: SessionControl,
+    closing: watch::Sender<bool>,
+    #[cfg(test)]
+    admissions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    startup_gate: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
-#[tauri::command]
-async fn prompt(state: tauri::State<'_, AppState>, text: String) -> Result<String, String> {
-    state
-        .session
-        .lock()
-        .await
-        .prompt(text)
-        .await
-        .map_err(|error| error.to_string())
+/// Commands can be composed with application commands in one invoke handler.
+pub mod commands {
+    use super::*;
+
+    #[tauri::command]
+    pub async fn prompt(state: tauri::State<'_, AppState>, text: String) -> Result<String, String> {
+        let mut closing = state.closing.subscribe();
+        #[cfg(test)]
+        state
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let closed = || "session is closing".to_owned();
+        let mut session = tokio::select! {
+            biased;
+            _ = closing.wait_for(|closing| *closing) => return Err(closed()),
+            session = state.session.lock() => session,
+        };
+        tokio::select! {
+            biased;
+            _ = closing.wait_for(|closing| *closing) => {
+                state.control.abort();
+                Err(closed())
+            }
+            result = async {
+                #[cfg(test)]
+                {
+                    let gate = state.startup_gate.lock().unwrap().take();
+                    if let Some(entered) = gate {
+                        entered.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                }
+                session.prompt(text).await
+            } => result.map_err(|error| error.to_string()),
+        }
+    }
+
+    #[tauri::command]
+    pub fn abort(state: tauri::State<'_, AppState>) {
+        state.control.abort();
+    }
+
+    #[tauri::command]
+    pub async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
+        state.closing.send_replace(true);
+        state.control.abort();
+        state
+            .session
+            .lock()
+            .await
+            .close()
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
-#[tauri::command]
-fn abort(state: tauri::State<'_, AppState>) {
-    state.control.abort();
+/// Create state for a Tauri builder without installing an invoke handler.
+pub fn session_state(model: Arc<dyn Model>, model_name: &str) -> pi_rs_core::Result<AppState> {
+    let session = SessionBuilder::new(model, model_name).in_memory()?;
+    let control = session.controls();
+    let (closing, _) = watch::channel(false);
+    Ok(AppState {
+        session: Mutex::new(session),
+        control,
+        closing,
+        #[cfg(test)]
+        admissions: std::sync::atomic::AtomicUsize::new(0),
+        #[cfg(test)]
+        startup_gate: std::sync::Mutex::new(None),
+    })
 }
 
-#[tauri::command]
-async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.control.abort();
-    state
-        .session
-        .lock()
-        .await
-        .close()
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Register a single in-memory session and its commands on a host-supplied builder.
-/// This installs the builder's invoke handler, replacing any existing handler.
-/// Applications with other commands must register them in the same handler.
+/// Install the fixture's state and a handler containing its three commands.
+/// This replaces any prior invoke handler; use `session_state` and register all
+/// public commands in one handler when composing with application commands.
 pub fn configure<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     model: Arc<dyn Model>,
     model_name: &str,
 ) -> pi_rs_core::Result<tauri::Builder<R>> {
-    let session = SessionBuilder::new(model, model_name).in_memory()?;
-    let control = session.controls();
     Ok(builder
-        .manage(AppState {
-            session: Mutex::new(session),
-            control,
-        })
-        .invoke_handler(tauri::generate_handler![prompt, abort, close]))
+        .manage(session_state(model, model_name)?)
+        .invoke_handler(tauri::generate_handler![
+            commands::prompt,
+            commands::abort,
+            commands::close
+        ]))
 }
 
 #[cfg(test)]
@@ -142,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_ipc_close_aborts_a_stalled_prompt() {
+    fn mock_ipc_close_aborts_active_and_queued_prompts() {
         use std::time::Duration;
         let (entered, started) = std::sync::mpsc::channel();
         let app = configure(
@@ -168,6 +216,28 @@ mod tests {
         started
             .recv_timeout(Duration::from_secs(5))
             .expect("prompt did not start");
+        let queued_view = webview.clone();
+        let (queued_sender, queued_result) = std::sync::mpsc::channel();
+        let queued_thread = std::thread::spawn(move || {
+            let response = tauri::test::get_ipc_response(
+                &queued_view,
+                request("prompt", serde_json::json!({"text":"queued"})),
+            );
+            queued_sender.send(response.is_err()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app
+            .state::<AppState>()
+            .admissions
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second prompt was not admitted"
+            );
+            std::thread::yield_now();
+        }
         let close_view = webview.clone();
         let (close_sender, close_result) = std::sync::mpsc::channel();
         let close_thread = std::thread::spawn(move || {
@@ -185,8 +255,14 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("prompt was not aborted")
         );
+        assert!(
+            queued_result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("queued prompt was not rejected")
+        );
         close_thread.join().unwrap();
         prompt_thread.join().unwrap();
+        queued_thread.join().unwrap();
         assert!(
             tauri::test::get_ipc_response(
                 &webview,
@@ -194,5 +270,50 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mock_ipc_close_cancels_prompt_before_run_registration() {
+        use std::time::Duration;
+        let app = configure(tauri::test::mock_builder(), Arc::new(Fixture), "fixture")
+            .unwrap()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        *app.state::<AppState>().startup_gate.lock().unwrap() = Some(entered);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let prompt_view = webview.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        let prompt_thread = std::thread::spawn(move || {
+            let response = tauri::test::get_ipc_response(
+                &prompt_view,
+                request("prompt", serde_json::json!({"text":"starting"})),
+            );
+            sender.send(response.is_err()).unwrap();
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prompt did not acquire session");
+        let close_view = webview.clone();
+        let (sender, close_result) = std::sync::mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let response =
+                tauri::test::get_ipc_response(&close_view, request("close", serde_json::json!({})));
+            sender.send(response.is_ok()).unwrap();
+        });
+        assert!(
+            close_result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("close blocked during startup")
+        );
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("startup was not cancelled")
+        );
+        prompt_thread.join().unwrap();
+        close_thread.join().unwrap();
     }
 }
