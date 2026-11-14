@@ -789,11 +789,15 @@ impl Client {
                             } else {
                                 selected
                             };
-                            client = client.with_configured_thinking(
-                                effort,
-                                adaptive.unwrap_or(false),
-                                true,
-                            );
+                            client = if adaptive.is_some() || metadata.has_thinking_level_map() {
+                                client.with_configured_thinking(
+                                    effort,
+                                    adaptive.unwrap_or(false),
+                                    true,
+                                )
+                            } else {
+                                client.with_fallback_thinking(effort, false, true)
+                            };
                             if matches!(args.provider.id(), "minimax" | "minimax-cn")
                                 && args.model == "MiniMax-M3"
                             {

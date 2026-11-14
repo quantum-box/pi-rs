@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn configured_thinking_controls_wire_without_models_api() {
-    for (offline, adaptive, mapped, level, expected, limit) in [
-        (true, false, false, "high", "budgeted", false),
-        (false, false, false, "minimal", "budgeted", false),
-        (true, false, true, "low", "budgeted", false),
-        (false, false, true, "low", "budgeted", true),
-        (true, true, false, "minimal", "low", false),
-        (true, true, true, "minimal", "medium", false),
+    for (offline, adaptive, mapped, level, expected, discovery) in [
+        (true, false, false, "high", "budgeted", 0),
+        (false, false, false, "minimal", "budgeted", 0),
+        (true, false, true, "low", "budgeted", 0),
+        (false, false, true, "low", "budgeted", 1),
+        (false, false, false, "high", "disabled", 2),
+        (false, false, false, "minimal", "low", 3),
+        (true, true, false, "minimal", "low", 0),
+        (true, true, true, "minimal", "medium", 0),
     ] {
         let root = tempfile::tempdir().unwrap();
         let mut model = json!({"id":"fixture-model","reasoning":true});
@@ -69,8 +71,13 @@ fn configured_thinking_controls_wire_without_models_api() {
                     }
                 }
                 if request.starts_with("GET ") {
-                    if limit {
-                        let model = json!({"id":"fixture-model","max_tokens":4096,"max_input_tokens":200000,"capabilities":{"thinking":{"supported":false}}});
+                    if discovery != 0 {
+                        let capabilities = if discovery == 3 {
+                            json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}})
+                        } else {
+                            json!({"thinking":{"supported":false}})
+                        };
+                        let model = json!({"id":"fixture-model","max_tokens":4096,"max_input_tokens":200000,"capabilities":capabilities});
                         let body = if request.contains("/models?") {
                             json!({"data":[model],"has_more":false}).to_string()
                         } else {
@@ -86,7 +93,7 @@ fn configured_thinking_controls_wire_without_models_api() {
                 let mut bytes = vec![0; length];
                 reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
-                if limit {
+                if discovery != 0 {
                     assert_eq!(body["max_tokens"], 4096);
                 }
                 if expected == "budgeted" {
@@ -99,6 +106,8 @@ fn configured_thinking_controls_wire_without_models_api() {
                     if level == "low" {
                         assert_eq!(body["thinking"]["budget_tokens"], 2048);
                     }
+                } else if expected == "disabled" {
+                    assert!(body.get("thinking").is_none());
                 } else {
                     assert_eq!(body["thinking"]["type"], "adaptive");
                     assert_eq!(body["output_config"]["effort"], expected);

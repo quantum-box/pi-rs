@@ -637,6 +637,10 @@ impl ModelMetadata {
         self.compat.force_adaptive_thinking
     }
 
+    pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
+    }
+
     pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {
         self.thinking_level_map.get(level).map(Option::as_deref)
     }

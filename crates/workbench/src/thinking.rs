@@ -34,12 +34,16 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return filter_levels(levels.to_vec());
     }
-    if let Some(levels) = args
-        .model_profiles
-        .model(&args.provider, &args.model)
-        .and_then(|model| model.levels(adapter))
-    {
-        let levels = filter_levels(levels);
+    let configured = metadata.as_ref().and_then(|model| model.levels(adapter));
+    let discover_first = adapter == super::providers::Adapter::Anthropic
+        && args.allow_model_probes()
+        && metadata.as_ref().is_some_and(|model| {
+            model.reasoning == Some(true)
+                && model.adaptive_thinking().is_none()
+                && !model.has_thinking_level_map()
+        });
+    if let Some(levels) = configured.as_ref().filter(|_| !discover_first) {
+        let levels = filter_levels(levels.clone());
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         return levels;
     }
@@ -100,7 +104,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         levels
     } else {
-        filter_levels(fallback())
+        filter_levels(configured.unwrap_or_else(fallback))
     }
 }
 
@@ -176,6 +180,66 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_reasoning_displays_discovered_anthropic_capabilities() {
+        use clap::Parser;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for (capabilities, expected) in [
+            (
+                serde_json::json!({"thinking":{"supported":false}}),
+                vec!["off"],
+            ),
+            (
+                serde_json::json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}}),
+                vec!["off", "low", "high"],
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({"id":"fixture-model","capabilities":capabilities})
+                    .to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--provider",
+                "anthropic",
+                "--model",
+                "fixture-model",
+                "--endpoint",
+                &endpoint,
+                "--api-key",
+                "fixture",
+            ])
+            .unwrap();
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&serde_json::json!({
+                    "providers":{"anthropic":{"models":[{"id":"fixture-model","reasoning":true}]}}
+                }))
+                .unwrap();
+            args.provider = args.model_profiles.provider("anthropic").unwrap();
+            assert_eq!(available(&mut args), expected);
+            assert_eq!(reported(&args).unwrap(), expected);
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn configured_anthropic_reasoning_without_map_supports_default_levels() {

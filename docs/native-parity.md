@@ -3820,6 +3820,12 @@ keep their standard request shape. Compaction omits automatic cache
 markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
 
+A configured Anthropic `reasoning: true` declaration supplies fallback thinking
+levels when model discovery is unavailable. When the Models API returns a
+capability, its supported modes and levels drive both selection and requests;
+explicit adaptive or thinking-level-map overrides remain authoritative. Other
+discovered model metadata, including output limits, is retained with overrides.
+
 ### Native Anthropic authorization header checkpoint
 
 The standard Anthropic Messages endpoint accepts an explicitly supplied

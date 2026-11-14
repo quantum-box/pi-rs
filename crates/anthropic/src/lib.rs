@@ -67,6 +67,7 @@ pub struct Anthropic {
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
     configured_thinking: Option<CatalogEntry>,
+    configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
     cache_retention: CacheRetention,
     cache_tools: bool,
@@ -132,6 +133,7 @@ impl Anthropic {
             thinking_level: None,
             thinking_budgets: None,
             configured_thinking: None,
+            configured_thinking_is_fallback: false,
             allow_empty_signature: false,
             cache_retention: CacheRetention::None,
             cache_tools: true,
@@ -214,6 +216,7 @@ impl Anthropic {
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
+        self.configured_thinking_is_fallback = false;
         self.configured_thinking = Some(CatalogEntry {
             thinking_levels: vec![level.into()],
             thinking: Some(if adaptive {
@@ -225,6 +228,13 @@ impl Anthropic {
             effort_levels: adaptive,
             ..CatalogEntry::default()
         });
+        self
+    }
+
+    /// Use declared capabilities only when model discovery is unavailable.
+    pub fn with_fallback_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
+        self = self.with_configured_thinking(level, adaptive, disable);
+        self.configured_thinking_is_fallback = true;
         self
     }
 
@@ -883,6 +893,7 @@ impl Model for Anthropic {
             &self.thinking_level,
             &self.thinking_budgets,
             format!("{:?}", self.configured_thinking),
+            self.configured_thinking_is_fallback,
             self.allow_empty_signature,
             self.cache_retention.anthropic_control(),
             self.cache_tools,
@@ -927,7 +938,9 @@ impl Model for Anthropic {
         } else {
             self.cached_model(&request.model)
         };
-        let details = if let Some(mut configured) = self.configured_thinking.clone() {
+        let details = if self.configured_thinking_is_fallback && discovered.is_some() {
+            discovered
+        } else if let Some(mut configured) = self.configured_thinking.clone() {
             if let Some(discovered) = discovered {
                 configured.id = discovered.id;
                 configured.context_window = discovered.context_window;
