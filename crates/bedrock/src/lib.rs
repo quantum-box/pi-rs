@@ -782,8 +782,7 @@ fn build_error(e: impl std::fmt::Display) -> Error {
 // provider reports it through a normally retryable service exception.
 // Classify the already redacted diagnostic and never echo the source text in
 // the permanent-limit message.
-fn permanent_bedrock_limit(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
+fn permanent_bedrock_limit(value: &str, secrets: &[String]) -> bool {
     const MARKERS: &[&str] = &[
         "gousagelimiterror",
         "freeusagelimiterror",
@@ -796,21 +795,73 @@ fn permanent_bedrock_limit(message: &str) -> bool {
         "subscription_sharing_usage_limit_exceeded",
         "subscription_sharing_workplace_individual_usage_limit_exceeded",
     ];
-    if MARKERS.iter().any(|marker| message.contains(marker)) {
-        return true;
+    // The longest literal is well below 128 bytes. Keep a fixed-size window
+    // while scanning the entire SDK message; no copy grows with its length.
+    #[derive(Clone, Copy)]
+    enum Code {
+        None,
+        Colon,
+        Number(bool),
+        Digits(u8),
+        Lookahead,
     }
-    message.match_indices("\"code\"").any(|(index, _)| {
-        let rest = message[index + 6..].trim_start();
-        let Some(rest) = rest.strip_prefix(':') else {
-            return false;
+    let mut code = Code::None;
+    let mut window = String::with_capacity(128);
+    {
+        let mut feed = |ch: char| {
+            let c = ch.to_ascii_lowercase();
+            code = match code {
+                Code::Colon if (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}' => {
+                    Code::Colon
+                }
+                Code::Colon if c == ':' => Code::Number(false),
+                Code::Number(quoted)
+                    if ((c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}') && !quoted =>
+                {
+                    Code::Number(false)
+                }
+                Code::Number(false) if c == '\"' => Code::Number(true),
+                Code::Number(_) if c == '1' => Code::Digits(1),
+                Code::Digits(1) if c == '3' => Code::Digits(2),
+                Code::Digits(2) if c == '0' => Code::Digits(3),
+                Code::Digits(3) if c == '8' => Code::Lookahead,
+                Code::Lookahead if !c.is_ascii_digit() => return true,
+                _ => Code::None,
+            };
+            window.push(if c.is_ascii() { c } else { '\0' });
+            if window.len() > 128 {
+                window.remove(0);
+            }
+            if MARKERS.iter().any(|marker| window.ends_with(marker)) {
+                return true;
+            }
+            if window.ends_with("\"code\"") {
+                code = Code::Colon;
+            }
+            false
         };
-        let rest = rest
-            .trim_start()
-            .strip_prefix('\"')
-            .unwrap_or(rest.trim_start());
-        rest.strip_prefix("1308")
-            .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit()))
-    })
+        let mut offset = 0;
+        while offset < value.len() {
+            let tail = &value[offset..];
+            if let Some(secret) = secrets
+                .iter()
+                .find(|secret| !secret.is_empty() && tail.starts_with(secret.as_str()))
+            {
+                if "[REDACTED]".chars().any(&mut feed) {
+                    return true;
+                }
+                offset += secret.len();
+            } else {
+                let c = tail.chars().next().expect("nonempty tail");
+                offset += c.len_utf8();
+                if feed(c) {
+                    return true;
+                }
+            }
+        }
+    }
+    // End of input satisfies the numeric negative lookahead.
+    matches!(code, Code::Lookahead)
 }
 
 fn bedrock_service_error(
@@ -822,7 +873,7 @@ fn bedrock_service_error(
     let permanent = [meta.message(), meta.code()]
         .into_iter()
         .flatten()
-        .any(|value| permanent_bedrock_limit(&bounded_redacted(value, secrets, 64 * 1024)));
+        .any(|value| permanent_bedrock_limit(value, secrets));
     if retryable && permanent {
         Error::Model("Bedrock account quota or billing limit reached".into())
     } else if retryable {
@@ -1426,7 +1477,11 @@ mod tests {
         let secrets = vec!["billing-secret".to_owned()];
         for (message, permanent) in [
             (format!("{} quota exceeded", "x".repeat(520)), true),
-            (format!("{} quota exceeded", "x".repeat(64 * 1024)), false),
+            (format!("{} quota exceeded", "x".repeat(64 * 1024)), true),
+            (
+                format!("{}\"code\":13089", "x".repeat(64 * 1024 - 11)),
+                false,
+            ),
             ("temporary billing-secret".to_owned(), false),
             (
                 format!("{}billing-secret", "x".repeat(64 * 1024 - 3)),
