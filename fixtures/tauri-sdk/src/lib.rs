@@ -28,6 +28,7 @@ fn abort(state: tauri::State<'_, AppState>) {
 
 #[tauri::command]
 async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.control.abort();
     state
         .session
         .lock()
@@ -38,6 +39,8 @@ async fn close(state: tauri::State<'_, AppState>) -> Result<(), String> {
 }
 
 /// Register a single in-memory session and its commands on a host-supplied builder.
+/// This installs the builder's invoke handler, replacing any existing handler.
+/// Applications with other commands must register them in the same handler.
 pub fn configure<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     model: Arc<dyn Model>,
@@ -60,6 +63,14 @@ mod tests {
     use tauri::Manager;
 
     struct Fixture;
+    struct StalledModel(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
+    #[async_trait::async_trait]
+    impl Model for StalledModel {
+        async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+            std::future::pending().await
+        }
+    }
     #[async_trait::async_trait]
     impl Model for Fixture {
         async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<ModelStream> {
@@ -121,6 +132,61 @@ mod tests {
             tauri::test::get_ipc_response(&webview, request("close", serde_json::json!({})))
                 .is_ok()
         );
+        assert!(
+            tauri::test::get_ipc_response(
+                &webview,
+                request("prompt", serde_json::json!({"text":"after close"}))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mock_ipc_close_aborts_a_stalled_prompt() {
+        use std::time::Duration;
+        let (entered, started) = std::sync::mpsc::channel();
+        let app = configure(
+            tauri::test::mock_builder(),
+            Arc::new(StalledModel(std::sync::Mutex::new(Some(entered)))),
+            "fixture",
+        )
+        .unwrap()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let prompt_view = webview.clone();
+        let (prompt_sender, prompt_result) = std::sync::mpsc::channel();
+        let prompt_thread = std::thread::spawn(move || {
+            let response = tauri::test::get_ipc_response(
+                &prompt_view,
+                request("prompt", serde_json::json!({"text":"stall"})),
+            );
+            prompt_sender.send(response.is_err()).unwrap();
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prompt did not start");
+        let close_view = webview.clone();
+        let (close_sender, close_result) = std::sync::mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let response =
+                tauri::test::get_ipc_response(&close_view, request("close", serde_json::json!({})));
+            close_sender.send(response.is_ok()).unwrap();
+        });
+        assert!(
+            close_result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("close blocked on prompt")
+        );
+        assert!(
+            prompt_result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("prompt was not aborted")
+        );
+        close_thread.join().unwrap();
+        prompt_thread.join().unwrap();
         assert!(
             tauri::test::get_ipc_response(
                 &webview,

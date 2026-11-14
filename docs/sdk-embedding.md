@@ -25,8 +25,9 @@ The [native host example](../examples/native_sdk_host.rs) demonstrates shared
 session state using an offline fixture; its tests check session reuse and that
 the state is `Send + Sync`. The standalone [Tauri SDK fixture](../fixtures/tauri-sdk/)
 compiles real Tauri 2 command macros and managed state against `pi-rs-core`.
-Its mock-runtime IPC test invokes two prompts, an idle abort, and close, checks
-session reuse, and confirms that a closed session rejects another prompt. Run
+Its mock-runtime IPC tests invoke two prompts, an idle abort, and close, check
+session reuse, and verify that close aborts a stalled prompt and a closed
+session rejects another prompt. Run
 it on a native host with Tauri's platform
 prerequisites installed:
 
@@ -45,6 +46,9 @@ The following is a Tauri 2 integration sketch using the same pattern. It
 needs a Tauri project and its normal generated configuration. Add `pi-rs` (with the
 default `ollama` feature) and `tokio` with the `sync` feature to `src-tauri`.
 Use a local path to your checkout or a pinned Git revision of this repository.
+The fixture's `configure` installs one invoke handler and replaces any handler
+already set on the builder. To integrate with other application commands, put
+all command names in a single `tauri::generate_handler![...]` registration.
 
 ```rust
 use std::sync::Arc;
