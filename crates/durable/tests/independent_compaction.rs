@@ -1628,3 +1628,569 @@ async fn earlier_reset_precedes_summary_during_on_yield() {
     );
     scheduler.shutdown().await.unwrap();
 }
+
+struct ParkedLifecycleHook {
+    event: pi_rs_durable::extension::GenerationEvent,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for ParkedLifecycleHook {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &serde_json::Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, HookTask};
+        if event == self.event && value["answer"] == "busy answer" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(GenerationDecision::Tasks(vec![HookTask {
+                name: "parked-job".into(),
+                input: serde_json::Value::Null,
+            }]));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+fn parked_registries(
+    event: pi_rs_durable::extension::GenerationEvent,
+    calls: Arc<AtomicUsize>,
+    handler: Arc<dyn pi_rs_durable::task_scheduler::Handler>,
+) -> (
+    pi_rs_durable::extension::Registry,
+    pi_rs_durable::task_scheduler::Registry,
+) {
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install(pi_rs_durable::extension::Extension {
+            name: "parked-hook".into(),
+            hooks: vec![Arc::new(ParkedLifecycleHook { event, calls })],
+            tasks: vec![("parked-job".into(), handler.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut tasks = pi_rs_durable::task_scheduler::Registry::default();
+    assert!(tasks.register_shared("parked-job", true, handler));
+    (extensions, tasks)
+}
+fn parked_handler(
+    _event: pi_rs_durable::extension::GenerationEvent,
+) -> Arc<dyn pi_rs_durable::task_scheduler::Handler> {
+    use pi_rs_durable::task::{Checkpoint, Task, WaitFor};
+    use pi_rs_durable::task_scheduler::Step;
+    Arc::new(move |task: &Task| {
+        if task.delivered_signal().is_some() {
+            Ok(Step::Succeed(
+                serde_json::json!({"continue":"child follow"}),
+            ))
+        } else {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "waiting".into(),
+                    data: task.checkpoint().data.clone(),
+                },
+                condition: WaitFor::Signal("go".into()),
+                children: vec![],
+            })
+        }
+    })
+}
+async fn parked_fixture(
+    path: &std::path::Path,
+    event: pi_rs_durable::extension::GenerationEvent,
+    model: Arc<BusyModel>,
+    calls: Arc<AtomicUsize>,
+    handler: Arc<dyn pi_rs_durable::task_scheduler::Handler>,
+    prior: u8,
+) -> (
+    Scheduler,
+    pi_rs_durable::task_driver::Driver,
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+) {
+    let (extensions, tasks) = parked_registries(event, calls, handler);
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        path,
+        busy_options(model.clone()),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["parked-hook".into()])
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    model.gate_summary.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    model.release.add_permits(1);
+    let child = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let value =
+                serde_json::to_value(scheduler.conversation(conversation).unwrap()).unwrap();
+            let phase = if event == pi_rs_durable::extension::GenerationEvent::OnYield {
+                "YieldTasksWaiting"
+            } else {
+                "HookTasksWaiting"
+            };
+            if let Some(id) = value["phase"][phase]["children"][0].as_str() {
+                let id = uuid::Uuid::parse_str(id).unwrap();
+                if driver.get(id).unwrap().is_some_and(|task| {
+                    matches!(task.state(), pi_rs_durable::task::TaskState::Waiting(_))
+                }) {
+                    break id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if prior == 1 {
+        scheduler
+            .submit(conversation, None, "queued before".into())
+            .unwrap();
+    }
+    if prior == 2 {
+        scheduler
+            .reset(conversation, Some("reset before summary".into()))
+            .unwrap();
+    }
+    if prior == 3 {
+        return (scheduler, driver, conversation, operation, child);
+    }
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    (scheduler, driver, conversation, operation, child)
+}
+fn wake_parked(driver: &pi_rs_durable::task_driver::Driver, child: uuid::Uuid) {
+    driver
+        .signal(&pi_rs_durable::task_store::Signal::new(
+            uuid::Uuid::new_v4(),
+            child,
+            "go".into(),
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+}
+#[tokio::test]
+async fn summaries_wait_for_parked_lifecycle_tasks_and_order_queued_inputs() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        for queued in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(BusyModel::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler = parked_handler(event);
+            let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+                &dir.path().join("db"),
+                event,
+                model,
+                calls.clone(),
+                handler,
+                0,
+            )
+            .await;
+            if queued {
+                scheduler
+                    .submit(conversation, None, "queued".into())
+                    .unwrap();
+            }
+            wake_parked(&driver, child);
+            scheduler.wait(conversation).await.unwrap();
+            assert_eq!(
+                scheduler.independent_compaction_status(operation).unwrap(),
+                IndependentCompactionStatus::Applied
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let c = scheduler.conversation(conversation).unwrap();
+            let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+            if event == GenerationEvent::OnYield && !queued {
+                let follow = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")).unwrap();
+                assert!(summary < follow);
+            } else {
+                assert!(!c.messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")));
+            }
+            if queued {
+                let input = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued")).unwrap();
+                assert!(summary < input);
+            }
+            scheduler.shutdown().await.unwrap();
+            driver.shutdown().unwrap();
+        }
+    }
+}
+#[tokio::test]
+async fn parked_lifecycle_summary_and_child_recover_together() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BusyModel::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = parked_handler(event);
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &path,
+            event,
+            model.clone(),
+            calls.clone(),
+            handler.clone(),
+            0,
+        )
+        .await;
+        scheduler
+            .submit(conversation, None, "queued".into())
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+        let (extensions, tasks) = parked_registries(event, calls.clone(), handler);
+        let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+            &path,
+            busy_options(model),
+            extensions,
+            None,
+            busy_provider(),
+            tasks,
+        )
+        .unwrap();
+        wake_parked(&driver, child);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let c = scheduler.conversation(conversation).unwrap();
+        let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+        let queued = c
+            .messages
+            .iter()
+            .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"))
+            .unwrap();
+        assert!(summary < queued);
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn parked_lifecycle_abort_preserves_admitted_summary() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(BusyModel::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            model,
+            calls.clone(),
+            parked_handler(event),
+            0,
+        )
+        .await;
+        scheduler
+            .submit(conversation, None, "withdraw me".into())
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scheduler.abort_and_wait(conversation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        assert!(driver.get(child).unwrap().unwrap().is_terminal());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!scheduler.conversation(conversation).unwrap().messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "withdraw me")));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn parked_lifecycle_reset_follows_admitted_summary() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(BusyModel::default());
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            model,
+            Arc::new(AtomicUsize::new(0)),
+            parked_handler(event),
+            0,
+        )
+        .await;
+        let reset = scheduler
+            .reset(conversation, Some("reset after".into()))
+            .unwrap();
+        wake_parked(&driver, child);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        let c = scheduler.conversation(conversation).unwrap();
+        assert!(c.resets.iter().any(|r| r.id == reset));
+        assert!(!c.messages.iter().any(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")
+        ));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn parked_summary_kill_child() {
+    let Ok(dir) = std::env::var("PI_PARKED_SUMMARY_KILL_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let event = pi_rs_durable::extension::GenerationEvent::OnYield;
+    let (mut scheduler, _driver, conversation, operation, child) = parked_fixture(
+        &dir.join("db"),
+        event,
+        Arc::new(BusyModel::default()),
+        Arc::new(AtomicUsize::new(0)),
+        parked_handler(event),
+        0,
+    )
+    .await;
+    scheduler
+        .submit(conversation, None, "queued".into())
+        .unwrap();
+    std::fs::write(
+        dir.join("ready"),
+        format!("{conversation} {operation} {child}"),
+    )
+    .unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_parked_summary_recovers_without_reinvoking_hook() {
+    use pi_rs_durable::extension::GenerationEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("parked_summary_kill_child")
+        .arg("--nocapture")
+        .env("PI_PARKED_SUMMARY_KILL_DIR", dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = dir.path().join("ready");
+    let found = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&ready) {
+                break value;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("child exited before ready: {status}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if found.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let ids = found.unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let ids: Vec<uuid::Uuid> = ids
+        .split_whitespace()
+        .map(|s| uuid::Uuid::parse_str(s).unwrap())
+        .collect();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let event = GenerationEvent::OnYield;
+    let (extensions, tasks) = parked_registries(event, calls.clone(), parked_handler(event));
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        dir.path().join("db"),
+        busy_options(Arc::new(BusyModel::default())),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    wake_parked(&driver, ids[2]);
+    scheduler.wait(ids[0]).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(ids[1]).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let c = scheduler.conversation(ids[0]).unwrap();
+    let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+    let queued = c
+        .messages
+        .iter()
+        .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"))
+        .unwrap();
+    assert!(summary < queued);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn reset_before_summary_while_hook_task_parked_is_stale() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            Arc::new(BusyModel::default()),
+            Arc::new(AtomicUsize::new(0)),
+            parked_handler(event),
+            2,
+        )
+        .await;
+        wake_parked(&driver, child);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Stale
+        );
+        let c = scheduler.conversation(conversation).unwrap();
+        assert!(c.messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "reset before summary")));
+        assert!(!c.messages.iter().any(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")
+        ));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn input_before_summary_while_hook_task_parked_follows_write() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            Arc::new(BusyModel::default()),
+            Arc::new(AtomicUsize::new(0)),
+            parked_handler(event),
+            1,
+        )
+        .await;
+        wake_parked(&driver, child);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        let c = scheduler.conversation(conversation).unwrap();
+        let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("busy checkpoint"))).unwrap();
+        let input = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued before")).unwrap();
+        assert!(summary < input);
+        assert!(!c.messages.iter().any(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")
+        ));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn abort_before_summary_admission_cancels_parked_task_and_summary() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            Arc::new(BusyModel::default()),
+            calls.clone(),
+            parked_handler(event),
+            3,
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scheduler.abort_and_wait(conversation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Aborted
+        );
+        assert!(driver.get(child).unwrap().unwrap().is_terminal());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn aborted_parked_hook_task_leaves_summary_for_boundary() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::OnYield, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut scheduler, driver, conversation, operation, child) = parked_fixture(
+            &dir.path().join("db"),
+            event,
+            Arc::new(BusyModel::default()),
+            calls.clone(),
+            parked_handler(event),
+            0,
+        )
+        .await;
+        driver.request_abort(child).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scheduler.wait(conversation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(driver.get(child).unwrap().unwrap().is_terminal());
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!scheduler.conversation(conversation).unwrap().messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == "child follow")));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}

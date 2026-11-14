@@ -8992,10 +8992,14 @@ impl SummaryPlacementDriver {
                         Phase::ModelRunning { .. }
                             | Phase::OnYield { .. }
                             | Phase::YieldDecision { .. }
+                            | Phase::YieldTasksWaiting { .. }
                     ) && state.active.is_some()
                         || matches!(
                             state.phase,
-                            Phase::Idle | Phase::FailedIdle | Phase::AfterRun { .. }
+                            Phase::Idle
+                                | Phase::FailedIdle
+                                | Phase::AfterRun { .. }
+                                | Phase::HookTasksWaiting { turns: None, .. }
                         ) && state.active.is_none())
                     && state.pending_independent_summary.is_none()
                     && state.pending_resets.len() <= SUMMARY_MAX_HISTORY_RECORDS
@@ -9421,6 +9425,32 @@ impl Scheduler {
             Some(provider),
         )
         .map(|(scheduler, _)| scheduler)
+    }
+
+    /// Install lifecycle task handlers and the summary provider before any
+    /// recovered conversation or summary worker is scheduled. Keep the returned
+    /// driver alive and shut it down after the scheduler.
+    pub fn open_with_summary_recovery_and_tasks(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+        provider: SummaryProviderIdentity,
+        tasks: crate::task_scheduler::Registry,
+    ) -> Result<(Self, crate::task_driver::Driver), Error> {
+        let (scheduler, driver) = Self::open_configured_with_tasks(
+            path,
+            options,
+            registry,
+            None,
+            adapter,
+            Some(tasks),
+            Some(provider),
+        )?;
+        Ok((
+            scheduler,
+            driver.ok_or_else(|| Error::Invalid("task driver was not installed".into()))?,
+        ))
     }
 
     /// Nonterminal independent summaries skipped during startup because their
