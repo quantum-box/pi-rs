@@ -2458,11 +2458,7 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
 // A nonblocking listener may produce nonblocking accepted sockets. Each
 // fixture connection is read with a bounded blocking timeout, independently
 // of the listener and of any idle peers on the same port.
-fn read_rpc_model_fixture_request(socket: &TcpStream) -> std::io::Result<(String, Vec<u8>)> {
-    read_rpc_model_fixture_request_with_hook(socket, |_| Ok(()))
-}
-
-fn read_rpc_model_fixture_request_with_hook(
+fn read_rpc_model_fixture_request(
     socket: &TcpStream,
     after_setup: impl FnOnce(&TcpStream) -> std::io::Result<()>,
 ) -> std::io::Result<(String, Vec<u8>)> {
@@ -2508,7 +2504,7 @@ fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
     let nonblocking_error = reader.read_line(&mut line).unwrap_err();
     assert_eq!(nonblocking_error.kind(), std::io::ErrorKind::WouldBlock);
     drop(reader);
-    let (request, body) = read_rpc_model_fixture_request_with_hook(&socket, |socket| {
+    let (request, body) = read_rpc_model_fixture_request(&socket, |socket| {
         // Inspect the actual socket after the production fixture's setup,
         // before the peer sends any bytes. No reader scheduling is involved.
         #[cfg(unix)]
@@ -2542,6 +2538,19 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join("models.json"),
@@ -2553,6 +2562,7 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let fixture_address = listener.local_addr().unwrap();
     let endpoint = format!("http://{}/v1/chat/completions", fixture_address);
     let stop = Arc::new(AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
     let stopped = stop.clone();
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed = requests.clone();
@@ -2571,20 +2581,27 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
                 }
                 Err(e) => panic!("{e}"),
             };
-            if let Some((idle_started, idle_release, idle_finished)) = idle_signals.take() {
-                connections.push(std::thread::spawn(move || {
-                    idle_started.send(()).unwrap();
-                    // The sender is dropped on test failure, so this remains
-                    // bounded by the test's existing RPC response deadline.
-                    let _ = idle_release.recv();
-                    drop(socket);
-                    let _ = idle_finished.send(());
-                }));
-                continue;
-            }
+            let idle_gate = idle_signals.take();
             let observed = observed.clone();
             connections.push(std::thread::spawn(move || {
-                let (request, request_body) = match read_rpc_model_fixture_request(&socket) {
+                let (gate, idle_finished) = match idle_gate {
+                    Some((started, release, finished)) => {
+                        (Some((started, release)), Some(finished))
+                    }
+                    None => (None, None),
+                };
+                let result = read_rpc_model_fixture_request(&socket, |_| {
+                    if let Some((started, release)) = gate {
+                        let _ = started.send(());
+                        // Dropping the sender on panic releases the handler.
+                        let _ = release.recv();
+                    }
+                    Ok(())
+                });
+                if let Some(finished) = idle_finished {
+                    let _ = finished.send(());
+                }
+                let (request, request_body) = match result {
                     Ok(request) => request,
                     Err(error) => {
                         observed
@@ -2626,29 +2643,31 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     // A serial fixture would wait for this peer and miss the probe deadline.
     let idle = TcpStream::connect(fixture_address).unwrap();
     idle_ready.recv_timeout(Duration::from_secs(3)).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .env("PI_RS_HOME", root.path())
-        .args([
-            "--workspace",
-            root.path().to_str().unwrap(),
-            "--offline",
-            "--no-session",
-            "--no-mcp",
-            "--no-trust",
-            "--model",
-            "dynamic",
-            "--endpoint",
-            &endpoint,
-            "--mode",
-            "rpc",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--offline",
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--model",
+                "dynamic",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
@@ -2678,8 +2697,8 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         Err(mpsc::TryRecvError::Empty)
     ));
     release_idle.send(()).unwrap();
-    idle_done.recv_timeout(Duration::from_secs(3)).unwrap();
     drop(idle);
+    idle_done.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
         models["models"]
             .as_array()
@@ -2709,7 +2728,7 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let state = request(json!({"type":"get_state", "id":"state2"}));
     assert_eq!(state["model"]["input"], json!(["text"]));
     drop(input);
-    let status = child.wait().unwrap();
+    let status = child.0.wait().unwrap();
     reader.join().unwrap();
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
