@@ -3979,11 +3979,9 @@ impl Agent<'_> {
             |result| result.tokens_before,
         );
         let from_extension = extension_result.is_some() || original_summary != compaction.summary;
-        commit(
+        commit_compaction_record(
             session,
             Event::Compacted {
-                details: extension_result.and_then(|result| result.details.clone()),
-                from_extension,
                 summary: compaction.summary,
                 system_prompt: None,
                 retain_from,
@@ -3992,6 +3990,12 @@ impl Agent<'_> {
                 usage,
                 usage_metadata,
             },
+            from_extension.then(|| {
+                serde_json::json!({
+                    "fromExtension": true,
+                    "details": extension_result.and_then(|result| result.details.clone()),
+                })
+            }),
             observer,
         )?;
         Ok(from_extension)
@@ -4045,11 +4049,9 @@ impl Agent<'_> {
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         let tokens_before = session.context_usage_estimate().tokens;
         let from_extension = original_summary != compaction.summary;
-        commit(
+        commit_compaction_record(
             session,
             Event::Compacted {
-                details: None,
-                from_extension,
                 summary: compaction.summary,
                 system_prompt: None,
                 retain_from,
@@ -4058,6 +4060,7 @@ impl Agent<'_> {
                 usage,
                 usage_metadata,
             },
+            from_extension.then(|| serde_json::json!({"fromExtension": true})),
             observer,
         )?;
         Ok(from_extension)
@@ -5138,6 +5141,21 @@ fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> R
     Ok(())
 }
 
+fn commit_compaction_record(
+    session: &mut Session,
+    event: Event,
+    metadata: Option<serde_json::Value>,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    let record = if let Some(metadata) = metadata {
+        session.append_with_record_metadata(event, metadata)?
+    } else {
+        session.append(event)?
+    };
+    observer(Notification::Committed(record));
+    Ok(())
+}
+
 // Serialize cancellation's snapshot read with the durable append and publication.
 fn commit_with_reply(
     session: &mut Session,
@@ -6022,8 +6040,11 @@ mod tree_tests {
                 } else {
                     assert_eq!(result.unwrap(), Some((0, true)));
                     assert!(
-                        matches!(&session.records().last().unwrap().event, Event::Compacted { summary, details: Some(details), from_extension: true, retain_from, tokens_before: Some(123), .. } if summary == "extension summary" && details["origin"] == "hook" && *retain_from == retention.boundary)
+                        matches!(&session.records().last().unwrap().event, Event::Compacted { summary, retain_from, tokens_before: Some(123), .. } if summary == "extension summary" && *retain_from == retention.boundary)
                     );
+                    let metadata = session.record_metadata(session.head()).unwrap();
+                    assert_eq!(metadata["details"]["origin"], "hook");
+                    assert_eq!(metadata["fromExtension"], true);
                     let events = events.lock().unwrap();
                     assert_eq!(events.last().unwrap()["type"], "session_compact");
                     assert_eq!(events.last().unwrap()["fromExtension"], true);
@@ -6102,7 +6123,7 @@ mod tree_tests {
             .unwrap();
         assert_eq!(result, "answer");
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
-        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, from_extension: true, .. } if summary == "extension summary")));
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "extension summary") && session.record_metadata(record.id).is_some_and(|v| v["fromExtension"] == true)));
         assert!(
             events
                 .lock()
@@ -6483,8 +6504,6 @@ mod tree_tests {
         session
             .append(Event::Compacted {
                 summary: "summary".into(),
-                details: None,
-                from_extension: true,
                 system_prompt: None,
                 retain_from: None,
                 tokens_before: None,
@@ -6712,7 +6731,7 @@ mod tree_tests {
                 ]
             );
             assert!(session.records().iter().any(|record|
-                matches!(&record.event, Event::Compacted { summary, from_extension: true, .. } if summary == "extension summary [legacy]")));
+                matches!(&record.event, Event::Compacted { summary, .. } if summary == "extension summary [legacy]") && session.record_metadata(record.id).is_some_and(|v| v["fromExtension"] == true)));
         }
     }
 
@@ -6806,11 +6825,10 @@ mod tree_tests {
             assert_eq!(
                 session.records().iter().any(|record| matches!(
                     &record.event,
-                    Event::Compacted {
-                        from_extension: true,
-                        ..
-                    }
-                )),
+                    Event::Compacted { .. }
+                ) && session
+                    .record_metadata(record.id)
+                    .is_some_and(|v| v["fromExtension"] == true)),
                 provide
             );
             assert!(

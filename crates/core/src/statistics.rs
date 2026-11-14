@@ -436,8 +436,6 @@ mod tests {
         let before = session.head();
         session
             .append(Event::Compacted {
-                details: None,
-                from_extension: false,
                 summary: "abcd".into(),
                 system_prompt: None,
                 retain_from: Some(before + 1),
@@ -719,8 +717,6 @@ mod tests {
         let before = session.head();
         session
             .append(Event::Compacted {
-                details: None,
-                from_extension: false,
                 summary: "summary".into(),
                 system_prompt: None,
                 retain_from: Some(before),
@@ -765,8 +761,6 @@ mod tests {
         let before = session.head();
         session
             .append(Event::Compacted {
-                details: None,
-                from_extension: false,
                 summary: "summary".into(),
                 system_prompt: None,
                 retain_from: Some(before),
