@@ -2162,11 +2162,17 @@ mod tests {
                 .is_cancelled()
         );
         let mut byte = [0];
-        let count = tokio::time::timeout(Duration::from_secs(15), child.read(&mut byte))
+        let connection = tokio::time::timeout(Duration::from_secs(15), child.read(&mut byte))
             .await
-            .expect("child connection remained open after cancellation")
-            .unwrap();
-        assert_eq!(count, 0, "child sent unexpected data");
+            .expect("child connection remained open after cancellation");
+        match connection {
+            Ok(0) => {}
+            // Windows can reset a socket when TerminateJobObject kills its owner.
+            // The original process handle below must still signal termination.
+            #[cfg(windows)]
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("unexpected child connection result: {other:?}"),
+        }
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
