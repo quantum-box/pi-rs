@@ -12,6 +12,12 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+pub(super) static SHARE_CONTEXT_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+// Retain uncertainty if a worker is replaced before its parent drains the
+// initialization event. This flag is local to the frontend process.
+pub(super) static DROPPED_SHARE_CONTEXT_POSSIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -36,6 +42,7 @@ pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(test)]
 pub(super) fn refresh_barrier() -> Result<RefreshBarrier> {
     let process = stop_new_refreshes();
     let worker = std::env::var_os(REFRESH_BARRIER_ENV)
@@ -99,6 +106,40 @@ pub(super) fn refresh_barrier_cancellable(
     }))
 }
 
+/// Cancels a queued credential exchange when its caller is dropped. Once
+/// admitted, the blocking task retains the barrier through durable persistence.
+pub(super) struct RefreshCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl RefreshCancellation {
+    pub(super) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+    pub(super) fn state(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        self.0.clone()
+    }
+    pub(super) fn enter(state: &std::sync::atomic::AtomicU8) -> Result<RefreshBarrier> {
+        use std::sync::atomic::Ordering;
+        let Some(barrier) = refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
+        else {
+            return Err(Error::Cancelled);
+        };
+        if state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(Error::Cancelled);
+        }
+        Ok(barrier)
+    }
+}
+impl Drop for RefreshCancellation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
     match reason {
         SessionStartReason::Startup => SessionShutdownReason::Quit,
@@ -126,6 +167,8 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
+    pub(super) context_may_exist: bool,
+    pub(super) startup_proven_empty: bool,
     extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
@@ -294,9 +337,20 @@ impl Worker {
         let readers = vec![
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if let Ok(event) = serde_json::from_str(&line) {
-                        let _ = sender.send(event);
+                    match line {
+                        Ok(line) => match serde_json::from_str(&line) {
+                            Ok(event) => {
+                                let _ = sender.send(event);
+                            }
+                            Err(_) => {
+                                let _ = sender.send(json!({"type":"share_context_initializing"}));
+                            }
+                        },
+                        Err(_) => {
+                            // A failed stream can hide the initialization marker.
+                            let _ = sender.send(json!({"type":"share_context_initializing"}));
+                            break;
+                        }
                     }
                 }
             }),
@@ -325,6 +379,8 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: Vec::new(),
+            context_may_exist: false,
+            startup_proven_empty: false,
             extension_sources: Default::default(),
             readers,
         })
@@ -415,6 +471,14 @@ impl Worker {
         events
             .into_iter()
             .filter_map(|mut event| {
+                if event["type"] == "share_context_initializing" {
+                    self.context_may_exist = true;
+                    return None;
+                }
+                if event["type"] == "share_context_not_started" {
+                    self.startup_proven_empty = true;
+                    return None;
+                }
                 if event["type"] == "worker_extension_sources" {
                     self.extension_sources = event["sources"]
                         .as_object()
@@ -520,12 +584,19 @@ impl Worker {
         Ok(slot.as_mut())
     }
 
-    pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+    pub(super) fn request_share_context(
+        slot: &mut Option<Self>,
+        args: &Cli,
+    ) -> Result<(uuid::Uuid, [u8; 32])> {
         if slot
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
         {
-            slot.take();
+            // Replacing a worker here could discard its unread context marker.
+            // Refuse this share until the normal transition has completed.
+            return Err(Error::Config(
+                "The active worker configuration changed; try sharing again".into(),
+            ));
         }
         if slot.is_none() {
             *slot = Some(Self::start(args, &["serve"])?);
@@ -537,8 +608,13 @@ impl Worker {
             ));
         }
         let id = uuid::Uuid::new_v4();
-        worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session}))?;
-        Ok(id)
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        // Even if stdin closed, wait for the exit and drain its final marker.
+        // Only that establishes whether unauthenticated fallback is safe.
+        let _ = worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session, "journal_key":key}));
+        Ok((id, key))
     }
 
     pub(super) fn notify_session_name(
@@ -759,6 +835,12 @@ impl Drop for Worker {
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
+        if self.persistent {
+            let _ = self.drain_events();
+            if self.context_may_exist || !self.startup_proven_empty {
+                DROPPED_SHARE_CONTEXT_POSSIBLE.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -825,6 +907,8 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
+            context_may_exist: false,
+            startup_proven_empty: false,
             extension_sources: Default::default(),
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),

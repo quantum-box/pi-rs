@@ -363,12 +363,14 @@ async fn access_at(
         return Ok(value.access);
     }
     let previous = stored["meta"].clone();
+    let _cancellation = super::process::RefreshCancellation::new();
+    let state = _cancellation.state();
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
+        let _barrier = super::process::RefreshCancellation::enter(&state)?;
         let access = runtime.block_on(service.mint(&value.refresh))?;
         let expires = now().saturating_add(KEY_LIFETIME_MS);
         super::config::update_object_locked(&path, Some(&guard), |data| {
@@ -707,6 +709,111 @@ mod tests {
         assert_eq!(saved["meta"]["extra"], "preserve");
         assert_eq!(saved["other"]["key"], "keep");
         assert!(saved["meta"]["expires"].as_u64().unwrap() >= now() + KEY_LIFETIME_MS - 10_000);
+    }
+
+    #[tokio::test]
+    async fn cancelled_mint_caller_still_persists_new_key() {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!(
+            "http://{}/muse-code/key",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 2048];
+            loop {
+                let count = tokio::time::timeout(Duration::from_secs(15), socket.read(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0, "request closed before its body arrived");
+                request.extend_from_slice(&bytes[..count]);
+                assert!(request.len() <= 16 * 1024);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .expect("request content length");
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer identity-secret")
+            );
+            started_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body = r#"{"api_key":"minted-after-cancel"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let _server_cleanup = AbortOnDrop(server.abort_handle());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        fixture(&path, 1);
+        let service = Service {
+            url,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let task = tokio::spawn(access_at(path.clone(), service, None, false));
+        let _task_cleanup = AbortOnDrop(task.abort_handle());
+        tokio::time::timeout(Duration::from_secs(15), started_rx)
+            .await
+            .expect("mint did not start")
+            .unwrap();
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        reply_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), server)
+            .await
+            .unwrap()
+            .unwrap();
+        // The refresh retains the auth lock through persistence; waiting for it
+        // distinguishes a completed write from a detached request still running.
+        let _guard = tokio::time::timeout(
+            Duration::from_secs(15),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .expect("mint did not release the auth lock")
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["meta"]["access"], "minted-after-cancel");
+        assert_eq!(saved["meta"]["refresh"], "identity-secret");
+        assert_eq!(saved["meta"]["extra"], "preserve");
+        assert_eq!(saved["other"]["key"], "keep");
     }
 
     #[tokio::test]

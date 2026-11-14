@@ -258,9 +258,11 @@ impl Gateway {
             return Ok(Some(credential.access()));
         }
         let gateway = self.clone();
+        let _cancellation = super::process::RefreshCancellation::new();
+        let state = _cancellation.state();
         tokio::task::spawn_blocking(move || {
             let _radius_guard = radius_guard;
-            let _barrier = super::process::refresh_barrier()?;
+            let _barrier = super::process::RefreshCancellation::enter(&state)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

@@ -143,6 +143,10 @@ enum Request {
     GetShareContext {
         id: Option<serde_json::Value>,
         session: PathBuf,
+        #[serde(default)]
+        journal_key: Option<[u8; 32]>,
+        #[serde(default)]
+        include_journal: bool,
     },
     ReadSession {
         request: serde_json::Value,
@@ -227,6 +231,7 @@ impl SessionSnapshot {
             session_id: session.session_id(),
             head: session.head(),
             context,
+            journal_tag: None,
         })
     }
 
@@ -304,6 +309,7 @@ impl SessionSnapshot {
     }
 }
 
+#[cfg(test)]
 fn snapshot_for_share(
     active: &Mutex<ControlState>,
     snapshot: &Mutex<SessionSnapshot>,
@@ -312,12 +318,72 @@ fn snapshot_for_share(
     snapshot_for_share_with_hook(active, snapshot, current, || {})
 }
 
+#[cfg(test)]
 fn snapshot_for_share_with_hook(
     active: &Mutex<ControlState>,
     snapshot: &Mutex<SessionSnapshot>,
     current: Option<Session>,
     hook: impl FnOnce(),
 ) -> Result<super::sessions::ShareSnapshot> {
+    snapshot_and_session_for_share_with_hook(active, snapshot, current, hook)
+        .map(|(snapshot, _session, _stamp)| snapshot)
+}
+
+#[derive(Clone, Copy)]
+struct ShareCaptureStamp {
+    revision: u64,
+    idle: bool,
+}
+
+struct ShareCaptureSize(usize);
+impl std::io::Write for ShareCaptureSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        const LIMIT: usize = 128 * 1024 * 1024 - 64;
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|size| *size <= LIMIT)
+            .ok_or_else(|| std::io::Error::other("share journal capture is too large"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn respond_share_capture_background(
+    snapshot: super::sessions::ShareSnapshot,
+    journal: Session,
+    slots: Arc<tokio::sync::Semaphore>,
+    id: Option<serde_json::Value>,
+) -> Result<()> {
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| Error::Config("Share journal capture is already being encoded".into()))?;
+    std::thread::Builder::new()
+        .name("share-encode".into())
+        .spawn(move || {
+            let _permit = permit;
+            let result =
+                serde_json::to_writer(&mut ShareCaptureSize(0), &(&snapshot, journal.records()))
+                    .map_err(|_| {
+                        Error::Config("Share journal capture is too large or invalid".into())
+                    })
+                    .map(|()| json!({"snapshot":snapshot, "records":journal.records()}));
+            control_response("get_share_context", id, result);
+        })
+        .map_err(|_| Error::Config("Share journal encoder could not start".into()))?;
+    Ok(())
+}
+
+// Keep the journal that produced the context alongside it. A future durable
+// publisher must bind this exact journal, not reopen a potentially newer file.
+fn snapshot_and_session_for_share_with_hook(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+    hook: impl FnOnce(),
+) -> Result<(super::sessions::ShareSnapshot, Session, ShareCaptureStamp)> {
     let changed = || Error::Config("Share context changed; try sharing again".into());
     let (revision, count, base, pending, emit_entries, idle) = {
         let state = active.lock().expect("worker control");
@@ -381,6 +447,7 @@ fn snapshot_for_share_with_hook(
         session_id: session.session_id(),
         head: session.head(),
         context,
+        journal_tag: None,
     };
     let state = active.lock().expect("worker control");
     let mut snapshot = snapshot.lock().expect("session snapshot");
@@ -395,18 +462,81 @@ fn snapshot_for_share_with_hook(
             std::mem::replace(&mut snapshot.entries, prepared.entries),
         )
     });
+    let stamp = ShareCaptureStamp {
+        revision: snapshot.revision,
+        idle,
+    };
     drop(snapshot);
     drop(state);
     drop(old);
-    Ok(result)
+    Ok((result, session, stamp))
 }
 
+fn finalize_share_capture(
+    active: &Mutex<ControlState>,
+    state_snapshot: &Mutex<SessionSnapshot>,
+    mut share: super::sessions::ShareSnapshot,
+    journal: Session,
+    stamp: ShareCaptureStamp,
+    key: Option<[u8; 32]>,
+) -> Result<(super::sessions::ShareSnapshot, Session)> {
+    if let Some(key) = key {
+        share.journal_tag = Some(super::sessions::share_journal_tag(
+            &journal,
+            &share.context,
+            &key,
+        )?);
+    }
+    let state = active.lock().expect("worker control");
+    let snapshot = state_snapshot.lock().expect("session snapshot");
+    if snapshot.revision != stamp.revision
+        || stamp.idle != (state.token.is_none() && state.queued == 0)
+    {
+        return Err(Error::Config(
+            "Share context changed; try sharing again".into(),
+        ));
+    }
+    Ok((share, journal))
+}
+
+#[cfg(test)]
 async fn share_snapshot_background<F>(
     active: Arc<Mutex<ControlState>>,
     snapshot: Arc<Mutex<SessionSnapshot>>,
     slots: Arc<tokio::sync::Semaphore>,
     read: F,
 ) -> Result<super::sessions::ShareSnapshot>
+where
+    F: FnOnce() -> Option<Session> + Send + 'static,
+{
+    share_snapshot_and_journal_background(active, snapshot, slots, None, read)
+        .await
+        .map(|(snapshot, _)| snapshot)
+}
+
+// Bound only the wait for an already-running worker to publish readiness.
+// This is not a deadline for runtime configuration or credential refresh.
+async fn wait_for_share_readiness(ready: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while !*ready.borrow_and_update() {
+            ready
+                .changed()
+                .await
+                .map_err(|_| Error::Config("Share context initialization stopped".into()))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::Config("Share context initialization timed out".into()))?
+}
+
+async fn share_snapshot_and_journal_background<F>(
+    active: Arc<Mutex<ControlState>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    journal_key: Option<[u8; 32]>,
+    read: F,
+) -> Result<(super::sessions::ShareSnapshot, Session)>
 where
     F: FnOnce() -> Option<Session> + Send + 'static,
 {
@@ -423,7 +553,19 @@ where
                 state.token.is_none() && state.queued == 0
             };
             let current = if idle { read() } else { None };
-            let _ = send.send(snapshot_for_share(&active, &snapshot, current));
+            let result =
+                snapshot_and_session_for_share_with_hook(&active, &snapshot, current, || {})
+                    .and_then(|(share, journal, stamp)| {
+                        finalize_share_capture(
+                            &active,
+                            &snapshot,
+                            share,
+                            journal,
+                            stamp,
+                            journal_key,
+                        )
+                    });
+            let _ = send.send(result);
         })
         .map_err(|_| Error::Config("Share context reader could not start".into()))?;
     receive
@@ -486,16 +628,74 @@ pub fn run(
     Box::pin(run_worker(args, ready))
 }
 
+#[cfg(all(test, any(unix, windows)))]
+fn worker_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
+    worker_share_store_at(&super::config::agent_dir())
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn worker_share_store_at(
+    parent: &std::path::Path,
+) -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
+    // The prototype does not publish or serve snapshots. Do not create a cache
+    // merely because a worker started; existing entries can be invalidated.
+    match pi_rs_workbench::private_share_store::Store::open_existing(parent) {
+        Ok(store) => Ok(store),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// Invalidation-only bridge: it does not publish or serve snapshots yet.
+#[cfg(all(test, any(unix, windows)))]
+fn invalidate_existing_share_generation<'a>(
+    store: Option<&'a pi_rs_workbench::private_share_store::Store>,
+    path: &std::path::Path,
+) -> Result<Option<pi_rs_workbench::private_share_store::Generation<'a>>> {
+    let Some(store) = store else { return Ok(None) };
+    let session = match Session::snapshot(path) {
+        Ok(session) => session,
+        // Preserve the existing startup behavior: configuration failure must
+        // not create a new session journal. No cache entry can be served yet.
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let binding = store.binding_for_session(&session, &())?;
+    Ok(Some(store.try_begin(path, binding)?))
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn optional_share_generation<'a>(
+    store: Option<&'a pi_rs_workbench::private_share_store::Store>,
+    path: &std::path::Path,
+) -> Option<pi_rs_workbench::private_share_store::Generation<'a>> {
+    invalidate_existing_share_generation(store, path)
+        .ok()
+        .flatten()
+}
+
 async fn run_worker(
     mut args: Cli,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    // This invalidation bridge runs only in tests. Synchronous storage I/O
+    // cannot be allowed to stall ordinary worker startup while cache lookup and
+    // a durable failure fence are not yet implemented.
+    #[cfg(all(test, any(unix, windows)))]
+    let share_store = worker_share_store().ok().flatten();
+    #[cfg(all(test, any(unix, windows)))]
+    let mut share_generation = optional_share_generation(share_store.as_ref(), &args.session);
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
     let mut runtime = runtime::configure(&args, true).await?;
+    // Publish before lifecycle and request context hooks can run.
+    if std::env::var_os(super::process::REFRESH_BARRIER_ENV).is_some() {
+        super::process::SHARE_CONTEXT_STARTED.store(true, Ordering::SeqCst);
+        super::output(json!({"type":"share_context_initializing"}));
+    }
     if args.mode == Some(super::OutputMode::Rpc) {
         super::output(
             json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
@@ -769,6 +969,13 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                // Try invalidating the target before lifecycle and discovery.
+                // Failure only disables this prototype's generation tracking.
+                #[cfg(all(test, any(unix, windows)))]
+                {
+                    let next = optional_share_generation(share_store.as_ref(), &session);
+                    share_generation = next;
+                }
                 share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
@@ -1343,7 +1550,10 @@ async fn run_worker(
         },
     )
     .await;
-    runtime.close().await
+    let result = runtime.close().await;
+    #[cfg(all(test, any(unix, windows)))]
+    drop(share_generation);
+    result
 }
 
 async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {
@@ -1510,6 +1720,7 @@ fn read_requests(
         trace,
     });
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let share_encode_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1550,25 +1761,55 @@ fn read_requests(
                         result,
                     );
                 }
-                Request::GetShareContext { id, session } => {
+                Request::GetShareContext {
+                    id,
+                    session,
+                    journal_key,
+                    include_journal,
+                } => {
                     let mut ready = share_ready.clone();
                     let snapshot = snapshot.clone();
                     let active = active.clone();
                     let slots = share_slots.clone();
+                    let encode_slots = share_encode_slots.clone();
                     runtime.spawn(async move {
-                        while !*ready.borrow_and_update() {
-                            if ready.changed().await.is_err() {
+                        if include_journal && journal_key.is_none() {
+                            control_response(
+                                "get_share_context",
+                                id,
+                                Err(Error::Config(
+                                    "Journal capture requires a per-request journal key".into(),
+                                )),
+                            );
+                            return;
+                        }
+                        if let Err(error) = wait_for_share_readiness(&mut ready).await {
+                            control_response("get_share_context", id, Err(error));
+                            return;
+                        }
+                        let captured = share_snapshot_and_journal_background(
+                            active,
+                            snapshot,
+                            slots,
+                            journal_key,
+                            move || Session::snapshot(session).ok(),
+                        )
+                        .await;
+                        let result = match captured {
+                            Ok((snapshot, journal)) if include_journal => {
+                                if let Err(error) = respond_share_capture_background(
+                                    snapshot,
+                                    journal,
+                                    encode_slots,
+                                    id.clone(),
+                                ) {
+                                    control_response("get_share_context", id, Err(error));
+                                }
                                 return;
                             }
-                        }
-                        let result =
-                            share_snapshot_background(active, snapshot, slots, move || {
-                                Session::snapshot(session).ok()
-                            })
-                            .await
-                            .and_then(|snapshot| {
-                                serde_json::to_value(snapshot).map_err(Into::into)
-                            });
+                            Ok((snapshot, _)) => serde_json::to_value(snapshot).map_err(Into::into),
+                            Err(error) => Err(error),
+                        };
                         control_response("get_share_context", id, result);
                     });
                 }
@@ -1799,6 +2040,483 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[tokio::test(start_paused = true)]
+    async fn share_readiness_wait_is_bounded_and_reports_closed_worker() {
+        let (sender, mut ready) = tokio::sync::watch::channel(false);
+        let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
+        assert!(result.to_string().contains("timed out"));
+        let waiter = tokio::spawn(async move { wait_for_share_readiness(&mut ready).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        sender.send_replace(true);
+        waiter.await.unwrap().unwrap();
+        let (sender, mut ready) = tokio::sync::watch::channel(false);
+        drop(sender);
+        let result = wait_for_share_readiness(&mut ready).await.unwrap_err();
+        assert!(result.to_string().contains("stopped"));
+    }
+
+    #[test]
+    fn equal_session_head_does_not_identify_live_share_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut summary = false;
+        let before_registry = Registry::default();
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "before runtime refresh",
+                registry: &before_registry,
+            },
+            &mut summary,
+        );
+        let before = snapshot.share_snapshot().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut after_registry = Registry::default();
+        after_registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "after runtime refresh",
+                registry: &after_registry,
+            },
+            &mut summary,
+        );
+        let after = snapshot.share_snapshot().unwrap();
+        assert_eq!(before.session_id, after.session_id);
+        assert_eq!(before.head, after.head);
+        assert_ne!(before.context.system_prompt, after.context.system_prompt);
+        assert_ne!(before.context.tools.len(), after.context.tools.len());
+    }
+
+    #[test]
+    fn legacy_worker_share_request_without_journal_key_still_parses() {
+        let request: Request = serde_json::from_value(json!({
+            "type":"get_share_context", "id":"legacy", "session":"session.jsonl"
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::GetShareContext {
+                journal_key: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn paired_journal_encoding_has_a_hard_byte_limit() {
+        use std::io::Write;
+        let mut count = ShareCaptureSize(128 * 1024 * 1024 - 65);
+        count.write_all(b"x").unwrap();
+        assert!(count.write_all(b"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn paired_journal_encoding_refuses_a_second_outstanding_request() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let snapshot = super::super::sessions::ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: super::super::sessions::ShareContext {
+                system_prompt: "fixture".into(),
+                tools: vec![],
+            },
+            journal_tag: Some([1; 32]),
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = slots.clone().acquire_owned().await.unwrap();
+        let result = respond_share_capture_background(snapshot, session, slots, None);
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("already being encoded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn live_worker_response_binds_context_to_exact_journal() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let key = [7; 32];
+        let (share, journal) = share_snapshot_and_journal_background(
+            Arc::new(Mutex::new(ControlState::default())),
+            Arc::new(Mutex::new(worker)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Some(key),
+            || None,
+        )
+        .await
+        .unwrap();
+        super::super::sessions::validate_live_share_journal(&journal, &share, Some(&key)).unwrap();
+        assert!(
+            super::super::sessions::validate_live_share_journal(&journal, &share, Some(&[8; 32]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_context_change_after_capture_is_rejected_before_response() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "before".into(),
+            tools: vec![],
+        }));
+        let active = Mutex::new(ControlState::default());
+        let snapshot = Mutex::new(worker);
+        let (share, journal, stamp) =
+            snapshot_and_session_for_share_with_hook(&active, &snapshot, None, || {}).unwrap();
+        {
+            let mut current = snapshot.lock().unwrap();
+            let registry = Registry::default();
+            current.track_share_event(
+                &Notification::ModelContext {
+                    system_prompt: "after",
+                    registry: &registry,
+                },
+                &mut false,
+            );
+        }
+        assert!(
+            finalize_share_capture(&active, &snapshot, share, journal, stamp, Some([7; 32]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn captured_share_context_keeps_exact_source_journal() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let expected = serde_json::to_vec(session.records()).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live prompt".into(),
+            tools: vec![],
+        }));
+        let (share, captured, _stamp) = snapshot_and_session_for_share_with_hook(
+            &Mutex::new(ControlState::default()),
+            &Mutex::new(worker),
+            None,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(share.session_id, captured.session_id());
+        assert_eq!(share.head, captured.head());
+        assert_eq!(share.context.system_prompt, "live prompt");
+        assert_eq!(serde_json::to_vec(captured.records()).unwrap(), expected);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_capture_round_trips_with_exact_journal_and_provenance() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("live".into(), Vec::new(), None)
+            .unwrap();
+        let provenance = json!({"workspace": "fixture", "configuration": "v1"});
+        let binding = store.binding_for_session(&session, &provenance).unwrap();
+        // Runtime initialization is only permitted after this generation is dirty.
+        let generation = store.begin(&path, binding.clone()).unwrap();
+        let busy = store
+            .try_begin(&path, binding)
+            .err()
+            .expect("active generation must block another worker");
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live context".into(),
+            tools: vec![],
+        }));
+        let (share, journal, _stamp) = snapshot_and_session_for_share_with_hook(
+            &Mutex::new(ControlState::default()),
+            &Mutex::new(worker),
+            None,
+            || {},
+        )
+        .unwrap();
+        generation
+            .publish_session(&journal, &provenance, &share)
+            .unwrap();
+        let restored: super::super::sessions::ShareSnapshot = store
+            .read_session(&path, &session, &provenance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&share).unwrap()
+        );
+        assert!(
+            store
+                .read_session::<_, super::super::sessions::ShareSnapshot>(
+                    &path,
+                    &session,
+                    &json!({"workspace": "changed"}),
+                )
+                .unwrap()
+                .is_none()
+        );
+        session
+            .append_user_with_images("new record".into(), Vec::new(), None)
+            .unwrap();
+        assert!(
+            store
+                .read_session::<_, super::super::sessions::ShareSnapshot>(
+                    &path,
+                    &session,
+                    &provenance,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn worker_does_not_create_store_and_rejects_unverifiable_existing_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("agent");
+        assert!(worker_share_store_at(&parent).unwrap().is_none());
+        assert!(!parent.exists());
+        std::fs::create_dir(&parent).unwrap();
+        assert!(worker_share_store_at(&parent).unwrap().is_none());
+        std::fs::write(parent.join("share-context-v1"), b"not a directory").unwrap();
+        assert!(worker_share_store_at(&parent).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_agent_directory_is_a_non_creating_cache_miss() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can bypass directory permissions; this checks normal users.
+        // SAFETY: geteuid takes no arguments and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = worker_share_store_at(directory.path());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.unwrap().is_none());
+        assert!(optional_share_generation(None, &directory.path().join("session.jsonl")).is_none());
+        assert!(!directory.path().join("share-context-v1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_optional_invalidation_can_leave_previous_snapshot_readable() {
+        use pi_rs_workbench::private_share_store::Store;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = root.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old":true}))
+            .unwrap();
+        drop(session);
+        let directory = root.path().join("share-context-v1");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let lease = optional_share_generation(Some(&store), &path);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(lease.is_none());
+        // This reproduces the unresolved failure-fence problem. A production
+        // reader must not be enabled while this old snapshot remains usable.
+        assert_eq!(
+            store.read(&path, &binding).unwrap(),
+            Some(json!({"old":true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_alias_can_bypass_path_keyed_invalidation() {
+        use pi_rs_workbench::private_share_store::Store;
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let original = root.path().join("original.jsonl");
+        let alias = root.path().join("alias.jsonl");
+        let session = Session::open(&original).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&original, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old": true}))
+            .unwrap();
+        drop(session);
+        std::fs::hard_link(&original, &alias).unwrap();
+        let first = std::fs::metadata(&original).unwrap();
+        let second = std::fs::metadata(&alias).unwrap();
+        assert_eq!((first.dev(), first.ino()), (second.dev(), second.ino()));
+        let generation = invalidate_existing_share_generation(Some(&store), &alias)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 1);
+        // Different path keys leave the original cache valid even though the
+        // worker used the same inode through an alias that no longer exists.
+        // Checking the current link count alone cannot discover that history.
+        assert_eq!(
+            store.read(&original, &binding).unwrap(),
+            Some(json!({"old": true}))
+        );
+        drop(generation);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn existing_generation_is_invalidated_before_worker_initialization() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old":true}))
+            .unwrap();
+        drop(session);
+        let lease = invalidate_existing_share_generation(Some(&store), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.read(&path, &binding).unwrap(), None);
+        let error = store
+            .try_begin(&path, binding.clone())
+            .err()
+            .expect("worker owns generation");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            invalidate_existing_share_generation(Some(&store), &path),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(optional_share_generation(Some(&store), &path).is_none());
+        drop(lease);
+        assert_eq!(store.read(&path, &binding).unwrap(), None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn new_session_is_not_created_during_optional_cache_setup() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("new-session.jsonl");
+        assert!(
+            invalidate_existing_share_generation(Some(&store), &path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalidating_switch_target_does_not_release_previous_generation() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let first_path = directory.path().join("first.jsonl");
+        let second_path = directory.path().join("second.jsonl");
+        let first = Session::open(&first_path).unwrap();
+        let second = Session::open(&second_path).unwrap();
+        let first_binding = store.binding_for_session(&first, &()).unwrap();
+        let second_binding = store.binding_for_session(&second, &()).unwrap();
+        drop(first);
+        drop(second);
+        let first_lease = invalidate_existing_share_generation(Some(&store), &first_path)
+            .unwrap()
+            .unwrap();
+        let second_lease = invalidate_existing_share_generation(Some(&store), &second_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .try_begin(&first_path, first_binding)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store
+                .try_begin(&second_path, second_binding)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop((first_lease, second_lease));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replacing_journal_after_invalidation_cannot_revive_another_identity() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let replacement_path = directory.path().join("replacement.jsonl");
+        let original = Session::open(&path).unwrap();
+        let replacement = Session::open(&replacement_path).unwrap();
+        let replacement_binding = store.binding_for_session(&replacement, &()).unwrap();
+        drop(original);
+        drop(replacement);
+        // A historical entry for a different session identity at the same
+        // pathname must be invalidated when the worker starts.
+        store
+            .begin(&path, replacement_binding.clone())
+            .unwrap()
+            .publish(replacement_binding.clone(), json!({"stale":true}))
+            .unwrap();
+        let lease = invalidate_existing_share_generation(Some(&store), &path)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&path, directory.path().join("old.jsonl")).unwrap();
+        std::fs::rename(&replacement_path, &path).unwrap();
+        let now = Session::snapshot(&path).unwrap();
+        assert_eq!(
+            store.binding_for_session(&now, &()).unwrap(),
+            replacement_binding
+        );
+        assert_eq!(store.read(&path, &replacement_binding).unwrap(), None);
+        drop(lease);
+        assert_eq!(store.read(&path, &replacement_binding).unwrap(), None);
+    }
+
+    #[test]
+    fn equal_session_id_and_head_do_not_identify_journal_content() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), Vec::new(), None)
+            .unwrap();
+        let mut altered = session.records().to_vec();
+        match &mut altered.last_mut().unwrap().event {
+            Event::User { content, .. } => *content = "different".into(),
+            _ => panic!("expected a user record"),
+        }
+        let altered = Session::from_records(altered).unwrap();
+        assert_eq!(session.session_id(), altered.session_id());
+        assert_eq!(session.head(), altered.head());
+        assert_ne!(
+            serde_json::to_vec(session.records()).unwrap(),
+            serde_json::to_vec(altered.records()).unwrap()
+        );
+    }
 
     #[test]
     fn stalled_share_reader_does_not_delay_runtime_shutdown() {
@@ -2160,6 +2878,15 @@ mod share_context_tests {
         assert_eq!(
             snapshot.share_snapshot().unwrap().context.system_prompt,
             "refreshed prompt"
+        );
+        assert!(
+            snapshot
+                .share_snapshot()
+                .unwrap()
+                .context
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read")
         );
         snapshot.settle_share_context();
         let context = snapshot.share_snapshot().unwrap().context;

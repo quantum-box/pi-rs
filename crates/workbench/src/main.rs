@@ -1290,6 +1290,18 @@ fn main() {
     };
     #[cfg(not(windows))]
     let code = run_cli();
+    // A normal startup failure can prove that no live context was started.
+    // A crash or lost stdout does not provide this proof and must fail closed.
+    if code != 0
+        && std::env::var_os(process::REFRESH_BARRIER_ENV).is_some()
+        && !process::SHARE_CONTEXT_STARTED.load(Ordering::SeqCst)
+    {
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            json!({"type":"share_context_not_started"})
+        );
+    }
     // Detached discovery threads may still be finishing. Wait for any token
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
@@ -1925,10 +1937,19 @@ async fn execute(
         return Ok(());
     }
     let mut session = if matches!(&command, Command::Share) {
-        Session::open_for_share(&args.session)?
+        Session::open_for_share(&args.session)
     } else {
-        Session::open(&args.session)?
-    };
+        Session::open(&args.session)
+    }
+    .map_err(|error| {
+        if matches!(&command, Command::Share) {
+            Error::Config(format!(
+                "Cannot prepare share from the session; live context is unavailable: {error}"
+            ))
+        } else {
+            error
+        }
+    })?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
@@ -2021,7 +2042,15 @@ async fn execute(
         }
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let shared = destination.share(session, &args.workspace, None).await?;
+            let workspace = args.workspace.clone();
+            let snapshot = if destination.is_radius() {
+                Some(runtime::standalone_share_snapshot(&args, &session).await?)
+            } else {
+                None
+            };
+            let shared = destination
+                .share(session, &workspace, snapshot, None)
+                .await?;
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);

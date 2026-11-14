@@ -73,6 +73,393 @@ fn accept_model_request(listener: TcpListener) -> (std::net::TcpStream, Value) {
 }
 
 #[test]
+fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    let prompt = root.path().join("system.txt");
+    std::fs::write(&prompt, "Unique standalone share prompt").unwrap();
+    let mut session = pi_rs::Session::open(&path).unwrap();
+    session
+        .append_user_with_images("hello".into(), Vec::new(), None)
+        .unwrap();
+    drop(session);
+    let original = std::fs::read(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        sender.send(body).unwrap();
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("PI_RS_MODEL_TOKEN")
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--tools",
+            "read",
+            "--system-prompt",
+        ])
+        .arg(&prompt)
+        .arg("--session")
+        .arg(&path);
+    command.args([
+        "--no-trust",
+        "--endpoint",
+        "http://127.0.0.1:1/v1/chat/completions",
+    ]);
+    let mut child = command
+        .arg("share")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("standalone share timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    server.join().unwrap();
+    let entries: Vec<Value> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let metadata = entries
+        .iter()
+        .find(|entry| entry["customType"] == "pi.share");
+    {
+        let metadata = metadata.unwrap();
+        assert_eq!(entries.last(), Some(metadata));
+        assert_eq!(metadata["parentId"], entries[entries.len() - 2]["id"]);
+        assert!(
+            metadata["data"]["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .contains("Unique standalone share prompt")
+        );
+        assert!(
+            metadata["data"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
+    for pending_trust in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        if pending_trust {
+            std::fs::create_dir_all(root.path().join(".agents/skills/example")).unwrap();
+        }
+        let path = root.path().join("session.jsonl");
+        drop(pi_rs::Session::open(&path).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+            ])
+            .arg("--session")
+            .arg(&path);
+        if pending_trust {
+            command.args(["--endpoint", "http://127.0.0.1:1/v1/chat/completions"]);
+        } else {
+            command.args([
+                "--no-trust",
+                "--provider",
+                "google",
+                "--model",
+                "gemini-2.5-flash",
+            ]);
+        }
+        let mut child = command
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("standalone share did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "unavailable context was shared");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Radius was contacted"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_share_does_not_upload_after_extension_hook_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    for fail_start in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let prompt = root.path().join("prompt.txt");
+        let marker = root.path().join("hook-ran");
+        let events = root.path().join("hook-events");
+        let extension = root.path().join("break-resources.py");
+        std::fs::write(&prompt, "original prompt").unwrap();
+        std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+r = json.load(sys.stdin)
+if r['type'] == 'describe':
+    response = {'Ok': {'id':'break-resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'lifecycle_hook':True,'session_lifecycle_hook':True}}
+elif r['type'] == 'lifecycle':
+    event = r['event']['type']
+    with open(os.environ['SHARE_EVENTS'], 'a') as f: f.write(event + '\n')
+    if event == 'session_start' and os.environ['SHARE_FAIL_START'] == '1':
+        with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
+        response = {'Err': 'fixture start failed'}
+    else:
+        response = {'Ok': None}
+elif r['type'] == 'discover_resources':
+    with open(os.environ['SHARE_EVENTS'], 'a') as f: f.write('discover_resources\n')
+    with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
+    response = {'Err': 'fixture discovery failed'}
+else:
+    response = {'Ok': None}
+print(json.dumps({'version':1,'response':response}))
+"##).unwrap();
+        std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = pi_rs::Session::open(&path).unwrap();
+        drop(session);
+        let before = std::fs::read(&path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .env("SHARE_MARKER", &marker)
+            .env("SHARE_EVENTS", &events)
+            .env("SHARE_FAIL_START", if fail_start { "1" } else { "0" })
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--system-prompt",
+            ])
+            .arg(&prompt)
+            .arg("--extension")
+            .arg(&extension)
+            .arg("--session")
+            .arg(&path)
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("standalone share did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            marker.exists(),
+            "resource discovery hook did not run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "failed reconstruction was shared");
+        let events = std::fs::read_to_string(events).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            if fail_start {
+                vec!["session_start", "session_shutdown"]
+            } else {
+                vec!["session_start", "discover_resources", "session_shutdown"]
+            },
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Radius was contacted"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn two_idle_workers_can_expose_different_contexts_for_the_same_unlocked_journal() {
+    use hmac::{Hmac, Mac};
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireContext {
+        system_prompt: String,
+        tools: Vec<pi_rs::ToolSpec>,
+    }
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("session.jsonl");
+    drop(pi_rs::Session::open(&journal).unwrap());
+    let first_prompt = root.path().join("first.txt");
+    let second_prompt = root.path().join("second.txt");
+    std::fs::write(&first_prompt, "first worker context").unwrap();
+    std::fs::write(&second_prompt, "second worker context").unwrap();
+    let spawn = |prompt: &std::path::Path| {
+        let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "ollama",
+                "--model",
+                "fixture",
+                "--endpoint",
+                "http://127.0.0.1:9",
+                "--system-prompt",
+            ])
+            .arg(prompt)
+            .arg("--session")
+            .arg(&journal)
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let input = child.0.stdin.take().unwrap();
+        let output = child.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && tx.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (child, input, rx)
+    };
+    let (_first, mut first_input, first_rx) = spawn(&first_prompt);
+    let key = [9u8; 32];
+    writeln!(first_input, "{}", json!({"type":"get_share_context", "id":"first", "session":journal, "journal_key":key, "include_journal":true})).unwrap();
+    first_input.flush().unwrap();
+    let first = receive(&first_rx, |event| event["id"] == "first");
+    assert_eq!(first["success"], true, "{first}");
+    let (_second, mut second_input, second_rx) = spawn(&second_prompt);
+    writeln!(second_input, "{}", json!({"type":"get_share_context", "id":"second", "session":journal, "journal_key":key, "include_journal":true})).unwrap();
+    second_input.flush().unwrap();
+    let second = receive(&second_rx, |event| event["id"] == "second");
+    assert_eq!(second["success"], true, "{second}");
+    assert_eq!(
+        first["data"]["snapshot"]["sessionId"],
+        second["data"]["snapshot"]["sessionId"]
+    );
+    assert_eq!(
+        first["data"]["snapshot"]["head"],
+        second["data"]["snapshot"]["head"]
+    );
+    assert_eq!(first["data"]["records"], second["data"]["records"]);
+    assert_ne!(
+        first["data"]["snapshot"]["context"]["systemPrompt"],
+        second["data"]["snapshot"]["context"]["systemPrompt"]
+    );
+    for response in [&first, &second] {
+        let records: Vec<pi_rs::Record> =
+            serde_json::from_value(response["data"]["records"].clone()).unwrap();
+        let context: WireContext =
+            serde_json::from_value(response["data"]["snapshot"]["context"].clone()).unwrap();
+        let tag: [u8; 32] =
+            serde_json::from_value(response["data"]["snapshot"]["journalTag"].clone()).unwrap();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+        mac.update(b"pi-rs-live-share-context-v2\0");
+        mac.update(&serde_json::to_vec(&(records, context)).unwrap());
+        assert!(mac.verify_slice(&tag).is_ok());
+    }
+    // A successful exclusive open does not prove that no idle worker exists.
+    drop(pi_rs::Session::open(&journal).unwrap());
+    writeln!(first_input, "{}", json!({"type":"shutdown"})).unwrap();
+    writeln!(second_input, "{}", json!({"type":"shutdown"})).unwrap();
+}
+
+#[test]
 fn share_context_tracks_idle_and_inflight_worker() {
     let root = tempfile::tempdir().unwrap();
     let prompt = root.path().join("system.txt");
@@ -169,10 +556,11 @@ fn share_context_tracks_idle_and_inflight_worker() {
     input.flush().unwrap();
     let request = receive(&rx, |event| event["type"] == "request");
     started.recv_timeout(Duration::from_secs(20)).unwrap();
+    let key = [7u8; 32];
     writeln!(
         input,
         "{}",
-        json!({"type":"get_share_context","id":"active", "session":root.path().join("session.jsonl")})
+        json!({"type":"get_share_context","id":"active", "session":root.path().join("session.jsonl"), "journal_key":key, "include_journal":true})
     )
     .unwrap();
     input.flush().unwrap();
@@ -186,10 +574,68 @@ fn share_context_tracks_idle_and_inflight_worker() {
         .iter()
         .find(|message| message["role"] == "system")
         .unwrap();
-    assert_eq!(active["data"]["context"]["systemPrompt"], system["content"]);
     assert_eq!(
-        active["data"]["context"]["tools"],
+        active["data"]["snapshot"]["context"]["systemPrompt"],
+        system["content"]
+    );
+    assert_eq!(
+        active["data"]["snapshot"]["context"]["tools"],
         request["request"]["tools"]
+    );
+    let records: Vec<pi_rs::Record> =
+        serde_json::from_value(active["data"]["records"].clone()).unwrap();
+    let captured = pi_rs::Session::from_records(records).unwrap();
+    assert_eq!(active["data"]["snapshot"]["head"], captured.head());
+    // An active worker owns the journal lock. The standalone CLI currently
+    // cannot ask it for context and must not contact Radius in this state.
+    let radius = TcpListener::bind("127.0.0.1:0").unwrap();
+    radius.set_nonblocking(true).unwrap();
+    let radius_url = format!("http://{}/v1/artifacts", radius.local_addr().unwrap());
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", radius_url)
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            &endpoint,
+            "--session",
+        ])
+        .arg(root.path().join("session.jsonl"))
+        .arg("share")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut standalone = KillOnDrop(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while standalone.0.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "standalone share did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!standalone.0.wait().unwrap().success());
+    let mut error = String::new();
+    standalone
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(error.contains("live context is unavailable"), "{error}");
+    assert!(
+        matches!(radius.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Radius was contacted"
     );
     release.send(()).unwrap();
     let settled = receive(&rx, |event| {
@@ -212,15 +658,19 @@ fn terminal_shares_idle_and_during_model_request() {
     let prompt = root.path().join("system.txt");
     std::fs::write(&prompt, "Terminal share prompt").unwrap();
     let extension = root.path().join("context.py");
+    let marker = root.path().join("context-worker-pid");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 r = json.load(sys.stdin)
 if r['type'] == 'describe':
     result = {'id':'share-context-fixture','dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True}
 elif r['type'] == 'context_with_system':
     result = r['messages']
     for message in result:
-        if message['role'] == 'system': message['content'] += ' fixture-context-hook'
+        if message['role'] == 'system':
+            message['content'] += ' fixture-context-hook'
+    with open(os.environ['SHARE_FIXTURE_MARKER'], 'w') as marker:
+        marker.write(str(os.getppid()))
 elif r['type'] == 'before_request':
     result = r['request']
 else:
@@ -239,6 +689,7 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
         share_listener.local_addr().unwrap()
     );
     let (share_tx, share_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
     let shares = std::thread::spawn(move || {
         for _ in 0..2 {
             let (mut socket, _) = share_listener.accept().unwrap();
@@ -269,6 +720,18 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
                 .map(|line| serde_json::from_slice(line).unwrap())
                 .collect();
             share_tx.send(entries).unwrap();
+        }
+        share_listener.set_nonblocking(true).unwrap();
+        loop {
+            if !matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                break;
+            }
+            match share_listener.accept() {
+                Ok(_) => panic!("an unauthenticated third share reached Radius"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("share listener: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
     let (started_tx, started_rx) = mpsc::channel();
@@ -313,6 +776,7 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
         .env("TERM", "xterm-256color")
         .env("RADIUS_API_KEY", "fixture")
         .env("PI_RS_RADIUS_SHARE_URL", &share_endpoint)
+        .env("SHARE_FIXTURE_MARKER", &marker)
         .args([
             "--offline",
             "--no-mcp",
@@ -382,6 +846,10 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     let idle = receive_share(&mut master);
     let idle_context = idle.last().unwrap();
     assert_eq!(idle_context["customType"], "pi.share");
+    // The per-request challenge and its tag are internal to the frontend and
+    // worker; neither belongs in the uploaded presentation metadata.
+    assert!(idle_context["data"].get("journalKey").is_none());
+    assert!(idle_context["data"].get("journalTag").is_none());
     assert!(
         idle_context["data"]["systemPrompt"]
             .as_str()
@@ -397,9 +865,24 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     );
     wait_output(&mut master, "Share URL:");
     master.write_all(b"hello\r").unwrap();
-    let request = started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    let model_request = started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|error| {
+            let mut output = Vec::new();
+            let mut buffer = [0; 8192];
+            while let Ok(count) = master.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
+            panic!(
+                "model request did not start: {error}; terminal: {}",
+                String::from_utf8_lossy(&output)
+            );
+        });
     assert!(
-        request["messages"]
+        model_request["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -411,9 +894,50 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     master.write_all(b"/share\r").unwrap();
     let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
-    assert_eq!(active.last().unwrap()["data"], idle_context["data"]);
+    assert!(active.last().unwrap()["data"].get("journalKey").is_none());
+    assert!(active.last().unwrap()["data"].get("journalTag").is_none());
+    let shared_prompt = active.last().unwrap()["data"]["systemPrompt"]
+        .as_str()
+        .unwrap();
+    assert!(shared_prompt.contains("Terminal share prompt"));
+    assert!(!shared_prompt.contains("fixture-context-hook"));
     release_tx.send(()).unwrap();
     wait_output(&mut master, "done");
+    let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    struct Resume(libc::pid_t);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGCONT);
+            }
+        }
+    }
+    let _resume = Resume(pid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut changed = loop {
+        match pi_rs::Session::open(root.path().join("session.jsonl")) {
+            Ok(session) => break session,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("worker did not release session: {error}"),
+        }
+    };
+    changed
+        .append_user_with_images("changed after hook".into(), Vec::new(), None)
+        .unwrap();
+    drop(changed);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    master.write_all(b"/share\r").unwrap();
+    wait_output(&mut master, "Preparing share");
+    wait_output(&mut master, "Live share context is unavailable");
+    master.write_all(b"/share\r").unwrap();
+    // The visible pending state proves the request was sent before exit.
+    wait_output(&mut master, "Preparing share");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    wait_output(&mut master, "Live share context is unavailable");
+    stop_tx.send(()).unwrap();
     shares.join().unwrap();
     model.join().unwrap();
 }

@@ -720,6 +720,7 @@ async fn run_device_side_effect<T>(
 
 struct PendingShare {
     id: uuid::Uuid,
+    journal_key: Option<[u8; 32]>,
     destination: sessions::ShareDestination,
     path: PathBuf,
     workspace: PathBuf,
@@ -735,6 +736,7 @@ fn start_share_upload(
         destination,
         path,
         workspace,
+        journal_key,
         ..
     } = pending;
     let status = destination.status();
@@ -743,7 +745,9 @@ fn start_share_upload(
         "Share cancelled",
         move |_| async move {
             let session = Session::snapshot(path)?;
-            let shared = destination.share(session, &workspace, snapshot).await?;
+            let shared = destination
+                .share(session, &workspace, snapshot, journal_key)
+                .await?;
             let mut lines = vec![format!("Share URL: {}", shared.url)];
             if let Some(gist) = shared.gist {
                 lines.push(format!("Gist: {gist}"));
@@ -791,6 +795,7 @@ struct View {
     model_list: Option<ModelDiscovery>,
     remote_task: Option<RemoteTask>,
     pending_share: Option<PendingShare>,
+    share_context_may_exist: bool,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
@@ -892,10 +897,12 @@ impl View {
         {
             return None;
         }
-        let snapshot = (value["success"] == true)
-            .then(|| serde_json::from_value(value["data"].clone()).ok())
-            .flatten();
-        Some((self.pending_share.take().expect("matching share"), snapshot))
+        let pending = self.pending_share.take().expect("matching share");
+        if value["success"] != true {
+            return Some((pending, None));
+        }
+        let snapshot = serde_json::from_value(value["data"].clone()).ok();
+        Some((pending, snapshot))
     }
 
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
@@ -2951,14 +2958,37 @@ fn slash(
             view.append("Copied last response");
         }
         "/share" => {
+            view.share_context_may_exist |= super::process::DROPPED_SHARE_CONTEXT_POSSIBLE
+                .load(std::sync::atomic::Ordering::SeqCst);
             let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let worker_present = worker.as_ref().is_some_and(|slot| slot.is_some());
             let id = if destination.is_radius() && !args.trust_pending {
-                worker.and_then(|worker| Worker::request_share_context(worker, args).ok())
+                if let Some(worker) = worker {
+                    let had_worker = worker.is_some();
+                    match Worker::request_share_context(worker, args) {
+                        Ok(request) => Some(request),
+                        Err(error) if had_worker || view.share_context_may_exist => {
+                            return Err(error);
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             };
+            if destination.is_radius()
+                && id.is_none()
+                && (view.share_context_may_exist || worker_present)
+            {
+                return Err(Error::Config(
+                    "Live share context is unavailable; try sharing again".into(),
+                ));
+            }
             let pending = PendingShare {
-                id: id.unwrap_or_else(uuid::Uuid::nil),
+                id: id.as_ref().map_or_else(uuid::Uuid::nil, |(id, _)| *id),
+                journal_key: id.as_ref().map(|(_, key)| *key),
                 destination,
                 path: args.session.clone(),
                 workspace: args.workspace.clone(),
@@ -4011,6 +4041,7 @@ pub(super) async fn run(
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.drain_events();
+            view.share_context_may_exist |= active.context_may_exist;
             for value in events {
                 if value["type"] == "response" && value["command"] == "get_share_context" {
                     if let Some((pending, snapshot)) = view.take_share_response(&value) {
@@ -4117,11 +4148,24 @@ pub(super) async fn run(
                 }
                 for value in finished.drain_events() {
                     if value["type"] == "response" && value["command"] == "get_share_context" {
+                        if let Some((pending, snapshot)) = view.take_share_response(&value) {
+                            start_share_upload(&mut view, pending, snapshot);
+                        }
                         continue;
                     }
                     view.receive_worker(value, &mut args);
                 }
-                if let Some(pending) = view.pending_share.take() {
+                view.share_context_may_exist |= finished.context_may_exist;
+                if let Some(mut pending) = view.pending_share.take() {
+                    // Only a worker known to have failed before context setup
+                    // may use the legacy metadata-free fallback.
+                    if finished.startup_proven_empty
+                        && !view.share_context_may_exist
+                        && !super::process::DROPPED_SHARE_CONTEXT_POSSIBLE
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        pending.journal_key = None;
+                    }
                     start_share_upload(&mut view, pending, None);
                 }
                 view.settle();
@@ -8120,6 +8164,88 @@ exit {exit}
     }
 
     #[test]
+    fn live_share_response_keeps_its_private_journal_key() {
+        let share_id = uuid::Uuid::new_v4();
+        let key = [3; 32];
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id: share_id,
+                journal_key: Some(key),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let snapshot = super::sessions::ShareSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            head: 7,
+            context: super::sessions::ShareContext {
+                system_prompt: "live".into(),
+                tools: vec![],
+            },
+            journal_tag: Some([9; 32]),
+        };
+        let (pending, received) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":share_id,
+                "success":true, "data":snapshot,
+            }))
+            .unwrap();
+        assert_eq!(pending.journal_key, Some(key));
+        assert_eq!(received.unwrap().journal_tag, Some([9; 32]));
+    }
+
+    #[test]
+    fn malformed_success_keeps_live_authentication_required() {
+        let id = uuid::Uuid::new_v4();
+        let key = [5; 32];
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id,
+                journal_key: Some(key),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let (pending, snapshot) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":id,
+                "success":true, "data":{}
+            }))
+            .unwrap();
+        assert_eq!(pending.journal_key, Some(key));
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn failed_live_share_response_requires_authenticated_context() {
+        let id = uuid::Uuid::new_v4();
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id,
+                journal_key: Some([3; 32]),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let (pending, snapshot) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":id, "success":false
+            }))
+            .unwrap();
+        assert_eq!(pending.journal_key, Some([3; 32]));
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn pending_share_keeps_extension_dialog_and_response_correlated() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let share_id = uuid::Uuid::new_v4();
@@ -8127,6 +8253,7 @@ exit {exit}
         let mut view = super::View {
             pending_share: Some(super::PendingShare {
                 id: share_id,
+                journal_key: None,
                 destination: super::sessions::ShareDestination::Gist,
                 path: Default::default(),
                 workspace: Default::default(),

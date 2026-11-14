@@ -45,6 +45,403 @@ fn jsonl_session_id_can_be_opened_by_session_and_resume() {
     assert!(!root.path().join("work.jsonl").exists());
 }
 
+fn assert_rpc_worker_starts_with_unavailable_store(root: &std::path::Path, home: &std::path::Path) {
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root)
+        .env("PI_RS_HOME", home)
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let mut input = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver
+            .recv_timeout(remaining)
+            .expect("worker did not become ready");
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    assert_eq!(response["success"], true, "{response}");
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.0.try_wait().unwrap().is_none() {
+        panic!("worker did not exit");
+    }
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reader.is_finished(), "worker output did not close");
+    reader.join().unwrap();
+}
+
+#[test]
+fn rpc_worker_starts_when_share_store_is_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("share-context-v1"), b"unavailable").unwrap();
+    assert_rpc_worker_starts_with_unavailable_store(root.path(), &home);
+    assert_eq!(
+        std::fs::read(home.join("share-context-v1")).unwrap(),
+        b"unavailable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_worker_starts_when_agent_directory_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = Restore(home.clone());
+    assert_rpc_worker_starts_with_unavailable_store(root.path(), &home);
+    assert!(!home.join("share-context-v1").exists());
+}
+
+#[test]
+fn worker_returns_keyed_share_journal_tag() {
+    use hmac::{Hmac, Mac};
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("fixture 🌸\nsecond".into(), Vec::new(), None)
+        .unwrap();
+    drop(session);
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .arg("--session")
+        .arg(&path)
+        .arg("--workspace")
+        .arg(root.path())
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--stdin-control",
+            "serve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let mut input = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let key = [37u8; 32];
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"share", "type":"get_share_context", "session":path, "journal_key":key})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "worker did not return share context: {error}; stderr: {}",
+                    String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap_or_default())
+                )
+            });
+        if event["id"] == "share" {
+            break event;
+        }
+    };
+    assert_eq!(response["success"], true, "{response}");
+    assert!(response["data"].get("journalKey").is_none());
+    let tag: [u8; 32] = serde_json::from_value(response["data"]["journalTag"].clone()).unwrap();
+    let journal = Session::snapshot(&path).unwrap();
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireContext {
+        system_prompt: String,
+        tools: Vec<pi_rs::ToolSpec>,
+    }
+    let context: WireContext = serde_json::from_value(response["data"]["context"].clone()).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    mac.update(b"pi-rs-live-share-context-v2\0");
+    mac.update(&serde_json::to_vec(&(journal.records(), &context)).unwrap());
+    assert!(mac.verify_slice(&tag).is_ok());
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"no-key", "type":"get_share_context", "session":path, "include_journal":true})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let denied = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "no-key" {
+            break event;
+        }
+    };
+    assert_eq!(denied["success"], false, "{denied}");
+    writeln!(input, "{}", json!({"id":"paired", "type":"get_share_context", "session":path, "journal_key":key, "include_journal":true})).unwrap();
+    input.flush().unwrap();
+    let paired = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "paired" {
+            break event;
+        }
+    };
+    assert_eq!(paired["success"], true, "{paired}");
+    let records: Vec<pi_rs::Record> =
+        serde_json::from_value(paired["data"]["records"].clone()).unwrap();
+    let captured = Session::from_records(records).unwrap();
+    assert_eq!(captured.session_id(), journal.session_id());
+    assert_eq!(captured.head(), journal.head());
+    let context: WireContext =
+        serde_json::from_value(paired["data"]["snapshot"]["context"].clone()).unwrap();
+    let tag: [u8; 32] =
+        serde_json::from_value(paired["data"]["snapshot"]["journalTag"].clone()).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    mac.update(b"pi-rs-live-share-context-v2\0");
+    mac.update(&serde_json::to_vec(&(captured.records(), &context)).unwrap());
+    assert!(mac.verify_slice(&tag).is_ok());
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.0.try_wait().unwrap().is_some(), "worker did not exit");
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reader.is_finished(), "worker output did not close");
+    reader.join().unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn standalone_radius_share_reconstructs_instead_of_using_old_cache() {
+    use pi_rs_workbench::private_share_store::Store;
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = root.path().join("session.jsonl");
+    let prompt = root.path().join("prompt.txt");
+    std::fs::write(&prompt, "fresh-from-disk").unwrap();
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("fixture".into(), Vec::new(), None)
+        .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let store = Store::open(&home).unwrap();
+    let binding = store.binding_for_session(&session, &()).unwrap();
+    let stale = json!({"sessionId":session.session_id(), "head":session.head(),
+        "context":{"systemPrompt":"stale-cache-canary", "tools":[]}});
+    store
+        .begin(&path, binding.clone())
+        .unwrap()
+        .publish(binding.clone(), stale.clone())
+        .unwrap();
+    drop(store);
+    drop(session);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+        let Some(length) = length.filter(|length| *length <= 1024 * 1024) else {
+            return;
+        };
+        let mut body = vec![0; length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let response = r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#;
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        );
+        let _ = sender.send((first, body));
+    });
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env("RADIUS_API_KEY", "fixture")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--system-prompt",
+        ])
+        .arg(&prompt)
+        .arg("--session")
+        .arg(&path)
+        .arg("share")
+        .stdout(Stdio::from(stdout.reopen().unwrap()))
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child
+        .0
+        .try_wait()
+        .unwrap()
+        .expect("standalone share did not exit");
+    assert!(
+        status.success(),
+        "{}",
+        String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+    );
+    let (first, body) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Radius request not received");
+    server.join().unwrap();
+    assert!(first.starts_with("POST /v1/artifacts?"), "{first}");
+    let entries: Vec<Value> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let metadata = entries
+        .iter()
+        .find(|entry| entry["customType"] == "pi.share")
+        .expect("missing share metadata");
+    assert!(
+        metadata["data"]["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .contains("fresh-from-disk")
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("stale-cache-canary"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let store = Store::open_existing(&home).unwrap().unwrap();
+    assert_eq!(store.read(&path, &binding).unwrap(), Some(stale));
+}
+
 #[test]
 fn missing_session_id_does_not_create_a_journal() {
     let root = tempfile::tempdir().unwrap();

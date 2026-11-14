@@ -3575,21 +3575,49 @@ both display modes, as well as the correlated RPC responses.
 Terminal `/share` appends Pi's `pi.share` entry with the session's system prompt
 and active tool schemas to Radius uploads. Idle and in-flight shares use the
 worker's session state; request-only `context_with_system` transformations do
-not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
-exposes interactive `/share`; the standalone `pi share` command is a pi-rs
-extension. Standalone share keeps the journal lock without implicitly repairing
-or creating the journal. An incomplete journal or pending handoff recovery is
-reported before upload; an explicit `--name` still updates the session name.
-The snapshot is matched to the session and head before upload, and a changed
-session requires a retry. Idle refreshes accept a disk snapshot only when it
+not replace the shared prompt, matching Pi's `session.state` export.
+The snapshot is matched to the session, head, and complete journal before
+upload. The frontend supplies an ephemeral per-request key, and the Radius
+upload boundary verifies the worker's keyed tag over the journal and context;
+a changed journal or modified prompt/tool schema requires a retry even when its
+session ID and head are unchanged. The worker rechecks its context revision after
+computing the tag and rejects changes during preparation. This does not establish
+that dynamic worker context remains unchanged after the response. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
-its entry projection. If a request's journal entry and context are not yet
-paired, the upload proceeds without metadata. Refreshed runtime prompts and
+its entry projection. A timeout, failed response, or exit after context may
+have started rejects the share. A worker that proves it exited before context
+initialization can still use the metadata-free interactive fallback.
+A malformed successful response or a journal/context authentication mismatch is
+rejected before upload. Refreshed runtime prompts and
 tool catalogs remain selected after the run settles; summary requests do not replace
 the active context. The metadata is not written to the journal, and the 128 MiB share limit includes
-it. Gist sharing continues to export HTML. When runtime metadata is unavailable, including missing model credentials,
-startup failure, pending project trust, or standalone `pi share`, Radius uploads
-continue without metadata rather than reconstructing it from stale settings.
+it. Gist sharing continues to export HTML. Pi v1.5.0 exposes this through
+interactive `/share`; a separate `pi share` subcommand is a pi-rs extension.
+Standalone `pi share` constructs an
+idle runtime and resolves the branch's effective context on an in-memory copy,
+using the reconstructed runtime's current tool list rather than old transcript
+declarations, without appending records to the source journal. Opening the
+journal for sharing retains the writer lock without repairing its contents;
+missing or incomplete journals and pending handoff recovery fail before upload.
+An explicitly supplied session name still updates the journal. Standalone preparation runs in
+the calling task and waits for configuration and discovery to finish; it has no
+metadata deadline, and synchronous filesystem operations cannot be interrupted
+until they return. This avoids abandoning a preparation worker after a timeout.
+An already-started credential refresh may finish to preserve rotated credentials.
+When standalone runtime metadata cannot be prepared, including missing model
+credentials, startup failure or pending project trust, Radius sharing fails
+before upload. A failing session-start or resource-discovery extension hook
+also fails standalone preparation, while ordinary worker hook reporting remains
+unchanged. Reconstruction still does not discover a separate live worker,
+so it is not proof that another process's dynamic context is represented.
+If that worker currently owns the journal's writer lock, standalone sharing
+reports that live context is unavailable before contacting Radius. An idle
+worker may release its lock, so this check does not establish its absence.
+The private worker control protocol bounds its asynchronous readiness wait to
+15 seconds while the worker event loop is responsive. This does not bound a
+blocked event loop or runtime preparation. The protocol can return the captured
+journal with the same context and keyed journal tag, subject to a size limit. This does not
+provide peer authentication or discovery for a separate standalone process.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
 locks and validates the captured version before publication. Transient streaming

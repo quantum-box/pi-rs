@@ -316,12 +316,14 @@ async fn access_at(
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
+    let _cancellation = super::process::RefreshCancellation::new();
+    let state = _cancellation.state();
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
+        let _barrier = super::process::RefreshCancellation::enter(&state)?;
         let previous = serde_json::to_value(&value)?;
         let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
