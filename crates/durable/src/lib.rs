@@ -37,6 +37,7 @@ pub mod task;
 pub mod task_driver;
 pub mod task_scheduler;
 pub mod task_store;
+pub mod task_tool;
 pub mod tool;
 pub mod tool_progress;
 pub mod transcript;

@@ -532,3 +532,731 @@ async fn parked_driver_clears_failure_when_it_takes_over_a_failed_retry() {
     assert_eq!(job.calls.load(Ordering::SeqCst), 1);
     assert!(scheduler.shutdown().await.is_err()); // The retry panic is still joinable.
 }
+
+#[tokio::test]
+async fn task_backed_tool_admits_and_resumes_after_reopen() {
+    use pi_rs_durable::{
+        task::{Task, TaskState},
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::sync::{Mutex, mpsc};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("task-tool.db");
+    let cancel = CancellationToken::new();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+        assert_eq!(task.input(), &json!({}));
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!("task result")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let opts = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let id;
+    let task_id;
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        let mut registry = Registry::default();
+        registry.register_shared("job-task", true, handler.clone());
+        let driver = h.start_tasks(registry).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        task_id = h
+            .conversation(id)
+            .unwrap()
+            .tool_attempt()
+            .unwrap()
+            .operation_id;
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if matches!(
+                driver.get(task_id).unwrap().unwrap().state(),
+                TaskState::Succeeded(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            driver.get(task_id).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        driver.shutdown().unwrap();
+    }
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("task result")))
+    );
+}
+
+#[tokio::test]
+async fn task_backed_tool_abort_waits_for_owned_task_cleanup() {
+    use pi_rs_durable::{
+        task::{Task, TaskState},
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::sync::{Mutex, mpsc};
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        started_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!("must not publish")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), options, &cancel)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler);
+    registry.set_abort("job-task", |_: &Task| Ok(Step::Succeed(json!(null))));
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let task_id = h
+        .conversation(id)
+        .unwrap()
+        .tool_attempt()
+        .unwrap()
+        .operation_id;
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    h.request_abort(id).unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.conversation(id).unwrap().abort_requested);
+    release_tx.send(()).unwrap();
+    for _ in 0..100 {
+        if driver.get(task_id).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        driver.get(task_id).unwrap().unwrap().state(),
+        &TaskState::Cancelled
+    );
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(!h.conversation(id).unwrap().abort_requested);
+    assert!(h.blocked(id).unwrap().is_none());
+    assert!(!h.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content.contains("must not publish"))
+    ));
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_tool_kill_worker() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_TASK_TOOL_KILL_DB") else {
+        return;
+    };
+    let safe = std::env::var("PI_TASK_TOOL_KILL_UNSAFE").is_err();
+    let handler: Arc<dyn Handler> = Arc::new(|_: &Task| -> Result<Step, String> {
+        println!("TASK_TOOL_HANDLER_RUNNING");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        safe,
+        handler.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(path, opts, &cancel).await.unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", safe, handler);
+    let _driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    println!("TASK_TOOL_CONVERSATION={id}");
+    std::io::stdout().flush().unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_backed_tool_process_death_replays_task_without_readmitting() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut process = Kill(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "task_tool_kill_worker", "--nocapture"])
+            .env("PI_TASK_TOOL_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = process.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut id = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, value)) = line.split_once("TASK_TOOL_CONVERSATION=") {
+                id = Some(value.parse::<uuid::Uuid>().unwrap());
+            }
+            if line.contains("TASK_TOOL_HANDLER_RUNNING") {
+                let _ = tx.send(id.unwrap());
+                break;
+            }
+        }
+    });
+    let id = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    process.0.kill().unwrap();
+    assert!(!process.0.wait().unwrap().success());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(Step::Succeed(json!("recovered")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, options, &cancel).await.unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    for _ in 0..100 {
+        h.resume_conversation(id, &cancel).await.unwrap();
+        if matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("recovered")))
+    );
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn task_backed_tool_without_driver_fails_before_admission() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!("created after retry"))));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let opts = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let id;
+    {
+        let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "work".into(), &cancel)
+                .await
+                .is_err()
+        );
+    }
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    for _ in 0..100 {
+        h.resume_conversation(id, &cancel).await.unwrap();
+        if matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn task_backed_tool_rejects_unscoped_invocation() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Step},
+        task_tool::TaskTool,
+    };
+    let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!("unexpected"))));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler,
+    ));
+    let _registration = adapter.register();
+    let outcome = adapter
+        .invoke(
+            json!({}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(matches!(outcome, Outcome::Skipped(_)));
+}
+
+#[tokio::test]
+async fn task_backed_tool_scheduler_polls_to_completion() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!("scheduled result"))));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut s = pi_rs_durable::runtime::Scheduler::open(dir.path().join("db"), opts).unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler);
+    let driver = s.start_tasks(registry).unwrap();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    s.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), s.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    s.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn task_backed_tool_abort_preserves_already_completed_result() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!("completed before abort"))));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        true,
+        handler.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let task_id = h
+        .conversation(id)
+        .unwrap()
+        .tool_attempt()
+        .unwrap()
+        .operation_id;
+    for _ in 0..100 {
+        if driver.get(task_id).unwrap().unwrap().is_terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(driver.get(task_id).unwrap().unwrap().is_terminal());
+    h.request_abort(id).unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content.contains("completed before abort"))
+    ));
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn task_backed_tool_failure_requires_reconciliation() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Fail("uncertain task".into())));
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        false,
+        handler.clone(),
+    ));
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(dir.path().join("db"), opts, &cancel)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", false, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        h.resume_conversation(id, &cancel).await.unwrap();
+        if h.blocked(id)
+            .unwrap()
+            .is_some_and(|(_, r)| r.contains("uncertain task"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (operation, reason) = h.blocked(id).unwrap().unwrap();
+    assert!(reason.contains("uncertain task"));
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Running
+    );
+    h.reconcile(id, operation, Outcome::Succeeded("reconciled".into()))
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done {
+            answer: "done".into()
+        }
+    );
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_backed_tool_process_death_unsafe_requires_reconciliation() {
+    use pi_rs_durable::{
+        task::Task,
+        task_scheduler::{Handler, Registry, Step},
+        task_tool::TaskTool,
+    };
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+        sync::mpsc,
+    };
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut process = Kill(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "task_tool_kill_worker", "--nocapture"])
+            .env("PI_TASK_TOOL_KILL_DB", &path)
+            .env("PI_TASK_TOOL_KILL_UNSAFE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = process.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut id = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, value)) = line.split_once("TASK_TOOL_CONVERSATION=") {
+                id = Some(value.parse::<uuid::Uuid>().unwrap());
+            }
+            if line.contains("TASK_TOOL_HANDLER_RUNNING") {
+                let _ = tx.send(id.unwrap());
+                break;
+            }
+        }
+    });
+    let id = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    process.0.kill().unwrap();
+    assert!(!process.0.wait().unwrap().success());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let handler: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(Step::Succeed(json!("unexpected replay")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        },
+        "job-task",
+        false,
+        handler.clone(),
+    ));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![adapter.register()],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, options, &cancel).await.unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job-task", false, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    for _ in 0..100 {
+        h.resume_conversation(id, &cancel).await.unwrap();
+        if h.blocked(id)
+            .unwrap()
+            .is_some_and(|(_, reason)| reason.contains("requires reconciliation"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        h.blocked(id)
+            .unwrap()
+            .unwrap()
+            .1
+            .contains("requires reconciliation")
+    );
+    assert_eq!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Running
+    );
+    driver.shutdown().unwrap();
+}

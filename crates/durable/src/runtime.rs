@@ -341,6 +341,15 @@ enum Phase {
         #[serde(default)]
         replay_ready: bool,
     },
+    /// An owned scheduler task and its tool operation were admitted atomically.
+    TaskPending {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        index: usize,
+        operation_id: Uuid,
+        arguments: serde_json::Value,
+        task: Uuid,
+    },
     /// The tool outcome and its state are committed before after-tool hooks run.
     ToolFinished {
         turns: u32,
@@ -672,6 +681,7 @@ impl Conversation {
         let operation_id = match &self.phase {
             Phase::ToolRunning { operation_id, .. }
             | Phase::Pending { operation_id, .. }
+            | Phase::TaskPending { operation_id, .. }
             | Phase::Blocked { operation_id, .. }
             | Phase::ToolFinished { operation_id, .. } => *operation_id,
             _ => return None,
@@ -4915,6 +4925,35 @@ impl Harness {
         }
         Ok(())
     }
+    fn task_tool_result(
+        &self,
+        conversation: Uuid,
+        operation: Uuid,
+        task: Uuid,
+    ) -> Result<Option<Outcome>, Error> {
+        let child = crate::task_store::TaskStore::new(self.owner.store())
+            .load(task)
+            .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+            .ok_or_else(|| Error::Invalid("task-backed tool task missing".into()))?;
+        if task != operation
+            || child.task.owner() != &crate::task::TaskOwner::Conversation(conversation)
+        {
+            return Err(Error::Invalid("task-backed tool owner mismatch".into()));
+        }
+        Ok(match child.task.state() {
+            crate::task::TaskState::Succeeded(value) => Some(Outcome::Succeeded(
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string()),
+            )),
+            // Generic task failures do not distinguish a handler-reported error
+            // from an interrupted effect. Do not turn uncertainty into a known result.
+            crate::task::TaskState::Failed(reason) => Some(Outcome::Unknown(reason.clone())),
+            crate::task::TaskState::Cancelled => Some(Outcome::Failed("task cancelled".into())),
+            _ => None,
+        })
+    }
     async fn settle_abort(
         &mut self,
         mut c: Conversation,
@@ -5015,6 +5054,39 @@ impl Harness {
                         .into(),
                     arguments: Some(arguments),
                 };
+            }
+            Phase::TaskPending {
+                calls,
+                index,
+                operation_id,
+                task,
+                turns,
+                arguments,
+            } => {
+                let outcome = self
+                    .task_tool_result(c.id, operation_id, task)?
+                    .ok_or_else(|| Error::Invalid("task-backed tool cleanup incomplete".into()))?;
+                if let Outcome::Unknown(reason) = outcome {
+                    c.phase = Phase::Blocked {
+                        tool_panicked: false,
+                        turns,
+                        calls,
+                        index,
+                        operation_id,
+                        reason,
+                        arguments: Some(arguments),
+                    };
+                } else {
+                    append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                    for i in index + 1..calls.len() {
+                        append_tool(
+                            &mut c,
+                            &calls,
+                            i,
+                            Outcome::Skipped("aborted before dispatch".into()).tool_content(),
+                        )?;
+                    }
+                }
             }
             Phase::Pending {
                 turns,
@@ -6513,6 +6585,9 @@ impl Harness {
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
                     let mut tool_panicked = false;
+                    let task_adapter = tools
+                        .get(&call.name)
+                        .and_then(|reg| crate::task_tool::lookup(&reg.tool));
                     let reply = if let Some(reg) = tools.get(&call.name).filter(|_| {
                         c.model_tools
                             .as_ref()
@@ -6574,14 +6649,18 @@ impl Harness {
                                                                 dyn crate::keyed_tool::StreamSink,
                                                             >
                                                     }),
-                                                    crate::tool::execute(
-                                                        reg.tool.as_ref(),
-                                                        &invocation,
-                                                        prepared,
-                                                        c.tool_states.get(&call.name),
-                                                        progress_host,
-                                                        cancel,
-                                                        Duration::from_secs(120),
+                                                    crate::task_tool::scope(
+                                                        task_adapter.clone(),
+                                                        operation_id,
+                                                        crate::tool::execute(
+                                                            reg.tool.as_ref(),
+                                                            &invocation,
+                                                            prepared,
+                                                            c.tool_states.get(&call.name),
+                                                            progress_host,
+                                                            cancel,
+                                                            Duration::from_secs(120),
+                                                        ),
                                                     ),
                                                 ),
                                             )
@@ -6661,6 +6740,33 @@ impl Harness {
                     }
                     if let Some(state) = reply.state {
                         c.tool_states.insert(call.name.clone(), state);
+                    }
+                    if let Some(adapter) = task_adapter
+                        && matches!(&reply.outcome, Outcome::Pending { reference } if reference == &format!("task:{operation_id}"))
+                    {
+                        let task = adapter
+                            .task(
+                                c.id,
+                                operation_id,
+                                arguments.clone(),
+                                self.options.restart_limit,
+                            )
+                            .map_err(Error::Invalid)?;
+                        c.phase = Phase::TaskPending {
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            arguments,
+                            task: task.id(),
+                        };
+                        self.save_hook_children(
+                            &c,
+                            Expected::Version(version),
+                            &[task],
+                            &[adapter.handler()],
+                        )?;
+                        continue;
                     }
                     match reply.outcome {
                         Outcome::Unknown(reason) => {
@@ -6750,6 +6856,39 @@ impl Harness {
                         turns,
                         calls,
                         index: index + 1,
+                    };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::TaskPending {
+                    turns,
+                    calls,
+                    index,
+                    operation_id,
+                    arguments,
+                    task,
+                } => {
+                    let Some(outcome) = self.task_tool_result(c.id, operation_id, task)? else {
+                        return Ok(());
+                    };
+                    c.phase = if let Outcome::Unknown(reason) = outcome {
+                        Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason,
+                            arguments: Some(arguments),
+                        }
+                    } else {
+                        Phase::ToolFinished {
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            arguments,
+                            content: outcome.tool_content(),
+                        }
                     };
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -6976,6 +7115,9 @@ impl Harness {
                 reference,
                 ..
             } => Some((operation_id, format!("pending: {reference}"))),
+            Phase::TaskPending {
+                operation_id, task, ..
+            } => Some((operation_id, format!("pending task: {task}"))),
             _ => None,
         })
     }
@@ -8197,7 +8339,8 @@ pub(crate) async fn drive_scheduled<'a>(
                     })
                     .transpose()?
                     .unwrap_or(false),
-                Phase::ToolGateSleeping { .. }
+                Phase::TaskPending { .. }
+                | Phase::ToolGateSleeping { .. }
                 | Phase::HookTasksWaiting { .. }
                 | Phase::YieldTasksWaiting { .. }
                 | Phase::OnYield { .. }
