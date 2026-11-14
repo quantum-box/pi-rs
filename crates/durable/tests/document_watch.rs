@@ -146,7 +146,6 @@ fn complete_commit_pages_survive_deletion_and_reopen() {
             .all(|(_, value)| value.as_ref().unwrap().value["n"] == 1)
     );
     let cursor = watch.cursor();
-    drop(watch);
     drop(store);
     let store = Store::open(&path).unwrap();
     let docs = Documents::new(&store);
