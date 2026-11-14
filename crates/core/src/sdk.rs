@@ -2158,6 +2158,11 @@ impl AgentSession {
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before startup".into(),
+            ));
+        }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -2696,7 +2701,13 @@ impl AgentSession {
             )
             .await;
         if result.is_ok() && run_id.is_some() {
-            self.start().await?;
+            let unresolved = {
+                let journal = self.journal_async().await;
+                crate::agent::resumable_compaction_run(&journal).is_some()
+            };
+            if !unresolved {
+                self.start().await?;
+            }
         }
         result
     }
@@ -9295,6 +9306,22 @@ mod tests {
                 .unwrap();
             assert!(
                 guarded
+                    .start()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .prompt("new prompt")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
                     .resume()
                     .await
                     .unwrap_err()
@@ -9555,6 +9582,39 @@ mod tests {
                 .append(Event::Run {
                     state: RunState::Running,
                     initial: Some("new".into()),
+                })
+                .unwrap();
+            // A completed compaction from an earlier turn of the same run
+            // must not hide a later pre-marker overflow.
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            journal
+                .append(Event::Compacted {
+                    summary: "earlier summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "intervening turn".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "intervening answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
                 })
                 .unwrap();
             journal

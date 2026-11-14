@@ -4513,7 +4513,8 @@ pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Optio
             .then_some(record.run_id)
             .flatten()
     })?;
-    let marker = branch.iter().rposition(|record| {
+    let epoch = overflow_recovery_epoch(&branch, run_id);
+    let marker = epoch.iter().rposition(|record| {
         record.run_id == Some(run_id) && matches!(&record.event,
             Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow")
     });
@@ -4536,7 +4537,7 @@ pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Optio
         });
         return Some((run_id, model, false));
     };
-    let following = &branch[marker + 1..];
+    let following = &epoch[marker + 1..];
     if following.iter().any(|record| {
         matches!(
             record.event,

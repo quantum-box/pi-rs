@@ -174,6 +174,10 @@ restores the branch model before checking the interrupted request's identity;
 queued trigger turns do not overtake an unresolved compaction recovery.
 SDK recovery defers session-start callbacks until recovery succeeds; when
 extensions are registered it requires reconciliation before invoking them.
+Public startup and prompt paths also reject an unresolved recovery before
+callbacks or queued triggers run. An ambiguous silent-overflow summary keeps
+the completed answer, but startup remains blocked while its marker is unresolved;
+there is currently no automatic reconciliation workflow for that case.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required
