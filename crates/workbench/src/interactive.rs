@@ -3992,9 +3992,6 @@ pub(super) async fn run(
                     state.available_levels = levels;
                     state.levels = None;
                     view.picker = Some(thinking_level_picker(state));
-                    while let Some(event) = thinking_level_input.pop_back() {
-                        deferred_input.push_front(crate::ui::input::InputEvent::Event(event));
-                    }
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -4007,6 +4004,16 @@ pub(super) async fn run(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
+        }
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title.starts_with("Thinking level · "))
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+        {
+            replay_thinking_level_input(&mut thinking_level_input, &mut deferred_input);
         }
         if let Some(active) = &mut worker {
             if (active.busy || active.bashing) && view.request_started.is_none() {
@@ -4402,6 +4409,10 @@ pub(super) async fn run(
             .picker
             .as_ref()
             .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+            && view.pending_transition.is_none()
             && buffer_thinking_level_input(&mut thinking_level_input, &event)
         {
             continue;
@@ -7053,6 +7064,15 @@ fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event) -> 
     }
 }
 
+fn replay_thinking_level_input(
+    pending: &mut VecDeque<Event>,
+    deferred: &mut VecDeque<crate::ui::input::InputEvent>,
+) {
+    while let Some(event) = pending.pop_back() {
+        deferred.push_front(crate::ui::input::InputEvent::Event(event));
+    }
+}
+
 // A bare Escape may need the input decoder's 25 ms disambiguation window.
 // Give already-arrived input priority over committing a prepared session.
 fn queued_transition_cancel(
@@ -7934,6 +7954,17 @@ mod tests {
             assert!(super::buffer_thinking_level_input(&mut pending, event));
         }
         assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
+        let later = crate::ui::input::InputEvent::Event(Event::Resize(80, 24));
+        let mut deferred = VecDeque::from([later.clone()]);
+        super::replay_thinking_level_input(&mut pending, &mut deferred);
+        let mut expected = typed
+            .iter()
+            .cloned()
+            .map(crate::ui::input::InputEvent::Event)
+            .collect::<Vec<_>>();
+        expected.push(later);
+        assert_eq!(deferred.into_iter().collect::<Vec<_>>(), expected);
+        assert!(super::buffer_thinking_level_input(&mut pending, &typed[0]));
         let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!super::buffer_thinking_level_input(&mut pending, &escape));
         assert!(pending.is_empty());
