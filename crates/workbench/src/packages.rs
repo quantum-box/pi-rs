@@ -475,24 +475,24 @@ fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
     } else {
         None
     };
+    // Validate a competing Pi package manifest even when a higher-priority
+    // native or Cargo manifest supplies the selected resources.
+    let package_manifest = read_optional_pi_package_json(root)?;
     if let Some(bytes) = pi_bytes {
         let manifest = parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?;
         manifest_pi(&manifest)?;
         return Ok((manifest, false));
     }
-    if let Some(manifest) = cargo_manifest {
-        let metadata = manifest
+    if let Some(metadata) = cargo_manifest.as_ref().and_then(|manifest| {
+        manifest
             .get("package")
             .and_then(|value| value.get("metadata"))
-            .and_then(|value| value.get("pi"));
-        return Ok((
-            metadata.map_or_else(|| json!({}), |pi| json!({"pi": pi})),
-            false,
-        ));
+            .and_then(|value| value.get("pi"))
+    }) {
+        return Ok((json!({"pi": metadata}), false));
     }
-    let manifest = read_optional_pi_package_json(root)?;
-    let pi_package = manifest.is_some();
-    Ok((manifest.unwrap_or_else(|| json!({})), pi_package))
+    let pi_package = package_manifest.is_some();
+    Ok((package_manifest.unwrap_or_else(|| json!({})), pi_package))
 }
 
 // A present manifest is authoritative, including broken links or devices.
@@ -1111,16 +1111,9 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     let pi_bytes = read_optional_manifest(&root, "pi-package.json")?;
     let cargo_bytes = read_optional_manifest(&root, "Cargo.toml")?;
     // Validate relevant manifests before the local/Git build below.
-    local_startup_manifest(&root)?;
+    let (mut manifest, _) = local_startup_manifest(&root)?;
     let has_pi_manifest = pi_bytes.is_some();
     let has_cargo_manifest = cargo_bytes.is_some();
-    let mut manifest = if let Some(bytes) = pi_bytes {
-        parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?
-    } else if !has_cargo_manifest {
-        read_optional_pi_package_json(&root)?.unwrap_or_else(|| json!({}))
-    } else {
-        json!({})
-    };
     manifest_pi(&manifest)?;
     let mut version = manifest
         .get("version")
@@ -1148,11 +1141,12 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 })
             })
         }) {
-            if !has_pi_manifest {
-                manifest = package
+            if !has_pi_manifest
+                && let Some(pi) = package
                     .get("metadata")
                     .and_then(|metadata| metadata.get("pi"))
-                    .map_or_else(|| json!({}), |pi| json!({"pi":pi}));
+            {
+                manifest = json!({"pi":pi});
                 manifest_pi(&manifest)?;
             }
             version = package["version"].as_str().map(str::to_owned);

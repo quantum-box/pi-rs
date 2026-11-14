@@ -8320,6 +8320,121 @@ mod tests {
         args.extensions.clear();
         std::fs::remove_file(&manifest_path).unwrap();
 
+        // Cargo without Pi metadata must honor package.json during both
+        // cached resolution and a fresh preparation of the package.
+        let cargo_manifest = pi_source.join("Cargo.toml");
+        let package_manifest = pi_source.join("package.json");
+        let cargo_plain =
+            "[package]\nname='mixed-upgrade-fixture'\nversion='0.1.0'\nedition='2021'\n";
+        std::fs::write(&cargo_manifest, cargo_plain).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let cached = super::super::packages::resources(&args).unwrap();
+        assert_eq!(cached.themes.len(), 1);
+        assert!(
+            cached.extensions.is_empty() && cached.skills.is_empty() && cached.prompts.is_empty()
+        );
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&index).unwrap(),
+            old_index,
+            "mixed package not prepared"
+        );
+        let prepared = super::super::packages::transient_resources(&args).unwrap();
+        assert_eq!(prepared.themes.len(), 1);
+        assert!(
+            prepared.extensions.is_empty()
+                && prepared.skills.is_empty()
+                && prepared.prompts.is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "mixed package executed undeclared extension"
+        );
+        args.extensions.clear();
+
+        // Even when Cargo or pi-package.json has higher precedence, a present
+        // malformed package.json must fail before Cargo runs its build script.
+        for higher in ["none", "cargo", "native"] {
+            let cargo = if higher == "cargo" {
+                format!("{cargo_plain}[package.metadata.pi]\nthemes=['assets/visual.json']\n")
+            } else {
+                cargo_plain.to_owned()
+            };
+            std::fs::write(&cargo_manifest, cargo).unwrap();
+            if higher == "native" {
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+                )
+                .unwrap();
+            }
+            std::fs::write(&package_manifest, r#"{"pi":{"extensions":42}}"#).unwrap();
+            std::fs::write(
+                pi_source.join("build.rs"),
+                format!(
+                    "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                    sentinel
+                ),
+            )
+            .unwrap();
+            std::fs::write(&index, &old_index).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{higher}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{higher}"
+            );
+            let mut empty_index: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            empty_index.as_object_mut().unwrap().retain(|_, entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|s| std::fs::canonicalize(s).ok())
+                    != Some(canonical_source.clone())
+            });
+            let empty_index = empty_index.to_string();
+            std::fs::write(&index, &empty_index).unwrap();
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            assert!(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(super::super::packages::prepare(&args))
+                    .is_err(),
+                "{higher}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&index).unwrap(),
+                empty_index,
+                "{higher}"
+            );
+            assert!(!sentinel.exists(), "{higher} ran build script or extension");
+            args.extensions.clear();
+            std::fs::remove_file(pi_source.join("build.rs")).unwrap();
+            if higher == "native" {
+                std::fs::remove_file(&manifest_path).unwrap();
+            }
+        }
+        std::fs::remove_file(&cargo_manifest).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+
         // Invalid resource fields and invalid pi values must be rejected both
         // for cached startup and before preparation can run any build script.
         for case in [

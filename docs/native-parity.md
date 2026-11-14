@@ -1506,7 +1506,9 @@ only metadata retains automatic directory and native executable discovery.
 Cached local, Git and Cargo package resources are filtered against the current
 cached-root manifest before loading. A present `pi` value must be an object, and
 every resource field must be a string array. Local and Git manifests are checked
-before their Cargo build. Registry packages are different: `cargo install` builds
+before their Cargo build. A Cargo manifest without Pi metadata falls back to
+`package.json` resource declarations; competing present manifests are validated.
+Registry packages are different: `cargo install` builds
 the crate (including build scripts) before pi-rs obtains and validates its source
 manifest. Installing a registry package therefore requires trusting its build;
 validating before that build needs a separate source acquisition and resolution
