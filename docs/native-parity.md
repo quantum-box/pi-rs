@@ -1503,7 +1503,9 @@ sources.
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
 only metadata retains automatic directory and native executable discovery.
-This prevents undeclared package resources from being enabled accidentally.
+Cached local native resources are filtered against the current manifest before
+loading. A present `pi` value must be an object, and every resource field must
+be a string array; malformed manifests are rejected before package preparation.
 
 ### MCP form elicitation checkpoint
 

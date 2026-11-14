@@ -214,24 +214,44 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
             let Ok((manifest, pi_package)) = local_startup_manifest(&package.root) else {
                 continue;
             };
-            let pi = manifest
-                .get("pi")
-                .filter(|value| value.is_object())
-                .unwrap_or(&manifest);
+            let Ok(pi) = manifest_pi(&manifest) else {
+                continue;
+            };
             let Ok(themes) = collect_package_themes(&package.root, pi) else {
                 continue;
             };
             package.resources.themes = themes;
             // Older indexes did not understand package.json and could have
             // discovered native resources that its explicit Pi manifest excludes.
-            if pi_package
-                && ["extensions", "skills", "prompts", "themes"]
-                    .iter()
-                    .any(|name| pi.get(name).is_some())
-            {
-                package.resources.extensions.clear();
-                package.resources.skills.clear();
-                package.resources.prompts.clear();
+            if has_resource_fields(pi) {
+                if pi_package {
+                    package.resources.extensions.clear();
+                    package.resources.skills.clear();
+                    package.resources.prompts.clear();
+                } else {
+                    let extensions = resource_patterns(pi, "extensions")?;
+                    package.resources.extensions.retain(|path| {
+                        extensions.iter().any(|name| {
+                            path.file_stem().is_some_and(|stem| stem == name.as_str())
+                                || manifest_selected(
+                                    path,
+                                    &package.root,
+                                    std::slice::from_ref(name),
+                                )
+                        })
+                    });
+                    let skills = resource_patterns(pi, "skills")?;
+                    package
+                        .resources
+                        .skills
+                        .retain(|path| manifest_selected(path, &package.root, &skills));
+                    let prompts = resource_patterns(pi, "prompts")?;
+                    let selected = collect_package_prompts(&package.root, &prompts);
+                    package
+                        .resources
+                        .prompts
+                        .retain(|path| selected.contains(path));
+                }
             }
         }
         for (name, paths, target) in [
@@ -281,10 +301,9 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
                 Ok((manifest, _)) => manifest,
                 Err(_) => continue,
             };
-            let pi = manifest
-                .get("pi")
-                .filter(|value| value.is_object())
-                .unwrap_or(&manifest);
+            let Ok(pi) = manifest_pi(&manifest) else {
+                continue;
+            };
             let themes = match collect_package_themes(&root, pi) {
                 Ok(themes) => themes,
                 Err(_) => continue,
@@ -450,22 +469,31 @@ fn local_startup_manifest(root: &Path) -> Result<(Value, bool)> {
             .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
         let manifest: toml::Value = toml::from_str(text)
             .map_err(|error| Error::Config(format!("invalid Cargo manifest: {error}")))?;
+        let metadata = manifest
+            .get("package")
+            .and_then(|v| v.get("metadata"))
+            .and_then(|v| v.get("pi"));
+        if let Some(metadata) = metadata {
+            validate_pi(&serde_json::to_value(metadata)?)?;
+        }
         Some(manifest)
     } else {
         None
     };
     if let Some(bytes) = pi_bytes {
-        return Ok((
-            parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?,
-            false,
-        ));
+        let manifest = parse_manifest_object(&root.join("pi-package.json"), &bytes, false)?;
+        manifest_pi(&manifest)?;
+        return Ok((manifest, false));
     }
     if let Some(manifest) = cargo_manifest {
         let metadata = manifest
             .get("package")
             .and_then(|value| value.get("metadata"))
             .and_then(|value| value.get("pi"));
-        return Ok((json!({"pi": metadata}), false));
+        return Ok((
+            metadata.map_or_else(|| json!({}), |pi| json!({"pi": pi})),
+            false,
+        ));
     }
     let manifest = read_optional_pi_package_json(root)?;
     let pi_package = manifest.is_some();
@@ -496,24 +524,47 @@ fn parse_manifest_object(path: &Path, bytes: &[u8], strip_bom: bool) -> Result<V
     Ok(value)
 }
 
+fn has_resource_fields(pi: &Value) -> bool {
+    ["extensions", "skills", "prompts", "themes"]
+        .iter()
+        .any(|name| pi.get(name).is_some())
+}
+
+fn resource_patterns(pi: &Value, name: &str) -> Result<Vec<String>> {
+    let patterns = pi
+        .get(name)
+        .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    validate_patterns(&patterns)?;
+    Ok(patterns)
+}
+
+fn validate_pi(pi: &Value) -> Result<()> {
+    if !pi.is_object() {
+        return Err(Error::Config("pi must contain an object".into()));
+    }
+    for name in ["extensions", "skills", "prompts", "themes"] {
+        resource_patterns(pi, name)?;
+    }
+    Ok(())
+}
+
+fn manifest_pi(manifest: &Value) -> Result<&Value> {
+    let pi = manifest.get("pi").unwrap_or(manifest);
+    validate_pi(pi)?;
+    Ok(pi)
+}
+
 // Pi packages describe resources in package.json's `pi` object. Never run
 // package scripts while reading it, and accept Pi's UTF-8 BOM handling.
 fn parse_pi_package_json(path: &Path, bytes: &[u8]) -> Result<Value> {
     let value = parse_manifest_object(path, bytes, true)?;
-    let pi = match value.get("pi") {
-        Some(pi) if !pi.is_object() => {
-            return Err(Error::Config(format!(
-                "{}: pi must contain an object",
-                path.display()
-            )));
-        }
-        pi => pi,
-    };
-    let explicit = pi.is_some_and(|pi| {
-        ["extensions", "skills", "prompts", "themes"]
-            .iter()
-            .any(|name| pi.get(name).is_some())
-    });
+    let pi = value.get("pi");
+    if let Some(pi) = pi {
+        validate_pi(pi)?;
+    }
+    let explicit = pi.is_some_and(has_resource_fields);
     let theme_only = if explicit {
         json!({"extensions": [], "skills": [], "prompts": [],
             "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
@@ -1056,6 +1107,8 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     // is an error, never an absent manifest that enables defaults.
     let pi_bytes = read_optional_manifest(&root, "pi-package.json")?;
     let cargo_bytes = read_optional_manifest(&root, "Cargo.toml")?;
+    // Validate every relevant manifest before Cargo can run a build script.
+    local_startup_manifest(&root)?;
     let has_pi_manifest = pi_bytes.is_some();
     let has_cargo_manifest = cargo_bytes.is_some();
     let mut manifest = if let Some(bytes) = pi_bytes {
@@ -1065,6 +1118,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     } else {
         json!({})
     };
+    manifest_pi(&manifest)?;
     let mut version = manifest
         .get("version")
         .and_then(Value::as_str)
@@ -1092,7 +1146,11 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             })
         }) {
             if !has_pi_manifest {
-                manifest = json!({"pi":package["metadata"]["pi"]});
+                manifest = package
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("pi"))
+                    .map_or_else(|| json!({}), |pi| json!({"pi":pi}));
+                manifest_pi(&manifest)?;
             }
             version = package["version"].as_str().map(str::to_owned);
         }
@@ -1133,10 +1191,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         root = snapshot_registry_source(&root, &directory)?;
     }
 
-    let pi = manifest
-        .get("pi")
-        .filter(|value| value.is_object())
-        .unwrap_or(&manifest);
+    let pi = manifest_pi(&manifest)?;
     let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
