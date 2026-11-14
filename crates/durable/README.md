@@ -383,8 +383,8 @@ entry/position forks, and `fork` copy documents whose scope is exactly the
 parent conversation UUID string into the corresponding child UUID scope. Copies
 are independent documents with fresh CAS versions; all other scopes remain
 shared and are not copied. Historical forks use the selected cut; current forks
-use a revision captured during the call. Copies and child creation commit
-atomically. A fork of a fork follows the same rule.
+use a revision captured during the call while the parent conversation version
+remains unchanged. Copies and child creation commit atomically. A fork of a fork follows the same rule.
 
 This scope convention is not enforced ownership or access control. Existing
 cuts from before this feature have no recorded boundary and historical document

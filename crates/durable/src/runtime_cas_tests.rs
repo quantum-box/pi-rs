@@ -1767,3 +1767,60 @@ fn interior_entry_fork_requires_proven_stable_state_and_valid_context() {
     let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(h.conversation(child).unwrap().messages.len(), 4);
 }
+
+#[test]
+fn current_fork_retries_when_parent_changes_before_document_snapshot() {
+    use crate::document::Address;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "old".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let address = Address {
+        scope: parent.to_string(),
+        name: "note".into(),
+        key: "x".into(),
+    };
+    let mut doc_key = b"durable/document/".to_vec();
+    doc_key.extend(serde_json::to_vec(&[&address.scope, &address.name, &address.key]).unwrap());
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: doc_key.clone(),
+                value: br#"{"n":1}"#.to_vec(),
+            }],
+        )
+        .unwrap();
+    let mut writer = h.worker();
+    let mut done = false;
+    let child = h
+        .fork_with_load_hook(parent, || {
+            if done {
+                return;
+            }
+            done = true;
+            let (mut state, version) = writer.load(parent).unwrap();
+            state.config.model = "new".into();
+            let mut prepared = writer
+                .prepare_saves(&[(&state, Expected::Version(version))])
+                .unwrap();
+            prepared.mutations.push(Mutation::Put {
+                key: doc_key.clone(),
+                value: br#"{"n":2}"#.to_vec(),
+            });
+            writer.commit_conversation_save(prepared).unwrap();
+        })
+        .unwrap();
+    assert_eq!(h.conversation(child).unwrap().config.model, "new");
+    let copied = Address {
+        scope: child.to_string(),
+        ..address
+    };
+    assert_eq!(h.document(&copied).unwrap().unwrap().value["n"], 2);
+}

@@ -1669,7 +1669,29 @@ impl Harness {
     /// Fork the current settled conversation. Queued inputs and request IDs
     /// are not inherited. Use `fork_at` for historical observation cuts.
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
-        let (mut state, _) = self.load(id)?;
+        self.fork_with_load_hook(id, || {})
+    }
+
+    fn fork_with_load_hook<F: FnMut()>(
+        &mut self,
+        id: Uuid,
+        mut after_load: F,
+    ) -> Result<Uuid, Error> {
+        let (mut state, revision) = loop {
+            let (state, version) = self.load(id)?;
+            after_load();
+            let revision = self.owner.store().document_snapshot()?;
+            // The parent must remain unchanged through the document snapshot.
+            // Otherwise the two reads may straddle an atomic admission commit.
+            if self
+                .owner
+                .store()
+                .get(&Self::key(id))?
+                .is_some_and(|entry| entry.version == version)
+            {
+                break (state, revision);
+            }
+        };
         if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
             || state.active.is_some()
             || !state.pending_resets.is_empty()
@@ -1694,7 +1716,6 @@ impl Harness {
         state.overflow_compaction_attempted = false;
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
-        let revision = self.owner.store().document_snapshot()?;
         let batch = crate::document::Documents::new(self.owner.store())
             .fork_scope(id, state.id, revision)?;
         self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))?;
