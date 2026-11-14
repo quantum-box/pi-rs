@@ -88,20 +88,9 @@ fn prepare_park_with_documents(
         return Err(Error::DocumentContext);
     }
     let mut transaction = crate::document::Transaction::new();
-    let document_batch = documents.into_batch()?;
+    let mut document_batch = documents.into_batch()?;
     let mut park = prepare_park_any(store, parent, checkpoint, keys)?;
-    // A signal to a waited-for child may impose a deadline as well as the
-    // child's version check. Preserve that stronger check when composing.
-    for check in &mut park.checks {
-        if let Expected::Version(version) = check.expected
-            && let Some(deadline_check) = document_batch.checks.iter().find(|other| {
-                other.key == check.key
-                    && matches!(other.expected, Expected::VersionBefore(v, _) if v == version)
-            })
-        {
-            check.expected = deadline_check.expected.clone();
-        }
-    }
+    crate::document::reconcile_task_checks(&mut document_batch, &mut park);
     transaction.append(document_batch)?;
     transaction.append(park)?;
     Ok(transaction)

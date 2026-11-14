@@ -445,6 +445,33 @@ pub struct Transaction {
     checked: HashSet<Vec<u8>>,
     written: HashSet<Vec<u8>>,
 }
+
+// Independently prepared task observations can race. Compose their fences
+// before appending batches so disagreement becomes a normal commit conflict.
+pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut OwnedBatch) {
+    for other in &mut graph.checks {
+        if !other.key.starts_with(crate::task_store::PREFIX) {
+            continue;
+        }
+        if let Some(check) = documents.checks.iter_mut().find(|c| c.key == other.key) {
+            let expected = match (&check.expected, &other.expected) {
+                (Expected::Version(a), Expected::VersionBefore(b, deadline))
+                | (Expected::VersionBefore(b, deadline), Expected::Version(a))
+                    if a == b =>
+                {
+                    Expected::VersionBefore(*a, *deadline)
+                }
+                (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
+                    Expected::VersionBefore(*a, (*x).min(*y))
+                }
+                (a, b) if a == b => a.clone(),
+                _ => Expected::VersionBefore(0, std::time::Instant::now()),
+            };
+            check.expected = expected.clone();
+            other.expected = expected;
+        }
+    }
+}
 impl Transaction {
     pub fn new() -> Self {
         Self::default()
@@ -1060,6 +1087,64 @@ mod nested_entry_tests {
     use crate::task_store::{Save, TaskStore};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn racing_child_observations_conflict_and_preserve_deadlines() {
+        let db = Store::memory().unwrap();
+        let store = TaskStore::new(&db);
+        let parent = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        let child = task(2, TaskOwner::Task(parent.id()));
+        store
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let mut docs = TaskDocuments::new(&db, &parent).unwrap();
+        docs.get_owned_child(child.id()).unwrap();
+        let old = store.load(child.id()).unwrap().unwrap();
+        store.update(&old, |t| t.start()).unwrap();
+        let new = store.load(child.id()).unwrap().unwrap();
+        let mut document_batch = docs.into_batch().unwrap();
+        let mut graph = OwnedBatch {
+            checks: vec![Check {
+                key: crate::task_store::key(child.id()),
+                expected: Expected::Version(new.version),
+            }],
+            mutations: vec![],
+        };
+        reconcile_task_checks(&mut document_batch, &mut graph);
+        let mut tx = Transaction::new();
+        tx.append(document_batch).unwrap();
+        tx.append(graph).unwrap();
+        assert!(matches!(
+            tx.commit(&db),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let key = crate::task_store::key(child.id());
+        let mut document_batch = OwnedBatch {
+            checks: vec![Check {
+                key: key.clone(),
+                expected: Expected::VersionBefore(new.version, deadline),
+            }],
+            mutations: vec![],
+        };
+        let mut graph = OwnedBatch {
+            checks: vec![Check {
+                key,
+                expected: Expected::Version(new.version),
+            }],
+            mutations: vec![],
+        };
+        reconcile_task_checks(&mut document_batch, &mut graph);
+        assert_eq!(
+            graph.checks[0].expected,
+            Expected::VersionBefore(new.version, deadline)
+        );
+        let mut tx = Transaction::new();
+        tx.append(document_batch).unwrap();
+        tx.append(graph).unwrap();
+        tx.commit(&db).unwrap();
+    }
 
     #[test]
     fn owned_child_read_is_cached_fenced_and_rejects_foreign_tasks() {

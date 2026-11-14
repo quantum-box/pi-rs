@@ -898,7 +898,7 @@ impl Scheduler {
             (!prepared.mutations.is_empty()).then_some(Save::Create(child))
         }));
         let mut transaction = crate::document::Transaction::new();
-        let document_batch = match documents.into_batch() {
+        let mut document_batch = match documents.into_batch() {
             Ok(batch) => batch,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {
                 // A staged runtime checkpoint observed a newer root while
@@ -943,18 +943,7 @@ impl Scheduler {
                 }
             }
         }
-        // Signals can impose a deadline on a child also checked by admission.
-        // Retain the stronger check for the same observed version.
-        for check in &mut graph.checks {
-            if let durable_store::Expected::Version(version) = check.expected
-                && let Some(deadline) = document_batch.checks.iter().find(|other| {
-                    other.key == check.key
-                        && matches!(other.expected, durable_store::Expected::VersionBefore(v, _) if v == version)
-                })
-            {
-                check.expected = deadline.expected.clone();
-            }
-        }
+        crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
         match transaction.commit(owner.store()) {
@@ -2510,6 +2499,74 @@ mod tests {
             &cp("start")
         );
     }
+    #[test]
+    fn stale_child_read_with_keyed_admission_obeys_replay_policy() {
+        struct Parent(std::path::PathBuf);
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(t.id()), "child", true, 5);
+                if t.checkpoint().phase == "start" {
+                    docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                    return Ok(Step::Continue(cp("read")));
+                }
+                docs.get_owned_child(child.id())?;
+                let db = durable_store::Store::open(&self.0).map_err(|e| e.to_string())?;
+                let tasks = task_store::TaskStore::new(&db);
+                let old = tasks.load(child.id()).map_err(|e| e.to_string())?.unwrap();
+                tasks
+                    .update(&old, |child| child.start())
+                    .map_err(|e| e.to_string())?;
+                let id = docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![id]),
+                    children: vec![],
+                })
+            }
+        }
+        for replay_safe in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tasks.db");
+            let mut registry = Registry::default();
+            registry.register("parent", replay_safe, Parent(path.clone()));
+            registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                replay_safe,
+                5,
+            );
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            scheduler.submit(&parent).unwrap();
+            scheduler.tick(0).unwrap();
+            scheduler.tick(0).unwrap();
+            let state = scheduler.get(parent.id()).unwrap().unwrap();
+            if replay_safe {
+                assert_eq!(state.state(), &TaskState::Ready);
+                assert_eq!(state.checkpoint(), &cp("read"));
+            } else {
+                assert!(
+                    matches!(state.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+                );
+                assert!(
+                    scheduler
+                        .get(Uuid::from_u128(2))
+                        .unwrap()
+                        .unwrap()
+                        .is_terminal()
+                );
+            }
+        }
+    }
+
     #[test]
     fn staged_keyed_child_live_handler_reopens_and_replays_identity() {
         struct Parent;
