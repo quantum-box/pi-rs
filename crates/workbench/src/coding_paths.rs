@@ -88,8 +88,8 @@ fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
         };
         Some(digit(*input.get(index + 1)?)? * 16 + digit(*input.get(index + 2)?)?)
     };
-    for index in 0..input.len() {
-        if input[index] == b'%'
+    for (index, &character) in input.iter().enumerate() {
+        if character == b'%'
             && let Some(byte) = escape(index)
             && (byte == b'/' || (windows && byte == b'\\'))
         {
