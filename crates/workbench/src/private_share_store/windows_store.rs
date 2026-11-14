@@ -207,12 +207,39 @@ impl Store {
             .and_then(|v| serde_json::from_value(v).ok()))
     }
     pub fn begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+        self.begin_inner(path, binding, false)
+    }
+
+    /// Fail closed immediately when another generation owns the session.
+    pub fn try_begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+        self.begin_inner(path, binding, true)
+    }
+
+    fn begin_inner(
+        &self,
+        path: &Path,
+        binding: Binding,
+        nonblocking: bool,
+    ) -> io::Result<Generation<'_>> {
         let lock = file(
             &self.directory,
             &name_for(&self.key, path, binding.session_id, "lock")?,
             true,
         )?;
-        lock.lock()?;
+        if nonblocking {
+            match lock.try_lock() {
+                Ok(()) => (),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "share generation is busy",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        } else {
+            lock.lock()?;
+        }
         let name = name_for(&self.key, path, binding.session_id, "json")?;
         let marker = name_for(&self.key, path, binding.session_id, "generation")?;
         let anchor = name_for(&self.key, path, binding.session_id, "anchor")?;

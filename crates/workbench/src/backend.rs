@@ -1904,7 +1904,12 @@ mod share_context_tests {
         let provenance = json!({"workspace": "fixture", "configuration": "v1"});
         let binding = store.binding_for_session(&session, &provenance).unwrap();
         // Runtime initialization is only permitted after this generation is dirty.
-        let generation = store.begin(&path, binding).unwrap();
+        let generation = store.begin(&path, binding.clone()).unwrap();
+        let busy = store
+            .try_begin(&path, binding)
+            .err()
+            .expect("active generation must block another worker");
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
         let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
         worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
             system_prompt: "live context".into(),
