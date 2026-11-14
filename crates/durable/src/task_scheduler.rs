@@ -776,6 +776,12 @@ impl Scheduler {
             return Ok(true);
         }
         let step = result.map_err(Error::Handler)?;
+        if let Step::Fail(reason) = step {
+            // Failure discards all staged effects, including child admissions.
+            self.finish_failed(&running, reason)?;
+            self.poisoned = false;
+            return Ok(true);
+        }
         let staged = std::mem::take(&mut documents.keyed_children);
         for (_, child, _) in &staged {
             let reg = self.registered(child)?;
@@ -843,15 +849,15 @@ impl Scheduler {
                 self.ensure_no_live_children(next.task.id())?;
                 next.task.succeed(value).map_err(Error::Transition)?;
             }
-            Step::Fail(reason) => {
-                // Failed handlers discard staged admissions, like staged documents.
-                self.finish_failed(&running, reason)?;
-                self.poisoned = false;
-                return Ok(true);
-            }
+            Step::Fail(_) => unreachable!(),
         }
         let mut batch = vec![Save::Update(&next)];
         batch.extend(children.iter().map(Save::Create));
+        // Validate all newly created children as one ownership graph, including
+        // collisions with children returned directly by the handler.
+        batch.extend(staged.iter().filter_map(|(_, child, prepared)| {
+            (!prepared.mutations.is_empty()).then_some(Save::Create(child))
+        }));
         let mut transaction = crate::document::Transaction::new();
         let document_batch = documents.into_batch()?;
         let mut document_keys: HashSet<_> = document_batch
@@ -859,7 +865,6 @@ impl Scheduler {
             .iter()
             .map(|c| c.key.clone())
             .collect();
-        transaction.append(document_batch)?;
         // One graph batch: the parent transition replaces admission's parent bump.
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
@@ -877,11 +882,24 @@ impl Scheduler {
                     durable_store::Mutation::Put { key, .. }
                     | durable_store::Mutation::Delete { key } => key,
                 };
-                if *key != parent_key {
+                if *key != parent_key && !key.starts_with(task_store::PREFIX) {
                     graph.mutations.push(mutation);
                 }
             }
         }
+        // Signals can impose a deadline on a child also checked by admission.
+        // Retain the stronger check for the same observed version.
+        for check in &mut graph.checks {
+            if let durable_store::Expected::Version(version) = check.expected
+                && let Some(deadline) = document_batch.checks.iter().find(|other| {
+                    other.key == check.key
+                        && matches!(other.expected, durable_store::Expected::VersionBefore(v, _) if v == version)
+                })
+            {
+                check.expected = deadline.expected.clone();
+            }
+        }
+        transaction.append(document_batch)?;
         transaction.append(graph)?;
         match transaction.commit(owner.store()) {
             Ok(()) => {}
@@ -2500,6 +2518,184 @@ mod tests {
             TaskState::Succeeded(_)
         ));
         assert!(s.get(Uuid::from_u128(3)).unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_existing_child_composes_with_signal_deadline() {
+        use crate::task_store::{SignalResult, SignalToken};
+        struct Parent(bool);
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(t.id()), "child", true, 5);
+                let id = docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                if t.checkpoint().phase == "start" {
+                    Ok(Step::Continue(cp("signal")))
+                } else {
+                    let token = SignalToken::new("answer", 1).unwrap();
+                    assert!(matches!(
+                        docs.signal_at(id, &token, "a", json!(1), 0).unwrap(),
+                        SignalResult::Delivered
+                    ));
+                    if self.0 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Ok(Step::Wait {
+                        checkpoint: cp("waiting"),
+                        condition: WaitFor::TasksAny(vec![id]),
+                        children: vec![],
+                    })
+                }
+            }
+        }
+        for expired in [false, true] {
+            let mut registry = Registry::default();
+            registry.register("parent", true, Parent(expired));
+            registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = Scheduler::open(dir.path().join("tasks.db"), registry).unwrap();
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                5,
+            );
+            s.submit(&parent).unwrap();
+            s.tick(0).unwrap();
+            let child = s.ts().load(Uuid::from_u128(2)).unwrap().unwrap();
+            let token = SignalToken::new("answer", 1).unwrap();
+            s.ts()
+                .update(&child, |t| {
+                    t.start()?;
+                    t.wait(WaitFor::TypedSleep {
+                        until_millis: Some(if expired { 10 } else { 60_000 }),
+                        signals: vec![token.key("a").unwrap()],
+                    })
+                })
+                .unwrap();
+            s.tick(0).unwrap();
+            let current = s.get(parent.id()).unwrap().unwrap();
+            if expired {
+                assert_eq!(current.state(), &TaskState::Ready);
+                assert_eq!(current.checkpoint(), &cp("signal"));
+            } else {
+                assert_eq!(
+                    current.state(),
+                    &TaskState::Waiting(WaitFor::TasksAny(vec![child.task.id()]))
+                );
+            }
+            assert!(matches!(
+                (
+                    expired,
+                    s.ts()
+                        .deliver_signal_at(child.task.id(), &token, "a", json!(1), 0)
+                        .unwrap()
+                ),
+                (true, SignalResult::Delivered) | (false, SignalResult::Duplicate)
+            ));
+        }
+    }
+
+    #[test]
+    fn staged_unregistered_child_is_discarded_on_failure() {
+        struct Parent;
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(t.id()), "unregistered", true, 5);
+                docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                Ok(Step::Fail("failed deliberately".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register("parent", true, Parent);
+        let mut s = Scheduler::open(&path, registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            5,
+        );
+        s.submit(&parent).unwrap();
+        s.tick(0).unwrap();
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        assert!(s.get(Uuid::from_u128(2)).unwrap().is_none());
+        drop(s);
+        let s = Scheduler::open(&path, Registry::default()).unwrap();
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        assert!(s.get(Uuid::from_u128(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_children_cannot_reuse_a_candidate_id() {
+        struct Parent(bool);
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(t.id()), "child", true, 5);
+                let id = docs.stage_keyed_child("first", "tool", child.input(), child.clone())?;
+                let children = if self.0 {
+                    vec![child.clone()]
+                } else {
+                    docs.stage_keyed_child("second", "tool", child.input(), child.clone())?;
+                    vec![]
+                };
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![id]),
+                    children,
+                })
+            }
+        }
+        for direct in [false, true] {
+            let mut registry = Registry::default();
+            registry.register("parent", true, Parent(direct));
+            registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = Scheduler::open(dir.path().join("tasks.db"), registry).unwrap();
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                5,
+            );
+            s.submit(&parent).unwrap();
+            assert!(s.tick(0).is_err());
+            assert!(s.ts().load(Uuid::from_u128(2)).unwrap().is_none());
+            assert_eq!(
+                s.ts().load(parent.id()).unwrap().unwrap().task.state(),
+                &TaskState::Running
+            );
+        }
     }
 
     #[test]
