@@ -129,7 +129,10 @@ threshold compaction. A supplied summary bypasses the summary model, carries
 optional details and usage into the journal, and emits the normal lifecycle
 notification; cancellation leaves the branch unchanged. Executable extensions
 negotiate this hook before receiving the new request. Existing post-summary
-compaction hooks continue to run. Unlike Pi, the native hook must retain at
+compaction hooks continue to run. An extension-provided summary does not consume
+a model request, so threshold compaction can use it even when only the turn's
+final model request remains. A declined optional hook preserves that request and
+does not emit a failed-compaction event. Unlike Pi, the native hook must retain at
 least the prepared recent context and uses native numeric journal IDs; native
 summary size and timeout limits still apply. Automatic overflow recovery and
 full Pi preparation payload compatibility remain separate gaps.
@@ -3455,8 +3458,9 @@ Async `session_compact` and
 Manual preparation failures also emit `session_compact_failed`; its error
 message identifies manual versus automatic threshold compaction, and aborted
 events omit the error message. Native compaction retains its existing
-preflight, error types, and extension replacement behavior; overflow recovery
-and Pi's pre-summary extension-provided compaction remain separate gaps.
+preflight, error types, and extension replacement behavior. Manual and threshold
+compaction accept extension-provided summaries before model generation; automatic
+overflow recovery remains a separate gap.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
