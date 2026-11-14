@@ -561,8 +561,10 @@ not upstream's retained-entry head test: it can reject a cut that upstream
 would still accept after a preceding compaction.
 For tracked manual operations, queued resets committed before the summary's
 placement admission are placed first, making the summary stale; resets admitted
-after that checkpoint are placed afterward. Concurrent reset admissions merged
-into the checkpoint count as earlier. Older checkpoints without ordering data
+after that checkpoint are placed afterward. Resets queued during an aborted
+operation stay ahead of later resets and their intervening writes, including
+after reopening. Concurrent reset admissions merged into the checkpoint count
+as earlier. Older checkpoints without ordering data
 retain their previous placement behavior. This orders only manual summaries and
 resets, not a general inbox or independently scheduled compaction.
 Runtime-owned preparations also pin the context generation; a reset or another

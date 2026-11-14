@@ -3422,6 +3422,7 @@ impl Harness {
             let (mut state, version) = self.load(id)?;
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
+                && state.pending_resets.is_empty()
                 && !state.submissions.iter().any(|s| s.status == Status::Queued)
             {
                 place_reset(&mut state, marker.clone());
@@ -8143,6 +8144,84 @@ mod scheduler_tests {
                 ]
             );
         }
+    }
+    #[tokio::test]
+    async fn reset_after_aborted_compaction_preserves_pending_reset_and_write_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (id, operation, first, second, write);
+        {
+            let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            (id, operation) = prepare_manual_placement(&mut h);
+            first = h.reset(id, Some("first".into())).unwrap();
+            write = h.submit_write(id, None, "note".into(), None).unwrap();
+            h.request_abort(id).unwrap();
+            let (c, version) = h.load(id).unwrap();
+            assert!(
+                h.settle_abort(c, version, &CancellationToken::new())
+                    .await
+                    .unwrap()
+            );
+            second = h.reset(id, Some("second".into())).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.manual_compactions[0].id, operation);
+        assert_eq!(
+            c.manual_compactions[0].status,
+            ManualCompactionStatus::Aborted
+        );
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            c.messages,
+            vec![Message::User {
+                content: "second".into()
+            }]
+        );
+        let entry = c
+            .application_writes
+            .iter()
+            .find(|entry| entry.id == write)
+            .unwrap();
+        assert_eq!(entry.after_reset, Some(first));
+        assert!(entry.placed);
+    }
+    #[tokio::test]
+    async fn reset_legacy_placement_without_order_retains_previous_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (id, operation);
+        {
+            let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            (id, operation) = prepare_manual_placement(&mut h);
+            h.reset(id, Some("later".into())).unwrap();
+            let (c, version) = h.load(id).unwrap();
+            let mut value = serde_json::to_value(c).unwrap();
+            value["phase"]["CompactionPlacement"]
+                .as_object_mut()
+                .unwrap()
+                .remove("resets_before");
+            let legacy: Conversation = serde_json::from_value(value).unwrap();
+            h.save(&legacy, Expected::Version(version)).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.manual_compactions[0].id, operation);
+        assert_eq!(
+            c.manual_compactions[0].status,
+            ManualCompactionStatus::Applied
+        );
+        assert_eq!(
+            c.messages,
+            vec![Message::User {
+                content: "later".into()
+            }]
+        );
     }
     #[tokio::test]
     async fn reset_after_manual_placement_admission_does_not_make_result_stale() {
