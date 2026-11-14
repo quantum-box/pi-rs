@@ -1,4 +1,4 @@
-// Run with: node browser-fetch.cjs <wasm-bindgen web output dir> <Chrome executable>
+// Run with: node browser-sdk.cjs <wasm-bindgen web output dir> <Chrome executable>
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -38,40 +38,50 @@ const reject = async (p, part) => { let err; try { await p; } catch(e) { err = e
 try {
   await init(); const base = ${JSON.stringify(origin)};
   if (sessionStorage.getItem('reloaded')) {
-    const restored = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 300);
+    const restored = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
     assert(JSON.parse(restored.messages()).some(m => m.content === 'after timeout'), 'restored after page reload');
     await restored.close(); restored.free();
     document.body.textContent = 'PASS';
   } else {
   localStorage.setItem('pi-rs:session:bad', 'invalid');
-  await reject(BrowserSession.open('bad', base + '/gateway', 'test-model', '', 300), 'expected value');
+  await reject(BrowserSession.open('bad', base + '/gateway', 'test-model', '', 1500), 'expected value');
   localStorage.removeItem('pi-rs:session:bad');
-  let recovered = await BrowserSession.open('bad', base + '/gateway', 'test-model', '', 300); await recovered.close(); recovered.free();
-  let session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 300);
-  await reject(BrowserSession.open('test', base + '/gateway', 'test-model', '', 300), 'already open');
+  let recovered = await BrowserSession.open('bad', base + '/gateway', 'test-model', '', 1500); await recovered.close(); recovered.free();
+  let session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
+  await reject(BrowserSession.open('test', base + '/gateway', 'test-model', '', 1500), 'already open');
   assert(await session.prompt('first') === 'answer one', 'first answer');
   let messages = JSON.parse(session.messages());
   assert(messages.some(m => m.content === 'first') && messages.some(m => m.content === 'answer one'), 'saved messages');
   await session.close(); session.free();
-  session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 300);
+  session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
   messages = JSON.parse(session.messages());
   assert(messages.some(m => m.content === 'first') && messages.some(m => m.content === 'answer one'), 'restored messages');
   assert(await session.prompt('second') === 'answer two', 'second answer');
+  const immediate = session.prompt('never sent'); session.cancel();
+  await reject(immediate, 'cancel');
   const pending = session.prompt('cancel me');
-  setTimeout(() => session.cancel(), 100);
+  while (!(await (await fetch('/cancel-started')).json())) await new Promise(r => setTimeout(r, 20));
+  session.cancel();
   await reject(pending, 'cancel');
   assert(await session.prompt('after cancel') === 'answer two', 'run after cancel');
   await reject(session.prompt('timeout me'), 'timed out');
   assert(await session.prompt('after timeout') === 'answer two', 'run after timeout');
   await reject(session.prompt('fail me'), 'gateway request failed');
   assert(await session.prompt('after failure') === 'answer two', 'run after gateway failure');
-  await session.close(); session.free();
+  const doomed = session.prompt('cancel me');
+  await new Promise(r => setTimeout(r, 30));
+  session.free();
+  await reject(doomed, 'cancel');
+  await new Promise(r => setTimeout(r, 50));
+  session = await BrowserSession.open('test', base + '/gateway', 'test-model', 'secret', 1500);
+  await Promise.all([session.close(), session.close()]); session.free();
   sessionStorage.setItem('reloaded', 'yes');
   location.reload();
   }
 } catch(e) { document.body.textContent = 'FAIL ' + String(e) + ' ' + (e.stack || ''); }
 </script></body>`;
   const site = http.createServer((req, res) => {
+    if (req.url === '/cancel-started') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(requests.some(r => r.messages.some(m => m.content === 'cancel me')))); return; }
     if (req.url === '/') { res.setHeader('content-type', 'text/html'); res.end(html); return; }
     const name = path.basename(req.url);
     const file = req.url.includes('/snippets/') ? path.join(dir, req.url.slice('/pkg/'.length)) : path.join(dir, name);
@@ -112,6 +122,7 @@ try {
       }
       socket.close();
       if (text !== 'PASS') throw Error(`browser failed: ${text}`);
+      if (requests.some(r => r.messages.some(m => m.content === 'never sent'))) throw Error('pre-start cancellation dispatched a request');
       if (requests.some(r => r._auth !== 'Bearer secret')) throw Error('gateway authorization header missing');
       if (requests.length < 4 || !requests[1].messages.some(m => m.content === 'first') || !requests[1].messages.some(m => m.content === 'answer one')) throw Error('restored context was not sent to gateway');
       if (!aborted) throw Error('cancel did not abort network request');

@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wasm_bindgen::{JsCast, prelude::*};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::{JsFuture, future_to_promise, spawn_local};
 
 // Web Locks holds an exclusive session owner across tabs and releases it on close.
 #[wasm_bindgen(inline_js = r#"
@@ -164,10 +164,15 @@ impl Model for Gateway {
 
 #[wasm_bindgen]
 pub struct BrowserSession {
-    session: Rc<RefCell<Option<AgentSession>>>,
+    inner: Rc<SessionInner>,
+}
+struct SessionInner {
+    session: RefCell<Option<AgentSession>>,
     control: SessionControl,
     release: Function,
-    released: Cell<bool>,
+    release_promise: RefCell<Option<js_sys::Promise>>,
+    disposed: Cell<bool>,
+    cancel_sequence: Cell<u64>,
 }
 #[wasm_bindgen]
 impl BrowserSession {
@@ -203,10 +208,14 @@ impl BrowserSession {
                 .map_err(|e| js_error(&e.to_string()))?;
             let control = session.controls();
             Ok(Self {
-                session: Rc::new(RefCell::new(Some(session))),
-                control,
-                release: release.clone(),
-                released: Cell::new(false),
+                inner: Rc::new(SessionInner {
+                    session: RefCell::new(Some(session)),
+                    control,
+                    release: release.clone(),
+                    release_promise: RefCell::new(None),
+                    disposed: Cell::new(false),
+                    cancel_sequence: Cell::new(0),
+                }),
             })
         })();
         if result.is_err()
@@ -216,40 +225,58 @@ impl BrowserSession {
         }
         result
     }
-    pub async fn prompt(&self, input: String) -> Result<String, JsValue> {
-        let mut session = self
-            .session
-            .borrow_mut()
-            .take()
-            .ok_or_else(|| js_error("session busy"))?;
-        let result = session
-            .prompt(input)
-            .await
-            .map_err(|e| js_error(&e.to_string()));
-        *self.session.borrow_mut() = Some(session);
-        result
+    pub fn prompt(&self, input: String) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        let sequence = inner.cancel_sequence.get();
+        future_to_promise(async move {
+            if inner.disposed.get() || inner.cancel_sequence.get() != sequence {
+                return Err(js_error("session cancelled"));
+            }
+            let mut session = inner
+                .session
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| js_error("session busy or closed"))?;
+            let result = session
+                .prompt(input)
+                .await
+                .map(JsValue::from)
+                .map_err(|e| js_error(&e.to_string()));
+            *inner.session.borrow_mut() = Some(session);
+            result
+        })
     }
     pub fn cancel(&self) {
-        self.control.abort();
+        self.inner
+            .cancel_sequence
+            .set(self.inner.cancel_sequence.get().wrapping_add(1));
+        self.inner.control.abort();
     }
     /// Close an idle session and wait for its cross-tab lock to be released.
-    pub async fn close(&self) -> Result<(), JsValue> {
-        if self.released.get() {
-            return Ok(());
-        }
-        let session = self
-            .session
-            .borrow_mut()
-            .take()
-            .ok_or_else(|| js_error("session busy"))?;
-        drop(session);
-        self.released.set(true);
-        let promise = self.release.call0(&JsValue::UNDEFINED)?;
-        JsFuture::from(js_sys::Promise::resolve(&promise)).await?;
-        Ok(())
+    pub fn close(&self) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        future_to_promise(async move {
+            let existing = inner.release_promise.borrow().clone();
+            let promise = if let Some(promise) = existing {
+                promise
+            } else {
+                let session = inner
+                    .session
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| js_error("session busy or closed"))?;
+                drop(session);
+                let value = inner.release.call0(&JsValue::UNDEFINED)?;
+                let promise = js_sys::Promise::resolve(&value);
+                *inner.release_promise.borrow_mut() = Some(promise.clone());
+                promise
+            };
+            JsFuture::from(promise).await?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
     pub fn messages(&self) -> Result<String, JsValue> {
-        let slot = self.session.borrow();
+        let slot = self.inner.session.borrow();
         let session = slot.as_ref().ok_or_else(|| js_error("session busy"))?;
         let messages = session.messages().map_err(|e| js_error(&e.to_string()))?;
         serde_json::to_string(&messages).map_err(|_| js_error("message serialization failed"))
@@ -257,8 +284,13 @@ impl BrowserSession {
 }
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        self.control.abort();
-        if !self.released.replace(true) {
+        self.inner.disposed.set(true);
+        self.inner.control.abort();
+    }
+}
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        if self.release_promise.borrow().is_none() {
             let _ = self.release.call0(&JsValue::UNDEFINED);
         }
     }

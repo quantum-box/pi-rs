@@ -1,5 +1,9 @@
 //! Platform boundary for clocks and timers used by the agent runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) use std::time::Instant as Monotonic;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) use time::Instant as Monotonic;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod time {
     pub use tokio::time::{Instant, sleep, timeout, timeout_at};
 }
