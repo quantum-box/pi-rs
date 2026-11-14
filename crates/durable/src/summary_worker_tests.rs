@@ -98,6 +98,30 @@ impl Model for TestModel {
     }
 }
 
+fn identity() -> SummaryProviderIdentity {
+    SummaryProviderIdentity {
+        model: "test-model-v1".into(),
+        settlement: "test-settlement-v1".into(),
+    }
+}
+fn open_manual(path: impl AsRef<std::path::Path>, options: Options) -> Result<Scheduler, Error> {
+    let mut scheduler = Scheduler::open(path, options)?;
+    scheduler.summary_provider = Some(identity());
+    Ok(scheduler)
+}
+fn open_auto(
+    path: impl AsRef<std::path::Path>,
+    model: Arc<TestModel>,
+    identity: SummaryProviderIdentity,
+) -> Result<Scheduler, Error> {
+    Scheduler::open_with_summary_recovery(
+        path,
+        opts(model),
+        crate::extension::Registry::default(),
+        None,
+        identity,
+    )
+}
 fn opts(model: Arc<TestModel>) -> Options {
     Options {
         model,
@@ -125,7 +149,7 @@ fn create(scheduler: &Scheduler, id: Uuid, session: Uuid) {
     .unwrap()
     .unwrap();
     SummaryStore::new(scheduler.harness.owner.store())
-        .create(id, session, preparation)
+        .create_identified(id, session, preparation, identity())
         .unwrap();
 }
 fn state(scheduler: &Scheduler, id: Uuid) -> crate::summary_store::Snapshot {
@@ -171,7 +195,7 @@ async fn completed_summary_places_once_after_reopen_and_preserves_occurrence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let before = scheduler.harness.conversation(conversation).unwrap();
     let occurrence = scheduler
@@ -189,7 +213,7 @@ async fn completed_summary_places_once_after_reopen_and_preserves_occurrence() {
     scheduler.schedule_summary(id).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     scheduler.shutdown().await.unwrap();
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
         SummaryPlacement::Placed
@@ -212,7 +236,7 @@ async fn completed_summary_places_once_after_reopen_and_preserves_occurrence() {
         .clone();
     assert_eq!(retained, occurrence);
     scheduler.shutdown().await.unwrap();
-    let mut scheduler = Scheduler::open(&path, opts(model)).unwrap();
+    let mut scheduler = open_manual(&path, opts(model)).unwrap();
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
         SummaryPlacement::Placed
@@ -235,7 +259,7 @@ async fn placement_kill_child() {
         return;
     };
     let dir = std::path::Path::new(&dir);
-    let mut scheduler = Scheduler::open(dir.join("db"), opts(TestModel::new(1))).unwrap();
+    let mut scheduler = open_manual(dir.join("db"), opts(TestModel::new(1))).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let id = Uuid::new_v4();
     scheduler
@@ -277,7 +301,7 @@ async fn killed_completed_worker_places_once_after_reopen() {
         .map(|id| Uuid::parse_str(id).unwrap());
     let id = ids.next().unwrap();
     let conversation = ids.next().unwrap();
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(TestModel::new(0))).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(TestModel::new(0))).unwrap();
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
         SummaryPlacement::Placed
@@ -303,7 +327,7 @@ async fn changed_context_is_terminally_stale_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let id = Uuid::new_v4();
     scheduler
@@ -332,7 +356,7 @@ async fn changed_context_is_terminally_stale_across_reopen() {
         state.messages
     );
     scheduler.shutdown().await.unwrap();
-    let mut scheduler = Scheduler::open(&path, opts(model)).unwrap();
+    let mut scheduler = open_manual(&path, opts(model)).unwrap();
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
         SummaryPlacement::Stale
@@ -352,7 +376,7 @@ async fn changed_context_is_terminally_stale_across_reopen() {
 async fn competing_results_have_one_winner() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(2);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
     scheduler
@@ -393,7 +417,7 @@ async fn competing_results_have_one_winner() {
 async fn staged_placement_loses_to_concurrent_conversation_commit() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let id = Uuid::new_v4();
     scheduler
@@ -469,7 +493,7 @@ async fn staged_placement_loses_to_concurrent_conversation_commit() {
 async fn creation_rejects_a_changed_conversation_version() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let (mut state, version) = scheduler
         .harness
@@ -494,7 +518,8 @@ async fn creation_rejects_a_changed_conversation_version() {
             conversation,
             preparation,
             Harness::key(conversation),
-            version
+            version,
+            identity(),
         ),
         Err(crate::summary_store::Error::Conflict)
     ));
@@ -506,7 +531,7 @@ async fn creation_rejects_a_changed_conversation_version() {
 async fn history_over_limit_is_rejected_without_creating_operation() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
     let conversation = placement_conversation(&mut scheduler);
     let owner = scheduler.harness.owner.clone();
     let (mut state, version) = scheduler.harness.load(conversation).unwrap();
@@ -554,7 +579,7 @@ async fn scheduler_executes_and_replays_lost_settlement_ack() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(1);
     model.fail_ack.store(true, Ordering::SeqCst);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model.clone())).unwrap();
     let (id, session) = (Uuid::new_v4(), Uuid::new_v4());
     create(&scheduler, id, session);
     scheduler.schedule_summary(id).unwrap();
@@ -584,7 +609,7 @@ async fn scheduler_executes_and_replays_lost_settlement_ack() {
 async fn abort_joins_running_worker_and_settles_unconfirmed() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model.clone())).unwrap();
     let id = Uuid::new_v4();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
@@ -604,7 +629,7 @@ async fn abort_joins_running_worker_and_settles_unconfirmed() {
 async fn separate_summaries_run_independently_and_abort_is_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model.clone())).unwrap();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     create(&scheduler, a, Uuid::new_v4());
@@ -636,7 +661,7 @@ async fn abort_during_settlement_replays_measured_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let model = TestModel::new(1);
     model.block_settlement.store(true, Ordering::SeqCst);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model.clone())).unwrap();
     let id = Uuid::new_v4();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
@@ -666,7 +691,7 @@ async fn interrupted_abort_cleanup_resumes_after_reopen() {
     let path = dir.path().join("db");
     let model = TestModel::new(0);
     model.block_settlement.store(true, Ordering::SeqCst);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     let id = Uuid::new_v4();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
@@ -687,8 +712,7 @@ async fn interrupted_abort_cleanup_resumes_after_reopen() {
     ));
     scheduler.shutdown().await.unwrap();
     model.block_settlement.store(false, Ordering::SeqCst);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
-    scheduler.schedule_summary(id).unwrap();
+    let mut scheduler = open_auto(&path, model.clone(), identity()).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Aborted));
@@ -706,15 +730,14 @@ async fn shutdown_reopen_recovers_running_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     let id = Uuid::new_v4();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
     started(&model).await;
     scheduler.shutdown().await.unwrap();
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
-    scheduler.schedule_summary(id).unwrap();
+    let mut scheduler = open_auto(&path, model.clone(), identity()).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Completed { .. }));
@@ -726,11 +749,222 @@ async fn shutdown_reopen_recovers_running_attempt() {
 }
 
 #[tokio::test]
+async fn startup_blocks_legacy_and_mismatched_provider_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    let good = Uuid::new_v4();
+    let legacy = Uuid::new_v4();
+    let wrong_model = Uuid::new_v4();
+    let wrong_settlement = Uuid::new_v4();
+    create(&scheduler, good, Uuid::new_v4());
+    let preparation = state(&scheduler, good).operation.preparation().clone();
+    let store = SummaryStore::new(scheduler.harness.owner.store());
+    store
+        .create(legacy, Uuid::new_v4(), preparation.clone())
+        .unwrap();
+    store
+        .create_identified(
+            wrong_model,
+            Uuid::new_v4(),
+            preparation.clone(),
+            SummaryProviderIdentity {
+                model: "other-model".into(),
+                settlement: identity().settlement,
+            },
+        )
+        .unwrap();
+    store
+        .create_identified(
+            wrong_settlement,
+            Uuid::new_v4(),
+            preparation,
+            SummaryProviderIdentity {
+                model: identity().model,
+                settlement: "other-ledger".into(),
+            },
+        )
+        .unwrap();
+    let owner = Uuid::new_v4();
+    for id in [legacy, wrong_model, wrong_settlement] {
+        store
+            .reserve(
+                id,
+                store.get(id).unwrap().unwrap().version,
+                owner,
+                Uuid::new_v4(),
+            )
+            .unwrap();
+        store
+            .start(id, store.get(id).unwrap().unwrap().version, owner)
+            .unwrap();
+    }
+    store
+        .begin_abort(legacy, store.get(legacy).unwrap().unwrap().version)
+        .unwrap();
+    store
+        .complete(
+            wrong_settlement,
+            store.get(wrong_settlement).unwrap().unwrap().version,
+            owner,
+            crate::model::CompletedGeneration {
+                content: "already generated".into(),
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                }),
+                metadata: ModelMetadata::default(),
+            },
+        )
+        .unwrap();
+    let versions: Vec<_> = [legacy, wrong_model, wrong_settlement]
+        .into_iter()
+        .map(|id| (id, store.get(id).unwrap().unwrap().version))
+        .collect();
+    scheduler.shutdown().await.unwrap();
+    let mut no_identity = Scheduler::open(&path, opts(model.clone())).unwrap();
+    assert!(no_identity.schedule_summary(good).is_err());
+    assert!(no_identity.abort_summary(good).await.is_err());
+    assert!(model.calls.lock().unwrap().is_empty());
+    no_identity.shutdown().await.unwrap();
+    let mut scheduler = open_auto(&path, model.clone(), identity()).unwrap();
+    let blocked: std::collections::HashSet<_> = scheduler
+        .blocked_summary_recovery()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        blocked,
+        [legacy, wrong_model, wrong_settlement]
+            .into_iter()
+            .collect()
+    );
+    for (id, version) in versions {
+        assert!(scheduler.schedule_summary(id).is_err());
+        assert!(scheduler.abort_summary(id).await.is_err());
+        assert_eq!(state(&scheduler, id).version, version);
+    }
+    scheduler.wait_summary(good).await.unwrap();
+    assert_eq!(model.calls.lock().unwrap().len(), 1);
+    assert_eq!(model.settlements.lock().unwrap().len(), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discovery_limit_prevents_partial_startup_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(200);
+    let scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    let first = Uuid::new_v4();
+    create(&scheduler, first, Uuid::new_v4());
+    let preparation = state(&scheduler, first).operation.preparation().clone();
+    let store = SummaryStore::new(scheduler.harness.owner.store());
+    for _ in 0..crate::summary_store::MAX_DISCOVERY_OPERATIONS {
+        store
+            .create_identified(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                preparation.clone(),
+                identity(),
+            )
+            .unwrap();
+    }
+    scheduler.shutdown().await.unwrap();
+    assert!(open_auto(&path, model.clone(), identity()).is_err());
+    assert!(model.calls.lock().unwrap().is_empty());
+    assert!(model.settlements.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn adapter_validation_precedes_summary_recovery() {
+    struct InvalidAdapter;
+    #[async_trait::async_trait]
+    impl crate::model::ProviderAdapter for InvalidAdapter {
+        fn id(&self) -> &str {
+            ""
+        }
+        async fn prepare(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+        ) -> pi_rs_core::Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn validate(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: &serde_json::Value,
+        ) -> pi_rs_core::Result<()> {
+            unreachable!()
+        }
+        async fn dispatch(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: serde_json::Value,
+        ) -> pi_rs_core::Result<ModelStream> {
+            unreachable!()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    create(&scheduler, Uuid::new_v4(), Uuid::new_v4());
+    scheduler.shutdown().await.unwrap();
+    assert!(
+        Scheduler::open_with_summary_recovery(
+            &path,
+            opts(model.clone()),
+            crate::extension::Registry::default(),
+            Some(Arc::new(InvalidAdapter)),
+            identity()
+        )
+        .is_err()
+    );
+    assert!(model.calls.lock().unwrap().is_empty());
+    assert!(model.settlements.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn executor_guard_rechecks_identity_before_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(1);
+    let scheduler = open_manual(dir.path().join("db"), opts(model.clone())).unwrap();
+    let id = Uuid::new_v4();
+    create(&scheduler, id, Uuid::new_v4());
+    let before = state(&scheduler, id);
+    let result = crate::summary_worker::run(
+        scheduler.harness.owner.clone(),
+        model.clone(),
+        id,
+        CancellationToken::new(),
+        SummaryProviderIdentity {
+            model: "different".into(),
+            settlement: identity().settlement,
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(crate::summary_worker::Error::Identity)
+    ));
+    assert_eq!(state(&scheduler, id).version, before.version);
+    assert!(model.calls.lock().unwrap().is_empty());
+    assert!(model.settlements.lock().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn storage_failure_requires_reopen_before_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
     let id = Uuid::new_v4();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
@@ -744,7 +978,7 @@ async fn storage_failure_requires_reopen_before_retry() {
     drop(inject);
     scheduler.shutdown().await.unwrap();
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(&path, opts(model)).unwrap();
+    let mut scheduler = open_manual(&path, opts(model)).unwrap();
     scheduler.schedule_summary(id).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     assert!(matches!(
@@ -769,7 +1003,7 @@ async fn killed_summary_child() {
     } else {
         Arc::get_mut(&mut model).unwrap().marker = Some(dir.join("running"));
     }
-    let mut scheduler = Scheduler::open(dir.join("db"), opts(model)).unwrap();
+    let mut scheduler = open_manual(dir.join("db"), opts(model)).unwrap();
     create(&scheduler, id, Uuid::new_v4());
     scheduler.schedule_summary(id).unwrap();
     std::future::pending::<()>().await;
@@ -804,8 +1038,7 @@ async fn killed_scheduler_replays_accepted_accounting() {
     let accepted: (Uuid, UsageReport) =
         serde_json::from_slice(&std::fs::read(dir.path().join("accepted")).unwrap()).unwrap();
     let model = TestModel::new(0);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
-    scheduler.schedule_summary(id).unwrap();
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Completed { .. }));
@@ -842,8 +1075,7 @@ async fn killed_scheduler_reopens_and_recovers_summary() {
     child.kill().unwrap();
     child.wait().unwrap();
     let model = TestModel::new(1);
-    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model.clone())).unwrap();
-    scheduler.schedule_summary(id).unwrap();
+    let mut scheduler = open_auto(dir.path().join("db"), model.clone(), identity()).unwrap();
     scheduler.wait_summary(id).await.unwrap();
     let snap = state(&scheduler, id);
     assert!(matches!(snap.operation.state(), State::Completed { .. }));

@@ -18,6 +18,24 @@ const REQUEST_PREFIX: &[u8] = b"durable/summary-request/";
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Bounds both retries and the retained attempt/usage history per operation.
 pub const MAX_ATTEMPTS: usize = 16;
+/// Upper bound on records inspected during one startup discovery.
+pub const MAX_DISCOVERY_OPERATIONS: usize = 128;
+const MAX_DISCOVERY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Host-attested, versioned identities for the model and usage-settlement
+/// service. Change either identity whenever its replay semantics change.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    pub model: String,
+    pub settlement: String,
+}
+impl ProviderIdentity {
+    pub fn valid(&self) -> bool {
+        [&self.model, &self.settlement]
+            .into_iter()
+            .all(|s| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic()))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -104,6 +122,8 @@ pub struct Operation {
     attempts: Vec<Attempt>,
     #[serde(default)]
     placement_version: Option<u64>,
+    #[serde(default)]
+    provider: Option<ProviderIdentity>,
 }
 impl Operation {
     pub fn id(&self) -> Uuid {
@@ -123,6 +143,9 @@ impl Operation {
     }
     pub(crate) fn placement_version(&self) -> Option<u64> {
         self.placement_version
+    }
+    pub(crate) fn provider(&self) -> Option<&ProviderIdentity> {
+        self.provider.as_ref()
     }
 
     /// Derive the exact report to replay from the durable checkpoint. Once an
@@ -173,6 +196,7 @@ impl<'a> SummaryStore<'a> {
         [PREFIX, id.as_bytes()].concat()
     }
 
+    #[cfg(test)]
     pub fn create(
         &self,
         id: Uuid,
@@ -192,8 +216,34 @@ impl<'a> SummaryStore<'a> {
             state: State::Ready,
             attempts: vec![],
             placement_version: None,
+            provider: None,
         };
         self.write(&op, Expected::Missing)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_identified(
+        &self,
+        id: Uuid,
+        session_id: Uuid,
+        preparation: Preparation,
+        provider: ProviderIdentity,
+    ) -> Result<(), Error> {
+        if id.is_nil() || session_id.is_nil() || !provider.valid() {
+            return Err(Error::Identity);
+        }
+        self.write(
+            &Operation {
+                id,
+                session_id,
+                preparation,
+                state: State::Ready,
+                attempts: vec![],
+                placement_version: None,
+                provider: Some(provider),
+            },
+            Expected::Missing,
+        )
     }
 
     /// Atomically bind a preparation to the exact conversation version whose
@@ -206,8 +256,9 @@ impl<'a> SummaryStore<'a> {
         preparation: Preparation,
         conversation_key: Vec<u8>,
         version: u64,
+        provider: ProviderIdentity,
     ) -> Result<(), Error> {
-        if id.is_nil() || session_id.is_nil() || version == 0 {
+        if id.is_nil() || session_id.is_nil() || version == 0 || !provider.valid() {
             return Err(Error::Identity);
         }
         if serde_json::to_vec(&preparation)?.len() > MAX_PAYLOAD_BYTES {
@@ -220,6 +271,7 @@ impl<'a> SummaryStore<'a> {
             state: State::Ready,
             attempts: vec![],
             placement_version: Some(version),
+            provider: Some(provider),
         };
         let key = Self::key(id);
         self.store
@@ -243,6 +295,67 @@ impl<'a> SummaryStore<'a> {
                 durable_store::Error::Conflict { .. } => Error::Conflict,
                 other => Error::Store(other),
             })
+    }
+
+    /// Bounded discovery is all-or-nothing: if the store exceeds its work or
+    /// payload budget no executor is started by this scan. Terminal records
+    /// count toward the limit, so callers can never silently skip older work.
+    pub(crate) fn discover(
+        &self,
+        provider: &ProviderIdentity,
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+        if !provider.valid() {
+            return Err(Error::Identity);
+        }
+        let mut after = PREFIX.to_vec();
+        let mut runnable = Vec::new();
+        let mut blocked = Vec::new();
+        let mut bytes = 0usize;
+        for count in 0..=MAX_DISCOVERY_OPERATIONS {
+            let (_, mut page) = self.store.page_with_metadata(
+                b"durable/summary-discovery/unused",
+                PREFIX,
+                &after,
+                1,
+            )?;
+            let Some((key, entry)) = page.pop() else {
+                return Ok((runnable, blocked));
+            };
+            if count == MAX_DISCOVERY_OPERATIONS {
+                return Err(Error::Limit);
+            }
+            bytes = bytes.saturating_add(entry.value.len());
+            if bytes > MAX_DISCOVERY_BYTES {
+                return Err(Error::Limit);
+            }
+            let id = Uuid::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidRecord)?)
+                .map_err(|_| Error::InvalidRecord)?;
+            let op: Operation = serde_json::from_slice(&entry.value)?;
+            if op.id != id
+                || id.is_nil()
+                || op.session_id.is_nil()
+                || op.attempts.len() > MAX_ATTEMPTS
+            {
+                return Err(Error::InvalidRecord);
+            }
+            let needs_worker = matches!(
+                op.state,
+                State::Ready
+                    | State::Reserved { .. }
+                    | State::Running { .. }
+                    | State::Accounting { .. }
+                    | State::Aborting { .. }
+            );
+            if needs_worker || matches!(op.state, State::Completed { .. }) {
+                if op.provider.as_ref() != Some(provider) {
+                    blocked.push(id);
+                } else if needs_worker {
+                    runnable.push(id);
+                }
+            }
+            after = key;
+        }
+        unreachable!()
     }
 
     /// Prepare a terminal placement decision for the host's atomic transaction.

@@ -602,10 +602,18 @@ An internal placement call accepts only an idle context at the exact version
 captured at preparation; a change settles the operation stale. The context edit
 and terminal status commit together. Placement limits transcript records and
 processed payload sizes, but the storage API still materializes individual
-entries before their sizes can be checked. Operations are not automatically
-discovered on reopen, and busy compaction admission is not exposed. Usage
-settlement requires the model's request-ID idempotence contract; interrupted
-attempts are reported unconfirmed.
+entries before their sizes can be checked. `Scheduler::open_with_summary_recovery`
+opts into startup discovery with host-attested model and usage-settlement
+identities. The identities must cover the provider, account or tenant and
+request-ID settlement namespace, and change when replay semantics change.
+Legacy or mismatched operations are blocked and listed by
+`blocked_summary_recovery`; completed results still require explicit internal
+placement. Discovery fails before dispatch if there are more than 128 total
+summary records or 16 MiB of serialized records, including terminal records;
+there is currently no retention policy. The store materializes each record
+before checking its size. Busy compaction admission is not exposed. Usage
+settlement requires request-ID idempotence; interrupted attempts are reported
+unconfirmed.
 Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is

@@ -16,6 +16,8 @@ pub(crate) enum Error {
     Model(#[from] pi_rs_core::Error),
     #[error("summary worker interrupted")]
     Interrupted,
+    #[error("summary provider identity is missing or does not match")]
+    Identity,
 }
 
 fn snapshot(store: &SummaryStore<'_>, id: Uuid) -> Result<Snapshot, Error> {
@@ -30,6 +32,7 @@ pub(crate) async fn run(
     model: Arc<dyn Model>,
     id: Uuid,
     cancel: CancellationToken,
+    provider: summary_store::ProviderIdentity,
 ) -> Result<(), Error> {
     let _guard = tokio::select! {
         biased;
@@ -44,6 +47,9 @@ pub(crate) async fn run(
             return Err(Error::Interrupted);
         }
         let snap = snapshot(&store, id)?;
+        if !provider.valid() || snap.operation.provider() != Some(&provider) {
+            return Err(Error::Identity);
+        }
         if !matches!(snap.operation.state(), State::Aborting { .. }) {
             observed_active = true;
         }

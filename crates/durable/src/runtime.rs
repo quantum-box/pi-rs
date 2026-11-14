@@ -3,6 +3,9 @@
 //! A committed phase is the authority for recovery. External calls never run
 //! inside storage transactions. Independent conversations can run concurrently.
 pub use crate::state::{AdmissionError, AdmissionOptions, InputMode};
+/// Host-attested identities for the summary model and usage settlement service.
+/// They must change whenever dispatch or request-ID settlement semantics change.
+pub use crate::summary_store::ProviderIdentity as SummaryProviderIdentity;
 use crate::{
     model::{
         CompletedGeneration, GenerationProgress, collect_generation_with_metadata, model_request,
@@ -7983,6 +7986,8 @@ pub struct Scheduler {
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
+    summary_provider: Option<SummaryProviderIdentity>,
+    summary_blocked: Vec<Uuid>,
 }
 
 struct SummaryTask {
@@ -8205,6 +8210,35 @@ impl Scheduler {
     ) -> Result<Self, Error> {
         Self::open_configured(path, options, registry, None, Some(adapter))
     }
+    /// Opt into bounded recovery of independent summaries. The identity is a
+    /// host assertion about `options.model`, including the service that handles
+    /// its usage receipts. It must be stable across restarts and changed when
+    /// either provider's replay semantics change. Unbound or mismatched records
+    /// remain blocked. The adapter, when present, is installed before recovery.
+    pub fn open_with_summary_recovery(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+        provider: SummaryProviderIdentity,
+    ) -> Result<Self, Error> {
+        Self::open_configured_with_tasks(
+            path,
+            options,
+            registry,
+            None,
+            adapter,
+            None,
+            Some(provider),
+        )
+        .map(|(scheduler, _)| scheduler)
+    }
+
+    /// Nonterminal independent summaries skipped during startup because their
+    /// persisted provider binding was absent or different.
+    pub fn blocked_summary_recovery(&self) -> &[Uuid] {
+        &self.summary_blocked
+    }
     /// Open with parent-bound management; new children exclude the `subagent` tool.
     /// Other registered tool names are captured as an allowlist at open time.
     pub fn open_with_subagent_management(
@@ -8267,7 +8301,7 @@ impl Scheduler {
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
-        Self::open_configured_with_tasks(path, options, registry, management, adapter, None)
+        Self::open_configured_with_tasks(path, options, registry, management, adapter, None, None)
             .map(|(scheduler, _)| scheduler)
     }
     fn open_configured_with_tasks(
@@ -8277,9 +8311,16 @@ impl Scheduler {
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
         tasks: Option<crate::task_scheduler::Registry>,
+        summary_provider: Option<SummaryProviderIdentity>,
     ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
+        if summary_provider
+            .as_ref()
+            .is_some_and(|identity| !identity.valid())
+        {
+            return Err(Error::Invalid("invalid summary provider identity".into()));
+        }
         let mut harness = Harness::open_paused(path, options)?;
         if let Some(adapter) = adapter {
             harness.install_provider_adapter(adapter)?;
@@ -8298,12 +8339,21 @@ impl Scheduler {
             ))?;
         }
         let ids = harness.conversations()?;
+        let (summaries, summary_blocked) = if let Some(identity) = &summary_provider {
+            crate::summary_store::SummaryStore::new(harness.owner.store())
+                .discover(identity)
+                .map_err(|e| Error::Invalid(format!("summary discovery: {e}")))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut scheduler = Self {
             cancel: harness.owner.conversation_controls().root(),
             worker_errors: harness.owner.conversation_controls().worker_errors(),
             harness,
             tasks: HashMap::new(),
             summary_tasks: HashMap::new(),
+            summary_provider,
+            summary_blocked,
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
@@ -8314,6 +8364,9 @@ impl Scheduler {
             .transpose()?;
         for id in ids {
             scheduler.schedule(id);
+        }
+        for id in summaries {
+            scheduler.spawn_summary(id);
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
@@ -8860,6 +8913,10 @@ impl Scheduler {
         max_output_tokens: u32,
         keep_recent_tokens: usize,
     ) -> Result<bool, Error> {
+        let provider = self
+            .summary_provider
+            .clone()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
         let (state, version) = self.harness.load_for_summary_placement(conversation)?;
         if state.is_working() || state.abort_requested || !state.content_blocks.is_empty() {
             return Err(Error::Invalid(
@@ -8886,6 +8943,7 @@ impl Scheduler {
                 preparation.bind_context(generation),
                 Harness::key(conversation),
                 version,
+                provider,
             )
             .map_err(|e| self.summary_store_error(e))?;
         Ok(true)
@@ -8896,6 +8954,10 @@ impl Scheduler {
     #[allow(dead_code)]
     fn place_summary(&mut self, id: Uuid) -> Result<SummaryPlacement, Error> {
         use crate::summary_store::{State, SummaryStore};
+        let provider = self
+            .summary_provider
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
         for _ in 0..8 {
             let owner = self.harness.owner.clone();
             let store = SummaryStore::new(owner.store());
@@ -8903,6 +8965,11 @@ impl Scheduler {
                 .get(id)
                 .map_err(|e| self.summary_store_error(e))?
                 .ok_or(Error::NotFound)?;
+            if snap.operation.provider() != Some(provider) {
+                return Err(Error::Invalid(
+                    "summary provider identity is missing or does not match".into(),
+                ));
+            }
             let result = match snap.operation.state() {
                 State::Placed { .. } => return Ok(SummaryPlacement::Placed),
                 State::Stale { .. } => return Ok(SummaryPlacement::Stale),
@@ -9000,18 +9067,37 @@ impl Scheduler {
         if self.summary_tasks.contains_key(&id) {
             return Err(Error::Invalid("summary already scheduled".into()));
         }
-        crate::summary_store::SummaryStore::new(self.harness.owner.store())
+        let provider = self
+            .summary_provider
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
+        let snap = crate::summary_store::SummaryStore::new(self.harness.owner.store())
             .get(id)
             .map_err(|e| self.summary_store_error(e))?
             .ok_or(Error::NotFound)?;
+        if snap.operation.provider() != Some(provider) {
+            return Err(Error::Invalid(
+                "summary provider identity is missing or does not match".into(),
+            ));
+        }
+        self.spawn_summary(id);
+        Ok(())
+    }
+
+    fn spawn_summary(&mut self, id: Uuid) {
         let cancel = self.cancel.child_token();
         let owner = self.harness.owner.clone();
         let model = self.harness.options.model.clone();
         let worker_cancel = cancel.clone();
         let root = self.cancel.clone();
         let storage_failed = self.harness.storage_failed.clone();
+        let provider = self
+            .summary_provider
+            .clone()
+            .expect("summary recovery requires a provider identity");
         let join = tokio::spawn(async move {
-            let result = crate::summary_worker::run(owner, model, id, worker_cancel).await;
+            let result =
+                crate::summary_worker::run(owner, model, id, worker_cancel, provider).await;
             if matches!(
                 &result,
                 Err(crate::summary_worker::Error::Store(
@@ -9024,7 +9110,6 @@ impl Scheduler {
             result
         });
         self.summary_tasks.insert(id, SummaryTask { cancel, join });
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -9045,6 +9130,10 @@ impl Scheduler {
         if self.harness.storage_failed.load(Ordering::Acquire) {
             return Err(Error::Failed);
         }
+        let provider = self
+            .summary_provider
+            .clone()
+            .ok_or_else(|| Error::Invalid("summary provider identity is not configured".into()))?;
         let store = SummaryStore::new(self.harness.owner.store());
         let mut marked = false;
         for _ in 0..8 {
@@ -9052,6 +9141,11 @@ impl Scheduler {
                 .get(id)
                 .map_err(|e| self.summary_store_error(e))?
                 .ok_or(Error::NotFound)?;
+            if snap.operation.provider() != Some(&provider) {
+                return Err(Error::Invalid(
+                    "summary provider identity is missing or does not match".into(),
+                ));
+            }
             match snap.operation.state() {
                 State::Aborting { .. } | State::Aborted => {
                     marked = true;
@@ -9096,6 +9190,7 @@ impl Scheduler {
             self.harness.options.model.clone(),
             id,
             self.cancel.child_token(),
+            provider,
         )
         .await
         .map_err(|e| match e {
@@ -9397,6 +9492,7 @@ impl RuntimeOwner {
             management,
             adapter,
             Some(tasks),
+            None,
         )?;
         Ok(Self {
             scheduler,
