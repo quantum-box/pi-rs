@@ -963,14 +963,15 @@ pub(super) fn validate_live_share_journal(
     snapshot: &ShareSnapshot,
     key: Option<&[u8; 32]>,
 ) -> Result<()> {
-    let matches = match (key, snapshot.journal_tag.as_ref()) {
-        (Some(key), Some(tag)) => verify_share_journal(session, key, tag)?,
-        _ => false,
+    let changed = || Error::Config("Session changed while preparing the share; try again".into());
+    if snapshot.session_id != session.session_id() || snapshot.head != session.head() {
+        return Err(changed());
+    }
+    let (Some(key), Some(tag)) = (key, snapshot.journal_tag.as_ref()) else {
+        return Err(changed());
     };
-    if !matches || snapshot.session_id != session.session_id() || snapshot.head != session.head() {
-        return Err(Error::Config(
-            "Session changed while preparing the share; try again".into(),
-        ));
+    if !verify_share_journal(session, key, tag)? {
+        return Err(changed());
     }
     Ok(())
 }
