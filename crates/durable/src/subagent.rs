@@ -286,11 +286,11 @@ impl Harness {
     }
     /// Attach a persistent background ownership boundary to an existing named child.
     /// The task and edge are committed atomically. Retrying returns the same task,
-    /// including after reopening. The anchor stays parked; stopping child work via
-    /// the management tool does not terminate it. A storage error requires reopen.
+    /// including after reopening. The anchor succeeds immediately while retaining its
+    /// ownership edge. Stopping child work leaves it reusable. A storage error requires reopen.
     pub fn anchor_subagent(&mut self, parent: Uuid, name: &str) -> Result<Uuid, Error> {
         use crate::ownership_edge::{self, Edge, Mode};
-        use crate::task::{Checkpoint, Task, TaskOwner, WaitFor};
+        use crate::task::{Checkpoint, Task, TaskOwner};
         use crate::task_store::{self, TaskStore};
         let anchor_key = format!("runtime/subagent-anchor/{parent}/{name}").into_bytes();
         loop {
@@ -342,8 +342,8 @@ impl Harness {
             .and_then(Task::background)
             .map_err(|e| Error::Invalid(format!("anchor task: {e:?}")))?;
             task.start()
-                .and_then(|()| task.wait(WaitFor::TasksAny(vec![])))
-                .map_err(|e| Error::Invalid(format!("anchor wait: {e:?}")))?;
+                .and_then(|()| task.succeed(serde_json::Value::Null))
+                .map_err(|e| Error::Invalid(format!("anchor completion: {e:?}")))?;
             let edge = Edge {
                 task: id,
                 task_owner: owner.clone(),

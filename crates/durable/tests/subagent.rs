@@ -557,7 +557,7 @@ fn anchor_survives_process_reopen_and_isolates_parent_abort() {
         h.subagent_status(parent, Some("worker")).unwrap()[0].state,
         ChildState::Working
     );
-    h.request_abort_task(anchor).unwrap();
+    h.request_abort_with_background(parent).unwrap();
     assert!(h.conversation(child).unwrap().abort_requested);
     assert!(!h.conversation(other_child).unwrap().abort_requested);
     assert!(h.anchor_subagent(other, "missing").is_err());

@@ -660,6 +660,15 @@ mod tests {
                 .status,
             crate::runtime::Status::Running
         ));
+        {
+            let mut h = tool.harness.lock().unwrap();
+            assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+            h.request_abort(parent).unwrap();
+            assert!(!h.conversation(child).unwrap().abort_requested);
+            h.request_abort_with_background(parent).unwrap();
+            assert!(h.conversation(child).unwrap().abort_requested);
+            assert!(!h.conversation(other_child).unwrap().abort_requested);
+        }
         assert!(!matches!(
             tool.invoke(
                 json!({"action":"stop","name":"missing"}),

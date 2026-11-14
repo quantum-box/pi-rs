@@ -2309,8 +2309,10 @@ async fn background_abort_reaches_reused_child_through_terminal_anchor_after_reo
     let unrelated = h.ensure_subagent(other, "worker", config).unwrap().child;
     let anchor = h.anchor_subagent(parent, "worker").unwrap();
     let store = TaskStore::new(h.owner.store());
-    let snapshot = store.load(anchor).unwrap().unwrap();
-    store.update(&snapshot, |task| task.cancel()).unwrap();
+    assert!(matches!(
+        store.load(anchor).unwrap().unwrap().task.state(),
+        crate::task::TaskState::Succeeded(serde_json::Value::Null)
+    ));
     h.submit(child, None, "first".into()).unwrap();
     h.submit(child, None, "queued".into()).unwrap();
     h.request_abort(parent).unwrap();
