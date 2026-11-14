@@ -16,4 +16,4 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.89.0 --profile minimal
-      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelling_package_command_ -- --test-threads=1
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_mint_caller_still_persists_new_key -- --test-threads=1
