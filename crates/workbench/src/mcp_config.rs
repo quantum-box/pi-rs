@@ -104,6 +104,27 @@ fn merge_project_servers(
                 )));
             }
             for (key, value) in overlay {
+                let valid =
+                    match key.as_str() {
+                        "enabled" => value.is_boolean(),
+                        "exposure" => valid_exposure(value),
+                        "toolExposure" => value
+                            .as_object()
+                            .is_some_and(|tools| tools.values().all(valid_exposure)),
+                        "oauth" => !value.is_null()
+                            && serde_json::from_value::<pi_rs_workbench::mcp_auth::OAuthSetting>(
+                                value.clone(),
+                            )
+                            .is_ok(),
+                        _ => false,
+                    };
+                if !valid {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} override has invalid field {key}"
+                    )));
+                }
+            }
+            for (key, value) in overlay {
                 base.insert(key.clone(), value.clone());
             }
             continue;
@@ -111,6 +132,15 @@ fn merge_project_servers(
         servers.insert(name.clone(), entry.clone());
     }
     Ok(())
+}
+
+fn valid_exposure(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        matches!(
+            value,
+            "direct" | "deferred" | "codemode" | "codemode-deferred" | "hidden" | "off"
+        )
+    })
 }
 
 pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
@@ -534,5 +564,24 @@ mod tests {
         let forbidden = json!({"service":{"enabled":true,"auth":{"provider":"openai"}}});
         assert!(merge_project_servers(&mut servers, forbidden.as_object().unwrap()).is_err());
         assert_eq!(servers, before);
+    }
+
+    #[test]
+    fn project_override_rejects_invalid_values_before_enabling_server() {
+        for invalid in [
+            json!({"enabled": null}),
+            json!({"enabled": "true"}),
+            json!({"enabled": true, "exposure": null}),
+            json!({"enabled": true, "exposure": "unknown"}),
+            json!({"enabled": true, "toolExposure": {"read": "unknown"}}),
+            json!({"enabled": true, "oauth": null}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "unknown"}}),
+        ] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
+            let mut servers = original.as_object().unwrap().clone();
+            let overlay = json!({"service": invalid});
+            assert!(merge_project_servers(&mut servers, overlay.as_object().unwrap()).is_err());
+            assert_eq!(Value::Object(servers), original);
+        }
     }
 }

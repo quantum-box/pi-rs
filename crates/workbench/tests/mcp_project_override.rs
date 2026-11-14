@@ -39,6 +39,13 @@ fn malformed_project_override_never_starts_disabled_server() {
     assert!(String::from_utf8_lossy(&trusted.stderr).contains("commmand"));
     assert!(!sentinel.exists());
     assert_eq!(std::fs::read_to_string(&project).unwrap(), invalid);
+    let null_enabled = r#"{"mcpServers":{"fixture":{"enabled":null}}}"#;
+    std::fs::write(&project, null_enabled).unwrap();
+    let trusted_null = run("--trust");
+    assert!(!trusted_null.status.success());
+    assert!(String::from_utf8_lossy(&trusted_null.stderr).contains("enabled"));
+    assert!(!sentinel.exists());
+    assert_eq!(std::fs::read_to_string(&project).unwrap(), null_enabled);
     let untrusted = run("--no-trust");
     assert!(
         untrusted.status.success(),
