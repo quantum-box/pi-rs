@@ -290,10 +290,16 @@ error containing the received arguments. The original model response remains
 in the journal; subsequent model requests use the repaired object.
 
 `get_tree` sorts siblings by timestamp in chronological order, including
-imported timestamps with UTC offsets and valid ISO year, year-month, and date
-forms interpreted at UTC midnight as in Pi. Siblings with the same instant
-retain append order. Entries whose parent is missing or points to themselves
-appear as roots. Other JavaScript date parsing edge cases remain open.
+imported timestamps with UTC offsets and ISO year, year-month, and date forms
+interpreted at UTC midnight as in Pi, including day overflow within 1–31.
+Siblings with the same instant retain append order. For mixed invalid dates,
+lists shorter than 64 entries reproduce the V8 natural-run and insertion order;
+longer lists use bounded stable merges and may differ from Node's merge and
+galloping order. The short-array order was compared with Node 22.23.4 and
+24.22.1; other JavaScript engines and versions may behave differently because
+this comparator is not transitive. Other JavaScript date parsing edge cases
+remain open. Entries whose parent is missing or points to themselves appear as
+roots.
 
 During manual compaction, an RPC `abort` response waits for the compaction
 command to finish, even if an internal agent-settled event arrives first.

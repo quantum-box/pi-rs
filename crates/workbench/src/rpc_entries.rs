@@ -273,9 +273,7 @@ impl Entries {
                 .map(str::to_owned);
             let mut descendants = children.remove(id).unwrap_or_default();
             descendants.reverse();
-            descendants.sort_by_cached_key(|node| {
-                node["entry"]["timestamp"].as_str().and_then(tree_timestamp)
-            });
+            sort_tree_children(&mut descendants);
             let mut node = json!({"entry":entry});
             node["children"] = Value::Array(descendants);
             if let Some((label, timestamp)) = labels.remove(id) {
@@ -320,6 +318,115 @@ impl Entries {
     }
 }
 
+// V8's Date comparator treats a comparison involving an invalid date as
+// equal. That relation is not transitive, so passing it to Rust's general
+// stable sort is invalid. Reproduce V8's natural-run and binary-insertion
+// sequence for short arrays, and use bounded stable merges for longer ones.
+fn sort_tree_children(children: &mut [Value]) {
+    let mut entries: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node["entry"]["timestamp"].as_str().and_then(tree_timestamp),
+                index,
+            )
+        })
+        .collect();
+    if entries.iter().all(|(timestamp, _)| timestamp.is_some()) {
+        entries.sort_by_key(|(timestamp, _)| *timestamp);
+    } else {
+        sort_tree_mixed(&mut entries);
+    }
+    let mut original: Vec<_> = children.iter_mut().map(std::mem::take).collect();
+    for (destination, (_, index)) in children.iter_mut().zip(entries) {
+        *destination = std::mem::take(&mut original[index]);
+    }
+}
+
+fn tree_less(left: Option<i64>, right: Option<i64>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left < right)
+}
+
+fn sort_tree_mixed(entries: &mut [(Option<i64>, usize)]) {
+    let len = entries.len();
+    if len < 2 {
+        return;
+    }
+    let mut min_run = len;
+    let mut remainder = 0;
+    while min_run >= 64 {
+        remainder |= min_run & 1;
+        min_run >>= 1;
+    }
+    min_run += remainder;
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < len {
+        let mut end = start + 1;
+        if end < len {
+            let descending = tree_less(entries[end].0, entries[start].0);
+            end += 1;
+            while end < len
+                && if descending {
+                    tree_less(entries[end].0, entries[end - 1].0)
+                } else {
+                    !tree_less(entries[end].0, entries[end - 1].0)
+                }
+            {
+                end += 1;
+            }
+            if descending {
+                entries[start..end].reverse();
+            }
+        }
+        let target = start.saturating_add(min_run).min(len);
+        while end < target {
+            let item = entries[end];
+            let (mut low, mut high) = (start, end);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if tree_less(item.0, entries[middle].0) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            entries[low..=end].rotate_right(1);
+            end += 1;
+        }
+        runs.push(start..end);
+        start = end;
+    }
+    let mut scratch = Vec::with_capacity(len);
+    while runs.len() > 1 {
+        let mut next = Vec::with_capacity(runs.len().div_ceil(2));
+        for pair in runs.chunks(2) {
+            if pair.len() == 1 {
+                next.push(pair[0].clone());
+                continue;
+            }
+            let (left, right) = (&pair[0], &pair[1]);
+            scratch.clear();
+            let (mut i, mut j) = (left.start, right.start);
+            while i < left.end && j < right.end {
+                if tree_less(entries[j].0, entries[i].0) {
+                    scratch.push(entries[j]);
+                    j += 1;
+                } else {
+                    scratch.push(entries[i]);
+                    i += 1;
+                }
+            }
+            scratch.extend_from_slice(&entries[i..left.end]);
+            scratch.extend_from_slice(&entries[j..right.end]);
+            entries[left.start..right.end].copy_from_slice(&scratch);
+            next.push(left.start..right.end);
+        }
+        runs = next;
+    }
+}
+
 // JavaScript Date treats valid ISO date-only forms as UTC midnight, whereas
 // chrono's RFC 3339 parser requires a time and offset.
 fn tree_timestamp(value: &str) -> Option<i64> {
@@ -340,12 +447,18 @@ fn tree_timestamp(value: &str) -> Option<i64> {
     } else {
         1
     };
-    let day = if bytes.len() == 10 {
+    let day: u32 = if bytes.len() == 10 {
         value[8..10].parse().ok()?
     } else {
         1
     };
-    chrono::NaiveDate::from_ymd_opt(year, month, day)?
+    // V8 accepts days 1 through 31 and rolls a day past the end of a
+    // month into the next month. Zero and values above 31 are invalid.
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)?
+        .checked_add_signed(chrono::Duration::days(i64::from(day - 1)))?
         .and_hms_opt(0, 0, 0)
         .map(|timestamp| timestamp.and_utc().timestamp_millis())
 }
@@ -1144,6 +1257,123 @@ mod tests {
         assert_eq!(names, ["year", "january2", "offset-equal", "february"]);
         assert_eq!(children[0]["entry"]["timestamp"], "2025");
         assert_eq!(children[1]["entry"]["timestamp"], "2025-01-02");
+    }
+
+    #[test]
+    fn tree_normalizes_date_only_overflow_with_stable_equal_instants() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("later", Some("root"), "2024-03-02"),
+            ("overflow", Some("root"), "2024-02-30"),
+            ("equal", Some("root"), "2024-03-01T00:00:00Z"),
+            ("earlier", Some("root"), "2024-02-29"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["earlier", "overflow", "equal", "later"]);
+        assert_eq!(children[1]["entry"]["timestamp"], "2024-02-30");
+        for (overflow, normalized) in [("2023-02-29", "2023-03-01"), ("2024-04-31", "2024-05-01")] {
+            assert_eq!(tree_timestamp(overflow), tree_timestamp(normalized));
+        }
+        for invalid in ["2024-02-00", "2024-02-32", "2024-00-01", "2024-13-01"] {
+            assert_eq!(tree_timestamp(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn tree_invalid_timestamp_matches_v8_stable_sort() {
+        for (timestamps, expected) in [
+            (
+                vec!["2025-03-01", "bad", "2025-01-01"],
+                vec!["2025-03-01", "bad", "2025-01-01"],
+            ),
+            (
+                vec!["2025-03-01", "2025-01-01", "bad", "2025-02-01"],
+                vec!["2025-01-01", "2025-02-01", "2025-03-01", "bad"],
+            ),
+        ] {
+            let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+            for (index, timestamp) in timestamps.iter().enumerate() {
+                values
+                    .push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+            }
+            let tree = Entries { values, leaf: None }.tree();
+            let actual: Vec<_> = tree["tree"][0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["entry"]["timestamp"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn large_tree_with_invalid_timestamp_keeps_v8_natural_run() {
+        // Node 22.23 and 24.22 both keep this 80-entry run in append order.
+        let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+        for index in 0..80 {
+            let timestamp = if index == 30 {
+                "bad"
+            } else if index < 30 {
+                "2025-03-01"
+            } else {
+                "2025-01-01"
+            };
+            values.push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+        }
+        let tree = Entries { values, leaf: None }.tree();
+        let ids: Vec<_> = tree["tree"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                node["entry"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, (0..80).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn large_mixed_tree_sort_is_deterministic_and_keeps_every_entry() {
+        let original: Vec<_> = (0..128)
+            .map(|index| {
+                (
+                    if index % 11 == 0 {
+                        None
+                    } else {
+                        Some(((index * 7) % 28 + 1) as i64)
+                    },
+                    index,
+                )
+            })
+            .collect();
+        let mut first = original.clone();
+        let mut second = original;
+        sort_tree_mixed(&mut first);
+        sort_tree_mixed(&mut second);
+        assert_eq!(first, second);
+        let mut indices: Vec<_> = first.iter().map(|(_, index)| *index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..128).collect::<Vec<_>>());
+        assert!(
+            first
+                .windows(2)
+                .any(|pair| pair[0].0.is_some() && pair[1].0.is_none())
+        );
     }
 
     #[test]
