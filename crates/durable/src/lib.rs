@@ -7,3 +7,4 @@ pub mod conversation;
 pub mod model;
 pub mod recovery;
 pub mod state;
+pub mod task;
