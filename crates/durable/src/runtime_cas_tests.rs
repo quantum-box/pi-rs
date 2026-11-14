@@ -1524,7 +1524,10 @@ fn compacted_replacement_rejects_collision_and_unproven_tail() {
         if case == 3 {
             // This is an otherwise valid projection, appended through the
             // public transcript and observer APIs, without a runtime commit.
-            assert!(h.resolved_occurrences(id, state.transcript.clone().unwrap()).is_err());
+            assert!(
+                h.resolved_occurrences(id, state.transcript.clone().unwrap())
+                    .is_err()
+            );
         }
         if collision {
             assert!(
