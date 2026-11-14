@@ -95,6 +95,7 @@ pub fn unprotect(input: &[u8]) -> io::Result<Vec<u8>> {
 pub struct VerifiedDirectory {
     _handle: std::fs::File,
     _ancestors: Vec<std::fs::File>,
+    path: std::path::PathBuf,
 }
 
 struct LocalDescriptor(*mut core::ffi::c_void);
@@ -155,59 +156,191 @@ fn current_user_token_info() -> io::Result<Vec<usize>> {
     Ok(info)
 }
 
+fn owner_descriptor(inheritable: bool) -> io::Result<LocalDescriptor> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{IsValidSid, TOKEN_USER};
+    let token_info = current_user_token_info()?;
+    // SAFETY: current_user_token_info returned a populated TOKEN_USER.
+    let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    if user.is_null() || unsafe { IsValidSid(user) } == 0 {
+        return Err(private_directory_error("invalid token user SID"));
+    }
+    let mut sid_string = std::ptr::null_mut();
+    // SAFETY: user points into token_info and the output pointer is valid.
+    if unsafe { ConvertSidToStringSidW(user, &mut sid_string) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sid_allocation = LocalDescriptor(sid_string.cast());
+    let mut length = 0usize;
+    // SID strings are NUL-terminated ASCII; bound the scan defensively.
+    while length < 1024 && unsafe { *sid_string.add(length) } != 0 {
+        length += 1;
+    }
+    if length == 1024 {
+        return Err(private_directory_error("invalid token SID string"));
+    }
+    // SAFETY: ConvertSidToStringSidW returned length initialized UTF-16 units.
+    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_string, length) })
+        .map_err(|_| private_directory_error("invalid token SID string"))?;
+    let inheritance = if inheritable { "OICI" } else { "" };
+    let sddl: Vec<u16> =
+        format!("O:{sid}D:P(A;{inheritance};FA;;;{sid})(A;{inheritance};FA;;;SY)\0")
+            .encode_utf16()
+            .collect();
+    drop(sid_allocation);
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: valid NUL-terminated SDDL and writable out pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LocalDescriptor(descriptor))
+}
+
+fn verify_private_acl(file: &std::fs::File, directory: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, INHERITED_ACE, IsValidSid, IsWellKnownSid,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_USER,
+        WinCreatorOwnerRightsSid, WinLocalSystemSid,
+    };
+    let token_info = current_user_token_info()?;
+    // SAFETY: current_user_token_info returned a populated TOKEN_USER.
+    let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: file is a live handle and output pointers are valid.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalDescriptor(descriptor);
+    if owner.is_null() || dacl.is_null() || user.is_null() {
+        return Err(private_directory_error("missing owner or dacl"));
+    }
+    // SAFETY: SIDs are held by the descriptor and token buffer.
+    if unsafe { IsValidSid(owner) == 0 || IsValidSid(user) == 0 || EqualSid(owner, user) == 0 } {
+        return Err(private_directory_error("owner differs from token user"));
+    }
+    let mut control = 0u16;
+    let mut revision = 0;
+    // SAFETY: descriptor is valid and outputs are writable.
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if control & SE_DACL_PROTECTED == 0 {
+        return Err(private_directory_error("dacl is not protected"));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: dacl is provided by GetSecurityInfo and info is writable.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if info.AceCount == 0 || info.AceCount > 64 {
+        return Err(private_directory_error("unexpected ace count"));
+    }
+    let mut has_owner = false;
+    for index in 0..info.AceCount {
+        let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: index is bounded by the ACL's reported AceCount.
+        if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
+            return Err(private_directory_error("cannot obtain ace"));
+        }
+        let ace = entry.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: the ACL is returned by Windows; check the header before SID access.
+        let header = unsafe { (*ace).Header };
+        let required = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        if header.AceType != 0
+            || header.AceSize < std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u16
+            || (directory && header.AceFlags & required != required)
+            || header.AceFlags & INHERITED_ACE as u8 != 0
+        {
+            return Err(private_directory_error("unsupported ace flags or type"));
+        }
+        // SAFETY: ACCESS_ALLOWED_ACE stores an inline SID at SidStart.
+        let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
+        // SAFETY: SID is within a Windows-supplied ACL; validity checked first.
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(private_directory_error("invalid ace sid"));
+        }
+        let is_owner = unsafe {
+            EqualSid(sid, user) != 0 || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+        };
+        let is_system = unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 };
+        if !is_owner && !is_system {
+            return Err(private_directory_error("unexpected ace principal"));
+        }
+        has_owner |= is_owner;
+    }
+    if !has_owner {
+        return Err(private_directory_error("no owner ace"));
+    }
+    Ok(())
+}
+
+fn verify_private_file(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(private_directory_error("reparse or non-regular file"));
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file is live and information is a valid writable structure.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.nNumberOfLinks != 1 {
+        return Err(private_directory_error("hard-linked cache file"));
+    }
+    verify_private_acl(file, false)
+}
+
 impl VerifiedDirectory {
     /// Create a directory with a protected inheritable DACL for its owner and
     /// LocalSystem, then validate it. The caller must independently secure and
     /// pin the parent; this function is not a complete private store.
     pub fn create(path: &std::path::Path) -> io::Result<Self> {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            SDDL_REVISION_1,
-        };
-        use windows_sys::Win32::Security::{IsValidSid, SECURITY_ATTRIBUTES, TOKEN_USER};
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-        let token_info = current_user_token_info()?;
-        // SAFETY: current_user_token_info returned a populated TOKEN_USER.
-        let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        if user.is_null() || unsafe { IsValidSid(user) } == 0 {
-            return Err(private_directory_error("invalid token user SID"));
-        }
-        let mut sid_string = std::ptr::null_mut();
-        // SAFETY: user points into token_info and the output pointer is valid.
-        if unsafe { ConvertSidToStringSidW(user, &mut sid_string) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let sid_allocation = LocalDescriptor(sid_string.cast());
-        let mut length = 0usize;
-        // SID strings are NUL-terminated ASCII; bound the scan defensively.
-        while length < 1024 && unsafe { *sid_string.add(length) } != 0 {
-            length += 1;
-        }
-        if length == 1024 {
-            return Err(private_directory_error("invalid token SID string"));
-        }
-        // SAFETY: ConvertSidToStringSidW returned length initialized UTF-16 units.
-        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_string, length) })
-            .map_err(|_| private_directory_error("invalid token SID string"))?;
-        let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)\0")
-            .encode_utf16()
-            .collect();
-        drop(sid_allocation);
-        let mut descriptor = std::ptr::null_mut();
-        // SAFETY: valid NUL-terminated SDDL and writable out pointer.
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let descriptor = LocalDescriptor(descriptor);
+        let descriptor = owner_descriptor(true)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -229,15 +362,6 @@ impl VerifiedDirectory {
     /// the returned value is alive.
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::{
-            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetSecurityDescriptorControl, INHERITED_ACE, IsValidSid, IsWellKnownSid,
-            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_USER,
-            WinCreatorOwnerRightsSid, WinLocalSystemSid,
-        };
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -275,102 +399,93 @@ impl VerifiedDirectory {
             ancestors.push(open_directory(ancestor)?);
         }
         let file = open_directory(path)?;
-        let token_info = current_user_token_info()?;
-        // SAFETY: current_user_token_info returned a populated TOKEN_USER.
-        let user = unsafe { (*(token_info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor = std::ptr::null_mut();
-        // SAFETY: file is a live handle and output pointers are valid.
-        let status = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle().cast(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status as i32));
-        }
-        let descriptor = LocalDescriptor(descriptor);
-        if owner.is_null() || dacl.is_null() || user.is_null() {
-            return Err(private_directory_error("missing owner or dacl"));
-        }
-        // SAFETY: SIDs are held by the descriptor and token buffer.
-        if unsafe { IsValidSid(owner) == 0 || IsValidSid(user) == 0 || EqualSid(owner, user) == 0 }
-        {
-            return Err(private_directory_error("owner differs from token user"));
-        }
-        let mut control = 0u16;
-        let mut revision = 0;
-        // SAFETY: descriptor is valid and outputs are writable.
-        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if control & SE_DACL_PROTECTED == 0 {
-            return Err(private_directory_error("dacl is not protected"));
-        }
-        let mut info = ACL_SIZE_INFORMATION::default();
-        // SAFETY: dacl is provided by GetSecurityInfo and info is writable.
-        if unsafe {
-            GetAclInformation(
-                dacl,
-                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if info.AceCount == 0 || info.AceCount > 64 {
-            return Err(private_directory_error("unexpected ace count"));
-        }
-        let mut has_owner = false;
-        for index in 0..info.AceCount {
-            let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
-            // SAFETY: index is bounded by the ACL's reported AceCount.
-            if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
-                return Err(private_directory_error("cannot obtain ace"));
-            }
-            let ace = entry.cast::<ACCESS_ALLOWED_ACE>();
-            // SAFETY: the ACL is returned by Windows; check the header before SID access.
-            let header = unsafe { (*ace).Header };
-            let required = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-            if header.AceType != 0
-                || header.AceSize < std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u16
-                || header.AceFlags & required != required
-                || header.AceFlags & INHERITED_ACE as u8 != 0
-            {
-                return Err(private_directory_error("unsupported ace flags or type"));
-            }
-            // SAFETY: ACCESS_ALLOWED_ACE stores an inline SID at SidStart.
-            let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
-            // SAFETY: SID is within a Windows-supplied ACL; validity checked first.
-            if unsafe { IsValidSid(sid) } == 0 {
-                return Err(private_directory_error("invalid ace sid"));
-            }
-            let is_owner = unsafe {
-                EqualSid(sid, user) != 0 || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
-            };
-            let is_system = unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 };
-            if !is_owner && !is_system {
-                return Err(private_directory_error("unexpected ace principal"));
-            }
-            has_owner |= is_owner;
-        }
-        if !has_owner {
-            return Err(private_directory_error("no owner ace"));
-        }
+        verify_private_acl(&file, true)?;
         Ok(Self {
             _handle: file,
             _ancestors: ancestors,
+            path: path.to_owned(),
         })
+    }
+
+    fn child_path(&self, name: &str) -> io::Result<std::path::PathBuf> {
+        let stem = name.split('.').next().unwrap_or("");
+        let reserved = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if name.is_empty()
+            || name.len() > 128
+            || name.ends_with('.')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || reserved
+                .iter()
+                .any(|entry| stem.eq_ignore_ascii_case(entry))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid share cache filename",
+            ));
+        }
+        Ok(self.path.join(name))
+    }
+
+    /// Create an owner-only regular file without following a reparse point.
+    pub fn create_private_file(&self, name: &str) -> io::Result<std::fs::File> {
+        verify_private_acl(&self._handle, true)?;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let path = self.child_path(name)?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let descriptor = owner_descriptor(false)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: path and attributes are valid; CREATE_NEW refuses an existing link.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful CreateFileW returns a new owned handle.
+        let file = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
+        verify_private_file(&file)?;
+        Ok(file)
+    }
+
+    /// Open an existing private file without following reparse points.
+    pub fn open_private_file(&self, name: &str) -> io::Result<std::fs::File> {
+        verify_private_acl(&self._handle, true)?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.child_path(name)?)?;
+        verify_private_file(&file)?;
+        Ok(file)
     }
 }
 
@@ -442,6 +557,33 @@ mod tests {
         let public = root.0.join("public");
         create_world_accessible(&public);
         assert!(VerifiedDirectory::open(&public).is_err());
+    }
+
+    #[test]
+    fn private_files_round_trip_and_reject_hard_links_and_path_escape() {
+        use std::io::{Read, Write};
+        let root = TestDirectory::new();
+        let directory = VerifiedDirectory::create(&root.0.join("private")).unwrap();
+        let mut file = directory.create_private_file("snapshot.dat").unwrap();
+        file.write_all(b"private").unwrap();
+        drop(file);
+        let mut reopened = directory.open_private_file("snapshot.dat").unwrap();
+        let mut contents = Vec::new();
+        reopened.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"private");
+        drop(reopened);
+        for name in ["../escape", "a\\b", "NUL", "trailing.", "x:stream"] {
+            assert!(
+                directory.create_private_file(name).is_err(),
+                "accepted {name}"
+            );
+        }
+        let original = root.0.join("private/snapshot.dat");
+        let link = root.0.join("alias.dat");
+        std::fs::hard_link(&original, &link).unwrap();
+        assert!(directory.open_private_file("snapshot.dat").is_err());
+        std::fs::remove_file(link).unwrap();
+        drop(directory);
     }
 
     #[test]
