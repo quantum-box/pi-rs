@@ -2414,19 +2414,7 @@ impl AgentSession {
         let mut fork = self.fork_snapshot(snapshot, resolution)?;
         {
             let mut journal = fork.journal()?;
-            journal.export_jsonl(destination)?;
-            let mut persisted = Session::open(destination)?;
-            if persisted.head() != journal.head()
-                || serde_json::to_vec(persisted.records())?
-                    != serde_json::to_vec(journal.records())?
-            {
-                return Err(Error::Session(
-                    "published fork changed before opening".into(),
-                ));
-            }
-            persisted.set_auto_compaction_control(journal.auto_compaction_control());
-            persisted.set_retry_control(journal.retry_control());
-            *journal = persisted;
+            journal.publish_and_bind_snapshot(destination)?;
         }
         fork.session_file = Some(destination.to_owned());
         Ok(fork)
@@ -5096,6 +5084,7 @@ mod tests {
                 Ok(())
             }
         }
+        for navigation in [false, true] {
         let mut original = Session::with_store(MemoryStore::default()).unwrap();
         original
             .select_provider_model(Some("historical"), "shared", None)
@@ -5126,7 +5115,11 @@ mod tests {
             .build(journal)
             .unwrap();
         let mut events = session.subscribe();
-        session.checkout(target).unwrap();
+        if navigation {
+            session.navigate_tree(target, crate::TreeNavigationOptions::default()).await.unwrap();
+        } else {
+            session.checkout(target).unwrap();
+        }
         assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
         assert_eq!(
             session.journal().unwrap().model_provider(),
@@ -5142,6 +5135,7 @@ mod tests {
             .is_none()
         );
         assert!(session.prompt("must not dispatch").await.is_err());
+        }
     }
 
     #[test]
@@ -5229,6 +5223,127 @@ mod tests {
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.model_provider(), Some("replacement"));
         assert_eq!(reopened.records().last().unwrap().parent, Some(target));
+    }
+
+    #[test]
+    fn historical_fallback_summary_is_rejected_by_v3_reader() {
+        // This fixture reproduces the v3 reader's serde shape and version
+        // check: unknown BranchSummary fields are ignored before validation.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct V3Record {
+            version: u32,
+            event: V3Event,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum V3Event {
+            Created {
+                session_id: Uuid,
+            },
+            ModelSelected {
+                model: String,
+                thinking: Option<String>,
+                provider: Option<String>,
+            },
+            BranchSummary {
+                summary: String,
+                from: Option<u64>,
+                target: Option<u64>,
+            },
+            SessionInfo {
+                name: Option<String>,
+                cwd: Option<String>,
+            },
+        }
+        fn read_v3(records: &[crate::Record]) -> bool {
+            let mut version = 1;
+            for record in records {
+                let Ok(old) =
+                    serde_json::from_value::<V3Record>(serde_json::to_value(record).unwrap())
+                else {
+                    return false;
+                };
+                if !(version..=3).contains(&old.version) {
+                    return false;
+                }
+                version = old.version;
+            }
+            true
+        }
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        assert!(read_v3(session.records()));
+        let target = session.head();
+        session
+            .append(crate::Event::BranchSummary {
+                summary: "summary".into(),
+                fallback_model: Some(crate::BranchFallbackModel {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                }),
+                extension_summary: None,
+                from: Some(target),
+                target: Some(target),
+                usage: None,
+                usage_metadata: None,
+                read_files: vec![],
+                modified_files: vec![],
+            })
+            .unwrap();
+        let encoded = serde_json::to_value(session.records().last().unwrap()).unwrap();
+        let parsed: V3Record = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(parsed.event, V3Event::BranchSummary { .. }));
+        assert_eq!(parsed.version, 4);
+        assert!(!read_v3(session.records()));
+        let mut downgraded = session.records().to_vec();
+        downgraded.last_mut().unwrap().version = 3;
+        assert!(Session::from_records(downgraded).is_err());
+        session
+            .append(crate::Event::SessionInfo {
+                name: None,
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(session.records().last().unwrap().version, 4);
+        assert!(Session::from_records(session.records().to_vec()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn historical_fork_recovers_handoff_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let marker = {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let return_to = journal.head();
+            journal
+                .append(crate::Event::TreeTriggerHandoff {
+                    run_id: Uuid::new_v4(),
+                    return_to,
+                })
+                .unwrap();
+            journal.head()
+        };
+        let mut fork = session.fork_to(marker, &path).unwrap();
+        assert!(path.exists());
+        assert_eq!(fork.prompt("fork").await.unwrap(), "current");
+        fork.close().await.unwrap();
+        drop(fork);
+        let mut reopened = Session::open(&path).unwrap();
+        assert!(reopened.recover_tree_trigger_handoff().unwrap().is_none());
+        drop(reopened);
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -5824,6 +5939,49 @@ mod tests {
                 assert!(builder.build(journal).is_err());
                 Ok(())
             })
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn startup_fallback_rejects_other_identity_reservation_before_write() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records,
+            writes: writes.clone(),
+            fail_on: usize::MAX,
+        })
+        .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "fallback".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("fallback")),
+            })
+        });
+        let builder = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver);
+        registry
+            .commit_resolved_session_model(
+                id,
+                "unrelated",
+                "shared",
+                Arc::new(ProviderBranchModel("unrelated")),
+                || {
+                    assert!(builder.build(journal).is_err());
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }

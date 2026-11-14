@@ -1971,6 +1971,66 @@ impl Session {
         publish_snapshot(&self.records, destination.as_ref())
     }
 
+    /// Publish an already validated in-memory fork and keep the same locked
+    /// file handle, avoiding a reopen/recovery window after publication.
+    pub(crate) fn publish_and_bind_snapshot(&mut self, destination: &Path) -> Result<()> {
+        if self.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be exported by their host".into(),
+            ));
+        }
+        validated_head(&self.records)?;
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        let parent_dir = File::open(parent)?;
+        #[cfg(windows)]
+        let lock_file = {
+            let mut lock_path = destination.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)?;
+            lock.try_lock()
+                .map_err(|error| Error::Session(format!("cannot lock journal: {error}")))?;
+            lock
+        };
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        for record in &self.records {
+            let mut line = serde_json::to_vec(record)?;
+            line.push(b'\n');
+            if line.len() > MAX_RECORD_BYTES {
+                return Err(Error::Session("journal record exceeds size limit".into()));
+            }
+            temporary.write_all(&line)?;
+        }
+        temporary.as_file().sync_all()?;
+        #[cfg(not(windows))]
+        temporary
+            .as_file()
+            .try_lock()
+            .map_err(|error| Error::Session(format!("cannot lock journal: {error}")))?;
+        let file = temporary
+            .persist_noclobber(destination)
+            .map_err(|error| Error::Io(error.error))?;
+        #[cfg(unix)]
+        parent_dir.sync_all()?;
+        self.store = Box::new(FileStore {
+            file,
+            #[cfg(windows)]
+            lock_file,
+            #[cfg(unix)]
+            parent: parent.into(),
+        });
+        Ok(())
+    }
+
     /// Create and open an independent, persistent branch with fresh session identity.
     pub fn fork_to(&self, target: u64, destination: impl AsRef<Path>) -> Result<Self> {
         let records = self.fork_records(target)?;
