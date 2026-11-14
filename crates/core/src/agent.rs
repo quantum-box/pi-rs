@@ -3818,7 +3818,7 @@ fn configured_retention(
     let mut cut = first;
     let mut accumulated = 0_u64;
     for (index, (source, message)) in entries.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(crate::tokens::estimate_budget_source_tokens(
+        accumulated = accumulated.saturating_add(crate::tokens::estimate_source_tokens(
             session, *source, message,
         ));
         if accumulated >= target {
@@ -3899,7 +3899,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         let middle = low + (high - low) / 2;
         let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
         let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
+            tokens.saturating_add(crate::tokens::estimate_source_tokens(
                 session, *source, message,
             ))
         });
@@ -4990,6 +4990,157 @@ fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Opti
     ))
     .ok()
     .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod retention_estimate_tests {
+    use super::*;
+
+    fn session_with_reasoning(reasoning: &str) -> (Session, u64) {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let completion = session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some(reasoning.into()),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        (session, completion)
+    }
+
+    #[test]
+    fn recent_token_cut_counts_assistant_thinking() {
+        let (session, completion) = session_with_reasoning(&"r".repeat(400));
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert_eq!(retention.boundary, Some(completion));
+        assert!(retention.split_turn);
+        let (without_thinking, _) = session_with_reasoning("");
+        let retention = configured_retention(&without_thinking, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn complete_turn_retention_counts_reasoning_in_latest_turn() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "next".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some("r".repeat(400)),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        assert_eq!(retained_turn_count(&session, Some(100)).unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_token_cut_ignores_tool_envelope_metadata() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                usage: None,
+                request_id: None,
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            })
+            .unwrap();
+        session.append(Event::ToolFinished {
+            operation_id,
+            outcome: crate::Outcome::Structured {
+                data: serde_json::json!({"content":[{"type":"text","text":"ok"}], "metadata":"z".repeat(4000)}),
+                attachments: vec![],
+            },
+            states: Default::default(),
+        }).unwrap();
+        let retention = configured_retention(&session, Some(50), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn recent_token_cut_uses_edited_thinking_not_stale_metadata() {
+        let (mut session, _) = session_with_reasoning(&"r".repeat(400));
+        let assistant = session
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
 }
 
 #[cfg(test)]

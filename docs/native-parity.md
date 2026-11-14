@@ -4224,3 +4224,11 @@ tool styling and preview limits, so a long output may hide its status until expa
 Shell transcript rendering strips terminal escape sequences and normalizes line
 endings, including for imported and extension-provided output; journal and
 model-context text retain the original bytes.
+
+### Compaction retention token estimate
+
+Token-based compaction retention uses the projected Pi message estimate,
+including assistant thinking and structured tool-result blocks, when choosing
+a cut point or complete turns. Context edits replace the original estimate.
+The separate native model-request safety budget retains its existing
+conservative estimate. Other token-estimator differences remain open.
