@@ -4310,7 +4310,9 @@ separate policy.
 Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
 recognize permanent account, billing and quota exhaustion in structured error
 message, code and type fields for retryable HTTP statuses and stream errors.
-Recognized transient stream errors remain retryable after permanent-limit checks.
+Recognized transient stream errors, including Gemini errors without a numeric
+code, remain retryable after permanent-limit checks. OpenAI response codes are
+classified only after known credentials are masked.
 JSON metadata such as request IDs does not affect classification. Known request
 credentials, Bearer tokens and conventional authentication-header values are
 masked before classification, even when they equal quota or transient terms.

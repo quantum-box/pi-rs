@@ -495,6 +495,7 @@ impl Model for OpenAiResponses {
                 bytes.extend_from_slice(&chunk);
             }
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
             return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
@@ -614,6 +615,44 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn http_400_does_not_classify_echoed_credential_as_subscription_code() {
+        use std::io::{Read, Write};
+        const CODE: &str = "subscription_sharing_usage_unavailable";
+        for echo in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = json!({"error":{"code":CODE}}).to_string();
+                write!(socket, "HTTP/1.1 400 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "ordinary-key".into(),
+                "fixture",
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-api-key",
+                    if echo { CODE } else { "other-key" }.parse().unwrap(),
+                );
+                headers
+            });
+            let error = match model.stream(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !echo);
+            assert!(!error.to_string().contains(CODE));
+            worker.join().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn subscription_stream_codes_take_precedence_over_transient_message() {
         use std::io::{Read, Write};

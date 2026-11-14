@@ -883,7 +883,7 @@ impl Model for Google {
                     let code = error["code"].as_u64().unwrap_or_default();
                     Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                         Error::Model("Google Gemini account quota or billing limit reached".into())
-                    } else if code == 429 || (500..600).contains(&code) {
+                    } else if code == 429 || (500..600).contains(&code) || pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("Google Gemini returned a transient stream error".into())
                     } else {
                         Error::Model("Google Gemini returned a stream error".into())
@@ -997,6 +997,56 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn code_less_stream_errors_use_transient_classifier() {
+        use std::io::{Read, Write};
+        for (message, retryable, permanent) in [
+            ("server overloaded", true, false),
+            ("server overloaded: quota exceeded", false, true),
+            ("invalid request", false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"error":{"message":message}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Google::new(&format!("http://{address}"), "ordinary-key")
+                .unwrap()
+                .with_context_probe(false);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = model.stream(request).await.unwrap();
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("missing stream error"),
+                }
+            };
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                retryable,
+                "{message}"
+            );
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent,
+                "{message}"
+            );
+            assert!(!error.to_string().contains("ordinary-key"));
+            worker.join().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn auth_header_error_literals_are_not_classified() {
         use std::io::{Read, Write};
