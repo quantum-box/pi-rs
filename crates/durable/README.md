@@ -226,7 +226,11 @@ driver must be running to drain tasks.
 Task-to-conversation edge preparation and owned-subagent admission reject owner
 cycles by checking the persisted owner chain, including background links. Versions
 and absent root edges are checked in the transaction, so concurrent changes require
-fresh preparation. Prepared edges must be committed one at a time without other
+fresh preparation. Task creation also checks staged tasks and persisted ownership,
+including missing task owners, to prevent cycles that would block child-first
+cleanup. Missing owners remain supported but are fenced against concurrent creation.
+Prepared task batches and edges must not be combined with separately prepared
+ownership changes in one transaction. Prepared edges must be committed one at a time without other
 ownership changes; raw store writes must preserve immutable ownership. Existing
 corrupt cycles are rejected on traversal, not repaired. Background remains an
 abort/idle boundary, not a break in ownership identity.

@@ -456,8 +456,11 @@ impl Transaction {
         let mut checks = self.checked.clone();
         let mut writes = self.written.clone();
         let mut local_checks = HashSet::new();
+        let mut unique = Vec::new();
         for check in &batch.checks {
-            if !checks.insert(check.key.clone()) {
+            if checks.insert(check.key.clone()) {
+                unique.push(check.clone());
+            } else if !self.checks.iter().chain(unique.iter()).any(|existing| existing == check) {
                 return Err(Error::InvalidBatch);
             }
             local_checks.insert(check.key.clone());
@@ -472,7 +475,7 @@ impl Transaction {
         }
         self.checked = checks;
         self.written = writes;
-        self.checks.extend(batch.checks);
+        self.checks.extend(unique);
         self.mutations.extend(batch.mutations);
         Ok(())
     }
@@ -819,6 +822,19 @@ mod nested_entry_tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    #[test]
+    fn transaction_coalesces_identical_checks_but_rejects_conflicts() {
+        let mut tx = Transaction::new();
+        let batch = |expected| OwnedBatch {
+            checks: vec![Check { key: b"owner".to_vec(), expected }],
+            mutations: vec![],
+        };
+        tx.append(batch(Expected::Missing)).unwrap();
+        tx.append(batch(Expected::Missing)).unwrap();
+        assert!(matches!(tx.append(batch(Expected::Version(1))), Err(Error::InvalidBatch)));
+        tx.commit(&Store::memory().unwrap()).unwrap();
+    }
+
     fn task(id: u128, owner: TaskOwner) -> Task {
         Task::new(
             Uuid::from_u128(id),
@@ -1004,8 +1020,15 @@ mod nested_entry_tests {
         let cycle_a = task(4, TaskOwner::Task(Uuid::from_u128(5)));
         let cycle_b = task(5, TaskOwner::Task(cycle_a.id()));
         let cyclic_author = task(6, TaskOwner::Task(cycle_a.id()));
-        ts.save(&[Save::Create(&cycle_a), Save::Create(&cycle_b)])
-            .unwrap();
+        // Simulate a legacy corrupt store, bypassing current admission checks.
+        let corrupt = [cycle_a, cycle_b]
+            .iter()
+            .map(|task| Mutation::Put {
+                key: crate::task_store::key(task.id()),
+                value: serde_json::to_vec(task).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        db.commit(&[], &corrupt).unwrap();
         let mut docs = TaskDocuments::new(&db, &cyclic_author).unwrap();
         assert!(matches!(
             docs.append_entry("app.test", json!(null)),

@@ -45,6 +45,8 @@ pub enum Error {
     InvalidOwnedBatch,
     #[error("task ownership cannot be changed")]
     OwnerChanged,
+    #[error("task ownership contains a cycle or invalid edge")]
+    InvalidOwnership,
     #[error("signal name, version, or key is invalid")]
     InvalidSignalToken,
     #[error("invalid signal schema: {0}")]
@@ -343,10 +345,23 @@ impl<'a> TaskStore<'a> {
     }
 
     /// Prepare task writes for an atomic commit with other checked records.
+    /// Do not compose separately prepared ownership changes in the same commit:
+    /// their checks observe the pre-commit state, not each other's writes.
     pub fn prepare_save(&self, tasks: &[Save<'_>]) -> Result<OwnedBatch, Error> {
         let mut checks = Vec::with_capacity(tasks.len());
         let mut mutations = Vec::with_capacity(tasks.len());
         let mut seen = std::collections::HashSet::new();
+        let mut created = std::collections::HashMap::new();
+        for save in tasks {
+            if let Save::Create(task) = save {
+                if created.insert(task.id(), *task).is_some() {
+                    return Err(Error::DuplicateTask);
+                }
+            }
+        }
+        for task in created.values() {
+            checks.extend(self.check_create_ownership(task, &created)?);
+        }
         for save in tasks {
             let (task, expected) = match save {
                 Save::Create(task) => (*task, Expected::Missing),
@@ -395,6 +410,71 @@ impl<'a> TaskStore<'a> {
             });
         }
         Ok(OwnedBatch { checks, mutations })
+    }
+
+    fn check_create_ownership(
+        &self,
+        task: &Task,
+        created: &std::collections::HashMap<Uuid, &Task>,
+    ) -> Result<Vec<Check>, Error> {
+        let mut checks = Vec::new();
+        let mut seen_tasks = std::collections::HashSet::from([task.id()]);
+        let mut seen_conversations = std::collections::HashSet::new();
+        let mut next = task.owner().clone();
+        loop {
+            match next {
+                TaskOwner::Task(id) => {
+                    if !seen_tasks.insert(id) {
+                        return Err(Error::InvalidOwnership);
+                    }
+                    if let Some(parent) = created.get(&id) {
+                        next = parent.owner().clone();
+                    } else {
+                        let parent = self.load(id)?;
+                        checks.push(Check {
+                            key: key(id),
+                            expected: parent.as_ref().map_or(Expected::Missing, |p| Expected::Version(p.version)),
+                        });
+                        match parent {
+                            Some(parent) => next = parent.task.owner().clone(),
+                            None => return Ok(checks),
+                        }
+                    }
+                }
+                TaskOwner::Conversation(id) => {
+                    if !seen_conversations.insert(id) {
+                        return Err(Error::InvalidOwnership);
+                    }
+                    let key = crate::ownership_edge::edge_key(id);
+                    let entry = self.store.get(&key)?;
+                    checks.push(Check {
+                        key: key.clone(),
+                        expected: entry.as_ref().map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                    });
+                    match entry {
+                        None => return Ok(checks),
+                        Some(entry) => {
+                            let edge = crate::ownership_edge::decode(&key, entry)
+                                .map_err(|_| Error::InvalidOwnership)?;
+                            let owner = if let Some(owner) = created.get(&edge.edge.task) {
+                                (*owner).clone()
+                            } else {
+                                let owner = self.load(edge.edge.task)?.ok_or(Error::InvalidOwnership)?;
+                                checks.push(Check {
+                                    key: self::key(edge.edge.task),
+                                    expected: Expected::Version(owner.version),
+                                });
+                                owner.task
+                            };
+                            if owner.owner() != &edge.edge.task_owner {
+                                return Err(Error::InvalidOwnership);
+                            }
+                            next = TaskOwner::Task(edge.edge.task);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Commit an owner's new checkpoint and its newly registered tasks in one
@@ -452,16 +532,11 @@ impl<'a> TaskStore<'a> {
             {
                 return Err(Error::InvalidOwnedBatch);
             }
-            let key = key(child.id());
-            checks.push(Check {
-                key: key.clone(),
-                expected: Expected::Missing,
-            });
-            mutations.push(Mutation::Put {
-                key,
-                value: serde_json::to_vec(child)?,
-            });
         }
+        let saves: Vec<_> = children.iter().map(Save::Create).collect();
+        let batch = self.prepare_save(&saves)?;
+        checks.extend(batch.checks);
+        mutations.extend(batch.mutations);
         Ok(OwnedBatch { checks, mutations })
     }
 
@@ -1184,6 +1259,72 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    fn owned(id: u128, parent: u128) -> Task {
+        Task::new(
+            Uuid::from_u128(id),
+            TaskOwner::Task(Uuid::from_u128(parent)),
+            Checkpoint { phase: "first".into(), data: json!({}) },
+            3,
+        ).unwrap()
+    }
+
+    #[test]
+    fn task_creation_rejects_cycles_and_fences_missing_owners() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let a = owned(1, 2);
+        let b = owned(2, 1);
+        assert!(matches!(
+            ts.save(&[Save::Create(&a), Save::Create(&b)]),
+            Err(Error::InvalidOwnership)
+        ));
+        assert!(ts.list().unwrap().is_empty());
+
+        let first = ts.prepare_save(&[Save::Create(&a)]).unwrap();
+        let second = ts.prepare_save(&[Save::Create(&b)]).unwrap();
+        db.commit(&first.checks, &first.mutations).unwrap();
+        assert!(matches!(
+            db.commit(&second.checks, &second.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(ts.save(&[Save::Create(&b)]), Err(Error::InvalidOwnership)));
+        assert!(ts.load(b.id()).unwrap().is_none());
+        let registered_b = b.clone().registered("job".into(), true);
+        assert!(matches!(
+            ts.commit_owned_tasks(&TaskOwner::Task(a.id()), b"checkpoint", Expected::Missing, b"value", &[registered_b]),
+            Err(Error::InvalidOwnership)
+        ));
+        assert!(db.get(b"checkpoint").unwrap().is_none());
+
+        let child = owned(3, 1).registered("job".into(), true);
+        assert!(ts.commit_owned_tasks(
+            &TaskOwner::Task(a.id()), b"checkpoint", Expected::Missing, b"value", &[child]
+        ).is_ok());
+    }
+
+    #[test]
+    fn task_creation_rejects_cycle_through_background_conversation_edge() {
+        use crate::ownership_edge::{Edge, Mode, edge_key};
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let parent = owned(2, 1);
+        ts.save(&[Save::Create(&parent)]).unwrap();
+        let conversation = Uuid::from_u128(100);
+        let edge = Edge {
+            task: parent.id(),
+            task_owner: parent.owner().clone(),
+            child: conversation,
+            mode: Mode::Background,
+        };
+        db.commit(&[], &[Mutation::Put {
+            key: edge_key(conversation),
+            value: serde_json::to_vec(&edge).unwrap(),
+        }]).unwrap();
+        let child = task(1, 3);
+        assert!(matches!(ts.save(&[Save::Create(&child)]), Err(Error::InvalidOwnership)));
+        assert!(ts.load(child.id()).unwrap().is_none());
     }
 
     #[test]
