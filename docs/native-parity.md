@@ -685,8 +685,10 @@ the structured value when they only update metadata, and discard it when they
 explicitly replace output, including with the same text. Custom host hooks may
 opt in to reporting output-field presence; native executable extensions negotiate
 that capability and forward the field-presence result across the process boundary.
-Older executables and opaque overrides remain conservative when field presence is
-unavailable. Image read structured output remains a separate parity gap.
+A duplex host remains available for nested calls even if it cannot send custom
+messages. Single-shot presence responses allow only the fixed wrapper overhead;
+the underlying outcome still obeys the original response limit. Older executables
+and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
