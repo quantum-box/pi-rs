@@ -214,10 +214,10 @@ impl<'a> Inbox<'a> {
         let rev = self.store.get(&rk)?;
         let entries = self.store.list(&prefix(conversation))?;
         for name in names {
-            if let Some(entry) = self.store.get(&slot(conversation, name))? {
-                if matches!(serde_json::from_slice::<Slot>(&entry.value)?, Slot::Expired) {
-                    return Err(Error::InvalidWait);
-                }
+            if let Some(entry) = self.store.get(&slot(conversation, name))?
+                && matches!(serde_json::from_slice::<Slot>(&entry.value)?, Slot::Expired)
+            {
+                return Err(Error::InvalidWait);
             }
             for (_, entry) in &entries {
                 let signal: Signal = serde_json::from_slice(&entry.value)?;
