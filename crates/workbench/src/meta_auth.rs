@@ -192,49 +192,51 @@ impl DeviceService {
             .as_f64()
             .filter(|v| v.is_finite() && *v > 0.0)
             .map(|v| poll_duration(Some(v), 900.0));
-        let poll = async {
-            loop {
-                tokio::time::sleep(interval).await;
-                let (status, json) = self
-                    .post(
-                        &self.token,
-                        &[
-                            ("grant_type", DEVICE_GRANT),
-                            ("device_code", device_code),
-                            ("client_id", CLIENT_ID),
-                        ],
-                    )
-                    .await?;
-                if status.is_success()
-                    && let Some(identity) = json["access_token"]
-                        .as_str()
-                        .filter(|s| super::model_auth::valid_key(s))
-                {
-                    return Ok(identity.to_owned());
+        let deadline = expires.map(|duration| tokio::time::Instant::now() + duration);
+        let identity = loop {
+            let wait = match deadline {
+                Some(deadline) => {
+                    interval.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
                 }
-                match json["error"].as_str() {
-                    Some("authorization_pending") => {}
-                    Some("slow_down") => {
-                        interval = json["interval"]
-                            .as_f64()
-                            .filter(|v| v.is_finite() && *v > 0.0)
-                            .map(|v| poll_duration(Some(v), 5.0).max(Duration::from_secs(1)))
-                            .unwrap_or(interval.saturating_add(Duration::from_secs(5)))
-                    }
-                    Some("access_denied") => return Err(error("login denied")),
-                    Some("expired_token") => {
-                        return Err(error("device authorization expired; restart login"));
-                    }
-                    _ => return Err(error(&format!("device token request failed ({status})"))),
+                None => interval,
+            };
+            tokio::time::sleep(wait).await;
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(error("device authorization expired; restart login"));
+            }
+            let (status, json) = self
+                .post(
+                    &self.token,
+                    &[
+                        ("grant_type", DEVICE_GRANT),
+                        ("device_code", device_code),
+                        ("client_id", CLIENT_ID),
+                    ],
+                )
+                .await?;
+            if status.is_success()
+                && let Some(identity) = json["access_token"]
+                    .as_str()
+                    .filter(|s| super::model_auth::valid_key(s))
+            {
+                break identity.to_owned();
+            }
+            match json["error"].as_str() {
+                Some("authorization_pending") => {}
+                Some("slow_down") => {
+                    interval = json["interval"]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| poll_duration(Some(v), 5.0).max(Duration::from_secs(1)))
+                        .unwrap_or(interval.saturating_add(Duration::from_secs(5)))
                 }
+                Some("access_denied") => return Err(error("login denied")),
+                Some("expired_token") => {
+                    return Err(error("device authorization expired; restart login"));
+                }
+                _ => return Err(error(&format!("device token request failed ({status})"))),
             }
         };
-        let identity = match expires {
-            Some(deadline) => tokio::time::timeout(deadline, poll)
-                .await
-                .map_err(|_| error("device authorization expired; restart login"))?,
-            None => poll.await,
-        }?;
         let access = self.mint.mint(&identity).await?;
         Ok(Credential {
             kind: "oauth".into(),
@@ -461,8 +463,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn device_login_polls_then_mints_a_separate_inference_key() {
+    async fn device_login_fixture(delayed_response: usize) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -501,8 +502,8 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
-                // The identity arrives before device expiry, but mint finishes after it.
-                if index == 3 {
+                // Delay either the in-flight token response or the mint past expiry.
+                if index == delayed_response {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -548,6 +549,48 @@ mod tests {
         );
         assert!(requests[3].ends_with("{}"));
     }
+    #[tokio::test]
+    async fn device_login_accepts_token_response_after_expiry() {
+        device_login_fixture(2).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_allows_mint_to_finish_after_expiry() {
+        device_login_fixture(3).await;
+    }
+
+    #[tokio::test]
+    async fn device_login_does_not_start_poll_after_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 2048];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            let body = r#"{"device_code":"device","user_code":"CODE","verification_uri":"https://auth.meta.com/device","interval":1,"expires_in":0.05}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let service = DeviceService {
+            authorization: reqwest::Url::parse(&format!("{base}/authorization")).unwrap(),
+            token: reqwest::Url::parse(&format!("{base}/token")).unwrap(),
+            mint: Service {
+                url: reqwest::Url::parse(&format!("{base}/mint")).unwrap(),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            },
+        };
+        let message = match service.login(|_, _| {}).await {
+            Ok(_) => panic!("expired login succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("expired"));
+        server.await.unwrap();
+    }
+
     #[test]
     fn blocked_file_lock_keeps_commit_observable_after_escape() {
         use std::sync::atomic::Ordering;
