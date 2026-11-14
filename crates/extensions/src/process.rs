@@ -19,7 +19,8 @@ const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
 // A duplex tool-result request and its completion can each contain an 8 MiB
 // journaled outcome, including JSON-escaped structured shell output.
 const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
-const MAX_NESTED_ARGUMENT_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+use super::json_size::MAX_NESTED_ARGUMENT_BYTES;
 // A lifecycle event can include an 8 MiB journaled tool result, whose JSON
 // representation may expand to six times its original size when escaped.
 const MAX_REQUEST: u64 = 64 * 1024 * 1024;
@@ -2034,6 +2035,10 @@ enum DuplexFrame {
     Call {
         calls: Vec<(String, Value)>,
     },
+    #[serde(skip)]
+    CheckedCall {
+        calls: Vec<(String, Option<Value>)>,
+    },
     Complete {
         response: std::result::Result<Value, String>,
     },
@@ -2133,14 +2138,19 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
         #[serde(borrow)]
         calls: Option<&'a serde_json::value::RawValue>,
     }
-    struct BoundedCalls;
-    impl<'de> Deserialize<'de> for BoundedCalls {
+    struct BoundedCalls<'a>(
+        Vec<(
+            &'a serde_json::value::RawValue,
+            &'a serde_json::value::RawValue,
+        )>,
+    );
+    impl<'de> Deserialize<'de> for BoundedCalls<'de> {
         fn deserialize<D: serde::Deserializer<'de>>(
             deserializer: D,
         ) -> std::result::Result<Self, D::Error> {
             struct Visitor;
             impl<'de> serde::de::Visitor<'de> for Visitor {
-                type Value = BoundedCalls;
+                type Value = BoundedCalls<'de>;
                 fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     formatter.write_str("an array of at most 4096 tool calls")
                 }
@@ -2148,20 +2158,14 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
                     self,
                     mut sequence: A,
                 ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut calls = Vec::new();
                     for _ in 0..4096 {
                         match sequence.next_element::<(
                             &'de serde_json::value::RawValue,
                             &'de serde_json::value::RawValue,
                         )>()? {
-                            None => return Ok(BoundedCalls),
-                            Some((_, arguments))
-                                if arguments.get().len() > MAX_NESTED_ARGUMENT_BYTES =>
-                            {
-                                return Err(serde::de::Error::custom(
-                                    "nested tool arguments exceed size limit",
-                                ));
-                            }
-                            Some(_) => {}
+                            None => return Ok(BoundedCalls(calls)),
+                            Some(call) => calls.push(call),
                         }
                     }
                     if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -2169,7 +2173,7 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
                             "native extension batch exceeds execution limit",
                         ));
                     }
-                    Ok(BoundedCalls)
+                    Ok(BoundedCalls(calls))
                 }
             }
             deserializer.deserialize_seq(Visitor)
@@ -2181,8 +2185,18 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
     if prefix.kind == "call"
         && let Some(calls) = prefix.calls
     {
-        serde_json::from_str::<BoundedCalls>(calls.get())
+        let BoundedCalls(calls) = serde_json::from_str::<BoundedCalls<'_>>(calls.get())
             .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        let calls = calls
+            .into_iter()
+            .map(|(name, arguments)| {
+                let name = serde_json::from_str::<String>(name.get())?;
+                let value = super::json_size::compact_value(arguments.get())?;
+                Ok::<_, serde_json::Error>((name, value))
+            })
+            .collect::<serde_json::Result<Vec<_>>>()
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        return Ok(DuplexFrame::CheckedCall { calls });
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension frame: {error}"))
@@ -2326,6 +2340,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
+                    | DuplexFrame::CheckedCall { .. }
                     | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
@@ -2380,7 +2395,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
             }
-            Ok(Ok(DuplexFrame::Call { calls })) => {
+            Ok(Ok(DuplexFrame::CheckedCall { calls })) => {
                 if calls.len() > 4096 {
                     return Err("native extension batch exceeds execution limit".into());
                 }
@@ -2388,7 +2403,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during host call".to_owned()),
-                        results = host.call_batch(calls) => Ok(results),
+                        results = host.call_batch_prevalidated(calls) => Ok(results),
                     }
                 })?;
                 let results: Vec<_> = results
@@ -2399,6 +2414,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
             }
+            Ok(Ok(DuplexFrame::Call { .. })) => unreachable!("call frames are prevalidated"),
             Ok(Ok(DuplexFrame::Ui { request })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
@@ -5450,7 +5466,7 @@ else:
             vec![call; 4096].join(",")
         );
         assert!(
-            matches!(read_duplex_frame(&mut std::io::Cursor::new(valid)), Ok(DuplexFrame::Call { calls }) if calls.len() == 4096)
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(valid)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len() == 4096)
         );
         let invalid = format!(
             "{{\"calls\":[{},[\"tool\",[{}]]],\"type\":\"call\"}}\n",
@@ -5465,7 +5481,7 @@ else:
     }
 
     #[test]
-    fn duplex_preflight_bounds_each_raw_argument_before_materialization() {
+    fn duplex_preflight_bounds_compact_arguments_before_materialization() {
         let at_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 2));
         let frame = format!(
             "{{\"calls\":[[\"first\",{{\"a\":1}}],[\"limit\",{at_limit}],[\"last\",[true,null]]],\"type\":\"call\"}}\n"
@@ -5473,16 +5489,81 @@ else:
         let parsed = read_duplex_frame(&mut std::io::Cursor::new(frame))
             .unwrap_or_else(|error| panic!("valid batch rejected: {error}"));
         assert!(
-            matches!(parsed, DuplexFrame::Call { calls } if calls.len() == 3 && calls[0].1["a"] == 1 && calls[1].1.as_str().unwrap().len() == MAX_NESTED_ARGUMENT_BYTES - 2 && calls[2].1 == serde_json::json!([true,null]))
+            matches!(parsed, DuplexFrame::CheckedCall { calls } if calls.len() == 3 && calls[0].1.as_ref().unwrap()["a"] == 1 && calls[1].1.as_ref().unwrap().as_str().unwrap().len() == MAX_NESTED_ARGUMENT_BYTES - 2 && calls[2].1 == Some(serde_json::json!([true,null])))
+        );
+        let over_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 1));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"large\",{over_limit}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.is_none())
         );
         let structured = format!("[{}{{}}]", "{},".repeat(2_000_000));
         assert!(structured.len() > MAX_NESTED_ARGUMENT_BYTES);
         let frame = format!("{{\"calls\":[[\"large\",{structured}]],\"type\":\"call\"}}\n");
-        let error = match read_duplex_frame(&mut std::io::Cursor::new(frame)) {
-            Err(error) => error,
-            Ok(_) => panic!("oversized argument accepted"),
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len()==1 && calls[0].1.is_none())
+        );
+        let escaped = format!("\"{}\"", "\\u0061".repeat(200_000));
+        let whitespace = format!("[{}1]", " ".repeat(MAX_NESTED_ARGUMENT_BYTES));
+        let frame = format!(
+            "{{\"type\":\"call\",\"calls\":[[\"escaped\",{escaped}],[\"space\",{whitespace}]]}}\n"
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.as_ref().unwrap().as_str().unwrap().len() == 200_000 && calls[1].1 == Some(serde_json::json!([1])))
+        );
+        let discarded = format!("{{\"x\":[{}{{}}],\"x\":0}}", "{},".repeat(500_000));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"duplicate\",{discarded}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(serde_json::json!({"x":0})))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_batch_skips_only_oversized_call_and_preserves_order() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.lock().unwrap().push(name.into());
+                Outcome::Succeeded(name.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}], 'host_calls':True, 'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    json.loads(sys.stdin.readline())
+    print(json.dumps({'type':'call','calls':[['first',{}],['too_large',[{}]*400000],['last',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert [v['status'] for v in values] == ['succeeded','skipped','succeeded']
+    assert values[0]['detail']=='first' and values[2]['detail']=='last'
+    assert values[1]['detail']=='nested tool arguments exceed size limit'
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(Host(std::sync::Mutex::new(Vec::new())));
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
         };
-        assert!(error.contains("nested tool arguments exceed size limit"));
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, host.clone())
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(*host.0.lock().unwrap(), vec!["first", "last"]);
     }
 
     #[cfg(unix)]

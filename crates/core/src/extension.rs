@@ -368,6 +368,37 @@ pub trait ToolHost: Send + Sync {
         )
         .await
     }
+    /// Submit calls whose arguments were size-checked before decoding. `None`
+    /// marks an oversized argument and must never be dispatched.
+    #[doc(hidden)]
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        let mut positions = Vec::with_capacity(calls.len());
+        let mut valid = Vec::new();
+        for (name, arguments) in calls {
+            positions.push(arguments.is_some());
+            if let Some(arguments) = arguments {
+                valid.push((name, arguments));
+            }
+        }
+        let mut outcomes = if valid.is_empty() {
+            Vec::new()
+        } else {
+            self.call_batch(valid).await
+        }
+        .into_iter();
+        positions
+            .into_iter()
+            .map(|valid| {
+                if valid {
+                    outcomes
+                        .next()
+                        .unwrap_or_else(|| Outcome::Unknown("nested tool response was lost".into()))
+                } else {
+                    Outcome::Skipped("nested tool arguments exceed size limit".into())
+                }
+            })
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]

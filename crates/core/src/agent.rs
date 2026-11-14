@@ -4337,13 +4337,28 @@ impl ToolHost for NestedHost {
         scoped.call(name, arguments).await
     }
     async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<Outcome> {
+        self.call_batch_prevalidated(
+            calls
+                .into_iter()
+                .map(|(name, value)| (name, Some(value)))
+                .collect(),
+        )
+        .await
+    }
+    async fn call_batch_prevalidated(
+        &self,
+        calls: Vec<(String, Option<serde_json::Value>)>,
+    ) -> Vec<Outcome> {
         let mut requests = Vec::new();
         let mut results = Vec::new();
         for (name, arguments) in calls {
             let error =
                 if self.depth >= 8 || self.call_count.fetch_add(1, Ordering::Relaxed) >= 4096 {
                     Some("nested tool execution limit reached")
-                } else if arguments.to_string().len() > 1024 * 1024 {
+                } else if arguments
+                    .as_ref()
+                    .is_none_or(|arguments| arguments.to_string().len() > 1024 * 1024)
+                {
                     Some("nested tool arguments exceed size limit")
                 } else {
                     None
@@ -4355,7 +4370,7 @@ impl ToolHost for NestedHost {
             } else {
                 requests.push(NestedRequest {
                     name,
-                    arguments,
+                    arguments: arguments.expect("validated nested arguments"),
                     parent_operation: self.parent_operation,
                     cancellation: self.cancellation.clone(),
                     depth: self.depth + 1,
@@ -5674,6 +5689,45 @@ mod nested_host_tests {
         });
         assert!(matches!(outcomes[0], Outcome::Skipped(_)));
         assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
+    }
+
+    #[tokio::test]
+    async fn prevalidated_oversized_calls_preserve_order_and_consume_call_budget() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let host = NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(4094)),
+        };
+        let calls = vec![
+            ("large".into(), None),
+            ("valid".into(), Some(serde_json::json!({}))),
+            ("over-budget".into(), Some(serde_json::json!({}))),
+        ];
+        let (outcomes, ()) = tokio::join!(host.call_batch_prevalidated(calls), async {
+            let mut batch = incoming.recv().await.unwrap();
+            assert_eq!(batch.len(), 1);
+            let request = batch.remove(0);
+            assert_eq!(request.name, "valid");
+            request
+                .reply
+                .send(Outcome::Succeeded("done".into()))
+                .unwrap();
+        });
+        assert_eq!(
+            outcomes[0],
+            Outcome::Skipped("nested tool arguments exceed size limit".into())
+        );
+        assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
+        assert_eq!(
+            outcomes[2],
+            Outcome::Skipped("nested tool execution limit reached".into())
+        );
     }
 }
 
