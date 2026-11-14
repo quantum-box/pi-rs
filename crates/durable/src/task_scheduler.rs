@@ -264,13 +264,17 @@ impl Scheduler {
                 self.cancel_failed_siblings(&snapshot, ids)?;
                 self.poisoned = false;
             }
-            if matches!(snapshot.task.state(), TaskState::Waiting(_))
-                && matches!(
-                    self.ts().poll_wait(&snapshot, now_millis)?,
-                    WakeResult::Woken { .. }
-                )
-            {
-                progress = true;
+            if matches!(snapshot.task.state(), TaskState::Waiting(_)) {
+                match self.ts().poll_wait(&snapshot, now_millis) {
+                    Ok(WakeResult::Woken { .. }) => progress = true,
+                    Ok(WakeResult::Pending) => (),
+                    Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+                        // A concurrent signal or task transition changed the snapshot.
+                        // Rescan on the next tick instead of failing the driver.
+                        progress = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         let tasks = self.ts().list()?;

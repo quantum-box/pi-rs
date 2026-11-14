@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/task/";
 const SIGNAL_PREFIX: &[u8] = b"durable/signal/";
+const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -186,10 +187,16 @@ impl<'a> TaskStore<'a> {
                         expected: Expected::Version(target.version),
                     },
                 ],
-                &[Mutation::Put {
-                    key: k.clone(),
-                    value: serde_json::to_vec(&fresh)?,
-                }],
+                &[
+                    Mutation::Put {
+                        key: k.clone(),
+                        value: serde_json::to_vec(&fresh)?,
+                    },
+                    Mutation::Put {
+                        key: signal_revision_key(signal.task_id),
+                        value: vec![],
+                    },
+                ],
             ) {
                 Ok(()) => return Ok(()),
                 Err(durable_store::Error::Conflict { .. }) => continue,
@@ -252,6 +259,41 @@ impl<'a> TaskStore<'a> {
                     value: serde_json::to_vec(&signal)?,
                 });
                 delivered = Some(signal);
+            }
+            WaitFor::Sleep {
+                until_millis,
+                signals,
+            } => {
+                // Fence a signal insertion between the scan and the wake commit.
+                let revision_key = signal_revision_key(snapshot.task.id());
+                let revision = self.store.get(&revision_key)?;
+                checks.push(Check {
+                    key: revision_key,
+                    expected: revision
+                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                });
+                let mut found = None;
+                for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
+                    let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if !signal.consumed && signals.contains(&signal.name) {
+                        found = Some((k, entry.version, signal));
+                        break;
+                    }
+                }
+                if let Some((k, version, mut signal)) = found {
+                    signal.consumed = true;
+                    checks.push(Check {
+                        key: k.clone(),
+                        expected: Expected::Version(version),
+                    });
+                    mutations.push(Mutation::Put {
+                        key: k,
+                        value: serde_json::to_vec(&signal)?,
+                    });
+                    delivered = Some(signal);
+                } else if !until_millis.is_some_and(|deadline| now_millis >= deadline) {
+                    return Ok(WakeResult::Pending);
+                }
             }
             WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) | WaitFor::TasksFailFast(ids) => {
                 let mut seen = std::collections::HashSet::new();
@@ -323,6 +365,12 @@ impl<'a> TaskStore<'a> {
 
 fn signal_task_prefix(task_id: Uuid) -> Vec<u8> {
     let mut key = SIGNAL_PREFIX.to_vec();
+    key.extend_from_slice(task_id.as_bytes());
+    key
+}
+
+fn signal_revision_key(task_id: Uuid) -> Vec<u8> {
+    let mut key = SIGNAL_REVISION_PREFIX.to_vec();
     key.extend_from_slice(task_id.as_bytes());
     key
 }
@@ -527,6 +575,52 @@ mod tests {
             ts.load(t.id()).unwrap().unwrap().task.state(),
             &TaskState::Ready
         );
+    }
+
+    #[test]
+    fn sleep_wakes_for_signal_or_expired_deadline_after_reopen() {
+        for with_signal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sleep.db");
+            let t = task(1, 3);
+            let signal = Signal::new(
+                Uuid::from_u128(42),
+                t.id(),
+                "go".into(),
+                serde_json::json!(1),
+            );
+            {
+                let db = Store::open(&path).unwrap();
+                let ts = TaskStore::new(&db);
+                ts.save(&[Save::Create(&t)]).unwrap();
+                ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
+                ts.update(&ts.load(t.id()).unwrap().unwrap(), |t| {
+                    t.wait(WaitFor::Sleep {
+                        until_millis: Some(100),
+                        signals: vec!["go".into(), "other".into()],
+                    })
+                })
+                .unwrap();
+                assert_eq!(
+                    ts.poll_wait(&ts.load(t.id()).unwrap().unwrap(), 99)
+                        .unwrap(),
+                    WakeResult::Pending
+                );
+                if with_signal {
+                    ts.send_signal(&signal).unwrap();
+                }
+            }
+            let db = Store::open(&path).unwrap();
+            let ts = TaskStore::new(&db);
+            let result = ts
+                .poll_wait(&ts.load(t.id()).unwrap().unwrap(), 100)
+                .unwrap();
+            assert!(matches!(result, WakeResult::Woken { signal: Some(_) }) == with_signal);
+            assert_eq!(ts.signal(t.id(), signal.id).unwrap().is_some(), with_signal);
+            if with_signal {
+                assert!(ts.signal(t.id(), signal.id).unwrap().unwrap().is_consumed());
+            }
+        }
     }
 
     #[test]

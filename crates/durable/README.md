@@ -49,8 +49,8 @@ Current limits and differences from upstream Pi Durable:
   compaction still requires an idle conversation. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
   The subagent link primitive does not provide an automatic conversation/task ownership tree.
-- Generic task waits support one deadline, one signal, or direct-child
-  all/any/fail-fast joins. Combined waits and abort handlers are not yet
+- Generic task waits support deadlines, signals, deadline-or-signal sleeps, and direct-child
+  all/any/fail-fast joins. Task abort handlers are not yet
   implemented. Local cancellation propagates through descendants, but cannot
   cancel an already running external effect. Handler steps run synchronously
   and shutdown waits for an in-flight step.

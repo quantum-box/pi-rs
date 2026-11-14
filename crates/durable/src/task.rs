@@ -28,6 +28,11 @@ pub struct Checkpoint {
 pub enum WaitFor {
     DeadlineMillis(i64),
     Signal(String),
+    /// Wake on the first matching signal or when the absolute deadline passes.
+    Sleep {
+        until_millis: Option<i64>,
+        signals: Vec<String>,
+    },
     Tasks(Vec<Uuid>),
     /// Wake when any direct child ends; an empty set remains pending.
     TasksAny(Vec<Uuid>),
@@ -70,6 +75,7 @@ pub enum TransitionError {
     RestartLimit,
     UnchangedCheckpoint,
     SelfOwned,
+    InvalidWait,
 }
 
 impl Task {
@@ -174,6 +180,18 @@ impl Task {
 
     pub fn wait(&mut self, condition: WaitFor) -> Result<(), TransitionError> {
         self.require_running()?;
+        if let WaitFor::Sleep {
+            until_millis,
+            signals,
+        } = &condition
+        {
+            if (until_millis.is_none() && signals.is_empty())
+                || until_millis.is_some_and(|time| time < 0)
+                || signals.iter().any(String::is_empty)
+            {
+                return Err(TransitionError::InvalidWait);
+            }
+        }
         self.delivered_signal = None;
         self.state = TaskState::Waiting(condition);
         Ok(())
