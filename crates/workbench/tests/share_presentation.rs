@@ -336,6 +336,166 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
 }
 
 #[test]
+fn failed_mcp_discovery_closes_connected_peer_before_share_returns() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = root.path().join("session.jsonl");
+    drop(pi_rs::Session::open(&path).unwrap());
+    let original = std::fs::read(&path).unwrap();
+    let mcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    mcp.set_nonblocking(true).unwrap();
+    let mcp_url = format!("http://{}/mcp", mcp.local_addr().unwrap());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let _stop = Stop(stopped.clone());
+    let initialized = Arc::new(AtomicBool::new(false));
+    let deleted = Arc::new(AtomicBool::new(false));
+    let server = {
+        let initialized = initialized.clone();
+        let deleted = deleted.clone();
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let (mut socket, _) = match mcp.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    continue;
+                }
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let (status, response) = if request["method"] == "initialize" {
+                    initialized.store(true, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+                        "protocolVersion":request["params"]["protocolVersion"], "capabilities":{},
+                        "serverInfo":{"name":"fixture", "version":"1"}}})
+                        .to_string(),
+                    )
+                } else if first.starts_with("DELETE ") {
+                    deleted.store(true, Ordering::SeqCst);
+                    ("200 OK", String::new())
+                } else if first.starts_with("GET ") {
+                    ("405 Method Not Allowed", String::new())
+                } else {
+                    ("202 Accepted", String::new())
+                };
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nMcp-Session-Id: fixture-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+            }
+        })
+    };
+    std::fs::write(
+        home.join("mcp.json"),
+        serde_json::to_vec(&json!({"mcpServers":{
+            "good":{"url":mcp_url, "oauth":false}, "bad":{"command":42}
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let radius = TcpListener::bind("127.0.0.1:0").unwrap();
+    radius.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/artifacts", radius.local_addr().unwrap());
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("RADIUS_API_KEY", "fixture")
+        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args([
+            "--offline",
+            "--no-trust",
+            "--no-skills",
+            "--no-context-files",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
+        ])
+        .arg("--session")
+        .arg(&path)
+        .arg("share")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = KillOnDrop(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "standalone share did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.0.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success(), "failed discovery was shared: {stderr}");
+    assert!(
+        initialized.load(Ordering::SeqCst),
+        "good MCP peer was never initialized: {stderr}"
+    );
+    assert!(
+        deleted.load(Ordering::SeqCst),
+        "connected MCP peer was not closed before returning: {stderr}"
+    );
+    assert!(
+        matches!(radius.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    _stop.0.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
 fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
     for pending_trust in [false, true] {
         let root = tempfile::tempdir().unwrap();
