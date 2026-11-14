@@ -707,7 +707,54 @@ impl Tool for Operations {
                     attachments: vec![],
                 }
             } else {
-                Outcome::Failed("unknown model for this operation".into())
+                let requested = match kind {
+                    Some(Kind::Classifier) => "classifier",
+                    Some(Kind::Image) => "image",
+                    _ => return Outcome::Failed("invalid model operation type".into()),
+                };
+                let id = args["id"].as_str().unwrap_or_default();
+                let provider = provider.unwrap_or_default();
+                let actual = if !self.chat_models(Some(provider), Some(id), false).is_empty() {
+                    Some("chat")
+                } else {
+                    [Kind::Image, Kind::Classifier]
+                        .into_iter()
+                        .find_map(|other| {
+                            (Some(other) != kind
+                                && catalogue.0.iter().any(|model| {
+                                    model.api.kind() == other
+                                        && model.provider == provider
+                                        && model.model.id == id
+                                }))
+                            .then_some(if other == Kind::Image {
+                                "image"
+                            } else {
+                                "classifier"
+                            })
+                        })
+                };
+                let article = |value| {
+                    if value == "image" {
+                        "an image"
+                    } else if value == "chat" {
+                        "a chat"
+                    } else {
+                        "a classifier"
+                    }
+                };
+                let hint = format!(
+                    "List the {requested} models you can use with models.getAvailableOfType(\"{requested}\")."
+                );
+                let message = if let Some(actual) = actual {
+                    format!(
+                        "\"{provider}/{id}\" is {} model, not {} model. {hint}",
+                        article(actual),
+                        article(requested)
+                    )
+                } else {
+                    format!("Unknown {requested} model \"{provider}/{id}\". {hint}")
+                };
+                Outcome::Failed(message)
             };
         }
         let keys = match Keys::load_async().await {
@@ -984,18 +1031,36 @@ mod tests {
                 .await,
             Outcome::Structured { .. }
         ));
-        assert!(matches!(
-            operation
-                .invoke(resolve("classifier", "fixture"), context())
-                .await,
-            Outcome::Failed(_)
-        ));
-        assert!(matches!(
-            operation
-                .invoke(resolve("image", "missing"), context())
-                .await,
-            Outcome::Failed(_)
-        ));
+        let Outcome::Failed(wrong_type) = operation
+            .invoke(resolve("classifier", "fixture"), context())
+            .await
+        else {
+            panic!("wrong type accepted")
+        };
+        assert_eq!(
+            wrong_type,
+            "\"relay/fixture\" is an image model, not a classifier model. List the classifier models you can use with models.getAvailableOfType(\"classifier\")."
+        );
+        let Outcome::Failed(unknown) = operation
+            .invoke(resolve("image", "missing"), context())
+            .await
+        else {
+            panic!("unknown accepted")
+        };
+        assert_eq!(
+            unknown,
+            "Unknown image model \"relay/missing\". List the image models you can use with models.getAvailableOfType(\"image\")."
+        );
+        let chat = operation
+            .chat_models(None, None, false)
+            .into_iter()
+            .next()
+            .unwrap();
+        let request = json!({"action":"resolve", "type":"image", "provider":chat["provider"], "id":chat["id"]});
+        let Outcome::Failed(wrong_type) = operation.invoke(request, context()).await else {
+            panic!("chat model accepted")
+        };
+        assert!(wrong_type.contains("is a chat model, not an image model"));
     }
 
     #[tokio::test]

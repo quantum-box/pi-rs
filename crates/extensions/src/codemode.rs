@@ -1362,7 +1362,10 @@ mod tests {
                 () => models.classify(model, {state:{}, questions:{}}),
                 () => models.classify(model, {state:{}, questions:q, images:null}),
                 () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:[1]}}}),
+                () => models.classify(model, {state:{}, questions:q, images:Array(1)}),
+                () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:Array(1)}}}),
                 () => models.generateImages(model, {input:[]}),
+                () => models.generateImages(model, {input:Array(1)}),
                 () => models.generateImages(model, {input:[{type:'image', data:1, mimeType:'image/png'}]}),
             ];
             for (const call of invalid) {

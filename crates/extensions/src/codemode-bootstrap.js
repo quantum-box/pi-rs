@@ -113,8 +113,11 @@
         const { provider, id } = model;
         const resolved = JSON.parse(await callModel(JSON.stringify({ action: "resolve", type: action === "classify" ? "classifier" : "image", provider, id })));
         if (!resolved.ok) throw new Error(resolved.error);
-        validateContext(action, context);
-        const reply = JSON.parse(await callModel(JSON.stringify({ action, provider, id, context })));
+        // Match the sandbox JSON boundary: holes, undefined and toJSON values
+        // must be validated exactly as the host will receive them.
+        const argumentsJson = JSON.stringify({ action, provider, id, context });
+        validateContext(action, JSON.parse(argumentsJson).context);
+        const reply = JSON.parse(await callModel(argumentsJson));
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;
     };
