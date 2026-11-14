@@ -145,6 +145,11 @@ one compact-and-retry recovery; otherwise, it records failed tool results and
 the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
+response is treated as context overflow, matching Pi's bodyless-error rule.
+Other providers and nonempty 400 bodies retain their normal classification;
+incomplete or timed-out bodies do not qualify as empty. Existing HTTP 413
+handling is unchanged.
 Native extensions can opt into a pre-summary compaction hook for manual,
 threshold, and supported overflow compaction. A supplied summary bypasses the summary model, carries
 optional details and usage into the journal, and emits the normal lifecycle

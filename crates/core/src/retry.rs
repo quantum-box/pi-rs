@@ -1034,6 +1034,21 @@ where
     S: futures_util::Stream<Item = std::result::Result<B, E>>,
     B: AsRef<[u8]>,
 {
+    provider_context_overflow_stream_or_empty(stream, secrets, false).await
+}
+
+/// Recognize an empty, completely received body only when the caller has
+/// established that the provider and status use Pi's bodyless-overflow rule.
+#[doc(hidden)]
+pub async fn provider_context_overflow_stream_or_empty<S, B, E>(
+    stream: S,
+    secrets: &[String],
+    empty_is_overflow: bool,
+) -> bool
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
     use futures_util::StreamExt;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         futures_util::pin_mut!(stream);
@@ -1047,6 +1062,9 @@ where
                 return false;
             }
             bytes.extend_from_slice(chunk.as_ref());
+        }
+        if bytes.is_empty() && empty_is_overflow {
+            return true;
         }
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => provider_context_overflow(&value, secrets),
@@ -1066,6 +1084,43 @@ where
 #[cfg(test)]
 mod overflow_tests {
     use super::{context_overflow_error, provider_context_overflow};
+
+    #[tokio::test]
+    async fn bodyless_overflow_requires_complete_successful_stream() {
+        use futures_util::stream;
+        assert!(
+            super::provider_context_overflow_stream_or_empty(
+                stream::empty::<Result<&[u8], ()>>(),
+                &[],
+                true
+            )
+            .await
+        );
+        assert!(
+            !super::provider_context_overflow_stream_or_empty(
+                stream::empty::<Result<&[u8], ()>>(),
+                &[],
+                false
+            )
+            .await
+        );
+        assert!(
+            !super::provider_context_overflow_stream_or_empty(
+                stream::iter([Err::<&[u8], _>(())]),
+                &[],
+                true
+            )
+            .await
+        );
+        assert!(
+            !super::provider_context_overflow_stream_or_empty(
+                stream::iter([Ok::<_, ()>(b" ".as_slice())]),
+                &[],
+                true
+            )
+            .await
+        );
+    }
 
     #[tokio::test]
     async fn overflow_stream_respects_json_boundaries_and_limits() {
