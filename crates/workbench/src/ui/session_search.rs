@@ -176,6 +176,12 @@ fn ascii_regex_classes(pattern: &str) -> String {
                 'D' => Some("(?-i:[^0-9])"),
                 'w' => Some("(?-i:[A-Za-z0-9_])"),
                 'W' => Some("(?-i:[^A-Za-z0-9_])"),
+                'b' => Some(
+                    "(?-i:(?:(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])))",
+                ),
+                'B' => Some(
+                    "(?-i:(?:(?<=[A-Za-z0-9_])(?=[A-Za-z0-9_])|(?<![A-Za-z0-9_])(?![A-Za-z0-9_])))",
+                ),
                 _ => None,
             };
             if let Some(replacement) = replacement {
@@ -308,6 +314,59 @@ mod tests {
         }
         assert!(Query::new(r"re:^\\d$").score(&doc(r"\d")).is_some());
         assert_eq!(ascii_regex_classes(r"[\d]"), r"[\d]");
+    }
+
+    #[test]
+    fn regex_word_boundaries_use_ascii_with_non_ascii_neighbours() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for text in ["Kfoo", "fooá", "Kfooá", "foo"] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["á", "K", ""] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for text in ["Kfooá", "foo", "a_b"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["K", "á", "a"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for (pattern, text, expected) in [
+            (r"re:^K\bfoo\bá$", "Kfooá", true),
+            (r"re:^K\bfoo\bá$", "Kfooxá", false),
+            (r"re:^K\Bfoo\Bá$", "Kfooá", false),
+            (r"re:^K\B!$", "K!", true),
+            (r"re:^\Bfoo\b$", "foo", false),
+            (r"re:^f\Boo\b$", "foo", true),
+        ] {
+            assert_eq!(
+                Query::new(pattern).score(&doc(text)).is_some(),
+                expected,
+                "{pattern} {text}"
+            );
+        }
+        assert!(Query::new(r"re:^\\b$").score(&doc(r"\b")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b]\w");
     }
 
     #[test]
