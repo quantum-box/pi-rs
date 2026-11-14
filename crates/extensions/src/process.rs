@@ -2123,6 +2123,74 @@ enum DuplexFrame {
     },
 }
 
+// Count the old response envelope without allocating another copy of its
+// potentially large outcome. Only the negotiated wrapper may exceed the cap.
+fn check_presence_response(
+    response: &std::result::Result<Value, String>,
+    limit: u64,
+    duplex: bool,
+    newline: bool,
+) -> ExtensionResult<()> {
+    #[derive(Serialize)]
+    struct Single<'a> {
+        version: u16,
+        response: std::result::Result<&'a Value, &'a String>,
+    }
+    #[derive(Serialize)]
+    struct Complete<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        response: std::result::Result<&'a Value, &'a String>,
+    }
+    struct Counter {
+        length: u64,
+        limit: u64,
+    }
+    impl Write for Counter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.length = self.length.saturating_add(data.len() as u64);
+            if self.length > self.limit {
+                return Err(std::io::Error::other("response limit exceeded"));
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let response = match response {
+        Ok(value) => Ok(value.get("outcome").ok_or("invalid presence response")?),
+        Err(error) => Err(error),
+    };
+    let mut counter = Counter {
+        length: u64::from(newline),
+        limit,
+    };
+    let result = if duplex {
+        serde_json::to_writer(
+            &mut counter,
+            &Complete {
+                kind: "complete",
+                response,
+            },
+        )
+    } else {
+        serde_json::to_writer(
+            &mut counter,
+            &Single {
+                version: PROTOCOL,
+                response,
+            },
+        )
+    };
+    result.map_err(|_| {
+        format!(
+            "native extension response exceeds {} MiB",
+            limit / (1024 * 1024)
+        )
+    })
+}
+
 fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
     write_bounded_line(writer, value, MAX_MESSAGE)
 }
@@ -2209,7 +2277,15 @@ fn read_bounded_frame(reader: &mut impl BufRead, limit: u64) -> ExtensionResult<
 
 // Inspect call count without allocating their arbitrary JSON arguments. The
 // frame may put `type` after `calls`, so borrow the raw array before parsing it.
+#[cfg(test)]
 fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> {
+    read_duplex_frame_with_presence(reader, false)
+}
+
+fn read_duplex_frame_with_presence(
+    reader: &mut impl BufRead,
+    presence: bool,
+) -> ExtensionResult<DuplexFrame> {
     #[derive(Deserialize)]
     struct Preflight<'a> {
         #[serde(rename = "type", borrow)]
@@ -2260,9 +2336,17 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
             deserializer.deserialize_seq(Visitor)
         }
     }
-    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE)?;
+    let allowance = if presence {
+        PRESENCE_RESPONSE_OVERHEAD
+    } else {
+        0
+    };
+    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE + allowance)?;
     let prefix: Preflight<'_> = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if bytes.len() as u64 > MAX_DUPLEX_MESSAGE && (!presence || prefix.kind != "complete") {
+        return Err("native extension frame exceeds 16 MiB".into());
+    }
     if prefix.kind == "call"
         && let Some(calls) = prefix.calls
     {
@@ -2328,8 +2412,12 @@ fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> 
             .map_err(|error| format!("invalid native extension frame: {error}"))?;
         return Ok(DuplexFrame::CheckedCall { calls });
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid native extension frame: {error}"))
+    let frame: DuplexFrame = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if presence && let DuplexFrame::Complete { response } = &frame {
+        check_presence_response(response, MAX_DUPLEX_MESSAGE, true, bytes.ends_with(b"\n"))?;
+    }
+    Ok(frame)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2448,6 +2536,14 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     {
         *result = endpoint.project_outcome(result);
     }
+    let presence = matches!(
+        &request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -2466,7 +2562,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = read_duplex_frame(&mut output);
+            let frame = read_duplex_frame_with_presence(&mut output, presence);
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
@@ -2768,6 +2864,14 @@ impl ToolHost for RemoteHost {
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
     let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
+    let presence = matches!(
+        &request.request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
@@ -2785,7 +2889,21 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         .io
         .lock()
         .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
-    duplex_write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
+    if presence {
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true)
+            .map_err(Error::Config)?;
+    }
+    write_bounded_line(
+        &mut io.1,
+        &DuplexFrame::Complete { response },
+        MAX_DUPLEX_MESSAGE
+            + if presence {
+                PRESENCE_RESPONSE_OVERHEAD
+            } else {
+                0
+            },
+    )
+    .map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -2992,51 +3110,12 @@ fn call<T: serde::de::DeserializeOwned>(
         return Err("unsupported native extension protocol version".into());
     }
     if presence_response {
-        // Only the wrapper gets extra bytes; the equivalent legacy envelope
-        // must still fit the original limit. Count without copying the value.
-        #[derive(Serialize)]
-        struct LegacyEnvelope<'a> {
-            version: u16,
-            response: std::result::Result<&'a Value, &'a String>,
-        }
-        struct Counter {
-            length: u64,
-            limit: u64,
-        }
-        impl Write for Counter {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.length = self.length.saturating_add(data.len() as u64);
-                if self.length > self.limit {
-                    return Err(std::io::Error::other("response limit exceeded"));
-                }
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let response = match &envelope.response {
-            Ok(value) => Ok(value.get("outcome").ok_or("invalid presence response")?),
-            Err(error) => Err(error),
-        };
-        let mut counter = Counter {
-            length: u64::from(bytes.ends_with(b"\n")),
-            limit: legacy_response_limit,
-        };
-        if serde_json::to_writer(
-            &mut counter,
-            &LegacyEnvelope {
-                version: envelope.version,
-                response,
-            },
-        )
-        .is_err()
-        {
-            return Err(format!(
-                "native extension response exceeds {} MiB",
-                legacy_response_limit / (1024 * 1024)
-            ));
-        }
+        check_presence_response(
+            &envelope.response,
+            legacy_response_limit,
+            false,
+            bytes.ends_with(b"\n"),
+        )?;
     }
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
@@ -5761,6 +5840,90 @@ else:
                 );
             }
         }
+    }
+
+    #[test]
+    fn duplex_presence_wrapper_preserves_complete_frame_boundary() {
+        let empty = Outcome::Succeeded(String::new());
+        let frame = |outcome: &Outcome| DuplexFrame::Complete {
+            response: Ok(serde_json::to_value(outcome).unwrap()),
+        };
+        let mut original = Vec::new();
+        duplex_write_line(&mut original, &frame(&empty)).unwrap();
+        let count = MAX_DUPLEX_MESSAGE as usize - original.len();
+        let outcome = Outcome::Succeeded("x".repeat(count));
+        original.clear();
+        duplex_write_line(&mut original, &frame(&outcome)).unwrap();
+        assert_eq!(original.len() as u64, MAX_DUPLEX_MESSAGE);
+        assert!(matches!(
+            read_duplex_frame(&mut std::io::Cursor::new(&original)),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        drop(original);
+
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(outcome),
+            output_unchanged: Some(false),
+        })
+        .unwrap());
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).unwrap();
+        let wrapped = DuplexFrame::Complete { response };
+        assert!(duplex_write_line(&mut std::io::sink(), &wrapped).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &wrapped,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD
+        );
+        assert!(matches!(
+            read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        assert!(read_duplex_frame(&mut std::io::Cursor::new(&bytes)).is_err());
+        drop(bytes);
+        drop(wrapped);
+
+        // A shorter boolean wrapper must not admit a one-byte oversized outcome.
+        let oversized = Outcome::Succeeded("x".repeat(count + 1));
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(oversized),
+            output_unchanged: Some(true),
+        })
+        .unwrap());
+        assert!(check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &DuplexFrame::Complete { response },
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
+        drop(bytes);
+
+        // The allowance never applies to progress or other nonterminal frames.
+        let empty_progress = DuplexFrame::Progress {
+            partial_result: serde_json::json!(""),
+        };
+        let mut bytes = Vec::new();
+        duplex_write_line(&mut bytes, &empty_progress).unwrap();
+        let progress_size = MAX_DUPLEX_MESSAGE as usize + 1 - bytes.len();
+        let frame = DuplexFrame::Progress {
+            partial_result: serde_json::json!("x".repeat(progress_size)),
+        };
+        bytes.clear();
+        write_bounded_line(
+            &mut bytes,
+            &frame,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
     }
 
     #[cfg(unix)]
