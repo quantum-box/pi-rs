@@ -1,8 +1,205 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
+
+// Handle each accepted connection independently so an idle connection cannot
+// prevent the actual HTTP request from reaching its assertions.
+fn serve_connection(
+    mut socket: TcpStream,
+    discovery: i32,
+    expected: &str,
+    level: &str,
+    stopping: &AtomicBool,
+) -> bool {
+    // Windows inherits the listener's nonblocking mode on accept.
+    // The buffered HTTP reader below relies on blocking reads.
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => return false,
+        Ok(_) => {}
+        Err(_) if stopping.load(Ordering::Acquire) => return false,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return false;
+        }
+        Err(error) => panic!("read request line: {error}"),
+    }
+    if !line.ends_with('\n') {
+        return false;
+    }
+    let request = line.clone();
+    let mut length = 0;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().unwrap();
+        }
+    }
+    if request.starts_with("GET ") {
+        if discovery != 0 {
+            let capabilities = if discovery == 3 {
+                json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}})
+            } else if discovery == 4 {
+                json!({})
+            } else {
+                json!({"thinking":{"supported":false}})
+            };
+            let model = json!({"id":"fixture-model","max_tokens":4096,"max_input_tokens":200000,"capabilities":capabilities});
+            let body = if request.contains("/models?") {
+                json!({"data":[model],"has_more":false}).to_string()
+            } else {
+                model.to_string()
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        } else {
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        }
+        return false;
+    }
+    assert!(request.starts_with("POST /v1/messages "), "{request}");
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes).unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    if discovery != 0 {
+        assert_eq!(body["max_tokens"], 4096);
+    }
+    if expected == "budgeted" {
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(
+            body["thinking"]["budget_tokens"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        if level == "low" {
+            assert_eq!(body["thinking"]["budget_tokens"], 2048);
+        }
+    } else if expected == "disabled" {
+        assert!(body.get("thinking").is_none());
+    } else {
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], expected);
+    }
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"fixture-model\"}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    true
+}
+
+fn serve_fixture(
+    listener: TcpListener,
+    discovery: i32,
+    expected: &str,
+    level: &str,
+    accepted: Option<mpsc::Sender<()>>,
+    timeout: Duration,
+    max_connections: usize,
+) {
+    let deadline = Instant::now() + timeout;
+    let (sender, receiver) = mpsc::channel();
+    let mut sockets = Vec::new();
+    let mut workers = Vec::new();
+    let mut completed = false;
+    let mut failure = None;
+    let mut accept_error = None;
+    let stopping = Arc::new(AtomicBool::new(false));
+    loop {
+        while let Ok(result) = receiver.try_recv() {
+            match result {
+                Ok(true) => completed = true,
+                Ok(false) => {}
+                Err(error) => failure = Some(error),
+            }
+        }
+        if completed || failure.is_some() || Instant::now() >= deadline {
+            break;
+        }
+        if workers.len() < max_connections {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    let control = socket.try_clone().unwrap();
+                    sockets.push(control);
+                    let sender = sender.clone();
+                    let stopping = stopping.clone();
+                    let expected = expected.to_owned();
+                    let level = level.to_owned();
+                    workers.push(std::thread::spawn(move || {
+                        let result = std::panic::catch_unwind(|| {
+                            serve_connection(socket, discovery, &expected, &level, &stopping)
+                        });
+                        let _ = sender.send(result);
+                    }));
+                    if let Some(accepted) = &accepted {
+                        let _ = accepted.send(());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    accept_error = Some(error);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Interrupt idle readers before joining, including on timeout or assertion failure.
+    stopping.store(true, Ordering::Release);
+    for socket in &sockets {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    while let Ok(result) = receiver.try_recv() {
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    }
+    if let Some(error) = failure {
+        std::panic::resume_unwind(error);
+    }
+    if let Some(error) = accept_error {
+        panic!("accept model request: {error}");
+    }
+    assert!(
+        completed,
+        "model request was not received before fixture deadline (max {max_connections} connections)"
+    );
+}
 
 #[test]
 fn configured_thinking_controls_wire_without_models_api() {
@@ -38,97 +235,15 @@ fn configured_thinking_controls_wire_without_models_api() {
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                let mut socket = match listener.accept() {
-                    Ok((socket, _)) => socket,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("accept model request: {error}"),
-                };
-                // Windows inherits the listener's nonblocking mode on accept.
-                // The buffered HTTP reader below relies on blocking reads.
-                socket.set_nonblocking(false).unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                let mut reader = BufReader::new(socket.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let request = line.clone();
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap();
-                    }
-                }
-                if request.starts_with("GET ") {
-                    if discovery != 0 {
-                        let capabilities = if discovery == 3 {
-                            json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true},"disabled":{"supported":true}}},"effort":{"low":{"supported":true},"high":{"supported":true}}})
-                        } else if discovery == 4 {
-                            json!({})
-                        } else {
-                            json!({"thinking":{"supported":false}})
-                        };
-                        let model = json!({"id":"fixture-model","max_tokens":4096,"max_input_tokens":200000,"capabilities":capabilities});
-                        let body = if request.contains("/models?") {
-                            json!({"data":[model],"has_more":false}).to_string()
-                        } else {
-                            model.to_string()
-                        };
-                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                    } else {
-                        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                    }
-                    continue;
-                }
-                assert!(request.starts_with("POST /v1/messages "), "{request}");
-                let mut bytes = vec![0; length];
-                reader.read_exact(&mut bytes).unwrap();
-                let body: Value = serde_json::from_slice(&bytes).unwrap();
-                if discovery != 0 {
-                    assert_eq!(body["max_tokens"], 4096);
-                }
-                if expected == "budgeted" {
-                    assert_eq!(body["thinking"]["type"], "enabled");
-                    assert!(
-                        body["thinking"]["budget_tokens"]
-                            .as_u64()
-                            .is_some_and(|value| value > 0)
-                    );
-                    if level == "low" {
-                        assert_eq!(body["thinking"]["budget_tokens"], 2048);
-                    }
-                } else if expected == "disabled" {
-                    assert!(body.get("thinking").is_none());
-                } else {
-                    assert_eq!(body["thinking"]["type"], "adaptive");
-                    assert_eq!(body["output_config"]["effort"], expected);
-                }
-                let events = concat!(
-                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"fixture-model\"}}\n\n",
-                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
-                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
-                    "data: {\"type\":\"message_stop\"}\n\n"
-                );
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
-                break;
-            }
+            serve_fixture(
+                listener,
+                discovery,
+                expected,
+                level,
+                None,
+                Duration::from_secs(20),
+                32,
+            )
         });
         let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
         command
@@ -176,4 +291,78 @@ fn configured_thinking_controls_wire_without_models_api() {
         server.join().unwrap();
         assert!(status.success(), "configured model request failed");
     }
+}
+
+#[test]
+fn idle_connection_does_not_block_following_model_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, received) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            Some(accepted),
+            Duration::from_secs(15),
+            32,
+        )
+    });
+    let idle = TcpStream::connect(address).unwrap();
+    received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut partial = TcpStream::connect(address).unwrap();
+    partial.write_all(b"GET /v1/").unwrap();
+    received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut request = TcpStream::connect(address).unwrap();
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"thinking":{"type":"enabled","budget_tokens":1000}}"#;
+    write!(
+        request,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    request.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("message_stop"));
+    server.join().unwrap();
+    drop((idle, partial));
+}
+
+#[test]
+fn fixture_limits_connections_and_finishes_at_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, received) = mpsc::channel();
+    let start = Instant::now();
+    let server = std::thread::spawn(move || {
+        serve_fixture(
+            listener,
+            0,
+            "budgeted",
+            "high",
+            Some(accepted),
+            Duration::from_secs(1),
+            1,
+        )
+    });
+    let idle = TcpStream::connect(address).unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _queued = TcpStream::connect(address).unwrap();
+    assert!(
+        server.join().is_err(),
+        "fixture must fail when no model request arrives"
+    );
+    assert!(
+        received.try_recv().is_err(),
+        "only one connection may be accepted"
+    );
+    assert!(start.elapsed() < Duration::from_secs(10));
+    drop(idle);
 }
