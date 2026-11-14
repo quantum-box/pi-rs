@@ -7365,17 +7365,11 @@ impl EditorJobSupervisor {
                     // Give a managing shell time to take the terminal. Keep
                     // waiting while it owns the terminal, including a long
                     // stopped job; foregrounding Pi permits resumption.
+                    let mut shell_owned_terminal = false;
                     for attempt in 0.. {
-                        let mut delay = if attempt == 0 {
-                            libc::timespec {
-                                tv_sec: 1,
-                                tv_nsec: 0,
-                            }
-                        } else {
-                            libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: 250_000_000,
-                            }
+                        let mut delay = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 10_000_000,
                         };
                         let mut remaining: libc::timespec = std::mem::zeroed();
                         while libc::nanosleep(&delay, &mut remaining) != 0 {
@@ -7386,7 +7380,14 @@ impl EditorJobSupervisor {
                         {
                             break;
                         }
-                        if libc::tcgetpgrp(tty) == group {
+                        if libc::tcgetpgrp(tty) != group {
+                            shell_owned_terminal = true;
+                            // A shell's `bg` resumes the entire job. Stop it
+                            // again while the shell still owns the terminal.
+                            if libc::kill(-group, libc::SIGSTOP) != 0 {
+                                break;
+                            }
+                        } else if shell_owned_terminal || attempt >= 99 {
                             libc::kill(-group, libc::SIGCONT);
                             let done = 1u8;
                             libc::write(response[1], (&done as *const u8).cast(), 1);
@@ -8090,7 +8091,8 @@ mod tests {
         const SUPERVISOR: &str = "PI_RS_EDITOR_TEST_SUPERVISOR";
         let managed = suspend && !shared_group && !test_name.contains("without_supervisor");
         let plain_launcher = test_name.contains("without_job_control_launcher");
-        let worker_case = test_name.contains("pauses_owned_worker");
+        let background_case = test_name.contains("background_job_restops_workers");
+        let worker_case = test_name.contains("pauses_owned_worker") || background_case;
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -8122,6 +8124,42 @@ mod tests {
                     before,
                     "worker advanced while Pi was stopped"
                 );
+            }
+            if background_case {
+                let shell_group = unsafe { libc::getpgrp() };
+                super::set_foreground(0, shell_group).unwrap();
+                assert_eq!(
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT) },
+                    0
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let result = unsafe {
+                        libc::waitpid(
+                            child.id() as libc::pid_t,
+                            &mut status,
+                            libc::WUNTRACED | libc::WNOHANG,
+                        )
+                    };
+                    assert!(result >= 0, "waitpid failed");
+                    if result > 0 && libc::WIFSTOPPED(status) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "background job was not stopped again"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let marker = std::path::PathBuf::from(&program).with_extension("worker");
+                let before = std::fs::read(&marker).unwrap().len();
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(
+                    std::fs::read(&marker).unwrap().len(),
+                    before,
+                    "worker advanced while backgrounded"
+                );
+                assert_eq!(unsafe { libc::tcgetpgrp(0) }, shell_group);
             }
             if test_name.contains("supervisor_retains_terminal") {
                 let shell_group = unsafe { libc::getpgrp() };
@@ -8472,6 +8510,16 @@ mod tests {
     fn stopped_editor_pauses_owned_worker_until_resume() {
         editor_pty_regression(
             "interactive::tests::stopped_editor_pauses_owned_worker_until_resume",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_background_job_restops_workers_until_foreground() {
+        editor_pty_regression(
+            "interactive::tests::editor_background_job_restops_workers_until_foreground",
             true,
             false,
         );
