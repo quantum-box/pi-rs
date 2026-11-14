@@ -816,6 +816,21 @@ impl Model for Ollama {
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
+            if matches!(status.as_u16(), 400 | 422) {
+                let overflow = pi_rs_core::provider_context_overflow_stream(
+                    response.bytes_stream(),
+                    &error_secrets,
+                )
+                .await;
+                return Err(Error::Model(if overflow {
+                    "context window exceeded".into()
+                } else {
+                    description
+                }));
+            }
             let permanent_quota = (matches!(status.as_u16(), 408 | 429)
                 || status.is_server_error())
                 && pi_rs_core::permanent_provider_limit(response.bytes_stream(), &error_secrets)
@@ -913,6 +928,8 @@ impl Model for Ollama {
                         Error::Model("Chat Completions account quota or billing limit reached".into())
                     } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("provider returned a transient stream error".into())
+                    } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
+                        Error::Model("context window exceeded".into())
                     } else {
                         Error::Model("provider returned a stream error".into())
                     })?;

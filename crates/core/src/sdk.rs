@@ -1774,7 +1774,11 @@ impl AgentSession {
             None => None,
         };
         let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())))
+            .start_with_fallback(
+                Some((model.clone(), provider.clone(), name.clone())),
+                true,
+                false,
+            )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
@@ -2137,7 +2141,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None).await?;
+        let (_, error) = self.start_with_fallback(None, true, false).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -2147,11 +2151,18 @@ impl AgentSession {
     async fn start_with_fallback(
         &mut self,
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+        drain_triggers: bool,
+        defer_startup: bool,
     ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before startup".into(),
+            ));
+        }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -2202,7 +2213,11 @@ impl AgentSession {
                 self.restore_branch_model(provider.as_deref(), name)?;
             }
         }
-        let startup = self.pending_start.lock().expect("session startup").take();
+        let startup = if defer_startup {
+            None
+        } else {
+            self.pending_start.lock().expect("session startup").take()
+        };
         let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
@@ -2225,7 +2240,8 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
@@ -2393,7 +2409,7 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.journal()?.fork_records_after_handoff(record)?)?;
+        let session = self.journal()?.fork_session_after_handoff(record)?;
         let resolution = self.resolve_branch_model(&session, session.head())?;
         self.fork_snapshot(session, resolution)
     }
@@ -2411,8 +2427,7 @@ impl AgentSession {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
-        let records = journal.fork_records_after_handoff(record)?;
-        let snapshot = Session::from_records(records)?;
+        let snapshot = journal.fork_session_after_handoff(record)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.fork_snapshot_to(snapshot, resolution, &destination)
@@ -2458,7 +2473,7 @@ impl AgentSession {
             }
         };
         let target = journal.fork_target_after_handoff(target)?;
-        let snapshot = Session::from_records(journal.fork_records_after_handoff(target)?)?;
+        let snapshot = journal.fork_session_after_handoff(target)?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.start().await?;
@@ -2482,7 +2497,7 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
-        let snapshot = Session::from_records(self.journal()?.fork_records_after_handoff(target)?)?;
+        let snapshot = self.journal()?.fork_session_after_handoff(target)?;
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -2604,8 +2619,15 @@ impl AgentSession {
     }
 
     pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, &mut |_| {})
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
     }
     /// Submit text and images as one durable user message.
     pub async fn prompt_with_images(
@@ -2618,6 +2640,7 @@ impl AgentSession {
             Some(images),
             Uuid::new_v4(),
             true,
+            false,
             &mut |_| {},
         )
         .await
@@ -2627,11 +2650,79 @@ impl AgentSession {
         input: impl Into<String>,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, observer)
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            observer,
+        )
+        .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        self.run(None, Uuid::new_v4(), &mut |_| {}).await
+        let recovery = {
+            let journal = self.journal_async().await;
+            crate::agent::resumable_compaction_run(&journal)
+        };
+        let (_, startup_error) = self
+            .start_with_fallback(None, false, recovery.is_some())
+            .await?;
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
+        if recovery.as_ref().is_some_and(|(_, model, _)| {
+            model
+                .as_ref()
+                .is_some_and(|model| model != &self.model_name)
+        }) {
+            return Err(Error::Session(
+                "pending compaction recovery requires its original model".into(),
+            ));
+        }
+        if let Some((run_id, _, _)) = recovery.as_ref()
+            && !self.registry.extensions.is_empty()
+        {
+            let journal = self.journal_async().await;
+            let agent = Agent {
+                model: self.model.as_ref(),
+                model_name: &self.model_name,
+                registry: &self.registry,
+                system_prompt: &self.system_prompt,
+                limits: self.limits.clone(),
+            };
+            agent
+                .settle_recovery_before_hooks(&journal, *run_id)
+                .await?;
+            return Err(Error::Session(
+                "pending compaction recovery requires reconciliation after extensions changed"
+                    .into(),
+            ));
+        }
+        let run_id = recovery.map(|(run_id, _, _)| run_id);
+        if run_id.is_none() {
+            self.drain_idle_triggers().await?;
+        }
+        let result = self
+            .run_input(
+                None,
+                None,
+                run_id.unwrap_or_else(Uuid::new_v4),
+                false,
+                true,
+                &mut |_| {},
+            )
+            .await;
+        if result.is_ok() && run_id.is_some() {
+            let unresolved = {
+                let journal = self.journal_async().await;
+                crate::agent::resumable_compaction_run(&journal).is_some()
+            };
+            if !unresolved {
+                self.start().await?;
+            }
+        }
+        result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -2640,7 +2731,8 @@ impl AgentSession {
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(input, None, run_id, false, observer).await
+        self.run_input(input, None, run_id, false, false, observer)
+            .await
     }
     async fn run_input(
         &mut self,
@@ -2648,9 +2740,12 @@ impl AgentSession {
         mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         prepare: bool,
+        already_started: bool,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.start().await?;
+        if !already_started {
+            self.start().await?;
+        }
         let journal_owner = self
             .control
             .owner
@@ -9026,6 +9121,840 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    struct ResumeSettlementModel {
+        summary_id: Uuid,
+        attempts: std::sync::Mutex<Vec<(Uuid, crate::UsageReport, crate::ModelMetadata)>>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for ResumeSettlementModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            id: Uuid,
+            usage: &crate::UsageReport,
+            metadata: &crate::ModelMetadata,
+        ) -> Result<()> {
+            if id == self.summary_id {
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push((id, usage.clone(), metadata.clone()));
+                if attempts.len() == 1 {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_reopens_and_settles_saved_overflow_summaries() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resume.jsonl");
+            let run_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            let steering_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal.select_model("fixture", None).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            let boundary = journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap()
+                .id;
+            if silent {
+                journal
+                    .append(Event::ModelRequested {
+                        model: "fixture".into(),
+                        messages: 1,
+                        tools: 0,
+                        max_output_tokens: 16,
+                        request_id: Some(turn_id),
+                        context_head: None,
+                        context_sha256: None,
+                        context_transformed: None,
+                        context_configuration_sha256: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: turn_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            advertised_tools: vec![],
+                            max_output_tokens: 16,
+                        }),
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        usage: Some(crate::Usage {
+                            input_tokens: 1001,
+                            output_tokens: 2,
+                        }),
+                        request_id: Some(turn_id),
+                    })
+                    .unwrap();
+            }
+            journal
+                .append(Event::SourceEntry {
+                    format: if silent {
+                        "pi-rs:silent-overflow"
+                    } else {
+                        "pi-rs:overflow-recovery"
+                    }
+                    .into(),
+                    entry: serde_json::json!({"requestId":turn_id}),
+                })
+                .unwrap();
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 9,
+                            output_tokens: 3,
+                        },
+                    },
+                    failure: None,
+                    partial: "saved summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            if !silent {
+                journal
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "after recovery".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            drop(journal);
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let limits = Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            };
+            // Startup would append immediate context; recovery must be
+            // classified before this callback can invalidate the summary.
+            let guarded_model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .start()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .prompt("new prompt")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reconciliation")
+            );
+            assert!(
+                !guarded
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::CustomMessage { message, .. } if message.custom_type == "lifecycle"))
+            );
+            assert_eq!(guarded_model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(guarded_model.attempts.lock().unwrap().len(), 2);
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert!(
+                !session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+            drop(session);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits)
+                .open(&path)
+                .unwrap();
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            {
+                let attempts = model.attempts.lock().unwrap();
+                assert_eq!(attempts.len(), 2);
+                assert!(attempts.iter().all(|(id, usage, metadata)| *id == summary_id && matches!(usage, crate::UsageReport::Measured { usage } if usage.input_tokens == 9 && usage.output_tokens == 3) && metadata.finish_reason.as_deref() == Some("stop")));
+            }
+            assert!(session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+            if !silent {
+                let journal = session.journal().unwrap();
+                let compacted = journal.records().iter().position(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")).unwrap();
+                let delivered = journal.records().iter().position(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)).unwrap();
+                assert!(compacted < delivered);
+            }
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_handles_interrupted_compaction_markers_without_duplicate_requests() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            for started in [false, true] {
+                let summary_id = Uuid::new_v4();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("interrupted.jsonl");
+                let run_id = Uuid::new_v4();
+                let turn_id = Uuid::new_v4();
+                let mut journal = Session::open(&path).unwrap();
+                journal
+                    .append(Event::User {
+                        content: "old".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "old reply".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: None,
+                    })
+                    .unwrap();
+                journal.set_run_id(Some(run_id));
+                journal
+                    .append(Event::Run {
+                        state: RunState::Running,
+                        initial: Some("new".into()),
+                    })
+                    .unwrap();
+                let boundary = journal
+                    .append(Event::User {
+                        content: "new".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap()
+                    .id;
+                if silent {
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(turn_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::ModelFinished {
+                            request_id: turn_id,
+                            metadata: Default::default(),
+                            usage: crate::UsageReport::Measured {
+                                usage: crate::Usage {
+                                    input_tokens: 1001,
+                                    output_tokens: 2,
+                                },
+                            },
+                            failure: None,
+                            partial: String::new(),
+                            reply: Some(RecordedReply {
+                                content: "answer".into(),
+                                invocations: vec![],
+                                advertised_tools: vec![],
+                                max_output_tokens: 16,
+                            }),
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::Assistant {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            }),
+                            request_id: Some(turn_id),
+                        })
+                        .unwrap();
+                }
+                journal
+                    .append(Event::SourceEntry {
+                        format: if silent {
+                            "pi-rs:silent-overflow"
+                        } else {
+                            "pi-rs:overflow-recovery"
+                        }
+                        .into(),
+                        entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                if started {
+                    journal.append(Event::SourceEntry { format: "pi-rs:overflow-retention-v1".into(), entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}) }).unwrap();
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(summary_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                }
+                let trigger = Uuid::new_v4();
+                let steering_id = Uuid::new_v4();
+                if started && !silent {
+                    journal
+                        .append(Event::InputQueued {
+                            input: crate::QueuedInput {
+                                id: steering_id,
+                                kind: crate::InputKind::Steer,
+                                content: "queued steering".into(),
+                            },
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::CustomMessageQueued {
+                            input: crate::QueuedCustomMessage {
+                                id: trigger,
+                                delivery: crate::CustomMessageDelivery::TriggerTurn,
+                                message: crate::CustomMessage {
+                                    custom_type: "queued".into(),
+                                    content: crate::ContextContent::Text("later".into()),
+                                    display: false,
+                                    details: None,
+                                },
+                            },
+                        })
+                        .unwrap();
+                }
+                drop(journal);
+                let model = Arc::new(ResumeSettlementModel {
+                    summary_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let mut session = SessionBuilder::new(model.clone(), "fixture")
+                    .limits(Limits {
+                        context_window: if silent && !started { None } else { Some(1000) },
+                        output_tokens_per_request: 16,
+                        model_requests: 3,
+                        compaction_tokens: Some(crate::CompactionTokens {
+                            reserve_tokens: Some(0),
+                            keep_recent_tokens: None,
+                        }),
+                        ..Limits::default()
+                    })
+                    .open(&path)
+                    .unwrap();
+                if silent && started {
+                    session
+                        .controls()
+                        .set_auto_compaction_enabled(false)
+                        .unwrap();
+                }
+                if started {
+                    assert!(
+                        session
+                            .resume()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settlement unavailable")
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+                }
+                let result = session.resume().await;
+                if silent {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                } else if started {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("requires reconciliation")
+                    );
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        model
+                            .attempts
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed))
+                    );
+                    assert_eq!(model.attempts.lock().unwrap().len(), 2);
+                    assert!(
+                        session
+                            .journal()
+                            .unwrap()
+                            .queued_inputs()
+                            .iter()
+                            .any(|input| input.input.id == steering_id)
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
+                    assert_eq!(
+                        session.journal().unwrap().pending_custom_trigger(),
+                        Some(trigger)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+                }
+                session.close().await.unwrap();
+                drop(session);
+                if silent {
+                    let mut reopened = SessionBuilder::new(model.clone(), "fixture")
+                        .limits(Limits {
+                            context_window: Some(1000),
+                            output_tokens_per_request: 16,
+                            model_requests: 3,
+                            compaction_tokens: Some(crate::CompactionTokens {
+                                reserve_tokens: Some(0),
+                                keep_recent_tokens: None,
+                            }),
+                            ..Limits::default()
+                        })
+                        .open(&path)
+                        .unwrap();
+                    assert_eq!(reopened.prompt("next").await.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    {
+                        let attempts = model.attempts.lock().unwrap();
+                        if started {
+                            assert_eq!(attempts.len(), 2);
+                            assert!(attempts.iter().all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed)));
+                        } else {
+                            assert!(attempts.is_empty());
+                        }
+                    }
+                    reopened.close().await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_recovers_overflow_before_marker_without_resending_turn() {
+        use crate::journal::{Event, ModelFailure, RecordedReply, RunState};
+        for length in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("before-marker.jsonl");
+            let run_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            // A completed compaction from an earlier turn of the same run
+            // must not hide a later pre-marker overflow.
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            journal
+                .append(Event::Compacted {
+                    summary: "earlier summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "intervening turn".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "intervening answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some(
+                            if length {
+                                "length"
+                            } else {
+                                "pi-rs:context-overflow"
+                            }
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                    usage: if length {
+                        crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 20,
+                                output_tokens: 2,
+                            },
+                        }
+                    } else {
+                        crate::UsageReport::Unconfirmed
+                    },
+                    failure: (!length).then_some(ModelFailure::Failed),
+                    partial: String::new(),
+                    reply: length.then(|| RecordedReply {
+                        content: "partial".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: 16,
+                    }),
+                })
+                .unwrap();
+            drop(journal);
+            for disabled in [false, true] {
+                let gate_path = dir.path().join(format!("gate-{disabled}.jsonl"));
+                std::fs::copy(&path, &gate_path).unwrap();
+                let gate_model = Arc::new(ResumeSettlementModel {
+                    summary_id: request_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let limits = Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..Limits::default()
+                };
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits.clone())
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                assert!(
+                    gated
+                        .resume()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("settlement unavailable")
+                );
+                gated.close().await.unwrap();
+                drop(gated);
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits)
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                let _ = gated.resume().await;
+                assert_eq!(gate_model.attempts.lock().unwrap().len(), 2);
+                assert_eq!(gate_model.calls.load(Ordering::SeqCst), 0);
+                gated.close().await.unwrap();
+            }
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id: request_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: 3,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                2,
+                "only summary and retry may call the model"
+            );
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+        }
+    }
+
+    struct SilentFailureModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for SilentFailureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            if request.messages.iter().any(|message| matches!(message, crate::Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                return Err(Error::Model("summary failed".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: if call == 0 { 1001 } else { 1 },
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_compaction_failure_does_not_block_the_next_prompt() {
+        for model_requests in [1, 3] {
+            let model = Arc::new(SilentFailureModel(AtomicUsize::new(0)));
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .append(crate::Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .build(journal)
+                .unwrap();
+            assert_eq!(session.prompt("new").await.unwrap(), "answer");
+            assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+            assert_eq!(session.prompt("next").await.unwrap(), "answer");
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                if model_requests == 1 { 2 } else { 3 }
+            );
+            session.close().await.unwrap();
         }
     }
 

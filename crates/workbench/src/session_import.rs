@@ -84,12 +84,7 @@ pub fn read(path: &Path) -> Result<Session> {
     {
         import_pi(entries)
     } else {
-        Session::from_records(
-            entries
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        )
+        Session::from_serialized_records(entries)
     }
 }
 
@@ -350,6 +345,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         records: Vec::new(),
         timestamp: header["timestamp"].as_str().map(str::to_owned),
     };
+    let mut compaction_metadata = BTreeMap::new();
     let mut root = Branch::default();
     let native_id = external_id
         .and_then(|id| Uuid::parse_str(id).ok())
@@ -454,6 +450,15 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             &mut branch,
             &branches,
         )?;
+        let extra_compaction_metadata = (entry["type"] == "compaction"
+            && (entry.get("details").is_some() || entry["fromHook"] == true))
+            .then(|| {
+                let mut metadata = serde_json::json!({"fromExtension": entry["fromHook"] == true});
+                if let Some(details) = entry.get("details") {
+                    metadata["details"] = details.clone();
+                }
+                metadata
+            });
         importer.append(
             &mut branch,
             Event::SourceEntry {
@@ -464,6 +469,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         branch.entry_start = branch.head + u64::from(!events.is_empty());
         branch.context_target = None;
         for event in events {
+            let is_compaction = matches!(event, Event::Compacted { .. });
             let context = matches!(
                 event,
                 Event::User { .. }
@@ -474,6 +480,9 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                     | Event::ToolReconciled { .. }
             );
             let id = importer.append(&mut branch, event);
+            if is_compaction && let Some(metadata) = &extra_compaction_metadata {
+                compaction_metadata.insert(id, metadata.clone());
+            }
             if context {
                 branch.context_target = Some(id);
             }
@@ -482,7 +491,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         legacy_ids.push(id.clone());
         previous = Some(id);
     }
-    Session::from_records(importer.records)
+    Session::from_records_with_metadata(importer.records, compaction_metadata)
 }
 fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
@@ -1086,6 +1095,28 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+
+    #[test]
+    fn imported_compaction_metadata_survives_native_export_and_reload() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","tokensBefore":42,"fromHook":true,"details":{"source":"extension"}}),
+        ]).unwrap();
+        let id = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let expected = json!({"fromExtension":true,"details":{"source":"extension"}});
+        assert_eq!(session.record_metadata(id), Some(&expected));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let restored = read(&path).unwrap();
+        assert_eq!(restored.record_metadata(id), Some(&expected));
+    }
 
     #[test]
     fn imported_history_keeps_legacy_version_and_accepts_native_appends() {

@@ -479,20 +479,66 @@ pub enum OperationState {
 pub trait SessionStore: Send {
     fn load(&mut self) -> Result<Vec<Record>>;
     fn append(&mut self, record: &Record) -> Result<()>;
+
+    /// Whether this store supports atomic auxiliary record metadata.
+    fn supports_record_metadata(&self) -> bool {
+        false
+    }
+
+    /// Load auxiliary data committed atomically with records. Legacy stores
+    /// need not implement this until they support metadata-bearing records.
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(BTreeMap::new())
+    }
+
+    /// Atomically commit a record and its optional auxiliary data. Legacy
+    /// stores fail closed instead of silently discarding metadata.
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        if metadata.is_some() {
+            return Err(Error::Session(
+                "session store does not support record metadata".into(),
+            ));
+        }
+        self.append(record)
+    }
 }
 
 #[derive(Default)]
 pub struct MemoryStore {
     records: Vec<Record>,
+    metadata: BTreeMap<u64, serde_json::Value>,
 }
 
 impl SessionStore for MemoryStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
         Ok(self.records.clone())
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
         self.records.push(record.clone());
+        Ok(())
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(self.metadata.clone())
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.records.push(record.clone());
+        if let Some(metadata) = metadata {
+            self.metadata.insert(record.id, metadata.clone());
+        }
         Ok(())
     }
 }
@@ -502,12 +548,16 @@ pub struct Session {
     retry: crate::RetryControl,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
+    record_metadata: BTreeMap<u64, serde_json::Value>,
     head: u64,
     run_id: Option<Uuid>,
     poisoned: bool,
 }
 
 impl Session {
+    pub fn supports_record_metadata(&self) -> bool {
+        self.store.supports_record_metadata()
+    }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
     }
@@ -550,20 +600,60 @@ impl Session {
     pub fn snapshot(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         let length = file.metadata()?.len();
-        let (records, _, _) = read_complete_records(file.take(length))?;
+        let (records, metadata, _, _) = read_complete_records(file.take(length))?;
         if records.is_empty() {
             return Err(Error::Session("journal has no committed header".into()));
         }
-        Self::from_records(records)
+        Self::with_store(MemoryStore { records, metadata })
     }
 
     /// Restore a validated, in-memory snapshot without mutating its source.
+    /// `Record` does not contain auxiliary metadata; use
+    /// `from_records_with_metadata` when the source includes it.
     pub fn from_records(records: Vec<Record>) -> Result<Self> {
-        Self::with_store(MemoryStore { records })
+        Self::with_store(MemoryStore {
+            records,
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// Restore records together with their atomic auxiliary metadata.
+    pub fn from_records_with_metadata(
+        records: Vec<Record>,
+        metadata: BTreeMap<u64, serde_json::Value>,
+    ) -> Result<Self> {
+        Self::with_store(MemoryStore { records, metadata })
+    }
+
+    /// Restore serialized native records, preserving auxiliary metadata.
+    pub fn from_serialized_records(values: Vec<serde_json::Value>) -> Result<Self> {
+        let mut records = Vec::with_capacity(values.len());
+        let mut metadata = BTreeMap::new();
+        for value in values {
+            let legacy = legacy_compaction_metadata(&value);
+            let stored: PersistedRecord = serde_json::from_value(value)?;
+            if let Some(extra) = stored.metadata.or(legacy) {
+                metadata.insert(stored.record.id, extra);
+            }
+            records.push(stored.record);
+        }
+        Self::from_records_with_metadata(records, metadata)
     }
 
     pub fn with_store(mut store: impl SessionStore + 'static) -> Result<Self> {
         let mut records = store.load()?;
+        let record_metadata = store.load_record_metadata()?;
+        if record_metadata
+            .keys()
+            .any(|id| *id == 0 || *id > records.len() as u64)
+        {
+            return Err(Error::Session(
+                "record metadata references a missing record".into(),
+            ));
+        }
+        if record_metadata.values().any(serde_json::Value::is_null) {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
         let head = validated_head(&records)?;
         restore_imported_compaction_prompts(&mut records);
         let mut session = Self {
@@ -571,6 +661,7 @@ impl Session {
             retry: crate::RetryControl::default(),
             store: Box::new(store),
             records,
+            record_metadata,
             head,
             run_id: None,
             poisoned: false,
@@ -581,6 +672,11 @@ impl Session {
             })?;
         }
         Ok(session)
+    }
+
+    /// Return auxiliary metadata attached atomically to a journal record.
+    pub fn record_metadata(&self, id: u64) -> Option<&serde_json::Value> {
+        self.record_metadata.get(&id)
     }
 
     pub(crate) fn set_run_id(&mut self, run_id: Option<Uuid>) {
@@ -1605,6 +1701,27 @@ impl Session {
         Ok(records)
     }
 
+    pub(crate) fn fork_session_after_handoff(&self, requested: u64) -> Result<Self> {
+        let target = self.fork_target_after_handoff(requested)?;
+        let records = self.fork_records_after_handoff(requested)?;
+        let metadata = self
+            .path(target)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, original)| {
+                let forked = records.get(index)?;
+                (std::mem::discriminant(&original.event) == std::mem::discriminant(&forked.event))
+                    .then(|| {
+                        self.record_metadata
+                            .get(&original.id)
+                            .map(|value| (forked.id, value.clone()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        Self::from_records_with_metadata(records, metadata)
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -1918,6 +2035,8 @@ impl Session {
     }
 
     /// Export one settled branch with fresh session identity and remapped record references.
+    /// Auxiliary record metadata is not representable in this legacy return type;
+    /// use `fork_session` or `fork_to` when it must be preserved.
     pub fn fork_records(&self, target: u64) -> Result<Vec<Record>> {
         if self.host_binding().is_some() {
             return Err(Error::Session(
@@ -1964,6 +2083,17 @@ impl Session {
                 }
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
+                }
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    if let Some(old) = entry.get("boundary").and_then(serde_json::Value::as_u64) {
+                        if let Some(new) = ids.get(&old) {
+                            entry["boundary"] = serde_json::json!(new);
+                        } else if let Some(object) = entry.as_object_mut() {
+                            // A missing retained record must not become a valid
+                            // all-history boundary on recovery.
+                            object.remove("boundary");
+                        }
+                    }
                 }
                 Event::TreeTriggerHandoff { return_to, .. } => {
                     *return_to = *ids
@@ -2040,6 +2170,27 @@ impl Session {
         Ok(records)
     }
 
+    /// Fork a settled branch in memory, preserving auxiliary record metadata.
+    pub fn fork_session(&self, target: u64) -> Result<Self> {
+        let records = self.fork_records(target)?;
+        let metadata = self
+            .path(target)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, original)| {
+                let forked = records.get(index)?;
+                (std::mem::discriminant(&original.event) == std::mem::discriminant(&forked.event))
+                    .then(|| {
+                        self.record_metadata
+                            .get(&original.id)
+                            .map(|value| (forked.id, value.clone()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        Self::from_records_with_metadata(records, metadata)
+    }
+
     /// Publish a complete local journal without replacing an existing file.
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
         if self.host_binding().is_some() {
@@ -2047,7 +2198,7 @@ impl Session {
                 "managed sessions must be exported by their host".into(),
             ));
         }
-        publish_snapshot(&self.records, destination.as_ref())
+        publish_snapshot(&self.records, &self.record_metadata, destination.as_ref())
     }
 
     /// Publish an already validated in-memory fork and keep the same locked
@@ -2082,7 +2233,7 @@ impl Session {
         };
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         for record in &self.records {
-            let mut line = serde_json::to_vec(record)?;
+            let mut line = encode_record(record, self.record_metadata.get(&record.id))?;
             line.push(b'\n');
             if line.len() > MAX_RECORD_BYTES {
                 return Err(Error::Session("journal record exceeds size limit".into()));
@@ -2102,6 +2253,7 @@ impl Session {
         parent_dir.sync_all()?;
         self.store = Box::new(FileStore {
             file,
+            metadata: self.record_metadata.clone(),
             #[cfg(windows)]
             lock_file,
             #[cfg(unix)]
@@ -2112,8 +2264,8 @@ impl Session {
 
     /// Create and open an independent, persistent branch with fresh session identity.
     pub fn fork_to(&self, target: u64, destination: impl AsRef<Path>) -> Result<Self> {
-        let records = self.fork_records(target)?;
-        publish_snapshot(&records, destination.as_ref())?;
+        let fork = self.fork_session(target)?;
+        publish_snapshot(&fork.records, &fork.record_metadata, destination.as_ref())?;
         Self::open(destination)
     }
 
@@ -2204,9 +2356,36 @@ impl Session {
     }
 
     fn append_inner(&mut self, event: Event, model_marker: bool) -> Result<&Record> {
+        self.append_inner_with_metadata(event, model_marker, None)
+    }
+
+    pub(crate) fn append_with_record_metadata(
+        &mut self,
+        event: Event,
+        metadata: serde_json::Value,
+    ) -> Result<&Record> {
+        if metadata.is_null() {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
+        self.append_inner_with_metadata(event, true, Some(metadata))
+    }
+
+    fn append_inner_with_metadata(
+        &mut self,
+        event: Event,
+        model_marker: bool,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<&Record> {
         if self.poisoned {
             return Err(Error::Session(
                 "journal write failed; reopen before continuing".into(),
+            ));
+        }
+        // Reject unsupported metadata before appending even implicit marker
+        // records. No write was attempted, so the journal remains usable.
+        if metadata.is_some() && !self.store.supports_record_metadata() {
+            return Err(Error::Session(
+                "session store does not support record metadata".into(),
             ));
         }
         // A native message branching directly from a legacy Pi source needs a
@@ -2282,11 +2461,14 @@ impl Session {
             parent,
             event,
         };
-        if let Err(err) = self.store.append(&record) {
+        if let Err(err) = self.store.append_with_metadata(&record, metadata.as_ref()) {
             self.poisoned = true;
             return Err(err);
         }
         self.head = next_head;
+        if let Some(metadata) = metadata {
+            self.record_metadata.insert(id, metadata);
+        }
         self.records.push(record);
         Ok(self.records.last().unwrap())
     }
@@ -2323,7 +2505,11 @@ pub(crate) fn validate_custom_message(message: &crate::CustomMessage) -> Result<
     Ok(())
 }
 
-fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
+fn publish_snapshot(
+    records: &[Record],
+    metadata: &BTreeMap<u64, serde_json::Value>,
+    destination: &Path,
+) -> Result<()> {
     validated_head(records)?;
     let parent = destination
         .parent()
@@ -2332,8 +2518,12 @@ fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     for record in records {
-        serde_json::to_writer(&mut temporary, record)?;
-        writeln!(temporary)?;
+        let mut line = encode_record(record, metadata.get(&record.id))?;
+        line.push(b'\n');
+        if line.len() > MAX_RECORD_BYTES {
+            return Err(Error::Session("journal record exceeds size limit".into()));
+        }
+        temporary.write_all(&line)?;
     }
     temporary.as_file().sync_all()?;
     temporary
@@ -2504,6 +2694,7 @@ fn validated_head(records: &[Record]) -> Result<u64> {
 
 struct FileStore {
     file: File,
+    metadata: BTreeMap<u64, serde_json::Value>,
     #[cfg(windows)]
     lock_file: File,
     #[cfg(unix)]
@@ -2552,6 +2743,7 @@ impl FileStore {
             .map_err(|err| Error::Session(format!("cannot lock journal: {err}")))?;
         Ok(Self {
             file,
+            metadata: BTreeMap::new(),
             #[cfg(windows)]
             lock_file,
             #[cfg(unix)]
@@ -2575,8 +2767,67 @@ impl Drop for FileStore {
     }
 }
 
-fn read_complete_records(reader: impl Read) -> Result<(Vec<Record>, u64, bool)> {
+#[derive(Deserialize)]
+struct PersistedRecord {
+    #[serde(flatten)]
+    record: Record,
+    #[serde(
+        default,
+        rename = "piRsRecordMetadata",
+        deserialize_with = "deserialize_present_metadata"
+    )]
+    metadata: Option<serde_json::Value>,
+}
+
+fn deserialize_present_metadata<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as Deserialize>::deserialize(deserializer).map(Some)
+}
+
+// Draft versions stored these fields inside Event::Compacted. Preserve them
+// while restoring the original public enum shape.
+fn legacy_compaction_metadata(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let event = value.get("event")?.as_object()?;
+    if event.get("type")?.as_str()? != "compacted" {
+        return None;
+    }
+    let from_extension = event
+        .get("from_extension")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let details = event.get("details");
+    if !from_extension && details.is_none() {
+        return None;
+    }
+    let mut result = serde_json::json!({"fromExtension":from_extension});
+    if let Some(details) = details {
+        result["details"] = details.clone();
+    }
+    Some(result)
+}
+
+fn encode_record(record: &Record, metadata: Option<&serde_json::Value>) -> Result<Vec<u8>> {
+    if let Some(metadata) = metadata {
+        if metadata.is_null() {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
+        let mut value = serde_json::to_value(record)?;
+        value
+            .as_object_mut()
+            .expect("record serializes as an object")
+            .insert("piRsRecordMetadata".into(), metadata.clone());
+        Ok(serde_json::to_vec(&value)?)
+    } else {
+        Ok(serde_json::to_vec(record)?)
+    }
+}
+
+type CompleteRecords = (Vec<Record>, BTreeMap<u64, serde_json::Value>, u64, bool);
+
+fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
     let mut records = Vec::new();
+    let mut metadata = BTreeMap::new();
     let mut offset = 0;
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
@@ -2593,54 +2844,100 @@ fn read_complete_records(reader: impl Read) -> Result<(Vec<Record>, u64, bool)> 
             if records.is_empty() {
                 return Err(Error::Session("journal has no committed header".into()));
             }
-            return Ok((records, offset, true));
+            return Ok((records, metadata, offset, true));
         }
-        records.push(serde_json::from_slice(&line)?);
+        let stored: PersistedRecord = serde_json::from_slice(&line)?;
+        let legacy = if stored.metadata.is_none()
+            && matches!(stored.record.event, Event::Compacted { .. })
+        {
+            legacy_compaction_metadata(&serde_json::from_slice(&line)?)
+        } else {
+            None
+        };
+        if let Some(extra) = stored.metadata.or(legacy) {
+            metadata.insert(stored.record.id, extra);
+        }
+        records.push(stored.record);
         offset += line.len() as u64;
         line.clear();
     }
-    Ok((records, offset, false))
+    Ok((records, metadata, offset, false))
 }
 
 // Keep the same exclusive lock as a normal session without recovery writes.
 struct ShareFileStore(FileStore);
 
 impl SessionStore for ShareFileStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
-        let (records, _, incomplete) = read_complete_records(&mut self.0.file)?;
+        let (records, metadata, _, incomplete) = read_complete_records(&mut self.0.file)?;
         if incomplete || records.is_empty() {
             return Err(Error::Session(
                 "journal is incomplete; reopen it before sharing".into(),
             ));
         }
+        self.0.metadata = metadata;
         Ok(records)
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
         self.0.append(record)
     }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        self.0.load_record_metadata()
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.0.append_with_metadata(record, metadata)
+    }
 }
 
 impl SessionStore for FileStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
-        let (records, offset, incomplete) = read_complete_records(&mut self.file)?;
+        let (records, metadata, offset, incomplete) = read_complete_records(&mut self.file)?;
         if incomplete {
             validated_head(&records)?;
             self.file.set_len(offset)?;
             self.file.sync_all()?;
         }
         self.file.seek(SeekFrom::End(0))?;
+        self.metadata = metadata;
         Ok(records)
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
-        let mut line = serde_json::to_vec(record)?;
+        self.append_with_metadata(record, None)
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        Ok(self.metadata.clone())
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let mut line = encode_record(record, metadata)?;
         line.push(b'\n');
         if line.len() > MAX_RECORD_BYTES {
             return Err(Error::Session("journal record exceeds size limit".into()));
         }
         self.file.write_all(&line)?;
         self.file.sync_data()?;
+        if let Some(metadata) = metadata {
+            self.metadata.insert(record.id, metadata.clone());
+        }
         #[cfg(unix)]
         if record.id == 1 {
             File::open(&self.parent)?.sync_all()?;
@@ -3336,6 +3633,247 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 }
 
 #[cfg(test)]
+mod record_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_compaction_fields_survive_journal_and_serialized_import() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        let mut values: Vec<_> = session
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).unwrap())
+            .collect();
+        values[1]["event"]["from_extension"] = true.into();
+        values[1]["event"]["details"] = serde_json::Value::Null;
+        let expected = serde_json::json!({"fromExtension":true,"details":null});
+        let imported = Session::from_serialized_records(values.clone()).unwrap();
+        assert_eq!(imported.record_metadata(2), Some(&expected));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let bytes = values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, bytes).unwrap();
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.record_metadata(2), Some(&expected));
+    }
+
+    #[test]
+    fn fork_remaps_overflow_retention_boundary() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::User {
+                content: "retained".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let retained = session.head();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":retained,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let (marker, boundary) = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some((record, entry["boundary"].as_u64().unwrap()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(boundary, retained);
+        assert!(boundary < marker.id);
+        assert!(
+            matches!(&fork.records()[(boundary - 1) as usize].event, Event::User { content, .. } if content == "retained")
+        );
+    }
+
+    #[test]
+    fn fork_invalidates_overflow_boundary_on_another_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let abandoned = session.head();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":abandoned,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let entry = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(entry.get("boundary").is_none());
+    }
+
+    #[test]
+    fn metadata_envelope_rejects_duplicate_record_fields() {
+        let record = Session::with_store(MemoryStore::default())
+            .unwrap()
+            .records()[0]
+            .clone();
+        let valid = serde_json::to_string(&record).unwrap();
+        assert!(serde_json::from_str::<PersistedRecord>(&valid).is_ok());
+        let duplicate = valid.replacen("\"id\":1", "\"id\":1,\"id\":2", 1);
+        assert_ne!(duplicate, valid);
+        assert!(serde_json::from_str::<PersistedRecord>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn null_record_metadata_is_rejected_on_restore() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut value = serde_json::to_value(&session.records()[0]).unwrap();
+        value["piRsRecordMetadata"] = serde_json::Value::Null;
+        assert!(Session::from_serialized_records(vec![value]).is_err());
+        assert!(
+            Session::from_records_with_metadata(
+                session.records().to_vec(),
+                [(1, serde_json::Value::Null)].into_iter().collect()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_metadata_is_atomic_and_survives_reopen_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.jsonl");
+        let metadata = serde_json::json!({"details": {"origin": "extension"}});
+        let mut session = Session::open(&path).unwrap();
+        let id = session
+            .append_with_record_metadata(
+                Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                },
+                metadata.clone(),
+            )
+            .unwrap()
+            .id;
+        assert_eq!(session.record_metadata(id), Some(&metadata));
+        let snapshot = Session::snapshot(&path).unwrap();
+        assert_eq!(snapshot.record_metadata(id), Some(&metadata));
+        let export = directory.path().join("export.jsonl");
+        session.export_jsonl(&export).unwrap();
+        let exported = Session::snapshot(&export).unwrap();
+        assert_eq!(exported.record_metadata(id), Some(&metadata));
+        let values = std::fs::read_to_string(&export)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let imported = Session::from_serialized_records(values).unwrap();
+        assert_eq!(imported.record_metadata(id), Some(&metadata));
+        let fork_path = directory.path().join("fork.jsonl");
+        let fork = session.fork_to(id, &fork_path).unwrap();
+        assert_eq!(fork.record_metadata(id), Some(&metadata));
+        let in_memory_fork = session.fork_session_after_handoff(id).unwrap();
+        assert_eq!(in_memory_fork.record_metadata(id), Some(&metadata));
+        let public_fork = session.fork_session(id).unwrap();
+        assert_eq!(public_fork.record_metadata(id), Some(&metadata));
+        drop(session);
+        let share = Session::open_for_share(&path).unwrap();
+        assert_eq!(share.record_metadata(id), Some(&metadata));
+        let share_export = directory.path().join("share-export.jsonl");
+        share.export_jsonl(&share_export).unwrap();
+        assert_eq!(
+            Session::snapshot(&share_export)
+                .unwrap()
+                .record_metadata(id),
+            Some(&metadata)
+        );
+        drop(share);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.record_metadata(id), Some(&metadata));
+    }
+
+    #[test]
+    fn legacy_store_rejects_metadata_without_appending() {
+        struct Legacy(MemoryStore);
+        impl SessionStore for Legacy {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                self.0.append(record)
+            }
+        }
+        let mut session = Session::with_store(Legacy(MemoryStore::default())).unwrap();
+        let length = session.records().len();
+        let result = session.append_with_record_metadata(
+            Event::SessionInfo {
+                name: None,
+                cwd: None,
+            },
+            serde_json::json!({"x": 1}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.records().len(), length);
+        let record = session
+            .append(Event::SessionInfo {
+                name: Some("still writable".into()),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(record.id, length as u64 + 1);
+        assert_eq!(session.records().len(), length + 1);
+    }
+}
+
+#[cfg(test)]
 mod session_metadata_tests {
     use super::*;
 
@@ -3633,7 +4171,11 @@ mod session_metadata_tests {
         session.set_name("experiment").unwrap();
         let source_records = session.records().len();
         let records = session.fork_records(session.head()).unwrap();
-        let fork = Session::with_store(MemoryStore { records }).unwrap();
+        let fork = Session::with_store(MemoryStore {
+            records,
+            metadata: BTreeMap::new(),
+        })
+        .unwrap();
         assert_ne!(fork.session_id(), session.session_id());
         assert_eq!(fork.name(), Some("experiment"));
         assert_eq!(fork.labels().get(&3).map(String::as_str), Some("chosen"));

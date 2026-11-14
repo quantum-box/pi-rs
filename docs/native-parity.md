@@ -139,11 +139,79 @@ the saved tool result retains the image for later use with a compatible model.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
-tool calls in a length-limited response are recorded as failed without executing
-their potentially incomplete arguments; the model receives those results and
-may request the tools again. Other incomplete reasons remain errors.
+tool calls in a length-limited response are never executed. When a recoverable
+length stop has an older prefix to compact, native omits the attempt and tries
+one compact-and-retry recovery; otherwise, it records failed tool results and
+the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+Native extensions can opt into a pre-summary compaction hook for manual,
+threshold, and supported overflow compaction. A supplied summary bypasses the summary model, carries
+optional details and usage into the journal, and emits the normal lifecycle
+notification; cancellation leaves the branch unchanged. Executable extensions
+negotiate this hook before receiving the new request. Existing post-summary
+compaction hooks continue to run. The detailed compaction lifecycle callback and
+negotiated executable protocol carry the `overflow` trigger; legacy lifecycle
+callbacks receive `threshold` so their closed Rust enum remains source compatible.
+An extension-provided summary does not consume
+a model request, so threshold compaction can use it even when only the turn's
+final model request remains. A declined optional hook preserves that request and
+does not emit a failed-compaction event. Unlike Pi, the native hook must retain at
+least the prepared recent context and uses native numeric journal IDs; cuts that
+split a user message from its legacy image records or a tool call from its
+result are rejected. Later legacy hook changes can retain more history, but
+cannot move an extension-provided boundary forward. Native summary size and
+timeout limits still apply. Custom `SessionStore` implementations that do not
+support atomic record metadata reject new pre-summary extension compactions
+rather than silently dropping their metadata. Legacy compaction hooks continue
+to work on those stores with their previous metadata-free behavior.
+An unsupported metadata append is rejected before any write, so the existing
+session remains usable. When a completed model summary is recovered, usage is
+settled with its original request ID and metadata before compaction is committed;
+the host must make settlement idempotent per request ID. A failed settlement
+leaves the summary available for retry instead of silently closing the run.
+SDK `resume()` also finds a recoverable summary on the latest branch run after
+reopening, and resumes that run instead of starting an unrelated one. It also
+recognizes interrupted compaction markers before a summary is complete, and
+recognizes a durable overflow or length stop before its marker is written. It
+restores the branch model before checking the interrupted request's identity;
+queued trigger turns do not overtake an unresolved compaction recovery.
+Queued steering and other deferred context are held until interrupted
+compaction is resolved; an unresolved request leaves them queued.
+SDK recovery defers session-start callbacks until recovery succeeds; when
+extensions are registered it settles known and unconfirmed recovery usage using
+the restored model, then requires reconciliation before invoking them. An
+interrupted hard-overflow summary request is settled as unconfirmed before that
+reconciliation; it is never automatically resent.
+Public startup and prompt paths also reject an unresolved recovery before
+callbacks or queued triggers run. For an ambiguous silent-overflow summary,
+resume retains the answer, settles any started summary request as unconfirmed
+when its outcome is unknown, and records a durable skip before accepting more
+work. Failed settlement leaves recovery pending for retry.
+The low-level agent similarly rejects a new run or direct queued-input
+delivery until the interrupted run has been resumed or reconciled.
+Ordinary silent-summary model or budget failures also record the skip before
+returning the answer. A saved summary's incurred usage is settled even when
+the restored run budget prevents further work.
+Saved summary usage is settled even when current request limits or the
+auto-compaction setting prevent replay. Cancellation during a silent summary
+returns cancellation and leaves the durable operation available for recovery.
+Explicit overflow recovery also settles durable failed, cancelled, truncated,
+empty, or oversized summary completions before deciding whether they can be
+reused; uncertain work still requires reconciliation rather than a resend.
+Saved silent-overflow recovery runs before checking the current auto-compaction
+setting or model window. A resumed run restores request and output limits from
+its journal; missing or unconfirmed usage reserves the request's full output
+allowance, while a replayed reply or summary is charged once.
+If cancellation arrives before silent recovery begins, it returns cancellation
+without delivering queued steering or marking the saved operation complete.
+Overflow recovery remains partial: when an
+interrupted operation may have invoked an extension hook or sent an unconfirmed
+summary request, native does not repeat the ambiguous operation. Retry-required
+recovery reports that reconciliation is needed; for a completed silent-overflow
+answer, native preserves the answer and skips the ambiguous compaction. An
+automatic reconciliation workflow, full Pi preparation payload and all
+provider overflow classifications remain gaps.
 
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
@@ -3555,8 +3623,10 @@ Async `session_compact` and
 Manual preparation failures also emit `session_compact_failed`; its error
 message identifies manual versus automatic threshold compaction, and aborted
 events omit the error message. Native compaction retains its existing
-preflight, error types, and extension replacement behavior; overflow recovery
-and Pi's pre-summary extension-provided compaction remain separate gaps.
+preflight, error types, and extension replacement behavior. Manual and threshold
+compaction accept extension-provided summaries before model generation.
+Supported overflow recovery also invokes the hook; ambiguous interrupted
+requests or hooks are not automatically repeated.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`

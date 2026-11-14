@@ -599,6 +599,21 @@ impl Model for PiMessages {
         if !response.status().is_success() {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
+            if matches!(status.as_u16(), 400 | 422) {
+                let overflow = pi_rs::provider_context_overflow_stream(
+                    response.bytes_stream(),
+                    &error_secrets,
+                )
+                .await;
+                return Err(Error::Model(if overflow {
+                    "context window exceeded".into()
+                } else {
+                    message
+                }));
+            }
             let permanent_quota = (status.as_u16() == 429 || status.is_server_error())
                 && pi_rs::permanent_provider_limit(response.bytes_stream(), &error_secrets).await;
             return Err(if permanent_quota {
@@ -764,7 +779,7 @@ impl Model for PiMessages {
                         return;
                     }
                     "error" => {
-                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"], &error_secrets) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"], &error_secrets) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
+                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"], &error_secrets) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"], &error_secrets) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else if pi_rs::provider_context_overflow(&event["errorMessage"], &error_secrets) { Error::Model("context window exceeded".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
                     }
                     _ => Err(Error::Model("Unknown Pi Messages stream event".into()))?,
                 }

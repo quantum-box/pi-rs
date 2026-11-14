@@ -498,6 +498,18 @@ async fn check_status(response: Response, secrets: &[String]) -> Result<Response
         return Ok(response);
     }
     let message = format!("Google Gemini returned HTTP {status}");
+    if status.as_u16() == 413 {
+        return Err(Error::Model("413 request too large".into()));
+    }
+    if matches!(status.as_u16(), 400 | 422) {
+        let overflow =
+            pi_rs_core::provider_context_overflow_stream(response.bytes_stream(), secrets).await;
+        return Err(Error::Model(if overflow {
+            "context window exceeded".into()
+        } else {
+            message
+        }));
+    }
     if (status.as_u16() == 429 || status.is_server_error())
         && pi_rs_core::permanent_provider_limit(response.bytes_stream(), secrets).await
     {
@@ -885,6 +897,8 @@ impl Model for Google {
                         Error::Model("Google Gemini account quota or billing limit reached".into())
                     } else if code == 429 || (500..600).contains(&code) || pi_rs_core::retryable_provider_error(error, &error_secrets) {
                         Error::RetryableModel("Google Gemini returned a transient stream error".into())
+                    } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
+                        Error::Model("context window exceeded".into())
                     } else {
                         Error::Model("Google Gemini returned a stream error".into())
                     })?;

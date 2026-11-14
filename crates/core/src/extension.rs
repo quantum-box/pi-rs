@@ -552,6 +552,66 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
+/// Detailed trigger for the new pre-summary compaction interface.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
+impl CompactionTrigger {
+    pub(crate) fn legacy_reason(self) -> crate::CompactionReason {
+        match self {
+            Self::Manual => crate::CompactionReason::Manual,
+            Self::Threshold | Self::Overflow => crate::CompactionReason::Threshold,
+        }
+    }
+}
+
+/// Prepared model-summary compaction, before an extension or model supplies its summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPreparation {
+    pub branch_entries: Vec<crate::Record>,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub reason: CompactionTrigger,
+    pub will_retry: bool,
+    pub custom_instructions: Option<String>,
+}
+
+/// An extension-provided compaction replaces the model-generated summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCompaction {
+    pub summary: String,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub usage: Option<crate::Usage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_value"
+    )]
+    pub details: Option<Value>,
+}
+
+fn deserialize_present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeSummaryCompactionResult {
+    #[serde(default)]
+    pub cancel: bool,
+    pub compaction: Option<ExtensionCompaction>,
+}
+
 /// A hook's reported change status. The host tracks mutable access separately;
 /// this status never proves that assistant messages were left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1171,6 +1231,19 @@ pub trait Extension: Send + Sync {
         self.lifecycle(event, state).await
     }
 
+    /// Observe compaction with its detailed trigger and committed metadata.
+    /// Older extensions receive the existing lifecycle event unchanged.
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &crate::LifecycleEvent,
+        _trigger: CompactionTrigger,
+        _metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle_with_host(event, state, host).await
+    }
+
     fn handles_cache_warming(&self) -> bool {
         false
     }
@@ -1468,6 +1541,21 @@ pub trait Extension: Send + Sync {
         _outcome: &Outcome,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
+        Ok(None)
+    }
+
+    /// Whether this extension participates in pre-summary compaction.
+    fn handles_before_summary_compaction(&self) -> bool {
+        false
+    }
+
+    /// Called before requesting a model-generated summary.
+    async fn before_summary_compaction(
+        &self,
+        _preparation: &CompactionPreparation,
+        _state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<BeforeSummaryCompactionResult>> {
         Ok(None)
     }
 
@@ -2567,6 +2655,21 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compaction_details_preserve_missing_and_explicit_null() {
+        for details in [None, Some(Value::Null), Some(json!({"origin":"extension"}))] {
+            let mut wire =
+                json!({"summary":"summary","firstKeptEntry":1,"tokensBefore":2,"usage":null});
+            if let Some(value) = &details {
+                wire["details"] = value.clone();
+            }
+            let decoded: ExtensionCompaction = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.details, details);
+            let encoded = serde_json::to_value(decoded).unwrap();
+            assert_eq!(encoded.get("details"), wire.get("details"));
+        }
+    }
 
     struct InputHook(&'static str);
 
