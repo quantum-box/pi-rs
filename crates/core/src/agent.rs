@@ -3590,13 +3590,20 @@ impl Agent<'_> {
             }
         };
         let idle = session.current_run_id().is_none();
-        let notification = crate::lifecycle::notify_session_with_host(
+        let metadata = match &event {
+            crate::LifecycleEvent::SessionCompact {
+                compaction_entry, ..
+            } => session.record_metadata(compaction_entry.id).cloned(),
+            _ => None,
+        };
+        let notification = crate::lifecycle::notify_session_compaction_with_host(
             self.registry,
             session,
             event,
             self.limits.model_timeout,
             observer,
             idle,
+            Some((reason, metadata)),
         )
         .await;
         if let Err(notification_error) = notification {

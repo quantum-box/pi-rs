@@ -1220,6 +1220,19 @@ pub trait Extension: Send + Sync {
         self.lifecycle(event, state).await
     }
 
+    /// Observe compaction with its detailed trigger and committed metadata.
+    /// Older extensions receive the existing lifecycle event unchanged.
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &crate::LifecycleEvent,
+        _trigger: CompactionTrigger,
+        _metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle_with_host(event, state, host).await
+    }
+
     fn handles_cache_warming(&self) -> bool {
         false
     }
