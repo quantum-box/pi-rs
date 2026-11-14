@@ -19,4 +19,7 @@ spec:
         command: bash examples/browser-preview/build.sh
         outputDirectory: examples/browser-preview/dist
         nodeVersion: "22"
+      watchPaths:
+        - examples/browser-preview/**
+        - tachyon.yml
       envVars: []
