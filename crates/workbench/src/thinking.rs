@@ -229,6 +229,31 @@ mod tests {
     }
 
     #[test]
+    fn cycling_unspecified_to_off_persists_without_duplicate_hook() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.thinking = None;
+        args.thinking_profile = Some((args.model.clone(), vec!["off".into()], Some(true)));
+
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(args.thinking.as_deref(), Some("off"));
+        let session = Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some((args.model.clone(), Some("off".into())))
+        );
+        drop(session);
+        // Native treats an unspecified level as off for hook comparisons.
+        assert!(args.selection_events.is_empty());
+        let before = std::fs::read(&args.session).unwrap();
+        assert_eq!(cycle(&mut args).unwrap().as_deref(), Some("off"));
+        assert_eq!(std::fs::read(&args.session).unwrap(), before);
+        assert!(args.selection_events.is_empty());
+    }
+
+    #[test]
     fn declared_reasoning_displays_discovered_anthropic_capabilities() {
         use clap::Parser;
         use std::io::{BufRead, BufReader, Write};
