@@ -524,6 +524,14 @@ impl NestedHost {
                     return self.fail("nested polling failed; pending reference retained");
                 }
             };
+            // Unknown is not a terminal observation. Keep the last accepted
+            // reference so a later safe replay can reattach, while poisoning
+            // this invocation so an ignoring parent cannot commit success.
+            if matches!(outcome, Outcome::Unknown(_)) {
+                return self.fail(
+                    "nested polling returned an uncertain outcome; pending reference retained",
+                );
+            }
             record.outcome = Some(outcome.clone());
             let value = match serde_json::to_vec(&record) {
                 Ok(value) => value,
@@ -619,6 +627,7 @@ mod tests {
                 0 => std::future::pending().await,
                 1 => None,
                 3 => std::panic::panic_any(PanicOnDrop),
+                4 => Some(Outcome::Unknown("poll status unavailable".into())),
                 _ => Some(Outcome::Succeeded("done".into())),
             }
         }
@@ -660,6 +669,15 @@ mod tests {
         drop(h);
 
         tool.mode.store(1, Ordering::SeqCst);
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            h.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+
+        tool.mode.store(4, Ordering::SeqCst);
         let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
         assert!(matches!(
             h.call_keyed("job-key", "polling", json!({})).await,

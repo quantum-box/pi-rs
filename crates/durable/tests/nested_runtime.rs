@@ -1250,8 +1250,110 @@ async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen
     }
     drop(owner);
 
-    let scheduler = Scheduler::open(&path, opts()).unwrap();
-    assert!(scheduler.blocked(id).unwrap().is_some());
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let (parent_operation, _) = h.blocked(id).unwrap().unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert!(
+        h.reconcile(
+            id,
+            parent_operation,
+            Outcome::Succeeded("parent done".into())
+        )
+        .is_err()
+    );
+    assert!(h.conversation(id).unwrap().abort_requested);
     assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
-    scheduler.shutdown().await.unwrap();
+    assert_eq!(child.ids.lock().unwrap().len(), 2);
+}
+
+struct UnknownPoll {
+    invoked: AtomicUsize,
+    polled: AtomicUsize,
+}
+#[async_trait]
+impl Tool for UnknownPoll {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.invoked.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: "still-needed".into(),
+        }
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        if self.polled.fetch_add(1, Ordering::SeqCst) == 0 {
+            assert_eq!(reference, "still-needed");
+            Some(Outcome::Pending {
+                reference: "updated-reference".into(),
+            })
+        } else {
+            assert_eq!(reference, "updated-reference");
+            Some(Outcome::Unknown("lost poll response".into()))
+        }
+    }
+}
+#[tokio::test]
+async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let child = Arc::new(UnknownPoll {
+        invoked: AtomicUsize::new(0),
+        polled: AtomicUsize::new(0),
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(Parent),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    drop(h);
+    let owner = durable_store::owner::OwnedStore::open(&path).unwrap();
+    let records = owner.store().list(b"nested/").unwrap();
+    assert_eq!(records.len(), 1);
+    let record: Value = serde_json::from_slice(&records[0].1.value).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Outcome>(record["outcome"].clone()).unwrap(),
+        Outcome::Pending {
+            reference: "updated-reference".into()
+        }
+    );
+    drop(owner);
+    let mut h = Harness::open(&path, opts(), &cancel).await.unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+    assert_eq!(child.polled.load(Ordering::SeqCst), 2);
 }
