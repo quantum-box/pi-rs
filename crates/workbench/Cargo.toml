@@ -85,7 +85,7 @@ reqwest = { version = "0.12", default-features = false, features = ["socks"] }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 tower = "0.5"
 
 [target.'cfg(windows)'.dependencies]
