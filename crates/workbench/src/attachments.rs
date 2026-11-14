@@ -1,4 +1,5 @@
 //! Explicit @file inputs for the initial CLI prompt.
+use std::io::Read;
 use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
@@ -26,7 +27,25 @@ pub fn expand(
         if metadata.is_file() && metadata.len() == 0 {
             continue;
         }
-        let (content, attached) = tools.read_attachment(&path)?;
+        let (content, attached) = match tools.read_attachment(&path) {
+            Ok(result) => result,
+            // Node's readFile(path, "utf-8") replaces malformed sequences. The
+            // normal attachment reader rejects them, so retry text with the
+            // same aggregate bound enforced below.
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)?
+                    .take(8 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(Error::Config(
+                        "attachments exceed the 8 MiB input limit".into(),
+                    ));
+                }
+                (String::from_utf8_lossy(&bytes).into_owned(), Vec::new())
+            }
+            Err(error) => return Err(error),
+        };
         let name = path
             .to_string_lossy()
             .replace('&', "&amp;")
@@ -75,6 +94,39 @@ mod tests {
         assert!(!text.contains("empty.md"));
         assert!(text.ends_with("note.md\">\ntext\n</file>\nprompt"));
     }
+    #[test]
+    fn malformed_utf8_text_attachments_use_replacement_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.txt"),
+            b"\xef\xbb\xbfhello \xffworld\xe2\x82",
+        )
+        .unwrap();
+        let (text, images) = expand(
+            &["@broken.txt".into(), "summarize".into()],
+            directory.path(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(images.is_empty());
+        assert!(text.ends_with("broken.txt\">\nhello \u{fffd}world\u{fffd}\n</file>\nsummarize"));
+    }
+
+    #[test]
+    fn malformed_text_still_obeys_aggregate_input_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = vec![b'a'; 8 * 1024 * 1024];
+        bytes.push(0xff);
+        std::fs::write(directory.path().join("large.txt"), bytes).unwrap();
+        let error = expand(&["@large.txt".into()], directory.path(), true, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attachments exceed the 8 MiB input limit")
+        );
+    }
+
     #[test]
     fn attachments_use_reader_filename_fallbacks_and_file_urls() {
         let directory = tempfile::tempdir().unwrap();

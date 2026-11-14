@@ -1104,7 +1104,8 @@ context or starting a new session clears the ambiguity. Google text and tool-cal
 
 The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
-prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
+prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
+malformed UTF-8 in text attachments is decoded with replacement characters.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
