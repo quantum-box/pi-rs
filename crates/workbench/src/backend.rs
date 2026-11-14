@@ -2233,6 +2233,35 @@ mod share_context_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_alias_can_bypass_path_keyed_invalidation() {
+        use pi_rs_workbench::private_share_store::Store;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let original = root.path().join("original.jsonl");
+        let alias = root.path().join("alias.jsonl");
+        let session = Session::open(&original).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&original, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old": true}))
+            .unwrap();
+        drop(session);
+        std::fs::hard_link(&original, &alias).unwrap();
+        let generation = invalidate_existing_share_generation(Some(&store), &alias)
+            .unwrap()
+            .unwrap();
+        // Different path keys leave the original cache valid even though the
+        // worker is using the same journal inode through the alias.
+        assert_eq!(
+            store.read(&original, &binding).unwrap(),
+            Some(json!({"old": true}))
+        );
+        drop(generation);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn existing_generation_is_invalidated_before_worker_initialization() {
