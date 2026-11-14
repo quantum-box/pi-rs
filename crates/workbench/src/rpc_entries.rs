@@ -852,7 +852,7 @@ mod tests {
                 }
             };
             records.push(Record {
-                version,
+                version: 4,
                 id: 3,
                 parent: Some(2),
                 run_id: None,
@@ -882,7 +882,7 @@ mod tests {
                 assert_eq!(model["parentId"], branch["id"]);
                 let mut labeled = restored.records().to_vec();
                 labeled.push(Record {
-                    version,
+                    version: 4,
                     id: 4,
                     parent: Some(3),
                     run_id: None,

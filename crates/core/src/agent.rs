@@ -269,6 +269,7 @@ pub(crate) struct TreeModelResolution {
     pub model: String,
     pub client: Arc<dyn Model>,
     pub fallback: bool,
+    pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Agent<'_> {
@@ -3045,13 +3046,16 @@ impl Agent<'_> {
             }
         }
         if let Some(resolved) = resolution {
-            let record = self.registry.commit_resolved_session_model(
+            let (record, revoked) = self.registry.commit_resolved_session_model(
                 session.session_id(),
                 &resolved.provider,
                 &resolved.model,
                 resolved.client,
                 || session.append(transition).cloned(),
             )?;
+            resolved
+                .revoked
+                .store(revoked, std::sync::atomic::Ordering::SeqCst);
             observer(Notification::Committed(&record));
         } else {
             commit(session, transition, observer)?;

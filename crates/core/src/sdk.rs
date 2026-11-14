@@ -1857,38 +1857,55 @@ impl AgentSession {
             journal.validate_checkout(record)?;
             self.resolve_branch_model(&journal, record)?
         };
-        {
+        let (revoked, selection, record, hooks) = {
             let mut journal = self
                 .session
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?;
-            match &resolution {
+            let revoked = match &resolution {
                 BranchResolution::Fallback {
                     provider,
                     model,
                     client,
                     ..
-                } => self.registry.commit_resolved_session_model(
-                    self.session_id,
-                    provider,
-                    model,
-                    client.clone(),
-                    || journal.checkout_provider_model_atomic(record, provider, model),
-                )?,
+                } => {
+                    self.registry
+                        .commit_resolved_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout_provider_model_atomic(record, provider, model),
+                        )?
+                        .1
+                }
                 BranchResolution::Historical {
                     provider,
                     model,
                     client,
-                } => self.registry.commit_resolved_session_model(
-                    self.session_id,
-                    provider,
-                    model,
-                    client.clone(),
-                    || journal.checkout(record),
-                )?,
-                BranchResolution::Registered => journal.checkout(record)?,
-            }
-        }
+                } => {
+                    self.registry
+                        .commit_resolved_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Registered => {
+                    journal.checkout(record)?;
+                    false
+                }
+            };
+            (
+                revoked,
+                journal.model_identity_at(journal.head()),
+                journal.records().last().cloned().expect("checkout record"),
+                InputHooks::new(&self.registry, &journal),
+            )
+        };
         match resolution {
             BranchResolution::Historical { .. } => {
                 self.model_fallback = None;
@@ -1909,15 +1926,20 @@ impl AgentSession {
             }
             BranchResolution::Registered => self.model_fallback = None,
         }
-        self.refresh_input_hooks()?;
-        self.emit_last()?;
-        let selection = {
-            let journal = self.journal()?;
-            journal.model_identity_at(journal.head())
-        };
-        if let Some((provider, model, _)) = selection {
-            self.restore_branch_model(provider.as_deref(), model)?;
+        *self.control.input_hooks.lock().expect("SDK input hooks") = hooks;
+        if !revoked
+            && let Some((provider, model, _)) = selection
+            && let Some(client) =
+                branch_client(&self.registry, self.session_id, provider.as_deref(), &model)
+        {
+            self.model = client;
+            self.model_name = model;
+            self.refresh_run_config();
         }
+        emit(
+            self.events.as_ref().expect("open session"),
+            &Notification::Committed(&record),
+        );
         Ok(())
     }
 
@@ -1976,6 +1998,7 @@ impl AgentSession {
             control.observe(&event);
             emit(&events, &event);
         };
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tree_resolution = match &resolution {
             BranchResolution::Registered => None,
             BranchResolution::Historical {
@@ -1987,6 +2010,7 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: false,
+                revoked: revoked.clone(),
             }),
             BranchResolution::Fallback {
                 provider,
@@ -1998,6 +2022,7 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: true,
+                revoked: revoked.clone(),
             }),
         };
         let mut result = agent
@@ -2025,9 +2050,11 @@ impl AgentSession {
         {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
-            if let Some((provider, model, _)) = journal.model_identity_at(journal.head()) {
+            if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some((provider, model, _)) = journal.model_identity_at(journal.head())
+            {
                 let restored = self.restore_branch_model(provider.as_deref(), model);
-                if result.is_ok() {
+                if result.is_ok() && restored.is_ok() {
                     result = restored;
                 }
             }
@@ -2062,7 +2089,9 @@ impl AgentSession {
             .map(Box::new);
         drop(input_queue);
         drop(journal);
-        let _ = self.drain_idle_triggers().await?;
+        if !revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.drain_idle_triggers().await?;
+        }
         Ok(TreeNavigationResult {
             editor_text,
             summary_entry,
@@ -2347,7 +2376,8 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.journal()?.fork_records(record)?)?;
+        let mut session = Session::from_records(self.journal()?.fork_records(record)?)?;
+        session.recover_tree_trigger_handoff()?;
         let resolution = self.resolve_branch_model(&session, session.head())?;
         self.fork_snapshot(session, resolution)
     }
@@ -2366,7 +2396,8 @@ impl AgentSession {
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
         let records = journal.fork_records(record)?;
-        let snapshot = Session::from_records(records)?;
+        let mut snapshot = Session::from_records(records)?;
+        snapshot.recover_tree_trigger_handoff()?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.fork_snapshot_to(snapshot, resolution, &destination)
@@ -2418,7 +2449,8 @@ impl AgentSession {
             crate::ForkPosition::Before => record.parent.unwrap_or(1),
             crate::ForkPosition::At => record.id,
         };
-        let snapshot = Session::from_records(journal.fork_records(target)?)?;
+        let mut snapshot = Session::from_records(journal.fork_records(target)?)?;
+        snapshot.recover_tree_trigger_handoff()?;
         let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         drop(journal);
         self.start().await?;
@@ -2442,7 +2474,8 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
-        let snapshot = Session::from_records(self.journal()?.fork_records(target)?)?;
+        let mut snapshot = Session::from_records(self.journal()?.fork_records(target)?)?;
+        snapshot.recover_tree_trigger_handoff()?;
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -2513,13 +2546,20 @@ impl AgentSession {
                 provider,
                 model,
                 client,
-            } => fork.registry.commit_resolved_session_model(
-                fork.session_id,
-                &provider,
-                &model,
-                client,
-                || Ok(()),
-            )?,
+            } => {
+                let (_, revoked) = fork.registry.commit_resolved_session_model(
+                    fork.session_id,
+                    &provider,
+                    &model,
+                    client,
+                    || Ok(()),
+                )?;
+                if revoked {
+                    return Err(Error::Config(
+                        "model client was revoked while preparing fork".into(),
+                    ));
+                }
+            }
             BranchResolution::Fallback {
                 requested_provider,
                 requested_model,
@@ -2527,13 +2567,18 @@ impl AgentSession {
                 model,
                 client,
             } => {
-                fork.registry.commit_resolved_session_model(
+                let (_, revoked) = fork.registry.commit_resolved_session_model(
                     fork.session_id,
                     &provider,
                     &model,
                     client,
                     || Ok(()),
                 )?;
+                if revoked {
+                    return Err(Error::Config(
+                        "model client was revoked while preparing fork".into(),
+                    ));
+                }
                 fork.model_fallback = Some(HistoricalModelFallback {
                     requested_provider,
                     requested_model,
@@ -5080,7 +5125,9 @@ mod tests {
             .historical_model_resolver(resolver)
             .build(journal)
             .unwrap();
-        assert!(session.checkout(target).is_err());
+        let mut events = session.subscribe();
+        session.checkout(target).unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
         assert_eq!(
             session.journal().unwrap().model_provider(),
             Some("replacement")
@@ -5147,7 +5194,7 @@ mod tests {
             .unwrap();
         let head = journal.head();
         let record = crate::Record {
-            version: journal.records()[0].version,
+            version: 4,
             id: journal.records().len() as u64 + 1,
             parent: Some(target),
             run_id: None,

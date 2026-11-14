@@ -12,7 +12,8 @@ use crate::{
 };
 
 pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
-const FORMAT_VERSION: u32 = TURN_END_JOURNAL_VERSION;
+const BRANCH_FALLBACK_JOURNAL_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = BRANCH_FALLBACK_JOURNAL_VERSION;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1947,7 +1948,9 @@ impl Session {
                 records.push(Record {
                     timestamp: Some(record_timestamp()),
                     run_id: None,
-                    version: FORMAT_VERSION,
+                    version: records
+                        .last()
+                        .map_or(TURN_END_JOURNAL_VERSION, |record| record.version),
                     id,
                     parent: Some(id - 1),
                     event: Event::TreeMessageQueued { input },
@@ -2116,10 +2119,24 @@ impl Session {
         {
             timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         }
+        let version = if matches!(
+            &event,
+            Event::BranchModelSelected { .. }
+                | Event::BranchSummary {
+                    fallback_model: Some(_),
+                    ..
+                }
+        ) {
+            BRANCH_FALLBACK_JOURNAL_VERSION
+        } else {
+            self.records
+                .last()
+                .map_or(TURN_END_JOURNAL_VERSION, |record| record.version)
+        };
         let record = Record {
             timestamp: Some(timestamp),
             run_id: self.run_id,
-            version: FORMAT_VERSION,
+            version,
             id,
             parent,
             event,
@@ -2307,6 +2324,20 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             || matches!(record.event, Event::Created { .. }) != (id == 1)
         {
             return Err(Error::Session(format!("invalid journal record {id}")));
+        }
+        if record.version < BRANCH_FALLBACK_JOURNAL_VERSION
+            && matches!(
+                &record.event,
+                Event::BranchModelSelected { .. }
+                    | Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    }
+            )
+        {
+            return Err(Error::Session(format!(
+                "invalid branch fallback version in record {id}"
+            )));
         }
         if let Event::ContextEdited {
             target,
