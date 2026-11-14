@@ -559,23 +559,35 @@ pub(super) fn tool_event_result_value(
     let Some(blocks) = data.get("content").and_then(Value::as_array) else {
         return result;
     };
-    let valid = blocks.iter().all(|block| match block["type"].as_str() {
-        Some("text") => block["text"].is_string(),
-        Some("image") => {
-            block["data"]
-                .as_str()
-                .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
-                && matches!(
-                    block["mimeType"].as_str(),
-                    Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-                )
+    let mut content = Vec::new();
+    let mut rejected = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let valid = match block["type"].as_str() {
+            Some("text") => block["text"].is_string(),
+            Some("image") => {
+                block["data"]
+                    .as_str()
+                    .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
+                    && matches!(
+                        block["mimeType"].as_str(),
+                        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                    )
+            }
+            _ => false,
+        };
+        if valid {
+            content.push(block.clone());
+        } else {
+            rejected.push(json!({"index":index,"block":block}));
         }
-        _ => false,
-    });
-    if !valid {
+    }
+    if content.is_empty() && !blocks.is_empty() {
         return result;
     }
-    result["content"] = json!(blocks);
+    result["content"] = json!(content);
+    if !rejected.is_empty() {
+        result["nativeRejectedBlocks"] = json!(rejected);
+    }
     // Preserve native fields that used to be present in the text envelope.
     let mut native = data.clone();
     native.remove("content");
@@ -702,6 +714,74 @@ mod streaming_tool_tests {
         assert_eq!(
             tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true)),
             tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))
+        );
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_valid_blocks_around_rejected_images() {
+        let oversized = "A".repeat(8 * 1024 * 1024 + 1);
+        let rejected_mime = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let rejected_size = json!({"type":"image","mimeType":"image/png","data":oversized});
+        let supported = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"before"}, rejected_mime, supported, rejected_size, {"type":"text","text":"after"}], "nativeInfo":"kept"}),
+            attachments: vec![],
+            details: json!({"code":42}),
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"before"}, supported, {"type":"text","text":"after"}])
+        );
+        assert_eq!(
+            result["nativeRejectedBlocks"][0],
+            json!({"index":1,"block":rejected_mime})
+        );
+        assert_eq!(result["nativeRejectedBlocks"][1]["index"], 3);
+        assert_eq!(result["nativeRejectedBlocks"][1]["block"], rejected_size);
+        assert_eq!(result["nativeData"]["nativeInfo"], "kept");
+        assert_eq!(result["details"]["code"], 42);
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap()["result"],
+            result
+        );
+        let message = &events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap()["message"];
+        assert_eq!(message["content"], result["content"]);
+        assert_eq!(
+            message["nativeRejectedBlocks"],
+            result["nativeRejectedBlocks"]
         );
     }
 

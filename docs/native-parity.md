@@ -975,8 +975,10 @@ fixture verify the new input paths.
 Live JSON/RPC tool completion events and reconstructed RPC tool messages
 preserve the order of native text and image content blocks. Details remain
 separate; extra native structured fields and attachment references are retained
-as `nativeData` and `nativeAttachments`. Plain text that happens to look like
-JSON and unrecognized block formats retain their previous representation.
+as `nativeData` and `nativeAttachments`. Unsupported or oversized blocks are
+kept with their original indexes in `nativeRejectedBlocks`, without moving
+supported blocks out of order. Plain text that happens to look like JSON and
+results with no recognized blocks retain their previous representation.
 The native provider-facing tool envelope is unchanged. Focused tests cover
 interleaved images, metadata, plain text and imported tool results.
 
