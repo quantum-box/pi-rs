@@ -347,6 +347,62 @@ fn wire_request(
     Ok(body)
 }
 
+// Hooks may change conversation content, but malformed content must not be sent.
+fn valid_content(body: &Value) -> bool {
+    let valid_parts = |parts: &Value| {
+        parts.as_array().is_some_and(|parts| {
+            !parts.is_empty()
+                && parts.iter().all(|part| {
+                    let Some(obj) = part.as_object() else {
+                        return false;
+                    };
+                    let kinds = ["text", "inlineData", "functionCall", "functionResponse"];
+                    if kinds.iter().filter(|key| obj.contains_key(**key)).count() != 1 {
+                        return false;
+                    }
+                    obj.iter().all(|(key, value)| match key.as_str() {
+                        "text" | "thoughtSignature" => value.is_string(),
+                        "thought" => value.is_boolean(),
+                        "inlineData" => {
+                            value.is_object()
+                                && value["mimeType"].is_string()
+                                && value["data"].is_string()
+                        }
+                        "functionCall" => {
+                            value.is_object()
+                                && value["name"].as_str().is_some_and(|s| !s.is_empty())
+                                && value
+                                    .get("args")
+                                    .is_none_or(|args| args.is_null() || args.is_object())
+                                && value.get("partialArgs").is_none()
+                                && value.get("willContinue").is_none()
+                        }
+                        "functionResponse" => {
+                            value.is_object()
+                                && value["name"].as_str().is_some_and(|s| !s.is_empty())
+                                && value["response"].is_object()
+                        }
+                        _ => false,
+                    })
+                })
+        })
+    };
+    body["contents"].as_array().is_some_and(|contents| {
+        contents.iter().all(|content| {
+            content.as_object().is_some_and(|obj| {
+                matches!(
+                    obj.get("role").and_then(Value::as_str),
+                    Some("user" | "model")
+                ) && obj.get("parts").is_some_and(&valid_parts)
+            })
+        })
+    }) && body.get("systemInstruction").is_none_or(|instruction| {
+        instruction
+            .as_object()
+            .is_some_and(|obj| obj.get("parts").is_some_and(valid_parts))
+    })
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for GoogleAdapter {
     fn id(&self) -> &str {
@@ -378,7 +434,7 @@ impl ProviderAdapter for GoogleAdapter {
                 "toolConfig",
             ]
             .contains(&k.as_str())
-        }) || !body["contents"].is_array()
+        }) || !valid_content(body)
             || config
                 .keys()
                 .any(|k| !["maxOutputTokens", "candidateCount"].contains(&k.as_str()))
@@ -501,8 +557,17 @@ impl ProviderAdapter for GoogleAdapter {
                 let Some(candidate) = candidates.first() else {
                     continue;
                 };
+                if finish.is_some() {
+                    Err(Error::Model("Google Gemini returned a candidate after its finish reason".into()))?;
+                }
+                if candidate.get("content").is_some_and(|content| !content.is_object() || content.get("parts").is_some_and(|parts| !parts.is_array())) {
+                    Err(Error::Model("invalid Google Gemini candidate content".into()))?;
+                }
                 if let Some(parts) = candidate["content"]["parts"].as_array() {
                     for part in parts {
+                        if !part.is_object() {
+                            Err(Error::Model("invalid Google Gemini part".into()))?;
+                        }
                         let thought = part["thought"].as_bool().unwrap_or(false);
                         if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty()) {
                             if thought {
@@ -513,6 +578,9 @@ impl ProviderAdapter for GoogleAdapter {
                             }
                         }
                         if let Some(call) = part.get("functionCall") {
+                            if !call.is_object() || call.get("partialArgs").is_some() || call.get("willContinue").is_some() {
+                                Err(Error::Model("unsupported partial Google Gemini function call".into()))?;
+                            }
                             let name = call["name"].as_str().filter(|name| !name.is_empty()).ok_or_else(|| Error::Model("invalid Google Gemini function name".into()))?;
                             let arguments = match call.get("args") {
                                 None | Some(Value::Null) => "{}".to_owned(),
@@ -520,9 +588,12 @@ impl ProviderAdapter for GoogleAdapter {
                                 _ => Err(Error::Model("Google Gemini function arguments are not an object".into()))?,
                             };
                             let provided = call["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 160);
-                            let mut id = provided.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
-                            while !call_ids.insert(id.clone()) {
-                                id = uuid::Uuid::new_v4().to_string();
+                            if call.get("id").is_some() && provided.is_none() {
+                                Err(Error::Model("invalid Google Gemini function call ID".into()))?;
+                            }
+                            let id = provided.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+                            if !call_ids.insert(id.clone()) {
+                                Err(Error::Model("duplicate Google Gemini function call ID".into()))?;
                             }
                             if calls.len() == 64 {
                                 Err(Error::Model("too many Google Gemini function calls".into()))?;

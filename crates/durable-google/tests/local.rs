@@ -246,3 +246,82 @@ async fn rejects_redirects_and_http_errors_without_exposing_body() {
         task.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn rejects_malformed_hook_contents_before_dispatch() {
+    let adapter = GoogleAdapter::new("http://127.0.0.1:9", "key").unwrap();
+    let req = request();
+    let a = attempt();
+    let body = adapter.prepare(&a, &req).await.unwrap();
+    for contents in [
+        json!([null]),
+        json!([{"role":"user","parts":[{}]}]),
+        json!([{"role":"admin","parts":[{"text":"hi"}]}]),
+        json!([{"role":"user","parts":[{"text":42}]}]),
+    ] {
+        let mut modified = body.clone();
+        modified["contents"] = contents;
+        assert!(matches!(
+            adapter.dispatch(&a, &req, modified).await,
+            Err(Error::Config(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn rejects_partial_calls_duplicate_ids_and_candidates_after_finish() {
+    for data in [
+        r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","partialArgs":[{"jsonPath":"$.path","stringValue":"x"}],"willContinue":true}}]},"finishReason":"STOP"}]}"#,
+        r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","id":"same","args":{}}},{"functionCall":{"name":"read","id":"same","args":{}}}]},"finishReason":"STOP"}]}"#,
+        "{\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}",
+        r#"{"candidates":[{"content":{"parts":[null]},"finishReason":"STOP"}]}"#,
+    ] {
+        let response = Box::leak(sse(data).into_boxed_str());
+        let (url, task) = server(response, false).await;
+        let adapter = GoogleAdapter::new(&url, "key").unwrap();
+        let req = request();
+        let a = attempt();
+        let body = adapter.prepare(&a, &req).await.unwrap();
+        assert!(
+            collect_generation(
+                adapter.dispatch(&a, &req, body),
+                &CancellationToken::new(),
+                |_| {}
+            )
+            .await
+            .is_err()
+        );
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn base_path_and_model_ids_cannot_change_request_target() {
+    let response = Box::leak(sse(r#"{"candidates":[{"finishReason":"STOP"}]}"#).into_boxed_str());
+    let (url, task) = server(response, false).await;
+    let adapter = GoogleAdapter::new(&format!("{url}/nested/"), "key").unwrap();
+    let mut req = request();
+    let a = attempt();
+    for invalid in ["../steal", "models/../steal", "a?key=x", "a%2fb", ".", ".."] {
+        req.model = invalid.into();
+        assert!(matches!(
+            adapter.prepare(&a, &req).await,
+            Err(Error::Config(_))
+        ));
+    }
+    req.model = "models/gemini-3-flash".into();
+    let body = adapter.prepare(&a, &req).await.unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &req, body),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let data = task.await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&data).starts_with(
+            "POST /v1beta/nested/models/gemini-3-flash:streamGenerateContent?alt=sse "
+        )
+    );
+}
