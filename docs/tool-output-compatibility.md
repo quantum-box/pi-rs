@@ -14,3 +14,6 @@ buffer threshold can also retain the suffix of a newline-terminated long line,
 matching the upstream streaming accumulator's buffer-boundary behavior.
 When the retained snapshot fits both limits, its contents are preserved
 verbatim, including trailing newlines and their byte counts.
+For a large backend chunk, rolling-tail trimming uses the end of that input
+chunk, independent of the decoder's internal buffer size; retained allocation
+remains bounded while decoding.

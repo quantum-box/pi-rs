@@ -239,6 +239,7 @@ impl Default for DisplayTail {
 impl DisplayTail {
     fn decode(&mut self, mut input: &[u8], finished: bool) {
         let mut buffer = [0; 8192];
+        let mut trimmed = false;
         loop {
             let (result, consumed, written, _) =
                 self.decoder.decode_to_utf8(input, &mut buffer, finished);
@@ -254,18 +255,32 @@ impl DisplayTail {
             }
             self.tail.push_str(text);
             if self.tail.len() > 4 * DISPLAY_BYTES {
-                let mut start = self.tail.len() - 2 * DISPLAY_BYTES;
-                while !self.tail.is_char_boundary(start) {
-                    start += 1;
-                }
-                self.starts_at_boundary = self.tail.as_bytes()[start - 1] == b'\n';
-                self.tail.drain(..start);
+                // Bound allocation while decoding a large input chunk. Pi
+                // trims once per input chunk, so repeat the trim after the
+                // decoder has consumed this whole chunk.
+                self.trim_tail();
+                trimmed = true;
             }
             if result == CoderResult::InputEmpty {
                 break;
             }
             input = &input[consumed..];
         }
+        if trimmed {
+            self.trim_tail();
+        }
+    }
+
+    fn trim_tail(&mut self) {
+        if self.tail.len() <= 2 * DISPLAY_BYTES {
+            return;
+        }
+        let mut start = self.tail.len() - 2 * DISPLAY_BYTES;
+        while !self.tail.is_char_boundary(start) {
+            start += 1;
+        }
+        self.starts_at_boundary = self.tail.as_bytes()[start - 1] == b'\n';
+        self.tail.drain(..start);
     }
 
     fn lines(&self) -> u64 {
@@ -518,6 +533,34 @@ mod tests {
             assert_eq!(truncation["truncatedBy"], "bytes");
             std::fs::remove_file(output.path.unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn single_large_chunk_trims_after_complete_chunk_and_stays_bounded() {
+        let input = format!(
+            "{}\n{}\n{}\n{}\n",
+            "a".repeat(250_000),
+            "b".repeat(120_000),
+            "c".repeat(30_000),
+            "d".repeat(500)
+        );
+        let mut accumulator = Accumulator::default();
+        accumulator.append(input.as_bytes()).unwrap();
+        assert!(accumulator.display.tail.len() <= 2 * DISPLAY_BYTES);
+        assert!(accumulator.display.tail.capacity() <= 8 * DISPLAY_BYTES);
+        let expected = format!("{}\n{}\n", "c".repeat(30_000), "d".repeat(500));
+        let progress = accumulator.partial_result();
+        assert_eq!(progress["content"][0]["text"], expected);
+        assert_eq!(progress["details"]["truncation"]["outputBytes"], 30_502);
+        let output = accumulator.finish().unwrap();
+        assert_eq!(output.display_without_notice, expected);
+        let truncation = &output.details.as_ref().unwrap()["truncation"];
+        assert_eq!(truncation["outputLines"], 2);
+        assert_eq!(truncation["outputBytes"], 30_502);
+        assert_eq!(truncation["truncatedBy"], "bytes");
+        let path = output.path.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
