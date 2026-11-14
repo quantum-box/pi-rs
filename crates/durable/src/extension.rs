@@ -25,11 +25,12 @@ pub(crate) fn yield_input(value: &Value) -> Option<pi_rs_core::Message> {
     let mut text = None;
     let mut images = Vec::new();
     for block in blocks {
+        let fields = block.as_object()?;
         match block.get("type")?.as_str()? {
-            "text" if text.is_none() && images.is_empty() => {
+            "text" if text.is_none() && images.is_empty() && fields.len() == 2 => {
                 text = Some(block.get("text")?.as_str()?.to_owned());
             }
-            "image" => {
+            "image" if fields.len() == 3 => {
                 let image = pi_rs_core::ImageContent {
                     data: block.get("data")?.as_str()?.to_owned(),
                     mime_type: block.get("mimeType")?.as_str()?.to_owned(),
@@ -58,6 +59,8 @@ mod yield_input_tests {
         for value in [
             json!([]),
             json!([{"type":"text"}]),
+            json!([{"type":"text","text":"a","textSignature":"opaque"}]),
+            json!([{"type":"image","data":"aGk=","mimeType":"image/png","extra":true}]),
             json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
             json!([{"type":"image","data":"aGk=","mimeType":"image/png"},{"type":"text","text":"after"}]),
             json!([{"type":"image","data":"invalid","mimeType":"image/png"}]),

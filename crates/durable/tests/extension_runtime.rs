@@ -3732,3 +3732,69 @@ async fn yield_accepts_representable_inputs_directly_and_from_tasks() {
         }
     }
 }
+
+#[tokio::test]
+async fn yield_does_not_drop_block_metadata_from_direct_or_child_decisions() {
+    use pi_rs_durable::task::Task;
+    use pi_rs_durable::task_scheduler::{Handler, Registry, Step};
+    for input in [
+        json!([{"type":"text","text":"signed","textSignature":"opaque"}]),
+        json!([{"type":"image","data":"aGk=","mimeType":"image/png","extra":true}]),
+    ] {
+        for via_task in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(FakeModel::default());
+            let mut h = Harness::open_paused(
+                dir.path().join("db"),
+                options(model.clone(), Arc::new(FakeTool::default())),
+            )
+            .unwrap();
+            let handler: Arc<dyn Handler> =
+                Arc::new(|task: &Task| Ok(Step::Succeed(task.checkpoint().data.clone())));
+            h.install_extension(Extension {
+                name: "once".into(),
+                hooks: vec![Arc::new(YieldOnce(
+                    input.clone(),
+                    via_task,
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))],
+                tasks: vec![("once-review".into(), handler.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+            let mut registry = Registry::default();
+            registry.register_shared("once-review", true, handler);
+            let driver = h.start_tasks(registry).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["once".into()]).unwrap();
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            if via_task {
+                for _ in 0..200 {
+                    h.resume_conversation(id, &CancellationToken::new())
+                        .await
+                        .unwrap();
+                    if matches!(
+                        h.conversation(id).unwrap().submissions[0].status,
+                        Status::Done { .. }
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            assert!(matches!(
+                h.conversation(id).unwrap().submissions[0].status,
+                Status::Done { .. }
+            ));
+            assert_eq!(model.0.lock().unwrap().len(), 2, "{input}");
+            let reports = h.extension_reports().unwrap();
+            assert_eq!(
+                reports.iter().filter(|r| r.phase == "OnYield").count(),
+                if via_task { 0 } else { 1 }
+            );
+            driver.shutdown().unwrap();
+        }
+    }
+}
