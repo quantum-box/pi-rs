@@ -3267,6 +3267,8 @@ Cloudflare Workers AI System One classifiers include Pi's five pinned catalog
 entries and support the `/run` request and response envelopes. The official
 endpoint uses an explicit account ID from stored credential metadata or
 `CLOUDFLARE_ACCOUNT_ID`; Pi does not discover accounts over the network.
+Configured official URLs can include `{CLOUDFLARE_ACCOUNT_ID}` or a concrete
+account ID; placeholder expansion is restricted to the official account path.
 Custom endpoints retain endpoint-scoped credential and header rules.
 Codemode validates classifier and image model arguments before dispatch: invalid
 model references and malformed contexts reject the script promise, while an

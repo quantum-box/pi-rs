@@ -24,7 +24,7 @@ const RESPONSE_LIMIT: usize = 7 * 1024 * 1024;
 const CLASSIFIER_MAX_RETRIES: usize = 2;
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
 const CLOUDFLARE_TEMPLATE: &str =
-    "https://api.cloudflare.com/client/v4/accounts/pi-account-placeholder/ai";
+    "https://api.cloudflare.com/client/v4/accounts/piaccountplaceholder/ai";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -394,7 +394,12 @@ impl Catalogue {
                     .ok_or_else(|| {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
-                let (base, endpoint) = endpoints(base, api.route())?;
+                let cloudflare =
+                    name == "cloudflare-workers-ai" && matches!(api, Api::WorkersAiSystemOne);
+                let cloudflare_default = cloudflare
+                    && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
+                        || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
+                let (base, endpoint) = operation_endpoints(base, api.route(), cloudflare)?;
                 let key_base = match &configured_binding {
                     Some(binding) => binding.as_deref(),
                     None => provider["baseUrl"]
@@ -403,7 +408,7 @@ impl Catalogue {
                         .or(inferred_base.as_deref()),
                 };
                 let key_endpoint = key_base
-                    .map(|base| endpoints(base, api.route()))
+                    .map(|base| operation_endpoints(base, api.route(), cloudflare))
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
@@ -450,9 +455,6 @@ impl Catalogue {
                 let api_key = (key_endpoint.as_ref() == Some(&endpoint))
                     .then(|| provider["apiKey"].as_str().map(str::to_owned))
                     .flatten();
-                let cloudflare_default = name == "cloudflare-workers-ai"
-                    && matches!(api, Api::WorkersAiSystemOne)
-                    && base.as_str().trim_end_matches('/') == CLOUDFLARE_TEMPLATE;
                 result.push(Entry {
                     provider: name.clone(),
                     model: configured,
@@ -563,6 +565,48 @@ fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
     Ok((base, endpoint))
 }
 
+fn official_cloudflare_endpoint(endpoint: &Url) -> bool {
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some("api.cloudflare.com")
+        || endpoint.port().is_some()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return false;
+    }
+    let parts: Vec<_> = endpoint.path().split('/').collect();
+    matches!(parts.as_slice(), ["", "client", "v4", "accounts", account, "ai", "run"]
+        if valid_cloudflare_account(account))
+}
+
+fn valid_cloudflare_account(account: &str) -> bool {
+    !account.is_empty()
+        && account.len() <= 128
+        && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn operation_endpoints(value: &str, route: &str, cloudflare: bool) -> Result<(Url, Url)> {
+    const PLACEHOLDER: &str = "{CLOUDFLARE_ACCOUNT_ID}";
+    if value.contains(PLACEHOLDER) {
+        if !cloudflare || value.matches(PLACEHOLDER).count() != 1 {
+            return Err(Error::Config(
+                "invalid Cloudflare account placeholder".into(),
+            ));
+        }
+        let replaced = value.replace(PLACEHOLDER, "piaccountplaceholder");
+        let (base, endpoint) = endpoints(&replaced, route)?;
+        if endpoint != endpoints(CLOUDFLARE_TEMPLATE, route)?.1 {
+            return Err(Error::Config(
+                "invalid Cloudflare account placeholder endpoint".into(),
+            ));
+        }
+        return Ok((base, endpoint));
+    }
+    endpoints(value, route)
+}
+
 async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option<String> {
     if value.starts_with('!') {
         pi_rs_workbench::mcp::resolve_value(value).await.ok()
@@ -574,6 +618,9 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 impl Entry {
     fn is_official(&self) -> bool {
         self.cloudflare_default
+            || (self.provider == "cloudflare-workers-ai"
+                && matches!(self.api, Api::WorkersAiSystemOne)
+                && official_cloudflare_endpoint(&self.endpoint))
             || official_base(&self.provider)
                 .and_then(|base| endpoints(base, self.api.route()).ok())
                 .is_some_and(|(_, endpoint)| endpoint == self.endpoint)
@@ -597,11 +644,7 @@ impl Entry {
                 .map(str::to_owned);
             let account = stored
                 .or_else(|| env("CLOUDFLARE_ACCOUNT_ID"))
-                .filter(|account| {
-                    !account.is_empty()
-                        && account.len() <= 128
-                        && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
-                })
+                .filter(|account| valid_cloudflare_account(account))
                 .ok_or_else(|| Error::Config("missing or invalid Cloudflare account ID".into()))?;
             let base = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai");
             (entry.base, entry.endpoint) = endpoints(&base, self.api.route())?;
@@ -1361,6 +1404,87 @@ mod tests {
             .unwrap();
         assert!(resolved.endpoint.as_str().contains("ambient123"));
         assert!(resolved.credential_with_env(&scoped, |_| None).is_none());
+    }
+
+    #[test]
+    fn configured_cloudflare_official_endpoints_validate_account_and_scope() {
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"saved-key","env":{"CLOUDFLARE_ACCOUNT_ID":"stored123"}}}),
+        );
+        let empty = Keys::parse(&json!({}));
+        for base in [
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/",
+        ] {
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":base}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+                })
+                .unwrap();
+            let resolved = entry.resolved_cloudflare_with_env(&keys, |_| None).unwrap();
+            assert_eq!(
+                resolved.endpoint.as_str(),
+                "https://api.cloudflare.com/client/v4/accounts/stored123/ai/run"
+            );
+            assert!(resolved.credential_with_env(&keys, |_| None).is_some());
+        }
+        let config = json!({"cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/explicit123/ai"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+            })
+            .unwrap();
+        assert!(entry.is_official());
+        assert!(!entry.cloudflare_default);
+        assert!(entry.credential_with_env(&keys, |_| None).is_some());
+        assert!(
+            entry
+                .credential_with_env(&empty, |name| (name == "CLOUDFLARE_API_KEY")
+                    .then(|| "ambient-key".into()))
+                .is_some()
+        );
+        for url in [
+            "https://evil.example/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com.evil.example/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com:8443/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/x{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/other",
+        ] {
+            assert!(operation_endpoints(url, "run", true).is_err(), "{url}");
+        }
+        for url in [
+            "https://evil.example/client/v4/accounts/explicit123/ai",
+            "https://api.cloudflare.com:8443/client/v4/accounts/explicit123/ai",
+            "https://api.cloudflare.com/client/v4/accounts/explicit123/other",
+        ] {
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":url}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+                })
+                .unwrap();
+            assert!(!entry.is_official(), "{url}");
+            assert!(
+                entry.credential_with_env(&keys, |_| None).is_none(),
+                "{url}"
+            );
+            assert!(
+                entry
+                    .credential_with_env(&empty, |_| Some("ambient-key".into()))
+                    .is_none(),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
