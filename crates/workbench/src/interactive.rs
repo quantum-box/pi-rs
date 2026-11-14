@@ -7427,13 +7427,13 @@ impl RunningExternalEditor {
                 {
                     return Err(error.into());
                 }
-            } else if unsafe { info.si_pid() } != 0 {
-                if let Err(error) = foreground.suspend_and_resume(self.child.id() as libc::pid_t) {
-                    if let Some(status) = self.child.try_wait()? {
-                        return Ok(Some(status));
-                    }
-                    return Err(error.into());
+            } else if unsafe { info.si_pid() } != 0
+                && let Err(error) = foreground.suspend_and_resume(self.child.id() as libc::pid_t)
+            {
+                if let Some(status) = self.child.try_wait()? {
+                    return Ok(Some(status));
                 }
+                return Err(error.into());
             }
         }
         Ok(self.child.try_wait()?)
