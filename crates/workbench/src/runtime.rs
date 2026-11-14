@@ -511,12 +511,21 @@ async fn standalone_share_snapshot_after(
     let mut args = args.clone();
     args.restore_session_model(source);
     super::thinking::adjust(&mut args);
-    let mut session = Session::from_records(source.records().to_vec())?;
-    let mut runtime = configure_after(&args, false, before_configure).await?;
+    let session = Session::from_records(source.records().to_vec())?;
+    let runtime = configure_after(&args, false, before_configure).await?;
+    standalone_share_snapshot_with_runtime(&args, source, session, runtime).await
+}
+
+async fn standalone_share_snapshot_with_runtime(
+    args: &Cli,
+    source: &Session,
+    mut session: Session,
+    mut runtime: Runtime,
+) -> Result<super::sessions::ShareSnapshot> {
     let result = async {
         runtime
             .session_lifecycle(
-                &args,
+                args,
                 &session,
                 pi_rs::LifecycleEvent::SessionStart {
                     reason: pi_rs::SessionStartReason::Startup,
@@ -525,7 +534,7 @@ async fn standalone_share_snapshot_after(
             )
             .await;
         runtime
-            .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
+            .discover_resources(args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
             .await?;
         let base = runtime.share_base();
         let (system_prompt, tools) =
@@ -540,6 +549,16 @@ async fn standalone_share_snapshot_after(
         })
     }
     .await;
+    runtime
+        .session_lifecycle(
+            args,
+            &session,
+            pi_rs::LifecycleEvent::SessionShutdown {
+                reason: pi_rs::SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+        )
+        .await;
     let closed = runtime.close().await;
     result.and_then(|snapshot| closed.map(|()| snapshot))
 }
@@ -1019,6 +1038,106 @@ impl pi_rs::Extension for LocalCommandPolicy {
 mod standalone_share_tests {
     use super::*;
     use clap::Parser;
+
+    struct LifecycleRecorder {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        invalid_prompt: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for LifecycleRecorder {
+        fn id(&self) -> &str {
+            "share-lifecycle-recorder"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &pi_rs::LifecycleEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<()> {
+            let event = match event {
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                } => "start",
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                } => "shutdown",
+                _ => "unexpected",
+            };
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn discover_resources(
+            &self,
+            _: &pi_rs::ResourceDiscoveryEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::DiscoveredResources> {
+            self.events.lock().unwrap().push("discover");
+            if let Some(path) = &self.invalid_prompt {
+                std::fs::write(path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+            }
+            Ok(pi_rs::DiscoveredResources::default())
+        }
+        async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+            self.events.lock().unwrap().push("close");
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_share_pairs_session_start_and_shutdown_on_success_and_failure() {
+        for fail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let prompt = directory.path().join("prompt.md");
+            std::fs::write(&prompt, "test prompt").unwrap();
+            let source = Session::open(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .unwrap();
+            args.workspace = directory.path().to_owned();
+            args.session = path.clone();
+            args.system_prompt = Some(prompt.clone());
+            let mut runtime = configure(&args, false).await.unwrap();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            runtime
+                .registry
+                .register(Arc::new(LifecycleRecorder {
+                    events: events.clone(),
+                    invalid_prompt: fail.then_some(prompt),
+                }))
+                .unwrap();
+            let session = Session::from_records(source.records().to_vec()).unwrap();
+            let result =
+                standalone_share_snapshot_with_runtime(&args, &source, session, runtime).await;
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["start", "discover", "shutdown", "close"]
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn slow_preparation_waits_for_metadata_without_detaching() {
