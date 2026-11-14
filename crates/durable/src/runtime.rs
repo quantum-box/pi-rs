@@ -106,6 +106,7 @@ const SUMMARY_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 enum SummaryPlacement {
     Placed,
     Stale,
+    Queued,
 }
 
 fn retry_document_fork(mut attempt: impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
@@ -650,6 +651,8 @@ pub struct Conversation {
     #[serde(default)]
     pending_resets: Vec<crate::reset::Reset>,
     #[serde(default)]
+    pending_independent_summary: Option<PendingIndependentSummary>,
+    #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
     #[serde(default)]
     round_terminates: Vec<bool>,
@@ -677,6 +680,14 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nested_resume: Option<NestedResume>,
     phase: Phase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingIndependentSummary {
+    id: Uuid,
+    submissions: usize,
+    writes: usize,
+    resets: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -2050,6 +2061,12 @@ impl Harness {
                             "conversation changed during execution; reopen before retry".into(),
                         ));
                     }
+                    if base.pending_independent_summary.is_none()
+                        && latest.pending_independent_summary.is_some()
+                    {
+                        state.pending_independent_summary =
+                            latest.pending_independent_summary.clone();
+                    }
                     // Settings changes can race external model/tool calls. Preserve the
                     // newest values; boundary commits retry selection separately.
                     state.queue_modes = latest.queue_modes;
@@ -2874,6 +2891,7 @@ impl Harness {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),
@@ -3155,6 +3173,7 @@ impl Harness {
                     .clone(),
             )?,
             pending_resets: vec![],
+            pending_independent_summary: None,
             application_writes: point
                 .documents
                 .get("pi-rs/runtime/application-writes")
@@ -6118,6 +6137,86 @@ impl Harness {
         };
         Ok(true)
     }
+    fn consume_independent_summary(
+        &mut self,
+        state: &mut Conversation,
+        version: u64,
+    ) -> Result<(), Error> {
+        use crate::summary_store::{State, SummaryStore};
+        let marker = state
+            .pending_independent_summary
+            .take()
+            .ok_or(Error::NotFound)?;
+        let owner = self.owner.clone();
+        let store = SummaryStore::new(owner.store());
+        let snap = store
+            .get(marker.id)
+            .map_err(|e| Error::Invalid(format!("summary: {e}")))?
+            .ok_or(Error::NotFound)?;
+        if snap.operation.session_id() != state.id {
+            return Err(Error::Invalid("summary owner mismatch".into()));
+        }
+        if snap.operation.provider() != self.summary_provider.as_ref()
+            || self.summary_provider.is_none()
+        {
+            return Err(Error::Invalid(
+                "summary provider identity is missing or does not match".into(),
+            ));
+        }
+        let result = match snap.operation.state() {
+            State::PlacementPending { result, .. } => result,
+            State::Aborted | State::Aborting { .. } => {
+                return self.save(state, Expected::Version(version));
+            }
+            _ => return Err(Error::Invalid("invalid pending summary state".into())),
+        };
+        store
+            .placement_ticket(&snap)
+            .map_err(|e| Error::Invalid(format!("summary: {e}")))?;
+        let placed = state.submissions.len() == marker.submissions
+            && state.application_writes.len() == marker.writes
+            && state.resets.len() == marker.resets
+            && state.pending_resets.is_empty()
+            && !state.abort_requested
+            && state.content_blocks.is_empty()
+            && !result.is_stale(&state.messages, state.context_generation);
+        if placed {
+            state.messages = result.apply_in_context(&state.messages, state.context_generation)?;
+            state.context_generation = Some(Uuid::new_v4());
+        }
+        let mut batch = self.prepare_conversation_save_inner(
+            state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            if placed { Some(result) } else { None },
+        )?;
+        let (checks, mutations) = store
+            .placement_batch(&snap, placed)
+            .map_err(|e| Error::Invalid(format!("summary: {e}")))?;
+        batch.extend(PreparedConversationSave {
+            owner,
+            checks,
+            mutations,
+        })?;
+        let bytes = batch
+            .mutations
+            .iter()
+            .map(|m| match m {
+                Mutation::Put { key, value } => key.len().saturating_add(value.len()),
+                Mutation::Delete { key } => key.len(),
+            })
+            .fold(0usize, usize::saturating_add);
+        if bytes > SUMMARY_MAX_BATCH_BYTES || batch.checks.len() > 64 || batch.mutations.len() > 64
+        {
+            return Err(Error::Invalid(
+                "independent summary placement batch exceeds limits".into(),
+            ));
+        }
+        self.commit_conversation_save(batch)
+    }
+
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
             if cancel.is_cancelled() {
@@ -6131,6 +6230,18 @@ impl Harness {
                     continue;
                 }
                 return Ok(());
+            }
+            if c.pending_independent_summary.is_some()
+                && matches!(
+                    c.phase,
+                    Phase::Boundary { .. } | Phase::Idle | Phase::FailedIdle
+                )
+            {
+                match self.consume_independent_summary(&mut c, version) {
+                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                    other => other?,
+                }
+                continue;
             }
             if self.prepare_nested_resume(&mut c)? {
                 match self.save(&c, Expected::Version(version)) {
@@ -8230,14 +8341,63 @@ impl SummaryPlacementDriver {
                 store
                     .placement_ticket(&snap)
                     .map_err(|e| self.summary_store_error(e))?;
+                if let Some(entry) = current.as_ref() {
+                    let raw: Conversation = serde_json::from_slice(&entry.value)?;
+                    if raw
+                        .pending_independent_summary
+                        .as_ref()
+                        .is_some_and(|marker| marker.id == id)
+                    {
+                        return Ok(SummaryPlacement::Queued);
+                    }
+                }
             } else if let Some(version) = snap.operation.placement_version()
                 && current
                     .as_ref()
                     .is_some_and(|entry| entry.version == version)
             {
-                match store.admit_placement(&snap, key.clone(), version) {
-                    Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
-                    Err(error) => return Err(self.summary_store_error(error)),
+                let (state, loaded_version) =
+                    self.harness.load_for_summary_placement(conversation)?;
+                if loaded_version != version {
+                    continue;
+                }
+                let marker = if matches!(state.phase, Phase::ModelRunning { .. })
+                    && state.active.is_some()
+                    && state.pending_independent_summary.is_none()
+                    && state.pending_resets.is_empty()
+                    && !state.submissions.iter().any(|s| s.status == Status::Queued)
+                    && !state.abort_requested
+                    && result.source_matches(&state.messages)
+                    && !result.is_stale(&state.messages, state.context_generation)
+                {
+                    let mut raw: serde_json::Value =
+                        serde_json::from_slice(&current.as_ref().unwrap().value)?;
+                    raw["pending_independent_summary"] =
+                        serde_json::to_value(PendingIndependentSummary {
+                            id,
+                            submissions: state.submissions.len(),
+                            writes: state.application_writes.len(),
+                            resets: state.resets.len(),
+                        })?;
+                    let encoded = serde_json::to_vec(&raw)?;
+                    if encoded.len() > SUMMARY_MAX_BATCH_BYTES {
+                        return Err(Error::Invalid(
+                            "independent summary admission exceeds limits".into(),
+                        ));
+                    }
+                    Some(encoded)
+                } else {
+                    None
+                };
+                if state.is_working() && marker.is_none() {
+                    // The original busy snapshot changed or is no longer eligible.
+                } else {
+                    let queued = marker.is_some();
+                    match store.admit_placement_with_marker(&snap, key.clone(), version, marker) {
+                        Ok(()) if queued => return Ok(SummaryPlacement::Queued),
+                        Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
+                        Err(error) => return Err(self.summary_store_error(error)),
+                    }
                 }
             }
             let mut placement = None;
@@ -9011,8 +9171,49 @@ impl Scheduler {
             conversation,
             None,
             keep_recent_tokens,
-            true,
+            (true, false),
             instructions,
+        )? {
+            return Ok(false);
+        }
+        self.spawn_summary(id, conversation);
+        Ok(true)
+    }
+
+    /// Admit one independent summary while a model request is in flight.
+    /// Competing queued inputs, resets and application writes conservatively
+    /// make the pending result stale at the next boundary.
+    pub fn request_busy_independent_compaction(
+        &mut self,
+        conversation: Uuid,
+        id: Uuid,
+        keep_recent_tokens: usize,
+    ) -> Result<bool, Error> {
+        if id.is_nil() {
+            return Err(Error::Invalid("independent compaction ID is nil".into()));
+        }
+        if self.harness.failed
+            || self.harness.dirty.load(Ordering::Acquire)
+            || self.harness.storage_failed.load(Ordering::Acquire)
+        {
+            return Err(Error::Failed);
+        }
+        if crate::summary_store::SummaryStore::new(self.harness.owner.store())
+            .get(id)
+            .map_err(|e| self.summary_store_error(e))?
+            .is_some()
+        {
+            return Err(Error::Invalid(
+                "independent compaction ID already exists".into(),
+            ));
+        }
+        if !self.create_independent_summary_impl(
+            id,
+            conversation,
+            None,
+            keep_recent_tokens,
+            (true, true),
+            None,
         )? {
             return Ok(false);
         }
@@ -9425,8 +9626,7 @@ impl Scheduler {
         self.tasks.entry(id).or_default().push(task);
     }
 
-    // These methods deliberately remain private: placement and public busy
-    // admission are not yet integrated. The caller persists the preparation.
+    // The private test worker does not automatically place its result.
     #[allow(dead_code)]
     fn create_independent_summary(
         &self,
@@ -9440,7 +9640,7 @@ impl Scheduler {
             conversation,
             Some(max_output_tokens),
             keep_recent_tokens,
-            false,
+            (false, false),
             None,
         )
     }
@@ -9451,7 +9651,7 @@ impl Scheduler {
         conversation: Uuid,
         max_output_tokens: Option<u32>,
         keep_recent_tokens: usize,
-        auto_place: bool,
+        (auto_place, allow_busy): (bool, bool),
         instructions: Option<&str>,
     ) -> Result<bool, Error> {
         let provider = self
@@ -9464,12 +9664,22 @@ impl Scheduler {
                 .map_err(|e| self.summary_store_error(e))?;
         }
         let (state, version) = self.harness.load_for_summary_placement(conversation)?;
-        if state.is_working() || state.abort_requested || !state.content_blocks.is_empty() {
+        let busy_ok = allow_busy
+            && matches!(state.phase, Phase::ModelRunning { .. })
+            && state.active.is_some()
+            && state.pending_independent_summary.is_none()
+            && state.pending_resets.is_empty()
+            && !state.submissions.iter().any(|s| s.status == Status::Queued);
+        if (state.is_working() && !busy_ok)
+            || state.abort_requested
+            || !state.content_blocks.is_empty()
+            || state.pending_independent_summary.is_some()
+        {
             return Err(Error::Invalid(
                 "conversation is not eligible for independent placement".into(),
             ));
         }
-        if auto_place && !matches!(state.phase, Phase::Idle) {
+        if auto_place && !busy_ok && !matches!(state.phase, Phase::Idle) {
             return Err(Error::Invalid(
                 "independent compaction requires an idle conversation".into(),
             ));
@@ -10325,6 +10535,13 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .as_object_mut()
         .and_then(|v| v.remove("submissions"))
         .ok_or_else(|| Error::Invalid("invalid snapshot".into()))?;
+    let old_pending = old
+        .as_object_mut()
+        .and_then(|v| v.remove("pending_independent_summary"));
+    let new_pending = new
+        .as_object_mut()
+        .and_then(|v| v.remove("pending_independent_summary"));
+    let pending_ok = old_pending == new_pending || old_pending == Some(serde_json::Value::Null);
     let old_resets = old.as_object_mut().and_then(|v| v.remove("pending_resets"));
     let new_resets = new.as_object_mut().and_then(|v| v.remove("pending_resets"));
     let resets_unchanged = match (old_resets, new_resets) {
@@ -10372,6 +10589,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         return Err(Error::Invalid("invalid submissions".into()));
     };
     Ok(old == new
+        && pending_ok
         && modes_unchanged
         && resets_unchanged
         && writes_unchanged
@@ -12657,6 +12875,7 @@ mod scheduler_tests {
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
+            pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),

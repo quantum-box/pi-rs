@@ -905,7 +905,7 @@ async fn public_placement_storage_error_fails_closed_until_reopen() {
     let conversation = placement_conversation(&mut scheduler);
     let id = Uuid::new_v4();
     scheduler
-        .create_independent_summary_impl(id, conversation, None, 0, true, None)
+        .create_independent_summary_impl(id, conversation, None, 0, (true, false), None)
         .unwrap();
     crate::summary_worker::run(
         scheduler.harness.owner.clone(),
@@ -947,7 +947,7 @@ async fn public_recovery_resumes_completed_and_admitted_placement() {
         let id = Uuid::new_v4();
         assert!(
             scheduler
-                .create_independent_summary_impl(id, conversation, None, 0, true, None)
+                .create_independent_summary_impl(id, conversation, None, 0, (true, false), None)
                 .unwrap()
         );
         crate::summary_worker::run(
@@ -997,7 +997,7 @@ async fn public_abort_can_win_after_completion_or_placement_admission() {
         let original = scheduler.conversation(conversation).unwrap().messages;
         let id = Uuid::new_v4();
         scheduler
-            .create_independent_summary_impl(id, conversation, None, 0, true, None)
+            .create_independent_summary_impl(id, conversation, None, 0, (true, false), None)
             .unwrap();
         crate::summary_worker::run(
             scheduler.harness.owner.clone(),

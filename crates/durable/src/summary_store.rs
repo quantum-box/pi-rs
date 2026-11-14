@@ -594,11 +594,22 @@ impl<'a> SummaryStore<'a> {
     /// Commit an immutable placement admission and the pending state together,
     /// while fencing the exact conversation version selected at preparation.
     /// The ticket's store commit sequence is the durable ordering boundary.
+    #[cfg(test)]
     pub(crate) fn admit_placement(
         &self,
         snap: &Snapshot,
         conversation_key: Vec<u8>,
         conversation_version: u64,
+    ) -> Result<(), Error> {
+        self.admit_placement_with_marker(snap, conversation_key, conversation_version, None)
+    }
+
+    pub(crate) fn admit_placement_with_marker(
+        &self,
+        snap: &Snapshot,
+        conversation_key: Vec<u8>,
+        conversation_version: u64,
+        marker: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         let mut op = snap.operation.clone();
         if op.placement_version != Some(conversation_version)
@@ -618,6 +629,22 @@ impl<'a> SummaryStore<'a> {
         op.state = State::PlacementPending { request_id, result };
         let key = Self::key(op.id);
         let ticket_key = Self::placement_key(op.id);
+        let mut mutations = vec![
+            Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&op)?,
+            },
+            Mutation::Put {
+                key: ticket_key.clone(),
+                value: serde_json::to_vec(&ticket)?,
+            },
+        ];
+        if let Some(value) = marker {
+            mutations.push(Mutation::Put {
+                key: conversation_key.clone(),
+                value,
+            });
+        }
         self.store
             .commit(
                 &[
@@ -634,16 +661,7 @@ impl<'a> SummaryStore<'a> {
                         expected: Expected::Missing,
                     },
                 ],
-                &[
-                    Mutation::Put {
-                        key,
-                        value: serde_json::to_vec(&op)?,
-                    },
-                    Mutation::Put {
-                        key: ticket_key,
-                        value: serde_json::to_vec(&ticket)?,
-                    },
-                ],
+                &mutations,
             )
             .map_err(|e| match e {
                 durable_store::Error::Conflict { .. } => Error::Conflict,

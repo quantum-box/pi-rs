@@ -596,6 +596,20 @@ Legacy in-flight preparations without a generation can finish while the
 conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
+`Scheduler::request_busy_independent_compaction` also accepts a conversation
+while a single model request is running, with no queued inputs or resets. The
+summary must finish before that conversation snapshot changes. Its completed
+result is atomically registered as a pending conversation write and decided at
+the next boundary. Inputs, resets, or application writes admitted after that
+registration conservatively make it stale. The same is true if its context
+generation or source prefix changes. This is narrower than upstream's ordered
+inbox: it does not place a summary around competing admissions. Conversation
+abort still aborts the pending operation, including its already queued write,
+an intentional difference from upstream. Recovery requires the matching
+provider identity. `wait_independent_compaction` may return `Running` after
+the summary worker finishes while boundary placement is still pending; use
+`independent_compaction_status` after the conversation reaches its boundary.
+
 `Scheduler::request_idle_independent_compaction` starts an independent summary
 for an idle conversation. Supply and retain a
 unique operation ID; the call returns false if nothing can be compacted. On a
