@@ -2029,10 +2029,8 @@ async fn execute(
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
             let workspace = args.workspace.clone();
-            let snapshot = if destination.is_radius() && !args.trust_pending {
-                runtime::standalone_share_snapshot(&args, &session)
-                    .await
-                    .ok()
+            let snapshot = if destination.is_radius() {
+                Some(runtime::standalone_share_snapshot(&args, &session).await?)
             } else {
                 None
             };
