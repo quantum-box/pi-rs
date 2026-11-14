@@ -372,6 +372,31 @@ impl std::io::Write for ShareCaptureSize {
     }
 }
 
+fn respond_share_capture_background(
+    snapshot: super::sessions::ShareSnapshot,
+    journal: Session,
+    slots: Arc<tokio::sync::Semaphore>,
+    id: Option<serde_json::Value>,
+) -> Result<()> {
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| Error::Config("Share journal capture is already being encoded".into()))?;
+    std::thread::Builder::new()
+        .name("share-encode".into())
+        .spawn(move || {
+            let _permit = permit;
+            let result =
+                serde_json::to_writer(&mut ShareCaptureSize(0), &(&snapshot, journal.records()))
+                    .map_err(|_| {
+                        Error::Config("Share journal capture is too large or invalid".into())
+                    })
+                    .map(|()| json!({"snapshot":snapshot, "records":journal.records()}));
+            control_response("get_share_context", id, result);
+        })
+        .map_err(|_| Error::Config("Share journal encoder could not start".into()))?;
+    Ok(())
+}
+
 // Keep the journal that produced the context alongside it. A future durable
 // publisher must bind this exact journal, not reopen a potentially newer file.
 fn snapshot_and_session_for_share_with_hook(
@@ -1699,6 +1724,7 @@ fn read_requests(
         trace,
     });
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let share_encode_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1749,6 +1775,7 @@ fn read_requests(
                     let snapshot = snapshot.clone();
                     let active = active.clone();
                     let slots = share_slots.clone();
+                    let encode_slots = share_encode_slots.clone();
                     runtime.spawn(async move {
                         if include_journal && journal_key.is_none() {
                             control_response(
@@ -1765,30 +1792,29 @@ fn read_requests(
                                 return;
                             }
                         }
-                        let result = share_snapshot_and_journal_background(
+                        let captured = share_snapshot_and_journal_background(
                             active,
                             snapshot,
                             slots,
                             journal_key,
                             move || Session::snapshot(session).ok(),
                         )
-                        .await
-                        .and_then(|(snapshot, journal)| {
-                            if include_journal {
-                                serde_json::to_writer(
-                                    &mut ShareCaptureSize(0),
-                                    &(&snapshot, journal.records()),
-                                )
-                                .map_err(|_| {
-                                    Error::Config(
-                                        "Share journal capture is too large or invalid".into(),
-                                    )
-                                })?;
-                                Ok(json!({"snapshot":snapshot, "records":journal.records()}))
-                            } else {
-                                serde_json::to_value(snapshot).map_err(Into::into)
+                        .await;
+                        let result = match captured {
+                            Ok((snapshot, journal)) if include_journal => {
+                                if let Err(error) = respond_share_capture_background(
+                                    snapshot,
+                                    journal,
+                                    encode_slots,
+                                    id.clone(),
+                                ) {
+                                    control_response("get_share_context", id, Err(error));
+                                }
+                                return;
                             }
-                        });
+                            Ok((snapshot, _)) => serde_json::to_value(snapshot).map_err(Into::into),
+                            Err(error) => Err(error),
+                        };
                         control_response("get_share_context", id, result);
                     });
                 }
@@ -2066,6 +2092,14 @@ mod share_context_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn paired_journal_encoding_has_a_hard_byte_limit() {
+        use std::io::Write;
+        let mut count = ShareCaptureSize(128 * 1024 * 1024 - 65);
+        count.write_all(b"x").unwrap();
+        assert!(count.write_all(b"x").is_err());
     }
 
     #[tokio::test]
