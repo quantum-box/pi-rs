@@ -987,3 +987,44 @@ fn document_admission_rechecks_read_only_dependencies() {
         7
     );
 }
+
+#[test]
+fn positioned_view_splits_a_single_immutable_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages = (0..5)
+        .map(|n| Message::User {
+            content: n.to_string(),
+        })
+        .collect();
+    h.save(&state, Expected::Version(version)).unwrap();
+    let limit = std::num::NonZeroUsize::new(2).unwrap();
+    let mut page = h.view_positioned(id, limit).unwrap();
+    let mut entries = Vec::new();
+    loop {
+        entries.extend(page.entries);
+        match page.older {
+            Some(next) => page = h.view_positioned_page(id, next, limit).unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(entries.len(), 5);
+    for (index, entry) in entries.iter().enumerate() {
+        let suffix = h
+            .view_positioned_page(id, entry.position.clone(), limit)
+            .unwrap();
+        assert_eq!(suffix.entries[0].message, state.messages[4 - index]);
+        assert_eq!(suffix.entries[0].message, entry.message);
+    }
+    let mut bad = entries[0].position.clone();
+    bad.remaining = Some(6);
+    assert!(h.view_positioned_page(id, bad, limit).is_err());
+}

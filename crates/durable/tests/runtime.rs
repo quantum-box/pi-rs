@@ -139,6 +139,70 @@ async fn view_pages_stay_on_captured_transcript_and_show_submission_state() {
 }
 
 #[tokio::test]
+async fn positioned_messages_survive_reset_and_reopen_and_are_conversation_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel {
+        calls: AtomicUsize::new(0),
+        fail_first: false,
+    });
+    let tool = Arc::new(FakeTool {
+        calls: AtomicUsize::new(0),
+        interrupt: false,
+        cancel: None,
+    });
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(
+        &path,
+        options(model.clone(), tool.clone(), ReplayPolicy::Unsafe),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let other = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "one".into(), &cancel)
+        .await
+        .unwrap();
+    let expected = h.conversation(id).unwrap().messages;
+    let limit = std::num::NonZeroUsize::new(2).unwrap();
+    let mut page = h.view_positioned(id, limit).unwrap();
+    let mut positions = Vec::new();
+    loop {
+        positions.extend(
+            page.entries
+                .into_iter()
+                .map(|e| (e.message, serde_json::to_string(&e.position).unwrap())),
+        );
+        match page.older {
+            Some(next) => page = h.view_positioned_page(id, next, limit).unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(positions.len(), expected.len());
+    assert_eq!(
+        positions.iter().map(|p| &p.0).collect::<Vec<_>>(),
+        expected.iter().rev().collect::<Vec<_>>()
+    );
+    h.reset(id, Some("new context".into())).unwrap();
+    drop(h);
+    let h = Harness::open(&path, options(model, tool, ReplayPolicy::Unsafe), &cancel)
+        .await
+        .unwrap();
+    for (index, (message, encoded)) in positions.iter().enumerate() {
+        let position = serde_json::from_str(encoded).unwrap();
+        let page = h
+            .view_positioned_page(id, position, std::num::NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(&page.entries[0].message, message, "position {index}");
+        assert!(
+            h.view_positioned_page(other, serde_json::from_str(encoded).unwrap(), limit)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn executes_model_tool_and_final_answer_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.sqlite");

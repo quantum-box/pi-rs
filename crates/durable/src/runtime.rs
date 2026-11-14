@@ -416,7 +416,7 @@ fn view_fingerprint(view: &ConversationView) -> Result<serde_json::Value, Error>
 }
 
 /// Opaque position in one immutable conversation transcript snapshot.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewCursor {
     cursor: crate::transcript::Cursor,
     remaining: Option<usize>,
@@ -425,6 +425,19 @@ pub struct ViewCursor {
 pub struct ViewPage {
     /// Newest first, including within a transcript batch.
     pub entries: Vec<Message>,
+    pub older: Option<ViewCursor>,
+}
+
+/// A message and its position in a captured transcript, inclusive of that message.
+/// This identifies a transcript position only; it does not establish a safe fork.
+pub struct PositionedMessage {
+    pub message: Message,
+    pub position: ViewCursor,
+}
+
+pub struct PositionedViewPage {
+    /// Newest first, including within a transcript batch.
+    pub entries: Vec<PositionedMessage>,
     pub older: Option<ViewCursor>,
 }
 
@@ -1438,9 +1451,57 @@ impl Harness {
     pub fn view_page(
         &self,
         id: Uuid,
-        mut position: ViewCursor,
+        position: ViewCursor,
         limit: std::num::NonZeroUsize,
     ) -> Result<ViewPage, Error> {
+        let page = self.view_positioned_page(id, position, limit)?;
+        Ok(ViewPage {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect(),
+            older: page.older,
+        })
+    }
+
+    /// Capture the active transcript and return its newest positioned messages.
+    /// Positions can be serialized and revisited after later appends or reopening.
+    pub fn view_positioned(
+        &self,
+        id: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedViewPage, Error> {
+        self.subagent_store()?;
+        let entry = self
+            .owner
+            .store()
+            .get(&Self::key(id))?
+            .ok_or(Error::NotFound)?;
+        let state: Conversation = serde_json::from_slice(&entry.value)?;
+        let cursor = state.transcript.ok_or_else(|| {
+            Error::Invalid(
+                "legacy conversation has no immutable transcript; save it before viewing".into(),
+            )
+        })?;
+        self.view_positioned_page(
+            id,
+            ViewCursor {
+                cursor,
+                remaining: None,
+            },
+            limit,
+        )
+    }
+
+    /// Read a position inclusively, with stable positions for every returned message.
+    /// A position is scoped to its conversation and is not a fork authorization.
+    pub fn view_positioned_page(
+        &self,
+        id: Uuid,
+        mut position: ViewCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedViewPage, Error> {
         self.subagent_store()?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let mut entries = Vec::new();
@@ -1461,7 +1522,21 @@ impl Harness {
                 return Err(Error::Invalid("invalid view cursor".into()));
             }
             let start = end.saturating_sub(limit.get() - entries.len());
-            entries.extend(messages.into_iter().take(end).skip(start).rev());
+            entries.extend(
+                messages
+                    .into_iter()
+                    .take(end)
+                    .enumerate()
+                    .skip(start)
+                    .rev()
+                    .map(|(index, message)| PositionedMessage {
+                        message,
+                        position: ViewCursor {
+                            cursor: position.cursor.clone(),
+                            remaining: Some(index + 1),
+                        },
+                    }),
+            );
             if start > 0 {
                 position.remaining = Some(start);
                 older = Some(position);
@@ -1484,7 +1559,7 @@ impl Harness {
             }
             older = Some(position.clone());
         }
-        Ok(ViewPage { entries, older })
+        Ok(PositionedViewPage { entries, older })
     }
     /// Override wall time for durable gate deadlines. Set before driving work.
     pub fn set_signal_clock(&mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
@@ -4109,6 +4184,21 @@ impl Scheduler {
         limit: std::num::NonZeroUsize,
     ) -> Result<ViewPage, Error> {
         self.harness.view_page(id, cursor, limit)
+    }
+    pub fn view_positioned(
+        &self,
+        id: Uuid,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedViewPage, Error> {
+        self.harness.view_positioned(id, limit)
+    }
+    pub fn view_positioned_page(
+        &self,
+        id: Uuid,
+        position: ViewCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedViewPage, Error> {
+        self.harness.view_positioned_page(id, position, limit)
     }
     pub fn send_signal(&self, signal: &crate::conversation_signal::Signal) -> Result<(), Error> {
         self.harness.send_signal(signal)
