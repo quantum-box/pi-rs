@@ -666,8 +666,8 @@ cannot verify an opaque client's endpoint; the host must enforce endpoint-bound
 credentials. Unqualified legacy selections never invoke the resolver, and
 existing exact registrations take precedence. This resolver runs on session
 construction, after recovering interrupted handoffs, not branch navigation or
-fork. Fallback fails without writing when the current imported Pi source would
-require a two-record selection; a custom store cannot commit both atomically.
+fork. Fallback commits a single native selection record even after an imported
+Pi source, using a distinct timestamp so older projections retain the change.
 Hosts can also explicitly call
 `set_model` or `set_model_with_hooks` to select another client. The hook-aware form installs the replacement after
 recovery and before startup hooks and any turns they trigger.

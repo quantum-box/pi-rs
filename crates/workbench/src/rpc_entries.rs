@@ -717,6 +717,40 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn imported_source_followed_by_distinct_native_selection_projects_both() {
+        let session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = session.records().to_vec();
+        let version = records[0].version;
+        records.push(Record {
+            version, id: 2, parent: Some(1), run_id: None,
+            timestamp: Some("2026-01-01T00:00:00.000Z".into()),
+            event: Event::SourceEntry { format: "pi".into(), entry: json!({"type":"model_change", "id":"old", "provider":"old", "modelId":"shared"}) },
+        });
+        records.push(Record {
+            version,
+            id: 3,
+            parent: Some(2),
+            run_id: None,
+            timestamp: Some("2026-01-01T00:00:00.000000Z".into()),
+            event: Event::ModelSelected {
+                provider: Some("new".into()),
+                model: "shared".into(),
+                thinking: None,
+            },
+        });
+        let restored = Session::from_records(records).unwrap();
+        let entries = Entries::new(&restored);
+        let models: Vec<_> = entries
+            .values
+            .iter()
+            .filter(|entry| entry["type"] == "model_change")
+            .collect();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["provider"], "old");
+        assert_eq!(models[1]["provider"], "new");
+    }
+
+    #[test]
     fn native_custom_entries_are_visible_without_entering_messages() {
         let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         session

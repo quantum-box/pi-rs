@@ -1070,6 +1070,28 @@ impl Session {
         Ok(())
     }
 
+    /// Commit a native fallback in one record, even on an imported Pi head.
+    /// A distinct timestamp preserves the existing imported-conversion marker
+    /// understood by older journal and RPC readers.
+    pub(crate) fn select_provider_model_atomic(
+        &mut self,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        self.append_inner(
+            Event::ModelSelected {
+                model: model.into(),
+                thinking: None,
+                provider: Some(provider.into()),
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
     // Older journals may contain only a thinking marker and its synthetic
     // ModelSelected record. An explicit model choice must establish a model.
     fn has_only_thinking_selection(&self) -> bool {
@@ -1947,6 +1969,10 @@ impl Session {
     }
 
     pub(crate) fn append(&mut self, event: Event) -> Result<&Record> {
+        self.append_inner(event, true)
+    }
+
+    fn append_inner(&mut self, event: Event, model_marker: bool) -> Result<&Record> {
         if self.poisoned {
             return Err(Error::Session(
                 "journal write failed; reopen before continuing".into(),
@@ -1968,7 +1994,8 @@ impl Session {
         }
         // Distinguish a native selection from a conversion appended directly
         // after a Pi source entry that did not itself produce a selection.
-        if matches!(&event, Event::ModelSelected { .. })
+        if model_marker
+            && matches!(&event, Event::ModelSelected { .. })
             && self.needs_native_model_selection_marker()
         {
             self.append(Event::SourceEntry {
@@ -1988,8 +2015,19 @@ impl Session {
             } => Some(*target),
             _ => (self.head != 0).then_some(self.head),
         };
+        let mut timestamp = record_timestamp();
+        if !model_marker
+            && self.needs_native_model_selection_marker()
+            && self
+                .records
+                .get(self.head.saturating_sub(1) as usize)
+                .and_then(|record| record.timestamp.as_deref())
+                == Some(timestamp.as_str())
+        {
+            timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        }
         let record = Record {
-            timestamp: Some(record_timestamp()),
+            timestamp: Some(timestamp),
             run_id: self.run_id,
             version: FORMAT_VERSION,
             id,

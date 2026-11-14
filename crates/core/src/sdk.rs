@@ -1253,10 +1253,7 @@ impl SessionBuilder {
                             "fallback provider or model name is empty".into(),
                         ));
                     }
-                    if session.needs_native_model_selection_marker() {
-                        return Err(Error::Session("automatic model fallback cannot safely commit on an imported source entry; select a model explicitly".into()));
-                    }
-                    session.select_provider_model(Some(&replacement_provider), &model, None)?;
+                    session.select_provider_model_atomic(&replacement_provider, &model)?;
                     model_fallback = Some(HistoricalModelFallback {
                         requested_provider: provider,
                         requested_model: name,
@@ -4112,7 +4109,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_on_imported_source_never_partially_writes_marker() {
+    fn fallback_on_imported_source_is_one_atomic_selection_record() {
         let mut original = Session::with_store(MemoryStore::default()).unwrap();
         original
             .select_provider_model(Some("old"), "shared", None)
@@ -4120,35 +4117,52 @@ mod tests {
         original
             .append(crate::Event::SourceEntry {
                 format: "pi".into(),
-                entry: serde_json::json!({"type":"message", "message":{"role":"assistant"}}),
+                entry: serde_json::json!({"type":"model_change", "provider":"old", "modelId":"shared"}),
             })
             .unwrap();
         let head = original.head();
-        let records = Arc::new(Mutex::new(original.records().to_vec()));
-        let writes = Arc::new(AtomicUsize::new(0));
-        let journal = Session::with_store(SeededStore {
-            records: records.clone(),
-            writes: writes.clone(),
-            fail_on: 2,
-        })
-        .unwrap();
-        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
-            Ok(HistoricalModelResolution::Fallback {
-                provider: "new".into(),
-                model: "shared".into(),
-                client: Arc::new(ProviderBranchModel("new")),
+        for fail_on in [1, 2] {
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
             })
-        });
-        let result = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
-            .provider("default")
-            .unwrap()
-            .historical_model_resolver(resolver)
-            .build(journal);
-        assert!(result.is_err());
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
-        assert_eq!(restored.head(), head);
-        assert_eq!(restored.model_provider(), Some("old"));
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("new")),
+                })
+            });
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+                .provider("default")
+                .unwrap()
+                .historical_model_resolver(resolver)
+                .build(journal);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), head);
+                assert_eq!(restored.model_provider(), Some("old"));
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(restored.head(), head + 1);
+                assert_eq!(restored.model_provider(), Some("new"));
+                let records = restored.records();
+                assert!(matches!(
+                    records.last().unwrap().event,
+                    crate::Event::ModelSelected { .. }
+                ));
+                assert_ne!(
+                    records[head as usize - 1].timestamp,
+                    records[head as usize].timestamp
+                );
+            }
+        }
     }
     #[async_trait::async_trait]
     impl Model for ProviderBranchModel {
