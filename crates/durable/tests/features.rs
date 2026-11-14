@@ -918,6 +918,119 @@ async fn reset_queued_during_manual_summary_precedes_its_placement() {
 }
 
 #[tokio::test]
+async fn manual_compaction_abort_waits_for_summary_drop_and_usage_settlement() {
+    use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Semaphore;
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct SummaryBarrier {
+        started: Semaphore,
+        dropped: Arc<AtomicBool>,
+        settling: Semaphore,
+        release: Semaphore,
+    }
+    #[async_trait]
+    impl Model for SummaryBarrier {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                let guard = DropFlag(self.dropped.clone());
+                self.started.add_permits(1);
+                return Ok(stream::pending::<Result<ModelEvent, Error>>()
+                    .map(move |event| {
+                        let _ = &guard;
+                        event
+                    })
+                    .boxed());
+            }
+            ModelStub.stream(request).await
+        }
+        async fn record_usage(
+            &self,
+            _: uuid::Uuid,
+            report: &pi_rs_core::UsageReport,
+        ) -> Result<(), Error> {
+            assert!(self.dropped.load(Ordering::SeqCst));
+            assert!(matches!(report, pi_rs_core::UsageReport::Unconfirmed));
+            self.settling.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let model = Arc::new(SummaryBarrier {
+        started: Semaphore::new(0),
+        dropped: Arc::new(AtomicBool::new(false)),
+        settling: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut scheduler = Scheduler::open(
+        &path,
+        Options {
+            model: model.clone(),
+            ..opts()
+        },
+    )
+    .unwrap();
+    let operation = scheduler
+        .request_manual_compaction(id, 0, None)
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), model.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    {
+        let abort = scheduler.abort_and_wait(id);
+        tokio::pin!(abort);
+        tokio::select! {
+            result = &mut abort => panic!("abort returned before usage settlement: {result:?}"),
+            permit = tokio::time::timeout(std::time::Duration::from_secs(5), model.settling.acquire()) => permit.unwrap().unwrap().forget(),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut abort)
+                .await
+                .is_err()
+        );
+        model.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), abort)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    scheduler.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    let record = &h.conversation(id).unwrap().manual_compactions[0];
+    assert_eq!(record.id, operation);
+    assert_eq!(record.status, ManualCompactionStatus::Aborted);
+}
+
+#[tokio::test]
 async fn manual_compaction_abort_during_summary_survives_reopen() {
     use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
     use tokio::sync::Semaphore;
