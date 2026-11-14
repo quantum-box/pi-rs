@@ -18,21 +18,35 @@
     globalThis.console = Object.freeze(Object.fromEntries(["log", "info", "warn", "error", "debug"].map(name => [name, (...args) => emit("console", args.map(stringify).join(" "))])));
     const values = Object.create(null);
     for (const [key, value] of Object.entries(__initial_store)) values[key] = JSON.stringify(value);
+    let storedChars = Object.entries(values).reduce((size, [key, value]) => size + key.length + value.length, 0);
     let changed = false;
-    globalThis.load = key => Object.hasOwn(values, String(key)) ? JSON.parse(values[String(key)]) : undefined;
+    const checkKey = (name, key) => {
+        if (typeof key !== "string") throw new TypeError(name + "() key must be a string");
+    };
+    globalThis.load = key => {
+        checkKey("load", key);
+        return Object.hasOwn(values, key) ? JSON.parse(values[key]) : undefined;
+    };
     globalThis.store = (key, value) => {
-        key = String(key);
-        if (key.length > 1024) throw new Error("store key exceeds size limit");
-        const encoded = value === undefined ? undefined : JSON.stringify(value);
-        if (value !== undefined && encoded === undefined) throw new Error("stored value is not JSON serializable");
-        if (encoded !== undefined && encoded.length > 262144) throw new Error("stored value exceeds size limit");
-        const next = { ...values };
-        if (encoded === undefined) delete next[key];
-        else next[key] = encoded;
-        const size = Object.entries(next).reduce((sum, [name, entry]) => sum + name.length + entry.length, 0);
-        if (size > 1048576) throw new Error("store exceeds size limit");
-        if (encoded === undefined) delete values[key];
-        else values[key] = encoded;
+        checkKey("store", key);
+        if (value === undefined) {
+            const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
+            delete values[key];
+            storedChars -= previous;
+            changed = true;
+            return;
+        }
+        let encoded;
+        try { encoded = JSON.stringify(value); }
+        catch (_) { throw new TypeError("stored value is not JSON serializable"); }
+        if (encoded === undefined) throw new TypeError("stored value is not JSON serializable");
+        if (encoded.length > 262144) throw new RangeError("stored value exceeds size limit");
+        // JSON.stringify can invoke toJSON, which may mutate this same key.
+        const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
+        const size = storedChars - previous + key.length + encoded.length;
+        if (size > 1048576) throw new RangeError("store exceeds size limit");
+        values[key] = encoded;
+        storedChars = size;
         changed = true;
     };
     const tools = Object.create(null);
