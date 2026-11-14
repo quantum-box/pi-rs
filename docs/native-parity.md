@@ -675,10 +675,12 @@ output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
 
 For text reads, Pi exposes the displayed page as both text content and a
-`structuredContent` string. Native local and injected read tools now retain
-that string in tool-result events, including continuation and truncation
-notices, while keeping truncation details separate and model-facing text
-unchanged. Image read structured output remains a separate parity gap.
+`structuredContent` string. Native agent tool-result events retain that string,
+including continuation and truncation notices, while keeping truncation details
+separate and model-facing text unchanged. Direct and programmatic read calls
+retain their existing `Outcome` variants. Agent result hooks and journal records
+still see a structured result variant, which is an SDK compatibility gap.
+Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even

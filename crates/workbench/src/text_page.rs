@@ -100,7 +100,7 @@ pub(super) fn read_from(
                 end + 1
             ));
         }
-        return Ok(text_result(output, None));
+        return Ok(Outcome::Succeeded(output));
     }
 
     head.truncate(total_lines.min(MAX_LINES));
@@ -143,17 +143,7 @@ pub(super) fn read_from(
             end + 1
         )
     };
-    Ok(text_result(output, Some(details)))
-}
-
-// Pi's read tool exposes the same displayed text separately to event consumers.
-fn text_result(output: String, details: Option<serde_json::Value>) -> Outcome {
-    Outcome::TextResultWithStructuredContent {
-        structured_content: json!(output),
-        output,
-        details,
-        is_error: false,
-    }
+    Ok(Outcome::SucceededWithDetails { output, details })
 }
 
 // Decode complete lines while retaining only a bounded prefix for display.
@@ -199,52 +189,6 @@ mod tests {
         super::read(path, name, offset, limit, &CancellationToken::new())
             .map(|outcome| outcome.tool_content())
     }
-    #[test]
-    fn structured_text_retains_paging_and_truncation_details() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), "first\nsecond\nthird").unwrap();
-        let page = super::read(
-            file.path(),
-            "fixture",
-            0,
-            Some(1),
-            &CancellationToken::new(),
-        )
-        .unwrap();
-        let Outcome::TextResultWithStructuredContent {
-            output,
-            details,
-            structured_content,
-            is_error,
-        } = page
-        else {
-            panic!("missing structured text")
-        };
-        assert_eq!(
-            output,
-            "first\n\n[2 more lines in file. Use offset=2 to continue.]"
-        );
-        assert_eq!(structured_content, output);
-        assert_eq!(details, None);
-        assert!(!is_error);
-
-        std::fs::write(file.path(), format!("{}\nend", "x".repeat(MAX_BYTES + 1))).unwrap();
-        let page = super::read(file.path(), "fixture", 0, None, &CancellationToken::new()).unwrap();
-        let Outcome::TextResultWithStructuredContent {
-            output,
-            details: Some(details),
-            structured_content,
-            is_error,
-        } = page
-        else {
-            panic!("missing structured truncated text")
-        };
-        assert_eq!(structured_content, output);
-        assert!(output.contains("exceeds 50.0KB limit"));
-        assert_eq!(details["truncation"]["firstLineExceedsLimit"], true);
-        assert!(!is_error);
-    }
-
     #[test]
     fn pages_preserve_empty_lines_and_report_continuation() {
         let file = tempfile::NamedTempFile::new().unwrap();

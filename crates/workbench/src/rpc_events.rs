@@ -676,15 +676,48 @@ mod streaming_tool_tests {
             std::sync::Arc::new(pi_rs_workbench::coding::LocalReadOperations),
         )
         .unwrap();
-        let outcome = tool
-            .invoke(
+        struct Host;
+        #[async_trait::async_trait]
+        impl pi_rs::ToolHost for Host {
+            fn tools(&self) -> Vec<pi_rs::ToolSpec> {
+                Vec::new()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                unreachable!()
+            }
+        }
+        let context = || pi_rs::ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        assert!(matches!(
+            tool.invoke(json!({"path":"file"}), context()).await,
+            Outcome::SucceededWithDetails { .. }
+        ));
+        assert!(matches!(
+            tool.invoke_programmatic(
                 json!({"path":"file"}),
-                pi_rs::ToolContext {
-                    operation_id: uuid::Uuid::new_v4(),
-                    cancellation: pi_rs::CancellationToken::new(),
-                },
+                context(),
+                None,
+                std::sync::Arc::new(Host)
             )
-            .await;
+            .await
+            .outcome,
+            Outcome::SucceededWithDetails { .. }
+        ));
+        std::fs::write(root.path().join("small"), "hello").unwrap();
+        assert!(
+            matches!(tool.invoke(json!({"path":"small"}), context()).await, Outcome::Succeeded(text) if text == "hello")
+        );
+        let outcome = tool
+            .invoke_transaction(
+                json!({"path":"file"}),
+                context(),
+                None,
+                std::sync::Arc::new(Host),
+            )
+            .await
+            .outcome;
         let event = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(false));
         assert_eq!(event["structuredContent"], event["content"][0]["text"]);
         assert_eq!(
