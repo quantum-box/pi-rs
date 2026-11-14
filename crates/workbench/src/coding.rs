@@ -428,6 +428,19 @@ impl CodingTools {
 
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, false)
+    }
+
+    /// Read CLI text attachments using Pi's replacement decoding and input bound.
+    pub fn read_attachment_lossy(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, true)
+    }
+
+    fn read_attachment_inner(
+        &self,
+        path: &Path,
+        lossy: bool,
+    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
         let tool = CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
@@ -442,23 +455,58 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        if let Some(image) = tool.read_image(&path)? {
-            let blocks = image["content"].as_array().expect("image content");
-            let images = blocks
-                .iter()
-                .filter(|block| block["type"] == "image")
-                .cloned()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()?;
-            let hints = blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok((hints, images))
+        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(&path)? {
+            Ok(None)
+        } else if lossy {
+            tool.read_image_inner(&path, false)
         } else {
-            Ok((tool.text(&path)?, Vec::new()))
-        }
+            tool.read_image(&path)
+        };
+        finish_attachment(image, || {
+            if !lossy {
+                return tool.text(&path);
+            }
+            use std::io::Read as _;
+            let metadata = path.metadata()?;
+            if !metadata.is_file() || (!tool.unrestricted && metadata.len() > MAX_FILE_BYTES) {
+                return Err(Error::Config(
+                    "expected a regular text file up to 4 MiB".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(Error::Config(
+                    "attachments exceed the 8 MiB input limit".into(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }
+}
+
+fn finish_attachment(
+    image: Result<Option<Value>>,
+    read_text: impl FnOnce() -> Result<String>,
+) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+    if let Some(image) = image? {
+        let blocks = image["content"].as_array().expect("image content");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()?;
+        let hints = blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok((hints, images))
+    } else {
+        Ok((read_text()?, Vec::new()))
     }
 }
 
@@ -1661,7 +1709,7 @@ impl BashOperations for LocalBashOperations {
             task.abort();
         }
         process.finished = true;
-        Ok(status.expect("shell status observed").code())
+        Ok(Some(exit_code(status.expect("shell status observed"))))
     }
 }
 
@@ -2240,10 +2288,19 @@ impl CodingTool {
     }
 
     fn read_image(&self, path: &Path) -> Result<Option<Value>> {
+        self.read_image_inner(path, true)
+    }
+
+    fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+        let reader = if infer_extension {
+            image::ImageReader::open(path)?
+        } else {
+            image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
+        .with_guessed_format()?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
@@ -2892,12 +2949,6 @@ impl CodingTool {
                 "Command aborted",
             )));
         }
-        if self.unrestricted && result.status.code().is_none() {
-            return Err(Error::Config(shell_status(
-                &result.output.result_display(),
-                "Command terminated without an exit code",
-            )));
-        }
         Ok(result)
     }
     async fn shell_stream(
@@ -3379,7 +3430,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        128 + status.signal().unwrap_or(0)
+        status.signal().map_or(1, |signal| 128 + signal)
     }
     #[cfg(not(unix))]
     {
@@ -3518,6 +3569,17 @@ mod tests {
         assert_eq!(super::read_event_content(&oversized), None);
     }
 
+    #[test]
+    fn attachment_image_io_invalid_data_does_not_fall_back_to_text() {
+        let image_error = std::io::Error::new(std::io::ErrorKind::InvalidData, "image read failed");
+        let result = super::finish_attachment(Err(image_error.into()), || {
+            panic!("image errors must not invoke text decoding")
+        });
+        assert!(
+            matches!(result, Err(pi_rs::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_structured_result_preserves_output_and_exit_status() {
@@ -3554,15 +3616,30 @@ mod tests {
             assert_eq!(structured_content["truncated"], false);
             assert!(structured_content["wall_time_seconds"].as_f64().is_some());
         }
-        let terminated = tool
-            .bash(
-                &serde_json::json!({"command":"kill -TERM $$"}),
-                &pi_rs::CancellationToken::new(),
-            )
-            .await;
-        assert!(
-            matches!(terminated, pi_rs::Outcome::Failed(ref message) if message.contains("Command terminated without an exit code"))
-        );
+        for (signal, code) in [("TERM", 143), ("KILL", 137)] {
+            let terminated = tool
+                .bash(
+                    &serde_json::json!({"command":format!("printf partial; kill -{signal} $$")}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                structured_content,
+                is_error,
+                ..
+            } = terminated
+            else {
+                panic!("signal termination must return a structured result")
+            };
+            assert_eq!(
+                output,
+                format!("partial\n\nCommand exited with code {code}")
+            );
+            assert!(is_error);
+            assert_eq!(structured_content["output"], "partial");
+            assert_eq!(structured_content["exit_code"], code);
+        }
     }
 
     #[test]

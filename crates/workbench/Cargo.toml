@@ -14,6 +14,8 @@ path = "src/main.rs"
 [[bin]]
 name = "pi"
 path = "src/pi.rs"
+# This alias includes main.rs, whose unit tests already run in the pi-rs target.
+test = false
 
 [features]
 evaluation-fixtures = ["dep:pi-rs-fixture-tools"]

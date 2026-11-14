@@ -944,29 +944,26 @@ impl Client {
         })
     }
 
-    pub async fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+    pub async fn thinking_levels(&self, model: &str) -> Option<(Vec<String>, Option<bool>)> {
         match self {
             Self::Ollama(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                Some((details.thinking_levels?, details.reasoning))
             }
             Self::Anthropic(client) => client
                 .model(model)
                 .await
                 .filter(|entry| entry.has_known_thinking())
-                .map(|entry| entry.thinking_levels),
-            Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+                .map(|entry| (entry.thinking_levels, entry.reasoning)),
+            Self::Google(client) => client
+                .model(model)
+                .await
+                .map(|entry| (entry.thinking_levels, Some(entry.reasoning))),
             Self::PiMessages(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                Some((details.thinking_levels?, details.reasoning))
             }
-            Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
+            Self::OpenAi(_) => Some((pi_rs::openai::thinking_levels(model), None)),
             Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await

@@ -273,12 +273,7 @@ impl Entries {
                 .map(str::to_owned);
             let mut descendants = children.remove(id).unwrap_or_default();
             descendants.reverse();
-            descendants.sort_by_cached_key(|node| {
-                node["entry"]["timestamp"]
-                    .as_str()
-                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-                    .map(|timestamp| timestamp.timestamp_millis())
-            });
+            sort_tree_children(&mut descendants);
             let mut node = json!({"entry":entry});
             node["children"] = Value::Array(descendants);
             if let Some((label, timestamp)) = labels.remove(id) {
@@ -321,6 +316,72 @@ impl Entries {
             .collect();
         json!({"messages":messages})
     }
+}
+
+// V8's Date comparator treats a comparison involving an invalid date as
+// equal. That relation is not transitive, so passing it to Rust's general
+// stable sort is invalid. Reproduce V8's natural-run and binary-insertion
+// sequence, run-stack and galloping merges used by Node 22 and 24.
+fn sort_tree_children(children: &mut [Value]) {
+    let mut entries: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node["entry"]["timestamp"].as_str().and_then(tree_timestamp),
+                index,
+            )
+        })
+        .collect();
+    if entries.iter().all(|(timestamp, _)| timestamp.is_some()) {
+        entries.sort_by_key(|(timestamp, _)| *timestamp);
+    } else {
+        sort_tree_mixed(&mut entries);
+    }
+    let mut original: Vec<_> = children.iter_mut().map(std::mem::take).collect();
+    for (destination, (_, index)) in children.iter_mut().zip(entries) {
+        *destination = std::mem::take(&mut original[index]);
+    }
+}
+
+#[path = "rpc_tree_sort.rs"]
+mod rpc_tree_sort;
+use rpc_tree_sort::sort_tree_mixed;
+
+// JavaScript Date treats valid ISO date-only forms as UTC midnight, whereas
+// chrono's RFC 3339 parser requires a time and offset.
+fn tree_timestamp(value: &str) -> Option<i64> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let bytes = value.as_bytes();
+    if !matches!(bytes.len(), 4 | 7 | 10)
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || (bytes.len() >= 7 && (bytes[4] != b'-' || !bytes[5..7].iter().all(u8::is_ascii_digit)))
+        || (bytes.len() == 10 && (bytes[7] != b'-' || !bytes[8..10].iter().all(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    let year = value[..4].parse().ok()?;
+    let month = if bytes.len() >= 7 {
+        value[5..7].parse().ok()?
+    } else {
+        1
+    };
+    let day: u32 = if bytes.len() == 10 {
+        value[8..10].parse().ok()?
+    } else {
+        1
+    };
+    // V8 accepts days 1 through 31 and rolls a day past the end of a
+    // month into the next month. Zero and values above 31 are invalid.
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)?
+        .checked_add_signed(chrono::Duration::days(i64::from(day - 1)))?
+        .and_hms_opt(0, 0, 0)
+        .map(|timestamp| timestamp.and_utc().timestamp_millis())
 }
 
 pub(super) struct Cursor {
@@ -1092,6 +1153,148 @@ mod tests {
             .collect();
         assert_eq!(names, ["earlier", "equal", "later"]);
         assert_eq!(tree["leafId"], children[1]["entry"]["id"]);
+    }
+
+    #[test]
+    fn imported_tree_orders_iso_date_only_timestamps_at_utc_midnight() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("february", Some("root"), "2025-02"),
+            ("january2", Some("root"), "2025-01-02"),
+            ("offset-equal", Some("root"), "2025-01-01T20:00:00-04:00"),
+            ("year", Some("root"), "2025"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["year", "january2", "offset-equal", "february"]);
+        assert_eq!(children[0]["entry"]["timestamp"], "2025");
+        assert_eq!(children[1]["entry"]["timestamp"], "2025-01-02");
+    }
+
+    #[test]
+    fn tree_normalizes_date_only_overflow_with_stable_equal_instants() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("later", Some("root"), "2024-03-02"),
+            ("overflow", Some("root"), "2024-02-30"),
+            ("equal", Some("root"), "2024-03-01T00:00:00Z"),
+            ("earlier", Some("root"), "2024-02-29"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["earlier", "overflow", "equal", "later"]);
+        assert_eq!(children[1]["entry"]["timestamp"], "2024-02-30");
+        for (overflow, normalized) in [("2023-02-29", "2023-03-01"), ("2024-04-31", "2024-05-01")] {
+            assert_eq!(tree_timestamp(overflow), tree_timestamp(normalized));
+        }
+        for invalid in ["2024-02-00", "2024-02-32", "2024-00-01", "2024-13-01"] {
+            assert_eq!(tree_timestamp(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn tree_invalid_timestamp_matches_v8_stable_sort() {
+        for (timestamps, expected) in [
+            (
+                vec!["2025-03-01", "bad", "2025-01-01"],
+                vec!["2025-03-01", "bad", "2025-01-01"],
+            ),
+            (
+                vec!["2025-03-01", "2025-01-01", "bad", "2025-02-01"],
+                vec!["2025-01-01", "2025-02-01", "2025-03-01", "bad"],
+            ),
+        ] {
+            let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+            for (index, timestamp) in timestamps.iter().enumerate() {
+                values
+                    .push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+            }
+            let tree = Entries { values, leaf: None }.tree();
+            let actual: Vec<_> = tree["tree"][0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["entry"]["timestamp"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn large_tree_with_invalid_timestamp_keeps_v8_natural_run() {
+        // Node 22.23 and 24.22 both keep this 80-entry run in append order.
+        let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+        for index in 0..80 {
+            let timestamp = if index == 30 {
+                "bad"
+            } else if index < 30 {
+                "2025-03-01"
+            } else {
+                "2025-01-01"
+            };
+            values.push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+        }
+        let tree = Entries { values, leaf: None }.tree();
+        let ids: Vec<_> = tree["tree"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                node["entry"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, (0..80).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn large_mixed_tree_sort_is_deterministic_and_keeps_every_entry() {
+        let original: Vec<_> = (0..128)
+            .map(|index| {
+                (
+                    if index % 11 == 0 {
+                        None
+                    } else {
+                        Some(((index * 7) % 28 + 1) as i64)
+                    },
+                    index,
+                )
+            })
+            .collect();
+        let mut first = original.clone();
+        let mut second = original;
+        sort_tree_mixed(&mut first);
+        sort_tree_mixed(&mut second);
+        assert_eq!(first, second);
+        let mut indices: Vec<_> = first.iter().map(|(_, index)| *index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..128).collect::<Vec<_>>());
+        assert!(
+            first
+                .windows(2)
+                .any(|pair| pair[0].0.is_some() && pair[1].0.is_none())
+        );
     }
 
     #[test]

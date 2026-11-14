@@ -2086,6 +2086,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "pi-rs-tool-arguments",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

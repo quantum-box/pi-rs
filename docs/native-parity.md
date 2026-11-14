@@ -69,6 +69,9 @@ The per-model thinking submenu discovers models and their supported levels off
 the terminal thread, saves or clears individual overrides, and preserves other
 user and trusted-project settings. Changes for the active model update the
 session; when an agent run is in progress, they take effect after that run.
+While supported levels load, up to 1024 keyboard or paste events are retained
+for the level selector; the configured picker cancellation key cancels loading
+and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
@@ -206,9 +209,10 @@ uses its DeepSeek-style thinking switch. Subscription OAuth supports device
 login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
 remains open.
 
-Markdown links use the reference's non-hyperlink terminal fallback: link text
-is underlined and destinations appear in parentheses only when they differ from
-the visible URL or email address. OSC 8 hyperlink capability remains open.
+On terminals without OSC 8 support, Markdown links use the reference's text
+fallback: link text is underlined and destinations appear in parentheses only
+when they differ from the visible URL or email address. Supported terminals use
+OSC 8 hyperlinks, as described in the terminal capabilities checkpoint below.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
@@ -297,9 +301,16 @@ characters as Pi does. Incomplete JSON and non-object values produce a tool
 error containing the received arguments. The original model response remains
 in the journal; subsequent model requests use the repaired object.
 
-`get_tree` sorts siblings by timestamp in chronological order, including
-imported timestamps with UTC offsets. Siblings with the same instant retain
-append order. Entries whose parent is missing or points to themselves appear as
+When all sibling timestamps are valid, `get_tree` sorts them in chronological
+order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
+interpreted at UTC midnight as in Pi, including day overflow within 1–31.
+For mixed invalid dates, the comparator is not transitive, so
+chronological order and equal-instant append order are not guaranteed. The
+native implementation reproduces Node 22/24 V8 natural runs, insertion,
+run-stack collapse and galloping merges. Mixed lists of 3–10,000 entries were
+compared with Node 22.23.4 and 24.22.1; other JavaScript engines and versions
+may behave differently. Other JavaScript date parsing edge cases
+remain open. Entries whose parent is missing or points to themselves appear as
 roots.
 
 During manual compaction, an RPC `abort` response waits for the compaction
@@ -399,8 +410,10 @@ remaining feature rows above still need their own acceptance checks.
 ### Faithful terminal checkpoint
 
 Markdown lists preserve the reference spacing between items in loose lists
-with direct text paragraphs, including nested lists, while tight lists remain
-compact. Lists containing only block elements still need comparison.
+with direct text paragraphs, including nested lists, and between block-only
+items separated by blank lines, including within blockquotes. Tight lists remain
+compact; blank lines inside fenced code do not loosen the enclosing list. Other block-only looseness and
+layout cases still need comparison.
 
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
@@ -1142,7 +1155,12 @@ context or starting a new session clears the ambiguity. Google text and tool-cal
 
 The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
-prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
+prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
+malformed UTF-8 in text attachments is decoded with replacement characters.
+For CLI attachments, image detection does not infer a format from the file
+extension. Malformed PNG headers and animated PNGs detected within the first
+4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
+also follows Pi; unsupported image formats are treated as text.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
@@ -1916,7 +1934,8 @@ clients, PKCE verification, rejection of an incorrect callback state,
 authenticated tool calls, token rotation, cross-process reuse, logout and login
 replacement. Store tests cover stale connections, locking, file permissions,
 failed oversized writes and recovery from a damaged store. These are fixture
-checks with an isolated browser launcher. Automatic interactive scope upgrades still require implementation.
+checks with an isolated browser launcher. Interactive scope upgrades for typed
+403 challenges are described in the MCP checkpoint above.
 
 ### Confidential MCP client checkpoint
 
@@ -1933,7 +1952,8 @@ rejected-token refresh, logout, re-login and concurrent configuration edits.
 Existing public-client fixtures also passed. Store tests preserve registration
 metadata across refresh and accept older files that have no registration field.
 The fixtures use a replacement browser launcher and a local authorization
-server. Interactive scope upgrades remain open.
+server. The MCP checkpoint above describes interactive upgrades for typed 403
+scope challenges.
 
 ### MCP client metadata registration checkpoint
 
@@ -2566,7 +2586,8 @@ inherit the refresher. Refresh waits obey model timeouts and cancellation.
 
 Core tests cover same-run advertising and dispatch updates, removal between
 request and dispatch, fixed read-only profiles and cancellation. Interactive
-OAuth scope upgrades and push-notification optimization remain open.
+OAuth upgrades for typed 403 scope challenges are described above;
+push-notification optimization remains open.
 
 Loopback runs verify a direct tool replacement, a same-name schema change,
 explicit exclusion of an added tool, and deferred discovery of a replacement
@@ -4235,7 +4256,12 @@ Consecutive editor kill commands now combine their removed text in deletion
 order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching
 Pi's editor behavior. Focused editor tests cover both directions, multiline
-text, interrupted kills and yank cycling; other editor parity gaps remain open.
+text, interrupted kills and yank cycling; other editor parity gaps remain open. Word navigation and word deletion use ICU word
+boundaries and Pi’s ASCII punctuation rules, and move across a newline one
+line at a time. As intentional fixes to pinned Pi, backward word operations
+advance past a trailing Hebrew apostrophe and preserve combining marks on
+punctuation graphemes. Native editing retains literal pasted text rather than Pi’s
+atomic paste markers.
 
 ### Session tree branch navigation checkpoint
 
@@ -4256,10 +4282,12 @@ non-null content. Other specialized message variants remain open.
 ### RPC truncated JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
-initial object property names, unfinished unescaped strings, and missing values.
-Offsets and columns in these diagnostics count UTF-16 units. Other malformed
-JSON, escaped unfinished strings and carriage-return position handling retain
-the native parser's diagnostics; full malformed-input parity remains open.
+initial object property names, unfinished strings with complete escapes
+(including lone surrogate escapes), and
+missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
+counted as line breaks. Other malformed JSON, including incomplete escapes,
+retains the native parser's diagnostics; full malformed-input parity remains
+open.
 
 ### Shell execution transcript checkpoint
 
@@ -4274,9 +4302,73 @@ Shell transcript rendering strips terminal escape sequences and normalizes line
 endings, including for imported and extension-provided output; journal and
 model-context text retain the original bytes.
 
+### Compaction retention token estimate
+
+Token-based compaction retention uses the projected Pi message estimate,
+including assistant thinking and structured tool-result blocks, when choosing
+a cut point or complete turns. Context edits replace the original estimate.
+A branch-local index shares reasoning and latest edits across message estimates;
+a 2,500-turn regression covers long histories and context usage.
+The separate native model-request safety budget retains its existing
+conservative estimate. Other token-estimator differences remain open.
+
 ### Model listing search checkpoint
 
 `--list-models` searches provider and model IDs with Pi's tokenized fuzzy
 matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
+
+### Messages quota retry classification
+
+Anthropic-compatible Messages requests inspect bounded retryable HTTP error
+responses and stream error fields for Pi's account, quota and billing markers.
+Structured JSON classification uses error message, code and type fields, excluding
+request identifiers and other metadata. Those failures
+stop agent retries; transient rate limits remain retryable. Response bodies are
+not surfaced or logged. Classification falls back to the existing retry behavior
+when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Complete error fields preceding a truncated later JSON field remain classifiable;
+unrelated metadata, incomplete numeric values and undelimited numbers are ignored.
+Known credentials and configured header values are redacted before error fields
+are classified, including for stream errors.
+Other provider adapters still need equivalent quota classification.
+
+### Bedrock quota retry classification
+
+Bedrock service and stream exceptions stop agent retries when their redacted
+error message or code contains Pi's account quota or billing exhaustion
+markers, even if AWS categorizes the exception as transient throttling. The model receives a
+fixed limit message; ordinary throttling remains retryable even if its request
+ID contains a marker. Classification scans the full SDK error message with a
+fixed-size rolling window and redacts secrets before matching. This uses bounded
+additional memory; scan time depends on message length and configured secrets.
+AWS SDK retries before an exception reaches
+the agent remain governed by the configured SDK policy.
+
+Pi's non-chat System One provider-level policy retries transient HTTP status
+codes including 429 without classifying the response body; native keeps that
+separate policy.
+
+### Provider quota retry classification
+
+Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
+recognize permanent account, billing and quota exhaustion in structured error
+message, code and type fields for retryable HTTP statuses and stream errors.
+Recognized transient stream errors, including Gemini errors without a numeric
+code, remain retryable after permanent-limit checks. OpenAI response codes are
+classified only after known credentials are masked.
+JSON metadata such as request IDs does not affect classification. Known request
+credentials, Bearer tokens and conventional authentication-header values are
+masked before classification, even when they equal quota or transient terms.
+Other configured header values are masked
+when distinguishable from those terms; ambiguous header values remain
+classifiable because an echo cannot be distinguished from a provider error.
+Diagnostics remain fixed and do not include provider bodies. Transient stream
+matching follows the pinned Pi patterns. OpenAI subscription
+codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
+seconds. Complete error fields preceding a truncated later JSON field remain
+classifiable; incomplete values and unrelated metadata are ignored. Failed or
+timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or
+returned. Bedrock typed SDK errors and non-chat operations retain their separate
+policies.
