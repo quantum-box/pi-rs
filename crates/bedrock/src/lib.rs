@@ -516,6 +516,42 @@ fn required_text(text: String) -> String {
         text
     }
 }
+// Inspect at most 64 KiB of source text, redacting complete secrets before
+// copying any bytes. This bounds allocations even for untrusted long errors.
+fn bounded_redacted(value: &str, secrets: &[String], max_chars: usize) -> String {
+    const MAX_SCAN_BYTES: usize = 64 * 1024;
+    let mut output = String::new();
+    let mut offset = 0;
+    let mut count = 0;
+    while offset < value.len() && offset < MAX_SCAN_BYTES && count < max_chars {
+        let tail = &value[offset..];
+        if let Some(secret) = secrets
+            .iter()
+            .find(|secret| !secret.is_empty() && tail.starts_with(secret.as_str()))
+        {
+            for c in "[REDACTED]".chars() {
+                if count == max_chars {
+                    break;
+                }
+                output.push(c);
+                count += 1;
+            }
+            offset = offset.saturating_add(secret.len());
+            continue;
+        }
+        let c = tail.chars().next().expect("nonempty tail");
+        if offset + c.len_utf8() > MAX_SCAN_BYTES {
+            break;
+        }
+        offset += c.len_utf8();
+        if !c.is_control() {
+            output.push(c);
+            count += 1;
+        }
+    }
+    output
+}
+
 fn diagnostic(
     meta: &aws_smithy_types::error::metadata::ErrorMetadata,
     fallback_id: Option<&str>,
@@ -530,12 +566,6 @@ fn diagnostic(
         }
         value
     };
-    let clean = |s: &str| {
-        s.chars()
-            .filter(|c| !c.is_control())
-            .take(512)
-            .collect::<String>()
-    };
     let mut parts = vec!["Bedrock error".to_owned()];
     if let Some(code) = meta.code().filter(|s| {
         !s.is_empty()
@@ -547,7 +577,7 @@ fn diagnostic(
     }
     if let Some(message) = meta
         .message()
-        .map(|message| clean(&redact(message)))
+        .map(|message| bounded_redacted(message, secrets, 512))
         .filter(|s| !s.trim().is_empty())
     {
         parts.push(message);
@@ -748,6 +778,111 @@ fn build_error(e: impl std::fmt::Display) -> Error {
     Error::Config(format!("invalid Bedrock request: {e}"))
 }
 
+// Pi's agent does not retry account or billing exhaustion even when a
+// provider reports it through a normally retryable service exception.
+// Classify the already redacted diagnostic and never echo the source text in
+// the permanent-limit message.
+fn permanent_bedrock_limit(value: &str, secrets: &[String]) -> bool {
+    const MARKERS: &[&str] = &[
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    ];
+    // The longest literal is well below 128 bytes. Keep a fixed-size window
+    // while scanning the entire SDK message; no copy grows with its length.
+    #[derive(Clone, Copy)]
+    enum Code {
+        None,
+        Colon,
+        Number(bool),
+        Digits(u8),
+        Lookahead,
+    }
+    let mut code = Code::None;
+    let mut window = String::with_capacity(128);
+    {
+        let mut feed = |ch: char| {
+            let c = ch.to_ascii_lowercase();
+            code = match code {
+                Code::Colon if (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}' => {
+                    Code::Colon
+                }
+                Code::Colon if c == ':' => Code::Number(false),
+                Code::Number(quoted)
+                    if ((c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}') && !quoted =>
+                {
+                    Code::Number(false)
+                }
+                Code::Number(false) if c == '\"' => Code::Number(true),
+                Code::Number(_) if c == '1' => Code::Digits(1),
+                Code::Digits(1) if c == '3' => Code::Digits(2),
+                Code::Digits(2) if c == '0' => Code::Digits(3),
+                Code::Digits(3) if c == '8' => Code::Lookahead,
+                Code::Lookahead if !c.is_ascii_digit() => return true,
+                _ => Code::None,
+            };
+            window.push(if c.is_ascii() { c } else { '\0' });
+            if window.len() > 128 {
+                window.remove(0);
+            }
+            if MARKERS.iter().any(|marker| window.ends_with(marker)) {
+                return true;
+            }
+            if window.ends_with("\"code\"") {
+                code = Code::Colon;
+            }
+            false
+        };
+        let mut offset = 0;
+        while offset < value.len() {
+            let tail = &value[offset..];
+            if let Some(secret) = secrets
+                .iter()
+                .find(|secret| !secret.is_empty() && tail.starts_with(secret.as_str()))
+            {
+                if "[REDACTED]".chars().any(&mut feed) {
+                    return true;
+                }
+                offset += secret.len();
+            } else {
+                let c = tail.chars().next().expect("nonempty tail");
+                offset += c.len_utf8();
+                if feed(c) {
+                    return true;
+                }
+            }
+        }
+    }
+    // End of input satisfies the numeric negative lookahead.
+    matches!(code, Code::Lookahead)
+}
+
+fn bedrock_service_error(
+    message: String,
+    retryable: bool,
+    meta: &aws_smithy_types::error::metadata::ErrorMetadata,
+    secrets: &[String],
+) -> Error {
+    let permanent = [meta.message(), meta.code()]
+        .into_iter()
+        .flatten()
+        .any(|value| permanent_bedrock_limit(value, secrets));
+    if retryable && permanent {
+        Error::Model("Bedrock account quota or billing limit reached".into())
+    } else if retryable {
+        Error::RetryableModel(message)
+    } else {
+        Error::Model(message)
+    }
+}
+
 fn request_error(
     e: aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
@@ -756,15 +891,11 @@ fn request_error(
 ) -> Error {
     if let Some(service) = e.as_service_error() {
         let message = diagnostic(service.meta(), service.request_id(), secrets);
-        if service.is_throttling_exception()
+        let retryable = service.is_throttling_exception()
             || service.is_model_timeout_exception()
             || service.is_service_unavailable_exception()
-            || service.is_internal_server_exception()
-        {
-            Error::RetryableModel(message)
-        } else {
-            Error::Model(message)
-        }
+            || service.is_internal_server_exception();
+        bedrock_service_error(message, retryable, service.meta(), secrets)
     } else {
         match &e {
                     aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
@@ -1237,7 +1368,8 @@ impl Model for Bedrock {
                         let code = if service.is_validation_exception() { Some("ValidationException") } else if service.is_throttling_exception() { Some("ThrottlingException") } else if service.is_service_unavailable_exception() { Some("ServiceUnavailableException") } else if service.is_internal_server_exception() { Some("InternalServerException") } else if service.is_model_stream_error_exception() { Some("ModelStreamErrorException") } else { None };
                         if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
                     }
-                    if service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception() { Error::RetryableModel(message) } else { Error::Model(message) }
+                    let retryable = service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception();
+                    bedrock_service_error(message, retryable, service.meta(), &secrets)
                 } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
             })? else { break };
                 match event {
@@ -1298,6 +1430,72 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_classification_keeps_transient_and_secret_safe() {
+        use aws_smithy_types::error::metadata::ErrorMetadata;
+        for message in [
+            "Insufficient_Quota",
+            "Monthly usage limit reached",
+            "Billing issue",
+            r#"{"code":"1308"}"#,
+        ] {
+            let meta = ErrorMetadata::builder().message(message).build();
+            assert!(
+                matches!(bedrock_service_error(message.into(), true, &meta, &[]), Error::Model(text) if text == "Bedrock account quota or billing limit reached")
+            );
+        }
+        for message in ["rate limit reached", r#"{"code":13080}"#] {
+            let meta = ErrorMetadata::builder().message(message).build();
+            assert!(matches!(
+                bedrock_service_error(message.into(), true, &meta, &[]),
+                Error::RetryableModel(_)
+            ));
+        }
+        let metadata = ErrorMetadata::builder()
+            .message("quota exceeded secret-token")
+            .build();
+        let redacted = diagnostic(&metadata, None, &["secret-token".into()]);
+        let error = bedrock_service_error(redacted, true, &metadata, &["secret-token".into()]);
+        assert!(!error.to_string().contains("secret-token"));
+        let meta = ErrorMetadata::builder()
+            .message("temporary throttling")
+            .build();
+        let diagnostic = diagnostic(&meta, Some("billing-123"), &[]);
+        assert!(matches!(
+            bedrock_service_error(diagnostic, true, &meta, &[]),
+            Error::RetryableModel(_)
+        ));
+        assert!(matches!(
+            bedrock_service_error("validation failed".into(), false, &meta, &[]),
+            Error::Model(_)
+        ));
+    }
+
+    #[test]
+    fn quota_scan_is_bounded_and_masks_secrets_before_classification() {
+        use aws_smithy_types::error::metadata::ErrorMetadata;
+        let secrets = vec!["billing-secret".to_owned()];
+        for (message, permanent) in [
+            (format!("{} quota exceeded", "x".repeat(520)), true),
+            (format!("{} quota exceeded", "x".repeat(64 * 1024)), true),
+            (
+                format!("{}\"code\":13089", "x".repeat(64 * 1024 - 11)),
+                false,
+            ),
+            ("temporary billing-secret".to_owned(), false),
+            (
+                format!("{}billing-secret", "x".repeat(64 * 1024 - 3)),
+                false,
+            ),
+        ] {
+            let meta = ErrorMetadata::builder().message(message).build();
+            let display = diagnostic(&meta, Some("billing-123"), &secrets);
+            let error = bedrock_service_error(display, true, &meta, &secrets);
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert!(!error.to_string().contains("billing-secret"));
+        }
+    }
+
     #[test]
     fn omitted_thinking_replays_empty_text_with_signature() {
         let replay = ProviderReplay {

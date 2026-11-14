@@ -48,9 +48,15 @@ when `NO_PROXY` selects a direct connection. Embedders using the original
 hostnames too; `HttpOptionsWithProxyHosts` enables private DNS proxy hosts.
 Lowercase environment variables take precedence, and explicit
 environment values take precedence over the setting. Proxy URL credentials are
-not displayed in the settings list. Other network surfaces need integration;
-for plain HTTP origins reqwest uses forward-proxy requests, while upstream Pi
-uses CONNECT tunneling.
+not displayed in the settings list. Workbench-configured reqwest proxies use
+CONNECT for HTTP as well as HTTPS origins, matching Pi. Externally supplied
+authenticated forward-only proxies retain forward behavior. Proxy decisions are captured per request and route-specific connection pools prevent
+credentials from following a request onto another route. Caller-provided forward
+proxy authorization is bound to the first route across redirects. Caller-provided proxy
+authorization is removed for direct and local-socket requests, and passed only
+to the selected proxy for CONNECT. It overrides configured basic authentication;
+configured proxy-specific headers retain their existing precedence. HTTP/3 rejects matched proxy routes rather
+than bypassing them. Other network surfaces need integration.
 
 The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates
@@ -69,6 +75,9 @@ The per-model thinking submenu discovers models and their supported levels off
 the terminal thread, saves or clears individual overrides, and preserves other
 user and trusted-project settings. Changes for the active model update the
 session; when an agent run is in progress, they take effect after that run.
+While supported levels load, up to 1024 keyboard or paste events are retained
+for the level selector; the configured picker cancellation key cancels loading
+and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
@@ -210,9 +219,10 @@ uses its DeepSeek-style thinking switch. Subscription OAuth supports device
 login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
 remains open.
 
-Markdown links use the reference's non-hyperlink terminal fallback: link text
-is underlined and destinations appear in parentheses only when they differ from
-the visible URL or email address. OSC 8 hyperlink capability remains open.
+On terminals without OSC 8 support, Markdown links use the reference's text
+fallback: link text is underlined and destinations appear in parentheses only
+when they differ from the visible URL or email address. Supported terminals use
+OSC 8 hyperlinks, as described in the terminal capabilities checkpoint below.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
@@ -247,8 +257,8 @@ form, including multiple keys and explicitly unbound actions.
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
 frontends. The standalone crate is compile-checked for
-`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
-on that target. Preview behavior retains the existing native parser's documented
+`wasm32-unknown-unknown`; the experimental browser SDK supports the text-only
+sessions described above. Preview behavior retains the existing native parser's documented
 differences from Pi's streaming parser.
 
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
@@ -687,6 +697,22 @@ Lock acquisition also observes cancellation while another writer is active.
 RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
+
+For text reads, Pi exposes the displayed page as both text content and a
+`structuredContent` string. Native agent tool-result events receive this string
+through operation-correlated transient metadata, including continuation and
+truncation notices. The journal, SDK observers, result hooks, direct calls and
+programmatic calls retain their existing `Outcome` variants, and the public
+`Notification` variants are unchanged. In-process partial patches preserve
+the structured value when they only update metadata, and discard it when they
+explicitly replace output, including with the same text. Custom host hooks may
+opt in to reporting output-field presence; native executable extensions negotiate
+that capability and forward the field-presence result across the process boundary.
+A duplex host remains available for nested calls even if it cannot send custom
+messages. Single-shot and duplex presence responses allow only the fixed wrapper
+overhead; the underlying outcome and nonterminal frames still obey their original
+limits. Older executables
+and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
@@ -1132,7 +1158,12 @@ context or starting a new session clears the ambiguity. Google text and tool-cal
 
 The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
-prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
+prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
+malformed UTF-8 in text attachments is decoded with replacement characters.
+For CLI attachments, image detection does not infer a format from the file
+extension. Malformed PNG headers and animated PNGs detected within the first
+4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
+also follows Pi; unsupported image formats are treated as text.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
@@ -1906,7 +1937,8 @@ clients, PKCE verification, rejection of an incorrect callback state,
 authenticated tool calls, token rotation, cross-process reuse, logout and login
 replacement. Store tests cover stale connections, locking, file permissions,
 failed oversized writes and recovery from a damaged store. These are fixture
-checks with an isolated browser launcher. Automatic interactive scope upgrades still require implementation.
+checks with an isolated browser launcher. Interactive scope upgrades for typed
+403 challenges are described in the MCP checkpoint above.
 
 ### Confidential MCP client checkpoint
 
@@ -1923,7 +1955,8 @@ rejected-token refresh, logout, re-login and concurrent configuration edits.
 Existing public-client fixtures also passed. Store tests preserve registration
 metadata across refresh and accept older files that have no registration field.
 The fixtures use a replacement browser launcher and a local authorization
-server. Interactive scope upgrades remain open.
+server. The MCP checkpoint above describes interactive upgrades for typed 403
+scope challenges.
 
 ### MCP client metadata registration checkpoint
 
@@ -2556,7 +2589,8 @@ inherit the refresher. Refresh waits obey model timeouts and cancellation.
 
 Core tests cover same-run advertising and dispatch updates, removal between
 request and dispatch, fixed read-only profiles and cancellation. Interactive
-OAuth scope upgrades and push-notification optimization remain open.
+OAuth upgrades for typed 403 scope challenges are described above;
+push-notification optimization remains open.
 
 Loopback runs verify a direct tool replacement, a same-name schema change,
 explicit exclusion of an added tool, and deferred discovery of a replacement
@@ -4225,7 +4259,12 @@ Consecutive editor kill commands now combine their removed text in deletion
 order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching
 Pi's editor behavior. Focused editor tests cover both directions, multiline
-text, interrupted kills and yank cycling; other editor parity gaps remain open.
+text, interrupted kills and yank cycling; other editor parity gaps remain open. Word navigation and word deletion use ICU word
+boundaries and Pi’s ASCII punctuation rules, and move across a newline one
+line at a time. As intentional fixes to pinned Pi, backward word operations
+advance past a trailing Hebrew apostrophe and preserve combining marks on
+punctuation graphemes. Native editing retains literal pasted text rather than Pi’s
+atomic paste markers.
 
 ### Session tree branch navigation checkpoint
 
@@ -4246,10 +4285,12 @@ non-null content. Other specialized message variants remain open.
 ### RPC truncated JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
-initial object property names, unfinished unescaped strings, and missing values.
-Offsets and columns in these diagnostics count UTF-16 units. Other malformed
-JSON, escaped unfinished strings and carriage-return position handling retain
-the native parser's diagnostics; full malformed-input parity remains open.
+initial object property names, unfinished strings with complete escapes
+(including lone surrogate escapes), and
+missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
+counted as line breaks. Other malformed JSON, including incomplete escapes,
+retains the native parser's diagnostics; full malformed-input parity remains
+open.
 
 ### Shell execution transcript checkpoint
 
@@ -4280,3 +4321,57 @@ conservative estimate. Other token-estimator differences remain open.
 matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
+
+### Messages quota retry classification
+
+Anthropic-compatible Messages requests inspect bounded retryable HTTP error
+responses and stream error fields for Pi's account, quota and billing markers.
+Structured JSON classification uses error message, code and type fields, excluding
+request identifiers and other metadata. Those failures
+stop agent retries; transient rate limits remain retryable. Response bodies are
+not surfaced or logged. Classification falls back to the existing retry behavior
+when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Complete error fields preceding a truncated later JSON field remain classifiable;
+unrelated metadata, incomplete numeric values and undelimited numbers are ignored.
+Known credentials and configured header values are redacted before error fields
+are classified, including for stream errors.
+Other provider adapters still need equivalent quota classification.
+
+### Bedrock quota retry classification
+
+Bedrock service and stream exceptions stop agent retries when their redacted
+error message or code contains Pi's account quota or billing exhaustion
+markers, even if AWS categorizes the exception as transient throttling. The model receives a
+fixed limit message; ordinary throttling remains retryable even if its request
+ID contains a marker. Classification scans the full SDK error message with a
+fixed-size rolling window and redacts secrets before matching. This uses bounded
+additional memory; scan time depends on message length and configured secrets.
+AWS SDK retries before an exception reaches
+the agent remain governed by the configured SDK policy.
+
+Pi's non-chat System One provider-level policy retries transient HTTP status
+codes including 429 without classifying the response body; native keeps that
+separate policy.
+
+### Provider quota retry classification
+
+Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
+recognize permanent account, billing and quota exhaustion in structured error
+message, code and type fields for retryable HTTP statuses and stream errors.
+Recognized transient stream errors, including Gemini errors without a numeric
+code, remain retryable after permanent-limit checks. OpenAI response codes are
+classified only after known credentials are masked.
+JSON metadata such as request IDs does not affect classification. Known request
+credentials, Bearer tokens and conventional authentication-header values are
+masked before classification, even when they equal quota or transient terms.
+Other configured header values are masked
+when distinguishable from those terms; ambiguous header values remain
+classifiable because an echo cannot be distinguished from a provider error.
+Diagnostics remain fixed and do not include provider bodies. Transient stream
+matching follows the pinned Pi patterns. OpenAI subscription
+codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
+seconds. Complete error fields preceding a truncated later JSON field remain
+classifiable; incomplete values and unrelated metadata are ignored. Failed or
+timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or
+returned. Bedrock typed SDK errors and non-chat operations retain their separate
+policies.
