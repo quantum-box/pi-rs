@@ -456,6 +456,17 @@ impl Scheduler {
         self.ts().send_signal(signal)?;
         Ok(())
     }
+    /// Deliver a typed task signal using task/key deduplication.
+    pub fn deliver_signal(
+        &self,
+        task_id: Uuid,
+        token: &task_store::SignalToken,
+        key: &str,
+        value: Value,
+    ) -> Result<task_store::SignalResult, Error> {
+        self.check()?;
+        Ok(self.ts().deliver_signal(task_id, token, key, value)?)
+    }
     pub fn signal_receipt(&self, task_id: Uuid, signal_id: Uuid) -> Result<Option<Signal>, Error> {
         self.check()?;
         Ok(self.ts().signal(task_id, signal_id)?)

@@ -194,6 +194,17 @@ struct TypedSignal {
     version: u32,
 }
 
+/// Outcome of delivering a typed signal to a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalResult {
+    Delivered,
+    Duplicate,
+    Invalid,
+    Closed,
+    NotFound,
+}
+
 /// A task and the storage version that must be supplied for its next update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredTask {
@@ -537,6 +548,82 @@ impl<'a> TaskStore<'a> {
                 ],
             ) {
                 Ok(()) => return Ok(()),
+                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Deliver a typed value, returning the upstream-style status. The generated
+    /// receipt ID is an internal detail; retries deduplicate by task, kind and key.
+    /// Schema validation and deadline expiry are not implemented.
+    pub fn deliver_signal(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key_text: &str,
+        value: Value,
+    ) -> Result<SignalResult, Error> {
+        let receipt_id = Uuid::new_v4();
+        loop {
+            let Some(target) = self.load(task_id)? else {
+                return Ok(SignalResult::NotFound);
+            };
+            if target.task.is_terminal() || target.task.abort_requested() {
+                return Ok(SignalResult::Closed);
+            }
+            if key_text.is_empty() {
+                return Ok(SignalResult::Invalid);
+            }
+            let signal = Signal::new_typed(receipt_id, task_id, token, key_text, value.clone())?;
+            let revision_key = signal_revision_key(task_id);
+            let revision = self.store.get(&revision_key)?;
+            let mut found = false;
+            for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+                let old: Signal = serde_json::from_slice(&entry.value)?;
+                if old.typed_key() == signal.typed_key() {
+                    found = true;
+                    break;
+                }
+            }
+            let receipt_key = signal_key(task_id, receipt_id);
+            let checks = [
+                Check {
+                    key: key(task_id),
+                    expected: Expected::Version(target.version),
+                },
+                Check {
+                    key: revision_key.clone(),
+                    expected: revision
+                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                },
+                Check {
+                    key: receipt_key.clone(),
+                    expected: Expected::Missing,
+                },
+            ];
+            let mutations = if found {
+                vec![]
+            } else {
+                vec![
+                    Mutation::Put {
+                        key: receipt_key,
+                        value: serde_json::to_vec(&signal)?,
+                    },
+                    Mutation::Put {
+                        key: revision_key,
+                        value: vec![],
+                    },
+                ]
+            };
+            match self.store.commit(&checks, &mutations) {
+                Ok(()) => {
+                    return Ok(if found {
+                        SignalResult::Duplicate
+                    } else {
+                        SignalResult::Delivered
+                    });
+                }
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => return Err(e.into()),
             }

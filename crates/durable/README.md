@@ -219,10 +219,12 @@ Current limits and differences from upstream Pi Durable:
   receipt reads and wake results bypass validation; hosts must use the typed
   read to enforce it. Token definitions and migration callbacks are supplied by
   the host after reopening. Duplicate historical typed keys fail typed reads.
-  Unlike upstream, expiry, typed deadline-or-signal sleeps, and upstream delivery
-  result variants are not implemented. Upstream reports any
-  occupied key as duplicate regardless of value; this API rejects a different
-  value or version. Same-ID retries remain successful after task termination,
+  `TaskStore::deliver_signal` and `Scheduler::deliver_signal` return upstream-shaped
+  delivered, duplicate, invalid, closed, or not-found outcomes. The older
+  `send_signal` retains its receipt idempotency semantics. Expiry, typed
+  deadline-or-signal sleeps and general transactional delivery remain missing.
+  Storage errors can have uncertain outcomes. Same-ID retries remain successful
+  after task termination,
   while a new ID is rejected for a terminal task. Existing stores with
   multiple typed records for one key are not consolidated; conflicting records
   reject new deliveries, and any consumed record closes the key.
