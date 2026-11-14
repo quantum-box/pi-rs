@@ -873,9 +873,9 @@ fn safe_hyperlink(url: &str) -> bool {
 
 // Parser formatting can split a local part across text events. Do not link a
 // trailing fragment if the original source immediately continues the address.
-fn has_email_prefix(text: &str, start: usize) -> bool {
+fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
     let mut has_content = false;
-    for c in text[..start].chars().rev() {
+    for c in text[lower_bound..start].chars().rev() {
         if c.is_alphanumeric()
             || unicode_normalization::char::is_combining_mark(c)
             || "!#$%&'*+-/=?^_`{|}~.\"\\’".contains(c)
@@ -890,7 +890,7 @@ fn has_email_prefix(text: &str, start: usize) -> bool {
 
 // Pi's GFM tokenizer links bare URLs and emails, but stops URLs at CJK
 // punctuation. Explicit Markdown links are handled separately by the parser.
-fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
+fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
     static EMAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+"#).unwrap()
     });
@@ -902,27 +902,57 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
     });
     let mut links = Vec::new();
     let mut offset = 0;
+    let mut next_web = None;
+    let mut next_mail = None;
     loop {
-        let web = URL.find_at(text, offset);
-        let mail = EMAIL.find_at(text, offset);
-        let (found, email) = match (web, mail) {
+        if next_web.is_none_or(|cached: Option<regex::Match<'_>>| {
+            cached.is_some_and(|m| m.start() < offset)
+        }) {
+            next_web = Some(URL.find_at(text, offset));
+        }
+        if next_mail.is_none_or(|cached: Option<regex::Match<'_>>| {
+            cached.is_some_and(|m| m.start() < offset)
+        }) {
+            next_mail = Some(EMAIL.find_at(text, offset));
+        }
+        let web = next_web.flatten();
+        let mail = next_mail.flatten();
+        let (found, email, ambiguous) = match (web, mail) {
             (None, None) => break,
-            (Some(web), None) => (web, false),
-            (None, Some(mail)) => (mail, true),
-            (Some(web), Some(mail)) if web.start() < mail.start() => (web, false),
-            (Some(web), Some(mail)) if mail.start() < web.start() => (mail, true),
+            (Some(web), None) => (web, false, false),
+            (None, Some(mail)) => (mail, true, false),
+            (Some(web), Some(mail)) if web.start() < mail.start() => (web, false, false),
+            (Some(web), Some(mail)) if mail.start() < web.start() => (mail, true, false),
             (Some(web), Some(mail)) => {
-                // A www URL with a path, query or fragment containing @ is a URL.
-                let is_web_path = web.as_str().starts_with("www.")
-                    && mail
-                        .as_str()
-                        .split('@')
-                        .next()
-                        .is_some_and(|local| local.contains(['/', '?', '#']));
-                if is_web_path {
-                    (web, false)
+                // A complete mailbox can also be a valid www URL. Pi picks
+                // HTTP, but silently choosing either destination is unsafe.
+                let web_end = CJK_PUNCT
+                    .find(web.as_str())
+                    .map_or(web.end(), |p| web.start() + p.start());
+                let trailing = text.get(mail.end()..web_end);
+                let ambiguous = web.as_str().starts_with("www.")
+                    && trailing.is_some_and(|tail| {
+                        tail.chars().all(|c| {
+                            matches!(
+                                c,
+                                '?' | '!'
+                                    | '.'
+                                    | ','
+                                    | ':'
+                                    | ';'
+                                    | '*'
+                                    | '_'
+                                    | '\''
+                                    | '"'
+                                    | '~'
+                                    | ')'
+                            )
+                        })
+                    });
+                if ambiguous {
+                    (mail, true, true)
                 } else {
-                    (mail, true)
+                    (web, false, false)
                 }
             }
         };
@@ -1047,7 +1077,7 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
             } else {
                 label.to_owned()
             };
-            links.push((start..end, href));
+            links.push((start..end, (!ambiguous).then_some(href)));
         }
         offset = end.max(start + 1);
     }
@@ -1232,6 +1262,7 @@ fn markdown_at_depth(
     let loose_lists = loose_list_offsets(text, options);
     let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
+    let mut table_cell_start = None;
     let mut links = Vec::new();
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
@@ -1266,10 +1297,12 @@ fn markdown_at_depth(
                     ..Table::default()
                 });
             }
+            Event::Start(Tag::TableCell) => table_cell_start = Some(range.start),
             Event::End(TagEnd::TableCell) => {
                 if let Some(table) = &mut table {
                     table.row.push(std::mem::take(&mut spans));
                 }
+                table_cell_start = None;
             }
             Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
                 if let Some(table) = &mut table {
@@ -1575,9 +1608,20 @@ fn markdown_at_depth(
                         && displayed == &text[range.clone()]
                     {
                         let mut cursor = 0;
-                        for (link_range, mut url) in bare_links(displayed) {
+                        for (link_range, url) in bare_links(displayed) {
+                            let Some(mut url) = url else {
+                                let mut plain = span.clone();
+                                plain.text = clean(&displayed[cursor..link_range.end]);
+                                spans.push(plain);
+                                cursor = link_range.end;
+                                continue;
+                            };
                             if url.starts_with("mailto:")
-                                && has_email_prefix(text, range.start + link_range.start)
+                                && has_email_prefix(
+                                    text,
+                                    range.start + link_range.start,
+                                    table_cell_start.unwrap_or(0),
+                                )
                             {
                                 continue;
                             }
@@ -2423,6 +2467,41 @@ mod tests {
             "{spans:?}"
         );
         assert!(spans.iter().any(|s| s.text.contains("keep")), "{spans:?}");
+        let source = "| A | B |\n|---|---|\n|user@example.com|keep|";
+        let lines = markdown_at_depth(
+            source,
+            &Theme::system(),
+            100,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.as_deref() == Some("mailto:user@example.com")),
+            "{spans:?}"
+        );
+        assert!(spans.iter().any(|s| s.text.contains("keep")));
+    }
+
+    #[test]
+    fn long_link_lists_keep_every_target() {
+        for (item, expected) in [
+            ("user@example.com", "mailto:user@example.com"),
+            ("https://example.com", "https://example.com"),
+        ] {
+            let source = vec![item; 512].join(" ");
+            let links = bare_links(&source);
+            assert_eq!(links.len(), 512);
+            assert!(
+                links
+                    .iter()
+                    .all(|(_, target)| target.as_deref() == Some(expected))
+            );
+        }
     }
 
     #[test]
@@ -2567,13 +2646,18 @@ mod tests {
     }
 
     #[test]
-    fn www_path_query_and_fragment_with_at_sign_are_urls() {
+    fn ambiguous_www_email_candidates_are_not_linked() {
         for source in [
+            "www.user?tag@example.com",
+            "www.user#tag@example.com",
+            "www.user/tag@example.com",
+            "www.foo@example.com",
             "www.example.com/a@other.example",
             "www.example.com?to=user@other.example",
             "www.example.com#user@other.example",
+            "www.user?tag@example.com.",
+            "www.user?tag@example.com。后文",
         ] {
-            let expected = format!("http://{source}");
             for hyperlinks in [false, true] {
                 let lines = markdown_at_depth(
                     source,
@@ -2585,44 +2669,52 @@ mod tests {
                     false,
                 );
                 let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
-                if hyperlinks {
-                    assert!(
-                        spans
-                            .iter()
-                            .any(|span| span.hyperlink.as_deref() == Some(expected.as_str())),
-                        "{source}: {spans:?}"
-                    );
-                } else {
-                    assert_eq!(
-                        spans
-                            .iter()
-                            .map(|span| span.text.as_str())
-                            .collect::<String>(),
-                        format!("{source} ({expected})")
-                    );
-                }
-                assert!(spans.iter().all(|span| {
-                    span.hyperlink
-                        .as_deref()
-                        .is_none_or(|url| !url.starts_with("mailto:"))
-                }));
+                assert_eq!(
+                    spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                    source
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .all(|span| span.hyperlink.is_none() && !span.underline),
+                    "{source}: {spans:?}"
+                );
             }
         }
-        let lines = markdown_at_depth(
-            "www.foo@example.com",
-            &Theme::system(),
-            100,
-            0,
-            super::super::mermaid::Mermaid::Off,
-            true,
-            false,
-        );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .any(|span| span.hyperlink.as_deref() == Some("mailto:www.foo@example.com"))
-        );
+        for (source, target) in [
+            (
+                "www.example.com/a@other.example/more",
+                "http://www.example.com/a@other.example/more",
+            ),
+            (
+                "[website](http://www.user?tag@example.com)",
+                "http://www.user?tag@example.com",
+            ),
+            (
+                "<mailto:www.user?tag@example.com>",
+                "mailto:www.user?tag@example.com",
+            ),
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &Theme::system(),
+                100,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some(target)),
+                "{source}: {lines:?}"
+            );
+        }
     }
 
     #[test]
