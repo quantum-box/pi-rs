@@ -2056,6 +2056,8 @@ impl AgentSession {
                 let restored = self.restore_branch_model(provider.as_deref(), model);
                 if result.is_ok() && restored.is_ok() {
                     result = restored;
+                } else if restored.is_err() {
+                    revoked.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             self.model_fallback = match resolution {
@@ -5161,6 +5163,66 @@ mod tests {
             );
             assert!(session.prompt("must not dispatch").await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn historical_tree_revocation_after_commit_keeps_success_observable() {
+        struct RevokeAfterTree(Registry, Uuid);
+        #[async_trait::async_trait]
+        impl Extension for RevokeAfterTree {
+            fn id(&self) -> &str {
+                "revoke-after-tree"
+            }
+            fn handles_tree_navigation(&self) -> bool {
+                true
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<()> {
+                if matches!(event, crate::LifecycleEvent::SessionTree { .. }) {
+                    self.0.remove_session_branch_models(self.1);
+                }
+                Ok(())
+            }
+        }
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(RevokeAfterTree(registry, id)))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut events = session.subscribe();
+        session
+            .navigate_tree(target, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
+        assert!(session.prompt("must not dispatch").await.is_err());
     }
 
     #[test]
