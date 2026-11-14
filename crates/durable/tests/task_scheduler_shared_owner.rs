@@ -103,7 +103,7 @@ fn attachment_fences_recovery_and_handler_until_completion() {
 }
 
 #[test]
-fn concurrent_attach_has_one_winner_and_failed_recovery_releases_guard() {
+fn concurrent_attach_has_one_winner_and_missing_definition_stays_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let owner = Arc::new(OwnedStore::open(dir.path().join("store.db")).unwrap());
     let start = Arc::new(Barrier::new(9));
@@ -133,10 +133,12 @@ fn concurrent_attach_has_one_winner_and_failed_recovery_releases_guard() {
     let t = task(true);
     ts.save(&[Save::Create(&t)]).unwrap();
     ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
-    assert!(matches!(
-        Scheduler::attach(owner.clone(), Registry::default()),
-        Err(Error::Registration)
-    ));
+    let blocked = Scheduler::attach(owner.clone(), Registry::default()).unwrap();
+    assert_eq!(
+        blocked.get(t.id()).unwrap().unwrap().state(),
+        &TaskState::Running
+    );
+    drop(blocked);
     let mut recovered = Scheduler::attach(owner, registry(true)).unwrap();
     assert_eq!(recovered.get(t.id()).unwrap().unwrap().restarts(), 1);
     assert!(recovered.tick(0).unwrap());

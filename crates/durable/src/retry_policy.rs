@@ -49,8 +49,8 @@ impl RetryState {
     /// Decide once per failed attempt, and persist the mutated state atomically.
     /// A pending deadline must first be consumed with `poll`.
     pub fn failed(&mut self, policy: RetryPolicy, failure: Failure<'_>, now_ms: u64) -> Decision {
-        if self.deadline_ms.is_some() {
-            return Decision::WaitUntil(self.deadline_ms.unwrap());
+        if let Some(deadline) = self.deadline_ms {
+            return Decision::WaitUntil(deadline);
         }
         match classify(failure) {
             Classification::Overflow => return Decision::ContextOverflow,

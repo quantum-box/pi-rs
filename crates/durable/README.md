@@ -49,19 +49,20 @@ Current limits and differences from upstream Pi Durable:
   and concurrent compaction remain unsupported. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
   There is no built-in subagent or automatic conversation/task ownership tree.
-- Generic task waits support one deadline, one signal, or all direct children;
-  any/fail-fast joins, combined waits, abort handlers and child cancellation
-  propagation are not yet implemented. Handler steps run synchronously and
-  shutdown waits for an in-flight step.
+- Generic task waits support one deadline, one signal, or direct-child
+  all/any/fail-fast joins. Combined waits and abort handlers are not yet
+  implemented. Local cancellation propagates through descendants, but cannot
+  cancel an already running external effect. Handler steps run synchronously
+  and shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model errors use a fixed retry delay. There is no flow control.
 - The scheduler retains scheduled join handles until `wait` or `shutdown`;
   callers should bound submissions and drain them. Owner locking currently
   supports cooperating Unix processes on local filesystems.
-- Each conversation is one growing JSON value. Observation reads scan the
-  bounded pages, but committed snapshots copy messages; the runtime is not
-  yet suitable for arbitrarily long-lived workloads. Model responses have a 1 MiB text and 64
-  tool-call bound.
+- Each conversation is one growing JSON value. Observation reads use bounded
+  pages, but committed snapshots copy messages; the runtime is not yet suitable
+  for arbitrarily long-lived workloads. Model responses have a 1 MiB text and
+  64 tool-call bound.
 - The host must supply valid replay-safe tools, models and storage. Unknown
   effects still require destination-level idempotency or reconciliation.
 

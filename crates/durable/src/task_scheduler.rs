@@ -207,7 +207,10 @@ impl Scheduler {
                     self.ts().update(&item, |task| task.recover())?;
                 }
             } else {
-                self.finish_failed(&item, "interrupted: execution outcome requires reconciliation".into())?;
+                self.finish_failed(
+                    &item,
+                    "interrupted: execution outcome requires reconciliation".into(),
+                )?;
             }
         }
         Ok(())
@@ -373,10 +376,10 @@ impl Scheduler {
         loop {
             let before = ids.len();
             for record in records {
-                if let TaskOwner::Task(parent) = record.task.owner() {
-                    if ids.contains(parent) {
-                        ids.insert(record.task.id());
-                    }
+                if let TaskOwner::Task(parent) = record.task.owner()
+                    && ids.contains(parent)
+                {
+                    ids.insert(record.task.id());
                 }
             }
             if ids.len() == before {
@@ -705,7 +708,7 @@ mod tests {
         );
     }
     #[test]
-    fn interrupted_invocations_are_not_replayed_even_if_marked_safe() {
+    fn interrupted_invocations_replay_only_when_marked_safe() {
         let dir = tempfile::tempdir().unwrap();
         for safe in [false, true] {
             let path = dir.path().join(format!("{safe}.db"));
@@ -727,11 +730,23 @@ mod tests {
             registry.register("x", safe, |_t: &Task| {
                 Ok(Step::Succeed(json!("should not execute")))
             });
-            let s = Scheduler::open(&path, registry).unwrap();
-            assert!(matches!(
-                s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
-                TaskState::Failed(_)
-            ));
+            let mut s = Scheduler::open(&path, registry).unwrap();
+            if safe {
+                assert_eq!(
+                    s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+                s.tick(0).unwrap();
+                assert!(matches!(
+                    s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    TaskState::Succeeded(_)
+                ));
+            } else {
+                assert!(matches!(
+                    s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+                    TaskState::Failed(_)
+                ));
+            }
         }
     }
     #[test]

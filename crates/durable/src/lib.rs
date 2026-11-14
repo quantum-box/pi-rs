@@ -13,6 +13,7 @@ pub mod poll;
 pub mod progress;
 pub mod recovery;
 pub mod reset;
+pub mod retry_policy;
 pub mod runtime;
 pub mod state;
 pub mod task;
