@@ -1,0 +1,625 @@
+//! Private, fail-closed storage for a last-live share snapshot.
+//!
+//! This storage primitive is not yet connected to standalone sharing. Callers
+//! must supply a complete provenance digest and invalidate before any runtime
+//! side effects. Other platforms deliberately return unsupported.
+
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use serde_json::Value;
+
+/// Exact identity of the journal and the environment that produced a snapshot.
+/// The provenance digest must cover all inputs relevant to the effective context.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub session_id: uuid::Uuid,
+    pub head: u64,
+    pub journal_digest: [u8; 32],
+    pub provenance_digest: [u8; 32],
+}
+
+#[cfg(unix)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope {
+    version: u32,
+    binding: Binding,
+    context: Value,
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::{Binding, Envelope, Value};
+    use sha2::{Digest, Sha256};
+    use std::ffi::CString;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// All operations remain relative to a verified private directory handle.
+    pub struct Store {
+        directory: File,
+    }
+
+    /// An exclusive generation invalidates any previous snapshot before the
+    /// caller is permitted to start the associated live runtime.
+    pub struct Generation<'a> {
+        store: &'a Store,
+        lock: File,
+        name: CString,
+        binding: Binding,
+    }
+
+    fn invalid() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "untrusted share cache storage",
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reject_extended_acl(file: &File) -> io::Result<()> {
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+            fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+        }
+        // SAFETY: file owns a live descriptor; ACL_TYPE_EXTENDED is 0x100 on Darwin.
+        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), 0x100) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: acl_get_fd_np returned an allocated ACL, released exactly once.
+        unsafe {
+            acl_free(acl);
+        }
+        Err(invalid())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reject_extended_acl(_: &File) -> io::Result<()> {
+        // On Linux the ACL mask is represented in group mode bits; the mode
+        // checks below deny any effective access outside the owner.
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn reject_extended_acl(_: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unverified ACL semantics",
+        ))
+    }
+
+    fn secure_dir(file: &File) -> io::Result<()> {
+        let meta = file.metadata()?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+        reject_extended_acl(file)
+    }
+
+    fn secure_parent(file: &File) -> io::Result<()> {
+        let meta = file.metadata()?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(invalid());
+        }
+        reject_extended_acl(file)
+    }
+
+    fn secure_file(file: &File) -> io::Result<()> {
+        let meta = file.metadata()?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(invalid());
+        }
+        reject_extended_acl(file)
+    }
+
+    fn open_at(
+        dir: &File,
+        name: &CString,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<File> {
+        // SAFETY: directory is a live directory fd and name is NUL terminated.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                mode as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn unlink_at(dir: &File, name: &CString) -> io::Result<()> {
+        // SAFETY: directory and NUL-terminated name remain valid for the call.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    fn name_for(session_path: &Path, id: uuid::Uuid, suffix: &str) -> io::Result<CString> {
+        let mut digest = Sha256::new();
+        digest.update(b"pi-rs-share-store-v1\0");
+        digest.update(session_path.as_os_str().as_bytes());
+        digest.update([0]);
+        digest.update(id.as_bytes());
+        CString::new(format!("{:x}.{suffix}", digest.finalize()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cache name"))
+    }
+
+    impl Store {
+        /// `parent` must already exist, be user-owned and not writable by others.
+        /// The cache directory is created owner-only and verified without
+        /// following a symlink. No existing permissions are widened or repaired.
+        pub fn open(parent: &Path) -> io::Result<Self> {
+            Self::open_inner(parent, true)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "share cache missing"))
+        }
+
+        /// Read-only opening: a legacy session never creates a cache directory.
+        pub fn open_existing(parent: &Path) -> io::Result<Option<Self>> {
+            Self::open_inner(parent, false)
+        }
+
+        fn open_inner(parent: &Path, create: bool) -> io::Result<Option<Self>> {
+            let parent = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(parent)?;
+            secure_parent(&parent)?;
+            let name = CString::new("share-context-v1").unwrap();
+            let created = if create {
+                // SAFETY: parent and name remain valid for the call.
+                let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+                result == 0
+            } else {
+                false
+            };
+            let directory = match open_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(directory) => directory,
+                Err(error) if !create && error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            secure_dir(&directory)?;
+            if created {
+                parent.sync_all()?;
+            }
+            Ok(Some(Self { directory }))
+        }
+
+        fn lock(&self, path: &Path, binding: &Binding, create: bool) -> io::Result<File> {
+            let name = name_for(path, binding.session_id, "lock")?;
+            let file = open_at(
+                &self.directory,
+                &name,
+                libc::O_RDWR | libc::O_NONBLOCK | if create { libc::O_CREAT } else { 0 },
+                0o600,
+            )?;
+            secure_file(&file)?;
+            Ok(file)
+        }
+
+        /// Invalidates the last generation before runtime preparation. The
+        /// exclusive lock remains held until the generation is dropped.
+        pub fn begin(&self, path: &Path, binding: Binding) -> io::Result<Generation<'_>> {
+            let lock = self.lock(path, &binding, true)?;
+            lock.lock()?;
+            let name = name_for(path, binding.session_id, "json")?;
+            unlink_at(&self.directory, &name)?;
+            self.directory.sync_all()?;
+            Ok(Generation {
+                store: self,
+                lock,
+                name,
+                binding,
+            })
+        }
+
+        /// A missing, busy, mismatched, malformed, or old-format entry is a
+        /// cache miss. Caller determines how to reconstruct a legacy session.
+        pub fn read(&self, path: &Path, binding: &Binding) -> io::Result<Option<Value>> {
+            let lock = match self.lock(path, binding, false) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            match lock.try_lock() {
+                Ok(()) => (),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+            let name = name_for(path, binding.session_id, "json")?;
+            let file = match open_at(&self.directory, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            secure_file(&file)?;
+            if file.metadata()?.len() > MAX_CACHE_BYTES {
+                return Ok(None);
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_CACHE_BYTES {
+                return Ok(None);
+            }
+            let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
+                return Ok(None);
+            };
+            if envelope.version != 1 || &envelope.binding != binding {
+                return Ok(None);
+            }
+            Ok(Some(envelope.context))
+        }
+    }
+
+    impl Generation<'_> {
+        /// Publish only after the live runtime has settled and the caller has
+        /// independently revalidated the complete binding and journal.
+        pub fn publish(self, binding: Binding, context: Value) -> io::Result<()> {
+            if binding.session_id != self.binding.session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session identity changed",
+                ));
+            }
+            let envelope = Envelope {
+                version: 1,
+                binding,
+                context,
+            };
+            let bytes = serde_json::to_vec(&envelope)?;
+            if bytes.len() as u64 > MAX_CACHE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "share cache too large",
+                ));
+            }
+            let temporary = CString::new(format!(".{}.tmp", uuid::Uuid::new_v4())).unwrap();
+            let mut renamed = false;
+            let result = (|| {
+                let mut file = open_at(
+                    &self.store.directory,
+                    &temporary,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )?;
+                secure_file(&file)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                // SAFETY: both names refer to the same verified directory.
+                if unsafe {
+                    libc::renameat(
+                        self.store.directory.as_raw_fd(),
+                        temporary.as_ptr(),
+                        self.store.directory.as_raw_fd(),
+                        self.name.as_ptr(),
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                renamed = true;
+                self.store.directory.sync_all()
+            })();
+            let _ = unlink_at(&self.store.directory, &temporary);
+            if result.is_err() && renamed {
+                let _ = unlink_at(&self.store.directory, &self.name);
+                let _ = self.store.directory.sync_all();
+            }
+            let _ = &self.lock;
+            result
+        }
+    }
+}
+
+#[cfg(unix)]
+pub use unix::{Generation, Store};
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::Path;
+
+    fn binding() -> Binding {
+        Binding {
+            session_id: uuid::Uuid::new_v4(),
+            head: 3,
+            journal_digest: [1; 32],
+            provenance_digest: [2; 32],
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_extended_acl_even_when_mode_is_private() {
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow list,search"])
+            .arg(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o022,
+            0
+        );
+        assert!(Store::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_lookup_does_not_create_cache_files() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(Store::open_existing(directory.path()).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let store = Store::open(directory.path()).unwrap();
+        assert!(
+            store
+                .read(Path::new("/legacy/session.jsonl"), &binding())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("share-context-v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn restart_requires_exact_binding_and_a_clean_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("/workspace/session.jsonl");
+        let original = binding();
+        let expected = serde_json::json!({"systemPrompt":"secret","tools":[{"name":"read"}]});
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.read(path, &original).unwrap().is_none());
+        let generation = store.begin(path, original.clone()).unwrap();
+        assert!(store.read(path, &original).unwrap().is_none());
+        generation
+            .publish(original.clone(), expected.clone())
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.read(path, &original).unwrap(), Some(expected));
+        let mut changed = original.clone();
+        changed.head += 1;
+        assert!(store.read(path, &changed).unwrap().is_none());
+        changed = original.clone();
+        changed.journal_digest[0] ^= 1;
+        assert!(store.read(path, &changed).unwrap().is_none());
+        changed = original.clone();
+        changed.provenance_digest[0] ^= 1;
+        assert!(store.read(path, &changed).unwrap().is_none());
+        assert!(
+            store
+                .read(Path::new("/other/session.jsonl"), &original)
+                .unwrap()
+                .is_none()
+        );
+        let generation = store.begin(path, original.clone()).unwrap();
+        drop(generation); // crash or unsuccessful shutdown leaves no clean cache
+        assert!(store.read(path, &original).unwrap().is_none());
+    }
+
+    #[test]
+    fn clean_generation_can_publish_a_later_head_but_not_another_session() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let initial = binding();
+        let mut final_binding = initial.clone();
+        final_binding.head += 1;
+        final_binding.journal_digest[0] ^= 1;
+        store
+            .begin(path, initial.clone())
+            .unwrap()
+            .publish(final_binding.clone(), serde_json::json!({"prompt":"final"}))
+            .unwrap();
+        assert!(store.read(path, &initial).unwrap().is_none());
+        assert_eq!(
+            store.read(path, &final_binding).unwrap(),
+            Some(serde_json::json!({"prompt":"final"}))
+        );
+        let mut other = final_binding.clone();
+        other.session_id = uuid::Uuid::new_v4();
+        assert!(
+            store
+                .begin(path, final_binding.clone())
+                .unwrap()
+                .publish(other, serde_json::json!({}))
+                .is_err()
+        );
+        assert!(store.read(path, &final_binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_generations_serialize_and_new_generation_invalidates_old() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/session.jsonl");
+        let binding = binding();
+        let first = store.begin(path, binding.clone()).unwrap();
+        let (attempted, started) = std::sync::mpsc::channel();
+        let (acquired, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let root_path = root.path().to_owned();
+        let second_binding = binding.clone();
+        let second = std::thread::spawn(move || {
+            let store = Store::open(&root_path).unwrap();
+            attempted.send(()).unwrap();
+            let generation = store.begin(path, second_binding.clone()).unwrap();
+            acquired.send(()).unwrap();
+            gate.recv().unwrap();
+            generation
+                .publish(second_binding, serde_json::json!({"prompt":"new"}))
+                .unwrap();
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            ready
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        first
+            .publish(binding.clone(), serde_json::json!({"prompt":"old"}))
+            .unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
+        release.send(()).unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            store.read(path, &binding).unwrap(),
+            Some(serde_json::json!({"prompt":"new"}))
+        );
+    }
+
+    #[test]
+    fn crashed_live_generation_cannot_restore_the_previous_snapshot() {
+        const CHILD: &str = "PI_RS_TEST_SHARE_CACHE_CRASH_CHILD";
+        let path = Path::new("/private/crash-session.jsonl");
+        let binding = Binding {
+            session_id: uuid::Uuid::from_u128(42),
+            head: 7,
+            journal_digest: [4; 32],
+            provenance_digest: [9; 32],
+        };
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = std::path::PathBuf::from(root);
+            let store = Store::open(&root).unwrap();
+            let _generation = store.begin(path, binding).unwrap();
+            std::fs::write(root.join("child-ready"), b"ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"systemPrompt":"old"}))
+            .unwrap();
+        let mut child = KillOnDrop(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "private_share_store::tests::crashed_live_generation_cannot_restore_the_previous_snapshot"])
+            .env(CHILD, root.path()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.path().join("child-ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before invalidation"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not start in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(store.read(path, &binding).unwrap().is_none());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_writable_parent_and_symlink_cache_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Store::open(&shared).is_err());
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, root.path().join("share-context-v1")).unwrap();
+        assert!(Store::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn stored_contents_are_owner_only_and_legacy_data_is_not_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let binding = binding();
+        let path = Path::new("/private/session.jsonl");
+        store
+            .begin(path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), serde_json::json!({"secret":"value"}))
+            .unwrap();
+        let directory = root.path().join("share-context-v1");
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let json = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&json).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&json, br#"{"version":0,"context":{"secret":"old"}}"#).unwrap();
+        assert!(store.read(path, &binding).unwrap().is_none());
+        std::fs::remove_file(&json).unwrap();
+        let external = root.path().join("external");
+        std::fs::write(&external, b"unchanged").unwrap();
+        symlink(&external, &json).unwrap();
+        assert!(store.read(path, &binding).is_err());
+        assert_eq!(std::fs::read(external).unwrap(), b"unchanged");
+    }
+}

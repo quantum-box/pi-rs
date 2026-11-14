@@ -86,9 +86,18 @@ cannot by itself prove what a newly configured runtime would expose now.
   metadata deadline. Prove no new effects start after cancellation and a
   started rotation is persisted exactly once.
 
-No cache is implemented here: privacy, freshness, the pre-change dirty marker,
-and a safe legacy reconstruction path have not yet been proven. In particular,
-a session/head keyed sidecar would produce misleading or unsafe results.
+An isolated storage prototype now exists in `private_share_store`: on Linux and
+macOS it uses an owner-only directory and files, no-follow directory-relative
+operations, generation locks, durable invalidation, atomic publication, exact
+binding checks, and read-only legacy misses. macOS extended ACLs are rejected;
+unverified Unix ACL semantics fail closed. Tests include a killed process,
+concurrent generations, old format, symlink substitution, and access modes.
+
+The prototype is not connected to live sessions or standalone sharing. The
+caller must still provide and revalidate complete provenance, the storage key
+must be protected against disclosure, Windows storage is not implemented, and
+a safe legacy reconstruction path remains unresolved. In particular, a
+session/head keyed sidecar would produce misleading or unsafe results.
 
 ## Legacy supervisor and credential broker candidate
 
