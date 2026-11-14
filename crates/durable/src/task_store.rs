@@ -144,12 +144,11 @@ impl<'a> TaskStore<'a> {
             let (task, expected) = match save {
                 Save::Create(task) => (*task, Expected::Missing),
                 Save::Update(stored) => {
-                    if let Some(current) = self.load(stored.task.id())? {
-                        if current.version == stored.version
-                            && current.task.owner() != stored.task.owner()
-                        {
-                            return Err(Error::OwnerChanged);
-                        }
+                    if let Some(current) = self.load(stored.task.id())?
+                        && current.version == stored.version
+                        && current.task.owner() != stored.task.owner()
+                    {
+                        return Err(Error::OwnerChanged);
                     }
                     (&stored.task, Expected::Version(stored.version))
                 }
