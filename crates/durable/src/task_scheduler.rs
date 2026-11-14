@@ -310,6 +310,8 @@ impl Scheduler {
     /// Errors after reservation poison this instance, including handler errors.
     pub fn tick(&mut self, now_millis: i64) -> Result<bool, Error> {
         self.check()?;
+        let owner = self.owner();
+        let gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         let mut progress = false;
         for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
@@ -354,7 +356,10 @@ impl Scheduler {
                     .ts()
                     .load(snapshot.task.id())?
                     .ok_or(Error::Ownership)?;
-                match abort.run(&running.task).map_err(Error::Handler)? {
+                drop(gate);
+                let result = abort.run(&running.task);
+                let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+                match result.map_err(Error::Handler)? {
                     Step::Succeed(_) => self.ts().update(&running, |t| t.cancel())?,
                     Step::Fail(reason) => self.ts().update(&running, |t| t.fail(reason))?,
                     _ => {
@@ -391,7 +396,18 @@ impl Scheduler {
             .ts()
             .load(snapshot.task.id())?
             .ok_or(Error::Ownership)?;
-        let step = handler.run(&running.task).map_err(Error::Handler)?;
+        drop(gate);
+        let result = handler.run(&running.task);
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        // An abort can commit while the synchronous handler is running. Its
+        // output (including proposed children) must never cross that fence.
+        let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+        if current.version != running.version && current.task.abort_requested() {
+            self.ts().update(&current, |task| task.yield_ready())?;
+            self.poisoned = false;
+            return Ok(true);
+        }
+        let step = result.map_err(Error::Handler)?;
         let mut next = running.clone();
         let mut children = Vec::new();
         match step {
@@ -452,7 +468,17 @@ impl Scheduler {
         }
         let mut batch = vec![Save::Update(&next)];
         batch.extend(children.iter().map(Save::Create));
-        self.ts().save(&batch)?;
+        match self.ts().save(&batch) {
+            Ok(()) => {}
+            Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => {
+                let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+                if !current.task.abort_requested() {
+                    return Err(Error::Ownership);
+                }
+                self.ts().update(&current, |task| task.yield_ready())?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.poisoned = false;
         Ok(true)
     }
@@ -483,46 +509,11 @@ impl Scheduler {
     /// accept this only between invocations; subsequent ticks drain children first.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
         self.check()?;
-        let records = self.ts().list()?;
-        let root = records
-            .iter()
-            .find(|s| s.task.id() == id)
-            .ok_or(Error::Ownership)?;
-        if root.task.is_terminal() {
-            return Err(Error::Transition(TransitionError::InvalidState));
-        }
-        let mut ids = HashSet::from([id]);
-        loop {
-            let before = ids.len();
-            for record in &records {
-                if let TaskOwner::Task(parent) = record.task.owner()
-                    && ids.contains(parent)
-                {
-                    ids.insert(record.task.id());
-                }
-            }
-            if ids.len() == before {
-                break;
-            }
-        }
-        let mut updates = Vec::new();
-        for record in &records {
-            if ids.contains(&record.task.id())
-                && !record.task.is_terminal()
-                && !record.task.abort_requested()
-            {
-                let mut next = record.clone();
-                next.task.request_abort().map_err(Error::Transition)?;
-                updates.push(next);
-            }
-        }
-        if !updates.is_empty() {
+        let result = request_abort_subtree(&self.ts(), id);
+        if matches!(result, Err(Error::Store(_))) {
             self.poisoned = true;
-            self.ts()
-                .save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
-            self.poisoned = false;
         }
-        Ok(())
+        result
     }
 
     /// Cancel a task and all of its owned descendants in one transaction.
@@ -567,7 +558,10 @@ impl Scheduler {
         }
         let mut updates = Vec::new();
         for record in records {
-            if ids.contains(&record.task.id()) && !record.task.is_terminal() {
+            if ids.contains(&record.task.id())
+                && !record.task.is_terminal()
+                && !record.task.abort_requested()
+            {
                 let mut next = record.clone();
                 next.task.cancel().map_err(Error::Transition)?;
                 updates.push(next);
@@ -627,6 +621,51 @@ impl Scheduler {
             Err(Error::LiveChildren)
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Mark the entire existing subtree atomically. Checking every live record also
+/// fences a concurrent handler trying to publish a child under that record.
+pub(crate) fn request_abort_subtree(ts: &TaskStore<'_>, id: Uuid) -> Result<(), Error> {
+    loop {
+        let records = ts.list()?;
+        let root = records
+            .iter()
+            .find(|s| s.task.id() == id)
+            .ok_or(Error::Ownership)?;
+        if root.task.is_terminal() {
+            return Err(Error::Transition(TransitionError::InvalidState));
+        }
+        let mut ids = HashSet::from([id]);
+        loop {
+            let before = ids.len();
+            for record in &records {
+                if let TaskOwner::Task(parent) = record.task.owner()
+                    && ids.contains(parent)
+                {
+                    ids.insert(record.task.id());
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        let mut updates = Vec::new();
+        for record in &records {
+            if ids.contains(&record.task.id())
+                && !record.task.is_terminal()
+                && !record.task.abort_requested()
+            {
+                let mut next = record.clone();
+                next.task.request_abort().map_err(Error::Transition)?;
+                updates.push(next);
+            }
+        }
+        match ts.save(&updates.iter().map(Save::Update).collect::<Vec<_>>()) {
+            Ok(()) => return Ok(()),
+            Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => continue,
+            Err(e) => return Err(e.into()),
         }
     }
 }

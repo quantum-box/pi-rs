@@ -142,15 +142,17 @@ impl Driver {
         self.shared.wake.notify_one();
         Ok(())
     }
-    /// Wait for the current synchronous invocation to finish, then persist
-    /// abort intent. Cleanup proceeds asynchronously on the driver thread.
+    /// Persist the abort without waiting for a running handler. The handler's
+    /// output is discarded when it returns; cleanup then runs on the worker.
     pub fn request_abort(&self, id: Uuid) -> Result<(), Error> {
         let _state = self.check()?;
-        self.shared
-            .scheduler
+        let _gate = self
+            .shared
+            .owner
+            .task_gate()
             .lock()
-            .map_err(|_| Error::Poisoned)?
-            .request_abort(id)?;
+            .map_err(|_| Error::Poisoned)?;
+        task_scheduler::request_abort_subtree(&TaskStore::new(self.shared.owner.store()), id)?;
         self.shared.wake.notify_one();
         Ok(())
     }
@@ -206,5 +208,93 @@ impl Shared {
         }
         let (policy, registered) = self.definitions.get(name)?;
         Arc::ptr_eq(handler, registered).then_some(*policy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::{Checkpoint, WaitFor};
+    use serde_json::json;
+    use std::sync::mpsc;
+
+    #[test]
+    fn abort_during_handler_fences_children_and_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register_with_abort(
+            "test",
+            true,
+            move |_: &Task| {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(task_scheduler::Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "wait".into(),
+                        data: json!(null),
+                    },
+                    condition: WaitFor::Tasks(vec![child]),
+                    children: vec![
+                        Task::new(
+                            child,
+                            TaskOwner::Task(parent),
+                            Checkpoint {
+                                phase: "start".into(),
+                                data: json!(null),
+                            },
+                            3,
+                        )
+                        .unwrap()
+                        .registered("test".into(), true),
+                    ],
+                })
+            },
+            |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+        );
+        let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+        scheduler
+            .submit(
+                &Task::new(
+                    parent,
+                    TaskOwner::Conversation(Uuid::new_v4()),
+                    checkpoint,
+                    3,
+                )
+                .unwrap()
+                .registered("test".into(), true),
+            )
+            .unwrap();
+        let driver = Driver::start(scheduler);
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        driver.request_abort(parent).unwrap();
+        assert!(driver.get(parent).unwrap().unwrap().abort_requested());
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if driver.get(parent).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert!(driver.get(child).unwrap().is_none());
+        driver.shutdown().unwrap();
+        let reopened =
+            task_scheduler::Scheduler::open(&path, task_scheduler::Registry::default()).unwrap();
+        assert!(reopened.get(parent).unwrap().unwrap().abort_requested());
+        assert!(reopened.get(child).unwrap().is_none());
     }
 }

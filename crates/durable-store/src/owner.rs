@@ -71,6 +71,7 @@ impl From<crate::Error> for OwnerError {
 pub struct OwnedStore {
     store: Store,
     _lock: File,
+    task_gate: std::sync::Mutex<()>,
 }
 
 impl OwnedStore {
@@ -115,7 +116,11 @@ impl OwnedStore {
         validate_file(&db, true)?;
         let store = Store::open(&db)?;
         validate_file(&db, false)?;
-        Ok(Self { store, _lock: lock })
+        Ok(Self {
+            store,
+            _lock: lock,
+            task_gate: std::sync::Mutex::new(()),
+        })
     }
 
     #[cfg(not(unix))]
@@ -123,6 +128,11 @@ impl OwnedStore {
         Err(OwnerError::InvalidPath(
             "scheduler ownership is supported only on Unix",
         ))
+    }
+
+    /// Serializes task graph decisions without holding a lock during handlers.
+    pub fn task_gate(&self) -> &std::sync::Mutex<()> {
+        &self.task_gate
     }
 
     pub fn store(&self) -> &Store {
