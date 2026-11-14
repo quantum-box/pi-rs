@@ -2454,7 +2454,8 @@ existing tighter output bound.
 
 The file tools share Pi-style input normalization for leading `@`, home-directory
 paths, file URLs and Unicode space variants. Windows input also accepts drive
-paths written in Git Bash, Cygwin and WSL form. Dot segments resolve before file
+paths written in Git Bash, Cygwin and WSL form, with case-insensitive `mnt` and
+`cygdrive` prefixes as in Pi. Dot segments resolve before file
 lookup. Existing canonical-path checks and parent traversal restrictions remain
 in the workspace-scoped profile.
 
