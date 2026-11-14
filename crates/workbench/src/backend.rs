@@ -226,11 +226,11 @@ impl SessionSnapshot {
         let context = if let Some(active) = &self.share_active {
             active.as_ref().clone()
         } else {
-            let (system_prompt, tools) =
+            let (system_prompt, _) =
                 session.effective_system_context(&base.system_prompt, base.tools.clone());
             super::sessions::ShareContext {
                 system_prompt,
-                tools,
+                tools: base.tools.clone(),
             }
         };
         Ok(super::sessions::ShareSnapshot {
@@ -451,11 +451,11 @@ fn snapshot_and_session_for_share_with_hook(
     let context = selected
         .map(|selected| selected.as_ref().clone())
         .unwrap_or_else(|| {
-            let (system_prompt, tools) =
+            let (system_prompt, _) =
                 session.effective_system_context(&base.system_prompt, base.tools.clone());
             super::sessions::ShareContext {
                 system_prompt,
-                tools,
+                tools: base.tools.clone(),
             }
         });
     let result = super::sessions::ShareSnapshot {
@@ -2871,6 +2871,53 @@ mod share_context_tests {
         let context = snapshot.share_snapshot().unwrap().context;
         assert_eq!(context.system_prompt, "refreshed prompt");
         assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn live_share_uses_current_tools_not_transcript_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::SystemCheckpoint {
+                content: "session prompt".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "fallback",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "transformed request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot_for_share(
+            &Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            }),
+            &Mutex::new(snapshot),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "session prompt");
+        assert!(result.context.tools.iter().any(|tool| tool.name == "read"));
     }
 
     #[tokio::test]
