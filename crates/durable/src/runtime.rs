@@ -4945,11 +4945,6 @@ impl Harness {
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
         loop {
             let (mut state, version) = self.load(id)?;
-            if !state.pending_reset_blocks.is_empty() {
-                return Err(Error::Invalid(
-                    "a block-bearing reset is already queued".into(),
-                ));
-            }
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && state.pending_resets.is_empty()
@@ -4977,8 +4972,8 @@ impl Harness {
         }
     }
     /// Admit a reset and ordered user block occurrences as one durable operation.
-    /// The handoff precedes the additions. While queued, other resets are rejected
-    /// until this marker is placed, so no intermediate block occurrence disappears.
+    /// The handoff precedes the additions. Queued resets are placed in order,
+    /// with separate commits where needed to preserve each block occurrence.
     pub fn reset_with_blocks(
         &mut self,
         id: Uuid,
@@ -5007,11 +5002,6 @@ impl Harness {
         let ids: Vec<_> = bindings.iter().map(|binding| binding.message_id).collect();
         loop {
             let (mut state, version) = self.load(id)?;
-            if !state.pending_resets.is_empty() || !state.pending_reset_blocks.is_empty() {
-                return Err(Error::Invalid(
-                    "reset with blocks requires no queued reset".into(),
-                ));
-            }
             let source = state
                 .transcript
                 .clone()
@@ -5024,7 +5014,16 @@ impl Harness {
             if ids
                 .iter()
                 .any(|id| id.is_nil() || !unique.insert(*id) || created.contains(id))
-                || state.resets.iter().any(|reset| reset.id == marker.id)
+                || state
+                    .resets
+                    .iter()
+                    .chain(&state.pending_resets)
+                    .any(|reset| reset.id == marker.id)
+                || state
+                    .pending_reset_blocks
+                    .values()
+                    .flatten()
+                    .any(|binding| unique.contains(&binding.message_id))
             {
                 return Err(Error::Invalid("reset identity collision".into()));
             }
@@ -5034,6 +5033,7 @@ impl Harness {
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && !state.abort_requested
+                && state.pending_resets.is_empty()
                 && state.pending_independent_summary.is_none()
                 && !state
                     .application_writes
@@ -5613,6 +5613,18 @@ impl Harness {
                 || !matches!(c.phase, Phase::Idle | Phase::FailedIdle)
             {
                 return Err(AdmissionError::Busy.into());
+            }
+            if !c.pending_reset_blocks.is_empty() && c.pending_resets.len() > 1 {
+                let marker = c.pending_resets.remove(0);
+                place_reset(&mut c, marker);
+                let merge = self.merge_admissions;
+                self.merge_admissions = false;
+                let result = self.save(&c, Expected::Version(version));
+                self.merge_admissions = merge;
+                match result {
+                    Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                    Err(error) => return Err(error),
+                }
             }
             for marker in std::mem::take(&mut c.pending_resets) {
                 place_reset(&mut c, marker);
@@ -6673,6 +6685,19 @@ impl Harness {
                 "independent summary ordering is inconsistent".into(),
             ));
         }
+        if marker.resets_before.len() > 1 && !state.pending_reset_blocks.is_empty() {
+            let reset = state.pending_resets.remove(0);
+            let mut remaining = marker;
+            remaining.resets_before.remove(0);
+            let writes = remaining.writes;
+            state.pending_independent_summary = Some(remaining);
+            place_reset_before_writes(state, reset, writes);
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(state, Expected::Version(version));
+            self.merge_admissions = merge;
+            return result;
+        }
         for reset in state
             .pending_resets
             .drain(..marker.resets_before.len())
@@ -6814,11 +6839,19 @@ impl Harness {
             match c.phase.clone() {
                 Phase::Idle => {
                     if !c.pending_resets.is_empty() {
-                        for marker in std::mem::take(&mut c.pending_resets) {
+                        for marker in take_reset_batch(&mut c) {
                             place_reset(&mut c, marker);
                         }
-                        self.save(&c, Expected::Version(version))?;
-                        continue;
+                        let merge = self.merge_admissions;
+                        self.merge_admissions = false;
+                        let result = self.save(&c, Expected::Version(version));
+                        self.merge_admissions = merge;
+                        match result {
+                            Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     place_queued(&mut c, true);
                     if c.active.is_none() {
@@ -7007,6 +7040,27 @@ impl Harness {
                             return Err(Error::Invalid(
                                 "compaction reset ordering is inconsistent".into(),
                             ));
+                        }
+                        if before.len() > 1 && !c.pending_reset_blocks.is_empty() {
+                            let reset = c.pending_resets.remove(0);
+                            let mut remaining = before;
+                            remaining.remove(0);
+                            place_reset(&mut c, reset);
+                            c.phase = Phase::CompactionPlacement {
+                                result,
+                                resets_before: Some(remaining),
+                            };
+                            let merge = self.merge_admissions;
+                            self.merge_admissions = false;
+                            let saved = self.save(&c, Expected::Version(version));
+                            self.merge_admissions = merge;
+                            match saved {
+                                Ok(())
+                                | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         let prior: Vec<_> = c.pending_resets.drain(..before.len()).collect();
                         for reset in prior {
@@ -7746,12 +7800,14 @@ impl Harness {
                     } else if !c.pending_resets.is_empty() {
                         finish_failure(&mut c, "reset".into());
                         c.phase = Phase::Idle;
-                        for marker in std::mem::take(&mut c.pending_resets) {
+                        for marker in take_reset_batch(&mut c) {
                             place_reset(&mut c, marker);
                         }
-                        place_queued(&mut c, true);
-                        if c.active.is_some() {
-                            c.phase = Phase::ModelReady { turns: 0 };
+                        if c.pending_resets.is_empty() {
+                            place_queued(&mut c, true);
+                            if c.active.is_some() {
+                                c.phase = Phase::ModelReady { turns: 0 };
+                            }
                         }
                     } else if let Some(answer) = answer {
                         finish_answer(&mut c, answer.clone());
@@ -8671,11 +8727,20 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::FailedIdle if !c.pending_resets.is_empty() => {
-                    for marker in std::mem::take(&mut c.pending_resets) {
+                    for marker in take_reset_batch(&mut c) {
                         place_reset(&mut c, marker);
                     }
                     c.phase = Phase::Idle;
-                    self.save(&c, Expected::Version(version))?;
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let result = self.save(&c, Expected::Version(version));
+                    self.merge_admissions = merge;
+                    match result {
+                        Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Phase::Blocked { .. } | Phase::FailedIdle => return Ok(()),
             }
@@ -11407,13 +11472,15 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
     if c.pending_reset_blocks.is_empty() {
         return Ok(());
     }
-    if c.pending_reset_blocks.len() != 1
-        || c.pending_resets.len() != 1
-        || !c.pending_reset_blocks.contains_key(&c.pending_resets[0].id)
-        || c.pending_resets[0].id.is_nil()
-        || c.resets
-            .iter()
-            .any(|reset| reset.id == c.pending_resets[0].id)
+    let mut reset_ids = std::collections::HashSet::new();
+    if c.pending_resets.iter().any(|reset| {
+        reset.id.is_nil()
+            || !reset_ids.insert(reset.id)
+            || c.resets.iter().any(|placed| placed.id == reset.id)
+    }) || c
+        .pending_reset_blocks
+        .keys()
+        .any(|id| !reset_ids.contains(id))
     {
         return Err(Error::Invalid(
             "invalid pending reset block ordering".into(),
@@ -11442,6 +11509,16 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+// Each block-bearing reset needs its own durable transcript transition.
+fn take_reset_batch(c: &mut Conversation) -> Vec<crate::reset::Reset> {
+    let count = if c.pending_reset_blocks.is_empty() {
+        c.pending_resets.len()
+    } else {
+        1
+    };
+    c.pending_resets.drain(..count).collect()
 }
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
@@ -12081,6 +12158,100 @@ mod scheduler_tests {
         assert_eq!(
             c.pending_reset_blocks[&reset][0].blocks,
             vec![json!({"type":"text","text":"original"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_block_reset_stale_placement_loses_to_admission_and_abort() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.submit(id, None, "active".into()).unwrap();
+        let (first, first_ids) = h
+            .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"first"})]])
+            .unwrap();
+        let (mut planned, version) = h.load(id).unwrap();
+        let marker = planned.pending_resets.remove(0);
+        place_reset(&mut planned, marker);
+        let stale = h
+            .prepare_save(&planned, Expected::Version(version))
+            .unwrap();
+        let (second, second_ids) = h
+            .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"second"})]])
+            .unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(stale),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        let (mut planned, version) = h.load(id).unwrap();
+        let marker = planned.pending_resets.remove(0);
+        place_reset(&mut planned, marker);
+        let stale = h
+            .prepare_save(&planned, Expected::Version(version))
+            .unwrap();
+        h.request_abort(id).unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(stale),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        drop(h);
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(c.content_blocks[&0].message_id, second_ids[0]);
+        let fork = h.fork_by_entry_id(id, first_ids[0]).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().content_blocks[&0].message_id,
+            first_ids[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_block_resets_recover_between_placement_commits() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let (id, first, second, first_id, second_id);
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.submit(id, None, "active".into()).unwrap();
+            let (r1, ids1) = h
+                .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"first"})]])
+                .unwrap();
+            let (r2, ids2) = h
+                .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"second"})]])
+                .unwrap();
+            (first, second, first_id, second_id) = (r1, r2, ids1[0], ids2[0]);
+            let (mut c, version) = h.load(id).unwrap();
+            let marker = c.pending_resets.remove(0);
+            place_reset(&mut c, marker);
+            h.save(&c, Expected::Version(version)).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.content_blocks[&0].message_id, first_id);
+        assert_eq!(c.pending_resets[0].id, second);
+        h.request_abort(id).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(c.content_blocks[&0].message_id, second_id);
+        let fork = h.fork_by_entry_id(id, first_id).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().content_blocks[&0].message_id,
+            first_id
         );
     }
 
@@ -13669,6 +13840,52 @@ mod scheduler_tests {
             vec![Message::User {
                 content: "replacement".into()
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn block_compaction_queues_two_block_resets_before_stale_result() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(BlockSummaryModel(std::sync::Mutex::new(vec![])));
+        let (id, operation, first, second, first_id, second_id);
+        {
+            let mut h = Harness::open_paused(&path, block_summary_options(model.clone())).unwrap();
+            (id, operation, _) = block_placement(&mut h);
+            let (r1, ids1) = h
+                .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"first"})]])
+                .unwrap();
+            let (r2, ids2) = h
+                .reset_with_blocks(id, None, vec![vec![json!({"type":"text","text":"second"})]])
+                .unwrap();
+            (first, second, first_id, second_id) = (r1, r2, ids1[0], ids2[0]);
+            let (mut c, version) = h.load(id).unwrap();
+            let Phase::CompactionPlacement { resets_before, .. } = &mut c.phase else {
+                panic!("missing result")
+            };
+            *resets_before = Some(vec![first, second]);
+            h.save(&c, Expected::Version(version)).unwrap();
+        }
+        let mut h = Harness::open_paused(&path, block_summary_options(model)).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0],
+            ManualCompaction {
+                id: operation,
+                status: ManualCompactionStatus::Stale
+            }
+        );
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(c.content_blocks[&0].message_id, second_id);
+        let fork = h.fork_by_entry_id(id, first_id).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().content_blocks[&0].message_id,
+            first_id
         );
     }
 

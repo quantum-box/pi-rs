@@ -666,8 +666,11 @@ async fn queued_block_reset_places_handoff_blocks_and_steer_atomically() {
     let (reset, ids) = s
         .reset_with_blocks(id, Some("new handoff".into()), vec![first.clone(), vec![]])
         .unwrap();
-    assert!(s.reset(id, None).is_err());
     s.submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+        .unwrap();
+    let second = vec![json!({"type":"text","text":"second"})];
+    let (reset2, ids2) = s
+        .reset_with_blocks(id, Some("second handoff".into()), vec![second.clone()])
         .unwrap();
     tool.release.add_permits(1);
     acquire(&model.started).await;
@@ -677,19 +680,26 @@ async fn queued_block_reset_places_handoff_blocks_and_steer_atomically() {
             .iter()
             .map(|r| r.handoff.as_deref())
             .collect::<Vec<_>>(),
-        [Some("tool handoff"), Some("new handoff")]
+        [
+            Some("tool handoff"),
+            Some("new handoff"),
+            Some("second handoff")
+        ]
     );
     assert_eq!(c.resets[1].id, reset);
-    assert_eq!(c.content_blocks[&1].message_id, ids[0]);
-    assert_eq!(c.content_blocks[&1].blocks, first);
-    assert_eq!(c.content_blocks[&2].message_id, ids[1]);
-    assert!(c.content_blocks[&2].blocks.is_empty());
-    assert_eq!(users(&c.messages), ["new handoff", "", "", "steer"]);
+    assert_eq!(c.resets[2].id, reset2);
+    assert_eq!(c.content_blocks[&1].message_id, ids2[0]);
+    assert_eq!(c.content_blocks[&1].blocks, second);
+    assert_eq!(users(&c.messages), ["second handoff", "", "steer"]);
     {
         let requests = provider.requests.lock().unwrap();
-        assert_eq!(requests[1].blocks[&2].message_id, ids[0]);
-        assert_eq!(requests[1].blocks[&3].message_id, ids[1]);
+        assert_eq!(requests[1].blocks[&2].message_id, ids2[0]);
     }
+    let intermediate = s.fork_by_entry_id(id, ids[1]).unwrap();
+    let snapshot = s.conversation(intermediate).unwrap();
+    assert_eq!(snapshot.content_blocks[&1].message_id, ids[0]);
+    assert_eq!(snapshot.content_blocks[&1].blocks, first);
+    assert_eq!(snapshot.content_blocks[&2].message_id, ids[1]);
     model.release.add_permits(1);
     s.wait(id).await.unwrap();
     let historical = s.fork_by_entry_id(id, old).unwrap();
@@ -698,10 +708,14 @@ async fn queued_block_reset_places_handoff_blocks_and_steer_atomically() {
         old
     );
     s.shutdown().await.unwrap();
-    let h = Harness::open_paused(&path, options).unwrap();
+    let mut h = Harness::open_paused(&path, options).unwrap();
     let reopened = h.conversation(id).unwrap();
-    assert_eq!(reopened.content_blocks[&1].message_id, ids[0]);
-    assert_eq!(reopened.content_blocks[&2].message_id, ids[1]);
+    assert_eq!(reopened.content_blocks[&1].message_id, ids2[0]);
+    let intermediate = h.fork_by_entry_id(id, ids[1]).unwrap();
+    assert_eq!(
+        h.conversation(intermediate).unwrap().content_blocks[&1].message_id,
+        ids[0]
+    );
 }
 
 #[test]
@@ -735,9 +749,16 @@ fn block_reset_crash_child() {
             ]],
         )
         .unwrap();
+    let (reset2, ids2) = h
+        .reset_with_blocks(
+            id,
+            Some("last after crash".into()),
+            vec![vec![json!({"type":"text","text":"last"})]],
+        )
+        .unwrap();
     std::fs::write(
         format!("{path}.ids"),
-        format!("{id}\n{old}\n{reset}\n{}", ids[0]),
+        format!("{id}\n{old}\n{reset}\n{}\n{reset2}\n{}", ids[0], ids2[0]),
     )
     .unwrap();
     std::process::exit(0);
@@ -771,11 +792,21 @@ async fn queued_block_reset_survives_process_exit_and_abort() {
         .await
         .unwrap();
     let c = h.conversation(ids[0]).unwrap();
-    assert_eq!(c.resets.last().unwrap().id, ids[2]);
-    assert_eq!(users(&c.messages), ["after crash", ""]);
-    assert_eq!(c.content_blocks[&1].message_id, ids[3]);
+    assert_eq!(
+        c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[2], ids[4]]
+    );
+    assert_eq!(users(&c.messages), ["last after crash", ""]);
+    assert_eq!(c.content_blocks[&1].message_id, ids[5]);
     assert_eq!(
         c.content_blocks[&1].blocks,
+        vec![json!({"type":"text","text":"last"})]
+    );
+    let intermediate = h.fork_by_entry_id(ids[0], ids[3]).unwrap();
+    let snapshot = h.conversation(intermediate).unwrap();
+    assert_eq!(snapshot.content_blocks[&1].message_id, ids[3]);
+    assert_eq!(
+        snapshot.content_blocks[&1].blocks,
         vec![
             json!({"type":"text","text":"kept"}),
             json!({"type":"image","data":"aGk=","mimeType":"image/png"})
@@ -790,7 +821,7 @@ async fn queued_block_reset_survives_process_exit_and_abort() {
     let h = Harness::open_paused(&path, options).unwrap();
     assert_eq!(
         h.conversation(ids[0]).unwrap().content_blocks[&1].message_id,
-        ids[3]
+        ids[5]
     );
 }
 
