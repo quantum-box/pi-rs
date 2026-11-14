@@ -900,8 +900,8 @@ async fn read_event_metadata_tracks_outcome_without_leaking_stale_content() {
                 Some("read".into()),
                 &mut inputs,
                 &CancellationToken::new(),
-                &mut |event| match event {
-                    pi_rs::Notification::Committed(record) => {
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event {
                         if let pi_rs::Event::ToolFinished {
                             operation_id,
                             outcome,
@@ -914,7 +914,6 @@ async fn read_event_metadata_tracks_outcome_without_leaking_stale_content() {
                             committed.push((*operation_id, outcome.clone()));
                         }
                     }
-                    _ => {}
                 },
             )
             .await
