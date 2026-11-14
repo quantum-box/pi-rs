@@ -2293,7 +2293,14 @@ mod tests {
                 Ok(Step::Succeed(serde_json::json!("done")))
             });
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
-            assert_eq!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().retired_attempt_id(), None);
+            assert_eq!(
+                scheduler
+                    .get(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .retired_attempt_id(),
+                None
+            );
             if safe {
                 assert_eq!(
                     scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
@@ -2618,7 +2625,13 @@ mod tests {
                 Ok(Step::Succeed(json!("should not execute")))
             });
             let mut s = Scheduler::open(&path, registry).unwrap();
-            assert_eq!(s.get(Uuid::from_u128(1)).unwrap().unwrap().retired_attempt_id(), None);
+            assert_eq!(
+                s.get(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .retired_attempt_id(),
+                None
+            );
             if safe {
                 assert_eq!(
                     s.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
