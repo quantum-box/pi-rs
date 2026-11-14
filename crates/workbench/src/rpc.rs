@@ -1338,7 +1338,9 @@ fn busy(worker: &Option<Worker>) -> bool {
 // JavaScript extension by path. Keep the native fields for existing clients.
 fn extension_error_for_rpc(mut event: Value) -> Value {
     if event["type"] == "extension_error" {
-        if let Some(extension) = event.get("extension").cloned() {
+        if event.get("extensionPath").is_none()
+            && let Some(extension) = event.get("extension").cloned()
+        {
             event["extensionPath"] = extension;
         }
         if let Some(message) = event.get("message").cloned() {
@@ -1516,6 +1518,12 @@ mod tests {
         assert_eq!(projected["extensionPath"], "cache-hook");
         assert_eq!(projected["error"], "failed");
         assert_eq!(projected["event"], "cache_warming_decision");
+        let with_source = json!({"type":"extension_error", "extension":"cache-hook",
+            "extensionPath":"/extensions/cache", "message":"failed"});
+        assert_eq!(
+            extension_error_for_rpc(with_source)["extensionPath"],
+            "/extensions/cache"
+        );
         let other = json!({"type":"error", "message":"failed"});
         assert_eq!(extension_error_for_rpc(other.clone()), other);
     }

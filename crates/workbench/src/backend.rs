@@ -272,6 +272,11 @@ async fn run_worker(
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
     let mut runtime = runtime::configure(&args, true).await?;
+    if args.mode == Some(super::OutputMode::Rpc) {
+        super::output(
+            json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
+        );
+    }
     let ui = Arc::new(super::extension_ui::Broker::default());
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));

@@ -1487,7 +1487,10 @@ print(json.dumps({'version':1, 'response':response}))
             .collect();
         assert_eq!(matching.len(), 1, "expected one {kind} error: {failures:?}");
         let failure = matching[0];
-        assert_eq!(failure["extensionPath"], "failure-fixture");
+        assert_eq!(
+            failure["extensionPath"],
+            extension.canonicalize().unwrap().to_str().unwrap()
+        );
         assert_eq!(failure["extension"], "failure-fixture");
         assert!(failure["error"].as_str().unwrap().contains(message));
         assert_eq!(failure["message"], failure["error"]);

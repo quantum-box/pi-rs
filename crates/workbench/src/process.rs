@@ -126,6 +126,7 @@ pub(super) struct Worker {
     refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
+    extension_sources: std::collections::BTreeMap<String, Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
 impl Worker {
@@ -324,6 +325,7 @@ impl Worker {
             refresh_barrier,
             events,
             pending_events: Vec::new(),
+            extension_sources: Default::default(),
             readers,
         })
     }
@@ -411,6 +413,27 @@ impl Worker {
                 .filter(|event| event["type"] != "session_transition_checked"),
         );
         events
+            .into_iter()
+            .filter_map(|mut event| {
+                if event["type"] == "worker_extension_sources" {
+                    self.extension_sources = event["sources"]
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|sources| sources.iter())
+                        .map(|(id, path)| (id.clone(), path.clone()))
+                        .collect();
+                    return None;
+                }
+                if event["type"] == "extension_error"
+                    && let Some(source) = event["extension"]
+                        .as_str()
+                        .and_then(|id| self.extension_sources.get(id))
+                {
+                    event["extensionPath"] = source.clone();
+                }
+                Some(event)
+            })
+            .collect()
     }
 
     pub(super) fn interrupt_shutdown(&mut self) {
@@ -591,9 +614,11 @@ impl Worker {
             replacing_session.then(|| args.session.clone()),
         ));
         let pending_events = std::mem::take(&mut active.pending_events);
+        let extension_sources = std::mem::take(&mut active.extension_sources);
         drop(slot.take());
         let mut next = Self::start_with_transition(args, &["serve"], Some((reason, previous)))?;
         next.pending_events = pending_events;
+        next.extension_sources = extension_sources;
         *slot = Some(next);
         Ok(())
     }
@@ -779,6 +804,7 @@ mod tests {
             stdin,
             events,
             pending_events: Vec::new(),
+            extension_sources: Default::default(),
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
         };
