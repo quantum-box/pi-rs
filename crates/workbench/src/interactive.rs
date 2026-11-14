@@ -7339,9 +7339,11 @@ impl RunningExternalEditor {
             use std::os::unix::process::CommandExt;
             process.process_group(0);
         }
-        let mut child = process
+        let child = process
             .spawn()
             .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
+        #[cfg(unix)]
+        let mut child = child;
         #[cfg(unix)]
         if let Some(foreground) = &foreground {
             use std::os::fd::AsRawFd;
@@ -7532,7 +7534,7 @@ fn external_editor_command(
         .to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
     let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
