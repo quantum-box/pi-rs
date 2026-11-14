@@ -1748,6 +1748,7 @@ async fn manual_target_rejects_forged_or_unrelated_source() {
     let encoded = serde_json::to_value(result).unwrap();
     for (field, replacement) in [
         ("id", serde_json::json!(Uuid::new_v4())),
+        ("reset_id", serde_json::json!(Uuid::new_v4())),
         ("source", serde_json::to_value(other_cursor).unwrap()),
         ("source", serde_json::to_value(older_cursor).unwrap()),
     ] {
@@ -1760,6 +1761,44 @@ async fn manual_target_rejects_forged_or_unrelated_source() {
                 .is_none()
         );
     }
+
+    // A real target cannot authenticate a different summary source or cut.
+    for field in ["source", "first_kept"] {
+        let mut forged = encoded.clone();
+        if field == "source" {
+            forged["preparation"]["source"][0]["content"] =
+                serde_json::json!("different source");
+        } else {
+            forged["preparation"]["first_kept"] = serde_json::json!(0);
+        }
+        let forged: crate::compact::CompactionResult = serde_json::from_value(forged).unwrap();
+        assert!(
+            h.apply_manual_compaction_target(&state, &forged)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Missing target metadata uses the legacy snapshot-and-generation check;
+    // it must not gain the relaxed behavior after an intervening compaction.
+    let mut legacy = encoded;
+    legacy["preparation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("retained_target");
+    let legacy: crate::compact::CompactionResult = serde_json::from_value(legacy).unwrap();
+    assert!(
+        h.apply_manual_compaction_target(&state, &legacy)
+            .unwrap()
+            .is_some()
+    );
+    let mut changed = state.clone();
+    changed.context_generation = Some(Uuid::new_v4());
+    assert!(
+        h.apply_manual_compaction_target(&changed, &legacy)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
