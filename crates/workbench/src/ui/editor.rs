@@ -52,10 +52,13 @@ fn word_boundary(text: &str, backward: bool) -> usize {
         };
         if word {
             text[start..end]
-                .char_indices()
+                .grapheme_indices(true)
                 .rev()
-                .find(|&(_, c)| WORD_PUNCTUATION.contains(c))
-                .map_or(start, |(i, c)| start + i + c.len_utf8())
+                .find(|&(_, grapheme)| grapheme.chars().any(|c| WORD_PUNCTUATION.contains(c)))
+                .map_or(start, |(i, grapheme)| {
+                    let after = start + i + grapheme.len();
+                    if after == end { start + i } else { after }
+                })
         } else {
             segments
                 .iter()
@@ -559,6 +562,30 @@ mod tests {
         editor.cursor = 0;
         editor.action("tui.editor.cursorWordRight");
         assert_eq!(&editor.text[..editor.cursor], "אב");
+    }
+
+    #[test]
+    fn backward_word_actions_advance_and_preserve_punctuation_graphemes() {
+        let mut editor = Editor::default();
+        editor.replace("אב'".into());
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(&editor.text[..editor.cursor], "אב");
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(editor.cursor, 0);
+        editor.cursor = editor.text.len();
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "אב");
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "");
+
+        editor.replace("a.\u{301}b".into());
+        editor.action("tui.editor.cursorWordLeft");
+        assert_eq!(&editor.text[..editor.cursor], "a.\u{301}");
+        editor.cursor = editor.text.len();
+        editor.action("tui.editor.deleteWordBackward");
+        assert_eq!(editor.text, "a.\u{301}");
+        editor.action("tui.editor.undo");
+        assert_eq!(editor.text, "a.\u{301}b");
     }
 
     #[test]
