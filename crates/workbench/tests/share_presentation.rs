@@ -342,6 +342,88 @@ print(json.dumps({'version':1,'response':response}))
 }
 
 #[test]
+fn two_idle_workers_can_expose_different_contexts_for_the_same_unlocked_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("session.jsonl");
+    drop(pi_rs::Session::open(&journal).unwrap());
+    let first_prompt = root.path().join("first.txt");
+    let second_prompt = root.path().join("second.txt");
+    std::fs::write(&first_prompt, "first worker context").unwrap();
+    std::fs::write(&second_prompt, "second worker context").unwrap();
+    let spawn = |prompt: &std::path::Path| {
+        let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "ollama",
+                "--model",
+                "fixture",
+                "--endpoint",
+                "http://127.0.0.1:9",
+                "--system-prompt",
+            ])
+            .arg(prompt)
+            .arg("--session")
+            .arg(&journal)
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let input = child.0.stdin.take().unwrap();
+        let output = child.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && tx.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (child, input, rx)
+    };
+    let (_first, mut first_input, first_rx) = spawn(&first_prompt);
+    let key = [9u8; 32];
+    writeln!(first_input, "{}", json!({"type":"get_share_context", "id":"first", "session":journal, "journal_key":key, "include_journal":true})).unwrap();
+    first_input.flush().unwrap();
+    let first = receive(&first_rx, |event| event["id"] == "first");
+    assert_eq!(first["success"], true, "{first}");
+    let (_second, mut second_input, second_rx) = spawn(&second_prompt);
+    writeln!(second_input, "{}", json!({"type":"get_share_context", "id":"second", "session":journal, "journal_key":key, "include_journal":true})).unwrap();
+    second_input.flush().unwrap();
+    let second = receive(&second_rx, |event| event["id"] == "second");
+    assert_eq!(second["success"], true, "{second}");
+    assert_eq!(
+        first["data"]["snapshot"]["sessionId"],
+        second["data"]["snapshot"]["sessionId"]
+    );
+    assert_eq!(
+        first["data"]["snapshot"]["head"],
+        second["data"]["snapshot"]["head"]
+    );
+    assert_eq!(first["data"]["records"], second["data"]["records"]);
+    assert_ne!(
+        first["data"]["snapshot"]["context"]["systemPrompt"],
+        second["data"]["snapshot"]["context"]["systemPrompt"]
+    );
+    // A successful exclusive open does not prove that no idle worker exists.
+    drop(pi_rs::Session::open(&journal).unwrap());
+    writeln!(first_input, "{}", json!({"type":"shutdown"})).unwrap();
+    writeln!(second_input, "{}", json!({"type":"shutdown"})).unwrap();
+}
+
+#[test]
 fn share_context_tracks_idle_and_inflight_worker() {
     let root = tempfile::tempdir().unwrap();
     let prompt = root.path().join("system.txt");
