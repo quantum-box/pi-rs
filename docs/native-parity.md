@@ -189,6 +189,9 @@ the restored run budget prevents further work.
 Saved summary usage is settled even when current request limits or the
 auto-compaction setting prevent replay. Cancellation during a silent summary
 returns cancellation and leaves the durable operation available for recovery.
+Explicit overflow recovery also settles durable failed, cancelled, truncated,
+empty, or oversized summary completions before deciding whether they can be
+reused; uncertain work still requires reconciliation rather than a resend.
 Saved silent-overflow recovery runs before checking the current auto-compaction
 setting or model window. A resumed run restores request and output limits from
 its journal; missing or unconfirmed usage reserves the request's full output

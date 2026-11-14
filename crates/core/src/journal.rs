@@ -2868,18 +2868,34 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
 struct ShareFileStore(FileStore);
 
 impl SessionStore for ShareFileStore {
+    fn supports_record_metadata(&self) -> bool {
+        true
+    }
     fn load(&mut self) -> Result<Vec<Record>> {
-        let (records, _, incomplete) = read_complete_records(&mut self.0.file)?;
+        let (records, metadata, _, incomplete) = read_complete_records(&mut self.0.file)?;
         if incomplete || records.is_empty() {
             return Err(Error::Session(
                 "journal is incomplete; reopen it before sharing".into(),
             ));
         }
+        self.0.metadata = metadata;
         Ok(records)
     }
 
     fn append(&mut self, record: &Record) -> Result<()> {
         self.0.append(record)
+    }
+
+    fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
+        self.0.load_record_metadata()
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.0.append_with_metadata(record, metadata)
     }
 }
 
@@ -3809,6 +3825,17 @@ mod record_metadata_tests {
         let public_fork = session.fork_session(id).unwrap();
         assert_eq!(public_fork.record_metadata(id), Some(&metadata));
         drop(session);
+        let share = Session::open_for_share(&path).unwrap();
+        assert_eq!(share.record_metadata(id), Some(&metadata));
+        let share_export = directory.path().join("share-export.jsonl");
+        share.export_jsonl(&share_export).unwrap();
+        assert_eq!(
+            Session::snapshot(&share_export)
+                .unwrap()
+                .record_metadata(id),
+            Some(&metadata)
+        );
+        drop(share);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.record_metadata(id), Some(&metadata));
     }
