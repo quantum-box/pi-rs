@@ -63,8 +63,14 @@ idempotent. Extension tools are conservatively unsafe to replay, and recovery
 with selected extensions also avoids replaying potentially overridden host tools.
 The runtime supports before-request message replacement and observes completed
 responses; hook errors and non-string after-tool replacements have limited
-reporting. Provider-body hooks, on-yield, after-tools and after-run hooks and
-their durable child tasks are not integrated. Before-tool hooks may sleep on
+reporting. After-tools receives the completed round's calls; after-run receives
+`{"answer": ...}` after the answer and submission settlement are committed.
+Both run in persistent phases with a stable operation memo and may execute again
+after a crash. A nonempty task request or a hook error stops execution with an
+explicit error and leaves the phase for retry after reopening; no requested
+tasks are scheduled. This differs from upstream reporting and skipping invalid
+task requests. Provider-body and on-yield hooks are not integrated, and this
+runtime does not support terminate-round decisions. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.

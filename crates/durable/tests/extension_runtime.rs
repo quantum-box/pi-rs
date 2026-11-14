@@ -968,3 +968,240 @@ async fn abort_during_generation_hook_never_dispatches_model() {
     assert!(model.0.lock().unwrap().is_empty());
     scheduler.shutdown().await.unwrap();
 }
+
+struct LifecycleHook {
+    events: Arc<Mutex<Vec<String>>>,
+    task_event: Option<pi_rs_durable::extension::GenerationEvent>,
+    park_event: Option<pi_rs_durable::extension::GenerationEvent>,
+    entered: Arc<tokio::sync::Semaphore>,
+}
+#[async_trait]
+impl Hook for LifecycleHook {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        ctx: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent, HookTask};
+        if !matches!(
+            event,
+            GenerationEvent::AfterTools | GenerationEvent::AfterRun
+        ) {
+            return Ok(GenerationDecision::Pass);
+        }
+        let name = format!("{event:?}");
+        let phase = &ctx.snapshot["phase"][&name];
+        let operation = phase["operation_id"].clone();
+        assert_eq!(
+            ctx.memo
+                .get_or_insert("operation", operation.clone())
+                .await?,
+            operation
+        );
+        self.events.lock().unwrap().push(name.clone());
+        if std::env::var("PI_LIFECYCLE_CRASH").ok().as_deref() == Some(&name) {
+            std::process::abort();
+        }
+        if self.park_event == Some(event) {
+            self.entered.add_permits(1);
+            std::future::pending::<()>().await;
+        }
+        if self.task_event == Some(event) {
+            return Ok(GenerationDecision::Tasks(vec![HookTask {
+                name: "job".into(),
+                input: json!(null),
+            }]));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+fn lifecycle(
+    h: &mut Harness,
+    task_event: Option<pi_rs_durable::extension::GenerationEvent>,
+    park_event: Option<pi_rs_durable::extension::GenerationEvent>,
+    events: Arc<Mutex<Vec<String>>>,
+) {
+    h.install_extension(Extension {
+        name: "lifecycle".into(),
+        hooks: vec![Arc::new(LifecycleHook {
+            events,
+            task_event,
+            park_event,
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        })],
+        ..Default::default()
+    })
+    .unwrap();
+}
+#[tokio::test]
+async fn lifecycle_hooks_run_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    lifecycle(&mut h, None, None, events.clone());
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*events.lock().unwrap(), vec!["AfterTools", "AfterRun"]);
+}
+#[tokio::test]
+async fn lifecycle_tasks_fail_closed_and_leave_phase_recoverable() {
+    use pi_rs_durable::extension::GenerationEvent;
+    for event in [GenerationEvent::AfterTools, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(FakeModel::default());
+        let tool = Arc::new(FakeTool::default());
+        let id;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+            lifecycle(&mut h, Some(event), None, Arc::default());
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+            let err = h
+                .submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("atomic scheduling is not supported")
+            );
+        }
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+        let c = h.conversation(id).unwrap();
+        assert!(serde_json::to_value(&c).unwrap()["phase"][format!("{event:?}")].is_object());
+        if event == GenerationEvent::AfterRun {
+            assert!(matches!(c.submissions[0].status, Status::Done { .. }));
+        }
+        lifecycle(&mut h, None, None, Arc::default());
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        assert_eq!(tool.0.lock().unwrap().len(), 1);
+    }
+}
+#[tokio::test]
+async fn lifecycle_crash_child() {
+    let Ok(path) = std::env::var("PI_LIFECYCLE_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(
+        &path,
+        options(
+            Arc::new(FakeModel::default()),
+            Arc::new(FakeTool::default()),
+        ),
+    )
+    .unwrap();
+    lifecycle(&mut h, None, None, Arc::default());
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["lifecycle".into()]).unwrap();
+    std::fs::write(format!("{path}.id"), id.to_string()).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    panic!("hook did not crash");
+}
+#[tokio::test]
+async fn lifecycle_crash_recovers_stable_memo_without_replaying_tool() {
+    for phase in ["AfterTools", "AfterRun"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lifecycle_crash_child"])
+            .env("PI_LIFECYCLE_DB", &path)
+            .env("PI_LIFECYCLE_CRASH", phase)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        let id = std::fs::read_to_string(format!("{}.id", path.display()))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let tool = Arc::new(FakeTool::default());
+        let mut h =
+            Harness::open_paused(&path, options(Arc::new(FakeModel::default()), tool.clone()))
+                .unwrap();
+        let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+        let operation = state["phase"][phase]["operation_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            h.extension_memo(operation)
+                .unwrap()
+                .get("operation")
+                .await
+                .unwrap(),
+            Some(json!(operation))
+        );
+        lifecycle(&mut h, None, None, Arc::default());
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(tool.0.lock().unwrap().is_empty());
+        assert!(matches!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+    }
+}
+#[tokio::test]
+async fn abort_during_lifecycle_hook_stops_without_replaying_tool() {
+    use pi_rs_durable::{extension::GenerationEvent, runtime::Scheduler};
+    for event in [GenerationEvent::AfterTools, GenerationEvent::AfterRun] {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = Arc::new(FakeTool::default());
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut scheduler = Scheduler::open(
+            dir.path().join("db"),
+            options(Arc::new(FakeModel::default()), tool.clone()),
+        )
+        .unwrap();
+        scheduler
+            .install_extension(Extension {
+                name: "lifecycle".into(),
+                hooks: vec![Arc::new(LifecycleHook {
+                    events: Arc::default(),
+                    task_event: None,
+                    park_event: Some(event),
+                    entered: entered.clone(),
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler
+            .select_extensions(id, vec!["lifecycle".into()])
+            .unwrap();
+        scheduler.submit(id, None, "go".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        scheduler.abort_and_wait(id).await.unwrap();
+        let c = scheduler.conversation(id).unwrap();
+        assert_eq!(tool.0.lock().unwrap().len(), 1);
+        assert!(match event {
+            GenerationEvent::AfterRun => matches!(c.submissions[0].status, Status::Done { .. }),
+            _ => matches!(c.submissions[0].status, Status::Unanswered { .. }),
+        });
+        scheduler.shutdown().await.unwrap();
+    }
+}

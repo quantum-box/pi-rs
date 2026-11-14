@@ -181,6 +181,15 @@ enum Phase {
         turns: u32,
         answer: Option<String>,
     },
+    AfterTools {
+        turns: u32,
+        calls: Vec<ToolCall>,
+        operation_id: Uuid,
+    },
+    AfterRun {
+        answer: String,
+        operation_id: Uuid,
+    },
     Tools {
         turns: u32,
         calls: Vec<ToolCall>,
@@ -1680,6 +1689,44 @@ impl Harness {
         self.save(&c, Expected::Version(version))?;
         Ok(true)
     }
+    async fn run_lifecycle_hook(
+        &self,
+        c: &Conversation,
+        operation_id: Uuid,
+        event: crate::extension::GenerationEvent,
+        value: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<(), Error> {
+        if c.extensions.is_empty() {
+            return Ok(());
+        }
+        let selected = self.selected_extensions(c)?;
+        let snapshot = serde_json::to_value(c)?;
+        let memo = self.extension_memo(operation_id)?;
+        let context = crate::extension::Context {
+            snapshot: &snapshot,
+            memo: &memo,
+        };
+        let (_, _, tasks, reports) = fenced_poll(
+            selected.generation(event, value, &context),
+            self.execution_gate.as_ref(),
+            cancel,
+        )
+        .await
+        .ok_or(Error::Interrupted)?;
+        self.subagent_store()?;
+        if !reports.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{event:?} hook failed: {reports:?}"
+            )));
+        }
+        if !tasks.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{event:?} hook requested tasks; atomic scheduling is not supported"
+            )));
+        }
+        Ok(())
+    }
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
         loop {
             if cancel.is_cancelled() {
@@ -2244,13 +2291,16 @@ impl Harness {
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Boundary { turns, answer } => {
-                    if !c.pending_resets.is_empty() {
-                        if let Some(answer) = answer {
-                            finish_answer(&mut c, answer);
-                        } else {
-                            finish_failure(&mut c, "reset".into());
-                            c.phase = Phase::Idle;
-                        }
+                    if !c.pending_resets.is_empty() && answer.is_some() {
+                        let answer = answer.expect("checked above");
+                        finish_answer(&mut c, answer.clone());
+                        c.phase = Phase::AfterRun {
+                            answer,
+                            operation_id: Uuid::new_v4(),
+                        };
+                    } else if !c.pending_resets.is_empty() {
+                        finish_failure(&mut c, "reset".into());
+                        c.phase = Phase::Idle;
                         for marker in std::mem::take(&mut c.pending_resets) {
                             place_reset(&mut c, marker);
                         }
@@ -2300,7 +2350,11 @@ impl Harness {
                         c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns };
                     } else if let Some(answer) = answer {
-                        finish_answer(&mut c, answer);
+                        finish_answer(&mut c, answer.clone());
+                        c.phase = Phase::AfterRun {
+                            answer,
+                            operation_id: Uuid::new_v4(),
+                        };
                     } else {
                         c.phase = Phase::ModelReady { turns };
                     }
@@ -2315,15 +2369,50 @@ impl Harness {
                         other => other?,
                     }
                 }
+                Phase::AfterTools {
+                    turns,
+                    calls,
+                    operation_id,
+                } => {
+                    self.run_lifecycle_hook(
+                        &c,
+                        operation_id,
+                        crate::extension::GenerationEvent::AfterTools,
+                        serde_json::to_value(&calls)?,
+                        cancel,
+                    )
+                    .await?;
+                    c.phase = Phase::Boundary {
+                        turns,
+                        answer: None,
+                    };
+                    self.save(&c, Expected::Version(version))?;
+                }
+                Phase::AfterRun {
+                    answer,
+                    operation_id,
+                } => {
+                    self.run_lifecycle_hook(
+                        &c,
+                        operation_id,
+                        crate::extension::GenerationEvent::AfterRun,
+                        serde_json::json!({"answer": answer}),
+                        cancel,
+                    )
+                    .await?;
+                    c.phase = Phase::Idle;
+                    self.save(&c, Expected::Version(version))?;
+                }
                 Phase::Tools {
                     turns,
                     calls,
                     index,
                 } => {
                     if index >= calls.len() {
-                        c.phase = Phase::Boundary {
+                        c.phase = Phase::AfterTools {
                             turns,
-                            answer: None,
+                            calls,
+                            operation_id: Uuid::new_v4(),
                         };
                     } else if !c.extensions.is_empty() {
                         c.phase = Phase::ToolPreparing {
