@@ -1873,6 +1873,55 @@ mod tests {
     }
 
     #[test]
+    fn marked_strike_preserves_offsets_after_link_label_unescaping() {
+        let theme = Theme::system();
+        for source in [
+            r"[a\[b](https://example.com) ~~strike~~",
+            "[a\\[b][id] ~~strike~~\n\n[id]: https://example.com",
+            r"[a\]b](https://example.com) ~~strike~~",
+            r"[a\[b](https://example.com/~~dest) ~~strike~~",
+        ] {
+            let lines = markdown(source, &theme, 120);
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+            assert!(
+                text.contains(if source.contains(r"\]b") {
+                    "a]b"
+                } else {
+                    "a[b"
+                }),
+                "{source:?}: {text:?}"
+            );
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text == "strike" && span.strikethrough),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_strike_unescapes_table_pipes_before_code_tokenization() {
+        let theme = Theme::system();
+        let source = "| header |\n| --- |\n| ~~a `x\\|y`~~ |";
+        let lines = markdown(source, &theme, 120);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("a ") && span.strikethrough)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "x|y" && span.strikethrough),
+            "{spans:?}"
+        );
+        assert!(!spans.iter().any(|span| span.text.contains(r"x\|y")));
+    }
+
+    #[test]
     fn inline_code_in_strikethrough_inherits_strikethrough() {
         let theme = Theme::system();
         let lines = markdown("~~deleted `code`~~ and `plain`", &theme, 80);

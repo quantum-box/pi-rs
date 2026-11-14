@@ -147,7 +147,28 @@ fn tree(events: impl IntoIterator<Item = Spanned>) -> Vec<Node> {
     roots
 }
 
-fn token_nodes(tokens: &[Value], source: &str, base: usize) -> Option<Vec<Node>> {
+// Remove only the escapes Marked removes before recursively tokenizing a link
+// label or a table cell, while retaining a byte-boundary map to the input.
+fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offsets = vec![0];
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && escaped.contains(&bytes[i + 1]) {
+            i += 1;
+        }
+        output.push(bytes[i]);
+        i += 1;
+        offsets.push(i);
+    }
+    (
+        String::from_utf8(output).expect("only ASCII escapes removed"),
+        offsets,
+    )
+}
+
+fn token_nodes(tokens: &[Value], source: &str, offsets: &[usize]) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
     for token in tokens {
@@ -156,13 +177,30 @@ fn token_nodes(tokens: &[Value], source: &str, base: usize) -> Option<Vec<Node>>
         if source.get(cursor..end)? != raw {
             return None;
         }
-        let span = base + cursor..base + end;
+        let span = *offsets.get(cursor)?..*offsets.get(end)?;
         let kind = token.get("type")?.as_str()?;
         let text = token.get("text").and_then(Value::as_str).unwrap_or(raw);
         let make_children = || -> Option<Vec<Node>> {
             let children = token.get("tokens")?.as_array()?;
-            let pos = raw.find(text)?;
-            token_nodes(children, text, base + cursor + pos)
+            // Marked unescapes brackets in link labels before running the
+            // inline lexer, so child raw text is not always a source substring.
+            let (normalized, local_offsets) = if kind == "link" {
+                unescape_with_offsets(raw, b"[]")
+            } else {
+                (raw.to_owned(), (0..=raw.len()).collect())
+            };
+            let search_start = if kind == "link" {
+                normalized.find('[')? + 1
+            } else {
+                0
+            };
+            let pos = search_start + normalized.get(search_start..)?.find(text)?;
+            let child_offsets = local_offsets
+                .get(pos..=pos + text.len())?
+                .iter()
+                .map(|offset| offsets.get(cursor + offset).copied())
+                .collect::<Option<Vec<_>>>()?;
+            token_nodes(children, text, &child_offsets)
         };
         let group = match kind {
             "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
@@ -210,7 +248,7 @@ fn token_nodes(tokens: &[Value], source: &str, base: usize) -> Option<Vec<Node>>
     (cursor == source.len()).then_some(result)
 }
 
-fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>) -> Vec<Node> {
+fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: bool) -> Vec<Node> {
     let Some(first) = nodes.first() else {
         return nodes;
     };
@@ -226,33 +264,48 @@ fn inline_run(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>) -> Vec<Node>
     if !source.contains("~~") {
         return nodes;
     }
+    // Marked's block table lexer removes a backslash before each pipe before
+    // handing a cell to its inline lexer, including inside code spans.
+    let (source, offsets) = if table_cell {
+        unescape_with_offsets(source, b"|")
+    } else {
+        (source.to_owned(), (0..=source.len()).collect())
+    };
+    let offsets: Vec<usize> = offsets.into_iter().map(|offset| start + offset).collect();
     let tokens = LEXER.with(|lexer| {
         lexer
             .borrow()
             .as_ref()
-            .and_then(|lexer| lexer.tokens(source, refs))
+            .and_then(|lexer| lexer.tokens(&source, refs))
     });
     tokens
-        .and_then(|tokens| token_nodes(&tokens, source, start))
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets))
         .unwrap_or(nodes)
 }
-fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>) -> Vec<Node> {
+fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>, table_cell: bool) -> Vec<Node> {
     let mut result = Vec::new();
     let mut inline = Vec::new();
     for node in nodes {
         if node.inline() {
             inline.push(node);
         } else {
-            result.extend(inline_run(std::mem::take(&mut inline), original, refs));
+            result.extend(inline_run(
+                std::mem::take(&mut inline),
+                original,
+                refs,
+                table_cell,
+            ));
             let node = match node {
                 Node::Group {
                     start,
                     children,
                     end,
                 } if !matches!(start.0, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)) => {
+                    let child_table_cell =
+                        table_cell || matches!(start.0, Event::Start(Tag::TableCell));
                     Node::Group {
                         start,
-                        children: rewrite(children, original, refs),
+                        children: rewrite(children, original, refs, child_table_cell),
                         end,
                     }
                 }
@@ -261,7 +314,7 @@ fn rewrite(nodes: Vec<Node>, original: &str, refs: &RefDefs<'_>) -> Vec<Node> {
             result.push(node);
         }
     }
-    result.extend(inline_run(inline, original, refs));
+    result.extend(inline_run(inline, original, refs, table_cell));
     result
 }
 
@@ -282,6 +335,7 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
         ),
         original,
         references.reference_definitions(),
+        false,
     );
     let mut output = Vec::new();
     for node in nodes {
