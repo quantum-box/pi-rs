@@ -553,7 +553,7 @@ mod tests {
         let commit_handler = handler.clone();
         let commit = thread::spawn(move || {
             commit_shared.with_hook_children(
-                &[commit_child.clone()],
+                std::slice::from_ref(&commit_child),
                 &[commit_handler],
                 conversation,
                 || {
@@ -599,10 +599,15 @@ mod tests {
         let mut called = false;
         assert!(
             shared
-                .with_hook_children(&[child.clone()], &[handler.clone()], conversation, || {
-                    called = true;
-                    Ok(())
-                })
+                .with_hook_children(
+                    std::slice::from_ref(&child),
+                    std::slice::from_ref(&handler),
+                    conversation,
+                    || {
+                        called = true;
+                        Ok(())
+                    }
+                )
                 .is_err()
         );
         assert!(!called);
@@ -617,7 +622,12 @@ mod tests {
             .unwrap();
         assert!(
             shared
-                .with_hook_children(&[versioned], &[handler.clone()], conversation, || Ok(()))
+                .with_hook_children(
+                    &[versioned],
+                    std::slice::from_ref(&handler),
+                    conversation,
+                    || Ok(())
+                )
                 .is_err()
         );
         // The same selected handler is still rejected if replay changed.
@@ -627,8 +637,8 @@ mod tests {
         assert!(
             shared
                 .with_hook_children(
-                    &[child.clone()],
-                    &[handler.clone()],
+                    std::slice::from_ref(&child),
+                    std::slice::from_ref(&handler),
                     conversation,
                     || Ok(())
                 )
