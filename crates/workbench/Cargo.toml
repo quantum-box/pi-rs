@@ -60,7 +60,7 @@ pi-rs-remote-ls = { path = "../remote-ls" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 regex = "1"
 rquickjs = { version = "0.14.0", features = ["parallel"] }
-process-wrap = { version = "10", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["std", "tokio1"] }
 rmcp = { version = "3.9", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 oauth2 = { version = "5", default-features = false }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
@@ -87,3 +87,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"

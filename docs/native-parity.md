@@ -4133,6 +4133,37 @@ model discovery, and workbench proxy/idle-timeout settings. Custom model endpoin
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
 
+### External editor result
+
+The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
+platform-default precedence, ignoring blank configured values and empty
+environment values. On successful return it decodes UTF-8 with replacement,
+strips one leading BOM and removes exactly one final LF. Failed editors leave
+the draft unchanged. Native shell-style command splitting remains supported.
+Multiline extension editor dialogs and local multiline editors use the same
+external-editor action and configured keybinding. Editor failures remain
+visible in the dialog without submitting or losing its draft; Escape cancels
+the dialog, and extension cancellation still removes the correlated request.
+If the extension worker exits during editing, its editor is stopped and the
+terminal is restored. On Unix, suspending the external editor stops Pi's
+process group, including its workers, then resumes the group and editor with
+its terminal settings. When the shell shares Pi's process group without job control, or Pi's parent is in a different
+session, the editor resumes immediately instead of suspending a job that cannot
+be foregrounded. For a same-session launcher without job control, a separate
+supervisor resumes Pi if it still owns the terminal after one second. A shell
+that takes terminal ownership retains control until it foregrounds Pi. A shell
+`bg` resumes Pi's processes and the separately grouped external editor; an
+editor that reads the terminal while backgrounded is stopped by job control,
+which also stops the Pi job so the shell reports it as stopped; subsequent
+`bg` signals continue it again.
+Pi upstream instead starts the editor in the same job group as Pi. The native
+terminal handoff waits for `fg`, including when the editor exits in the
+background. Cancellation restores
+the original terminal settings; on Windows it also terminates editor wrapper
+descendants through a job object. Interrupts received while an editor
+is active do not disable subsequent terminal interrupt handling.
+The native 1 MiB extension response limit also applies to externally edited text.
+
 ### Editor kill ring checkpoint
 
 Typing now follows Pi's undo grouping: consecutive non-whitespace characters
