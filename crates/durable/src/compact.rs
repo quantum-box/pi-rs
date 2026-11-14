@@ -500,6 +500,19 @@ impl CompactionResult {
         self.preparation
             .matches_blocks(messages, blocks, generation)
     }
+    pub(crate) fn matches_blocks_prefix(
+        &self,
+        messages: &[Message],
+        blocks: &std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+        generation: Option<Uuid>,
+    ) -> bool {
+        let p = &self.preparation;
+        p.source_blocks.as_ref().is_some_and(|source| {
+            p.context_generation == generation
+                && messages.starts_with(&p.source)
+                && blocks == source
+        })
+    }
     pub(crate) fn retained_target(&self) -> Option<&RetainedTarget> {
         self.preparation.retained_target.as_ref()
     }

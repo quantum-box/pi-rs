@@ -1368,6 +1368,23 @@ impl Harness {
             return Err(Error::Invalid("invalid independent hook snapshot".into()));
         }
         let selected = self.selected_extensions(&state)?;
+        if preparation.has_blocks() {
+            if !selected.supports_compaction_blocks() {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
+            let cursor = state
+                .transcript
+                .clone()
+                .ok_or(crate::transcript::Error::Corrupt)?;
+            let (messages, blocks) = self.read_transcript_blocks(conversation, cursor)?;
+            if !preparation.matches_blocks(&messages, &blocks, state.context_generation)
+                || messages != state.messages
+            {
+                return Err(Error::Invalid(
+                    "invalid independent hook block snapshot".into(),
+                ));
+            }
+        }
         let memo = self.extension_memo(operation)?;
         let context = crate::extension::Context {
             snapshot: &checkpoint.snapshot,
@@ -2235,16 +2252,25 @@ impl Harness {
             (old, compacted)
         {
             let result = match (independent, &previous.phase) {
+                (Some(result), _) => Some(result),
                 (None, Phase::CompactionPlacement { result, .. }) => Some(result.as_ref()),
                 _ => None,
             };
             result.is_some_and(|result| {
                 result.has_blocks()
-                    && result.matches_blocks(
-                        &previous.messages,
-                        &previous.content_blocks,
-                        previous.context_generation,
-                    )
+                    && (if independent.is_some() {
+                        result.matches_blocks_prefix(
+                            &previous.messages,
+                            &previous.content_blocks,
+                            previous.context_generation,
+                        )
+                    } else {
+                        result.matches_blocks(
+                            &previous.messages,
+                            &previous.content_blocks,
+                            previous.context_generation,
+                        )
+                    })
                     && project_compaction_blocks(&previous.content_blocks, system_end, first_kept)
                         .is_ok_and(|blocks| blocks == state.content_blocks)
             })
@@ -6262,9 +6288,22 @@ impl Harness {
             && state.application_writes.len() >= marker.writes
             && state.resets.len() == marker.resets
             && !state.abort_requested
-            && state.content_blocks.is_empty()
+            && (if result.has_blocks() {
+                result.matches_blocks_prefix(
+                    &state.messages,
+                    &state.content_blocks,
+                    state.context_generation,
+                )
+            } else {
+                state.content_blocks.is_empty()
+            })
             && !result.is_stale(&state.messages, state.context_generation);
         if placed {
+            if result.has_blocks() {
+                let (system_end, first_kept) = result.retained_range();
+                state.content_blocks =
+                    project_compaction_blocks(&state.content_blocks, system_end, first_kept)?;
+            }
             state.messages = result.apply_in_context(&state.messages, state.context_generation)?;
             state.context_generation = Some(Uuid::new_v4());
         }
@@ -8512,6 +8551,15 @@ impl SummaryPlacementDriver {
                     && !state.submissions.iter().any(|s| s.status == Status::Queued)
                     && !state.abort_requested
                     && result.source_matches(&state.messages)
+                    && (if result.has_blocks() {
+                        result.matches_blocks(
+                            &state.messages,
+                            &state.content_blocks,
+                            state.context_generation,
+                        )
+                    } else {
+                        state.content_blocks.is_empty()
+                    })
                     && !result.is_stale(&state.messages, state.context_generation)
                 {
                     let mut raw: serde_json::Value =
@@ -8554,10 +8602,26 @@ impl SummaryPlacementDriver {
                 }
                 if !state.is_working()
                     && !state.abort_requested
-                    && state.content_blocks.is_empty()
+                    && (if result.has_blocks() {
+                        result.matches_blocks(
+                            &state.messages,
+                            &state.content_blocks,
+                            state.context_generation,
+                        )
+                    } else {
+                        state.content_blocks.is_empty()
+                    })
                     && result.source_matches(&state.messages)
                     && !result.is_stale(&state.messages, state.context_generation)
                 {
+                    if result.has_blocks() {
+                        let (system_end, first_kept) = result.retained_range();
+                        state.content_blocks = project_compaction_blocks(
+                            &state.content_blocks,
+                            system_end,
+                            first_kept,
+                        )?;
+                    }
                     state.messages =
                         result.apply_in_context(&state.messages, state.context_generation)?;
                     state.context_generation = Some(Uuid::new_v4());
@@ -9816,7 +9880,6 @@ impl Scheduler {
             && !state.submissions.iter().any(|s| s.status == Status::Queued);
         if (state.is_working() && !busy_ok)
             || state.abort_requested
-            || !state.content_blocks.is_empty()
             || state.pending_independent_summary.is_some()
         {
             return Err(Error::Invalid(
@@ -9831,10 +9894,11 @@ impl Scheduler {
         let generation = state
             .context_generation
             .ok_or_else(|| Error::Invalid("conversation lacks context identity".into()))?;
-        let Some(preparation) = crate::compact::prepare(
-            &state.messages,
-            &state.config.model,
-            max_output_tokens.unwrap_or(state.config.max_output_tokens),
+        let mut prepared_state = state.clone();
+        prepared_state.config.max_output_tokens =
+            max_output_tokens.unwrap_or(state.config.max_output_tokens);
+        let Some(preparation) = self.harness.prepare_runtime_compaction(
+            &prepared_state,
             keep_recent_tokens,
             instructions,
         )?
