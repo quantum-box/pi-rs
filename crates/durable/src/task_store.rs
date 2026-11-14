@@ -353,10 +353,10 @@ impl<'a> TaskStore<'a> {
         let mut seen = std::collections::HashSet::new();
         let mut created = std::collections::HashMap::new();
         for save in tasks {
-            if let Save::Create(task) = save {
-                if created.insert(task.id(), *task).is_some() {
-                    return Err(Error::DuplicateTask);
-                }
+            if let Save::Create(task) = save
+                && created.insert(task.id(), *task).is_some()
+            {
+                return Err(Error::DuplicateTask);
             }
         }
         for task in created.values() {
