@@ -4141,23 +4141,15 @@ external-editor action and configured keybinding. Editor failures remain
 visible in the dialog without submitting or losing its draft; Escape cancels
 the dialog, and extension cancellation still removes the correlated request.
 If the extension worker exits during editing, its editor is stopped and the
-terminal is restored. On Unix, suspending the external editor stops Pi's
-process group, including its workers, then resumes the group and editor with
-its terminal settings. When the shell shares Pi's process group without job control, or Pi's parent is in a different
-session, the editor resumes immediately instead of suspending a job that cannot
-be foregrounded. For a same-session launcher without job control, a separate
-supervisor resumes Pi if it still owns the terminal after one second. A shell
-that takes terminal ownership retains control until it foregrounds Pi. A shell
-`bg` resumes Pi's processes and the separately grouped external editor; an
-editor that reads the terminal while backgrounded is stopped by job control,
-which also stops the Pi job so the shell reports it as stopped; subsequent
-`bg` signals continue it again.
-Pi upstream instead starts the editor in the same job group as Pi. The native
-terminal handoff waits for `fg`, including when the editor exits in the
-background. Cancellation restores
-the original terminal settings; on Windows it also terminates editor wrapper
-descendants through a job object. Interrupts received while an editor
-is active do not disable subsequent terminal interrupt handling.
+terminal is restored. On Unix, the editor inherits Pi's foreground process
+group and terminal, matching Pi's shell job control, including the operating
+system's orphan-group signal behavior. If an editor exits or an extension
+request is cancelled while the job is in the background, terminal restoration
+and TUI redraw wait until the job is foregrounded. Correlated cancellation
+terminates and reaps the direct editor process; Unix editor descendants are not
+guaranteed to terminate. On Windows the job object also terminates wrapper
+descendants. Interrupts received while an editor is active do not disable
+subsequent terminal interrupt handling.
 The native 1 MiB extension response limit also applies to externally edited text.
 
 ### Editor kill ring checkpoint
