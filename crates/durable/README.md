@@ -265,7 +265,8 @@ For restricted children use `Scheduler::open_with_restricted_subagent_management
 with an explicit child allowlist, including on reopen. `None` retains the existing
 unrestricted behavior; `Some(vec![])` disables all child tools. The bound selection
 is recorded per named child, and changing it for an existing name is rejected.
-The tool exposes `list`, `stop`, and `send` (optional `follow_up` or `steer` mode).
+The tool exposes `status` (upstream's name, optionally filtered by name), its
+existing alias `list`, `stop`, and `send` (optional `follow_up` or `steer` mode).
 A send creates the named child if needed and queues its answer as a parent
 follow-up. Calls with the same persisted operation ID reuse the first message,
 child and reporter; a new operation ID is a new send. `stop` addresses only a
@@ -284,7 +285,10 @@ including forks; named children start without selected extensions. Do not regist
 this tool globally or replace the bound extension with another implementation.
 `ToolContext` does not identify the caller or its owning task. In particular,
 this API cannot verify a caller through independently implemented `ToolHost`s
-or implement task-owner-scoped stop or wait. Stop is scoped by the bound parent
+or implement task-owner-scoped stop or wait. The upstream Durable background
+example has no `wait` action; its separate foreground waiting example parks on
+a task-owned child's submission signal, which this extension does not support.
+Stop is scoped by the bound parent
 and its named reservation, not by a calling task. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is

@@ -48,6 +48,7 @@ struct Management {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Args {
+    #[serde(alias = "status")]
     List {
         name: Option<String>,
     },
@@ -72,10 +73,11 @@ impl Tool for Management {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "subagent".into(),
-            description: "List named background subagents, send a message to one (creating it if needed), or stop its current work. Answers arrive as follow-up messages. Each send is a separate request.".into(),
+            description: "Check the status of named background subagents (status or list), send a message to one (creating it if needed), or stop its current work. Answers arrive as follow-up messages. Each send is a separate request.".into(),
             parameters: json!({
                 "oneOf": [
                     {"type":"object","properties":{"action":{"const":"list"},"name":{"type":"string","minLength":1,"maxLength":128}},"required":["action"],"additionalProperties":false},
+                    {"type":"object","properties":{"action":{"const":"status"},"name":{"type":"string","minLength":1,"maxLength":128}},"required":["action"],"additionalProperties":false},
                     {"type":"object","properties":{"action":{"const":"stop"},"name":{"type":"string","minLength":1,"maxLength":128}},"required":["action","name"],"additionalProperties":false},
                     {"type":"object","properties":{"action":{"const":"send"},"name":{"type":"string","minLength":1,"maxLength":128},"message":{"type":"string","minLength":1,"maxLength":65536},"mode":{"enum":["follow_up","steer"]}},"required":["action","name","message"],"additionalProperties":false}
                 ]
@@ -276,6 +278,54 @@ mod tests {
             operation_id: id,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn status_alias_is_scoped_filtered_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let other = h.create_conversation(config()).unwrap();
+        h.ensure_subagent(parent, "idle", config()).unwrap();
+        h.submit_subagent(
+            parent,
+            "busy",
+            config(),
+            "req",
+            "work".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+        h.ensure_subagent(other, "private", config()).unwrap();
+        let tool = Management {
+            harness: Mutex::new(h),
+            parent,
+            config: config(),
+            allowed_tools: None,
+        };
+        assert!(tool.spec().parameters.to_string().contains("\"status\""));
+        let invoke = |args| tool.invoke(args, context(Uuid::new_v4()));
+        assert!(
+            matches!(invoke(json!({"action":"status"})).await, Outcome::Succeeded(s) if s == "busy: working\nidle: idle")
+        );
+        assert!(
+            matches!(invoke(json!({"action":"status", "name":"idle"})).await, Outcome::Succeeded(s) if s == "idle: idle")
+        );
+        assert!(
+            matches!(invoke(json!({"action":"status", "name":"private"})).await, Outcome::Succeeded(s) if s == "No subagents.")
+        );
+        assert!(matches!(
+            invoke(json!({"action":"status", "name":" "})).await,
+            Outcome::Failed(_)
+        ));
+        assert!(matches!(
+            invoke(json!({"action":"status", "extra":true})).await,
+            Outcome::Failed(_)
+        ));
+        assert_eq!(
+            format!("{:?}", invoke(json!({"action":"status"})).await),
+            format!("{:?}", invoke(json!({"action":"list"})).await)
+        );
     }
 
     #[tokio::test]
