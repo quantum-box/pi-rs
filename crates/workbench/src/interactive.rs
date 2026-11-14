@@ -762,7 +762,7 @@ enum TranscriptPanel {
 #[derive(Default)]
 struct StreamingTool {
     name: String,
-    arguments: crate::streaming_json::StreamingJson,
+    arguments: crate::StreamingJson,
     preview: Value,
 }
 

@@ -54,7 +54,7 @@ mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;
-mod streaming_json;
+use pi_rs::StreamingJson;
 mod thinking;
 mod tool_selection;
 mod ui;
