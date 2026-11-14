@@ -2556,9 +2556,12 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let stopped = stop.clone();
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed = requests.clone();
-    let (accepted, acceptance) = mpsc::channel();
+    let (idle_started, idle_ready) = mpsc::channel();
+    let (release_idle, idle_release) = mpsc::channel();
+    let (idle_finished, idle_done) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let mut connections = Vec::new();
+        let mut idle_signals = Some((idle_started, idle_release, idle_finished));
         while !stopped.load(Ordering::Relaxed) {
             let (mut socket, _) = match listener.accept() {
                 Ok(pair) => pair,
@@ -2568,7 +2571,17 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
                 }
                 Err(e) => panic!("{e}"),
             };
-            let _ = accepted.send(());
+            if let Some((idle_started, idle_release, idle_finished)) = idle_signals.take() {
+                connections.push(std::thread::spawn(move || {
+                    idle_started.send(()).unwrap();
+                    // The sender is dropped on test failure, so this remains
+                    // bounded by the test's existing RPC response deadline.
+                    let _ = idle_release.recv();
+                    drop(socket);
+                    let _ = idle_finished.send(());
+                }));
+                continue;
+            }
             let observed = observed.clone();
             connections.push(std::thread::spawn(move || {
                 let (request, request_body) = match read_rpc_model_fixture_request(&socket) {
@@ -2612,7 +2625,7 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     // Keep one accepted connection idle while the real discovery proceeds.
     // A serial fixture would wait for this peer and miss the probe deadline.
     let idle = TcpStream::connect(fixture_address).unwrap();
-    acceptance.recv_timeout(Duration::from_secs(3)).unwrap();
+    idle_ready.recv_timeout(Duration::from_secs(3)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
         .args([
@@ -2660,6 +2673,12 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         }
     };
     let models = request(json!({"type":"get_available_models", "id":"models"}));
+    assert!(matches!(
+        idle_done.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release_idle.send(()).unwrap();
+    idle_done.recv_timeout(Duration::from_secs(3)).unwrap();
     drop(idle);
     assert!(
         models["models"]
