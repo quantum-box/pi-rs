@@ -7562,9 +7562,7 @@ mod scheduler_tests {
         stale.messages.push(Message::User {
             content: "stale".into(),
         });
-        let prepared = h
-            .prepare_save(&stale, Expected::Version(version))
-            .unwrap();
+        let prepared = h.prepare_save(&stale, Expected::Version(version)).unwrap();
         let mut reset = base.clone();
         place_reset(&mut reset, crate::reset::Reset::new(Uuid::new_v4(), None));
         reset.messages = base.messages.clone();
