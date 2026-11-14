@@ -89,11 +89,12 @@ pub fn unprotect(input: &[u8]) -> io::Result<Vec<u8>> {
     transform(input, false)
 }
 
-/// A verified directory handle. This verifies only the opened directory; a
-/// store must also pin and validate its parent and use handle-relative file
-/// operations before it can rely on this as a storage boundary.
+/// A verified directory handle with no-delete-sharing handles to each
+/// ancestor. File creation and generation locking still require separate
+/// verification before this can serve as a complete private store.
 pub struct VerifiedDirectory {
     _handle: std::fs::File,
+    _ancestors: Vec<std::fs::File>,
 }
 
 struct LocalDescriptor(*mut core::ffi::c_void);
@@ -116,11 +117,8 @@ impl Drop for Token {
     }
 }
 
-fn private_directory_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "untrusted share cache directory",
-    )
+fn private_directory_error(detail: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, detail)
 }
 
 impl VerifiedDirectory {
@@ -168,6 +166,8 @@ impl VerifiedDirectory {
 
     /// Reject reparse points, inherited/unprotected DACLs, unexpected allow
     /// principals, and directories not owned by the current token's user.
+    /// Ancestor handles deny delete-sharing to keep the path anchored while
+    /// the returned value is alive.
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use std::os::windows::io::AsRawHandle;
@@ -185,15 +185,39 @@ impl VerifiedDirectory {
             FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(private_directory_error());
+        if !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "share cache path must be absolute and normalized",
+            ));
         }
+        let open_directory = |path: &std::path::Path| -> io::Result<std::fs::File> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(private_directory_error("reparse or non-directory"));
+            }
+            Ok(file)
+        };
+        let mut ancestor_paths: Vec<_> = path.ancestors().skip(1).collect();
+        ancestor_paths.reverse();
+        let mut ancestors = Vec::with_capacity(ancestor_paths.len());
+        for ancestor in ancestor_paths {
+            ancestors.push(open_directory(ancestor)?);
+        }
+        let file = open_directory(path)?;
         let mut token = std::ptr::null_mut();
         // SAFETY: current process is a valid pseudo-handle and token is writable.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -206,7 +230,7 @@ impl VerifiedDirectory {
             GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
         }
         if needed < std::mem::size_of::<TOKEN_USER>() as u32 || needed > 1024 * 1024 {
-            return Err(private_directory_error());
+            return Err(private_directory_error("token user size"));
         }
         // usize gives the returned TOKEN_USER structure adequate alignment.
         let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
@@ -247,12 +271,12 @@ impl VerifiedDirectory {
         }
         let descriptor = LocalDescriptor(descriptor);
         if owner.is_null() || dacl.is_null() || user.is_null() {
-            return Err(private_directory_error());
+            return Err(private_directory_error("missing owner or dacl"));
         }
         // SAFETY: SIDs are held by the descriptor and token buffer.
         if unsafe { IsValidSid(owner) == 0 || IsValidSid(user) == 0 || EqualSid(owner, user) == 0 }
         {
-            return Err(private_directory_error());
+            return Err(private_directory_error("owner differs from token user"));
         }
         let mut control = 0u16;
         let mut revision = 0;
@@ -261,7 +285,7 @@ impl VerifiedDirectory {
             return Err(io::Error::last_os_error());
         }
         if control & SE_DACL_PROTECTED == 0 {
-            return Err(private_directory_error());
+            return Err(private_directory_error("dacl is not protected"));
         }
         let mut info = ACL_SIZE_INFORMATION::default();
         // SAFETY: dacl is provided by GetSecurityInfo and info is writable.
@@ -277,14 +301,14 @@ impl VerifiedDirectory {
             return Err(io::Error::last_os_error());
         }
         if info.AceCount == 0 || info.AceCount > 64 {
-            return Err(private_directory_error());
+            return Err(private_directory_error("unexpected ace count"));
         }
         let mut has_owner = false;
         for index in 0..info.AceCount {
             let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
             // SAFETY: index is bounded by the ACL's reported AceCount.
             if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
-                return Err(private_directory_error());
+                return Err(private_directory_error("cannot obtain ace"));
             }
             let ace = entry.cast::<ACCESS_ALLOWED_ACE>();
             // SAFETY: the ACL is returned by Windows; check the header before SID access.
@@ -295,27 +319,30 @@ impl VerifiedDirectory {
                 || header.AceFlags & required != required
                 || header.AceFlags & INHERITED_ACE as u8 != 0
             {
-                return Err(private_directory_error());
+                return Err(private_directory_error("unsupported ace flags or type"));
             }
             // SAFETY: ACCESS_ALLOWED_ACE stores an inline SID at SidStart.
             let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
             // SAFETY: SID is within a Windows-supplied ACL; validity checked first.
             if unsafe { IsValidSid(sid) } == 0 {
-                return Err(private_directory_error());
+                return Err(private_directory_error("invalid ace sid"));
             }
             let is_owner = unsafe {
                 EqualSid(sid, user) != 0 || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
             };
             let is_system = unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 };
             if !is_owner && !is_system {
-                return Err(private_directory_error());
+                return Err(private_directory_error("unexpected ace principal"));
             }
             has_owner |= is_owner;
         }
         if !has_owner {
-            return Err(private_directory_error());
+            return Err(private_directory_error("no owner ace"));
         }
-        Ok(Self { _handle: file })
+        Ok(Self {
+            _handle: file,
+            _ancestors: ancestors,
+        })
     }
 }
 
@@ -387,6 +414,18 @@ mod tests {
         let public = root.0.join("public");
         create_world_accessible(&public);
         assert!(VerifiedDirectory::open(&public).is_err());
+    }
+
+    #[test]
+    fn private_directory_pins_parent_against_rename() {
+        let root = TestDirectory::new();
+        let parent = root.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = VerifiedDirectory::create(&parent.join("private")).unwrap();
+        let renamed = root.0.join("renamed");
+        assert!(std::fs::rename(&parent, &renamed).is_err());
+        drop(directory);
+        std::fs::rename(&parent, &renamed).unwrap();
     }
 
     #[test]
