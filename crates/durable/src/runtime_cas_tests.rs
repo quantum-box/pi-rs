@@ -1606,6 +1606,320 @@ async fn compaction_missing_original_observation_fails_closed() {
 }
 
 #[tokio::test]
+async fn identical_reset_creates_new_identity_and_legacy_target_is_conservative() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let legacy = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let (mut old, old_version) = h.load(legacy).unwrap();
+        old.messages = vec![
+            Message::User {
+                content: "old".into(),
+            },
+            Message::User {
+                content: "target".into(),
+            },
+        ];
+        old.occurrence_epoch_proven = false;
+        h.save(&old, Expected::Version(old_version)).unwrap();
+        h.request_manual_compaction(legacy, 0, None)
+            .unwrap()
+            .unwrap();
+        let old = h.conversation(legacy).unwrap();
+        let Phase::CompactionHook { preparation, .. } = old.phase else {
+            panic!("missing legacy preparation")
+        };
+        let old_result = preparation
+            .finish(CompletedGeneration {
+                content: "summary".into(),
+                calls: vec![],
+                usage: None,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        assert!(old_result.retained_target().is_none());
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages = vec![Message::User {
+            content: "handoff".into(),
+        }];
+        state.occurrence_epoch_proven = false;
+        h.save(&state, Expected::Version(version)).unwrap();
+        let before = h
+            .view_positioned(id, std::num::NonZeroUsize::MIN)
+            .unwrap()
+            .entries[0]
+            .history
+            .clone()
+            .unwrap()
+            .id;
+        h.reset(id, Some("handoff".into())).unwrap();
+        let after = h
+            .view_positioned(id, std::num::NonZeroUsize::MIN)
+            .unwrap()
+            .entries[0]
+            .history
+            .clone()
+            .unwrap()
+            .id;
+        assert_ne!(before, after);
+        assert!(h.conversation(id).unwrap().occurrence_epoch_proven);
+    }
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(id).unwrap().occurrence_epoch_proven);
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "target".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    let state = h.conversation(id).unwrap();
+    let Phase::CompactionHook { preparation, .. } = &state.phase else {
+        panic!("missing preparation")
+    };
+    let result = (**preparation)
+        .clone()
+        .finish(CompletedGeneration {
+            content: "summary".into(),
+            calls: vec![],
+            usage: None,
+            metadata: Default::default(),
+        })
+        .unwrap();
+    assert!(result.retained_target().is_some());
+}
+
+#[tokio::test]
+async fn manual_target_rejects_forged_or_unrelated_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let id = h.create_conversation(config.clone()).unwrap();
+    let other = h.create_conversation(config).unwrap();
+    let other_cursor = h.conversation(other).unwrap().transcript.unwrap();
+    let older_cursor = h.conversation(id).unwrap().transcript.unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages = vec![
+        Message::User {
+            content: "old".into(),
+        },
+        Message::User {
+            content: "target".into(),
+        },
+    ];
+    h.save(&state, Expected::Version(version)).unwrap();
+    h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    let state = h.conversation(id).unwrap();
+    let Phase::CompactionHook { preparation, .. } = &state.phase else {
+        panic!("missing preparation")
+    };
+    let result = (**preparation)
+        .clone()
+        .finish(CompletedGeneration {
+            content: "summary".into(),
+            calls: vec![],
+            usage: None,
+            metadata: Default::default(),
+        })
+        .unwrap();
+    assert!(
+        h.apply_manual_compaction_target(&state, &result)
+            .unwrap()
+            .is_some()
+    );
+    let encoded = serde_json::to_value(result).unwrap();
+    for (field, replacement) in [
+        ("id", serde_json::json!(Uuid::new_v4())),
+        ("source", serde_json::to_value(other_cursor).unwrap()),
+        ("source", serde_json::to_value(older_cursor).unwrap()),
+    ] {
+        let mut forged = encoded.clone();
+        forged["preparation"]["retained_target"][field] = replacement;
+        let forged: crate::compact::CompactionResult = serde_json::from_value(forged).unwrap();
+        assert!(
+            h.apply_manual_compaction_target(&state, &forged)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn overlapping_manual_results_follow_retained_target_after_reopen() {
+    struct Summary;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for Summary {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            Ok(crate::extension::BeforeCompact::Summary(
+                "first completion".into(),
+            ))
+        }
+    }
+    for case in 0..5 {
+        let retain_target = case != 1 && case != 3;
+        let target_text = if case >= 2 { "newer" } else { "target" };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (id, operation, target_id);
+        {
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            h.install_extension(crate::extension::Extension {
+                name: "summary".into(),
+                hooks: vec![Arc::new(Summary)],
+                ..Default::default()
+            })
+            .unwrap();
+            id = h
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            h.select_extensions(id, vec!["summary".into()]).unwrap();
+            let (mut state, version) = h.load(id).unwrap();
+            state.messages = vec![
+                Message::User {
+                    content: "old".repeat(100),
+                },
+                Message::User {
+                    content: "target".into(),
+                },
+                Message::User {
+                    content: "newer".into(),
+                },
+            ];
+            h.save(&state, Expected::Version(version)).unwrap();
+            target_id = h.view_positioned(id, std::num::NonZeroUsize::new(10).unwrap()).unwrap().entries.into_iter().find(|entry| matches!(&entry.message, Message::User { content } if content == target_text)).unwrap().history.unwrap().id;
+            let messages = h.conversation(id).unwrap().messages;
+            let budget = (0..1000)
+                .find(|budget| {
+                    crate::compact::prepare(&messages, "test", 10, *budget, None)
+                        .unwrap()
+                        .is_some_and(|p| p.first_kept() == 1)
+                })
+                .unwrap();
+            operation = h
+                .request_manual_compaction(id, if case >= 2 { 0 } else { budget }, None)
+                .unwrap()
+                .unwrap();
+            let (mut state, version) = h.load(id).unwrap();
+            let Phase::CompactionHook { preparation, .. } = state.phase.clone() else {
+                panic!("missing preparation")
+            };
+            let later = preparation
+                .finish(CompletedGeneration {
+                    content: "later completion".into(),
+                    calls: vec![],
+                    usage: None,
+                    metadata: Default::default(),
+                })
+                .unwrap();
+            // Model an independently retained result while the existing public
+            // API remains idle-only; the competing compaction below is real.
+            state.phase = Phase::Idle;
+            state.active_manual_compaction = None;
+            h.save(&state, Expected::Version(version)).unwrap();
+            assert!(
+                h.request_compaction(id, if case == 1 { 0 } else { budget })
+                    .unwrap()
+            );
+            h.resume(&CancellationToken::new()).await.unwrap();
+            let (mut state, version) = h.load(id).unwrap();
+            state.active_manual_compaction = Some(operation);
+            if case == 3 {
+                state.phase = Phase::CompactionReady {
+                    preparation: Box::new(
+                        crate::compact::prepare(&state.messages, "test", 10, 0, None)
+                            .unwrap()
+                            .unwrap(),
+                    ),
+                    restarts: 0,
+                };
+                h.save(&state, Expected::Version(version)).unwrap();
+                h.reset(id, Some("ordered reset".into())).unwrap();
+                let loaded = h.load(id).unwrap();
+                state = loaded.0;
+                let version = loaded.1;
+                let resets_before =
+                    Some(state.pending_resets.iter().map(|reset| reset.id).collect());
+                state.phase = Phase::CompactionPlacement {
+                    result: Box::new(later),
+                    resets_before,
+                };
+                h.save(&state, Expected::Version(version)).unwrap();
+            } else {
+                state.phase = Phase::CompactionPlacement {
+                    result: Box::new(later),
+                    resets_before: Some(vec![]),
+                };
+                h.save(&state, Expected::Version(version)).unwrap();
+                if case == 4 {
+                    h.reset(id, Some("ordered reset".into())).unwrap();
+                }
+            }
+        }
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        let status = &c
+            .manual_compactions
+            .iter()
+            .find(|item| item.id == operation)
+            .unwrap()
+            .status;
+        assert_eq!(
+            *status,
+            if retain_target {
+                ManualCompactionStatus::Applied
+            } else {
+                ManualCompactionStatus::Stale
+            }
+        );
+        if case == 4 {
+            assert_eq!(
+                c.messages,
+                vec![Message::User {
+                    content: "ordered reset".into()
+                }]
+            );
+        } else if retain_target {
+            assert!(c.messages.iter().any(
+                |m| matches!(m, Message::User { content } if content.contains("later completion"))
+            ));
+            let target = h.view_positioned(id, std::num::NonZeroUsize::new(10).unwrap()).unwrap().entries.into_iter().find(|entry| matches!(&entry.message, Message::User { content } if content == target_text)).unwrap().history.unwrap();
+            assert_eq!(target.id, target_id);
+        } else {
+            assert!(!c.messages.iter().any(
+                |m| matches!(m, Message::User { content } if content.contains("later completion"))
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn repeated_compaction_retains_original_provenance() {
     struct Summary;
     #[async_trait::async_trait]

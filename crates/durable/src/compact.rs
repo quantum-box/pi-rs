@@ -25,6 +25,16 @@ pub struct Preparation {
     // preparations bind to the context generation before being committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_generation: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_target: Option<RetainedTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RetainedTarget {
+    pub source: crate::transcript::Cursor,
+    pub id: Uuid,
+    #[serde(default)]
+    pub reset_id: Option<Uuid>,
 }
 
 /// Result retains the exact preparation and usage/metadata for the host to commit.
@@ -147,7 +157,7 @@ pub fn prepare(
         transcript
     );
     Ok(Some(Preparation {
-        source: messages.to_vec(), system_end, first_kept, instructions: instructions.map(str::to_owned), context_generation: None,
+        source: messages.to_vec(), system_end, first_kept, instructions: instructions.map(str::to_owned), context_generation: None, retained_target: None,
         request: ModelRequest {
             model: model.into(), max_output_tokens, tools: vec![],
             messages: vec![Message::System { content: "You are a context summarization assistant. Do not continue the conversation; output only the summary.".into() }, Message::User { content: prompt }],
@@ -156,6 +166,22 @@ pub fn prepare(
 }
 
 impl Preparation {
+    pub(crate) fn first_kept(&self) -> usize {
+        self.first_kept
+    }
+    pub(crate) fn bind_target(
+        mut self,
+        source: crate::transcript::Cursor,
+        id: Uuid,
+        reset_id: Option<Uuid>,
+    ) -> Self {
+        self.retained_target = Some(RetainedTarget {
+            source,
+            id,
+            reset_id,
+        });
+        self
+    }
     pub(crate) fn bind_context(mut self, generation: Uuid) -> Self {
         self.context_generation = Some(generation);
         self
@@ -215,8 +241,59 @@ impl Preparation {
 }
 
 impl CompactionResult {
+    pub(crate) fn retained_target(&self) -> Option<&RetainedTarget> {
+        self.preparation.retained_target.as_ref()
+    }
+    pub(crate) fn source_matches(&self, messages: &[Message]) -> bool {
+        self.preparation.source == messages
+    }
     pub(crate) fn retained_range(&self) -> (usize, usize) {
         (self.preparation.system_end, self.preparation.first_kept)
+    }
+    /// Apply at a host-proven retained occurrence in the current context.
+    /// The host must validate the occurrence and atomically commit the result.
+    pub(crate) fn apply_at_target(
+        &self,
+        current: &[Message],
+        first_kept: usize,
+    ) -> Result<(Vec<Message>, (usize, usize))> {
+        let p = &self.preparation;
+        if p.system_end > p.first_kept
+            || p.first_kept >= p.source.len()
+            || p.first_kept == p.system_end
+            || !is_user(&p.source[p.first_kept])
+            || p.source[..p.system_end]
+                .iter()
+                .any(|m| !matches!(m, Message::System { .. }))
+        {
+            return Err(invalid("invalid compaction preparation"));
+        }
+        validate(&p.source)?;
+        validate(current)?;
+        let system_end = current
+            .iter()
+            .take_while(|m| matches!(m, Message::System { .. }))
+            .count();
+        if first_kept < system_end || first_kept >= current.len() || !is_user(&current[first_kept])
+        {
+            return Err(invalid("invalid retained compaction target"));
+        }
+        if self.generation.content.trim().is_empty()
+            || !self.generation.calls.is_empty()
+            || matches!(
+                self.generation.metadata.finish_reason.as_deref(),
+                Some("length" | "error" | "cancelled" | "canceled")
+            )
+        {
+            return Err(Error::Model(
+                "invalid or incomplete compaction summary".into(),
+            ));
+        }
+        let mut result = current[..system_end].to_vec();
+        result.push(Message::User { content: format!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>", self.generation.content) });
+        result.extend_from_slice(&current[first_kept..]);
+        validate(&result)?;
+        Ok((result, (system_end, first_kept)))
     }
     /// A conservative check for a displaced selection. The host must compare
     /// and commit the settlement in the same transaction as any context edit.

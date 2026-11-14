@@ -471,7 +471,7 @@ impl TranscriptChange {
             return Ok(None);
         };
         let mut seen = std::collections::HashSet::new();
-        if *system_end >= *first_kept
+        if *system_end > *first_kept
             || *system_end >= messages.len()
             || histories.len() != messages.len()
             || summary_id.is_nil()
@@ -595,6 +595,9 @@ pub struct Conversation {
     /// Older persisted conversations acquire one at the next compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_generation: Option<Uuid>,
+    /// False for stores whose earlier reset identity boundaries cannot be proved.
+    #[serde(default)]
+    occurrence_epoch_proven: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
@@ -1900,23 +1903,30 @@ impl Harness {
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
-        let compacted = old.and_then(|previous| {
-            if create || previous.context_generation == state.context_generation {
-                return None;
-            }
-            let Phase::CompactionPlacement { result, .. } = &previous.phase else {
-                return None;
-            };
-            if result
-                .apply_in_context(&previous.messages, previous.context_generation)
-                .ok()
-                .as_ref()
-                != Some(&state.messages)
-            {
-                return None;
-            }
-            Some(result.retained_range())
-        });
+        let compacted = old
+            .map(|previous| -> Result<Option<(usize, usize)>, Error> {
+                if create
+                    || previous.context_generation == state.context_generation
+                    || previous.resets != state.resets
+                {
+                    return Ok(None);
+                }
+                let Phase::CompactionPlacement { result, .. } = &previous.phase else {
+                    return Ok(None);
+                };
+                let applied = if previous.active_manual_compaction.is_some() {
+                    self.apply_manual_compaction_target(previous, result)?
+                } else {
+                    result
+                        .apply_in_context(&previous.messages, previous.context_generation)
+                        .ok()
+                        .map(|messages| (messages, result.retained_range()))
+                };
+                Ok(applied
+                    .and_then(|(messages, range)| (messages == state.messages).then_some(range)))
+            })
+            .transpose()?
+            .flatten();
         let change = if let Some((system_end, first_kept)) = compacted {
             let previous = old.unwrap();
             let (source, created) =
@@ -1962,6 +1972,11 @@ impl Harness {
             })
         } else {
             match old {
+                // A reset is an identity boundary even if its resulting text
+                // happens to equal the previous messages.
+                Some(previous) if !create && state.resets != previous.resets => {
+                    Some(TranscriptChange::Replace(state.messages.clone()))
+                }
                 Some(previous) if !create && state.messages == previous.messages => None,
                 Some(previous) if !create && state.messages.starts_with(&previous.messages) => {
                     Some(TranscriptChange::Append(
@@ -1986,6 +2001,7 @@ impl Harness {
                         &state.provider_adapter,
                         &state.allowed_tools,
                         &state.model_tools,
+                        &state.occurrence_epoch_proven,
                         &state.resets,
                         &state.application_writes,
                         &state.tool_states,
@@ -1997,6 +2013,7 @@ impl Harness {
                             &previous.provider_adapter,
                             &previous.allowed_tools,
                             &previous.model_tools,
+                            &previous.occurrence_epoch_proven,
                             &previous.resets,
                             &previous.application_writes,
                             &previous.tool_states,
@@ -2015,10 +2032,10 @@ impl Harness {
                 })
                 && matches!((serde_json::to_value((
                     &state.queue_modes, &state.after_failed_run, &state.extensions, &state.provider_adapter,
-                    &state.allowed_tools, &state.model_tools, &state.resets, &state.application_writes, &state.tool_states,
+                    &state.allowed_tools, &state.model_tools, &state.occurrence_epoch_proven, &state.resets, &state.application_writes, &state.tool_states,
                 )), serde_json::to_value((
                     &previous.queue_modes, &previous.after_failed_run, &previous.extensions, &previous.provider_adapter,
-                    &previous.allowed_tools, &previous.model_tools, &previous.resets, &previous.application_writes, &previous.tool_states,
+                    &previous.allowed_tools, &previous.model_tools, &previous.occurrence_epoch_proven, &previous.resets, &previous.application_writes, &previous.tool_states,
                 ))), (Ok(a), Ok(b)) if a == b)
         }).map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
@@ -2118,6 +2135,10 @@ impl Harness {
                 (
                     "pi-rs/runtime/model-tools".into(),
                     serde_json::to_value(&state.model_tools)?,
+                ),
+                (
+                    "pi-rs/runtime/occurrence-epoch-proven".into(),
+                    serde_json::to_value(state.occurrence_epoch_proven)?,
                 ),
                 (
                     "pi-rs/runtime/resets".into(),
@@ -2423,6 +2444,7 @@ impl Harness {
             model_tools: None,
             messages: vec![],
             context_generation: Some(Uuid::new_v4()),
+            occurrence_epoch_proven: true,
             transcript: None,
             submissions: vec![],
             manual_compactions: vec![],
@@ -2670,6 +2692,12 @@ impl Harness {
                 .unwrap_or_default(),
             messages: point.messages,
             context_generation: Some(Uuid::new_v4()),
+            occurrence_epoch_proven: point
+                .documents
+                .get("pi-rs/runtime/occurrence-epoch-proven")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or(false),
             transcript: if prefix.is_some() { None } else { transcript },
             submissions: vec![],
             manual_compactions: vec![],
@@ -3532,6 +3560,88 @@ impl Harness {
         )
     }
 
+    /// Resolve a manual result against the immutable source and current range.
+    /// None means the retained target is not provably active.
+    fn apply_manual_compaction_target(
+        &self,
+        c: &Conversation,
+        result: &crate::compact::CompactionResult,
+    ) -> Result<Option<(Vec<Message>, (usize, usize))>, Error> {
+        let Some(target) = result.retained_target() else {
+            return if result.is_stale(&c.messages, c.context_generation) {
+                Ok(None)
+            } else {
+                Ok(Some((
+                    result.apply_in_context(&c.messages, c.context_generation)?,
+                    result.retained_range(),
+                )))
+            };
+        };
+        if !c.occurrence_epoch_proven || c.resets.last().map(|reset| reset.id) != target.reset_id {
+            return Ok(None);
+        }
+        let Some(mut cursor) = c.transcript.clone() else {
+            return Ok(None);
+        };
+        if target.id.is_nil() || target.source.transcript_id() != c.id {
+            return Ok(None);
+        }
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), c.id);
+        let mut ancestor = false;
+        loop {
+            if cursor == target.source {
+                ancestor = true;
+                break;
+            }
+            let page = transcript.read(&cursor, std::num::NonZeroUsize::MIN)?;
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        if !ancestor {
+            return Ok(None);
+        }
+        let source = self.resolved_occurrences(c.id, target.source.clone())?;
+        let source_messages: Vec<_> = source.iter().map(|(message, _)| message.clone()).collect();
+        if !result.source_matches(&source_messages) {
+            return Ok(None);
+        }
+        let (_, first_kept) = result.retained_range();
+        let Some(source_history) = source
+            .get(first_kept)
+            .and_then(|(_, history)| history.as_ref())
+        else {
+            return Ok(None);
+        };
+        if source_history.id != target.id {
+            return Ok(None);
+        }
+        let Some(head) = c.transcript.clone() else {
+            return Ok(None);
+        };
+        let current = self.resolved_occurrences(c.id, head)?;
+        if current
+            .iter()
+            .map(|(message, _)| message)
+            .ne(c.messages.iter())
+        {
+            return Ok(None);
+        }
+        let mut matches = current.iter().enumerate().filter(|(_, (_, history))| {
+            history
+                .as_ref()
+                .is_some_and(|history| history.id == target.id)
+        });
+        let Some((index, (_, Some(history)))) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() || history != source_history {
+            return Ok(None);
+        }
+        Ok(Some(result.apply_at_target(&c.messages, index)?))
+    }
+
     /// Resolve provenance through immutable predecessor links. A compacted
     /// replacement is accepted only when its retained messages are exactly the
     /// stated projection of its immediate predecessor.
@@ -3583,7 +3693,7 @@ impl Harness {
                 if summary_id.is_nil()
                     || origin.is_nil()
                     || commit == 0
-                    || system_end >= first_kept
+                    || system_end > first_kept
                     || first_kept >= active.len()
                     || active[..system_end]
                         .iter()
@@ -4187,6 +4297,30 @@ impl Harness {
         )?
         else {
             return Ok(None);
+        };
+        let preparation = if let Some(source) =
+            c.transcript.clone().filter(|_| c.occurrence_epoch_proven)
+        {
+            let occurrences = self.resolved_occurrences(id, source.clone())?;
+            if occurrences
+                .iter()
+                .map(|(message, _)| message)
+                .ne(c.messages.iter())
+            {
+                return Err(Error::Invalid(
+                    "compaction source transcript changed".into(),
+                ));
+            }
+            if let Some(history) = occurrences
+                .get(preparation.first_kept())
+                .and_then(|(_, history)| history.as_ref())
+            {
+                preparation.bind_target(source, history.id, c.resets.last().map(|reset| reset.id))
+            } else {
+                preparation
+            }
+        } else {
+            preparation
         };
         let generation = *c.context_generation.get_or_insert_with(Uuid::new_v4);
         let operation_id = Uuid::new_v4();
@@ -5552,14 +5686,19 @@ impl Harness {
                             place_reset(&mut c, reset);
                         }
                     }
-                    if c.active_manual_compaction.is_some()
-                        && result.is_stale(&c.messages, c.context_generation)
-                    {
-                        finish_manual_compaction(&mut c, ManualCompactionStatus::Stale)?;
+                    if c.active_manual_compaction.is_some() {
+                        if let Some((messages, _)) =
+                            self.apply_manual_compaction_target(&c, &result)?
+                        {
+                            c.messages = messages;
+                            c.context_generation = Some(Uuid::new_v4());
+                            finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
+                        } else {
+                            finish_manual_compaction(&mut c, ManualCompactionStatus::Stale)?;
+                        }
                     } else {
                         c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
                         c.context_generation = Some(Uuid::new_v4());
-                        finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
                     }
                     c.phase = c
                         .compaction_return_turns
@@ -8732,6 +8871,7 @@ fn place_round_handoff(c: &mut Conversation) {
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     c.context_generation = Some(Uuid::new_v4());
+    c.occurrence_epoch_proven = true;
     c.messages.clear();
     if let Some(message) = marker.message() {
         c.messages.push(message);
@@ -10140,6 +10280,7 @@ mod scheduler_tests {
             model_tools: None,
             messages: vec![],
             context_generation: Some(Uuid::new_v4()),
+            occurrence_epoch_proven: true,
             transcript: None,
             submissions: vec![],
             manual_compactions: vec![],

@@ -570,11 +570,17 @@ phase, not a separately scheduled upstream task. Admission also rejects an
 idle conversation with an unsettled abort, so that an earlier abort cannot
 cancel a newly accepted operation.
 After hook-supplied or accounted model output, the completed summary is
-persisted before placement. Placement atomically applies the result or settles
-the operation stale if its context generation or source prefix changed; an
-abort committed first settles it aborted. The stale check is conservative,
-not upstream's retained-entry head test: it can reject a cut that upstream
-would still accept after a preceding compaction.
+persisted before placement. A new tracked manual preparation pins its selected
+occurrence and immutable source when provenance is available. Placement proves
+the source is an ancestor, validates its selection and original metadata, and
+checks that the same occurrence remains active. A retained target can be applied
+after another compaction; a removed or unprovable target settles stale. The
+placement, provenance and status commit atomically. An abort committed first
+settles it aborted. Legacy or unannotated preparations retain the conservative
+generation and source-prefix check. Proof validation scans transcript history
+and is unbounded. Conversations created before reset identity boundaries were
+recorded use that conservative check until a newly committed reset establishes
+a proven boundary. An identical-text reset still creates new occurrence IDs.
 For tracked manual operations, queued resets committed before the summary's
 placement admission are placed first, making the summary stale; resets admitted
 after that checkpoint are placed afterward. Resets queued during an aborted
@@ -583,12 +589,13 @@ after reopening. Concurrent reset admissions merged into the checkpoint count
 as earlier. Older checkpoints without ordering data
 retain their previous placement behavior. This orders only manual summaries and
 resets, not a general inbox or independently scheduled compaction.
-Runtime-owned preparations also pin the context generation; a reset or another
-applied compaction invalidates the pinned generation even if message text later
-matches. Legacy in-flight preparations without a generation can finish while
-the conversation also has no generation; a reset, compaction, or fork fences
-them. This guard does not enable busy manual compaction or
-provide upstream's stale-submission settlement.
+Runtime-owned preparations also pin the context generation. Automatic and
+legacy manual preparations without a proven target use it with the message
+prefix to reject changed contexts, including resets with identical later text.
+Legacy in-flight preparations without a generation can finish while the
+conversation also has no generation; a reset, compaction, or fork fences them.
+These checks do not enable busy manual compaction or provide upstream's full
+stale-submission API.
 Hook errors are retained in the extension report log and available through the
 pull subscription and opt-in dispatcher described below; upstream's `onReport` API is not exposed. Empty hook
 summaries are rejected by the existing compaction validation. Compaction is
