@@ -50,8 +50,20 @@ pub enum Token {
 }
 pub enum Query {
     Tokens(Vec<Token>),
-    Regex(fancy_regex::Regex),
+    Regex(SearchRegex),
     Invalid,
+}
+pub enum SearchRegex {
+    Linear(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+impl SearchRegex {
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Linear(regex) => regex.is_match(text),
+            Self::Fancy(regex) => regex.is_match(text).unwrap_or(false),
+        }
+    }
 }
 impl Query {
     pub fn new(query: &str) -> Self {
@@ -60,13 +72,19 @@ impl Query {
             if pattern.trim_matches(is_whitespace).is_empty() {
                 return Self::Invalid;
             }
-            return fancy_regex::RegexBuilder::new(&format!(
-                "(?i){}",
-                ascii_regex_classes(pattern.trim_matches(is_whitespace))
-            ))
-            .backtrack_limit(100_000)
-            .build()
-            .map_or(Self::Invalid, Self::Regex);
+            let pattern = pattern.trim_matches(is_whitespace);
+            let linear = format!("(?i){}", ascii_regex_classes(pattern));
+            if let Ok(regex) = regex::Regex::new(&linear) {
+                return Self::Regex(SearchRegex::Linear(regex));
+            }
+            // Keep advanced patterns on their original bounded implementation.
+            // Expanded lookarounds can exhaust its limit on long fields.
+            return fancy_regex::RegexBuilder::new(&format!("(?i){pattern}"))
+                .backtrack_limit(100_000)
+                .build()
+                .map_or(Self::Invalid, |regex| {
+                    Self::Regex(SearchRegex::Fancy(regex))
+                });
         }
         let mut tokens = Vec::new();
         let mut buffer = String::new();
@@ -115,7 +133,7 @@ impl Query {
                 .fields
                 .iter()
                 .enumerate()
-                .find(|(_, field)| regex.is_match(field).unwrap_or(false))
+                .find(|(_, field)| regex.is_match(field))
                 .map(|(index, _)| if index == 0 { 0 } else { TEXT }),
             Self::Tokens(tokens) => {
                 let mut total = 0;
@@ -176,12 +194,8 @@ fn ascii_regex_classes(pattern: &str) -> String {
                 'D' => Some("(?-i:[^0-9])"),
                 'w' => Some("(?-i:[A-Za-z0-9_])"),
                 'W' => Some("(?-i:[^A-Za-z0-9_])"),
-                'b' => Some(
-                    "(?-i:(?:(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])))",
-                ),
-                'B' => Some(
-                    "(?-i:(?:(?<=[A-Za-z0-9_])(?=[A-Za-z0-9_])|(?<![A-Za-z0-9_])(?![A-Za-z0-9_])))",
-                ),
+                'b' => Some(r"(?-u:\b)"),
+                'B' => Some(r"(?-u:\B)"),
                 _ => None,
             };
             if let Some(replacement) = replacement {
@@ -367,6 +381,27 @@ mod tests {
         }
         assert!(Query::new(r"re:^\\b$").score(&doc(r"\b")).is_some());
         assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b]\w");
+    }
+
+    #[test]
+    fn regex_word_boundary_finds_match_after_long_session_text() {
+        let text = format!("{} missing", "a".repeat(50_000));
+        let document = Document::new(String::new(), String::new(), String::new(), text, true);
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_some());
+        assert!(
+            Query::new(r"re:\bmissing\b(?=$)")
+                .score(&document)
+                .is_some()
+        );
+        let nonmatching = format!("{} missingx", "a".repeat(50_000));
+        let document = Document::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            nonmatching,
+            true,
+        );
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_none());
     }
 
     #[test]
