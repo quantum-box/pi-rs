@@ -1227,7 +1227,7 @@ pub(super) fn snapshot_response(
             let pending = pending_request();
             state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
             state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
-            state["sessionId"] = json!(session.session_id());
+            state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
             }
@@ -1289,6 +1289,7 @@ pub(super) fn snapshot_response(
             native.tokens.total = native.tokens.total.saturating_add(operations.total_tokens);
             native.cost = native.cost.map(|cost| cost + operations.cost.total);
             let mut stats = serde_json::to_value(native)?;
+            stats["sessionId"] = json!(session.external_session_id());
             if operations.measured() {
                 stats["operationUsage"] = serde_json::to_value(operations)?;
             }
@@ -1910,6 +1911,56 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn rpc_session_identity_survives_import_export_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.jsonl");
+        for identity in ["legacy-id", "ID / 日本語", "bad\r\nid"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"session", "version":3, "id":identity})
+                ),
+            )
+            .unwrap();
+            let imported = super::super::session_import::read(&path).unwrap();
+            let check = |session: &Session, expected: &str| {
+                for command in ["get_state", "get_session_stats"] {
+                    for native in [false, true] {
+                        let result = snapshot_response(
+                            &json!({"type":command,"includeNative":native}),
+                            session,
+                            &path,
+                            None,
+                            json!({}),
+                        )
+                        .unwrap();
+                        assert_eq!(result["sessionId"], expected, "{command}");
+                    }
+                }
+            };
+            check(&imported, identity);
+            assert_eq!(imported.statistics().session_id, imported.session_id());
+            let export = directory.path().join("export.jsonl");
+            imported.export_jsonl(&export).unwrap();
+            let reopened = super::super::session_import::read(&export).unwrap();
+            check(&reopened, identity);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_ne!(fork.session_id(), reopened.session_id());
+            check(&fork, &fork.session_id().to_string());
+            std::fs::remove_file(export).unwrap();
+        }
+        let native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for command in ["get_state", "get_session_stats"] {
+            let result =
+                snapshot_response(&json!({"type":command}), &native, &path, None, json!({}))
+                    .unwrap();
+            assert_eq!(result["sessionId"], native.session_id().to_string());
+        }
+    }
 
     #[cfg(unix)]
     #[test]
