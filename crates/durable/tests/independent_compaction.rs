@@ -2810,3 +2810,540 @@ async fn aborted_aftertools_child_leaves_summary_for_tool_boundary() {
     scheduler.shutdown().await.unwrap();
     driver.shutdown().unwrap();
 }
+
+struct DirectAfterToolsGate {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+    effects: AtomicUsize,
+    make_task: bool,
+}
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for DirectAfterToolsGate {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &serde_json::Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent, HookTask};
+        if event == GenerationEvent::AfterTools {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.memo.get("effect").await?.is_none() {
+                ctx.memo
+                    .get_or_insert("effect", serde_json::json!(true))
+                    .await?;
+                self.effects.fetch_add(1, Ordering::SeqCst);
+            }
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            return Ok(if self.make_task {
+                GenerationDecision::Tasks(vec![HookTask {
+                    name: "direct-job".into(),
+                    input: serde_json::json!({"selected":"exact"}),
+                }])
+            } else {
+                GenerationDecision::Pass
+            });
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+fn direct_aftertools_registries(
+    hook: Arc<DirectAfterToolsGate>,
+    handler: Arc<dyn pi_rs_durable::task_scheduler::Handler>,
+) -> (
+    pi_rs_durable::extension::Registry,
+    pi_rs_durable::task_scheduler::Registry,
+) {
+    let mut extensions = pi_rs_durable::extension::Registry::default();
+    extensions
+        .install(pi_rs_durable::extension::Extension {
+            name: "direct-aftertools".into(),
+            hooks: vec![hook],
+            tasks: vec![("direct-job".into(), handler.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut tasks = pi_rs_durable::task_scheduler::Registry::default();
+    assert!(tasks.register_shared("direct-job", true, handler));
+    (extensions, tasks)
+}
+fn direct_aftertools_gate(make_task: bool) -> Arc<DirectAfterToolsGate> {
+    Arc::new(DirectAfterToolsGate {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        effects: AtomicUsize::new(0),
+        make_task,
+    })
+}
+async fn direct_aftertools_fixture(
+    path: &std::path::Path,
+    model: Arc<ToolRoundModel>,
+    tool_calls: Arc<AtomicUsize>,
+    hook: Arc<DirectAfterToolsGate>,
+    handler: Arc<dyn pi_rs_durable::task_scheduler::Handler>,
+    handoff: bool,
+) -> (
+    Scheduler,
+    pi_rs_durable::task_driver::Driver,
+    uuid::Uuid,
+    uuid::Uuid,
+) {
+    let (extensions, tasks) = direct_aftertools_registries(hook.clone(), handler);
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        path,
+        round_options(model.clone(), tool_calls, handoff),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(conversation, vec!["direct-aftertools".into()])
+        .unwrap();
+    for input in ["first", "second"] {
+        scheduler.submit(conversation, None, input.into()).unwrap();
+        scheduler.wait(conversation).await.unwrap();
+    }
+    model.gate_next.store(true, Ordering::SeqCst);
+    scheduler
+        .submit(conversation, None, "third".into())
+        .unwrap();
+    model.started.acquire().await.unwrap().forget();
+    let operation = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(conversation, operation, 0)
+            .unwrap()
+    );
+    model.summary_started.acquire().await.unwrap().forget();
+    model.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    (scheduler, driver, conversation, operation)
+}
+async fn admit_direct_summary(
+    scheduler: &mut Scheduler,
+    model: &ToolRoundModel,
+    operation: uuid::Uuid,
+) {
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        scheduler
+            .wait_independent_compaction(operation)
+            .await
+            .unwrap(),
+        IndependentCompactionStatus::Running
+    );
+}
+async fn direct_aftertools_child(
+    scheduler: &Scheduler,
+    driver: &pi_rs_durable::task_driver::Driver,
+    conversation: uuid::Uuid,
+) -> uuid::Uuid {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let state =
+                serde_json::to_value(scheduler.conversation(conversation).unwrap()).unwrap();
+            if let Some(raw) = state["phase"]["HookTasksWaiting"]["children"][0].as_str() {
+                let id = uuid::Uuid::parse_str(raw).unwrap();
+                if let Some(task) = driver.get(id).unwrap()
+                    && matches!(task.state(), pi_rs_durable::task::TaskState::Waiting(_))
+                {
+                    assert_eq!(
+                        task.checkpoint().data,
+                        serde_json::json!({"selected":"exact"})
+                    );
+                    break id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn direct_aftertools_summary_preserves_completed_pass_and_order() {
+    use pi_rs_durable::state::InputMode;
+    for mode in [InputMode::Steer, InputMode::FollowUp] {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(ToolRoundModel::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = direct_aftertools_gate(false);
+        let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+            &dir.path().join("db"),
+            model.clone(),
+            calls.clone(),
+            hook.clone(),
+            aftertools_handler(false),
+            false,
+        )
+        .await;
+        scheduler
+            .submit_with_mode(conversation, None, "queued".into(), mode)
+            .unwrap();
+        admit_direct_summary(&mut scheduler, &model, operation).await;
+        hook.release.add_permits(1);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let requests = model.requests.lock().unwrap();
+            assert!(requests[3].messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("round checkpoint"))));
+            assert!(requests[3].messages.iter().any(|m| matches!(m, pi_rs_core::Message::Tool { content, .. } if content == "tool result")));
+            assert_eq!(
+                requests[3].messages.iter().any(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued")
+                ),
+                mode == InputMode::Steer
+            );
+            if mode == InputMode::FollowUp {
+                assert!(requests[4].messages.iter().any(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued")
+                ));
+            }
+        }
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn direct_aftertools_completed_task_decision_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ToolRoundModel::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = direct_aftertools_gate(true);
+    let handler = aftertools_handler(true);
+    let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+        &path,
+        model.clone(),
+        calls.clone(),
+        hook.clone(),
+        handler.clone(),
+        false,
+    )
+    .await;
+    admit_direct_summary(&mut scheduler, &model, operation).await;
+    hook.release.add_permits(1);
+    let child = direct_aftertools_child(&scheduler, &driver, conversation).await;
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+    let (extensions, tasks) = direct_aftertools_registries(hook.clone(), handler);
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        &path,
+        round_options(model.clone(), calls.clone(), false),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    wake_parked(&driver, child);
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+#[tokio::test]
+async fn direct_aftertools_handoff_stales_admitted_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ToolRoundModel::default());
+    let hook = direct_aftertools_gate(false);
+    let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+        &dir.path().join("db"),
+        model.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        hook.clone(),
+        aftertools_handler(false),
+        true,
+    )
+    .await;
+    admit_direct_summary(&mut scheduler, &model, operation).await;
+    hook.release.add_permits(1);
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .iter()
+            .any(
+                |m| matches!(m, pi_rs_core::Message::User { content } if content == "round handoff")
+            )
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+#[tokio::test]
+async fn direct_aftertools_abort_preserves_admitted_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ToolRoundModel::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = direct_aftertools_gate(false);
+    let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+        &dir.path().join("db"),
+        model.clone(),
+        calls.clone(),
+        hook.clone(),
+        aftertools_handler(false),
+        false,
+    )
+    .await;
+    admit_direct_summary(&mut scheduler, &model, operation).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        scheduler.abort_and_wait(conversation),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+#[tokio::test]
+async fn interrupted_direct_aftertools_hook_replays_with_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ToolRoundModel::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = direct_aftertools_gate(false);
+    let handler = aftertools_handler(false);
+    let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+        &path,
+        model.clone(),
+        calls.clone(),
+        hook.clone(),
+        handler.clone(),
+        false,
+    )
+    .await;
+    admit_direct_summary(&mut scheduler, &model, operation).await;
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+    hook.release.add_permits(1);
+    let (extensions, tasks) = direct_aftertools_registries(hook.clone(), handler);
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        &path,
+        round_options(model, calls.clone(), false),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    scheduler.wait(conversation).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(hook.effects.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+#[tokio::test]
+async fn direct_aftertools_reset_order_is_preserved() {
+    for prior in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(ToolRoundModel::default());
+        let hook = direct_aftertools_gate(false);
+        let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+            &dir.path().join("db"),
+            model.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            hook.clone(),
+            aftertools_handler(false),
+            false,
+        )
+        .await;
+        if prior {
+            scheduler
+                .reset(conversation, Some("reset before".into()))
+                .unwrap();
+        }
+        admit_direct_summary(&mut scheduler, &model, operation).await;
+        if !prior {
+            scheduler
+                .reset(conversation, Some("reset after".into()))
+                .unwrap();
+        }
+        hook.release.add_permits(1);
+        scheduler.wait(conversation).await.unwrap();
+        assert_eq!(
+            scheduler.independent_compaction_status(operation).unwrap(),
+            if prior {
+                IndependentCompactionStatus::Stale
+            } else {
+                IndependentCompactionStatus::Applied
+            }
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        let c = scheduler.conversation(conversation).unwrap();
+        assert!(c.messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content == if prior { "reset before" } else { "reset after" })));
+        scheduler.shutdown().await.unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+#[tokio::test]
+async fn direct_aftertools_kill_child() {
+    let Ok(dir) = std::env::var("PI_DIRECT_AFTERTOOLS_KILL_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let model = Arc::new(ToolRoundModel::default());
+    let hook = direct_aftertools_gate(false);
+    let (mut scheduler, _driver, conversation, operation) = direct_aftertools_fixture(
+        &dir.join("db"),
+        model.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        hook,
+        aftertools_handler(false),
+        false,
+    )
+    .await;
+    scheduler
+        .submit(conversation, None, "queued".into())
+        .unwrap();
+    admit_direct_summary(&mut scheduler, &model, operation).await;
+    std::fs::write(dir.join("ready"), format!("{conversation} {operation}")).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_direct_aftertools_hook_replays_memo_without_repeating_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("direct_aftertools_kill_child")
+        .arg("--nocapture")
+        .env("PI_DIRECT_AFTERTOOLS_KILL_DIR", dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = dir.path().join("ready");
+    let found = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&ready) {
+                break value;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("child exited before ready: {status}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if found.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let ids = found.unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let ids: Vec<uuid::Uuid> = ids
+        .split_whitespace()
+        .map(|s| uuid::Uuid::parse_str(s).unwrap())
+        .collect();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = direct_aftertools_gate(false);
+    hook.release.add_permits(1);
+    let (extensions, tasks) = direct_aftertools_registries(hook.clone(), aftertools_handler(false));
+    let (mut scheduler, driver) = Scheduler::open_with_summary_recovery_and_tasks(
+        dir.path().join("db"),
+        round_options(Arc::new(ToolRoundModel::default()), calls.clone(), false),
+        extensions,
+        None,
+        busy_provider(),
+        tasks,
+    )
+    .unwrap();
+    scheduler.wait(ids[0]).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(ids[1]).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.effects.load(Ordering::SeqCst), 0);
+    let c = scheduler.conversation(ids[0]).unwrap();
+    let summary = c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("round checkpoint"))).unwrap();
+    let queued = c
+        .messages
+        .iter()
+        .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"))
+        .unwrap();
+    assert!(summary < queued);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+#[tokio::test]
+async fn direct_aftertools_abort_before_summary_admission_cancels_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ToolRoundModel::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = direct_aftertools_gate(false);
+    let (mut scheduler, driver, conversation, operation) = direct_aftertools_fixture(
+        &dir.path().join("db"),
+        model,
+        calls.clone(),
+        hook.clone(),
+        aftertools_handler(false),
+        false,
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        scheduler.abort_and_wait(conversation),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(operation).unwrap(),
+        IndependentCompactionStatus::Aborted
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}

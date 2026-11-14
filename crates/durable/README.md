@@ -600,8 +600,8 @@ stale-submission API.
 `Scheduler::request_busy_independent_compaction` accepts a conversation while
 a single model request is running, with no queued inputs or resets at selection.
 It persists a bounded selection snapshot. When summarization completes during
-an active model request, on-yield or after-run hook, a parked lifecycle hook
-task, or at idle, it checks the source prefix, context generation, original
+an active model request, on-yield, after-run or after-tools hook, a parked
+lifecycle hook task, or at idle, it checks the source prefix, context generation, original
 submission and write identities, and configuration.
 This permits append-only model progress and fenced model restarts, while queued
 inputs, resets and application writes are ordered against the summary. An
@@ -626,7 +626,9 @@ snapshots share a 512 KiB limit, and at most 128 preceding resets can be ordered
 return `Running` while boundary placement is pending; inspect its status after
 the conversation reaches the boundary. On-yield decisions are checkpointed
 before inbox selection, so an admission race does not repeat a completed hook.
-A crash before the checkpoint can replay a hook; use its durable memo and
+An after-tools hook's completed decision and any child tasks commit with its
+phase transition; concurrent summary admission is merged into that commit. A
+crash before the decision commits can replay a hook; use its durable memo and
 idempotent external effects to handle replay.
 
 `Scheduler::request_idle_independent_compaction` starts an independent summary

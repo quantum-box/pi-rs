@@ -7924,6 +7924,9 @@ impl Harness {
                     if children.is_empty() {
                         place_round_handoff(&mut c);
                     }
+                    // The phase transition and any hook-created children are
+                    // committed together. Admission conflicts merge the queued
+                    // summary without executing this completed hook again.
                     self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
                 }
                 Phase::AfterRun {
@@ -9110,6 +9113,7 @@ impl SummaryPlacementDriver {
                         state.phase,
                         Phase::ModelRunning { .. }
                             | Phase::OnYield { .. }
+                            | Phase::AfterTools { .. }
                             | Phase::YieldDecision { .. }
                             | Phase::YieldTasksWaiting { .. }
                             | Phase::HookTasksWaiting { turns: Some(_), .. }
