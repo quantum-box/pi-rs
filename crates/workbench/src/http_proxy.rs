@@ -561,7 +561,7 @@ mod tests {
                 });
                 let client = $client::Client::builder()
                     .no_proxy()
-                    .unix_socket(&path)
+                    .unix_socket(path.as_path())
                     .proxy(
                         $client::Proxy::all("http://127.0.0.1:1")
                             .unwrap()
