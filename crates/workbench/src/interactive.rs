@@ -653,6 +653,41 @@ impl RemoteTask {
     }
 }
 
+struct PendingShare {
+    id: uuid::Uuid,
+    destination: sessions::ShareDestination,
+    path: PathBuf,
+    workspace: PathBuf,
+    started: Instant,
+}
+
+fn start_share_upload(
+    view: &mut View,
+    pending: PendingShare,
+    snapshot: Option<sessions::ShareSnapshot>,
+) {
+    let PendingShare {
+        destination,
+        path,
+        workspace,
+        ..
+    } = pending;
+    let status = destination.status();
+    view.remote_task = Some(RemoteTask::start(
+        status,
+        "Share cancelled",
+        move |_| async move {
+            let session = Session::snapshot(path)?;
+            let shared = destination.share(session, &workspace, snapshot).await?;
+            let mut lines = vec![format!("Share URL: {}", shared.url)];
+            if let Some(gist) = shared.gist {
+                lines.push(format!("Gist: {gist}"));
+            }
+            Ok(lines)
+        },
+    ));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TranscriptPanel {
     Summary(u64),
@@ -690,6 +725,7 @@ struct View {
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
     remote_task: Option<RemoteTask>,
+    pending_share: Option<PendingShare>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
@@ -772,6 +808,29 @@ impl View {
                 numbered_diff: false,
             })
         })
+    }
+
+    fn share_blocks_input(&self) -> bool {
+        self.pending_share.is_some() && self.dialogs.is_empty() && self.local_editor.is_none()
+    }
+
+    fn take_share_response(
+        &mut self,
+        value: &Value,
+    ) -> Option<(PendingShare, Option<sessions::ShareSnapshot>)> {
+        if value["type"] != "response"
+            || value["command"] != "get_share_context"
+            || !self
+                .pending_share
+                .as_ref()
+                .is_some_and(|pending| value["id"] == json!(pending.id))
+        {
+            return None;
+        }
+        let snapshot = (value["success"] == true)
+            .then(|| serde_json::from_value(value["data"].clone()).ok())
+            .flatten();
+        Some((self.pending_share.take().expect("matching share"), snapshot))
     }
 
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
@@ -894,6 +953,8 @@ impl View {
                 task.status,
                 task.started.elapsed().as_secs_f32()
             )
+        } else if self.pending_share.is_some() {
+            "Preparing share · Esc cancels · ".into()
         } else if self.clipboard.is_some() {
             "Reading clipboard · ".into()
         } else if !self.draft_images.is_empty() {
@@ -2821,22 +2882,23 @@ fn slash(
         }
         "/share" => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let status = destination.status();
-            let path = args.session.clone();
-            let workspace = args.workspace.clone();
-            view.remote_task = Some(RemoteTask::start(
-                status,
-                "Share cancelled",
-                move |_| async move {
-                    let session = Session::snapshot(path)?;
-                    let shared = destination.share(session, &workspace).await?;
-                    let mut lines = vec![format!("Share URL: {}", shared.url)];
-                    if let Some(gist) = shared.gist {
-                        lines.push(format!("Gist: {gist}"));
-                    }
-                    Ok(lines)
-                },
-            ));
+            let id = if destination.is_radius() && !args.trust_pending {
+                worker.and_then(|worker| Worker::request_share_context(worker, args).ok())
+            } else {
+                None
+            };
+            let pending = PendingShare {
+                id: id.unwrap_or_else(uuid::Uuid::nil),
+                destination,
+                path: args.session.clone(),
+                workspace: args.workspace.clone(),
+                started: Instant::now(),
+            };
+            if id.is_some() {
+                view.pending_share = Some(pending);
+            } else {
+                start_share_upload(view, pending, None);
+            }
         }
         "/model" if rest.is_empty() => {
             args.reload_model_profiles()?;
@@ -3845,6 +3907,13 @@ pub(super) async fn run(
             }
             let events: Vec<_> = active.drain_events();
             for value in events {
+                if value["type"] == "response" && value["command"] == "get_share_context" {
+                    if let Some((pending, snapshot)) = view.take_share_response(&value) {
+                        start_share_upload(&mut view, pending, snapshot);
+                        dirty = true;
+                    }
+                    continue;
+                }
                 if value["type"] == "extension_ui_request" {
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
@@ -3942,7 +4011,13 @@ pub(super) async fn run(
                     let _ = reader.join();
                 }
                 for value in finished.drain_events() {
+                    if value["type"] == "response" && value["command"] == "get_share_context" {
+                        continue;
+                    }
                     view.receive_worker(value, &mut args);
+                }
+                if let Some(pending) = view.pending_share.take() {
+                    start_share_upload(&mut view, pending, None);
                 }
                 view.settle();
                 view.cache_warming_status = None;
@@ -3962,6 +4037,16 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if view.dialogs.is_empty()
+            && view
+                .pending_share
+                .as_ref()
+                .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(15))
+        {
+            let pending = view.pending_share.take().expect("timed out share");
+            start_share_upload(&mut view, pending, None);
+            dirty = true;
         }
         if let Some(task) = &view.remote_task {
             match task.receiver.try_recv() {
@@ -4053,7 +4138,7 @@ pub(super) async fn run(
             dirty = true;
         }
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || ((is_busy(&worker) || view.remote_task.is_some())
+            || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
         {
             view.draw(&args, &theme, is_busy(&worker), &keys)?;
@@ -4273,7 +4358,11 @@ pub(super) async fn run(
                 dirty = true;
             }
             Event::Paste(text) => {
-                if view.remote_task.is_some() && view.local_editor.is_none() {
+                if (view.remote_task.is_some()
+                    && view.local_editor.is_none()
+                    && view.dialogs.is_empty())
+                    || view.share_blocks_input()
+                {
                     continue;
                 }
                 last_idle_interrupt = None;
@@ -4295,7 +4384,14 @@ pub(super) async fn run(
                 if !mouse_activate && let Some(picker) = &mut view.picker {
                     picker.clear_mouse_press();
                 }
-                if view.remote_task.is_some() {
+                if view.share_blocks_input() {
+                    if keys.action(key, true) == Some("app.interrupt") {
+                        view.pending_share = None;
+                        view.append("Share cancelled");
+                    }
+                    continue;
+                }
+                if view.remote_task.is_some() && view.dialogs.is_empty() {
                     if keys.action(key, true) == Some("app.interrupt") {
                         interrupt_remote_task(&mut view);
                         continue;
@@ -5056,7 +5152,9 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if input.trim() == "/session" && view.draft_images.is_empty() {
+                        } else if matches!(input.trim(), "/session" | "/share")
+                            && view.draft_images.is_empty()
+                        {
                             if let Err(error) =
                                 slash(&input, &mut args, &mut view, Some(&mut worker))
                             {
@@ -7331,6 +7429,41 @@ mod tests {
         );
         let auth = super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
         assert!(auth.get("openai-chatgpt").is_some());
+    }
+
+    #[test]
+    fn pending_share_keeps_extension_dialog_and_response_correlated() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let share_id = uuid::Uuid::new_v4();
+        let ui_id = uuid::Uuid::new_v4();
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id: share_id,
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        assert!(view.share_blocks_input());
+        assert!(view.take_share_response(&json!({"type":"response","command":"get_share_context","id":uuid::Uuid::new_v4(),"success":true})).is_none());
+        assert!(view.ui_request(&json!({"type":"extension_ui_request","id":ui_id,"method":"input","title":"Startup question"})).unwrap().is_none());
+        assert!(!view.share_blocks_input());
+        let dialog = view.dialogs.front_mut().unwrap();
+        assert_eq!(dialog.id, ui_id);
+        dialog.paste("answer");
+        let response = dialog.input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &super::Keys::default(),
+        );
+        assert!(matches!(response, Some(pi_rs::UiResponse::Text(value)) if value == "answer"));
+        view.dialogs.pop_front();
+        assert!(view.share_blocks_input());
+        let (pending, snapshot) = view.take_share_response(&json!({"type":"response","command":"get_share_context","id":share_id,"success":false})).unwrap();
+        assert_eq!(pending.id, share_id);
+        assert!(snapshot.is_none());
+        assert!(view.pending_share.is_none());
     }
 
     #[test]

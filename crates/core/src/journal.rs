@@ -636,6 +636,15 @@ impl Session {
         self.path(self.head)
     }
 
+    /// Resolve the current branch's system context against the active runtime tools.
+    pub fn effective_system_context(
+        &self,
+        fallback: &str,
+        tools: Vec<crate::ToolSpec>,
+    ) -> (String, Vec<crate::ToolSpec>) {
+        system_context(&self.branch(), fallback, tools)
+    }
+
     /// Conversation-only snapshot of a settled branch. External effects and
     /// extension state remain with the original session.
     pub fn conversation_at(&self, record_id: u64) -> Result<Vec<Message>> {

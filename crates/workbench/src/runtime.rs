@@ -71,6 +71,13 @@ fn synthetic_command_source(command: &pi_rs::RegisteredCommand) -> serde_json::V
 }
 
 impl Runtime {
+    pub fn share_base(&self) -> super::sessions::ShareContext {
+        super::sessions::ShareContext {
+            system_prompt: self.system_prompt.clone(),
+            tools: self.registry.active_tool_specs(),
+        }
+    }
+
     pub async fn discover_resources(
         &mut self,
         args: &Cli,

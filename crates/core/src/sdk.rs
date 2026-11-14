@@ -2816,6 +2816,7 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
         Notification::SummaryRequest
+        | Notification::ModelContext { .. }
         | Notification::ToolProgress(_)
         | Notification::BranchState(_) => return,
         Notification::QueueUpdated {

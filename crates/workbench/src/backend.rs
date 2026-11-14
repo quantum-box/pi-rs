@@ -140,6 +140,10 @@ enum Request {
     GetCommands {
         id: Option<serde_json::Value>,
     },
+    GetShareContext {
+        id: Option<serde_json::Value>,
+        session: PathBuf,
+    },
     ReadSession {
         request: serde_json::Value,
         path: PathBuf,
@@ -159,6 +163,7 @@ struct ReaderControls {
     command_catalog: Arc<Mutex<serde_json::Value>>,
     resources: Arc<Mutex<super::resources::Resources>>,
     resources_ready: tokio::sync::watch::Receiver<bool>,
+    share_ready: tokio::sync::watch::Receiver<bool>,
     registry: pi_rs::Registry,
     lifecycle_timeout: std::time::Duration,
     trace: bool,
@@ -176,7 +181,12 @@ struct ControlState {
 
 struct SessionSnapshot {
     records: Vec<pi_rs::Record>,
+    share_records: Vec<Arc<pi_rs::Record>>,
+    revision: u64,
     entries: Option<super::rpc_entries::Cursor>,
+    share_base: Option<Arc<super::sessions::ShareContext>>,
+    share_active: Option<Arc<super::sessions::ShareContext>>,
+    share_pending: bool,
 }
 
 impl SessionSnapshot {
@@ -185,26 +195,266 @@ impl SessionSnapshot {
         if let Some(cursor) = &mut entries {
             cursor.advance(&records);
         }
-        Self { records, entries }
+        let share_records = records.iter().cloned().map(Arc::new).collect();
+        Self {
+            records,
+            share_records,
+            revision: 0,
+            entries,
+            share_base: None,
+            share_active: None,
+            share_pending: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn share_snapshot(&self) -> Result<super::sessions::ShareSnapshot> {
+        if self.share_pending {
+            return Err(Error::Config(
+                "Model request context is changing; try sharing again".into(),
+            ));
+        }
+        let session = Session::from_records(self.records.clone())?;
+        let base = self
+            .share_base
+            .as_ref()
+            .ok_or_else(|| Error::Config("share context is not ready".into()))?;
+        let context = if let Some(active) = &self.share_active {
+            active.as_ref().clone()
+        } else {
+            let (system_prompt, tools) =
+                session.effective_system_context(&base.system_prompt, base.tools.clone());
+            super::sessions::ShareContext {
+                system_prompt,
+                tools,
+            }
+        };
+        Ok(super::sessions::ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context,
+        })
+    }
+
+    fn track_share_event(&mut self, event: &pi_rs::Notification<'_>, summary: &mut bool) {
+        match event {
+            pi_rs::Notification::ModelContext {
+                system_prompt,
+                registry,
+            } => {
+                self.revision = self.revision.wrapping_add(1);
+                self.share_base = Some(Arc::new(super::sessions::ShareContext {
+                    system_prompt: (*system_prompt).into(),
+                    tools: registry.active_tool_specs(),
+                }));
+            }
+            pi_rs::Notification::SummaryRequest => *summary = true,
+            pi_rs::Notification::Committed(record)
+                if matches!(record.event, pi_rs::Event::ModelRequested { .. }) =>
+            {
+                self.revision = self.revision.wrapping_add(1);
+                self.share_pending = true;
+            }
+            pi_rs::Notification::Request(request) => {
+                self.revision = self.revision.wrapping_add(1);
+                if !*summary {
+                    let system_prompt = request
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            pi_rs::Message::System { content } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    self.share_active = Some(Arc::new(super::sessions::ShareContext {
+                        system_prompt,
+                        tools: request.tools.clone(),
+                    }));
+                }
+                self.share_pending = false;
+                *summary = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_share_context(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.share_active = None;
+        self.share_pending = false;
     }
 
     fn refresh(&mut self, session: &Session) {
+        self.revision = self.revision.wrapping_add(1);
         self.records = session.records().to_vec();
+        self.share_records = self.records.iter().cloned().map(Arc::new).collect();
         if let Some(cursor) = &mut self.entries {
             cursor.advance(&self.records);
         }
     }
 
+    // The disk read may have completed before an in-flight run settled.
+    // Only advance this append-only snapshot when every retained record agrees.
+    #[cfg(test)]
+    fn refresh_if_extends(&mut self, session: &Session) {
+        let current = session.records();
+        if self.records.is_empty() || current.len() < self.records.len() {
+            return;
+        }
+        let extends = self.records.iter().zip(current).all(|(previous, next)| {
+            matches!((serde_json::to_vec(previous), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+        });
+        if extends {
+            self.refresh(session);
+        }
+    }
+
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
+        self.revision = self.revision.wrapping_add(1);
         if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
             *existing = record.clone();
+            self.share_records[record.id.saturating_sub(1) as usize] = Arc::new(record.clone());
             return Vec::new();
         }
         self.records.push(record.clone());
+        self.share_records.push(Arc::new(record.clone()));
         self.entries
             .as_mut()
             .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
     }
+}
+
+fn snapshot_for_share(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+) -> Result<super::sessions::ShareSnapshot> {
+    snapshot_for_share_with_hook(active, snapshot, current, || {})
+}
+
+fn snapshot_for_share_with_hook(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+    hook: impl FnOnce(),
+) -> Result<super::sessions::ShareSnapshot> {
+    let changed = || Error::Config("Share context changed; try sharing again".into());
+    let (revision, count, base, selected, pending, emit_entries, idle) = {
+        let state = active.lock().expect("worker control");
+        let snapshot = snapshot.lock().expect("session snapshot");
+        (
+            snapshot.revision,
+            snapshot.share_records.len(),
+            snapshot.share_base.clone(),
+            snapshot.share_active.clone(),
+            snapshot.share_pending,
+            snapshot.entries.is_some(),
+            state.token.is_none() && state.queued == 0,
+        )
+    };
+    if pending {
+        return Err(Error::Config(
+            "Model request context is changing; try sharing again".into(),
+        ));
+    }
+    let mut records = Vec::with_capacity(count);
+    while records.len() < count {
+        let snapshot = snapshot.lock().expect("session snapshot");
+        if snapshot.revision != revision {
+            return Err(changed());
+        }
+        let end = (records.len() + 64).min(count);
+        records.extend_from_slice(&snapshot.share_records[records.len()..end]);
+    }
+    hook();
+    let extends = idle && current.as_ref().is_some_and(|current| {
+        !records.is_empty() && current.records().len() >= records.len()
+            && records.iter().zip(current.records()).all(|(previous, next)| {
+                matches!((serde_json::to_vec(previous.as_ref()), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+            })
+    });
+    let prepared = if extends {
+        Some(SessionSnapshot::new(
+            current.as_ref().expect("checked").records().to_vec(),
+            emit_entries,
+        ))
+    } else {
+        None
+    };
+    let session = if extends {
+        current.expect("checked")
+    } else {
+        Session::from_records(
+            records
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
+        )?
+    };
+    let base = base.ok_or_else(|| Error::Config("share context is not ready".into()))?;
+    let context = selected
+        .map(|selected| selected.as_ref().clone())
+        .unwrap_or_else(|| {
+            let (system_prompt, tools) =
+                session.effective_system_context(&base.system_prompt, base.tools.clone());
+            super::sessions::ShareContext {
+                system_prompt,
+                tools,
+            }
+        });
+    let result = super::sessions::ShareSnapshot {
+        session_id: session.session_id(),
+        head: session.head(),
+        context,
+    };
+    let state = active.lock().expect("worker control");
+    let mut snapshot = snapshot.lock().expect("session snapshot");
+    if snapshot.revision != revision || idle != (state.token.is_none() && state.queued == 0) {
+        return Err(changed());
+    }
+    let old = prepared.map(|prepared| {
+        snapshot.revision = snapshot.revision.wrapping_add(1);
+        (
+            std::mem::replace(&mut snapshot.records, prepared.records),
+            std::mem::replace(&mut snapshot.share_records, prepared.share_records),
+            std::mem::replace(&mut snapshot.entries, prepared.entries),
+        )
+    });
+    drop(snapshot);
+    drop(state);
+    drop(old);
+    Ok(result)
+}
+
+async fn share_snapshot_background<F>(
+    active: Arc<Mutex<ControlState>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    read: F,
+) -> Result<super::sessions::ShareSnapshot>
+where
+    F: FnOnce() -> Option<Session> + Send + 'static,
+{
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| Error::Config("Share context is already being read".into()))?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("share-snapshot".into())
+        .spawn(move || {
+            let _permit = permit;
+            let idle = {
+                let state = active.lock().expect("worker control");
+                state.token.is_none() && state.queued == 0
+            };
+            let current = if idle { read() } else { None };
+            let _ = send.send(snapshot_for_share(&active, &snapshot, current));
+        })
+        .map_err(|_| Error::Config("Share context reader could not start".into()))?;
+    receive
+        .await
+        .map_err(|_| Error::Config("Share context reader stopped".into()))?
 }
 
 struct ShellRunner {
@@ -301,6 +551,7 @@ async fn run_worker(
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
         tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
         inputs.clone(),
@@ -314,6 +565,7 @@ async fn run_worker(
             command_catalog: command_catalog.clone(),
             resources: shared_resources.clone(),
             resources_ready: ready_receiver,
+            share_ready: share_receiver,
             registry: runtime.registry.clone(),
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
@@ -362,7 +614,12 @@ async fn run_worker(
             },
         )
         .await?;
-    snapshot.lock().expect("session snapshot").refresh(&session);
+    {
+        let mut snapshot = snapshot.lock().expect("session snapshot");
+        snapshot.refresh(&session);
+        snapshot.share_base = Some(Arc::new(runtime.share_base()));
+    }
+    share_ready.send_replace(true);
     let startup_trigger = session
         .host_binding()
         .is_none()
@@ -538,6 +795,7 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
                 }
@@ -590,6 +848,13 @@ async fn run_worker(
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
             }
+            {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.share_base = Some(Arc::new(runtime.share_base()));
+                snapshot.share_active = None;
+                snapshot.revision = snapshot.revision.wrapping_add(1);
+            }
+            share_ready.send_replace(true);
             continue;
         }
         let request = match request {
@@ -688,10 +953,20 @@ async fn run_worker(
             }
             args.record_automatic_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
-            snapshot.lock().expect("session snapshot").refresh(session);
+            {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.refresh(session);
+                snapshot.share_base = Some(Arc::new(runtime.share_base()));
+                snapshot.share_active = None;
+            }
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
+            let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
+                snapshot
+                    .lock()
+                    .expect("session snapshot")
+                    .track_share_event(&event, &mut summary_request);
                 cache_capture.observe(&event);
                 observe_snapshot(event, args.trace, &snapshot);
             };
@@ -1001,7 +1276,12 @@ async fn run_worker(
             }
         };
         drop(operation);
-        active.lock().expect("worker control").token = None;
+        {
+            let mut state = active.lock().expect("worker control");
+            let mut snapshot = snapshot.lock().expect("session snapshot");
+            snapshot.settle_share_context();
+            state.token = None;
+        }
         if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
             let recorded = input.apply(session, &mut |event| {
                 observe_snapshot(event, args.trace, &snapshot)
@@ -1228,6 +1508,7 @@ fn read_requests(
         command_catalog,
         resources,
         resources_ready,
+        share_ready,
         registry,
         lifecycle_timeout,
         trace,
@@ -1248,6 +1529,7 @@ fn read_requests(
         lifecycle_timeout,
         trace,
     });
+    let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1287,6 +1569,28 @@ fn read_requests(
                         request.get("id").cloned(),
                         result,
                     );
+                }
+                Request::GetShareContext { id, session } => {
+                    let mut ready = share_ready.clone();
+                    let snapshot = snapshot.clone();
+                    let active = active.clone();
+                    let slots = share_slots.clone();
+                    runtime.spawn(async move {
+                        while !*ready.borrow_and_update() {
+                            if ready.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        let result =
+                            share_snapshot_background(active, snapshot, slots, move || {
+                                Session::snapshot(session).ok()
+                            })
+                            .await
+                            .and_then(|snapshot| {
+                                serde_json::to_value(snapshot).map_err(Into::into)
+                            });
+                        control_response("get_share_context", id, result);
+                    });
                 }
                 Request::GetCommands { id } => {
                     let mut ready = resources_ready.clone();
@@ -1509,6 +1813,516 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod share_context_tests {
+    use super::*;
+    use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn stalled_share_reader_does_not_delay_runtime_shutdown() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let session = Session::with_store(MemoryStore::default()).unwrap();
+                let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
+                    session.records().to_vec(),
+                    false,
+                )));
+                tokio::spawn(share_snapshot_background(
+                    Arc::new(Mutex::new(ControlState::default())),
+                    snapshot,
+                    Arc::new(tokio::sync::Semaphore::new(1)),
+                    move || {
+                        started_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                        None
+                    },
+                ));
+                tokio::task::yield_now().await;
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            });
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        completed.expect("runtime shutdown waited for a stalled reader");
+    }
+
+    #[test]
+    fn share_preparation_does_not_hold_worker_locks_and_rejects_changes() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let active = active.clone();
+            let snapshot = snapshot.clone();
+            move || {
+                snapshot_for_share_with_hook(&active, &snapshot, None, || {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let mut state = active
+            .try_lock()
+            .expect("control lock held during preparation");
+        let mut worker = snapshot
+            .try_lock()
+            .expect("snapshot lock held during preparation");
+        state.token = Some(CancellationToken::new());
+        session
+            .append_user_with_images("foreground progress".into(), vec![], None)
+            .unwrap();
+        worker.record(session.records().last().unwrap());
+        state.token = None;
+        drop(worker);
+        drop(state);
+        release_tx.send(()).unwrap();
+        assert!(
+            reader
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert_eq!(
+            snapshot.lock().unwrap().records.len(),
+            session.records().len()
+        );
+    }
+
+    #[test]
+    fn transient_streaming_does_not_invalidate_large_shared_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let context = Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "x".repeat(2_000_000),
+            tools: vec![],
+        });
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(context.clone());
+        initial.share_active = Some(context.clone());
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState {
+            token: Some(CancellationToken::new()),
+            ..Default::default()
+        }));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let active = active.clone();
+            let snapshot = snapshot.clone();
+            move || {
+                snapshot_for_share_with_hook(&active, &snapshot, None, || {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            Arc::strong_count(&context) >= 5,
+            "share capture must retain references, not clone the context"
+        );
+        let _state = active
+            .try_lock()
+            .expect("control lock held during preparation");
+        let mut worker = snapshot
+            .try_lock()
+            .expect("snapshot lock held during preparation");
+        let version = worker.revision;
+        let mut summary = false;
+        worker.track_share_event(&Notification::Text("streaming"), &mut summary);
+        worker.track_share_event(&Notification::Reasoning("thinking"), &mut summary);
+        assert_eq!(worker.revision, version);
+        drop(worker);
+        drop(_state);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap().context.system_prompt,
+            context.system_prompt
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_share_disk_read_does_not_block_worker_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let read = tokio::spawn(share_snapshot_background(
+            active.clone(),
+            snapshot.clone(),
+            slots.clone(),
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .ok()?;
+                Some(stale)
+            },
+        ));
+        started_rx.await.unwrap();
+        // This runs on the same single-thread runtime while the filesystem
+        // reader is paused; a second read fails immediately without spawning.
+        let rejected =
+            share_snapshot_background(active.clone(), snapshot.clone(), slots.clone(), || {
+                panic!("reader must not start")
+            })
+            .await;
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("already being read")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            {
+                active.lock().unwrap().token = Some(CancellationToken::new());
+            }
+            tokio::task::yield_now().await;
+            session
+                .append_user_with_images("model progressed".into(), vec![], None)
+                .unwrap();
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        })
+        .await
+        .unwrap();
+        let head = session.head();
+        release_tx.send(()).unwrap();
+        let result = read.await.unwrap().unwrap();
+        assert_eq!(result.head, head);
+        session
+            .append_user_with_images("next event".into(), vec![], None)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .lock()
+                .unwrap()
+                .record(session.records().last().unwrap())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_share_uses_memory_without_reading_disk() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let result = share_snapshot_background(
+            Arc::new(Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            })),
+            Arc::new(Mutex::new(initial)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            || panic!("active share must not read the disk"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "live");
+    }
+
+    #[test]
+    fn delayed_share_disk_read_cannot_rewind_settled_worker_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState {
+            token: Some(CancellationToken::new()),
+            ..Default::default()
+        }));
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            let active = active.clone();
+            let path = path.clone();
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                read_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                snapshot_for_share(&active, &snapshot, Some(stale)).unwrap()
+            }
+        });
+        read_rx.recv().unwrap();
+        session
+            .append_user_with_images("committed while reading".into(), vec![], None)
+            .unwrap();
+        {
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        }
+        let committed_head = session.head();
+        resume_tx.send(()).unwrap();
+        let result = reader.join().unwrap();
+        assert_eq!(result.head, committed_head);
+        assert_eq!(result.context.system_prompt, "live");
+        session
+            .append_user_with_images("later event".into(), vec![], None)
+            .unwrap();
+        let mut worker = snapshot.lock().unwrap();
+        let entries = worker.record(session.records().last().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], session.head().to_string());
+        assert_eq!(entries[0]["message"]["content"], "later event");
+        assert_eq!(worker.share_snapshot().unwrap().head, session.head());
+    }
+
+    #[test]
+    fn idle_share_rejects_divergent_journal_prefix() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), vec![], None)
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut records = session.records().to_vec();
+        if let Event::User { content, .. } = &mut records[1].event {
+            *content = "changed".into();
+        } else {
+            panic!("expected user record");
+        }
+        let mut replacement = Session::from_records(records).unwrap();
+        replacement
+            .append_user_with_images("new".into(), vec![], None)
+            .unwrap();
+        snapshot.refresh_if_extends(&replacement);
+        assert_eq!(snapshot.records.len(), session.records().len());
+        assert!(
+            matches!(&snapshot.records[1].event, Event::User { content, .. } if content == "original")
+        );
+    }
+
+    #[test]
+    fn selected_catalog_survives_settling_and_uses_runtime_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "old prompt".into(),
+            tools: vec![],
+        }));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "refreshed prompt",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "request-specific prompt".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        assert_eq!(
+            snapshot.share_snapshot().unwrap().context.system_prompt,
+            "request-specific prompt"
+        );
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[tokio::test]
+    async fn running_agent_keeps_refreshed_catalog_after_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Refresh {
+            fired: AtomicBool,
+            workspace: PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl pi_rs::RegistryRefresher for Refresh {
+            async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
+                if self.fired.swap(true, Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                let mut registry = current.clone();
+                registry.register(Arc::new(CodingTools::local(&self.workspace)?))?;
+                Ok(Some(pi_rs::RegistryUpdate {
+                    registry,
+                    system_prompt: Some("refreshed runtime prompt".into()),
+                }))
+            }
+        }
+        struct Model;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Model {
+            async fn stream(&self, _: ModelRequest) -> Result<pi_rs::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("done".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.set_refresher(Arc::new(Refresh {
+            fired: AtomicBool::new(false),
+            workspace: root.path().into(),
+        }));
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "old".into(),
+            tools: vec![],
+        }));
+        let agent = pi_rs::Agent {
+            model: &Model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "old",
+            limits: Default::default(),
+        };
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut summary = false;
+        let mut saw_boundary = false;
+        agent
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    snapshot.track_share_event(&event, &mut summary);
+                    if let Notification::Committed(record) = &event {
+                        snapshot.record(record);
+                        if matches!(record.event, Event::ModelRequested { .. }) {
+                            saw_boundary = true;
+                            assert!(snapshot.share_snapshot().is_err());
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saw_boundary);
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed runtime prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn request_commit_boundary_never_exposes_mismatched_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "base".into(),
+            tools: vec![],
+        }));
+        snapshot.share_active = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "previous".into(),
+            tools: vec![],
+        }));
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: session.records()[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 1,
+                request_id: None,
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+            },
+        };
+        let mut summary = false;
+        snapshot.track_share_event(&Notification::Committed(&record), &mut summary);
+        snapshot.record(&record);
+        assert!(
+            snapshot
+                .share_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("context is changing")
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "new".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot.share_snapshot().unwrap();
+        assert_eq!(result.head, 2);
+        assert_eq!(result.context.system_prompt, "new");
+    }
 }
 
 #[cfg(test)]

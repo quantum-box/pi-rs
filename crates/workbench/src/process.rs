@@ -520,6 +520,27 @@ impl Worker {
         Ok(slot.as_mut())
     }
 
+    pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+        if slot
+            .as_ref()
+            .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
+        {
+            slot.take();
+        }
+        if slot.is_none() {
+            *slot = Some(Self::start(args, &["serve"])?);
+        }
+        let worker = slot.as_mut().expect("share worker");
+        if worker.session != args.session || !worker.persistent {
+            return Err(Error::Config(
+                "The active worker belongs to another session".into(),
+            ));
+        }
+        let id = uuid::Uuid::new_v4();
+        worker.send(json!({"type":"get_share_context", "id":id, "session":worker.session}))?;
+        Ok(id)
+    }
+
     pub(super) fn notify_session_name(
         slot: &mut Option<Self>,
         args: &Cli,
