@@ -2564,6 +2564,7 @@ impl Model for ControlModel {
 }
 struct ControlledTool {
     controls: [bool; 2],
+    handoffs: [Option<String>; 2],
     calls: Arc<Mutex<Vec<usize>>>,
     fail_second: bool,
 }
@@ -2601,7 +2602,7 @@ impl pi_rs_durable::keyed_tool::KeyedTool for ControlledTool {
             Outcome::Succeeded(format!("result {n}")).into(),
             pi_rs_durable::reset::ToolControl {
                 terminate: self.controls[n],
-                ..Default::default()
+                handoff: self.handoffs[n].clone(),
             },
         )
     }
@@ -2644,6 +2645,7 @@ fn control_options(
     let tool = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
         ControlledTool {
             controls,
+            handoffs: [None, None],
             calls,
             fail_second,
         },
@@ -2761,10 +2763,15 @@ async fn controlled_crash_worker() {
     let Ok(path) = std::env::var("PI_CONTROL_CRASH_DB") else {
         return;
     };
-    let model = Arc::new(ControlModel(Mutex::new(0)));
+    let model = Arc::new(HandoffModel(Mutex::new(vec![])));
     let mut h = Harness::open_paused(
         &path,
-        control_options(model, Arc::default(), [true, true], false),
+        handoff_options(
+            model,
+            Arc::default(),
+            [Some("crash handoff".into()), None],
+            true,
+        ),
     )
     .unwrap();
     h.install_extension(Extension {
@@ -2796,12 +2803,17 @@ async fn controlled_result_survives_process_crash() {
         .unwrap()
         .parse()
         .unwrap();
-    let model = Arc::new(ControlModel(Mutex::new(0)));
+    let model = Arc::new(HandoffModel(Mutex::new(vec![])));
     let calls = Arc::new(Mutex::new(vec![]));
     let after = Arc::new(Mutex::new(0));
     let mut h = Harness::open_paused(
         &path,
-        control_options(model.clone(), calls.clone(), [true, true], false),
+        handoff_options(
+            model.clone(),
+            calls.clone(),
+            [Some("crash handoff".into()), None],
+            true,
+        ),
     )
     .unwrap();
     install_control_hook(&h, None, after.clone());
@@ -2809,9 +2821,228 @@ async fn controlled_result_survives_process_crash() {
         .await
         .unwrap();
     assert_eq!(*calls.lock().unwrap(), vec![1]);
-    assert_eq!(*model.0.lock().unwrap(), 0);
+    assert_eq!(model.0.lock().unwrap().len(), 0);
+    assert_eq!(
+        h.conversation(id).unwrap().resets[0].handoff.as_deref(),
+        Some("crash handoff")
+    );
     assert_eq!(*after.lock().unwrap(), 1);
     assert!(
         matches!(&h.conversation(id).unwrap().submissions[0].status, Status::Done { answer } if answer == "tool answer")
     );
+}
+
+struct HandoffModel(Mutex<Vec<Vec<Message>>>);
+#[async_trait]
+impl Model for HandoffModel {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        let first = {
+            let mut requests = self.0.lock().unwrap();
+            requests.push(request.messages);
+            requests.len() == 1
+        };
+        let calls = if first {
+            (0..2)
+                .map(|n| ToolCall {
+                    id: format!("c{n}"),
+                    name: "controlled".into(),
+                    arguments: format!(r#"{{"n":{n}}}"#),
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text(
+                if first { "tool answer" } else { "done" }.into(),
+            )),
+            Ok(ModelEvent::Complete { calls, usage: None }),
+        ])
+        .boxed())
+    }
+}
+fn handoff_options(
+    model: Arc<HandoffModel>,
+    calls: Arc<Mutex<Vec<usize>>>,
+    handoffs: [Option<String>; 2],
+    terminate: bool,
+) -> Options {
+    let tool = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        ControlledTool {
+            controls: [terminate; 2],
+            handoffs,
+            calls,
+            fail_second: false,
+        },
+    ));
+    Options {
+        model,
+        tools: vec![tool.register(ReplayPolicy::Safe)],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    }
+}
+#[tokio::test]
+async fn handoff_last_call_including_empty_starts_new_context_and_preserves_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(HandoffModel(Mutex::new(vec![])));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mut h = Harness::open_paused(
+        dir.path().join("db"),
+        handoff_options(
+            model.clone(),
+            calls,
+            [Some("first".into()), Some("".into())],
+            false,
+        ),
+    )
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "old input".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = model.0.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content.is_empty()))
+    );
+    assert!(
+        !requests[1].iter().any(|m| matches!(m, Message::Tool { .. })
+            || matches!(m, Message::User { content } if content == "old input"))
+    );
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.resets.len(), 1);
+    assert_eq!(c.resets[0].handoff.as_deref(), Some(""));
+}
+#[tokio::test]
+async fn handoff_terminating_round_survives_cancel_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(HandoffModel(Mutex::new(vec![])));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let after = Arc::new(Mutex::new(0));
+    let id;
+    {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open_paused(
+            &path,
+            handoff_options(
+                model.clone(),
+                calls.clone(),
+                [Some("saved".into()), None],
+                true,
+            ),
+        )
+        .unwrap();
+        install_control_hook(&h, Some(cancel.clone()), after.clone());
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["control-hook".into()])
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+    }
+    let mut h = Harness::open_paused(
+        &path,
+        handoff_options(
+            model.clone(),
+            calls.clone(),
+            [Some("saved".into()), None],
+            true,
+        ),
+    )
+    .unwrap();
+    install_control_hook(&h, None, after.clone());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+    assert_eq!(c.resets.len(), 1);
+    assert_eq!(c.resets[0].handoff.as_deref(), Some("saved"));
+    assert!(matches!(&c.submissions[0].status, Status::Done { answer } if answer == "tool answer"));
+    assert_eq!(*after.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn handoff_waits_for_after_tools_and_survives_reopen() {
+    use pi_rs_durable::task::Task;
+    use pi_rs_durable::task_scheduler::{Handler, Registry, Step};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(HandoffModel(Mutex::new(vec![])));
+    let calls = Arc::new(Mutex::new(vec![]));
+    let after = Arc::new(Mutex::new(vec![]));
+    let handler: Arc<dyn Handler> =
+        Arc::new(|_: &Task| Ok(Step::Succeed(json!({"terminate": true}))));
+    let install = |h: &Harness| {
+        h.install_extension(Extension {
+            name: "decision".into(),
+            hooks: vec![Arc::new(TerminateRoundHook {
+                after_run: after.clone(),
+            })],
+            tasks: vec![("decision".into(), handler.clone())],
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let id;
+    {
+        let mut h = Harness::open_paused(
+            &path,
+            handoff_options(
+                model.clone(),
+                calls.clone(),
+                [Some("fresh".into()), None],
+                false,
+            ),
+        )
+        .unwrap();
+        install(&h);
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["decision".into()]).unwrap();
+        h.submit_and_run(id, None, "old".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(h.conversation(id).unwrap().resets.is_empty());
+        h.submit(id, None, "queued".into()).unwrap();
+    }
+    let mut h = Harness::open_paused(
+        &path,
+        handoff_options(
+            model.clone(),
+            calls.clone(),
+            [Some("fresh".into()), None],
+            false,
+        ),
+    )
+    .unwrap();
+    install(&h);
+    let mut registry = Registry::default();
+    registry.register_shared("decision", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    for _ in 0..200 {
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        if !h.conversation(id).unwrap().resets.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.resets.len(), 1);
+    assert_eq!(c.resets[0].handoff.as_deref(), Some("fresh"));
+    assert!(matches!(&c.submissions[0].status, Status::Done { answer } if answer == "tool answer"));
+    assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+    let snapshots = after.lock().unwrap();
+    assert!(!snapshots.is_empty());
+    assert_eq!(snapshots[0]["resets"][0]["handoff"], "fresh");
+    drop(snapshots);
+    driver.shutdown().unwrap();
 }

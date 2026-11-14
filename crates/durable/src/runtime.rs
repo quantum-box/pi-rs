@@ -475,6 +475,8 @@ pub struct Conversation {
     #[serde(default)]
     round_terminates: Vec<bool>,
     #[serde(default)]
+    round_handoffs: Vec<Option<String>>,
+    #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
     #[serde(default)]
     answer_ids: HashMap<Uuid, Uuid>,
@@ -1891,6 +1893,7 @@ impl Harness {
             application_writes: vec![],
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),
+            round_handoffs: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -2124,6 +2127,7 @@ impl Harness {
                 .collect(),
             tool_states: point.tool_states,
             round_terminates: Vec::new(),
+            round_handoffs: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
@@ -4576,6 +4580,7 @@ impl Harness {
                             };
                         } else {
                             c.round_terminates = vec![false; response.calls.len()];
+                            c.round_handoffs = vec![None; response.calls.len()];
                             c.phase = Phase::Tools {
                                 turns: turns + 1,
                                 calls: response.calls,
@@ -4789,6 +4794,9 @@ impl Harness {
                             turns: Some(turns),
                         }
                     };
+                    if children.is_empty() {
+                        place_round_handoff(&mut c);
+                    }
                     self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
                 }
                 Phase::AfterRun {
@@ -4882,6 +4890,9 @@ impl Harness {
                             answer: None,
                         })
                     };
+                    if turns.is_some() {
+                        place_round_handoff(&mut c);
+                    }
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::Tools {
@@ -5203,7 +5214,8 @@ impl Harness {
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
                     let tools = self.resolved_tools(&c)?;
-                    let control = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let control =
+                        Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
                     let reply = if let Some(reg) = tools.get(&call.name) {
                         let invocation = Invocation {
                             operation_id,
@@ -5269,20 +5281,20 @@ impl Harness {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
                                                 None => {
-                                                    control.store(
-                                                        false,
-                                                        std::sync::atomic::Ordering::Release,
-                                                    );
+                                                    *control
+                                                        .lock()
+                                                        .expect("control mutex poisoned") =
+                                                        Default::default();
                                                     Outcome::Unknown(
                                                         "local cancellation after dispatch".into(),
                                                     )
                                                     .into()
                                                 }
                                                 Some(Err(_)) => {
-                                                    control.store(
-                                                        false,
-                                                        std::sync::atomic::Ordering::Release,
-                                                    );
+                                                    *control
+                                                        .lock()
+                                                        .expect("control mutex poisoned") =
+                                                        Default::default();
                                                     Outcome::Unknown(
                                                         "parent tool panicked after dispatch"
                                                             .into(),
@@ -5291,10 +5303,8 @@ impl Harness {
                                                 }
                                             },
                                             Err(error) => {
-                                                control.store(
-                                                    false,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
+                                                *control.lock().expect("control mutex poisoned") =
+                                                    Default::default();
                                                 Outcome::Unknown(format!(
                                                     "nested tool requires reconciliation: {error}"
                                                 ))
@@ -5342,8 +5352,14 @@ impl Harness {
                             }
                         }
                         other => {
+                            // Older persisted rounds predate handoff slots.
+                            c.round_handoffs.resize(calls.len(), None);
                             if let Some(slot) = c.round_terminates.get_mut(index) {
-                                *slot = control.load(std::sync::atomic::Ordering::Acquire);
+                                let control = control.lock().expect("control mutex poisoned");
+                                *slot = control.terminate;
+                                if let Some(handoff) = c.round_handoffs.get_mut(index) {
+                                    *handoff = control.handoff.clone();
+                                }
                             }
                             c.phase = Phase::ToolFinished {
                                 turns,
@@ -6900,6 +6916,13 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         }))
 }
 
+fn place_round_handoff(c: &mut Conversation) {
+    if let Some(text) = c.round_handoffs.iter().rev().find_map(|text| text.clone()) {
+        place_reset(c, crate::reset::Reset::new(Uuid::new_v4(), Some(text)));
+    }
+    c.round_handoffs.clear();
+}
+
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     c.messages.clear();
     if let Some(message) = marker.message() {
@@ -7445,6 +7468,7 @@ mod scheduler_tests {
             application_writes: vec![],
             tool_states: HashMap::new(),
             round_terminates: Vec::new(),
+            round_handoffs: Vec::new(),
             input_modes: HashMap::new(),
             answer_ids: HashMap::new(),
             auto_compaction_attempted: false,

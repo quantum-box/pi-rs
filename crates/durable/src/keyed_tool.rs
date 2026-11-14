@@ -17,7 +17,7 @@ struct Dispatch {
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     claimed: AtomicBool,
-    control: Arc<AtomicBool>,
+    control: Arc<Mutex<crate::reset::ToolControl>>,
 }
 tokio::task_local! { static CURRENT_HOST: Dispatch; }
 
@@ -34,7 +34,7 @@ pub(crate) async fn scope<F: std::future::Future>(
         tool,
         operation_id,
         ordinary,
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(Default::default())),
         future,
     )
     .await
@@ -45,7 +45,7 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
     tool: Arc<dyn Tool>,
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
-    control: Arc<AtomicBool>,
+    control: Arc<Mutex<crate::reset::ToolControl>>,
     future: F,
 ) -> F::Output {
     let _invocation_scope = crate::nested::InvocationScope(nested.clone());
@@ -76,9 +76,8 @@ pub trait KeyedTool: Send + Sync {
         host: KeyedHost,
     ) -> ToolReply;
 
-    /// Return a control with the reply to opt into durable round termination.
-    /// Only `terminate` is applied; handoff is not supported by this adapter.
-    /// Nested calls do not terminate their caller’s model round.
+    /// Return a control with the reply to opt into durable round termination or handoff.
+    /// Nested calls do not affect their caller’s model round.
     async fn invoke_controlled(
         &self,
         arguments: Value,
@@ -196,8 +195,9 @@ impl<T: KeyedTool> Tool for KeyedToolAdapter<T> {
             .0
             .invoke_controlled(arguments, context, state, KeyedHost { ordinary, nested })
             .await;
-        let _ = CURRENT_HOST
-            .try_with(|dispatch| dispatch.control.store(control.terminate, Ordering::Release));
+        let _ = CURRENT_HOST.try_with(|dispatch| {
+            *dispatch.control.lock().expect("control mutex poisoned") = control
+        });
         reply
     }
 }

@@ -302,3 +302,114 @@ async fn writes_follow_queued_resets_across_reopen() {
     );
     s.shutdown().await.unwrap();
 }
+
+struct HandoffTool(Arc<TestTool>);
+#[async_trait]
+impl pi_rs_durable::keyed_tool::KeyedTool for HandoffTool {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+    async fn invoke(
+        &self,
+        _: serde_json::Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        unreachable!()
+    }
+    async fn invoke_controlled(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: pi_rs_durable::keyed_tool::KeyedHost,
+    ) -> (pi_rs_core::ToolReply, pi_rs_durable::reset::ToolControl) {
+        let result = self.0.invoke(args, ctx).await;
+        (
+            result.into(),
+            pi_rs_durable::reset::ToolControl {
+                handoff: Some("tool handoff".into()),
+                terminate: false,
+            },
+        )
+    }
+}
+#[tokio::test]
+async fn tool_handoff_precedes_queued_reset_and_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (model, tool) = setup();
+    let adapter = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        HandoffTool(tool.clone()),
+    ));
+    let mut options = opts(model.clone(), tool.clone());
+    options.tools = vec![adapter.register(ReplayPolicy::Safe)];
+    let mut s = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    let initial = s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    s.submit(id, None, "follow".into()).unwrap();
+    s.reset(id, Some("queued reset".into())).unwrap();
+    s.submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+        .unwrap();
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    let c = s.conversation(id).unwrap();
+    assert_eq!(
+        c.resets
+            .iter()
+            .map(|r| r.handoff.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("tool handoff"), Some("queued reset")]
+    );
+    assert_eq!(
+        users(&model.requests.lock().unwrap()[1]),
+        ["queued reset", "follow", "steer"]
+    );
+    assert!(matches!(
+        c.submissions
+            .iter()
+            .find(|x| x.id == initial)
+            .unwrap()
+            .status,
+        Status::Unanswered { .. }
+    ));
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_handoff_places_steer_in_new_context_before_followup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (model, tool) = setup();
+    let adapter = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        HandoffTool(tool.clone()),
+    ));
+    let mut options = opts(model.clone(), tool.clone());
+    options.tools = vec![adapter.register(ReplayPolicy::Safe)];
+    let mut s = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    s.submit(id, None, "follow".into()).unwrap();
+    s.submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+        .unwrap();
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    assert_eq!(
+        users(&model.requests.lock().unwrap()[1]),
+        ["tool handoff", "steer"]
+    );
+    model.release.add_permits(1);
+    acquire(&model.started).await;
+    assert_eq!(
+        users(&model.requests.lock().unwrap()[2]),
+        ["tool handoff", "steer", "follow"]
+    );
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+}
