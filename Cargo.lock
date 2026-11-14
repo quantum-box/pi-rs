@@ -722,6 +722,9 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3583,6 +3586,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

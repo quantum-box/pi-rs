@@ -4417,17 +4417,10 @@ impl Harness {
 pub struct Scheduler {
     harness: Harness,
     tasks: std::collections::HashMap<Uuid, Vec<tokio::task::JoinHandle<Result<(), Error>>>>,
-    locks: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
     cancel: CancellationToken,
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
-    conversations: Arc<std::sync::Mutex<HashMap<Uuid, ConversationControl>>>,
-}
-
-struct ConversationControl {
-    gate: Arc<std::sync::Mutex<()>>,
-    cancel: CancellationToken,
 }
 
 impl Scheduler {
@@ -4448,14 +4441,12 @@ impl Scheduler {
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
         let ids = harness.conversations()?;
         let mut scheduler = Self {
+            cancel: harness.owner.conversation_controls().root(),
             harness,
             tasks: HashMap::new(),
-            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            cancel: CancellationToken::new(),
             reporter_cancel: CancellationToken::new(),
             reporter: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
-            conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         for id in ids {
             scheduler.schedule(id);
@@ -4697,24 +4688,14 @@ impl Scheduler {
         // Prevent controls from being created and fence every existing poll while
         // discovering and committing the graph. A child may be admitted right up
         // to the transaction, so fencing a previously read graph is insufficient.
-        let mut controls = self.conversations.lock().unwrap_or_else(|e| e.into_inner());
-        let gates: Vec<_> = controls
-            .values()
-            .map(|control| control.gate.clone())
-            .collect();
-        let _guards: Vec<_> = gates
-            .iter()
-            .map(|gate| gate.lock().map_err(|_| Error::Failed))
-            .collect::<Result<_, _>>()?;
-        let affected = self.harness.abort_owned_graph(conversation, task)?;
-        for id in &affected {
-            if let Some(control) = controls.get_mut(id) {
-                control.cancel.cancel();
-                control.cancel = self.cancel.child_token();
-            }
-        }
-        drop(_guards);
-        drop(controls);
+        let owner = self.harness.owner.clone();
+        let affected = owner
+            .conversation_controls()
+            .fence(|| self.harness.abort_owned_graph(conversation, task))
+            .map_err(|error| match error {
+                durable_store::controls::FenceError::Poisoned => Error::Failed,
+                durable_store::controls::FenceError::Commit(error) => error,
+            })?;
         for id in &affected {
             self.schedule(*id);
         }
@@ -4743,16 +4724,11 @@ impl Scheduler {
     }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {
-        let lock = conversation_lock(&self.locks, id);
+        let control = self.harness.owner.conversation_controls().get(id);
+        let lock = control.worker;
+        let cancel = control.cancel;
         let mut worker = self.harness.worker();
-        let mut controls = self.conversations.lock().unwrap_or_else(|e| e.into_inner());
-        let control = controls.entry(id).or_insert_with(|| ConversationControl {
-            gate: Arc::new(std::sync::Mutex::new(())),
-            cancel: self.cancel.child_token(),
-        });
-        let cancel = control.cancel.clone();
-        worker.execution_gate = Some(control.gate.clone());
-        drop(controls);
+        worker.execution_gate = Some(control.gate);
         let task = tokio::spawn(async move {
             let _lock = lock.lock().await;
             drive_scheduled(&mut worker, id, &cancel).await
@@ -4768,9 +4744,6 @@ impl Scheduler {
     }
     fn start_reporter(&mut self) {
         let source = self.harness.worker();
-        let locks = self.locks.clone();
-        let controls = self.conversations.clone();
-        let root_cancel = self.cancel.clone();
         let cancel = self.reporter_cancel.clone();
         let errors = self.reporter_error.clone();
         self.reporter = Some(tokio::spawn(async move {
@@ -4808,31 +4781,32 @@ impl Scheduler {
                                 continue;
                             }
                             let mut worker = source.worker();
-                            let locks = locks.clone();
-                            let controls = controls.clone();
-                            let root_cancel = root_cancel.clone();
                             let task_key = key.clone();
                             active.insert(
                                 key,
                                 tokio::spawn(async move {
                                     let child = worker.reporter_child(&reporter)?;
-                                    let lock = conversation_lock(&locks, child);
+                                    let lock =
+                                        worker.owner.conversation_controls().get(child).worker;
                                     {
                                         let _guard = lock.lock().await;
-                                        let (gate, token) =
-                                            reporter_control(&controls, &root_cancel, child);
-                                        worker.execution_gate = Some(gate);
-                                        drive_scheduled(&mut worker, child, &token).await?;
+                                        let control =
+                                            worker.owner.conversation_controls().get(child);
+                                        worker.execution_gate = Some(control.gate);
+                                        drive_scheduled(&mut worker, child, &control.cancel)
+                                            .await?;
                                     }
                                     if let Some(parent) =
                                         worker.deliver_report(&task_key, &reporter)?
                                     {
-                                        let lock = conversation_lock(&locks, parent);
+                                        let lock =
+                                            worker.owner.conversation_controls().get(parent).worker;
                                         let _guard = lock.lock().await;
-                                        let (gate, token) =
-                                            reporter_control(&controls, &root_cancel, parent);
-                                        worker.execution_gate = Some(gate);
-                                        drive_scheduled(&mut worker, parent, &token).await?;
+                                        let control =
+                                            worker.owner.conversation_controls().get(parent);
+                                        worker.execution_gate = Some(control.gate);
+                                        drive_scheduled(&mut worker, parent, &control.cancel)
+                                            .await?;
                                     }
                                     Ok(())
                                 }),
@@ -4962,19 +4936,6 @@ async fn drive_scheduled(
     }
 }
 
-fn reporter_control(
-    controls: &std::sync::Mutex<HashMap<Uuid, ConversationControl>>,
-    root: &CancellationToken,
-    id: Uuid,
-) -> (Arc<std::sync::Mutex<()>>, CancellationToken) {
-    let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
-    let control = controls.entry(id).or_insert_with(|| ConversationControl {
-        gate: Arc::new(std::sync::Mutex::new(())),
-        cancel: root.child_token(),
-    });
-    (control.gate.clone(), control.cancel.clone())
-}
-
 // Serialize polling of effectful futures with the durable abort commit. Once
 // the commit wins, no subsequent poll can initiate or resume dispatch.
 async fn fenced_poll<F: std::future::Future>(
@@ -5063,18 +5024,6 @@ impl Drop for Scheduler {
         // The poller is otherwise perpetual and would keep the owner alive.
         self.reporter_cancel.cancel();
     }
-}
-
-fn conversation_lock(
-    locks: &std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
-    id: Uuid,
-) -> Arc<tokio::sync::Mutex<()>> {
-    locks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(id)
-        .or_default()
-        .clone()
 }
 
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
@@ -5951,8 +5900,7 @@ mod scheduler_tests {
         s.submit(id, None, "first".into()).unwrap();
         model.started.acquire().await.unwrap().forget();
         {
-            let controls = s.conversations.lock().unwrap();
-            let control = controls.get(&id).unwrap();
+            let control = s.harness.owner.conversation_controls().get(id);
             let _guard = control.gate.lock().unwrap();
             s.harness.request_abort(id).unwrap();
             s.cancel.cancel();
@@ -6027,8 +5975,7 @@ mod scheduler_tests {
         s.submit(id, None, "work".into()).unwrap();
         started.acquire().await.unwrap().forget();
         {
-            let controls = s.conversations.lock().unwrap();
-            let control = controls.get(&id).unwrap();
+            let control = s.harness.owner.conversation_controls().get(id);
             let _guard = control.gate.lock().unwrap();
             s.harness.request_abort(id).unwrap();
             s.cancel.cancel();

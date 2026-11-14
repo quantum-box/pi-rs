@@ -6,6 +6,7 @@
 //! A storage error during commit can leave its outcome unknown: reopen and read
 //! the database before deciding whether to retry a non-idempotent operation.
 
+pub mod controls;
 pub mod owner;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};

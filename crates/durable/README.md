@@ -24,7 +24,11 @@ does not expose upstream's submit-in-commit API.
 dispatch for that conversation; `abort_and_wait` also waits for its workers.
 Queued resets remain. Uncertain dispatched effects require reconciliation, even
 for replay-safe tools; cancellation cannot undo an external effect. Reporter
-workers use the same conversation fence as ordinary scheduled work.
+workers use the same conversation fence as ordinary scheduled work. The store owner
+shares process-local conversation gates, cancellation epochs, and worker locks
+with attached components. Controls are recreated on reopen; they do not fence
+noncooperating writers or processes. An attached task driver still cannot abort
+foreground owned conversations; this registry is a prerequisite for that work.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before

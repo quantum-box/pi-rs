@@ -1,0 +1,141 @@
+//! Process-local conversation fences, cancellation epochs and worker locks.
+//!
+//! The registry lives as long as the exclusive store owner. Always acquire the
+//! registry before poll gates; never await while holding either. Poll code must
+//! not acquire the registry while holding a gate. Acquire task gates only after
+//! these fences, and never invoke a fence while holding a task gate or poll gate. A worker lock may span async
+//! execution, but must not be held while waiting for another conversation.
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct Control {
+    pub gate: Arc<Mutex<()>>,
+    pub worker: Arc<tokio::sync::Mutex<()>>,
+    pub cancel: CancellationToken,
+}
+
+/// A poisoned poll gate or a failed durable commit.
+#[derive(Debug)]
+pub enum FenceError<E> {
+    Poisoned,
+    Commit(E),
+}
+
+#[derive(Default)]
+pub struct ConversationControls {
+    root: CancellationToken,
+    entries: Mutex<HashMap<Uuid, Control>>,
+}
+
+impl ConversationControls {
+    pub fn root(&self) -> CancellationToken {
+        self.root.clone()
+    }
+
+    pub fn get(&self, id: Uuid) -> Control {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .entry(id)
+            .or_insert_with(|| Control {
+                gate: Arc::new(Mutex::new(())),
+                worker: Arc::new(tokio::sync::Mutex::new(())),
+                cancel: self.root.child_token(),
+            })
+            .clone()
+    }
+
+    /// Fence all registered polls while `commit` discovers and persists its
+    /// affected graph. Only after a successful commit are their epochs cancelled.
+    /// The callback must not acquire a conversation control or await.
+    pub fn fence<E>(
+        &self,
+        commit: impl FnOnce() -> Result<Vec<Uuid>, E>,
+    ) -> Result<Vec<Uuid>, FenceError<E>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let gates: Vec<_> = entries.values().map(|c| c.gate.clone()).collect();
+        let _guards: Vec<_> = gates
+            .iter()
+            .map(|g| g.lock().map_err(|_| FenceError::Poisoned))
+            .collect::<Result<_, _>>()?;
+        let affected = commit().map_err(FenceError::Commit)?;
+        for id in &affected {
+            if let Some(control) = entries.get_mut(id) {
+                control.cancel.cancel();
+                control.cancel = self.root.child_token();
+            }
+        }
+        Ok(affected)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::owner::OwnedStore;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn fence_waits_for_poll_then_cancels_only_committed_epochs() {
+        let controls = Arc::new(ConversationControls::default());
+        let id = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let old = controls.get(id);
+        let untouched = controls.get(other);
+        let guard = old.gate.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let registry = controls.clone();
+        let thread = std::thread::spawn(move || {
+            registry
+                .fence(|| {
+                    tx.send(()).unwrap();
+                    Ok::<_, ()>(vec![id])
+                })
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(!old.cancel.is_cancelled());
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        assert!(old.cancel.is_cancelled());
+        assert!(!untouched.cancel.is_cancelled());
+        let fresh = controls.get(id);
+        assert!(!fresh.cancel.is_cancelled());
+        assert!(Arc::ptr_eq(&old.gate, &fresh.gate));
+        assert!(Arc::ptr_eq(&old.worker, &fresh.worker));
+        assert!(controls.fence(|| Err::<Vec<Uuid>, _>(())).is_err());
+        assert!(!fresh.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn owner_clones_share_controls_and_reopen_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let id = Uuid::from_u128(1);
+        let owner = Arc::new(OwnedStore::open(&path).unwrap());
+        let attached = owner.clone();
+        let first = owner.conversation_controls().get(id);
+        let second = attached.conversation_controls().get(id);
+        assert!(Arc::ptr_eq(&first.worker, &second.worker));
+        let worker_guard = first.worker.try_lock().unwrap();
+        assert!(second.worker.try_lock().is_err());
+        drop(worker_guard);
+        assert!(second.worker.try_lock().is_ok());
+        attached
+            .conversation_controls()
+            .fence(|| Ok::<_, ()>(vec![id]))
+            .unwrap();
+        assert!(first.cancel.is_cancelled());
+        drop(attached);
+        drop(owner);
+        let reopened = OwnedStore::open(&path).unwrap();
+        let fresh = reopened.conversation_controls().get(id);
+        assert!(!fresh.cancel.is_cancelled());
+        assert!(!Arc::ptr_eq(&first.gate, &fresh.gate));
+    }
+}

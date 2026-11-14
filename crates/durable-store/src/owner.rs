@@ -72,6 +72,7 @@ pub struct OwnedStore {
     store: Store,
     _lock: File,
     task_gate: std::sync::Mutex<()>,
+    controls: crate::controls::ConversationControls,
 }
 
 impl OwnedStore {
@@ -120,6 +121,7 @@ impl OwnedStore {
             store,
             _lock: lock,
             task_gate: std::sync::Mutex::new(()),
+            controls: crate::controls::ConversationControls::default(),
         })
     }
 
@@ -133,6 +135,11 @@ impl OwnedStore {
     /// Serializes task graph decisions without holding a lock during handlers.
     pub fn task_gate(&self) -> &std::sync::Mutex<()> {
         &self.task_gate
+    }
+
+    /// Process-local coordination shared by all users of this owner.
+    pub fn conversation_controls(&self) -> &crate::controls::ConversationControls {
+        &self.controls
     }
 
     pub fn store(&self) -> &Store {
