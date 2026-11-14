@@ -16,6 +16,7 @@ pub struct Prompt {
     pub path: PathBuf,
     pub body: String,
     pub description: String,
+    pub argument_hint: Option<String>,
 }
 #[derive(Clone, Default)]
 pub struct Resources {
@@ -47,6 +48,7 @@ struct ResourceCollision {
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
+    argument_hint: Option<String>,
     manual: bool,
 }
 impl Resources {
@@ -615,6 +617,7 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
     Ok(Prompt {
         path: path.to_owned(),
         description,
+        argument_hint: metadata.argument_hint.filter(|hint| !hint.is_empty()),
         body,
     })
 }
@@ -641,6 +644,10 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
             .map(str::to_owned),
         description: value
             .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        argument_hint: value
+            .get("argument-hint")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         manual: value
@@ -1579,6 +1586,23 @@ mod tests {
             "$@|$@suffix|$1|${1}|${bad:-literal}|$@|"
         );
     }
+    #[test]
+    fn prompt_argument_hint_uses_nonempty_string_frontmatter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (yaml, expected) in [
+            ("argument-hint: '<path> [focus]'", Some("<path> [focus]")),
+            ("argument-hint: ''", None),
+            ("argument-hint: 42", None),
+            ("other: value", None),
+        ] {
+            std::fs::write(&path, format!("---\n{yaml}\n---\nReview $1")).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.argument_hint.as_deref(), expected);
+            assert_eq!(prompt.body, "Review $1");
+        }
+    }
+
     #[test]
     fn frontmatter_reads_multiline_yaml_without_exposing_it_as_prompt() {
         let (metadata, body) = frontmatter(
