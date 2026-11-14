@@ -165,3 +165,129 @@ fn unrelated_signal_does_not_wake_typed_wait() {
         WakeResult::Pending
     );
 }
+
+#[test]
+fn typed_key_is_single_value_and_closed_after_wake_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.db");
+    let token = SignalToken::new("answer", 1).unwrap();
+    let task_id = Uuid::from_u128(101);
+    let first =
+        Signal::new_typed(Uuid::from_u128(102), task_id, &token, "k", json!({"v": 1})).unwrap();
+    let retry =
+        Signal::new_typed(Uuid::from_u128(103), task_id, &token, "k", json!({"v": 1})).unwrap();
+    {
+        let db = Store::open(&path).unwrap();
+        let store = TaskStore::new(&db);
+        for id in [task_id, Uuid::from_u128(104)] {
+            let task = Task::new(
+                id,
+                TaskOwner::Conversation(Uuid::from_u128(1)),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap();
+            store.save(&[Save::Create(&task)]).unwrap();
+        }
+        store.send_signal(&first).unwrap();
+        store.send_signal(&retry).unwrap();
+        assert!(store.signal(task_id, retry.id).unwrap().is_none());
+        assert!(matches!(
+            store.send_signal(
+                &Signal::new_typed(Uuid::from_u128(105), task_id, &token, "k", json!(2)).unwrap()
+            ),
+            Err(Error::SignalKeyMismatch)
+        ));
+        store
+            .send_signal(
+                &Signal::new_typed(first.id, Uuid::from_u128(104), &token, "k", json!(2)).unwrap(),
+            )
+            .unwrap();
+        store
+            .reserve(&store.load(task_id).unwrap().unwrap())
+            .unwrap();
+        store
+            .update(&store.load(task_id).unwrap().unwrap(), |t| {
+                t.wait(WaitFor::TypedSignal(token.key("k").unwrap()))
+            })
+            .unwrap();
+        assert!(matches!(
+            store
+                .poll_wait(&store.load(task_id).unwrap().unwrap(), 0)
+                .unwrap(),
+            WakeResult::Woken { .. }
+        ));
+    }
+    {
+        let db = Store::open(&path).unwrap();
+        let store = TaskStore::new(&db);
+        store.send_signal(&first).unwrap();
+        store.send_signal(&retry).unwrap();
+        assert!(matches!(
+            store.send_signal(
+                &Signal::new_typed(Uuid::from_u128(106), task_id, &token, "k", json!(3)).unwrap()
+            ),
+            Err(Error::SignalKeyMismatch)
+        ));
+        store
+            .reserve(&store.load(task_id).unwrap().unwrap())
+            .unwrap();
+        assert!(matches!(
+            store.update(&store.load(task_id).unwrap().unwrap(), |t| t
+                .wait(WaitFor::TypedSignal(token.key("k").unwrap()))),
+            Err(Error::SignalKeyConsumed)
+        ));
+        store
+            .update(&store.load(task_id).unwrap().unwrap(), |t| {
+                t.wait(WaitFor::TypedSignal(token.key("next").unwrap()))
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn concurrent_typed_deliveries_accept_only_one_value() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.db");
+    let db = Store::open(&path).unwrap();
+    let task_id = Uuid::new_v4();
+    let task = Task::new(
+        task_id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(&db).save(&[Save::Create(&task)]).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Store::open(&path).unwrap();
+                let token = SignalToken::new("race", 1).unwrap();
+                let signal =
+                    Signal::new_typed(Uuid::new_v4(), task_id, &token, "key", json!(i)).unwrap();
+                barrier.wait();
+                TaskStore::new(&db).send_signal(&signal)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::SignalKeyMismatch)))
+            .count(),
+        1
+    );
+}

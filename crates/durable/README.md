@@ -202,10 +202,17 @@ Current limits and differences from upstream Pi Durable:
   `Signal::new_typed`, and `WaitFor::TypedSignal(token.key(key)?)`. The stored
   signal carries its positive version; waits match kind and key regardless of
   version. Typed and legacy named waits do not consume each other's signals.
-  Legacy records and UUID-scoped idempotency remain supported. Unlike upstream,
-  these are JSON values without schema validation or migration; multiple receipt
-  IDs can use one key, and keys neither expire nor enforce one wait per key.
-  Typed keys are not supported in deadline-or-signal sleeps.
+  A task/key holds one version and JSON value: identical retries, including with
+  another receipt ID, succeed without creating another receipt; conflicting
+  values or versions are rejected. Consumed keys reject later waits. Legacy
+  records and task-scoped UUID idempotency remain supported. Unlike upstream,
+  schema validation, migration, expiry, typed deadline-or-signal sleeps, and
+  upstream delivery result variants are not implemented. Upstream reports any
+  occupied key as duplicate regardless of value; this API rejects a different
+  value or version. Same-ID retries remain successful after task termination,
+  while a new ID is rejected for a terminal task. Existing stores with
+  multiple typed records for one key are not consolidated; conflicting records
+  reject new deliveries, and any consumed record closes the key.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

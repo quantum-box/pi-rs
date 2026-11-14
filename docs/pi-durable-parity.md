@@ -96,7 +96,7 @@ original audit table below remains a historical baseline.
 
 **Queue delivery checkpoint:** Durable conversations persist independent steering and follow-up delivery modes, defaulting to one at a time for new and legacy records. `all` selects every queued input of that kind at the eligible boundary. Final boundaries settle the previous run before starting the selected successor inputs; post-tool boundaries select steers only. See [durable README](../crates/durable/README.md).
 
-**Typed signal checkpoint:** Task signals optionally record a versioned token and structured kind/key and survive reopen; matching is by kind and key. Payload schema validation, value migration, single-value keys, expiry, consumed-key rejection, and typed deadline-or-signal sleeps remain unimplemented. Legacy signals remain separate. See [typed signal tests](../crates/durable/tests/typed_task_signals.rs).
+**Typed signal checkpoint:** Task signals optionally record a versioned token and structured kind/key and survive reopen; matching is by kind and key. Typed keys hold a single value per task, reject conflicting deliveries, and close to further waits after consumption; identical retries with another ID do not create another receipt. Payload schema validation, value migration, expiry, upstream result variants, and typed deadline-or-signal sleeps remain unimplemented. Preexisting duplicate typed records are not consolidated. Legacy signals remain separate. See [typed signal tests](../crates/durable/tests/typed_task_signals.rs).
 
 | Priority / feature | Current implementation and evidence | Remaining upstream differences and verification |
 | --- | --- | --- |

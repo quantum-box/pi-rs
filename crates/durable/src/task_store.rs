@@ -28,6 +28,10 @@ pub enum Error {
     DuplicateTask,
     #[error("signal ID was already used with different content")]
     SignalMismatch,
+    #[error("typed signal key already holds different content")]
+    SignalKeyMismatch,
+    #[error("typed signal key has already been consumed")]
+    SignalKeyConsumed,
     #[error("wait contains a missing, duplicate, or non-child task")]
     InvalidChild,
     #[error("task is not waiting")]
@@ -147,7 +151,7 @@ impl Signal {
         }
     }
     /// Construct a versioned signal. IDs retain their existing task-scoped
-    /// deduplication semantics; multiple IDs may use the same signal key.
+    /// deduplication semantics; a typed key holds at most one value.
     pub fn new_typed(
         id: Uuid,
         task_id: Uuid,
@@ -244,6 +248,14 @@ impl<'a> TaskStore<'a> {
                     (&stored.task, Expected::Version(stored.version))
                 }
             };
+            if let TaskState::Waiting(WaitFor::TypedSignal(wait_key)) = task.state() {
+                for (_, entry) in self.store.list(&signal_task_prefix(task.id()))? {
+                    let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if signal.typed_key() == Some(wait_key) && signal.consumed {
+                        return Err(Error::SignalKeyConsumed);
+                    }
+                }
+            }
             let key = key(task.id());
             if !seen.insert(key.clone()) {
                 return Err(Error::DuplicateTask);
@@ -365,8 +377,56 @@ impl<'a> TaskStore<'a> {
             if target.task.is_terminal() {
                 return Err(Error::SignalTargetClosed);
             }
+            // The revision fences the scan against all concurrent insertions,
+            // including records written by versions without a typed-key index.
+            let revision_key = signal_revision_key(signal.task_id);
+            let revision = self.store.get(&revision_key)?;
+            if let Some(typed_key) = fresh.typed_key() {
+                let mut found = false;
+                for (_, entry) in self.store.list(&signal_task_prefix(signal.task_id))? {
+                    let old: Signal = serde_json::from_slice(&entry.value)?;
+                    if old.typed_key() == Some(typed_key) {
+                        if old.payload != fresh.payload || old.typed != fresh.typed {
+                            return Err(Error::SignalKeyMismatch);
+                        }
+                        found = true;
+                    }
+                }
+                if found {
+                    // Validate the snapshot even for a no-op: the caller's ID
+                    // may have been claimed while the key was being scanned.
+                    match self.store.commit(
+                        &[
+                            Check {
+                                key: k.clone(),
+                                expected: Expected::Missing,
+                            },
+                            Check {
+                                key: revision_key.clone(),
+                                expected: revision.as_ref().map_or(Expected::Missing, |entry| {
+                                    Expected::Version(entry.version)
+                                }),
+                            },
+                            Check {
+                                key: key(signal.task_id),
+                                expected: Expected::Version(target.version),
+                            },
+                        ],
+                        &[],
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(durable_store::Error::Conflict { .. }) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             match self.store.commit(
                 &[
+                    Check {
+                        key: revision_key,
+                        expected: revision
+                            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                    },
                     Check {
                         key: k.clone(),
                         expected: Expected::Missing,
@@ -453,9 +513,13 @@ impl<'a> TaskStore<'a> {
                 let mut found = None;
                 for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
-                    if !signal.consumed && signal.typed_key() == Some(key) {
-                        found = Some((k, entry.version, signal));
-                        break;
+                    if signal.typed_key() == Some(key) {
+                        if signal.consumed {
+                            return Err(Error::SignalKeyConsumed);
+                        }
+                        if found.is_none() {
+                            found = Some((k, entry.version, signal));
+                        }
                     }
                 }
                 let Some((k, version, mut signal)) = found else {
