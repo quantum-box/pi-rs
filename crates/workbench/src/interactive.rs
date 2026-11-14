@@ -7417,6 +7417,7 @@ impl EditorJobSupervisor {
                     // waiting while it owns the terminal, including a long
                     // stopped job; foregrounding Pi permits resumption.
                     let mut shell_owned_terminal = false;
+                    let mut foreground_notified = false;
                     for attempt in 0.. {
                         let mut delay = libc::timespec {
                             tv_sec: 0,
@@ -7438,14 +7439,16 @@ impl EditorJobSupervisor {
                                 libc::write(response[1], (&stopped as *const u8).cast(), 1);
                             }
                         } else if shell_owned_terminal || attempt >= 99 {
-                            if !shell_owned_terminal {
-                                let stopped = 1u8;
-                                libc::write(response[1], (&stopped as *const u8).cast(), 1);
+                            if !foreground_notified {
+                                if !shell_owned_terminal {
+                                    let stopped = 1u8;
+                                    libc::write(response[1], (&stopped as *const u8).cast(), 1);
+                                }
+                                let done = 1u8;
+                                libc::write(response[1], (&done as *const u8).cast(), 1);
+                                foreground_notified = true;
                             }
                             libc::kill(-group, libc::SIGCONT);
-                            let done = 1u8;
-                            libc::write(response[1], (&done as *const u8).cast(), 1);
-                            break;
                         }
                     }
                 }
@@ -7475,13 +7478,56 @@ impl EditorJobSupervisor {
         })
     }
 
-    fn stop_and_wait(&self) -> std::io::Result<()> {
+    fn stop_and_wait(
+        &self,
+        tty: libc::c_int,
+        editor: libc::pid_t,
+        group: libc::pid_t,
+    ) -> std::io::Result<()> {
         let command = 1u8;
         if unsafe { libc::write(self.control, (&command as *const u8).cast(), 1) } != 1 {
             return Err(std::io::Error::last_os_error());
         }
         if read_editor_supervisor_byte(self.response)? != 1 {
             return Err(std::io::Error::other("editor job supervisor stopped"));
+        }
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: self.response,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 10) };
+            if ready > 0 {
+                break;
+            }
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    editor as libc::id_t,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG,
+                )
+            };
+            let foreground = unsafe { libc::tcgetpgrp(tty) };
+            // The editor is outside Pi's job group. Mirror a background
+            // terminal stop so the shell can observe and resume the job.
+            if rc == 0
+                && unsafe { info.si_pid() } != 0
+                && matches!(unsafe { info.si_status() }, libc::SIGTTIN | libc::SIGTTOU)
+                && foreground > 0
+                && foreground != group
+                && unsafe { libc::kill(-group, libc::SIGSTOP) } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         if read_editor_supervisor_byte(self.response)? != 1 {
             return Err(std::io::Error::other("editor job supervisor stopped"));
@@ -7616,7 +7662,7 @@ impl EditorForeground {
         };
         // The helper stops the whole Pi group. Blocking for its response keeps
         // this thread from running past an asynchronously delivered SIGSTOP.
-        watchdog.stop_and_wait()?;
+        watchdog.stop_and_wait(fd, editor_group, group)?;
         drop(watchdog);
         drop(forwarder);
         // Restore the editor's terminal state before handing input back.
@@ -8152,7 +8198,8 @@ mod tests {
         let plain_launcher = test_name.contains("without_job_control_launcher");
         let background_case = test_name.contains("background_job_continues_workers");
         let background_editor = test_name.contains("background_editor_finishes");
-        let repeat_background = test_name.contains("editor_repeated_background");
+        let repeat_background = test_name.contains("editor_repeated_background")
+            || test_name.contains("shell_jobs_bg_fg");
         let worker_case = test_name.contains("pauses_owned_worker") || background_case;
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
@@ -8249,6 +8296,24 @@ mod tests {
                     // Give the editor time to block on its next terminal read.
                     std::thread::sleep(Duration::from_millis(200));
                     assert_eq!(unsafe { libc::tcgetpgrp(0) }, shell_group);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let result = unsafe {
+                            libc::waitpid(
+                                child.id() as libc::pid_t,
+                                &mut status,
+                                libc::WUNTRACED | libc::WNOHANG,
+                            )
+                        };
+                        if result > 0 && libc::WIFSTOPPED(status) {
+                            break;
+                        }
+                        assert!(
+                            result >= 0 && Instant::now() < deadline,
+                            "Pi job did not stop after editor terminal read"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                 }
             }
             if test_name.contains("supervisor_retains_terminal") {
@@ -8658,6 +8723,123 @@ mod tests {
             true,
             false,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_jobs_bg_fg_observes_editor_terminal_stops() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        const NAME: &str = "interactive::tests::shell_jobs_bg_fg_observes_editor_terminal_stops";
+        if std::env::var_os("PI_RS_EDITOR_JOB_CONTROL_TEST").is_some() {
+            editor_pty_regression(NAME, true, false);
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nstty -echo -icanon\nprintf '%s' \"$$\" > \"${0}.pid\"\nprintf started > \"$1\"\nprintf 'EDITOR_READY\\n'\ntrap 'printf x >> \"${0}.signals\"' CONT\nwhile :; do read line; done\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new("/bin/bash");
+        command
+            .args(["--noprofile", "--norc", "-i"])
+            .env("PS1", "PI_TEST_PROMPT> ")
+            .env("TERM", "dumb")
+            .env("PI_RS_EDITOR_JOB_CONTROL_TEST", &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        fn wait_for(master: &mut std::fs::File, expected: &str) -> String {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut output = Vec::new();
+            loop {
+                let mut bytes = [0; 2048];
+                if let Ok(n) = master.read(&mut bytes) {
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                if output
+                    .windows(expected.len())
+                    .any(|part| part == expected.as_bytes())
+                {
+                    return String::from_utf8_lossy(&output).into_owned();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "timed out waiting for {expected}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        wait_for(&mut master, "PI_TEST_PROMPT> ");
+        let exe = std::env::current_exe().unwrap();
+        writeln!(
+            master,
+            "{} --exact {} --nocapture",
+            shell_words::quote(&exe.to_string_lossy()),
+            NAME
+        )
+        .unwrap();
+        wait_for(&mut master, "READY_FOR_CTRL_Z");
+        master.write_all(&[26]).unwrap();
+        std::fs::write(program.with_extension("go"), "go").unwrap();
+        wait_for(&mut master, "PI_TEST_PROMPT> ");
+        for count in 1..=2 {
+            master.write_all(b"bg\n").unwrap();
+            wait_for(&mut master, "PI_TEST_PROMPT> ");
+            let until = Instant::now() + Duration::from_secs(5);
+            while std::fs::read(program.with_extension("signals")).map_or(0, |v| v.len()) < count {
+                assert!(
+                    Instant::now() < until,
+                    "editor did not resume on bg {count}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            master.write_all(b"jobs\n").unwrap();
+            let jobs = wait_for(&mut master, "PI_TEST_PROMPT> ");
+            assert!(
+                jobs.contains("Stopped"),
+                "job not stopped after bg {count}: {jobs}"
+            );
+        }
+        master.write_all(b"fg\n").unwrap();
+        wait_for(&mut master, "EDITOR_RESUMED");
+        master.write_all(&[3]).unwrap();
+        let finished = wait_for(&mut master, "PI_TEST_PROMPT> ");
+        assert!(finished.contains("PARENT_FINISHED"), "{finished}");
+        master.write_all(b"exit\n").unwrap();
+        assert!(shell.wait().unwrap().success());
     }
 
     #[cfg(unix)]
