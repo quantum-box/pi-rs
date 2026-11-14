@@ -621,3 +621,22 @@ some interrupted tasks running until a missing definition returns. Generic tasks
 are not yet fully integrated into upstream's registry, task graph, or lifecycle.
 
 Inherited entry-ID forks are supported for annotated append batches visible in the captured shared transcript chain. They use the original conversation’s recorded observation and document cut; replacement boundaries, unannotated or ambiguous chains, and materialized interior forks are rejected.
+
+### Inputs queued after a failed run
+
+`Harness::set_after_failed_run` and `Scheduler::set_after_failed_run` persist a
+per-conversation `AfterFailedRun` policy. `Keep` is the default: inputs remain
+queued until a later submission, reset, or explicit `continue_queued` releases
+them. `Continue` schedules the next queued inputs; repeated failures can drain
+the queue. `Withdraw` settles queued inputs as `Unanswered { reason:
+"run_failed" }`. Request IDs stay reserved, including after withdrawal and
+reopening. Queued application writes are not withdrawn. The policy does not
+change abort or reset behavior.
+
+The failed settlement and policy decision are committed together. Unlike
+upstream, `Continue` records an idle runnable boundary first and places inputs
+in the next commit; reopening resumes that boundary. Configuration is
+per-conversation here, rather than upstream's harness setting. Historical
+snapshots predating this setting default to `Keep`; inheritance by independently
+created or task-owned children is not implemented. Existing failure reasons and
+supported failure paths remain those of this runtime.

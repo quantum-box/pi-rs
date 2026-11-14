@@ -374,6 +374,16 @@ impl TranscriptChange {
     }
 }
 
+/// Action taken for inputs queued behind a terminal failed run.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AfterFailedRun {
+    #[default]
+    Keep,
+    Continue,
+    Withdraw,
+}
+
 /// Delivery selection at durable conversation boundaries.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
@@ -396,6 +406,8 @@ pub struct Conversation {
     pub config: Config,
     #[serde(default)]
     pub queue_modes: QueueModes,
+    #[serde(default)]
+    pub after_failed_run: AfterFailedRun,
     /// Installed extension names in execution order. Older conversations select none.
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -1146,13 +1158,33 @@ impl Harness {
         }
         let key = Self::key(state.id);
         let mut state = state.clone();
+        let failed_transition = {
+            let loaded = self.loaded.lock().map_err(|_| Error::Failed)?;
+            loaded.get(&state.id).is_some_and(|(_, base)| {
+                matches!(state.phase, Phase::FailedIdle)
+                    && !matches!(base.phase, Phase::FailedIdle)
+                    && !base.abort_requested
+                    && !state.submissions.iter().any(|s| {
+                        matches!(&s.status, Status::Unanswered { reason } if reason == "aborted")
+                            && base
+                                .submissions
+                                .iter()
+                                .any(|old| old.id == s.id && old.status == Status::Running)
+                    })
+            })
+        };
         let mut expected = expected;
         loop {
+            let mut committed = state.clone();
+            if failed_transition {
+                apply_failed_run_policy(&mut committed);
+            }
+            let state_for_commit = &committed;
             let mut prepared = if wake.is_none() && children.is_empty() && abort_tasks.is_empty() {
-                self.prepare_saves(&[(&state, expected.clone())])?
+                self.prepare_saves(&[(state_for_commit, expected.clone())])?
             } else {
                 self.prepare_conversation_save(
-                    &state,
+                    state_for_commit,
                     expected.clone(),
                     wake,
                     children,
@@ -1205,6 +1237,7 @@ impl Harness {
                     // Settings changes can race external model/tool calls. Preserve the
                     // newest values; boundary commits retry selection separately.
                     state.queue_modes = latest.queue_modes;
+                    state.after_failed_run = latest.after_failed_run;
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
@@ -1315,6 +1348,7 @@ impl Harness {
                     && matches!((serde_json::to_value((
                         &state.config,
                         &state.queue_modes,
+                        &state.after_failed_run,
                         &state.extensions,
                         &state.provider_adapter,
                         &state.allowed_tools,
@@ -1324,6 +1358,7 @@ impl Harness {
                     )), serde_json::to_value((
                             &previous.config,
                             &previous.queue_modes,
+                            &previous.after_failed_run,
                             &previous.extensions,
                             &previous.provider_adapter,
                             &previous.allowed_tools,
@@ -1344,10 +1379,10 @@ impl Harness {
                     _ => true,
                 })
                 && matches!((serde_json::to_value((
-                    &state.queue_modes, &state.extensions, &state.provider_adapter,
+                    &state.queue_modes, &state.after_failed_run, &state.extensions, &state.provider_adapter,
                     &state.allowed_tools, &state.resets, &state.application_writes, &state.tool_states,
                 )), serde_json::to_value((
-                    &previous.queue_modes, &previous.extensions, &previous.provider_adapter,
+                    &previous.queue_modes, &previous.after_failed_run, &previous.extensions, &previous.provider_adapter,
                     &previous.allowed_tools, &previous.resets, &previous.application_writes, &previous.tool_states,
                 ))), (Ok(a), Ok(b)) if a == b)
         }).map(|previous| previous.messages.len());
@@ -1427,6 +1462,10 @@ impl Harness {
                 (
                     "pi-rs/runtime/queue-modes".into(),
                     serde_json::to_value(state.queue_modes)?,
+                ),
+                (
+                    "pi-rs/runtime/after-failed-run".into(),
+                    serde_json::to_value(state.after_failed_run)?,
                 ),
                 (
                     "pi-rs/runtime/extensions".into(),
@@ -1653,6 +1692,21 @@ impl Harness {
             }
         }
     }
+    /// Persist the policy used at the next failed-run boundary.
+    pub fn set_after_failed_run(&mut self, id: Uuid, policy: AfterFailedRun) -> Result<(), Error> {
+        loop {
+            let (mut state, version) = self.load(id)?;
+            state.after_failed_run = policy;
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&state, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
+                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                other => return other,
+            }
+        }
+    }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.create_conversation_with_id(Uuid::new_v4(), config)
     }
@@ -1673,6 +1727,7 @@ impl Harness {
             id,
             config,
             queue_modes: QueueModes::default(),
+            after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
             provider_adapter: None,
             allowed_tools: None,
@@ -1856,6 +1911,12 @@ impl Harness {
             queue_modes: point
                 .documents
                 .get("pi-rs/runtime/queue-modes")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
+            after_failed_run: point
+                .documents
+                .get("pi-rs/runtime/after-failed-run")
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
@@ -5333,6 +5394,9 @@ impl Scheduler {
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
     }
+    pub fn set_after_failed_run(&mut self, id: Uuid, policy: AfterFailedRun) -> Result<(), Error> {
+        self.harness.set_after_failed_run(id, policy)
+    }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
         self.harness.create_conversation(config)
     }
@@ -6146,6 +6210,10 @@ impl Drop for Scheduler {
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
     let mut old = serde_json::to_value(base)?;
     let mut new = serde_json::to_value(latest)?;
+    old.as_object_mut()
+        .and_then(|v| v.remove("after_failed_run"));
+    new.as_object_mut()
+        .and_then(|v| v.remove("after_failed_run"));
     old.as_object_mut().and_then(|v| v.remove("queue_modes"));
     new.as_object_mut().and_then(|v| v.remove("queue_modes"));
     let old_submissions = old
@@ -6283,6 +6351,21 @@ fn finish_answer(c: &mut Conversation, answer: String) {
         }
     }
     c.phase = Phase::Idle;
+}
+fn apply_failed_run_policy(c: &mut Conversation) {
+    match c.after_failed_run {
+        AfterFailedRun::Keep => {}
+        AfterFailedRun::Continue => c.phase = Phase::Idle,
+        AfterFailedRun::Withdraw => {
+            for s in &mut c.submissions {
+                if s.status == Status::Queued {
+                    s.status = Status::Unanswered {
+                        reason: "run_failed".into(),
+                    };
+                }
+            }
+        }
+    }
 }
 fn finish_abort(c: &mut Conversation) {
     finish_failure(c, "aborted".into());
@@ -6435,6 +6518,7 @@ mod scheduler_tests {
             id: Uuid::new_v4(),
             config: config(),
             queue_modes: QueueModes::default(),
+            after_failed_run: AfterFailedRun::default(),
             extensions: vec![],
             provider_adapter: None,
             allowed_tools: None,
