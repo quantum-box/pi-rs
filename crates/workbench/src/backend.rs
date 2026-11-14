@@ -525,27 +525,21 @@ pub fn run(
 }
 
 #[cfg(any(unix, windows))]
-fn existing_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
-    existing_share_store_at(&super::config::agent_dir())
+fn worker_share_store() -> Result<pi_rs_workbench::private_share_store::Store> {
+    worker_share_store_at(&super::config::agent_dir())
 }
 
 #[cfg(any(unix, windows))]
-fn existing_share_store_at(
+fn worker_share_store_at(
     parent: &std::path::Path,
-) -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
-    use pi_rs_workbench::private_share_store::Store;
-    match std::fs::symlink_metadata(parent.join("share-context-v1")) {
-        Ok(_) => Store::open_existing(parent)?
-            .map(Some)
-            .ok_or_else(|| Error::Config("existing share cache cannot be verified".into())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+) -> Result<pi_rs_workbench::private_share_store::Store> {
+    // All workers must establish the same store before configuring a runtime;
+    // skipping an absent cache would race with another worker creating it.
+    std::fs::create_dir_all(parent)?;
+    Ok(pi_rs_workbench::private_share_store::Store::open(parent)?)
 }
 
-// This invalidation-only bridge does not publish snapshots. Before adding a
-// publisher, cache creation and absent-cache startup must share a process-wide
-// protocol; otherwise a cache created after the absence check can go stale.
+// Invalidation-only bridge: it does not publish or serve snapshots yet.
 #[cfg(any(unix, windows))]
 fn invalidate_existing_share_generation<'a>(
     store: Option<&'a pi_rs_workbench::private_share_store::Store>,
@@ -570,10 +564,10 @@ async fn run_worker(
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     #[cfg(any(unix, windows))]
-    let share_store = existing_share_store()?;
+    let share_store = worker_share_store()?;
     #[cfg(any(unix, windows))]
     let mut share_generation =
-        invalidate_existing_share_generation(share_store.as_ref(), &args.session)?;
+        invalidate_existing_share_generation(Some(&share_store), &args.session)?;
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
@@ -858,8 +852,7 @@ async fn run_worker(
                 // new one is acquired successfully.
                 #[cfg(any(unix, windows))]
                 {
-                    let next =
-                        invalidate_existing_share_generation(share_store.as_ref(), &session)?;
+                    let next = invalidate_existing_share_generation(Some(&share_store), &session)?;
                     share_generation = next;
                 }
                 share_ready.send_replace(false);
@@ -2018,12 +2011,16 @@ mod share_context_tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn worker_rejects_unverifiable_existing_cache_without_creating_one() {
+    fn worker_creates_store_and_rejects_unverifiable_existing_cache() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(existing_share_store_at(directory.path()).unwrap().is_none());
-        assert!(!directory.path().join("share-context-v1").exists());
-        std::fs::create_dir(directory.path().join("share-context-v1")).unwrap();
-        assert!(existing_share_store_at(directory.path()).is_err());
+        let parent = directory.path().join("agent");
+        let store = worker_share_store_at(&parent).unwrap();
+        assert!(parent.join("share-context-v1").is_dir());
+        drop(store);
+        let other = directory.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("share-context-v1"), b"not a directory").unwrap();
+        assert!(worker_share_store_at(&other).is_err());
     }
 
     #[cfg(any(unix, windows))]
