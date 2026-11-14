@@ -404,12 +404,63 @@ enum TranscriptChange {
         commit: u64,
         origin: Uuid,
     },
+    /// A compaction projection of the immediately preceding active transcript.
+    /// Retained provenance is derived from that link, never from message text.
+    ReplaceCompacted {
+        messages: Vec<Message>,
+        system_end: usize,
+        first_kept: usize,
+        summary_id: Uuid,
+        commit: u64,
+        origin: Uuid,
+        histories: Vec<Option<MessageHistory>>,
+    },
 }
 
 type TranscriptChangeParts = (Vec<Message>, bool, Option<(Vec<Uuid>, u64, Uuid)>);
 
 impl TranscriptChange {
+    fn compacted_histories(&self) -> Result<Option<&[Option<MessageHistory>]>, Error> {
+        let Self::ReplaceCompacted {
+            messages,
+            system_end,
+            first_kept,
+            summary_id,
+            commit,
+            origin,
+            histories,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::new();
+        if *system_end >= *first_kept
+            || *system_end >= messages.len()
+            || histories.len() != messages.len()
+            || summary_id.is_nil()
+            || origin.is_nil()
+            || *commit == 0
+            || !matches!(messages.get(*system_end), Some(Message::User { .. }))
+            || histories[*system_end].as_ref()
+                != Some(&MessageHistory {
+                    id: *summary_id,
+                    commit: *commit,
+                    origin: *origin,
+                    commit_boundary: *system_end + 1 == messages.len(),
+                })
+            || histories
+                .iter()
+                .flatten()
+                .any(|h| h.id.is_nil() || h.origin.is_nil() || h.commit == 0 || !seen.insert(h.id))
+        {
+            return Err(Error::Invalid(
+                "invalid compacted transcript metadata".into(),
+            ));
+        }
+        Ok(Some(histories))
+    }
     fn parts(self) -> Result<TranscriptChangeParts, Error> {
+        self.compacted_histories()?;
         let (messages, base, metadata) = match self {
             Self::Append(messages) => (messages, false, None),
             Self::Replace(messages) => (messages, true, None),
@@ -439,6 +490,7 @@ impl TranscriptChange {
                 commit,
                 origin,
             } => (messages, true, Some((ids, commit, origin))),
+            Self::ReplaceCompacted { messages, .. } => (messages, true, None),
         };
         if let Some((ids, commit, origin)) = &metadata {
             let unique: std::collections::HashSet<_> = ids.iter().collect();
@@ -708,7 +760,7 @@ pub struct PositionedMessage {
     pub history: Option<MessageHistory>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageHistory {
     pub id: Uuid,
     pub commit: u64,
@@ -1502,11 +1554,19 @@ impl Harness {
         mut cursor: crate::transcript::Cursor,
     ) -> Result<Vec<Message>, Error> {
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let head = cursor.clone();
         let mut parts = Vec::new();
         loop {
             let page = transcript.read(&cursor, std::num::NonZeroUsize::new(128).unwrap())?;
             for record in page.records {
                 let change: TranscriptChange = serde_json::from_value(record.value)?;
+                if matches!(&change, TranscriptChange::ReplaceCompacted { .. }) {
+                    return Ok(self
+                        .resolved_occurrences(id, head)?
+                        .into_iter()
+                        .map(|(message, _)| message)
+                        .collect());
+                }
                 let (messages, base, _) = change.parts()?;
                 parts.push(messages);
                 if base {
@@ -1794,12 +1854,76 @@ impl Harness {
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
-        let change = match old {
-            Some(previous) if !create && state.messages == previous.messages => None,
-            Some(previous) if !create && state.messages.starts_with(&previous.messages) => Some(
-                TranscriptChange::Append(state.messages[previous.messages.len()..].to_vec()),
-            ),
-            _ => Some(TranscriptChange::Replace(state.messages.clone())),
+        let compacted = old.and_then(|previous| {
+            if create || previous.context_generation == state.context_generation {
+                return None;
+            }
+            let Phase::CompactionPlacement { result, .. } = &previous.phase else {
+                return None;
+            };
+            if result
+                .apply_in_context(&previous.messages, previous.context_generation)
+                .ok()
+                .as_ref()
+                != Some(&state.messages)
+            {
+                return None;
+            }
+            Some(result.retained_range())
+        });
+        let change = if let Some((system_end, first_kept)) = compacted {
+            let previous = old.unwrap();
+            let (source, created) =
+                self.resolved_occurrences_with_ids(state.id, previous.transcript.clone().unwrap())?;
+            if source
+                .iter()
+                .map(|(message, _)| message)
+                .ne(previous.messages.iter())
+            {
+                return Err(Error::Invalid(
+                    "compaction source transcript changed".into(),
+                ));
+            }
+            let summary_id = Uuid::new_v4();
+            if created.contains(&summary_id) {
+                return Err(Error::Invalid(
+                    "compaction occurrence identity collision".into(),
+                ));
+            }
+            let mut histories: Vec<_> = source[..system_end]
+                .iter()
+                .map(|(_, history)| history.clone())
+                .collect();
+            histories.push(Some(MessageHistory {
+                id: summary_id,
+                commit,
+                origin: state.id,
+                commit_boundary: system_end + 1 == state.messages.len(),
+            }));
+            histories.extend(
+                source[first_kept..]
+                    .iter()
+                    .map(|(_, history)| history.clone()),
+            );
+            Some(TranscriptChange::ReplaceCompacted {
+                messages: state.messages.clone(),
+                system_end,
+                first_kept,
+                summary_id,
+                commit,
+                origin: state.id,
+                histories,
+            })
+        } else {
+            match old {
+                Some(previous) if !create && state.messages == previous.messages => None,
+                Some(previous) if !create && state.messages.starts_with(&previous.messages) => {
+                    Some(TranscriptChange::Append(
+                        state.messages[previous.messages.len()..].to_vec(),
+                    ))
+                }
+                _ => Some(TranscriptChange::Replace(state.messages.clone())),
+            }
         };
         // An interior cut is provable only when every forked state field is
         // unchanged across the entire atomic append. Never infer this for old
@@ -1888,6 +2012,7 @@ impl Harness {
                     commit,
                     origin: state.id,
                 },
+                change @ TranscriptChange::ReplaceCompacted { .. } => change,
                 _ => unreachable!(),
             }
         });
@@ -2846,13 +2971,32 @@ impl Harness {
             .first()
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        let compacted_metadata = match &change {
+            TranscriptChange::ReplaceCompacted {
+                commit,
+                origin,
+                system_end,
+                ..
+            } => {
+                let occurrences = self.resolved_occurrences(id, position.cursor.clone())?;
+                Some((*commit, *origin, *system_end, occurrences))
+            }
+            _ => None,
+        };
         let stable_prefix = match &change {
             TranscriptChange::AppendV3 { stable_prefix, .. }
             | TranscriptChange::AppendV4 { stable_prefix, .. } => Some(*stable_prefix),
             _ => None,
         };
         let (messages, _, metadata) = change.parts()?;
-        let (_, commit, origin) = metadata.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let (commit, origin) = metadata
+            .map(|(_, commit, origin)| (commit, origin))
+            .or_else(|| {
+                compacted_metadata
+                    .as_ref()
+                    .map(|(commit, origin, _, _)| (*commit, *origin))
+            })
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
         if origin != id {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
@@ -2907,6 +3051,18 @@ impl Harness {
                             return Err(crate::fork::Error::InvalidSnapshot.into());
                         }
                     }
+                    if let Some((_, _, summary_index, occurrences)) = &compacted_metadata {
+                        if count - 1 != *summary_index {
+                            let (message, history) = occurrences
+                                .get(count - 1)
+                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                            let history = history
+                                .as_ref()
+                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                            let original = self.original_occurrence_position(history, message)?;
+                            return self.fork_at_position(history.origin, original);
+                        }
+                    }
                     if count == messages.len() {
                         return self.fork_at(id, record.cursor);
                     }
@@ -2927,6 +3083,83 @@ impl Harness {
         }
         Err(crate::fork::Error::InvalidSnapshot.into())
     }
+    fn original_occurrence_position(
+        &self,
+        history: &MessageHistory,
+        expected: &Message,
+    ) -> Result<ViewCursor, Error> {
+        let observer = crate::observer::Observer::new(self.owner.store(), history.origin);
+        let after = history
+            .commit
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let page = observer.read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let record = page
+            .records
+            .first()
+            .filter(|record| record.cursor.0 == history.commit)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let cursor: Option<crate::transcript::Cursor> = serde_json::from_value(
+            record
+                .value
+                .get("_transcript")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        let cursor = cursor.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), history.origin);
+        let batch = transcript.read(&cursor, std::num::NonZeroUsize::MIN)?;
+        let change: TranscriptChange = serde_json::from_value(
+            batch
+                .records
+                .first()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?
+                .value
+                .clone(),
+        )?;
+        let index = match &change {
+            TranscriptChange::ReplaceCompacted {
+                messages,
+                system_end,
+                summary_id,
+                commit,
+                origin,
+                ..
+            } => {
+                self.resolved_occurrences(history.origin, cursor.clone())?;
+                if *summary_id != history.id
+                    || *commit != history.commit
+                    || *origin != history.origin
+                    || messages.get(*system_end) != Some(expected)
+                    || history.commit_boundary != (*system_end + 1 == messages.len())
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                *system_end
+            }
+            _ => {
+                let (messages, _, metadata) = change.parts()?;
+                let (ids, commit, origin) = metadata.ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let index = ids
+                    .iter()
+                    .position(|id| *id == history.id)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if commit != history.commit
+                    || origin != history.origin
+                    || messages.get(index) != Some(expected)
+                    || history.commit_boundary != (index + 1 == messages.len())
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                index
+            }
+        };
+        Ok(ViewCursor {
+            cursor,
+            remaining: Some(index + 1),
+        })
+    }
+
     /// Fork at the exact committed boundary of a message occurrence.
     /// Interior messages require a proven safe append. Inherited entries must
     /// be visible in the captured shared chain and have an origin snapshot.
@@ -2958,8 +3191,35 @@ impl Harness {
                 let Some(batch) = batch.records.first() else {
                     continue;
                 };
-                let (_, _, metadata) =
-                    serde_json::from_value::<TranscriptChange>(batch.value.clone())?.parts()?;
+                let change = serde_json::from_value::<TranscriptChange>(batch.value.clone())?;
+                if let TranscriptChange::ReplaceCompacted {
+                    system_end,
+                    summary_id,
+                    commit,
+                    origin,
+                    histories,
+                    ..
+                } = &change
+                {
+                    if histories
+                        .iter()
+                        .flatten()
+                        .any(|history| history.id == entry_id)
+                    {
+                        self.resolved_occurrences(id, reference.clone())?;
+                    }
+                    if *origin == id && *summary_id == entry_id {
+                        if local_match.is_some() || *commit != record.cursor.0 {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        local_match = Some(ViewCursor {
+                            cursor: reference.clone(),
+                            remaining: Some(*system_end + 1),
+                        });
+                    }
+                    continue;
+                }
+                let (_, _, metadata) = change.parts()?;
                 let Some((ids, commit, origin)) = metadata else {
                     continue;
                 };
@@ -2999,6 +3259,27 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             };
             let change: TranscriptChange = serde_json::from_value(batch.value.clone())?;
+            if matches!(&change, TranscriptChange::ReplaceCompacted { .. }) {
+                let active = self.resolved_occurrences(id, position.clone())?;
+                if let Some((message, history)) = active
+                    .iter()
+                    .find(|(_, history)| history.as_ref().is_some_and(|h| h.id == entry_id))
+                {
+                    let history = history.as_ref().unwrap();
+                    let original = self.original_occurrence_position(history, message)?;
+                    if history.origin == id {
+                        if local_match.as_ref().is_none_or(|local| {
+                            local.cursor != original.cursor || local.remaining != original.remaining
+                        }) {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                    } else if local_match.is_some() || found.is_some() {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    return self.fork_at_position(history.origin, original);
+                }
+                break;
+            }
             let (_, base, metadata) = change.parts()?;
             let Some((ids, _commit, origin)) = metadata else {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
@@ -3205,6 +3486,169 @@ impl Harness {
         )
     }
 
+    /// Resolve provenance through immutable predecessor links. A compacted
+    /// replacement is accepted only when its retained messages are exactly the
+    /// stated projection of its immediate predecessor.
+    fn resolved_occurrences(
+        &self,
+        id: Uuid,
+        cursor: crate::transcript::Cursor,
+    ) -> Result<Vec<(Message, Option<MessageHistory>)>, Error> {
+        Ok(self.resolved_occurrences_with_ids(id, cursor)?.0)
+    }
+
+    fn resolved_occurrences_with_ids(
+        &self,
+        id: Uuid,
+        mut cursor: crate::transcript::Cursor,
+    ) -> Result<
+        (
+            Vec<(Message, Option<MessageHistory>)>,
+            std::collections::HashSet<Uuid>,
+        ),
+        Error,
+    > {
+        let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
+        let mut changes = Vec::new();
+        loop {
+            let mut page = transcript.read(&cursor, std::num::NonZeroUsize::MIN)?;
+            let Some(record) = page.records.pop() else {
+                break;
+            };
+            changes.push((
+                cursor.clone(),
+                serde_json::from_value::<TranscriptChange>(record.value)?,
+            ));
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        changes.reverse();
+        let mut active: Vec<(Message, Option<MessageHistory>)> = Vec::new();
+        let mut created = std::collections::HashSet::new();
+        for (position, change) in changes {
+            change.compacted_histories()?;
+            if let TranscriptChange::ReplaceCompacted {
+                messages,
+                system_end,
+                first_kept,
+                summary_id,
+                commit,
+                origin,
+                histories,
+            } = change
+            {
+                self.verify_occurrence_origin(id, &position, origin, commit)?;
+                if summary_id.is_nil()
+                    || origin.is_nil()
+                    || commit == 0
+                    || system_end >= first_kept
+                    || first_kept >= active.len()
+                    || active[..system_end]
+                        .iter()
+                        .any(|(message, _)| !matches!(message, Message::System { .. }))
+                    || !matches!(
+                        &active[first_kept].0,
+                        Message::User { .. } | Message::UserWithImages { .. }
+                    )
+                    || messages.len() != system_end + 1 + active.len() - first_kept
+                    || !messages[..system_end]
+                        .iter()
+                        .zip(&active[..system_end])
+                        .all(|(m, (old, _))| m == old)
+                    || !messages[system_end + 1..]
+                        .iter()
+                        .zip(&active[first_kept..])
+                        .all(|(m, (old, _))| m == old)
+                    || !created.insert(summary_id)
+                {
+                    return Err(Error::Invalid(
+                        "invalid compacted transcript provenance".into(),
+                    ));
+                }
+                let mut next = active[..system_end].to_vec();
+                next.push((
+                    messages[system_end].clone(),
+                    Some(MessageHistory {
+                        id: summary_id,
+                        commit,
+                        origin,
+                        commit_boundary: system_end + 1 == messages.len(),
+                    }),
+                ));
+                next.extend_from_slice(&active[first_kept..]);
+                if next.iter().map(|(_, history)| history).ne(histories.iter()) {
+                    return Err(Error::Invalid(
+                        "compacted transcript provenance mismatch".into(),
+                    ));
+                }
+                active = next;
+            } else {
+                let (messages, base, metadata) = change.parts()?;
+                if let Some((_, commit, origin)) = &metadata {
+                    self.verify_occurrence_origin(id, &position, *origin, *commit)?;
+                }
+                if base {
+                    active.clear();
+                }
+                let n = messages.len();
+                for (index, message) in messages.into_iter().enumerate() {
+                    let history = if let Some((ids, commit, origin)) = &metadata {
+                        if !created.insert(ids[index]) {
+                            return Err(Error::Invalid(
+                                "duplicate transcript occurrence identity".into(),
+                            ));
+                        }
+                        Some(MessageHistory {
+                            id: ids[index],
+                            commit: *commit,
+                            origin: *origin,
+                            commit_boundary: index + 1 == n,
+                        })
+                    } else {
+                        None
+                    };
+                    active.push((message, history));
+                }
+            }
+        }
+        Ok((active, created))
+    }
+
+    fn verify_occurrence_origin(
+        &self,
+        transcript_id: Uuid,
+        position: &crate::transcript::Cursor,
+        origin: Uuid,
+        commit: u64,
+    ) -> Result<(), Error> {
+        let after = commit
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let page = crate::observer::Observer::new(self.owner.store(), origin)
+            .read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let record = page
+            .records
+            .first()
+            .filter(|record| record.cursor.0 == commit)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let source: Option<crate::transcript::Cursor> = serde_json::from_value(
+            record
+                .value
+                .get("_transcript")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        let source = source.ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let mut rebound = serde_json::to_value(source)?;
+        rebound["transcript"] = serde_json::to_value(transcript_id)?;
+        if serde_json::from_value::<crate::transcript::Cursor>(rebound)? != *position {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        Ok(())
+    }
+
     /// Read a position inclusively, with stable positions for every returned message.
     /// A position is scoped to its conversation and is not a fork authorization.
     pub fn view_positioned_page(
@@ -3224,6 +3668,9 @@ impl Harness {
                 break;
             };
             let change: TranscriptChange = serde_json::from_value(record.value)?;
+            let histories = change
+                .compacted_histories()?
+                .map(|histories| histories.to_vec());
             let (messages, base, metadata) = change.parts()?;
             let batch_len = messages.len();
             let end = position.remaining.unwrap_or(messages.len());
@@ -3244,13 +3691,18 @@ impl Harness {
                             cursor: position.cursor.clone(),
                             remaining: Some(index + 1),
                         },
-                        history: metadata
+                        history: histories
                             .as_ref()
-                            .map(|(ids, commit, origin)| MessageHistory {
-                                id: ids[index],
-                                commit: *commit,
-                                origin: *origin,
-                                commit_boundary: index + 1 == batch_len,
+                            .and_then(|entries| entries[index].clone())
+                            .or_else(|| {
+                                metadata
+                                    .as_ref()
+                                    .map(|(ids, commit, origin)| MessageHistory {
+                                        id: ids[index],
+                                        commit: *commit,
+                                        origin: *origin,
+                                        commit_boundary: index + 1 == batch_len,
+                                    })
                             }),
                     }),
             );

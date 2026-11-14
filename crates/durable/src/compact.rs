@@ -215,6 +215,9 @@ impl Preparation {
 }
 
 impl CompactionResult {
+    pub(crate) fn retained_range(&self) -> (usize, usize) {
+        (self.preparation.system_end, self.preparation.first_kept)
+    }
     /// A conservative check for a displaced selection. The host must compare
     /// and commit the settlement in the same transaction as any context edit.
     pub(crate) fn is_stale(&self, current: &[Message], generation: Option<Uuid>) -> bool {

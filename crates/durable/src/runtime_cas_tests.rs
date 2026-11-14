@@ -1380,6 +1380,322 @@ fn legacy_batches_are_readable_but_cannot_claim_entry_history_or_fork() {
 }
 
 #[test]
+fn compacted_replacement_rejects_collision_and_unproven_tail() {
+    for case in 0..3 {
+        let collision = case == 0;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages = vec![
+            Message::User {
+                content: "old".into(),
+            },
+            Message::User {
+                content: "kept".into(),
+            },
+        ];
+        h.save(&state, Expected::Version(version)).unwrap();
+        let prior = h
+            .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+            .unwrap();
+        let used = prior.entries[0].history.as_ref().unwrap().id;
+        let other = prior.entries[1].history.clone();
+        let (mut state, _) = h.load(id).unwrap();
+        let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+        let mut observation = crate::observer::Observer::new(h.owner.store(), id)
+            .prepare_append(&serde_json::json!({}))
+            .unwrap();
+        let summary_id = if collision { used } else { Uuid::new_v4() };
+        let change = TranscriptChange::ReplaceCompacted {
+            messages: vec![
+                Message::User {
+                    content: "summary".into(),
+                },
+                Message::User {
+                    content: if case == 1 { "forged" } else { "kept" }.into(),
+                },
+            ],
+            system_end: 0,
+            first_kept: 1,
+            summary_id,
+            commit: observation.cursor.0,
+            origin: id,
+            histories: vec![
+                Some(MessageHistory {
+                    id: summary_id,
+                    commit: observation.cursor.0,
+                    origin: id,
+                    commit_boundary: false,
+                }),
+                if case == 2 {
+                    other
+                } else {
+                    prior.entries[0].history.clone()
+                },
+            ],
+        };
+        let (batch, cursor) = transcript
+            .prepare_write(&serde_json::to_value(change).unwrap(), false)
+            .unwrap();
+        observation
+            .set_value(&serde_json::json!({"_transcript": cursor}))
+            .unwrap();
+        state.transcript = Some(cursor);
+        state.messages.clear();
+        let mut mutations = batch.mutations;
+        mutations.push(Mutation::Put {
+            key: Harness::key(id),
+            value: serde_json::to_vec(&state).unwrap(),
+        });
+        let mut checks = batch.checks;
+        checks.extend(observation.checks);
+        mutations.extend(observation.mutations);
+        h.owner.store().commit(&checks, &mutations).unwrap();
+        if collision {
+            assert!(
+                h.view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+                    .is_err()
+            );
+        }
+        assert!(h.conversation(id).is_err());
+        let attempted = if case == 2 {
+            prior.entries[1].history.as_ref().unwrap().id
+        } else {
+            used
+        };
+        assert!(h.fork_by_entry_id(id, attempted).is_err());
+    }
+}
+
+#[tokio::test]
+async fn compaction_missing_original_observation_fails_closed() {
+    struct Summary;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for Summary {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            Ok(crate::extension::BeforeCompact::Summary("summary".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    h.install_extension(crate::extension::Extension {
+        name: "summary".into(),
+        hooks: vec![Arc::new(Summary)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["summary".into()]).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages = vec![
+        Message::User {
+            content: "old".into(),
+        },
+        Message::User {
+            content: "kept".into(),
+        },
+    ];
+    h.save(&state, Expected::Version(version)).unwrap();
+    let original = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries[0]
+        .history
+        .clone()
+        .unwrap();
+    assert!(h.request_compaction(id, 0).unwrap());
+    h.resume(&CancellationToken::new()).await.unwrap();
+    let mut key = b"durable/observer/".to_vec();
+    key.extend_from_slice(id.as_bytes());
+    key.extend_from_slice(b"/r");
+    key.extend_from_slice(&original.commit.to_be_bytes());
+    h.owner
+        .store()
+        .commit(&[], &[Mutation::Delete { key }])
+        .unwrap();
+    assert!(h.conversation(id).is_err());
+    assert!(h.fork_by_entry_id(id, original.id).is_err());
+}
+
+#[tokio::test]
+async fn repeated_compaction_retains_original_provenance() {
+    struct Summary;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for Summary {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            Ok(crate::extension::BeforeCompact::Summary("summary".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    h.install_extension(crate::extension::Extension {
+        name: "summary".into(),
+        hooks: vec![Arc::new(Summary)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["summary".into()]).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages = vec![
+        Message::User {
+            content: "old".repeat(100),
+        },
+        Message::User {
+            content: "kept".into(),
+        },
+    ];
+    h.save(&state, Expected::Version(version)).unwrap();
+    let history = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries[0]
+        .history
+        .clone()
+        .unwrap();
+    assert!(h.request_compaction(id, 0).unwrap());
+    h.resume(&CancellationToken::new()).await.unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.push(Message::User {
+        content: "new".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let state = h.conversation(id).unwrap();
+    let index = state
+        .messages
+        .iter()
+        .position(|m| matches!(m, Message::User { content } if content == "kept"))
+        .unwrap();
+    let budget = (0..1000)
+        .find(|budget| {
+            crate::compact::prepare(&state.messages, "test", 10, *budget, None)
+                .unwrap()
+                .is_some_and(|p| {
+                    p.hook_input(crate::extension::CompactionReason::Manual)
+                        .first_kept
+                        == index
+                })
+        })
+        .unwrap();
+    assert!(h.request_compaction(id, budget).unwrap());
+    h.resume(&CancellationToken::new()).await.unwrap();
+    let retained = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "kept"))
+        .unwrap()
+        .history
+        .unwrap();
+    assert_eq!(retained, history);
+    let fork = h.fork_by_entry_id(id, history.id).unwrap();
+    assert!(
+        h.conversation(fork)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "kept"))
+    );
+}
+
+#[tokio::test]
+async fn compaction_keeps_legacy_occurrences_unidentified() {
+    struct Summary;
+    #[async_trait::async_trait]
+    impl crate::extension::Hook for Summary {
+        async fn before_compact(
+            &self,
+            _: &crate::extension::CompactionInput,
+            _: &crate::extension::Context<'_>,
+        ) -> Result<crate::extension::BeforeCompact, String> {
+            Ok(crate::extension::BeforeCompact::Summary("summary".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(crate::extension::Extension {
+            name: "summary".into(),
+            hooks: vec![Arc::new(Summary)],
+            ..Default::default()
+        })
+        .unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        h.select_extensions(id, vec!["summary".into()]).unwrap();
+        let (mut state, _) = h.load(id).unwrap();
+        let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+        let change = TranscriptChange::Replace(vec![
+            Message::User {
+                content: "old".into(),
+            },
+            Message::User {
+                content: "kept".into(),
+            },
+        ]);
+        let (batch, cursor) = transcript
+            .prepare_write(&serde_json::to_value(change).unwrap(), false)
+            .unwrap();
+        state.transcript = Some(cursor);
+        state.messages.clear();
+        let mut mutations = batch.mutations;
+        mutations.push(Mutation::Put {
+            key: Harness::key(id),
+            value: serde_json::to_vec(&state).unwrap(),
+        });
+        h.owner.store().commit(&batch.checks, &mutations).unwrap();
+        assert!(h.request_compaction(id, 0).unwrap());
+        h.resume(&CancellationToken::new()).await.unwrap();
+    }
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let kept = entries
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "kept"))
+        .unwrap();
+    assert!(kept.history.is_none());
+    assert!(h.fork_at_position(id, kept.position.clone()).is_err());
+}
+
+#[test]
 fn malformed_entry_metadata_fails_closed() {
     let id = Uuid::new_v4();
     let message = Message::User {

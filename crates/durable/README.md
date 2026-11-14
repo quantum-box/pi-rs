@@ -56,10 +56,21 @@ fork-state changes, configuration-changing batches containing any tool call or
 result, legacy batches without the required proof, and interior replacement
 batches fail closed. The document revision must also be unchanged across the
 commit, even if an unrelated scope caused the change.
-Replacement batches assign fresh occurrence IDs, and an interior fork currently
-materializes a new transcript with fresh IDs. Annotated occurrences in a shared
-immutable chain, including complete replacement boundaries, may be selected by ID
-using their origin’s historical cut. See the parity document for remaining limitations.
+Proven compaction replacements retain each kept message's occurrence ID and
+original commit, origin and boundary; their new summary has a new ID. Other
+replacement batches assign fresh IDs, and an interior fork currently materializes
+a new transcript with fresh IDs. Legacy messages without provenance stay
+unidentified. Loading a compacted context and authorizing a fork verify the
+predecessor projection, original observation links and ID uniqueness; these
+checks scan the retained transcript history and are unbounded. Positioned page
+reads remain bounded and expose structurally checked metadata; the fork APIs
+perform the full authorization. Annotated occurrences in a shared immutable
+chain can be selected by ID using their origin’s historical cut. See the parity
+document for remaining limitations. The new replacement record is not readable
+by older pi-rs versions; use a compatible version when reopening a store after
+such a compaction.
+Collision checks cover the predecessor chain; the store has no global index
+of occurrence IDs across unrelated conversation branches.
 
 The runtime can also fork a settled conversation at its current state or a
 supported historical snapshot cursor, and performs explicit idle compaction. It also
@@ -896,7 +907,7 @@ policies remain pi-rs extensions and can differ from upstream, including leaving
 some interrupted tasks running until a missing definition returns. Generic tasks
 are not yet fully integrated into upstream's registry, task graph, or lifecycle.
 
-Inherited entry-ID forks are supported for annotated append batches visible in the captured shared transcript chain. They use the original conversation’s recorded observation and document cut; replacement boundaries, unannotated or ambiguous chains, and materialized interior forks are rejected.
+Inherited entry-ID forks are supported for annotated occurrences visible in the captured shared transcript chain, including proven compaction copies. They use the original conversation’s recorded observation and document cut; unannotated or ambiguous chains and materialized interior forks are rejected.
 
 ### Inputs queued after a failed run
 

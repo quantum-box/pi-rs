@@ -260,6 +260,188 @@ async fn bounded_conversation_history_reopens_and_forks_at_captured_cursor() {
     assert!(h.history_head(uuid::Uuid::new_v4()).is_err());
 }
 #[tokio::test]
+async fn compaction_provenance_survives_concurrent_input_admission() {
+    use pi_rs_durable::runtime::Scheduler;
+    use tokio::sync::Semaphore;
+    struct Gated {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+    #[async_trait]
+    impl Model for Gated {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                self.started.add_permits(1);
+                let release = self.release.clone();
+                Ok(stream::once(async move { release.acquire().await.unwrap().forget(); Ok(ModelEvent::Text("checkpoint".into())) }).chain(stream::iter(vec![Ok(ModelEvent::Complete { calls: vec![], usage: None })])).boxed())
+            } else { ModelStub.stream(request).await }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    let original;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "latest".into(), &cancel)
+            .await
+            .unwrap();
+        original = h
+            .view_positioned(id, NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(
+                |entry| matches!(&entry.message, Message::User { content } if content == "latest"),
+            )
+            .unwrap()
+            .history
+            .unwrap();
+    }
+    let started = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let mut s = Scheduler::open(
+        &path,
+        Options {
+            model: Arc::new(Gated {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            ..opts()
+        },
+    )
+    .unwrap();
+    s.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let queued = s.submit(id, None, "queued".into()).unwrap();
+    release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        s.wait_for_idle(id, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        s.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        pi_rs_durable::runtime::Status::Done { .. }
+    ));
+    let retained = s
+        .view_positioned(id, NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "latest"))
+        .unwrap()
+        .history
+        .unwrap();
+    assert_eq!(retained, original);
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_retains_occurrence_provenance_across_reopen_and_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    let original;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "latest".into(), &cancel)
+            .await
+            .unwrap();
+        let entries = h
+            .view_positioned(id, NonZeroUsize::new(100).unwrap())
+            .unwrap()
+            .entries;
+        original = entries
+            .iter()
+            .find(
+                |entry| matches!(&entry.message, Message::User { content } if content == "latest"),
+            )
+            .unwrap()
+            .history
+            .clone()
+            .unwrap();
+        assert!(h.request_compaction(id, 0).unwrap());
+        h.resume(&cancel).await.unwrap();
+    }
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let entries = h
+        .view_positioned(id, NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .entries;
+    let retained = entries
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "latest"))
+        .unwrap()
+        .history
+        .clone()
+        .unwrap();
+    assert_eq!(retained, original);
+    let retained_position = entries
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "latest"))
+        .unwrap()
+        .position
+        .clone();
+    let positioned_fork = h.fork_at_position(id, retained_position).unwrap();
+    assert!(!h.conversation(positioned_fork).unwrap().messages.iter().any(|message| matches!(message, Message::User { content } if content.contains("summary of prior work"))));
+    let child = h.fork(id).unwrap();
+    let inherited = h
+        .view_positioned(child, NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| matches!(&entry.message, Message::User { content } if content == "latest"))
+        .unwrap()
+        .history
+        .unwrap();
+    assert_eq!(inherited, original);
+    let historical = h.fork_by_entry_id(child, original.id).unwrap();
+    let historical = h.conversation(historical).unwrap();
+    assert!(
+        historical
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::User { content } if content == "latest"))
+    );
+    assert!(!historical.messages.iter().any(|message| matches!(message, Message::User { content } if content.contains("summary of prior work"))));
+}
+
+#[tokio::test]
 async fn compaction_is_durable_and_old_snapshots_remain_observable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
