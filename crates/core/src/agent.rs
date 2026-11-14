@@ -4480,11 +4480,12 @@ fn completed_overflow_summary(
     if format != "pi-rs:overflow-retention-v1" || plan.run_id != Some(run_id) {
         return None;
     }
+    let boundary = entry.get("boundary")?;
     let retention = RetentionPlan {
-        boundary: if entry["boundary"].is_null() {
+        boundary: if boundary.is_null() {
             None
         } else {
-            Some(entry["boundary"].as_u64()?)
+            Some(boundary.as_u64()?)
         },
         keep_turns: usize::try_from(entry["keepTurns"].as_u64()?).ok()?,
         split_turn: entry["splitTurn"].as_bool()?,

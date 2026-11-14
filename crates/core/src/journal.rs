@@ -2057,6 +2057,17 @@ impl Session {
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
                 }
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    if let Some(old) = entry.get("boundary").and_then(serde_json::Value::as_u64) {
+                        if let Some(new) = ids.get(&old) {
+                            entry["boundary"] = serde_json::json!(new);
+                        } else if let Some(object) = entry.as_object_mut() {
+                            // A missing retained record must not become a valid
+                            // all-history boundary on recovery.
+                            object.remove("boundary");
+                        }
+                    }
+                }
                 Event::TreeTriggerHandoff { return_to, .. } => {
                     *return_to = *ids
                         .get(return_to)
@@ -3498,6 +3509,54 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod record_metadata_tests {
     use super::*;
+
+    #[test]
+    fn fork_remaps_overflow_retention_boundary() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "base".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let base = session.head();
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session.checkout(base).unwrap();
+        session
+            .append(Event::User {
+                content: "retained".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let retained = session.head();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":retained,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let (marker, boundary) = fork
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
+                    Some((record, entry["boundary"].as_u64().unwrap()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(boundary, retained);
+        assert!(boundary < marker.id);
+        assert!(
+            matches!(&fork.records()[(boundary - 1) as usize].event, Event::User { content, .. } if content == "retained")
+        );
+    }
 
     #[test]
     fn metadata_envelope_rejects_duplicate_record_fields() {
