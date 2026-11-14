@@ -245,11 +245,20 @@ sequence numbers. Addresses are caller-defined and do not enforce ownership.
 Raw prepared batches are trusted and must respect reserved namespaces and JSON
 invariants. Do not perform external effects while preparing a batch.
 
-This is a synchronous storage foundation, not upstream `Session.commit` or
-Chord: it has no draft callbacks, transaction snapshot reads, definitions,
+`Harness::submit_with_documents` admits one new input and document changes in
+the same durable commit as the conversation, transcript and observation updates.
+Its callback reads documents before staging any writes; every read, including
+missing or read-only values, is checked at commit. Write only addresses read in
+the attempt, once each. A CAS conflict reruns the whole callback, so it must be
+deterministic and have no external effects. Duplicate request IDs return the
+original submission without running the callback, and rejections do not write.
+A failed storage commit can have an unknown outcome: reopen and reconcile using
+a request ID. This API does not schedule the input; call `resume` as usual.
+
+This is a synchronous, bounded API, not upstream `Session.commit` or
+Chord: it has no upstream-style draft transactions, general transaction snapshot reads, definitions,
 operation history, observation, fork/rewind, deferred persistence, or automatic
-lifecycle/ownership validation for arbitrary host batches. Existing conversation
-admission commits internally and cannot be composed with this API; task batches
+lifecycle/ownership validation for arbitrary host batches. Admission callbacks cannot compose arbitrary task batches; task batches
 are low-level records and do not by themselves reserve executors or schedule work.
 
 ### Extension error observation

@@ -578,7 +578,7 @@ async fn conversation_abort_marks_owned_tree_atomically_and_recovers_child_first
     let (mut state, version) = h.load(id).unwrap();
     state.abort_requested = true;
     assert!(
-        h.save_composed_locked(&state, Expected::Version(version), None, &[], &stale)
+        h.save_composed_locked(&state, Expected::Version(version), None, &[], &stale, None)
             .is_err()
     );
     assert!(!h.conversation(id).unwrap().abort_requested);
@@ -763,4 +763,227 @@ fn conversation_abort_fences_running_task_and_its_proposed_child() {
     }
     assert!(driver.get(child_id).unwrap().is_none());
     driver.shutdown().unwrap();
+}
+
+#[test]
+fn document_admissions_compete_retry_and_reopen() {
+    use crate::document::{Address, Documents};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let address = Address {
+        scope: "session".into(),
+        name: "counter".into(),
+        key: "".into(),
+    };
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..2)
+        .map(|i| {
+            let mut worker = owner.worker();
+            let address = address.clone();
+            let barrier = barrier.clone();
+            let attempts = attempts.clone();
+            std::thread::spawn(move || {
+                let mut first = true;
+                worker
+                    .submit_with_documents(
+                        id,
+                        Some(format!("{i}")),
+                        "input".into(),
+                        AdmissionOptions::default(),
+                        |docs| {
+                            let n = docs
+                                .get(&address)?
+                                .map_or(0, |d| d.value["n"].as_u64().unwrap());
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            if first {
+                                first = false;
+                                barrier.wait();
+                            }
+                            docs.put(
+                                &address,
+                                serde_json::json!({"n": n + 1}).as_object().unwrap().clone(),
+                            )
+                        },
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_ne!(ids[0], ids[1]);
+    assert!(attempts.load(Ordering::SeqCst) >= 3);
+    assert_eq!(
+        Documents::new(owner.owner.store())
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        2
+    );
+    drop(owner);
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(owner.conversation(id).unwrap().submissions.len(), 2);
+    assert_eq!(
+        Documents::new(owner.owner.store())
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        2
+    );
+    let same = owner
+        .submit_with_documents(
+            id,
+            Some("0".into()),
+            "different".into(),
+            AdmissionOptions {
+                reject_when_busy: true,
+                ..Default::default()
+            },
+            |_| panic!("duplicate callback"),
+        )
+        .unwrap();
+    assert_eq!(same, ids[0]);
+    let rejected = owner.submit_with_documents(
+        id,
+        Some("new".into()),
+        "input".into(),
+        AdmissionOptions {
+            reject_when_busy: true,
+            ..Default::default()
+        },
+        |_| panic!("rejected callback"),
+    );
+    assert!(matches!(
+        rejected,
+        Err(Error::Admission(AdmissionError::Busy))
+    ));
+    assert_eq!(
+        Documents::new(owner.owner.store())
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        2
+    );
+}
+
+#[test]
+fn document_admission_read_after_write_and_callback_failure_roll_back() {
+    use crate::document::{Address, Documents};
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let a = Address {
+        scope: "s".into(),
+        name: "a".into(),
+        key: "".into(),
+    };
+    let b = Address {
+        scope: "s".into(),
+        name: "b".into(),
+        key: "".into(),
+    };
+    let result = owner.submit_with_documents(
+        id,
+        None,
+        "input".into(),
+        AdmissionOptions::default(),
+        |docs| {
+            docs.get(&a)?;
+            docs.put(&a, serde_json::Map::new())?;
+            docs.get(&b)?;
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Document(crate::document::Error::ReadAfterWrite))
+    ));
+    assert!(owner.conversation(id).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(owner.owner.store())
+            .get(&a)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn document_admission_rechecks_read_only_dependencies() {
+    use crate::document::{Address, Transaction};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut owner = Harness::open_paused(&path, options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let dependency = Address {
+        scope: "s".into(),
+        name: "dependency".into(),
+        key: "".into(),
+    };
+    let output = Address {
+        scope: "s".into(),
+        name: "output".into(),
+        key: "".into(),
+    };
+    let external = durable_store::Store::open(&path).unwrap();
+    let mut calls = 0;
+    owner
+        .submit_with_documents(
+            id,
+            Some("request".into()),
+            "input".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                let old = docs.get(&dependency)?;
+                docs.get(&output)?;
+                calls += 1;
+                if calls == 1 {
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &dependency,
+                        Expected::Missing,
+                        serde_json::json!({"n": 7}).as_object().unwrap(),
+                    )?;
+                    tx.commit(&external)?;
+                }
+                let n = old.map_or(0, |d| d.value["n"].as_u64().unwrap());
+                docs.put(
+                    &output,
+                    serde_json::json!({"n": n}).as_object().unwrap().clone(),
+                )
+            },
+        )
+        .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(
+        crate::document::Documents::new(&external)
+            .get(&output)
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        7
+    );
 }

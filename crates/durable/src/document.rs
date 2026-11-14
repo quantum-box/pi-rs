@@ -7,7 +7,7 @@
 use crate::task_store::OwnedBatch;
 use durable_store::{Check, Expected, Mutation, Store};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const PREFIX: &[u8] = b"durable/document/";
 
@@ -21,6 +21,10 @@ pub enum Error {
     InvalidDocument,
     #[error("a batch has duplicate checks or writes, or an unchecked write")]
     InvalidBatch,
+    #[error("document reads must precede all writes")]
+    ReadAfterWrite,
+    #[error("document must be read before writing, and written at most once")]
+    UnreadOrWritten,
 }
 
 /// An application-defined address. Components are encoded unambiguously;
@@ -141,5 +145,70 @@ impl Transaction {
     pub fn commit(self, store: &Store) -> Result<(), Error> {
         store.commit(&self.checks, &self.mutations)?;
         Ok(())
+    }
+}
+
+/// Checked document operations for one admission attempt. Reads are cached and
+/// validated at commit, including missing and read-only documents. Once any
+/// write is staged, further reads are rejected. A conflict reruns the caller.
+pub struct AdmissionDocuments<'a> {
+    store: &'a Store,
+    reads: HashMap<Address, Option<Document>>,
+    writes: HashMap<Address, Option<Map<String, Value>>>,
+}
+impl<'a> AdmissionDocuments<'a> {
+    pub(crate) fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+        }
+    }
+    pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
+        if !self.writes.is_empty() {
+            return Err(Error::ReadAfterWrite);
+        }
+        if let Some(value) = self.reads.get(address) {
+            return Ok(value.clone());
+        }
+        let value = Documents::new(self.store).get(address)?;
+        self.reads.insert(address.clone(), value.clone());
+        Ok(value)
+    }
+    pub fn put(&mut self, address: &Address, value: Map<String, Value>) -> Result<(), Error> {
+        self.write(address, Some(value))
+    }
+    pub fn delete(&mut self, address: &Address) -> Result<(), Error> {
+        self.write(address, None)
+    }
+    fn write(&mut self, address: &Address, value: Option<Map<String, Value>>) -> Result<(), Error> {
+        if !self.reads.contains_key(address) || self.writes.contains_key(address) {
+            return Err(Error::UnreadOrWritten);
+        }
+        self.writes.insert(address.clone(), value);
+        Ok(())
+    }
+    pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
+        let mut batch = OwnedBatch {
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        };
+        for (address, document) in self.reads {
+            let key = address.storage_key()?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: document.map_or(Expected::Missing, |d| Expected::Version(d.version)),
+            });
+            if let Some(value) = self.writes.get(&address) {
+                batch.mutations.push(match value {
+                    Some(value) => Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(value)?,
+                    },
+                    None => Mutation::Delete { key },
+                });
+            }
+        }
+        Ok(batch)
     }
 }

@@ -48,6 +48,8 @@ pub enum Error {
     Transcript(#[from] crate::transcript::Error),
     #[error("conversation signal: {0}")]
     Signal(#[from] crate::conversation_signal::Error),
+    #[error("document: {0}")]
+    Document(#[from] crate::document::Error),
     #[error("fork: {0}")]
     Fork(#[from] crate::fork::Error),
     #[error("task scheduler: {0}")]
@@ -702,7 +704,7 @@ impl Harness {
         } else {
             Some(owner.task_gate().lock().map_err(|_| Error::Failed)?)
         };
-        self.save_composed_locked(state, expected, wake, children, &[])
+        self.save_composed_locked(state, expected, wake, children, &[], None)
     }
     fn save_composed_locked(
         &mut self,
@@ -711,6 +713,7 @@ impl Harness {
         wake: Option<&crate::conversation_signal::PreparedWake>,
         children: &[crate::task::Task],
         abort_tasks: &[crate::task_store::StoredTask],
+        documents: Option<&crate::task_store::OwnedBatch>,
     ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
@@ -889,6 +892,10 @@ impl Harness {
             if let Some(wake) = wake {
                 checks.extend(wake.checks.clone());
                 mutations.extend(wake.mutations.clone());
+            }
+            if let Some(batch) = documents {
+                checks.extend(batch.checks.clone());
+                mutations.extend(batch.mutations.clone());
             }
             match self.owner.store().commit(&checks, &mutations) {
                 Ok(()) => break,
@@ -1510,7 +1517,30 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options)
+        self.submit_internal_with_options(id, request_id, content, options, &mut |_| Ok(()))
+    }
+    /// Atomically admit a new input with checked custom document changes.
+    /// The callback may run again after a conflict and must have no external
+    /// effects. Duplicate IDs and rejected inputs never invoke it.
+    pub fn submit_with_documents(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        mut change: impl FnMut(
+            &mut crate::document::AdmissionDocuments<'_>,
+        ) -> Result<(), crate::document::Error>,
+    ) -> Result<Uuid, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        self.submit_internal_with_options(id, request_id, content, options, &mut change)
     }
     pub(crate) fn submit_internal(
         &mut self,
@@ -1527,6 +1557,7 @@ impl Harness {
                 mode,
                 ..Default::default()
             },
+            &mut |_| Ok(()),
         )
     }
     fn submit_internal_with_options(
@@ -1535,6 +1566,9 @@ impl Harness {
         request_id: Option<String>,
         content: String,
         options: AdmissionOptions,
+        change: &mut impl FnMut(
+            &mut crate::document::AdmissionDocuments<'_>,
+        ) -> Result<(), crate::document::Error>,
     ) -> Result<Uuid, Error> {
         loop {
             let (mut c, version) = self.load(id)?;
@@ -1610,7 +1644,23 @@ impl Harness {
             // Merging by submission UUID could otherwise admit the same key twice.
             let merge = self.merge_admissions;
             self.merge_admissions = false;
-            let result = self.save(&c, Expected::Version(version));
+            let mut documents = crate::document::AdmissionDocuments::new(self.owner.store());
+            if let Err(error) = change(&mut documents) {
+                self.merge_admissions = merge;
+                return Err(error.into());
+            }
+            let batch = documents.into_batch();
+            let result = match batch {
+                Ok(batch) => self.save_composed_locked(
+                    &c,
+                    Expected::Version(version),
+                    None,
+                    &[],
+                    &[],
+                    Some(&batch),
+                ),
+                Err(error) => Err(error.into()),
+            };
             self.merge_admissions = merge;
             match result {
                 Ok(()) => return Ok(sid),
@@ -1745,7 +1795,8 @@ impl Harness {
             {
                 c.abort_requested = true;
             }
-            match self.save_composed_locked(&c, Expected::Version(version), None, &[], &tasks) {
+            match self.save_composed_locked(&c, Expected::Version(version), None, &[], &tasks, None)
+            {
                 Ok(()) => return Ok(()),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(error) => return Err(error),
