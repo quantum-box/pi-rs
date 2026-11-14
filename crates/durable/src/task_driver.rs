@@ -117,6 +117,19 @@ impl Driver {
         {
             return Err(task_scheduler::Error::Ownership.into());
         }
+        if let TaskOwner::Conversation(id) = task.owner() {
+            let key = format!("runtime/conversation/{id}");
+            if self
+                .shared
+                .owner
+                .store()
+                .get(key.as_bytes())
+                .map_err(|e| task_scheduler::Error::Store(e.into()))?
+                .is_none()
+            {
+                return Err(task_scheduler::Error::Ownership.into());
+            }
+        }
         TaskStore::new(self.shared.owner.store())
             .save(&[Save::Create(task)])
             .map_err(task_scheduler::Error::from)?;

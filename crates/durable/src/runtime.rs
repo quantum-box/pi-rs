@@ -713,14 +713,34 @@ impl Harness {
                 return Ok(s.id);
             }
             let sid = Uuid::new_v4();
+            let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+                && c.active.is_none()
+                && c.pending_resets.is_empty()
+                && !c
+                    .submissions
+                    .iter()
+                    .any(|item| item.status == Status::Queued);
             c.submissions.push(Submission {
                 id: sid,
                 request_id: request_id.clone(),
                 content: content.clone(),
-                status: Status::Queued,
+                status: if place_now {
+                    Status::Running
+                } else {
+                    Status::Queued
+                },
             });
             c.input_modes.insert(sid, mode);
-            if matches!(c.phase, Phase::FailedIdle) {
+            if place_now {
+                c.active = Some(sid);
+                c.messages.push(Message::User {
+                    content: content.clone(),
+                });
+                c.auto_compaction_attempted = false;
+                c.retry_state = RetryState::default();
+                c.overflow_compaction_attempted = false;
+                c.phase = Phase::ModelReady { turns: 0 };
+            } else if matches!(c.phase, Phase::FailedIdle) {
                 c.phase = Phase::Idle;
             }
             match self.save(&c, Expected::Version(version)) {
@@ -965,27 +985,53 @@ impl Harness {
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     }
-                    let Some(i) = c
-                        .submissions
-                        .iter()
-                        .position(|s| s.status == Status::Queued)
-                    else {
+                    let mut steer = false;
+                    let mut follow = false;
+                    for s in &mut c.submissions {
+                        if s.status != Status::Queued {
+                            continue;
+                        }
+                        let selected = match c
+                            .input_modes
+                            .get(&s.id)
+                            .copied()
+                            .unwrap_or(InputMode::FollowUp)
+                        {
+                            InputMode::Steer if !steer => {
+                                steer = true;
+                                true
+                            }
+                            InputMode::FollowUp if !follow => {
+                                follow = true;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if selected {
+                            s.status = Status::Running;
+                            c.active.get_or_insert(s.id);
+                            c.messages.push(Message::User {
+                                content: s.content.clone(),
+                            });
+                        }
+                    }
+                    if c.active.is_none() {
                         return Ok(());
-                    };
-                    let s = &mut c.submissions[i];
-                    s.status = Status::Running;
-                    c.active = Some(s.id);
+                    }
                     c.auto_compaction_attempted = false;
                     c.retry_state = RetryState::default();
                     c.overflow_compaction_attempted = false;
-                    c.messages.push(Message::User {
-                        content: s.content.clone(),
-                    });
-                    c.phase = Phase::Boundary {
-                        turns: 0,
-                        answer: None,
-                    };
-                    self.save(&c, Expected::Version(version))?;
+                    c.phase = Phase::ModelReady { turns: 0 };
+                    // Placement races with withdrawal and queued resets. Re-read
+                    // rather than merging a stale placement over a newer inbox.
+                    let merge = self.merge_admissions;
+                    self.merge_admissions = false;
+                    let result = self.save(&c, Expected::Version(version));
+                    self.merge_admissions = merge;
+                    match result {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        other => other?,
+                    }
                 }
                 Phase::CompactionReady {
                     preparation,

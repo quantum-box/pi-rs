@@ -35,7 +35,7 @@ backfilled. `Scheduler::start_tasks` attaches a background generic task driver
 to the same owner; registered synchronous handlers, timers, signals, and
 direct-child waits use persistent task state. Hosts must register definitions
 again after reopening. `reset` preserves older observation records and can
-carry handoff text; it currently requires an idle conversation with no queue.
+carry handoff text; busy resets are queued until a safe boundary.
 
 Nested tool calls are journaled by parent operation and call order. A replayed
 parent reuses completed child results, while unsafe interrupted children block
@@ -45,8 +45,8 @@ calls are serialized, bounded in depth, and cannot update extension state.
 Current limits and differences from upstream Pi Durable:
 
 - Historical fork currently accepts settled snapshots, not every upstream entry.
-  Automatic compaction requires a known context window; provider overflow retry
-  and concurrent compaction remain unsupported. Streaming checkpoints retain
+  Automatic compaction uses a known context window or provider overflow; manual
+  compaction still requires an idle conversation. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
   The subagent link primitive does not provide an automatic conversation/task ownership tree.
 - Generic task waits support one deadline, one signal, or direct-child
@@ -55,7 +55,8 @@ Current limits and differences from upstream Pi Durable:
   cancel an already running external effect. Handler steps run synchronously
   and shutdown waits for an in-flight step.
 - Polling uses an in-process interval rather than a durable timer; reopening
-  resumes it. Model errors use a fixed retry delay. There is no flow control.
+  resumes it. Model retry deadlines use persisted bounded exponential backoff.
+  There is no flow control.
 - The scheduler retains scheduled join handles until `wait` or `shutdown`;
   callers should bound submissions and drain them. Owner locking currently
   supports cooperating Unix processes on local filesystems.

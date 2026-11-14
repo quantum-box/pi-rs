@@ -31,6 +31,10 @@ pub enum Error {
     InvalidChild,
     #[error("task is not waiting")]
     NotWaiting,
+    #[error("signal target was not found")]
+    SignalTargetNotFound,
+    #[error("signal target is closed")]
+    SignalTargetClosed,
 }
 
 /// A task and the storage version that must be supplied for its next update.
@@ -165,11 +169,23 @@ impl<'a> TaskStore<'a> {
                 }
                 return Err(Error::SignalMismatch);
             }
+            let target = self
+                .load(signal.task_id)?
+                .ok_or(Error::SignalTargetNotFound)?;
+            if target.task.is_terminal() {
+                return Err(Error::SignalTargetClosed);
+            }
             match self.store.commit(
-                &[Check {
-                    key: k.clone(),
-                    expected: Expected::Missing,
-                }],
+                &[
+                    Check {
+                        key: k.clone(),
+                        expected: Expected::Missing,
+                    },
+                    Check {
+                        key: key(signal.task_id),
+                        expected: Expected::Version(target.version),
+                    },
+                ],
                 &[Mutation::Put {
                     key: k.clone(),
                     value: serde_json::to_vec(&fresh)?,
@@ -527,6 +543,7 @@ mod tests {
         {
             let db = Store::open(&path).unwrap();
             let ts = TaskStore::new(&db);
+            ts.save(&[Save::Create(&t)]).unwrap();
             ts.send_signal(&sig).unwrap();
             ts.send_signal(&sig).unwrap();
             let mut changed = sig.clone();
@@ -535,7 +552,6 @@ mod tests {
                 ts.send_signal(&changed),
                 Err(Error::SignalMismatch)
             ));
-            ts.save(&[Save::Create(&t)]).unwrap();
             ts.reserve(&ts.load(t.id()).unwrap().unwrap()).unwrap();
             let running = ts.load(t.id()).unwrap().unwrap();
             ts.update(&running, |t| t.wait(WaitFor::Signal("go".into())))
@@ -559,6 +575,24 @@ mod tests {
         assert_eq!(receipt.payload, sig.payload);
         ts.send_signal(&sig).unwrap();
         assert!(ts.signal(t.id(), id).unwrap().unwrap().is_consumed());
+    }
+    #[test]
+    fn signal_rejects_missing_and_terminal_targets() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let mut t = task(1, 3);
+        let signal = Signal::new(Uuid::new_v4(), t.id(), "go".into(), json!(null));
+        assert!(matches!(
+            ts.send_signal(&signal),
+            Err(Error::SignalTargetNotFound)
+        ));
+        t.start().unwrap();
+        t.succeed(json!("done")).unwrap();
+        ts.save(&[Save::Create(&t)]).unwrap();
+        assert!(matches!(
+            ts.send_signal(&signal),
+            Err(Error::SignalTargetClosed)
+        ));
     }
 
     #[test]

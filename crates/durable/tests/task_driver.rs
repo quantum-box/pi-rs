@@ -97,7 +97,14 @@ async fn generic_tasks_run_under_the_same_owner_and_survive_reopen() {
 #[tokio::test]
 async fn signal_is_admitted_while_handler_is_running() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let mut s = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let conversation = s
+        .create_conversation(Config {
+            model: "m".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Mutex::new(release_rx));
@@ -111,7 +118,7 @@ async fn signal_is_admitted_while_handler_is_running() {
     let id = Uuid::new_v4();
     let task = Task::new(
         id,
-        TaskOwner::Conversation(Uuid::new_v4()),
+        TaskOwner::Conversation(conversation),
         Checkpoint {
             phase: "start".into(),
             data: json!(null),

@@ -331,3 +331,54 @@ async fn idle_reset_preserves_observed_history_and_uses_handoff() {
             .any(|r| r.value.to_string().contains("old task"))
     );
 }
+struct CountingModel(std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl Model for CountingModel {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("answer".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn input_is_placed_before_second_follow_up_is_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let model = Arc::new(CountingModel(std::sync::atomic::AtomicUsize::new(0)));
+    let options = Options {
+        model: model.clone(),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open(dir.path().join("db"), options, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit(id, None, "first".into()).unwrap();
+    h.submit(id, None, "followup".into()).unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.submissions[0].status,
+        pi_rs_durable::runtime::Status::Running
+    );
+    assert_eq!(
+        c.submissions[1].status,
+        pi_rs_durable::runtime::Status::Queued
+    );
+    h.resume(&cancel).await.unwrap();
+    assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

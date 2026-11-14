@@ -33,6 +33,7 @@ fn cas_merges_admission_and_boundary_retries_instead_of_losing_steer() {
             max_output_tokens: 10,
         })
         .unwrap();
+    admission.submit(id, None, "initial".into()).unwrap();
     let mut worker = admission.worker();
     let (mut stale, version) = worker.load(id).unwrap();
     let steer = admission
@@ -56,7 +57,7 @@ fn cas_merges_admission_and_boundary_retries_instead_of_losing_steer() {
     ));
     let (latest, _) = worker.load(id).unwrap();
     assert!(matches!(latest.phase, Phase::Boundary { .. }));
-    assert_eq!(latest.submissions.len(), 2);
+    assert_eq!(latest.submissions.len(), 3);
     assert_eq!(latest.input_modes.get(&next), Some(&InputMode::Steer));
 }
 
@@ -115,6 +116,7 @@ fn withdrawal_is_durable_and_merges_with_worker_progress() {
             max_output_tokens: 10,
         })
         .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
     let sid = owner
         .submit(id, Some("request".into()), "queued".into())
         .unwrap();
@@ -130,7 +132,7 @@ fn withdrawal_is_durable_and_merges_with_worker_progress() {
     drop(owner);
     let mut reopened = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(
-        reopened.conversation(id).unwrap().submissions[0].status,
+        reopened.conversation(id).unwrap().submissions[1].status,
         Status::Unanswered {
             reason: "aborted".into()
         }
