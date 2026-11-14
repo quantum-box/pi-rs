@@ -4479,6 +4479,25 @@ type RecoveredSummary = (
     ModelMetadata,
 );
 
+// Resume only the current branch's latest run, and only when it contains a
+// validated durable summary that can be settled without reissuing a request.
+pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, String)> {
+    let branch = session.branch();
+    let run_id = branch.iter().rev().find_map(|record| {
+        matches!(record.event, Event::Run { .. })
+            .then_some(record.run_id)
+            .flatten()
+    })?;
+    let model = branch.iter().rev().find_map(|record| match &record.event {
+        Event::ModelRequested { model, .. } if record.run_id == Some(run_id) => Some(model),
+        _ => None,
+    })?;
+    ["pi-rs:overflow-recovery", "pi-rs:silent-overflow"]
+        .iter()
+        .any(|marker| completed_overflow_summary(session, run_id, marker, model).is_some())
+        .then(|| (run_id, model.clone()))
+}
+
 fn completed_overflow_summary(
     session: &Session,
     run_id: Uuid,

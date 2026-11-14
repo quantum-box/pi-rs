@@ -2630,7 +2630,27 @@ impl AgentSession {
             .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        self.run(None, Uuid::new_v4(), &mut |_| {}).await
+        let recovery = {
+            let journal = self.journal_async().await;
+            crate::agent::resumable_compaction_run(&journal)
+        };
+        if recovery.is_some() && !self.registry.extensions.is_empty() {
+            return Err(Error::Session(
+                "pending compaction recovery requires reconciliation after extensions changed"
+                    .into(),
+            ));
+        }
+        if recovery
+            .as_ref()
+            .is_some_and(|(_, model)| model != &self.model_name)
+        {
+            return Err(Error::Session(
+                "pending compaction recovery requires its original model".into(),
+            ));
+        }
+        let run_id = recovery.map(|(run_id, _)| run_id);
+        self.run(None, run_id.unwrap_or_else(Uuid::new_v4), &mut |_| {})
+            .await
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -9025,6 +9045,229 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    struct ResumeSettlementModel {
+        summary_id: Uuid,
+        attempts: std::sync::Mutex<Vec<(Uuid, crate::UsageReport, crate::ModelMetadata)>>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for ResumeSettlementModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            id: Uuid,
+            usage: &crate::UsageReport,
+            metadata: &crate::ModelMetadata,
+        ) -> Result<()> {
+            if id == self.summary_id {
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push((id, usage.clone(), metadata.clone()));
+                if attempts.len() == 1 {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_reopens_and_settles_saved_overflow_summaries() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resume.jsonl");
+            let run_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            let boundary = journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap()
+                .id;
+            if silent {
+                journal
+                    .append(Event::ModelRequested {
+                        model: "fixture".into(),
+                        messages: 1,
+                        tools: 0,
+                        max_output_tokens: 16,
+                        request_id: Some(turn_id),
+                        context_head: None,
+                        context_sha256: None,
+                        context_transformed: None,
+                        context_configuration_sha256: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: turn_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            advertised_tools: vec![],
+                            max_output_tokens: 16,
+                        }),
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        usage: Some(crate::Usage {
+                            input_tokens: 1001,
+                            output_tokens: 2,
+                        }),
+                        request_id: Some(turn_id),
+                    })
+                    .unwrap();
+            }
+            journal
+                .append(Event::SourceEntry {
+                    format: if silent {
+                        "pi-rs:silent-overflow"
+                    } else {
+                        "pi-rs:overflow-recovery"
+                    }
+                    .into(),
+                    entry: serde_json::json!({"requestId":turn_id}),
+                })
+                .unwrap();
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 9,
+                            output_tokens: 3,
+                        },
+                    },
+                    failure: None,
+                    partial: "saved summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            drop(journal);
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let limits = Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            };
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert!(
+                !session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+            drop(session);
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(limits)
+                .open(&path)
+                .unwrap();
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            {
+                let attempts = model.attempts.lock().unwrap();
+                assert_eq!(attempts.len(), 2);
+                assert!(attempts.iter().all(|(id, usage, metadata)| *id == summary_id && matches!(usage, crate::UsageReport::Measured { usage } if usage.input_tokens == 9 && usage.output_tokens == 3) && metadata.finish_reason.as_deref() == Some("stop")));
+            }
+            assert!(session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            session.close().await.unwrap();
         }
     }
 
