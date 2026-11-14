@@ -4947,6 +4947,25 @@ impl Scheduler {
             None,
         )
     }
+    /// Restore provider and parent-bound subagent management before recovery.
+    pub fn open_with_provider_and_subagent_management(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        validate_allowed_tools(&allowed_tools)?;
+        Self::open_configured(
+            path,
+            options,
+            registry,
+            Some((parent, child_config, allowed_tools)),
+            Some(adapter),
+        )
+    }
     /// Install management with an initial child allowlist before recovery.
     pub fn open_with_restricted_subagent_management(
         path: impl AsRef<Path>,
