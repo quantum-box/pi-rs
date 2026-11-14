@@ -2369,6 +2369,13 @@ impl Session {
                 "journal write failed; reopen before continuing".into(),
             ));
         }
+        // Reject unsupported metadata before appending even implicit marker
+        // records. No write was attempted, so the journal remains usable.
+        if metadata.is_some() && !self.store.supports_record_metadata() {
+            return Err(Error::Session(
+                "session store does not support record metadata".into(),
+            ));
+        }
         // A native message branching directly from a legacy Pi source needs a
         // distinct parent, even if its content is identical to the old message.
         if matches!(&event, Event::CustomMessage { .. } | Event::CustomMessageDelivered { .. })
@@ -3785,6 +3792,14 @@ mod record_metadata_tests {
         );
         assert!(result.is_err());
         assert_eq!(session.records().len(), length);
+        let record = session
+            .append(Event::SessionInfo {
+                name: Some("still writable".into()),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(record.id, length as u64 + 1);
+        assert_eq!(session.records().len(), length + 1);
     }
 }
 

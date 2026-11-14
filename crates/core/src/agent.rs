@@ -7917,6 +7917,81 @@ mod tree_tests {
     }
 
     #[tokio::test]
+    async fn unsupported_extension_summary_keeps_legacy_store_writable() {
+        struct LegacyStore(crate::MemoryStore);
+        impl crate::SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+        }
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(LegacyStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "recent".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let error = agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support record metadata")
+        );
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        session
+            .append(Event::User {
+                content: "continue".into(),
+                input_id: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn legacy_compaction_hooks_run_after_supplied_manual_and_automatic_summaries() {
         for automatic in [false, true] {
             let legacy_events = Arc::new(std::sync::Mutex::new(Vec::new()));
