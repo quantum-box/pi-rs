@@ -46,6 +46,78 @@ fn jsonl_session_id_can_be_opened_by_session_and_resume() {
 }
 
 #[test]
+fn rpc_worker_starts_when_share_store_is_unavailable() {
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    // An existing non-directory deterministically makes cache initialization fail
+    // on Unix and Windows without changing other configuration behavior.
+    std::fs::write(home.join("share-context-v1"), b"unavailable").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Reap(child);
+    let mut input = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver
+            .recv_timeout(remaining)
+            .expect("worker did not become ready");
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    assert_eq!(response["success"], true, "{response}");
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.0.try_wait().unwrap().is_none() {
+        panic!("worker did not exit");
+    }
+    reader.join().unwrap();
+    assert_eq!(
+        std::fs::read(home.join("share-context-v1")).unwrap(),
+        b"unavailable"
+    );
+}
+
+#[test]
 fn missing_session_id_does_not_create_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))

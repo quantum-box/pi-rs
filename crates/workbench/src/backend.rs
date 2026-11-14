@@ -559,15 +559,26 @@ fn invalidate_existing_share_generation<'a>(
     Ok(Some(store.try_begin(path, binding)?))
 }
 
+#[cfg(any(unix, windows))]
+fn optional_share_generation<'a>(
+    store: Option<&'a pi_rs_workbench::private_share_store::Store>,
+    path: &std::path::Path,
+) -> Option<pi_rs_workbench::private_share_store::Generation<'a>> {
+    invalidate_existing_share_generation(store, path)
+        .ok()
+        .flatten()
+}
+
 async fn run_worker(
     mut args: Cli,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    // Cache publishing and lookup are disabled. Storage errors must not stop
+    // the existing worker; enabling a reader requires a durable failure fence.
     #[cfg(any(unix, windows))]
-    let share_store = worker_share_store()?;
+    let share_store = worker_share_store().ok();
     #[cfg(any(unix, windows))]
-    let mut share_generation =
-        invalidate_existing_share_generation(Some(&share_store), &args.session)?;
+    let mut share_generation = optional_share_generation(share_store.as_ref(), &args.session);
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
@@ -847,12 +858,11 @@ async fn run_worker(
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
-                // Invalidate the target before any lifecycle hook or discovery
-                // can change its live context. Retain the old lease until the
-                // new one is acquired successfully.
+                // Try invalidating the target before lifecycle and discovery.
+                // Failure only disables this prototype's generation tracking.
                 #[cfg(any(unix, windows))]
                 {
-                    let next = invalidate_existing_share_generation(Some(&share_store), &session)?;
+                    let next = optional_share_generation(share_store.as_ref(), &session);
                     share_generation = next;
                 }
                 share_ready.send_replace(false);
@@ -2037,6 +2047,7 @@ mod share_context_tests {
         let result = worker_share_store_at(directory.path());
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
+        assert!(optional_share_generation(None, &directory.path().join("session.jsonl")).is_none());
         assert!(!directory.path().join("share-context-v1").exists());
     }
 
@@ -2068,6 +2079,7 @@ mod share_context_tests {
             invalidate_existing_share_generation(Some(&store), &path),
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+        assert!(optional_share_generation(Some(&store), &path).is_none());
         drop(lease);
         assert_eq!(store.read(&path, &binding).unwrap(), None);
     }
