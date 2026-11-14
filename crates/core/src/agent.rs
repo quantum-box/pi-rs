@@ -2021,9 +2021,14 @@ impl Agent<'_> {
         let mut reasoning_delta_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
+            let external_id = session.external_session_id();
             let opening = if retain_reply {
-                self.model
-                    .stream_in_session(request_id, session_id, request)
+                self.model.stream_in_session_with_identity(
+                    request_id,
+                    session_id,
+                    &external_id,
+                    request,
+                )
             } else {
                 self.model
                     .stream_for_summary(request_id, session_id, request)
