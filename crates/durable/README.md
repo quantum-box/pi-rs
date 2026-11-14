@@ -218,6 +218,24 @@ individual batches, and the retained initial snapshot are not byte-bounded.
 For an append-only cursor stream use `watch_history` instead; it covers only
 records explicitly included in that observation log.
 
+`Harness::watch_committed_view` and `Scheduler::watch_committed_view` add a
+separate pull stream of runtime conversation observations. Attachment captures
+the latest observation and returns it as `initial`; pass a saved
+`CommittedViewCursor` to resume from that exact observation after reopen. Each
+`next` returns the next observation without coalescing, with a single Chord root
+replacement `["r", value]`. Stop, abort, cancellation and source failure have the
+same first-wins end reasons as the latest-state watch. Each observation must have
+a matching runtime fork snapshot in the same tracked store commit; untracked
+legacy history, foreign observer appends and inconsistent snapshots fail closed.
+Cursors are scoped to the same store and conversation, and the observer and
+fork namespaces must remain immutable. The value is the committed observation
+(messages, block bindings, submissions, reset and write markers), not the full
+`ConversationView`: separate progress-only updates, application document commits
+and other unlogged state are absent. The frames synthesize full replacements,
+not upstream's fine-grained operations or windowed view. There is no background
+queue or automatic termination on harness close. Individual frames and retained
+history are not byte-bounded.
+
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
 completed results across reordered replay, rejecting a changed tool or arguments.

@@ -931,6 +931,87 @@ impl ViewWatch {
     }
 }
 
+/// Exclusive position in one conversation's committed snapshot stream.
+/// Persist with the same database; it is not portable between stores.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CommittedViewCursor {
+    pub conversation: Uuid,
+    pub position: u64,
+}
+
+/// One complete committed conversation observation, expressed as a root
+/// replacement. This is a historical observation, not the live bounded view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommittedViewFrame {
+    pub cursor: CommittedViewCursor,
+    pub value: serde_json::Value,
+    pub ops: Vec<serde_json::Value>,
+    /// Conversation observation frames do not represent document retirement.
+    pub retired: bool,
+}
+
+/// Pull one validated conversation commit at a time; no committed observations
+/// are coalesced. Stop or abort releases its store owner.
+pub struct CommittedViewWatch {
+    pub initial: CommittedViewFrame,
+    reader: Option<Harness>,
+    cursor: CommittedViewCursor,
+    interval: Duration,
+    end: Option<ViewWatchEnd>,
+}
+impl CommittedViewWatch {
+    pub fn cursor(&self) -> &CommittedViewCursor {
+        &self.cursor
+    }
+    pub fn end_reason(&self) -> Option<&ViewWatchEnd> {
+        self.end.as_ref()
+    }
+    pub fn close(&mut self) {
+        self.end_with(ViewWatchEnd::Stopped);
+    }
+    pub fn abort(&mut self) {
+        self.end_with(ViewWatchEnd::Aborted);
+    }
+    fn end_with(&mut self, reason: ViewWatchEnd) {
+        if self.end.is_none() {
+            self.end = Some(reason);
+            self.reader = None;
+        }
+    }
+    /// A dropped wait does not advance the cursor or end the watch.
+    pub async fn next(&mut self) -> Result<Option<CommittedViewFrame>, Error> {
+        loop {
+            let Some(reader) = self.reader.as_ref() else {
+                return Ok(None);
+            };
+            let result = reader.next_committed_view(&self.cursor);
+            match result {
+                Ok(Some(frame)) => {
+                    self.cursor = frame.cursor.clone();
+                    return Ok(Some(frame));
+                }
+                Ok(None) => tokio::time::sleep(self.interval).await,
+                Err(error) => {
+                    self.end_with(ViewWatchEnd::Failed(error.to_string()));
+                    return Err(error);
+                }
+            }
+        }
+    }
+    pub async fn next_with_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<CommittedViewFrame>, Error> {
+        if self.end.is_some() {
+            return Ok(None);
+        }
+        tokio::select! { biased;
+            _ = cancel.cancelled() => { self.abort(); Ok(None) }
+            frame = self.next() => frame,
+        }
+    }
+}
+
 fn view_fingerprint(view: &ConversationView) -> Result<serde_json::Value, Error> {
     Ok(serde_json::json!({
         "state": serde_json::to_value(&view.state)?,
@@ -4243,6 +4324,116 @@ impl Harness {
             tool_progress,
             entries: page.entries,
             older: page.older,
+        })
+    }
+
+    fn committed_view_frame(&self, id: Uuid, position: u64) -> Result<CommittedViewFrame, Error> {
+        if position == 0 {
+            return Err(Error::Invalid(
+                "committed view cursor has no snapshot".into(),
+            ));
+        }
+        let store = self.owner.store();
+        let mut key = b"durable/observer/".to_vec();
+        key.extend_from_slice(id.as_bytes());
+        key.extend_from_slice(b"/r");
+        key.extend_from_slice(&position.to_be_bytes());
+        let event = store
+            .get(&key)?
+            .ok_or_else(|| Error::Invalid("missing committed view observation".into()))?;
+        let fork_key = format!("runtime/fork/{id}/{position:020}");
+        let fork = store
+            .get(fork_key.as_bytes())?
+            .ok_or_else(|| Error::Invalid("unproven committed view snapshot".into()))?;
+        let sequence = store.commit_for_version(&key, event.version)?;
+        if sequence.is_none()
+            || sequence != store.commit_for_version(fork_key.as_bytes(), fork.version)?
+        {
+            return Err(Error::Invalid("unproven committed view transaction".into()));
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(&event.value)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+        if snapshot["version"] != 1
+            || snapshot["conversation_id"] != serde_json::json!(id)
+            || value
+                .get("_transcript")
+                .is_none_or(serde_json::Value::is_null)
+            || value.get("_transcript") != snapshot.get("_transcript")
+            || !value
+                .get("submissions")
+                .is_some_and(serde_json::Value::is_array)
+            || !value.get("resets").is_some_and(serde_json::Value::is_array)
+            || !value
+                .get("application_writes")
+                .is_some_and(serde_json::Value::is_array)
+            || !value
+                .get("aborted_generations")
+                .is_some_and(serde_json::Value::is_array)
+            || !value
+                .get("abort_requested")
+                .is_some_and(serde_json::Value::is_boolean)
+            || value.get("submissions") != snapshot.get("submissions")
+            || value.get("resets") != snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+            || value.get("application_writes")
+                != snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+        {
+            return Err(Error::Invalid(
+                "inconsistent committed view snapshot".into(),
+            ));
+        }
+        self.expand_event(id, &mut value)?;
+        Ok(CommittedViewFrame {
+            cursor: CommittedViewCursor {
+                conversation: id,
+                position,
+            },
+            ops: vec![serde_json::json!(["r", value])],
+            retired: false,
+            value,
+        })
+    }
+    fn next_committed_view(
+        &self,
+        cursor: &CommittedViewCursor,
+    ) -> Result<Option<CommittedViewFrame>, Error> {
+        let page = crate::observer::Observer::new(self.owner.store(), cursor.conversation).read(
+            crate::observer::Cursor(cursor.position),
+            std::num::NonZeroUsize::MIN,
+        )?;
+        page.records
+            .first()
+            .map(|record| self.committed_view_frame(cursor.conversation, record.cursor.0))
+            .transpose()
+    }
+    /// Attach at the latest durable observation, or resume after a consumed
+    /// cursor. The initial frame is the snapshot at that exact cursor.
+    pub fn watch_committed_view(
+        &self,
+        id: Uuid,
+        after: Option<CommittedViewCursor>,
+        interval: Duration,
+    ) -> Result<CommittedViewWatch, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid("view watch interval must be nonzero".into()));
+        }
+        self.load(id)?;
+        let head = crate::observer::Observer::new(self.owner.store(), id).head()?;
+        let cursor = after.unwrap_or(CommittedViewCursor {
+            conversation: id,
+            position: head.0,
+        });
+        if cursor.conversation != id || cursor.position > head.0 {
+            return Err(Error::Invalid(
+                "committed view cursor does not belong to conversation".into(),
+            ));
+        }
+        let initial = self.committed_view_frame(id, cursor.position)?;
+        Ok(CommittedViewWatch {
+            initial,
+            reader: Some(self.worker()),
+            cursor,
+            interval,
+            end: None,
         })
     }
 
@@ -9814,6 +10005,14 @@ impl Scheduler {
         limit: std::num::NonZeroUsize,
     ) -> Result<crate::observer::Page, Error> {
         self.harness.tool_attempts(conversation_id, after, limit)
+    }
+    pub fn watch_committed_view(
+        &self,
+        id: Uuid,
+        after: Option<CommittedViewCursor>,
+        interval: Duration,
+    ) -> Result<CommittedViewWatch, Error> {
+        self.harness.watch_committed_view(id, after, interval)
     }
     pub fn watch_view(
         &self,

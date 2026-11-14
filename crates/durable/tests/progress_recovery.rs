@@ -286,3 +286,223 @@ async fn view_watch_coalesces_and_cancelled_wait_can_resume() {
     );
     assert!(watch.next().await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn committed_view_frames_replay_each_commit_and_resume_after_reopen() {
+    use pi_rs_durable::runtime::ViewWatchEnd;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let id;
+    let saved;
+    {
+        let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let mut watch = h
+            .watch_committed_view(id, None, Duration::from_millis(1))
+            .unwrap();
+        let mut other = h
+            .watch_committed_view(id, None, Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            watch.initial.ops,
+            vec![serde_json::json!(["r", watch.initial.value])]
+        );
+        h.submit(id, None, "one".into()).unwrap();
+        h.submit(id, None, "two".into()).unwrap();
+        h.submit(id, None, "three".into()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value["submissions"].as_array().unwrap().len(), 1);
+        assert_eq!(second.value["submissions"].as_array().unwrap().len(), 2);
+        assert_eq!(second.ops, vec![serde_json::json!(["r", second.value])]);
+        assert_eq!(other.next().await.unwrap().unwrap(), first);
+        saved = second.cursor.clone();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<pi_rs_durable::runtime::CommittedViewCursor>(&encoded)
+                .unwrap(),
+            saved
+        );
+        watch.close();
+        assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Stopped));
+        other.abort();
+        other.close();
+        assert_eq!(other.end_reason(), Some(&ViewWatchEnd::Aborted));
+    }
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut watch = h
+        .watch_committed_view(id, Some(saved.clone()), Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(watch.initial.cursor, saved);
+    let third = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.value["submissions"].as_array().unwrap().len(), 3);
+    assert_eq!(third.cursor.position, saved.position + 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), watch.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(watch.cursor(), &third.cursor);
+    assert_eq!(watch.end_reason(), None);
+    let mut wrong = saved.clone();
+    wrong.conversation = uuid::Uuid::new_v4();
+    assert!(
+        h.watch_committed_view(id, Some(wrong), Duration::from_millis(1))
+            .is_err()
+    );
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(watch.next_with_cancel(&token).await.unwrap().is_none());
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Aborted));
+    assert_eq!(watch.cursor(), &third.cursor);
+}
+
+#[tokio::test]
+async fn committed_view_rejects_unproven_observer_records() {
+    use pi_rs_durable::{observer::Observer, runtime::ViewWatchEnd};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = h
+        .watch_committed_view(id, None, Duration::from_millis(1))
+        .unwrap();
+    let initial = watch.cursor().clone();
+    let store = durable_store::Store::open(&path).unwrap();
+    let append = Observer::new(&store, id)
+        .prepare_append(&serde_json::json!({"forged":true}))
+        .unwrap();
+    store.commit(&append.checks, &append.mutations).unwrap();
+    assert!(watch.next().await.is_err());
+    assert!(matches!(watch.end_reason(), Some(ViewWatchEnd::Failed(_))));
+    assert_eq!(watch.cursor(), &initial);
+    assert!(
+        h.watch_committed_view(id, None, Duration::from_millis(1))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn committed_view_keeps_ordered_block_occurrence() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(dir.path().join("db"), opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = h
+        .watch_committed_view(id, None, Duration::from_millis(1))
+        .unwrap();
+    let blocks = vec![
+        serde_json::json!({"type":"text","text":"first"}),
+        serde_json::json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+        serde_json::json!({"type":"text","text":"last"}),
+    ];
+    let occurrence = h.append_user_blocks(id, blocks.clone()).unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frame.value["content_blocks"]["0"]["message_id"],
+        serde_json::json!(occurrence)
+    );
+    assert_eq!(
+        frame.value["content_blocks"]["0"]["blocks"],
+        serde_json::json!(blocks)
+    );
+}
+
+#[tokio::test]
+async fn committed_view_rejects_snapshot_from_different_transaction() {
+    use pi_rs_durable::observer::Observer;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = h
+        .watch_committed_view(id, None, Duration::from_millis(1))
+        .unwrap();
+    let cursor = watch.cursor().clone();
+    let store = durable_store::Store::open(&path).unwrap();
+    let previous = format!("runtime/fork/{id}/{:020}", cursor.position);
+    let fork = store.get(previous.as_bytes()).unwrap().unwrap();
+    let append = Observer::new(&store, id)
+        .prepare_append(&serde_json::json!({}))
+        .unwrap();
+    let next = append.cursor.0;
+    store.commit(&append.checks, &append.mutations).unwrap();
+    let forged = format!("runtime/fork/{id}/{next:020}");
+    store
+        .commit(
+            &[],
+            &[durable_store::Mutation::Put {
+                key: forged.into_bytes(),
+                value: fork.value,
+            }],
+        )
+        .unwrap();
+    assert!(
+        watch
+            .next()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unproven committed view transaction")
+    );
+    assert_eq!(watch.cursor(), &cursor);
+}
