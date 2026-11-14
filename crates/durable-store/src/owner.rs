@@ -21,11 +21,14 @@
 
 use crate::Store;
 use std::{
+    collections::HashMap,
     fmt,
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
 };
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum OwnerError {
@@ -73,6 +76,14 @@ pub struct OwnedStore {
     _lock: File,
     task_gate: std::sync::Mutex<()>,
     controls: crate::controls::ConversationControls,
+    summary_fences: Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+/// Exclusive execution of one summary operation, including usage settlement.
+/// Retains the database owner until the executor has actually stopped.
+pub struct SummaryGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _owner: Arc<OwnedStore>,
 }
 
 impl OwnedStore {
@@ -122,6 +133,7 @@ impl OwnedStore {
             _lock: lock,
             task_gate: std::sync::Mutex::new(()),
             controls: crate::controls::ConversationControls::default(),
+            summary_fences: Mutex::new(HashMap::new()),
         })
     }
 
@@ -140,6 +152,34 @@ impl OwnedStore {
     /// Process-local coordination shared by all users of this owner.
     pub fn conversation_controls(&self) -> &crate::controls::ConversationControls {
         &self.controls
+    }
+
+    /// Serialize all executors and recovery for an operation. Hold this guard
+    /// through provider invocation, settlement, and all associated commits.
+    /// Cancelling a waiter or dropping its guard releases its claim. A caller
+    /// must cancel and join an executor before starting replacement work.
+    /// This fence coordinates only users of this owner, not direct store writes.
+    pub async fn summary_guard(self: &Arc<Self>, id: Uuid) -> SummaryGuard {
+        let lock = {
+            let mut entries = self
+                .summary_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.retain(|_, entry| entry.strong_count() != 0);
+            match entries.get(&id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entries.insert(id, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let guard = lock.lock_owned().await;
+        SummaryGuard {
+            _guard: guard,
+            _owner: self.clone(),
+        }
     }
 
     pub fn store(&self) -> &Store {

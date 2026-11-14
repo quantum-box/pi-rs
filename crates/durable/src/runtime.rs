@@ -9352,6 +9352,31 @@ mod scheduler_tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_joins_summary_fence_holder_before_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = Scheduler::open(&path, options(placement_model())).unwrap();
+        let id = Uuid::new_v4();
+        let owner = scheduler.harness.owner.clone();
+        let cancel = scheduler.cancel.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = owner.summary_guard(id).await;
+            started.send(()).unwrap();
+            cancel.cancelled().await;
+            Ok(())
+        });
+        scheduler.tasks.entry(id).or_default().push(task);
+        ready.await.unwrap();
+        assert!(matches!(OwnedStore::open(&path), Err(OwnerError::Busy)));
+        scheduler.shutdown().await.unwrap();
+        let reopened = Arc::new(OwnedStore::open(&path).unwrap());
+        let _guard = tokio::time::timeout(Duration::from_secs(2), reopened.summary_guard(id))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn runtime_block_save_reopens_and_rejects_lossy_operations() {
         use serde_json::json;
