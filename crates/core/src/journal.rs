@@ -585,6 +585,8 @@ impl Session {
     }
 
     /// Restore a validated, in-memory snapshot without mutating its source.
+    /// `Record` does not contain auxiliary metadata; use
+    /// `from_records_with_metadata` when the source includes it.
     pub fn from_records(records: Vec<Record>) -> Result<Self> {
         Self::with_store(MemoryStore {
             records,
