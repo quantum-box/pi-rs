@@ -7277,6 +7277,20 @@ impl EditorForeground {
     fn suspend_and_resume(&self, editor_group: libc::pid_t) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
         let fd = self.tty.as_raw_fd();
+        // Without shell job control Pi shares its parent's process group.
+        // Suspending that group freezes the shell, and stopping Pi alone leaves
+        // a non-job-control shell waiting with no way to foreground it. Resume
+        // the editor instead, retaining its foreground and terminal state.
+        let group = unsafe { libc::getpgrp() };
+        let parent_group = unsafe { libc::getpgid(libc::getppid()) };
+        if parent_group < 0 || parent_group == group {
+            if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(test)]
+            EDITOR_JOB_RESUMES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
         let mut editor_settings = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut editor_settings) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -7774,7 +7788,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn editor_pty_regression(test_name: &str, suspend: bool) {
+    fn editor_pty_regression(test_name: &str, suspend: bool, shared_group: bool) {
         use std::io::{Read, Write};
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::{fs::PermissionsExt, process::CommandExt};
@@ -7782,6 +7796,11 @@ mod tests {
         use std::time::{Duration, Instant};
         const CHILD: &str = "PI_RS_EDITOR_JOB_CONTROL_TEST";
         if let Some(program) = std::env::var_os(CHILD) {
+            if shared_group {
+                assert_eq!(unsafe { libc::getpgrp() }, unsafe {
+                    libc::getpgid(libc::getppid())
+                });
+            }
             let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(0, &mut baseline) }, 0);
             let mut editor = super::RunningExternalEditor::start(
@@ -7860,7 +7879,18 @@ mod tests {
         );
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let slave = unsafe { std::fs::File::from_raw_fd(slave) };
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let executable = std::env::current_exe().unwrap();
+        let mut command = if shared_group {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("\"$@\"; rc=$?; printf 'SHELL_ALIVE\\n'; exit $rc")
+                .arg("fixture-shell")
+                .arg(&executable);
+            command
+        } else {
+            std::process::Command::new(&executable)
+        };
         command
             .args(["--exact", test_name, "--nocapture"])
             .env(CHILD, &program)
@@ -7906,9 +7936,18 @@ mod tests {
                         libc::WUNTRACED | libc::WNOHANG,
                     )
                 };
-                if rc > 0 && libc::WIFSTOPPED(status) {
+                if shared_group && rc > 0 && libc::WIFSTOPPED(status) {
                     unsafe {
-                        libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
+                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
+                    let _ = child.wait();
+                    panic!("shell was stopped along with the editor");
+                }
+                if (shared_group && rc == 0) || (rc > 0 && libc::WIFSTOPPED(status)) {
+                    if !shared_group {
+                        unsafe {
+                            libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
+                        }
                     }
                     // Wait for the child to confirm it restored editor foreground.
                     let until = Instant::now() + Duration::from_secs(3);
@@ -7947,6 +7986,9 @@ mod tests {
                     String::from_utf8_lossy(&output)
                 );
                 assert!(String::from_utf8_lossy(&output).contains("PARENT_FINISHED"));
+                if shared_group {
+                    assert!(String::from_utf8_lossy(&output).contains("SHELL_ALIVE"));
+                }
                 break;
             }
             if Instant::now() >= deadline {
@@ -7964,6 +8006,17 @@ mod tests {
         editor_pty_regression(
             "interactive::tests::stopped_editor_suspends_and_resumes_parent_job",
             true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_suspend_keeps_shared_group_shell_running() {
+        editor_pty_regression(
+            "interactive::tests::editor_suspend_keeps_shared_group_shell_running",
+            true,
+            true,
         );
     }
 
@@ -7972,6 +8025,7 @@ mod tests {
     fn cancelled_editor_restores_original_termios() {
         editor_pty_regression(
             "interactive::tests::cancelled_editor_restores_original_termios",
+            false,
             false,
         );
     }
