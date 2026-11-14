@@ -34,7 +34,8 @@ pub mod state;
 pub mod streamed_output;
 pub mod subagent;
 pub mod subagent_management;
-pub mod summary_store;
+#[allow(dead_code)] // Storage foundation; no independent worker is connected yet.
+mod summary_store;
 pub mod task;
 pub mod task_driver;
 pub mod task_scheduler;

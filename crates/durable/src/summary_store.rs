@@ -8,6 +8,7 @@
 use crate::compact::{CompactionResult, Preparation};
 use crate::model::CompletedGeneration;
 use durable_store::{Check, Expected, Mutation, Store};
+use pi_rs_core::UsageReport;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -111,6 +112,37 @@ impl Operation {
     }
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+
+    /// Derive the exact report to replay from the durable checkpoint. Once an
+    /// attempt is unconfirmed, later observations must not change its report:
+    /// the external settlement may already have accepted this value.
+    pub fn settlement_report(&self, request_id: Uuid) -> Result<UsageReport, Error> {
+        let attempt = self
+            .attempts
+            .iter()
+            .find(|a| a.request_id == request_id)
+            .ok_or(Error::Identity)?;
+        if attempt.unconfirmed {
+            return Ok(UsageReport::Unconfirmed);
+        }
+        let generation = match &self.state {
+            State::Accounting {
+                request_id: current,
+                generation,
+                ..
+            } if *current == request_id => generation,
+            State::Aborting {
+                accounting: Some(pending),
+                ..
+            } if pending.request_id == request_id => &pending.generation,
+            _ => return Err(Error::State),
+        };
+        Ok(generation
+            .usage
+            .map_or(UsageReport::Unconfirmed, |usage| UsageReport::Measured {
+                usage,
+            }))
     }
 }
 #[derive(Clone, Debug)]
@@ -299,7 +331,8 @@ impl<'a> SummaryStore<'a> {
     /// Record the successful provider settlement for a persisted accounting
     /// checkpoint or an unconfirmed attempt. The provider must make settlement
     /// idempotent by request ID: a crash after its acknowledgement but before
-    /// this commit requires replay with the same ID and report. The caller must
+    /// this commit requires replay with the same ID and the report derived by
+    /// `settlement_report`. The caller must
     /// fence the settlement executor before another executor retries it.
     pub fn record_settlement(&self, id: Uuid, version: u64, request_id: Uuid) -> Result<(), Error> {
         let mut op = self.load(id, version)?;
@@ -508,6 +541,87 @@ mod tests {
     }
     fn snapshot(s: &SummaryStore<'_>, id: Uuid) -> Snapshot {
         s.get(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn lost_settlement_ack_replays_identical_reports_after_reopen_and_abort() {
+        use std::collections::HashMap;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let (id, owner, first, second) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        // Simulate an external service which rejects a changed report for an ID.
+        let mut accepted = HashMap::new();
+        let mut settle = |request, report: UsageReport| {
+            if let Some(previous) = accepted.insert(request, report.clone()) {
+                assert_eq!(previous, report);
+            }
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            let s = SummaryStore::new(&store);
+            s.create(id, Uuid::new_v4(), preparation()).unwrap();
+            s.reserve(id, snapshot(&s, id).version, owner, first)
+                .unwrap();
+            s.start(id, snapshot(&s, id).version, owner).unwrap();
+            s.recover(id, snapshot(&s, id).version, owner).unwrap();
+            settle(
+                first,
+                snapshot(&s, id).operation.settlement_report(first).unwrap(),
+            );
+            // Service accepted it; receipt acknowledgement is lost.
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let s = SummaryStore::new(&store);
+            settle(
+                first,
+                snapshot(&s, id).operation.settlement_report(first).unwrap(),
+            );
+            s.record_settlement(id, snapshot(&s, id).version, first)
+                .unwrap();
+            s.reserve(id, snapshot(&s, id).version, owner, second)
+                .unwrap();
+            s.start(id, snapshot(&s, id).version, owner).unwrap();
+            let mut completed = generation();
+            completed.usage = Some(pi_rs_core::Usage {
+                input_tokens: 42,
+                output_tokens: 7,
+            });
+            s.complete(id, snapshot(&s, id).version, owner, completed)
+                .unwrap();
+            let report = snapshot(&s, id)
+                .operation
+                .settlement_report(second)
+                .unwrap();
+            assert!(matches!(report, UsageReport::Measured { .. }));
+            settle(second, report);
+            s.begin_abort(id, snapshot(&s, id).version).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let s = SummaryStore::new(&store);
+            settle(
+                second,
+                snapshot(&s, id)
+                    .operation
+                    .settlement_report(second)
+                    .unwrap(),
+            );
+            assert!(matches!(
+                s.finish_abort(id, snapshot(&s, id).version, Some(owner)),
+                Err(Error::State)
+            ));
+            s.record_settlement(id, snapshot(&s, id).version, second)
+                .unwrap();
+            s.finish_abort(id, snapshot(&s, id).version, Some(owner))
+                .unwrap();
+            assert!(matches!(snapshot(&s, id).operation.state(), State::Aborted));
+        }
     }
 
     #[test]
