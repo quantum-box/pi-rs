@@ -1722,10 +1722,18 @@ impl Harness {
                 {
                     return Err(Error::Storage(durable_store::Error::Conflict { key }));
                 }
-                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+                Err(Error::Storage(durable_store::Error::Conflict { key: conflict }))
                     if self.merge_admissions =>
                 {
                     let entry = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
+                    // Merging admissions can only resolve a changed conversation.
+                    // A task ID collision (or any other independently conflicting
+                    // record) otherwise retries the same transaction forever.
+                    if expected == Expected::Version(entry.version) {
+                        return Err(Error::Storage(durable_store::Error::Conflict {
+                            key: conflict,
+                        }));
+                    }
                     let mut latest: Conversation = serde_json::from_slice(&entry.value)?;
                     self.hydrate(&mut latest)?;
                     let base = self
@@ -10245,6 +10253,43 @@ mod scheduler_tests {
             .tool_attempts(id, crate::observer::Cursor(0), limit)
             .unwrap();
         assert_eq!(page.records[0].value["attempt"], serde_json::json!(attempt));
+    }
+
+    #[test]
+    fn task_id_collision_does_not_retry_admission_merge() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(id),
+            Checkpoint {
+                phase: "initial".into(),
+                data: serde_json::json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("job".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let (state, version) = h.load(id).unwrap();
+        h.merge_admissions = true;
+        assert!(matches!(
+            h.save_composed(&state, Expected::Version(version), None, &[task]),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(h.load(id).unwrap().1, version);
     }
 
     #[test]
