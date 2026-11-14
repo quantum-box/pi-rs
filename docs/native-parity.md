@@ -161,6 +161,11 @@ timeout limits still apply. Custom `SessionStore` implementations that do not
 support atomic record metadata reject new pre-summary extension compactions
 rather than silently dropping their metadata. Legacy compaction hooks continue
 to work on those stores with their previous metadata-free behavior.
+An unsupported metadata append is rejected before any write, so the existing
+session remains usable. When a completed model summary is recovered, usage is
+settled with its original request ID and metadata before compaction is committed;
+the host must make settlement idempotent per request ID. A failed settlement
+leaves the summary available for retry instead of silently closing the run.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

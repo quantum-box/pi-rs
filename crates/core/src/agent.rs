@@ -1224,7 +1224,7 @@ impl Agent<'_> {
             .filter(|_| !trigger_unanswered)
         {
             if !apply_inputs(session, true, observer)? {
-                self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await;
+                self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
                 return Ok(answer);
             }
         } else if !session.branch().iter().any(|record| {
@@ -1303,15 +1303,23 @@ impl Agent<'_> {
                     // to replay. A validated completed summary can be committed
                     // without a second billable provider request.
                     if active.registry.extensions.is_empty()
-                        && let Some((summary, spent, billing, retention)) =
-                            completed_overflow_summary(
-                                session,
-                                run_id,
-                                "pi-rs:overflow-recovery",
-                                active.model_name,
-                            )
+                        && let Some((
+                            summary,
+                            spent,
+                            billing,
+                            retention,
+                            request_id,
+                            usage,
+                            metadata,
+                        )) = completed_overflow_summary(
+                            session,
+                            run_id,
+                            "pi-rs:overflow-recovery",
+                            active.model_name,
+                        )
                         && spent <= budget
                     {
+                        active.settle_usage(request_id, &usage, &metadata).await?;
                         active
                             .commit_compaction_with_host(
                                 session,
@@ -1875,7 +1883,7 @@ impl Agent<'_> {
                         .compact_silent_overflow(
                             session, run_id, &states, cancel, observer, followups,
                         )
-                        .await;
+                        .await?;
                     return Ok(answer);
                 }
             }
@@ -1891,9 +1899,9 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         followups: &mut mpsc::Receiver<T>,
-    ) {
+    ) -> Result<()> {
         if !session.auto_compaction_control().enabled() || cancel.is_cancelled() {
-            return;
+            return Ok(());
         }
         let window = match self.limits.context_window {
             Some(window) => Some(window),
@@ -1906,13 +1914,13 @@ impl Agent<'_> {
             .flatten(),
         };
         let Some(window) = window.filter(|window| *window > 0) else {
-            return;
+            return Ok(());
         };
         let branch = session.branch();
         let Some((index, record)) = branch.iter().enumerate().rev().find(|(_, record)| {
             record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
         }) else {
-            return;
+            return Ok(());
         };
         let Event::Assistant {
             invocations,
@@ -1921,7 +1929,7 @@ impl Agent<'_> {
             ..
         } = &record.event
         else {
-            return;
+            return Ok(());
         };
         if !invocations.is_empty()
             || usage.input_tokens <= u64::from(window)
@@ -1939,7 +1947,7 @@ impl Agent<'_> {
                 )
             })
         {
-            return;
+            return Ok(());
         }
         let request_id = *request_id;
         let requests_used = branch
@@ -1992,19 +2000,21 @@ impl Agent<'_> {
                     <= u64::from(window)
             })
         {
-            return;
+            return Ok(());
         }
         if already_started {
             // A completed summary is safe to reuse only when no external
             // hooks could have run before the interruption.
             if self.registry.extensions.is_empty()
-                && let Some((summary, _, billing, retention)) = completed_overflow_summary(
-                    session,
-                    run_id,
-                    "pi-rs:silent-overflow",
-                    self.model_name,
-                )
+                && let Some((summary, _, billing, retention, request_id, usage, metadata)) =
+                    completed_overflow_summary(
+                        session,
+                        run_id,
+                        "pi-rs:silent-overflow",
+                        self.model_name,
+                    )
             {
+                self.settle_usage(request_id, &usage, &metadata).await?;
                 let _ = self
                     .commit_compaction_with_host(
                         session,
@@ -2022,17 +2032,17 @@ impl Agent<'_> {
                     )
                     .await;
             }
-            return;
+            return Ok(());
         }
         let Ok(retention) = configured_retention(
             session,
             self.compaction_tokens(session).keep_recent_tokens,
             1,
         ) else {
-            return;
+            return Ok(());
         };
         if !has_summary_prefix(session, retention.boundary) {
-            return;
+            return Ok(());
         }
         if commit(
             session,
@@ -2044,7 +2054,7 @@ impl Agent<'_> {
         )
         .is_err()
         {
-            return;
+            return Ok(());
         }
         let output_limit = if requests_used < self.limits.model_requests && output_used.is_some() {
             self.limits.output_tokens_per_request.min(512).min(
@@ -2055,7 +2065,7 @@ impl Agent<'_> {
         } else {
             0
         };
-        let _ = self
+        let result = self
             .summarize_prefix(
                 session,
                 states,
@@ -2072,6 +2082,16 @@ impl Agent<'_> {
                 Some(followups),
             )
             .await;
+        if let Err(error) = result
+            && self.registry.extensions.is_empty()
+            && completed_overflow_summary(session, run_id, "pi-rs:silent-overflow", self.model_name)
+                .is_some()
+        {
+            // A completed summary must be settled before the run is closed;
+            // leave it recoverable if settlement failed after the durable reply.
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn migrate(
@@ -3844,9 +3864,16 @@ impl Agent<'_> {
         let reason = scope.reason;
         let will_retry = scope.will_retry;
         let cancellation = scope.cancellation;
-        let from_extension = std::sync::atomic::AtomicBool::new(false);
+        let supplied_without_model = std::sync::atomic::AtomicBool::new(false);
         let result = self
-            .summarize_prefix_inner(session, states, scope, observer, inputs, &from_extension)
+            .summarize_prefix_inner(
+                session,
+                states,
+                scope,
+                observer,
+                inputs,
+                &supplied_without_model,
+            )
             .await;
         if matches!(result, Ok(None)) {
             return Ok(None);
@@ -3872,7 +3899,7 @@ impl Agent<'_> {
                     ..
                 } = &mut event
                 {
-                    *value = from_extension.load(std::sync::atomic::Ordering::Relaxed);
+                    *value = supplied_without_model.load(std::sync::atomic::Ordering::Relaxed);
                 }
                 event
             }
@@ -3909,7 +3936,7 @@ impl Agent<'_> {
             value.map(|(spent, _)| {
                 (
                     spent,
-                    from_extension.load(std::sync::atomic::Ordering::Relaxed),
+                    supplied_without_model.load(std::sync::atomic::Ordering::Relaxed),
                 )
             })
         })
@@ -3922,7 +3949,7 @@ impl Agent<'_> {
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
-        from_extension: &std::sync::atomic::AtomicBool,
+        supplied_without_model: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
             retention,
@@ -3996,7 +4023,7 @@ impl Agent<'_> {
             }
         }
         if let Some(result) = supplied {
-            from_extension.store(true, std::sync::atomic::Ordering::Relaxed);
+            supplied_without_model.store(true, std::sync::atomic::Ordering::Relaxed);
             let boundary = result.first_kept_entry.ok_or_else(|| {
                 Error::Config("extension compaction requires a retained branch entry".into())
             })?;
@@ -4447,6 +4474,9 @@ type RecoveredSummary = (
     u32,
     Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
     RetentionPlan,
+    Uuid,
+    UsageReport,
+    ModelMetadata,
 );
 
 fn completed_overflow_summary(
@@ -4563,7 +4593,15 @@ fn completed_overflow_summary(
         }
         _ => return None,
     };
-    Some((partial.clone(), spent, billing, retention))
+    Some((
+        partial.clone(),
+        spent,
+        billing,
+        retention,
+        *request_id,
+        usage.clone(),
+        metadata.clone(),
+    ))
 }
 
 fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRecoveryState> {
@@ -6566,6 +6604,37 @@ mod tree_tests {
         }
     }
 
+    struct RecoverySettlementModel {
+        turn: TurnModel,
+        summary_id: Uuid,
+        fail_once: std::sync::atomic::AtomicBool,
+        settlements: std::sync::Mutex<Vec<(Uuid, UsageReport, ModelMetadata)>>,
+    }
+    #[async_trait::async_trait]
+    impl Model for RecoverySettlementModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            self.turn.stream(request).await
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            request_id: Uuid,
+            usage: &UsageReport,
+            metadata: &ModelMetadata,
+        ) -> Result<()> {
+            if request_id == self.summary_id {
+                self.settlements.lock().unwrap().push((
+                    request_id,
+                    usage.clone(),
+                    metadata.clone(),
+                ));
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn automatic_compaction_uses_extension_summary_before_turn_model() {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -7638,7 +7707,10 @@ mod tree_tests {
         session
             .append(Event::ModelFinished {
                 request_id: summary_id,
-                metadata: Default::default(),
+                metadata: ModelMetadata {
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                },
                 usage: UsageReport::Measured {
                     usage: Usage {
                         input_tokens: 9,
@@ -7652,7 +7724,12 @@ mod tree_tests {
             .unwrap();
         drop(session);
         let mut session = Session::open(&path).unwrap();
-        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+            settlements: std::sync::Mutex::new(Vec::new()),
+        };
         let registry = Registry::default();
         let agent = Agent {
             model: &model,
@@ -7671,6 +7748,24 @@ mod tree_tests {
             },
         };
         let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let failure = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("settlement unavailable"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
         let answer = agent
             .run_correlated(
                 &mut session,
@@ -7683,8 +7778,18 @@ mod tree_tests {
             .await
             .unwrap();
         assert_eq!(answer, "answer");
+        let settlements = model.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 2);
+        assert!(
+            settlements
+                .iter()
+                .all(|(id, usage, metadata)| *id == summary_id
+                    && matches!(usage, UsageReport::Measured { usage } if usage.input_tokens == 9)
+                    && metadata.finish_reason.as_deref() == Some("stop"))
+        );
+        drop(settlements);
         assert_eq!(
-            model.0.load(Ordering::SeqCst),
+            model.turn.0.load(Ordering::SeqCst),
             1,
             "only the retried turn may call the model"
         );
@@ -7770,7 +7875,10 @@ mod tree_tests {
             session
                 .append(Event::ModelFinished {
                     request_id: id,
-                    metadata: Default::default(),
+                    metadata: ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
                     usage: UsageReport::Measured {
                         usage: Usage {
                             input_tokens: if id == turn_id { 1001 } else { 9 },
@@ -7794,7 +7902,12 @@ mod tree_tests {
         }
         drop(session);
         let mut session = Session::open(&path).unwrap();
-        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+            settlements: std::sync::Mutex::new(Vec::new()),
+        };
         let registry = Registry::default();
         let agent = Agent {
             model: &model,
@@ -7813,6 +7926,24 @@ mod tree_tests {
             },
         };
         let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let failure = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("settlement unavailable"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
         let answer = agent
             .run_correlated(
                 &mut session,
@@ -7825,7 +7956,17 @@ mod tree_tests {
             .await
             .unwrap();
         assert_eq!(answer, "answer");
-        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+        let settlements = model.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 2);
+        assert!(
+            settlements
+                .iter()
+                .all(|(id, usage, metadata)| *id == summary_id
+                    && matches!(usage, UsageReport::Measured { usage } if usage.input_tokens == 9)
+                    && metadata.finish_reason.as_deref() == Some("stop"))
+        );
+        drop(settlements);
+        assert_eq!(model.turn.0.load(Ordering::SeqCst), 0);
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")));
     }
 
@@ -7857,6 +7998,133 @@ mod tree_tests {
                 .push(format!("after:{}", compaction.summary));
             Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_summary_edits_still_count_model_requests_for_automatic_compaction() {
+        for reason in [
+            crate::CompactionTrigger::Threshold,
+            crate::CompactionTrigger::Overflow,
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(LegacyCompaction(events)))
+                .unwrap();
+            let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::User {
+                    content: "recent".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let retention = RetentionPlan::turns(&session, 1);
+            let result = agent
+                .summarize_prefix::<AgentInput>(
+                    &mut session,
+                    &ExtensionStates::new(),
+                    SummaryScope {
+                        retention,
+                        instructions: None,
+                        output_limit: 16,
+                        cancellation: &CancellationToken::new(),
+                        reason,
+                        will_retry: matches!(reason, crate::CompactionTrigger::Overflow),
+                        skip_without_model: false,
+                    },
+                    &mut |_| {},
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!result.1, "a legacy edit must not refund the model request");
+            assert_eq!(model.0.load(Ordering::SeqCst), 1);
+            let record = session.records().iter().find(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")).unwrap();
+            assert_eq!(
+                session.record_metadata(record.id).unwrap()["fromExtension"],
+                true
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_edited_overflow_summary_uses_three_model_requests() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            )))))
+            .unwrap();
+        let model = OverflowModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            always_fail: false,
+        };
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 3,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(result.unwrap(), "answer");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
