@@ -1248,9 +1248,22 @@ impl Agent<'_> {
         // restart. Pending replies and saved summaries are charged below when
         // replayed, so exclude them here to avoid charging them twice.
         let pending_id = pending.as_ref().map(|(id, ..)| *id);
+        let mut settled = HashSet::new();
+        for (id, usage, metadata) in durable_overflow_completions(session, run_id) {
+            self.settle_usage(id, &usage, &metadata).await?;
+            settled.insert(id);
+        }
+        if let Some((id, metadata, usage, _)) = &pending
+            && metadata.finish_reason.as_deref() == Some("length")
+            && settled.insert(*id)
+        {
+            self.settle_usage(*id, usage, metadata).await?;
+        }
         let saved_summary =
             completed_overflow_summary(session, run_id, "pi-rs:overflow-recovery", self.model_name);
-        if let Some((_, _, _, _, id, usage, metadata)) = &saved_summary {
+        if let Some((_, _, _, _, id, usage, metadata)) = &saved_summary
+            && settled.insert(*id)
+        {
             self.settle_usage(*id, usage, metadata).await?;
         }
         let saved_summary_id = saved_summary.as_ref().map(|(_, _, _, _, id, _, _)| *id);
@@ -1334,28 +1347,6 @@ impl Agent<'_> {
                     return Err(Error::Model(
                         "context overflow and automatic compaction is disabled".into(),
                     ));
-                }
-                if !recovery.started
-                    && let Some((usage, metadata)) =
-                        session
-                            .branch()
-                            .iter()
-                            .rev()
-                            .find_map(|record| match &record.event {
-                                Event::ModelFinished {
-                                    request_id,
-                                    usage,
-                                    metadata,
-                                    ..
-                                } if *request_id == recovery.request_id => {
-                                    Some((usage.clone(), metadata.clone()))
-                                }
-                                _ => None,
-                            })
-                {
-                    active
-                        .settle_usage(recovery.request_id, &usage, &metadata)
-                        .await?;
                 }
                 if recovery.started
                     && !recovery.summary_started
@@ -1491,7 +1482,9 @@ impl Agent<'_> {
                         )
                         .await?;
                 }
-                active.settle_usage(request, &usage, &metadata).await?;
+                if !settled.contains(&request) {
+                    active.settle_usage(request, &usage, &metadata).await?;
+                }
                 let allowance = recorded
                     .max_output_tokens
                     .min(active.limits.output_tokens_per_request)
@@ -4613,6 +4606,43 @@ fn overflow_recovery_attempted(session: &Session, run_id: Uuid) -> bool {
         && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
 }
 
+// Settlement follows durable completion, even when a summary cannot safely be
+// replayed. Do not couple accounting to retention or response validation.
+fn durable_overflow_completions(
+    session: &Session,
+    run_id: Uuid,
+) -> Vec<(Uuid, UsageReport, ModelMetadata)> {
+    let Some(recovery) = overflow_recovery_state(session, run_id).filter(|state| !state.compacted)
+    else {
+        return Vec::new();
+    };
+    let branch = session.branch();
+    let epoch = overflow_recovery_epoch(&branch, run_id);
+    let mut ids = vec![recovery.request_id];
+    if let Some(marker) = epoch.iter().rposition(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
+        && let Some(id) = epoch[marker + 1..].iter().find_map(|record| match &record.event {
+            Event::ModelRequested { request_id: Some(id), .. } if record.run_id == Some(run_id) => Some(*id),
+            _ => None,
+        })
+        && !ids.contains(&id)
+    { ids.push(id); }
+    ids.into_iter()
+        .filter_map(|id| {
+            epoch.iter().find_map(|record| match &record.event {
+                Event::ModelFinished {
+                    request_id,
+                    usage,
+                    metadata,
+                    ..
+                } if record.run_id == Some(run_id) && *request_id == id => {
+                    Some((id, usage.clone(), metadata.clone()))
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 // A completed model summary can be reused only if its response is durable and
 // no later event changed the context from which its retention plan was chosen.
 type RecoveredSummary = (
@@ -7194,6 +7224,69 @@ mod tree_tests {
                 .count(),
             2
         );
+        let run_id = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow" => {
+                    record.run_id
+                }
+                _ => None,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut reopened = Session::open(&path).unwrap();
+        let summary_id = session
+            .records()
+            .iter()
+            .rev()
+            .find_map(|record| match record.event {
+                Event::ModelRequested {
+                    request_id: Some(id),
+                    ..
+                } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        let resumed_model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(false),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
+        let resumed_agent = Agent {
+            model: &resumed_model,
+            ..agent
+        };
+        assert_eq!(
+            resumed_agent
+                .run_correlated(
+                    &mut reopened,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(resumed_model.turn.0.load(Ordering::SeqCst), 0);
+        assert!(
+            resumed_model
+                .settlements
+                .lock()
+                .unwrap()
+                .iter()
+                .any(
+                    |(id, usage, _)| *id == summary_id && matches!(usage, UsageReport::Unconfirmed)
+                )
+        );
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
     }
     #[async_trait::async_trait]
     impl Model for SilentOverflowModel {
@@ -8050,6 +8143,83 @@ mod tree_tests {
             .unwrap();
         drop(session);
         let mut session = Session::open(&path).unwrap();
+        for case in 0..5 {
+            let mut records = session.records().to_vec();
+            for record in &mut records {
+                if let Event::ModelFinished {
+                    request_id,
+                    metadata,
+                    failure,
+                    partial,
+                    ..
+                } = &mut record.event
+                    && *request_id == summary_id
+                {
+                    match case {
+                        0 => *failure = Some(ModelFailure::Failed),
+                        1 => *failure = Some(ModelFailure::Cancelled),
+                        2 => metadata.finish_reason = Some("length".into()),
+                        3 => partial.clear(),
+                        _ => *partial = "x".repeat(65537),
+                    }
+                }
+            }
+            let staged = Session::from_records(records).unwrap();
+            let recovery_path = directory
+                .path()
+                .join(format!("invalid-summary-{case}.jsonl"));
+            staged.export_jsonl(&recovery_path).unwrap();
+            drop(staged);
+            let recovery_model = RecoverySettlementModel {
+                turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+                summary_id,
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+                settlements: std::sync::Mutex::new(Vec::new()),
+                allowances: std::sync::Mutex::new(Vec::new()),
+            };
+            let recovery_registry = Registry::default();
+            let recovery_agent = Agent {
+                model: &recovery_model,
+                model_name: "fixture",
+                registry: &recovery_registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let (_sender, mut recovery_inputs) = mpsc::channel::<String>(1);
+            let mut reopened = Session::open(&recovery_path).unwrap();
+            assert!(
+                recovery_agent
+                    .run_correlated(
+                        &mut reopened,
+                        run_id,
+                        None,
+                        &mut recovery_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            drop(reopened);
+            let mut reopened = Session::open(&recovery_path).unwrap();
+            assert!(
+                recovery_agent
+                    .run_correlated(
+                        &mut reopened,
+                        run_id,
+                        None,
+                        &mut recovery_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(recovery_model.settlements.lock().unwrap().len(), 2);
+            assert_eq!(recovery_model.turn.0.load(Ordering::SeqCst), 0);
+        }
         let mut limited_session = Session::from_records(session.records().to_vec()).unwrap();
         let limited_model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
         let limited_registry = Registry::default();

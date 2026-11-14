@@ -9722,6 +9722,49 @@ mod tests {
                 })
                 .unwrap();
             drop(journal);
+            for disabled in [false, true] {
+                let gate_path = dir.path().join(format!("gate-{disabled}.jsonl"));
+                std::fs::copy(&path, &gate_path).unwrap();
+                let gate_model = Arc::new(ResumeSettlementModel {
+                    summary_id: request_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let limits = Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..Limits::default()
+                };
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits.clone())
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                assert!(
+                    gated
+                        .resume()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("settlement unavailable")
+                );
+                gated.close().await.unwrap();
+                drop(gated);
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits)
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                let _ = gated.resume().await;
+                assert_eq!(gate_model.attempts.lock().unwrap().len(), 2);
+                assert_eq!(gate_model.calls.load(Ordering::SeqCst), 0);
+                gated.close().await.unwrap();
+            }
             let model = Arc::new(ResumeSettlementModel {
                 summary_id: request_id,
                 attempts: std::sync::Mutex::new(Vec::new()),
