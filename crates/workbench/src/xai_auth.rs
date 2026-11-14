@@ -505,8 +505,35 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // Consume the entire HTTP request before closing the connection.
+            // A single read can leave request bytes unread; on Windows the
+            // resulting reset may discard the response to a rotated token.
+            let mut request = Vec::new();
             let mut bytes = [0; 2048];
-            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            loop {
+                let count = tokio::time::timeout(Duration::from_secs(10), socket.read(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0, "request closed before its body arrived");
+                request.extend_from_slice(&bytes[..count]);
+                assert!(request.len() <= 16 * 1024, "unexpectedly large request");
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .expect("request content length");
+                    if request.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            assert!(String::from_utf8_lossy(&request).contains("refresh_token=old-refresh"));
             started_tx.send(()).unwrap();
             reply_rx.await.unwrap();
             let body =

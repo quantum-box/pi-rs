@@ -354,6 +354,8 @@ elif r['type'] == 'context_with_system':
             message['content'] += ' fixture-context-hook'
     with open(os.environ['SHARE_FIXTURE_MARKER'], 'w') as marker:
         marker.write(str(os.getppid()))
+elif r['type'] == 'before_request':
+    result = r['request']
 else:
     result = None
 print(json.dumps({'version':1,'response':{'Ok':result}}))
@@ -546,7 +548,20 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     );
     wait_output(&mut master, "Share URL:");
     master.write_all(b"hello\r").unwrap();
-    started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    if let Err(error) = started_rx.recv_timeout(Duration::from_secs(20)) {
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        while let Ok(count) = master.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+        panic!(
+            "model request did not start: {error}; terminal: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     master.write_all(b"/share\r").unwrap();
     let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
