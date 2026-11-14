@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub(crate) const PREFIX: &[u8] = b"durable/summary-operation/";
 const REQUEST_PREFIX: &[u8] = b"durable/summary-request/";
 const PLACEMENT_PREFIX: &[u8] = b"durable/summary-placement/";
+type Discovery = (Vec<(Uuid, Uuid)>, Vec<Uuid>);
 const OWNER_PREFIX: &[u8] = b"durable/summary-owner/";
 /// Bounds the persisted request and result separately, in serialized bytes.
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -330,8 +331,7 @@ impl<'a> SummaryStore<'a> {
         preparation: Preparation,
         (conversation_key, version): (Vec<u8>, u64),
         provider: ProviderIdentity,
-        auto_place: bool,
-        hook: Option<HookCheckpoint>,
+        (auto_place, hook): (bool, Option<HookCheckpoint>),
     ) -> Result<(), Error> {
         if id.is_nil() || session_id.is_nil() || version == 0 || !provider.valid() {
             return Err(Error::Identity);
@@ -468,7 +468,7 @@ impl<'a> SummaryStore<'a> {
     pub(crate) fn discover(
         &self,
         provider: &ProviderIdentity,
-    ) -> Result<(Vec<(Uuid, Uuid)>, Vec<Uuid>), Error> {
+    ) -> Result<Discovery, Error> {
         if !provider.valid() {
             return Err(Error::Identity);
         }

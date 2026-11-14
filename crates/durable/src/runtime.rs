@@ -9407,8 +9407,7 @@ impl Scheduler {
                 preparation.bind_context(generation),
                 (Harness::key(conversation), version),
                 provider,
-                auto_place,
-                hook,
+                (auto_place, hook),
             )
             .map_err(|e| self.summary_store_error(e))?;
         Ok(true)

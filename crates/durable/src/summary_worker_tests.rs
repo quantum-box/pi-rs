@@ -609,10 +609,11 @@ async fn independent_hook_replays_with_the_same_durable_memo_after_reopen() {
         scheduler.wait_independent_compaction(id).await.unwrap(),
         IndependentCompactionStatus::Applied
     );
-    let values = hook.values.lock().unwrap();
-    assert_eq!(values.len(), 2);
-    assert_eq!(values[0], values[1]);
-    drop(values);
+    {
+        let values = hook.values.lock().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], values[1]);
+    }
     assert!(model.calls.lock().unwrap().is_empty());
     scheduler.shutdown().await.unwrap();
 }
@@ -1713,8 +1714,7 @@ async fn creation_rejects_a_changed_conversation_version() {
             preparation,
             (Harness::key(conversation), version),
             identity(),
-            false,
-            None,
+            (false, None),
         ),
         Err(crate::summary_store::Error::Conflict)
     ));
