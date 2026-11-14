@@ -439,11 +439,15 @@ impl Scheduler {
         if snapshot.task.definition_version() < reg.version {
             let migration = reg.migrate.as_ref().unwrap().clone();
             let version = reg.version;
-            match migration(
-                snapshot.task.input(),
-                snapshot.task.checkpoint(),
-                snapshot.task.definition_version(),
-            ) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                migration(
+                    snapshot.task.input(),
+                    snapshot.task.checkpoint(),
+                    snapshot.task.definition_version(),
+                )
+            }))
+            .unwrap_or_else(|_| Err("migration panicked".into()));
+            match result {
                 Ok((input, checkpoint)) => next.task.migrate(version, input, checkpoint),
                 Err(error) => {
                     self.failed_migrations.insert(snapshot.task.id(), error);
@@ -1163,6 +1167,61 @@ mod tests {
         let s = Scheduler::open(&path, r).unwrap();
         assert_eq!(s.blocked_reason(&finished), Some(BlockedReason::TaskTooOld));
         assert!(s.blocked_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn panicking_migration_blocks_without_mutation_and_retries_on_registry_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let migration_calls = calls.clone();
+        let mut initial = Registry::default();
+        initial.register("job", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, initial).unwrap();
+        let task = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(2)),
+            "job",
+            true,
+            5,
+        );
+        scheduler.submit(&task).unwrap();
+        let mut registry = Registry::default();
+        registry.register_versioned(
+            "job",
+            2,
+            true,
+            |_: &Task| panic!("blocked task must not execute"),
+            Some(Arc::new(move |_, _, _| {
+                migration_calls.fetch_add(1, Ordering::SeqCst);
+                panic!("bad migration")
+            })),
+        );
+        scheduler.replace_registry(registry).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(scheduler.get(task.id()).unwrap().unwrap(), task);
+        assert_eq!(
+            scheduler.blocked_tasks().unwrap()[0].reason,
+            BlockedReason::MigrationFailed("migration panicked".into())
+        );
+        assert!(!scheduler.tick(0).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut replacement = Registry::default();
+        replacement.register_versioned(
+            "job",
+            2,
+            true,
+            |_: &Task| Ok(Step::Succeed(json!("done"))),
+            Some(Arc::new(|_, _, _| Ok((json!(42), cp("new"))))),
+        );
+        scheduler.replace_registry(replacement).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        let finished = scheduler.get(task.id()).unwrap().unwrap();
+        assert_eq!(finished.definition_version(), 2);
+        assert!(matches!(finished.state(), TaskState::Succeeded(_)));
     }
 
     #[test]
