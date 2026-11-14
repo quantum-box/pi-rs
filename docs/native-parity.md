@@ -4322,13 +4322,14 @@ empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
 
-### RPC truncated JSON diagnostics
+### RPC JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
-escapes, and missing values. Offsets and columns count UTF-16 units; CR, LF and
-CRLF are counted as line breaks. Incomplete escapes following lone surrogate
+escapes, invalid escape characters or Unicode digits, and missing values. Offsets
+and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+Escapes following lone surrogate
 escapes and other malformed JSON retain the native parser's diagnostics; full
 malformed-input parity remains open.
 
