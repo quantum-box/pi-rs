@@ -4260,6 +4260,16 @@ Shell transcript rendering strips terminal escape sequences and normalizes line
 endings, including for imported and extension-provided output; journal and
 model-context text retain the original bytes.
 
+### Compaction retention token estimate
+
+Token-based compaction retention uses the projected Pi message estimate,
+including assistant thinking and structured tool-result blocks, when choosing
+a cut point or complete turns. Context edits replace the original estimate.
+A branch-local index shares reasoning and latest edits across message estimates;
+a 2,500-turn regression covers long histories and context usage.
+The separate native model-request safety budget retains its existing
+conservative estimate. Other token-estimator differences remain open.
+
 ### Model listing search checkpoint
 
 `--list-models` searches provider and model IDs with Pi's tokenized fuzzy
