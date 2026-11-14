@@ -84,6 +84,17 @@ impl Runtime {
         session: &mut Session,
         reason: pi_rs::ResourceDiscoveryReason,
     ) -> Result<pi_rs::DiscoveredResources> {
+        self.discover_resources_checked(args, session, reason, false)
+            .await
+    }
+
+    async fn discover_resources_checked(
+        &mut self,
+        args: &Cli,
+        session: &mut Session,
+        reason: pi_rs::ResourceDiscoveryReason,
+        require_complete: bool,
+    ) -> Result<pi_rs::DiscoveredResources> {
         if !self.registry.has_resource_discovery_hooks() {
             return Ok(pi_rs::DiscoveredResources::default());
         }
@@ -94,6 +105,7 @@ impl Runtime {
                 .unwrap_or_else(|_| args.workspace.clone()),
             reason,
         };
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let results = if session.host_binding().is_some() {
             self.registry
                 .discover_resources(
@@ -101,6 +113,7 @@ impl Runtime {
                     &session.extension_states(),
                     args.tool_timeout(),
                     |extension, error| {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         super::observe(
                             pi_rs::Notification::ExtensionLifecycleError {
                                 extension,
@@ -120,6 +133,7 @@ impl Runtime {
                     args.tool_timeout(),
                     &mut |event| super::observe(event, args.trace),
                     |extension, error| {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         super::observe(
                             pi_rs::Notification::ExtensionLifecycleError {
                                 extension,
@@ -132,6 +146,11 @@ impl Runtime {
                 )
                 .await?
         };
+        if require_complete && failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(pi_rs::Error::Config(
+                "Extension resource discovery failed while preparing share context".into(),
+            ));
+        }
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {
@@ -151,6 +170,7 @@ impl Runtime {
                 let path = match resolve_discovered_path(&path, &event.cwd) {
                     Ok(path) => path,
                     Err(error) => {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         eprintln!("Extension {}: {error}", item.extension_id);
                         return None;
                     }
@@ -158,6 +178,7 @@ impl Runtime {
                 if path.exists() {
                     Some(path)
                 } else {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "Extension {}: resource {} was not found",
                         item.extension_id,
@@ -199,6 +220,11 @@ impl Runtime {
                 &mut discovered.theme_paths,
                 &mut origins.themes,
             );
+        }
+        if require_complete && failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(pi_rs::Error::Config(
+                "Extension resources are unavailable while preparing share context".into(),
+            ));
         }
         let resources = resources::Resources::load_with_discovered(args, &discovered)?;
         for warning in &resources.warnings {
@@ -523,18 +549,37 @@ async fn standalone_share_snapshot_with_runtime(
     mut runtime: Runtime,
 ) -> Result<super::sessions::ShareSnapshot> {
     let result = async {
-        runtime
-            .session_lifecycle(
-                args,
-                &session,
+        if runtime.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
+            let mut failed = false;
+            pi_rs::notify_extension_lifecycle(
+                &runtime.registry,
                 pi_rs::LifecycleEvent::SessionStart {
                     reason: pi_rs::SessionStartReason::Startup,
                     previous_session_file: None,
                 },
+                &session.extension_states(),
+                args.tool_timeout(),
+                &mut |event| {
+                    if matches!(&event, pi_rs::Notification::ExtensionLifecycleError { .. }) {
+                        failed = true;
+                    }
+                    super::observe(event, args.trace);
+                },
             )
             .await;
+            if failed {
+                return Err(pi_rs::Error::Config(
+                    "Extension session start failed while preparing share context".into(),
+                ));
+            }
+        }
         runtime
-            .discover_resources(args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
+            .discover_resources_checked(
+                args,
+                &mut session,
+                pi_rs::ResourceDiscoveryReason::Startup,
+                true,
+            )
             .await?;
         let base = runtime.share_base();
         let (system_prompt, tools) =

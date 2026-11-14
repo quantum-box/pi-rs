@@ -269,83 +269,87 @@ fn standalone_radius_share_rejects_unavailable_context_before_connecting() {
 
 #[cfg(unix)]
 #[test]
-fn standalone_share_does_not_upload_after_extension_breaks_context_reconstruction() {
+fn standalone_share_does_not_upload_after_extension_hook_failure() {
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("session.jsonl");
-    let prompt = root.path().join("prompt.txt");
-    let marker = root.path().join("hook-ran");
-    let extension = root.path().join("break-resources.py");
-    std::fs::write(&prompt, "original prompt").unwrap();
-    std::fs::write(&extension, r##"#!/usr/bin/env python3
+    for fail_start in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let prompt = root.path().join("prompt.txt");
+        let marker = root.path().join("hook-ran");
+        let extension = root.path().join("break-resources.py");
+        std::fs::write(&prompt, "original prompt").unwrap();
+        std::fs::write(&extension, r##"#!/usr/bin/env python3
 import json, os, sys
 r = json.load(sys.stdin)
 if r['type'] == 'describe':
-    response = {'Ok': {'id':'break-resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}}
-elif r['type'] == 'discover_resources':
-    with open(os.environ['SHARE_PROMPT'], 'w') as f: f.write('x' * (64 * 1024 + 1))
+    response = {'Ok': {'id':'break-resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'lifecycle_hook':True,'session_lifecycle_hook':True}}
+elif r['type'] == 'lifecycle' and r['event']['type'] == 'session_start' and os.environ['SHARE_FAIL_START'] == '1':
     with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
-    response = {'Ok': {'skillPaths':[],'promptPaths':[],'themePaths':[]}}
+    response = {'Err': 'fixture start failed'}
+elif r['type'] == 'discover_resources':
+    with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
+    response = {'Err': 'fixture discovery failed'}
 else:
     response = {'Ok': None}
 print(json.dumps({'version':1,'response':response}))
 "##).unwrap();
-    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let session = pi_rs::Session::open(&path).unwrap();
-    drop(session);
-    let before = std::fs::read(&path).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(root.path())
-        .env("PI_RS_HOME", root.path().join("home"))
-        .env("RADIUS_API_KEY", "fixture")
-        .env("PI_RS_RADIUS_SHARE_URL", endpoint)
-        .env("SHARE_PROMPT", &prompt)
-        .env("SHARE_MARKER", &marker)
-        .args([
-            "--offline",
-            "--no-mcp",
-            "--no-trust",
-            "--no-skills",
-            "--no-context-files",
-            "--endpoint",
-            "http://127.0.0.1:1/v1/chat/completions",
-            "--system-prompt",
-        ])
-        .arg(&prompt)
-        .arg("--extension")
-        .arg(&extension)
-        .arg("--session")
-        .arg(&path)
-        .arg("share")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("standalone share did not finish");
+        std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = pi_rs::Session::open(&path).unwrap();
+        drop(session);
+        let before = std::fs::read(&path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("RADIUS_API_KEY", "fixture")
+            .env("PI_RS_RADIUS_SHARE_URL", endpoint)
+            .env("SHARE_MARKER", &marker)
+            .env("SHARE_FAIL_START", if fail_start { "1" } else { "0" })
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--system-prompt",
+            ])
+            .arg(&prompt)
+            .arg("--extension")
+            .arg(&extension)
+            .arg("--session")
+            .arg(&path)
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("standalone share did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            marker.exists(),
+            "resource discovery hook did not run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "failed reconstruction was shared");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "Radius was contacted"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        marker.exists(),
-        "resource discovery hook did not run: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.status.success(), "failed reconstruction was shared");
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-        "Radius was contacted"
-    );
-    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 #[test]
