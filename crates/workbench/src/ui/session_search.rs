@@ -50,8 +50,20 @@ pub enum Token {
 }
 pub enum Query {
     Tokens(Vec<Token>),
-    Regex(fancy_regex::Regex),
+    Regex(SearchRegex),
     Invalid,
+}
+pub enum SearchRegex {
+    Linear(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+impl SearchRegex {
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Linear(regex) => regex.is_match(text),
+            Self::Fancy(regex) => regex.is_match(text).unwrap_or(false),
+        }
+    }
 }
 impl Query {
     pub fn new(query: &str) -> Self {
@@ -60,13 +72,19 @@ impl Query {
             if pattern.trim_matches(is_whitespace).is_empty() {
                 return Self::Invalid;
             }
-            return fancy_regex::RegexBuilder::new(&format!(
-                "(?i){}",
-                pattern.trim_matches(is_whitespace)
-            ))
-            .backtrack_limit(100_000)
-            .build()
-            .map_or(Self::Invalid, Self::Regex);
+            let pattern = pattern.trim_matches(is_whitespace);
+            let linear = format!("(?i){}", ascii_regex_classes(pattern));
+            if let Ok(regex) = regex::Regex::new(&linear) {
+                return Self::Regex(SearchRegex::Linear(regex));
+            }
+            // Keep advanced patterns on their original bounded implementation.
+            // Expanded lookarounds can exhaust its limit on long fields.
+            return fancy_regex::RegexBuilder::new(&format!("(?i){pattern}"))
+                .backtrack_limit(100_000)
+                .build()
+                .map_or(Self::Invalid, |regex| {
+                    Self::Regex(SearchRegex::Fancy(regex))
+                });
         }
         let mut tokens = Vec::new();
         let mut buffer = String::new();
@@ -115,7 +133,7 @@ impl Query {
                 .fields
                 .iter()
                 .enumerate()
-                .find(|(_, field)| regex.is_match(field).unwrap_or(false))
+                .find(|(_, field)| regex.is_match(field))
                 .map(|(index, _)| if index == 0 { 0 } else { TEXT }),
             Self::Tokens(tokens) => {
                 let mut total = 0;
@@ -148,6 +166,49 @@ impl Query {
             }
         }
     }
+}
+// JavaScript's non-Unicode regular expressions use ASCII for these classes.
+// Leave patterns with bracket expressions untouched: nested or negated class
+// expressions require a full JavaScript regex parser.
+fn ascii_regex_classes(pattern: &str) -> String {
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '[' {
+            return pattern.to_owned();
+        }
+    }
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            let Some(next) = chars.next() else {
+                result.push(character);
+                break;
+            };
+            let replacement = match next {
+                'd' => Some("(?-i:[0-9])"),
+                'D' => Some("(?-i:[^0-9])"),
+                'w' => Some("(?-i:[A-Za-z0-9_])"),
+                'W' => Some("(?-i:[^A-Za-z0-9_])"),
+                'b' => Some(r"(?-u:\b)"),
+                'B' => Some(r"(?-u:\B)"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                result.push_str(replacement);
+            } else {
+                result.push(character);
+                result.push(next);
+            }
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 fn is_whitespace(character: char) -> bool {
     matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
@@ -238,6 +299,110 @@ fn position_score(text: &[u16], positions: &[usize]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_shorthand_classes_match_javascript_ascii_rules() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for (pattern, yes, no) in [
+            (r"re:^\d+$", "123", "١٢٣"),
+            (r"re:^\D+$", "١٢٣", "123"),
+            (r"re:^\w+$", "A_2", "K"),
+            (r"re:^\W+$", "K", "A_2"),
+        ] {
+            assert!(
+                Query::new(pattern).score(&doc(yes)).is_some(),
+                "{pattern} {yes}"
+            );
+            assert!(
+                Query::new(pattern).score(&doc(no)).is_none(),
+                "{pattern} {no}"
+            );
+        }
+        assert!(Query::new(r"re:^\\d$").score(&doc(r"\d")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\d]"), r"[\d]");
+    }
+
+    #[test]
+    fn regex_word_boundaries_use_ascii_with_non_ascii_neighbours() {
+        let doc = |name: &str| {
+            Document::new(
+                name.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for text in ["Kfoo", "fooá", "Kfooá", "foo"] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["á", "K", ""] {
+            assert!(
+                Query::new(r"re:\b\w+\b").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for text in ["Kfooá", "foo", "a_b"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_some(),
+                "{text}"
+            );
+        }
+        for text in ["K", "á", "a"] {
+            assert!(
+                Query::new(r"re:\B\w+\B").score(&doc(text)).is_none(),
+                "{text}"
+            );
+        }
+        for (pattern, text, expected) in [
+            (r"re:^K\bfoo\bá$", "Kfooá", true),
+            (r"re:^K\bfoo\bá$", "Kfooxá", false),
+            (r"re:^K\Bfoo\Bá$", "Kfooá", false),
+            (r"re:^K\B!$", "K!", true),
+            (r"re:^\Bfoo\b$", "foo", false),
+            (r"re:^f\Boo\b$", "foo", true),
+        ] {
+            assert_eq!(
+                Query::new(pattern).score(&doc(text)).is_some(),
+                expected,
+                "{pattern} {text}"
+            );
+        }
+        assert!(Query::new(r"re:^\\b$").score(&doc(r"\b")).is_some());
+        assert_eq!(ascii_regex_classes(r"[\b]\w"), r"[\b]\w");
+    }
+
+    #[test]
+    fn regex_word_boundary_finds_match_after_long_session_text() {
+        let text = format!("{} missing", "a".repeat(50_000));
+        let document = Document::new(String::new(), String::new(), String::new(), text, true);
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_some());
+        assert!(
+            Query::new(r"re:\bmissing\b(?=$)")
+                .score(&document)
+                .is_some()
+        );
+        let nonmatching = format!("{} missingx", "a".repeat(50_000));
+        let document = Document::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            nonmatching,
+            true,
+        );
+        assert!(Query::new(r"re:\bmissing\b").score(&document).is_none());
+    }
 
     #[test]
     fn imported_external_identity_is_searchable_after_reopen_and_fork_changes_it() {
