@@ -2000,9 +2000,9 @@ impl Session {
                 records.push(Record {
                     timestamp: Some(record_timestamp()),
                     run_id: None,
-                    version: records
-                        .last()
-                        .map_or(TURN_END_JOURNAL_VERSION, |record| record.version),
+                    version: records.last().map_or(TURN_END_JOURNAL_VERSION, |record| {
+                        record.version.max(TURN_END_JOURNAL_VERSION)
+                    }),
                     id,
                     parent: Some(id - 1),
                     event: Event::TreeMessageQueued { input },
@@ -2243,7 +2243,9 @@ impl Session {
         } else {
             self.records
                 .last()
-                .map_or(TURN_END_JOURNAL_VERSION, |record| record.version)
+                .map_or(TURN_END_JOURNAL_VERSION, |record| {
+                    record.version.max(TURN_END_JOURNAL_VERSION)
+                })
         };
         let record = Record {
             timestamp: Some(timestamp),

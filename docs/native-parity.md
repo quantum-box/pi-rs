@@ -3320,7 +3320,9 @@ indefinitely. Executable extensions negotiate keyed-message support.
 The journal records completion of turn-end callbacks and application of deferred
 context. Recovery reruns an unfinished callback before returning an existing
 answer or advancing the tool turn, then applies deferred context once. Journal
-version 3 identifies turns that use these boundaries. An older assistant record
+version 3 identifies turns that use these boundaries. New records appended to a
+version 1 or 2 journal use at least version 3; earlier records retain their
+original version. An older assistant record
 without a completion marker is treated as already observed: older journals
 cannot distinguish a completed callback from one interrupted before completion.
 Before a new run starts, unfinished earlier turn boundaries are resolved and

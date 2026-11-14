@@ -11415,6 +11415,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upgraded_v2_journal_recovers_new_interrupted_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let mut legacy = Session::with_store(MemoryStore::default()).unwrap();
+        legacy.set_run_id(Some(Uuid::new_v4()));
+        legacy
+            .append(crate::Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let mut records = legacy.records().to_vec();
+        for record in &mut records {
+            record.version = 2;
+        }
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(&path, contents).unwrap();
+
+        let new_run = Uuid::new_v4();
+        let assistant_id = {
+            let mut session = Session::open(&path).unwrap();
+            session.set_run_id(Some(new_run));
+            session
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: Some("new prompt".into()),
+                })
+                .unwrap();
+            session
+                .append(crate::Event::User {
+                    content: "new prompt".into(),
+                    input_id: Some(new_run),
+                })
+                .unwrap();
+            let assistant = session
+                .append(crate::Event::Assistant {
+                    content: "new answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            assert_eq!(assistant.version, crate::journal::TURN_END_JOURNAL_VERSION);
+            assistant.id
+        }; // Simulate interruption after the assistant record, before turn-end callbacks.
+
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.records()[0].version, 2);
+        agent
+            .resolve_prior_turn_end(
+                &mut reopened,
+                Uuid::new_v4(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            2,
+            "only the new turn must invoke the callback"
+        );
+        assert!(reopened.records().iter().any(|record| matches!(record.event, crate::Event::TurnEndBoundaryApplied { assistant_record } if assistant_record == assistant_id)));
+    }
+
     struct LegacyDeferredModel;
     #[async_trait::async_trait]
     impl Model for LegacyDeferredModel {
