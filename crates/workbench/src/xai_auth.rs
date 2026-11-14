@@ -538,37 +538,60 @@ mod tests {
         server.await.unwrap();
     }
 
-    async fn cancelled_refresh_case(success: bool) {
+    async fn cancelled_refresh_case(success: bool, read_full_request: bool) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}/", listener.local_addr().unwrap());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
-            let mut request_line = String::new();
-            socket.read_line(&mut request_line).await.unwrap();
-            assert!(request_line.starts_with("POST /oauth2/token "));
-            let mut length = None;
-            loop {
-                let mut line = String::new();
-                socket.read_line(&mut line).await.unwrap();
-                assert!(!line.is_empty(), "request ended before headers");
-                if line == "\r\n" {
-                    break;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let observation = if read_full_request {
+                let mut reader = BufReader::new(&mut socket);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).await.unwrap();
+                assert!(request_line.starts_with("POST /oauth2/token "));
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(!line.is_empty(), "request ended before headers");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
                 }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let length = length.expect("refresh request has content length");
-            assert!(length <= 4096);
-            let mut request_body = vec![0; length];
-            socket.read_exact(&mut request_body).await.unwrap();
-            started_tx.send(()).unwrap();
+                let length = length.expect("refresh request has content length");
+                assert!(length <= 4096);
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).await.unwrap();
+                (None, Some(true))
+            } else {
+                // Match the original fixture's single read, even when it
+                // receives only a fragment of the HTTP request.
+                let mut bytes = [0; 2048];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                let complete = bytes[..count]
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .and_then(|end| {
+                        let headers = std::str::from_utf8(&bytes[..end]).ok()?;
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })?;
+                        Some(count >= end + 4 + length)
+                    });
+                (Some(count), complete)
+            };
+            started_tx.send(observation).unwrap();
             reply_rx.await.unwrap();
             let (status, body) = if success {
                 (
@@ -608,10 +631,14 @@ mod tests {
             false,
             Some(observer),
         ));
-        tokio::time::timeout(Duration::from_secs(5), started_rx)
+        let request_observation = tokio::time::timeout(Duration::from_secs(5), started_rx)
             .await
             .expect("refresh request did not arrive")
             .unwrap();
+        eprintln!(
+            "xAI refresh fixture: full_read={read_full_request}, first_read_bytes={:?}, request_complete={:?}",
+            request_observation.0, request_observation.1
+        );
         task.abort();
         reply_tx.send(()).unwrap();
         server.await.unwrap();
@@ -620,7 +647,7 @@ mod tests {
         let observed = loop {
             let event = tokio::time::timeout_at(deadline, events.recv())
                 .await
-                .unwrap_or_else(|_| panic!("refresh worker did not finish; stages: {stages:?}"))
+                .unwrap_or_else(|_| panic!("refresh worker did not finish; stages: {stages:?}; request: {request_observation:?}"))
                 .unwrap_or_else(|| {
                     panic!("refresh worker observation channel closed; stages: {stages:?}")
                 });
@@ -653,12 +680,17 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_caller_still_saves_rotated_refresh_token() {
-        cancelled_refresh_case(true).await;
+        cancelled_refresh_case(true, true).await;
     }
 
     #[tokio::test]
     async fn cancelled_caller_observes_refresh_worker_failure() {
-        cancelled_refresh_case(false).await;
+        cancelled_refresh_case(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_observes_single_read_fixture() {
+        cancelled_refresh_case(true, false).await;
     }
 
     #[tokio::test]
