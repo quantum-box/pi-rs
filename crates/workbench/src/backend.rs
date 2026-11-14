@@ -1890,6 +1890,69 @@ mod share_context_tests {
         assert_eq!(serde_json::to_vec(captured.records()).unwrap(), expected);
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_capture_round_trips_with_exact_journal_and_provenance() {
+        use pi_rs_workbench::private_share_store::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("live".into(), Vec::new(), None)
+            .unwrap();
+        let provenance = json!({"workspace": "fixture", "configuration": "v1"});
+        let binding = store.binding_for_session(&session, &provenance).unwrap();
+        // Runtime initialization is only permitted after this generation is dirty.
+        let generation = store.begin(&path, binding).unwrap();
+        let mut worker = SessionSnapshot::new(session.records().to_vec(), false);
+        worker.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live context".into(),
+            tools: vec![],
+        }));
+        let (share, journal) = snapshot_and_session_for_share_with_hook(
+            &Mutex::new(ControlState::default()),
+            &Mutex::new(worker),
+            None,
+            || {},
+        )
+        .unwrap();
+        generation
+            .publish_session(&journal, &provenance, &share)
+            .unwrap();
+        let restored: super::super::sessions::ShareSnapshot = store
+            .read_session(&path, &session, &provenance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&share).unwrap()
+        );
+        assert!(
+            store
+                .read_session::<_, super::super::sessions::ShareSnapshot>(
+                    &path,
+                    &session,
+                    &json!({"workspace": "changed"}),
+                )
+                .unwrap()
+                .is_none()
+        );
+        session
+            .append_user_with_images("new record".into(), Vec::new(), None)
+            .unwrap();
+        assert!(
+            store
+                .read_session::<_, super::super::sessions::ShareSnapshot>(
+                    &path,
+                    &session,
+                    &provenance,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn equal_session_id_and_head_do_not_identify_journal_content() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
