@@ -2851,21 +2851,10 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        session.validate_checkout(selected)?;
-        let from = session.head();
-        if selected == from {
+        let Some(target) = session.tree_navigation_target(selected)? else {
             return Ok(());
-        }
-        let record = &session.records()[selected as usize - 1];
-        let target = if matches!(
-            record.event,
-            Event::User { .. } | Event::UserWithImages { .. }
-        ) {
-            record.parent.unwrap_or(1)
-        } else {
-            selected
         };
-        session.validate_checkout(target)?;
+        let from = session.head();
         let mut decision = crate::TreeDecision::default();
         if self
             .registry

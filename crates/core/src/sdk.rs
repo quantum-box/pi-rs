@@ -698,9 +698,20 @@ impl SessionControl {
         if let Some(record) = journal.recover_tree_trigger_handoff()?.cloned() {
             observe(Notification::Committed(&record));
             self.input_hooks.lock().expect("SDK input hooks").states = journal.extension_states();
-            if let Some((model, _)) = journal.model_selection() {
-                self.owner.config.lock().expect("run config").model_name = model;
-            }
+        }
+        if let Some((name, _)) = journal.model_selection() {
+            let mut config = self.owner.config.lock().expect("run config");
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let model = registry
+                .branch_model(journal.session_id(), &name)
+                .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
+            config.model = Arc::downgrade(&model);
+            config.model_name = name;
         }
         let startup = self
             .owner
@@ -1086,7 +1097,8 @@ impl SessionBuilder {
         self.registry.register(extension)?;
         Ok(self)
     }
-    /// Register a model needed when recovering an interrupted run on another branch.
+    /// Register a client for a historical model name, including reopened,
+    /// navigated and forked branches. Names must distinguish provider clients.
     pub fn branch_model(mut self, name: impl Into<String>, model: Arc<dyn Model>) -> Result<Self> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -1201,6 +1213,29 @@ pub struct AgentSession {
     session_file: Option<PathBuf>,
 }
 impl AgentSession {
+    fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
+        if let Some(target) = journal.tree_navigation_target(selected)?
+            && let Some((name, _)) = journal.model_selection_at(target)
+            && self.registry.branch_model(self.session_id, &name).is_none()
+        {
+            return Err(Error::Config(format!(
+                "session branch requires registered model {name}"
+            )));
+        }
+        Ok(())
+    }
+    fn restore_branch_model(&mut self, name: String) -> Result<()> {
+        let model = self
+            .registry
+            .branch_model(self.session_id, &name)
+            .ok_or_else(|| {
+                Error::Config(format!("session branch requires registered model {name}"))
+            })?;
+        self.model = model;
+        self.model_name = name;
+        self.refresh_run_config();
+        Ok(())
+    }
     pub fn auto_compaction_enabled(&self) -> bool {
         self.control.auto_compaction.enabled()
     }
@@ -1243,15 +1278,24 @@ impl AgentSession {
     /// Resolve the configured or provider-reported context window within the model timeout.
     pub async fn context_usage(&self) -> Result<Option<crate::ContextUsage>> {
         self.ensure_open()?;
+        let selection = self.session.lock().await.model_selection();
+        let (name, model) = if let Some((name, _)) = selection {
+            let model = self
+                .registry
+                .branch_model(self.session_id, &name)
+                .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
+            (name, model)
+        } else {
+            (self.model_name.clone(), self.model.clone())
+        };
         let window = match self.limits.context_window {
             Some(window) => Some(window),
-            None => tokio::time::timeout(
-                self.limits.model_timeout,
-                self.model.context_window(&self.model_name),
-            )
-            .await
-            .ok()
-            .flatten(),
+            None => tokio::time::timeout(self.limits.model_timeout, model.context_window(&name))
+                .await
+                .ok()
+                .flatten(),
         };
         let journal = self.session.lock().await;
         Ok(window.and_then(|window| journal.context_usage(window)))
@@ -1340,7 +1384,7 @@ impl AgentSession {
         &self.model_name
     }
 
-    /// Supply a model needed to recover an interrupted run on another branch.
+    /// Supply a client for a historical model name in this session.
     pub fn register_branch_model(
         &self,
         name: impl Into<String>,
@@ -1404,16 +1448,25 @@ impl AgentSession {
         descriptor: serde_json::Value,
         previous_descriptor: Option<serde_json::Value>,
     ) -> Result<()> {
-        self.start().await?;
         let name = name.into();
-        let previous_name = self.model_name.clone();
-        let previous_level = self
-            .session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .model_selection()
-            .and_then(|(_, level)| level)
-            .unwrap_or_else(|| "off".into());
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        let (fallback_previous, startup_error) = self
+            .start_with_fallback(Some((model.clone(), name.clone())))
+            .await?;
+        let (previous_name, previous_level) = match fallback_previous {
+            Some(previous) => previous,
+            None => (
+                self.model_name.clone(),
+                self.session
+                    .try_lock()
+                    .map_err(|_| Error::Session("session journal is in use".into()))?
+                    .model_selection()
+                    .and_then(|(_, level)| level)
+                    .unwrap_or_else(|| "off".into()),
+            ),
+        };
         self.set_model(model, name.clone())?;
         if previous_level != "off" {
             self.notify_selection_event(crate::LifecycleEvent::ThinkingLevelSelect {
@@ -1439,6 +1492,9 @@ impl AgentSession {
                 source: crate::ModelSelectSource::Set,
             })
             .await?;
+        }
+        if let Some(error) = startup_error {
+            return Err(error);
         }
         let _ = self.drain_idle_triggers().await?;
         Ok(())
@@ -1481,22 +1537,29 @@ impl AgentSession {
         self.refresh_input_hooks()?;
         Ok(())
     }
+    /// Check out a branch after validating that its selected model is registered.
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
+        {
+            let journal = self.journal()?;
+            journal.validate_checkout(record)?;
+            if let Some((name, _)) = journal.model_selection_at(record)
+                && self.registry.branch_model(self.session_id, &name).is_none()
+            {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {name}"
+                )));
+            }
+        }
         self.session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?
             .checkout(record)?;
         self.refresh_input_hooks()?;
         self.emit_last()?;
-        if let Some((model, _)) = self
-            .session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .model_selection()
-        {
-            self.model_name = model;
-            self.refresh_run_config();
+        let selection = self.journal()?.model_selection();
+        if let Some((model, _)) = selection {
+            self.restore_branch_model(model)?;
         }
         Ok(())
     }
@@ -1508,8 +1571,15 @@ impl AgentSession {
         selected: u64,
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
+        self.ensure_open()?;
+        {
+            let journal = self.session.lock().await;
+            self.validate_tree_model(&journal, selected)?;
+        }
         self.start().await?;
-        let mut journal = self.session.lock().await;
+        let session = self.session.clone();
+        let mut journal = session.lock().await;
+        self.validate_tree_model(&journal, selected)?;
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -1522,7 +1592,8 @@ impl AgentSession {
                     _ => None,
                 })
         };
-        let mut input_queue = self.input.lock().await;
+        let input = self.input.clone();
+        let mut input_queue = input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1532,11 +1603,12 @@ impl AgentSession {
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
         };
+        let control = self.control.clone();
         let mut observer = |event: Notification<'_>| {
-            self.control.observe(&event);
+            control.observe(&event);
             emit(&events, &event);
         };
-        let result = agent
+        let mut result = agent
             .navigate_tree_with_options(
                 &mut journal,
                 selected,
@@ -1549,8 +1621,7 @@ impl AgentSession {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
             if let Some((model, _)) = journal.model_selection() {
-                self.model_name = model;
-                self.refresh_run_config();
+                result = self.restore_branch_model(model).map(|_| ());
             }
         }
         let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
@@ -1597,9 +1668,21 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
+        let (_, error) = self.start_with_fallback(None).await?;
+        error.map_or(Ok(()), Err)
+    }
+
+    // Explicit model replacement is available during startup only when the
+    // recovered branch's client is missing. Install it before startup hooks
+    // can trigger work, while retaining the old selection for notifications.
+    async fn start_with_fallback(
+        &mut self,
+        fallback: Option<(Arc<dyn Model>, String)>,
+    ) -> Result<(Option<(String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
-        let mut journal = self.session.lock().await;
+        let session = self.session.clone();
+        let mut journal = session.lock().await;
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -1608,14 +1691,36 @@ impl AgentSession {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
         }
-        if let Some((model, _)) = journal.model_selection()
-            && self.model_name != model
-        {
-            self.model_name = model;
-            self.refresh_run_config();
+        let mut replaced = None;
+        if let Some((name, level)) = journal.model_selection() {
+            if self.registry.branch_model(self.session_id, &name).is_some() {
+                self.restore_branch_model(name)?;
+            } else if let Some((model, replacement)) = fallback {
+                self.registry.register_session_branch_model(
+                    self.session_id,
+                    replacement.clone(),
+                    model.clone(),
+                )?;
+                let before = journal.records().len();
+                journal.select_model(&replacement, None)?;
+                if journal.records().len() != before {
+                    emit(
+                        self.events.as_ref().expect("open session"),
+                        &Notification::Committed(
+                            journal.records().last().expect("model selection"),
+                        ),
+                    );
+                }
+                self.model = model;
+                self.model_name = replacement;
+                self.refresh_run_config();
+                replaced = Some((name, level.unwrap_or_else(|| "off".into())));
+            } else {
+                self.restore_branch_model(name)?;
+            }
         }
         let startup = self.pending_start.lock().expect("session startup").take();
-        if let Some((reason, previous_session_file)) = startup {
+        let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
             let mut observe = |event: Notification<'_>| {
@@ -1630,12 +1735,21 @@ impl AgentSession {
                     &active.token,
                     &mut observe,
                 )
-                .await?;
-        }
+                .await
+        } else {
+            Ok(())
+        };
         drop(journal);
         drop(order);
-        let _ = self.drain_idle_triggers().await?;
-        Ok(())
+        let startup_result = match startup_result {
+            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match startup_result {
+            Ok(()) => Ok((replaced, None)),
+            Err(error) if replaced.is_some() => Ok((replaced, Some(error))),
+            Err(error) => Err(error),
+        }
     }
 
     async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
@@ -1802,7 +1916,18 @@ impl AgentSession {
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
-        let forked = self.journal()?.fork_to(record, &destination)?;
+        let journal = self.journal()?;
+        let records = journal.fork_records(record)?;
+        let snapshot = Session::from_records(records)?;
+        if let Some((name, _)) = snapshot.model_selection()
+            && self.registry.branch_model(self.session_id, &name).is_none()
+        {
+            return Err(Error::Config(format!(
+                "session branch requires registered model {name}"
+            )));
+        }
+        let forked = journal.fork_to(record, &destination)?;
+        drop(journal);
         let mut fork = self.fork_session(forked)?;
         fork.session_file = Some(destination);
         Ok(fork)
@@ -1871,6 +1996,14 @@ impl AgentSession {
             .model_selection()
             .map(|selection| selection.0)
             .unwrap_or_else(|| self.model_name.clone());
+        let model = self
+            .registry
+            .branch_model(self.session_id, &model_name)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "session branch requires registered model {model_name}"
+                ))
+            })?;
         session
             .auto_compaction_control()
             .set_enabled(self.auto_compaction_enabled());
@@ -1881,7 +2014,7 @@ impl AgentSession {
                 .auto_compaction_control()
                 .token_settings(),
         );
-        let mut fork = SessionBuilder::new(self.model.clone(), model_name)
+        let mut fork = SessionBuilder::new(model, model_name)
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
             .build(session)?;
@@ -2962,6 +3095,186 @@ mod tests {
         );
     }
 
+    struct ReplacementStartupHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+    #[async_trait::async_trait]
+    impl Extension for ReplacementStartupHook {
+        fn id(&self) -> &str {
+            "replacement-startup"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_model_selection(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(
+                event,
+                crate::LifecycleEvent::SessionStart { .. }
+                    | crate::LifecycleEvent::ThinkingLevelSelect { .. }
+                    | crate::LifecycleEvent::ModelSelect { .. }
+            ) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "startup".into(),
+                        content: crate::ContextContent::Text("start".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::TriggerTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_aware_model_switch_replaces_missing_reopened_model_before_startup_triggers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut original = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .open(&path)
+            .unwrap();
+        original
+            .journal()
+            .unwrap()
+            .select_model("model-A", Some("high"))
+            .unwrap();
+        original.prompt("original").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut reopened = SessionBuilder::new(Arc::new(NamedBranchModel("model-B")), "model-B")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        reopened
+            .set_model_with_hooks(
+                Arc::new(NamedBranchModel("model-B")),
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                Some(serde_json::json!({"id":"model-A", "provider":"fixture"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.model_name(), "model-B");
+        assert_eq!(
+            reopened.journal().unwrap().model_selection(),
+            Some(("model-B".into(), None))
+        );
+        assert!(
+            reopened
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(
+                    &record.event, crate::Event::ModelRequested { model, .. } if model == "model-B"
+                ))
+        );
+        assert_eq!(reopened.prompt("next").await.unwrap(), "model-B");
+        {
+            let events = observed.lock().unwrap();
+            assert!(matches!(events.as_slice(), [
+            crate::LifecycleEvent::SessionStart { .. },
+            crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
+            crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
+        ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
+        }
+        reopened.close().await.unwrap();
+    }
+
+    struct FailingStartupModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for FailingStartupModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(request.model, "model-B");
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Error::Model("startup fixture failure".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("recovered".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_startup_trigger_still_notifies_committed_model_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut original = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .open(&path)
+            .unwrap();
+        original
+            .journal()
+            .unwrap()
+            .select_model("model-A", Some("high"))
+            .unwrap();
+        original.prompt("original").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let replacement = Arc::new(FailingStartupModel(AtomicUsize::new(0)));
+        let mut reopened = SessionBuilder::new(replacement.clone(), "model-B")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        let error = reopened
+            .set_model_with_hooks(
+                replacement.clone(),
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                Some(serde_json::json!({"id":"model-A", "provider":"fixture"})),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("startup fixture failure"));
+        assert_eq!(
+            reopened.journal().unwrap().model_selection(),
+            Some(("model-B".into(), None))
+        );
+        {
+            let events = observed.lock().unwrap();
+            assert!(matches!(events.as_slice(), [
+                crate::LifecycleEvent::SessionStart { .. },
+                crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level },
+                crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set },
+            ] if previous_level == "high" && level == "off" && model["id"] == "model-B" && previous["id"] == "model-A"));
+        }
+        reopened
+            .set_model_with_hooks(
+                replacement,
+                "model-B",
+                serde_json::json!({"id":"model-B", "provider":"fixture"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(observed.lock().unwrap().len(), 3);
+        assert_eq!(reopened.prompt("next").await.unwrap(), "recovered");
+        reopened.close().await.unwrap();
+    }
+
     struct ForkHook(Arc<std::sync::atomic::AtomicBool>);
 
     #[async_trait::async_trait]
@@ -3469,6 +3782,309 @@ mod tests {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         waits: AtomicUsize,
+    }
+
+    struct NamedBranchModel(&'static str);
+    struct TriggerFromIdleInput;
+    #[async_trait::async_trait]
+    impl Extension for TriggerFromIdleInput {
+        fn id(&self) -> &str {
+            "idle-branch-trigger"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "idle".into(),
+                    content: crate::ContextContent::Text("trigger".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(crate::InputAction::Handled)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for NamedBranchModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(request.model, self.0);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text(self.0.into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            Some(if self.0 == "model-A" {
+                100_000
+            } else {
+                200_000
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_session_restores_branch_model_client_for_navigation_and_forks() {
+        let a = Arc::new(NamedBranchModel("model-A"));
+        let b = Arc::new(NamedBranchModel("model-B"));
+        let mut session = SessionBuilder::new(a.clone(), "model-A")
+            .in_memory()
+            .unwrap();
+        session.set_model(a, "model-A").unwrap();
+        assert_eq!(session.prompt("first").await.unwrap(), "model-A");
+        let a_head = session.journal().unwrap().head();
+        session.set_model(b, "model-B").unwrap();
+        assert_eq!(session.prompt("second").await.unwrap(), "model-B");
+        let b_head = session.journal().unwrap().head();
+
+        session.checkout(a_head).unwrap();
+        assert_eq!(session.model_name(), "model-A");
+        assert_eq!(
+            session
+                .context_usage()
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            100_000
+        );
+        assert_eq!(session.prompt("after checkout").await.unwrap(), "model-A");
+        session
+            .navigate_tree(b_head, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.model_name(), "model-B");
+        assert_eq!(session.prompt("after tree").await.unwrap(), "model-B");
+
+        let mut fork = session.fork_at(a_head).unwrap();
+        assert_eq!(fork.model_name(), "model-A");
+        assert_eq!(fork.prompt("on fork").await.unwrap(), "model-A");
+        assert_eq!(session.prompt("on original").await.unwrap(), "model-B");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_session_restores_registered_model_on_reopen_and_rejects_missing_client() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let a = Arc::new(NamedBranchModel("model-A"));
+        let b = Arc::new(NamedBranchModel("model-B"));
+        let mut first = SessionBuilder::new(a.clone(), "model-A")
+            .open(&path)
+            .unwrap();
+        first.set_model(a.clone(), "model-A").unwrap();
+        assert_eq!(first.prompt("save").await.unwrap(), "model-A");
+        first.close().await.unwrap();
+        drop(first);
+
+        let mut missing = SessionBuilder::new(b.clone(), "model-B")
+            .open(&path)
+            .unwrap();
+        assert!(missing.context_usage().await.is_err());
+        let fork_path = root.path().join("missing-fork.jsonl");
+        let head = missing.journal().unwrap().head();
+        assert!(missing.fork_to(head, &fork_path).is_err());
+        assert!(!fork_path.exists());
+        assert!(
+            missing
+                .prompt("not sent")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires registered model model-A")
+        );
+        missing.register_branch_model("model-A", a.clone()).unwrap();
+        assert_eq!(
+            missing.prompt("after registering").await.unwrap(),
+            "model-A"
+        );
+        missing.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_and_persistent_fork_reject_missing_branch_model_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.jsonl");
+        let a = Arc::new(NamedBranchModel("model-A"));
+        let b = Arc::new(NamedBranchModel("model-B"));
+        let mut source = SessionBuilder::new(a.clone(), "model-A")
+            .open(&path)
+            .unwrap();
+        source.set_model(a, "model-A").unwrap();
+        source.prompt("first").await.unwrap();
+        let a_head = source.journal().unwrap().head();
+        source.set_model(b.clone(), "model-B").unwrap();
+        source.prompt("second").await.unwrap();
+        source.close().await.unwrap();
+        drop(source);
+
+        let mut reopened = SessionBuilder::new(b, "model-B").open(&path).unwrap();
+        let before = reopened.journal().unwrap().head();
+        assert!(reopened.checkout(a_head).is_err());
+        assert_eq!(reopened.journal().unwrap().head(), before);
+        let fork_path = root.path().join("fork.jsonl");
+        assert!(reopened.fork_to(a_head, &fork_path).is_err());
+        assert!(!fork_path.exists());
+        assert_eq!(reopened.prompt("unchanged").await.unwrap(), "model-B");
+        reopened.close().await.unwrap();
+    }
+
+    struct TreePreflightHook(Arc<Mutex<Vec<&'static str>>>);
+    #[async_trait::async_trait]
+    impl Extension for TreePreflightHook {
+        fn id(&self) -> &str {
+            "tree-preflight"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn before_tree(
+            &self,
+            _: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            self.0.lock().unwrap().push("before");
+            Ok(Some(crate::TreeDecision {
+                summary: Some(crate::TreeSummary {
+                    summary: "extension summary".into(),
+                    details: None,
+                    usage: None,
+                }),
+                label: Some("hook label".into()),
+                ..Default::default()
+            }))
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionTree { .. }) {
+                self.0.lock().unwrap().push("after");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_navigation_rejects_missing_destination_before_hooks_or_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tree.jsonl");
+        let a = Arc::new(NamedBranchModel("model-A"));
+        let b = Arc::new(NamedBranchModel("model-B"));
+        let mut original = SessionBuilder::new(a.clone(), "model-A")
+            .open(&path)
+            .unwrap();
+        original.set_model(a.clone(), "model-A").unwrap();
+        original.prompt("branch A").await.unwrap();
+        let target = original.journal().unwrap().head();
+        original.set_model(b.clone(), "model-B").unwrap();
+        original.prompt("branch B").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(b, "model-B")
+            .extension(Arc::new(TreePreflightHook(calls.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.start().await.unwrap();
+        let mut events = session.subscribe();
+        let (head, count, labels) = {
+            let journal = session.journal().unwrap();
+            (journal.head(), journal.records().len(), journal.labels())
+        };
+        for summarize in [false, true] {
+            let options = crate::TreeNavigationOptions {
+                summary: summarize.then_some(crate::BranchSummaryOptions {
+                    instructions: None,
+                    reserve_tokens: 1024,
+                }),
+                label: Some("requested"),
+                ..Default::default()
+            };
+            let error = session.navigate_tree(target, options).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires registered model model-A")
+            );
+            let journal = session.journal().unwrap();
+            assert_eq!(journal.head(), head);
+            assert_eq!(journal.records().len(), count);
+            assert_eq!(journal.labels(), labels);
+            assert_eq!(session.model_name(), "model-B");
+            assert!(events.try_recv().is_err());
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        session.register_branch_model("model-A", a).unwrap();
+        let result = session
+            .navigate_tree(
+                target,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: None,
+                        reserve_tokens: 1024,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let summary = result.summary_entry.unwrap();
+        assert!(
+            matches!(&summary.event, crate::Event::BranchSummary { summary, .. } if summary == "extension summary")
+        );
+        assert_eq!(
+            session.journal().unwrap().labels()[&summary.id],
+            "hook label"
+        );
+        assert_eq!(&*calls.lock().unwrap(), &["before", "after"]);
+        assert_eq!(session.model_name(), "model-A");
+        assert_eq!(session.prompt("after navigation").await.unwrap(), "model-A");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_input_trigger_uses_restored_branch_model_before_session_start() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal.select_model("model-A", None).unwrap();
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("model-B")), "model-B")
+            .branch_model("model-A", Arc::new(NamedBranchModel("model-A")))
+            .unwrap()
+            .extension(Arc::new(TriggerFromIdleInput))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session.controls().steer("hello").await.unwrap();
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(
+                    &record.event, crate::Event::ModelRequested { model, .. } if model == "model-A"
+                ))
+        );
+        session.close().await.unwrap();
     }
     #[async_trait::async_trait]
     impl Model for BranchModelProbe {
@@ -11125,6 +11741,9 @@ mod tests {
         session.close().await.unwrap();
         let mut reopened = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
             .open(path)
+            .unwrap();
+        reopened
+            .set_model(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
             .unwrap();
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
