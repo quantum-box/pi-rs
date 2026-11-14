@@ -628,6 +628,9 @@ impl Session {
                 "record metadata references a missing record".into(),
             ));
         }
+        if record_metadata.values().any(serde_json::Value::is_null) {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
         let head = validated_head(&records)?;
         restore_imported_compaction_prompts(&mut records);
         let mut session = Self {
@@ -2338,6 +2341,9 @@ impl Session {
         event: Event,
         metadata: serde_json::Value,
     ) -> Result<&Record> {
+        if metadata.is_null() {
+            return Err(Error::Session("record metadata must not be null".into()));
+        }
         self.append_inner_with_metadata(event, true, Some(metadata))
     }
 
@@ -2723,8 +2729,18 @@ impl Drop for FileStore {
 struct PersistedRecord {
     #[serde(flatten)]
     record: Record,
-    #[serde(default, rename = "piRsRecordMetadata")]
+    #[serde(
+        default,
+        rename = "piRsRecordMetadata",
+        deserialize_with = "deserialize_present_metadata"
+    )]
     metadata: Option<serde_json::Value>,
+}
+
+fn deserialize_present_metadata<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as Deserialize>::deserialize(deserializer).map(Some)
 }
 
 // Draft versions stored these fields inside Event::Compacted. Preserve them
@@ -3674,6 +3690,21 @@ mod record_metadata_tests {
         let duplicate = valid.replacen("\"id\":1", "\"id\":1,\"id\":2", 1);
         assert_ne!(duplicate, valid);
         assert!(serde_json::from_str::<PersistedRecord>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn null_record_metadata_is_rejected_on_restore() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut value = serde_json::to_value(&session.records()[0]).unwrap();
+        value["piRsRecordMetadata"] = serde_json::Value::Null;
+        assert!(Session::from_serialized_records(vec![value]).is_err());
+        assert!(
+            Session::from_records_with_metadata(
+                session.records().to_vec(),
+                [(1, serde_json::Value::Null)].into_iter().collect()
+            )
+            .is_err()
+        );
     }
 
     #[test]
