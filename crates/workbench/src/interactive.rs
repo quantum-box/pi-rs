@@ -513,6 +513,7 @@ struct PendingThinking {
 
 enum RemoteEvent {
     Notice(String),
+    DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
@@ -601,6 +602,9 @@ struct RemoteTask {
     cancelled: &'static str,
     started: Instant,
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
+    device_code: Option<(String, String)>,
+    device_copy: Option<std::sync::mpsc::Receiver<bool>>,
+    device_cancel: pi_rs::CancellationToken,
     _cancel: tokio::sync::oneshot::Sender<()>,
     logout_control: Option<super::chatgpt_auth::LogoutControl>,
     meta_login_control: Option<super::meta_auth::LoginControl>,
@@ -642,6 +646,9 @@ impl RemoteTask {
             cancelled,
             started: Instant::now(),
             receiver,
+            device_code: None,
+            device_copy: None,
+            device_cancel: pi_rs::CancellationToken::new(),
             _cancel: cancel,
             logout_control: None,
             meta_login_control: None,
@@ -656,6 +663,23 @@ impl RemoteTask {
                 .meta_login_control
                 .as_ref()
                 .is_none_or(|control| control.cancel_before_commit())
+    }
+}
+
+impl Drop for RemoteTask {
+    fn drop(&mut self) {
+        self.device_cancel.cancel();
+    }
+}
+
+async fn run_device_side_effect<T>(
+    cancel: pi_rs::CancellationToken,
+    action: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = action => Some(result),
     }
 }
 
@@ -2914,6 +2938,10 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
+        "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
+            edit_provider_key(super::Provider::named("xai").expect("xAI provider"), view)
+        }
         "/login" if rest.eq_ignore_ascii_case("meta") => start_meta_login(view, &args.settings),
         "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
             edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
@@ -2993,6 +3021,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "xai · Subscription OAuth".into(),
+                            selection: Selection::LoginXai,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -4071,6 +4106,15 @@ pub(super) async fn run(
                     view.append(&notice);
                     dirty = true;
                 }
+                Ok(RemoteEvent::DeviceCode { url, code }) => {
+                    view.append(&format!(
+                        "Enter code {code} at {url} · Enter opens browser and copies code"
+                    ));
+                    if let Some(task) = &mut view.remote_task {
+                        task.device_code = Some((url, code));
+                    }
+                    dirty = true;
+                }
                 Ok(RemoteEvent::OpenRouterCode(sender)) => {
                     view.local_editor = Some((
                         LocalEditor::OpenRouterCode(Some(sender)),
@@ -4110,6 +4154,18 @@ pub(super) async fn run(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
+        }
+        if let Some(task) = &mut view.remote_task
+            && let Some(receiver) = &task.device_copy
+            && let Ok(copied) = receiver.try_recv()
+        {
+            task.device_copy = None;
+            view.append(if copied {
+                "Code copied to clipboard"
+            } else {
+                "Copy code manually"
+            });
+            dirty = true;
         }
         dirty |= view.poll_clipboard();
         if view
@@ -4414,6 +4470,32 @@ pub(super) async fn run(
                         continue;
                     }
                     if view.local_editor.is_none() {
+                        if let Some((url, code)) = take_device_code_action(&mut view, key, &keys) {
+                            view.append("Opening browser and copying code");
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            let cancel = if let Some(task) = &mut view.remote_task {
+                                task.device_copy = Some(receiver);
+                                task.device_cancel.clone()
+                            } else {
+                                continue;
+                            };
+                            let browser_cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                let _ = run_device_side_effect(browser_cancel, async move {
+                                    pi_rs_workbench::oauth_callback::open_browser(&url).await
+                                })
+                                .await;
+                            });
+                            tokio::spawn(async move {
+                                if let Some(result) = run_device_side_effect(cancel, async move {
+                                    sessions::copy_text_async(&code).await
+                                })
+                                .await
+                                {
+                                    let _ = sender.send(result.is_ok());
+                                }
+                            });
+                        }
                         continue;
                     }
                 }
@@ -5594,6 +5676,40 @@ fn start_kimi_logout(view: &mut View) {
     ));
 }
 
+fn take_device_code_action(
+    view: &mut View,
+    key: KeyEvent,
+    keys: &Keys,
+) -> Option<(String, String)> {
+    if !keys.matches("tui.select.confirm", key) {
+        return None;
+    }
+    view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to xAI",
+        "xAI login cancelled",
+        move |sender| async move {
+            super::xai_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to xAI".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_meta_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -5719,7 +5835,11 @@ fn interrupt_remote_task(view: &mut View) {
         clear_openrouter_editor(view);
         view.append(message);
     } else if task.meta_login_control.is_some() {
-        view.append("Meta sign-in is completing; waiting for the result");
+        view.append(if task.status == "Signing in to xAI" {
+            "xAI sign-in is completing; waiting for the result"
+        } else {
+            "Meta sign-in is completing; waiting for the result"
+        });
     } else {
         view.append("ChatGPT sign-out is completing; waiting for the result");
     }
@@ -6670,6 +6790,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
@@ -7354,6 +7475,110 @@ mod tests {
             serde_json::json!({"client":credential}).to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn device_code_action_is_one_shot_and_cancelled_with_its_task() {
+        let keys = super::Keys::default();
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let other = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let make_task = || {
+            super::RemoteTask::start("Signing in to xAI", "xAI login cancelled", |_| async {
+                std::future::pending::<pi_rs::Result<Vec<String>>>().await
+            })
+        };
+        let mut task = make_task();
+        task.device_code = Some(("https://auth.x.ai/activate".into(), "CODE".into()));
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        assert!(super::take_device_code_action(&mut view, other, &keys).is_none());
+        let (url, code) = super::take_device_code_action(&mut view, enter, &keys).unwrap();
+        assert_eq!(url, "https://auth.x.ai/activate");
+        assert_eq!(code, "CODE");
+        assert!(super::take_device_code_action(&mut view, enter, &keys).is_none());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.remote_task.as_mut().unwrap().device_copy = Some(receiver);
+        super::interrupt_remote_task(&mut view);
+        assert!(view.remote_task.is_none());
+        assert!(
+            sender.send(true).is_err(),
+            "late clipboard results must not reach another login"
+        );
+        assert!(super::take_device_code_action(&mut view, enter, &keys).is_none());
+
+        let mut task = make_task();
+        task.device_code = Some(("https://auth.x.ai/activate".into(), "OTHER".into()));
+        view.remote_task = Some(task);
+        super::interrupt_remote_task(&mut view);
+        assert!(
+            super::take_device_code_action(&mut view, enter, &keys).is_none(),
+            "cancellation discards an unused action"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_device_side_effects_stop_on_cancel_and_login_replacement() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let make_task = || {
+            super::RemoteTask::start("Signing in to xAI", "xAI login cancelled", |_| async {
+                std::future::pending::<pi_rs::Result<Vec<String>>>().await
+            })
+        };
+        for replace in [false, true] {
+            let mut view = super::View {
+                remote_task: Some(make_task()),
+                ..Default::default()
+            };
+            let cancel = view.remote_task.as_ref().unwrap().device_cancel.clone();
+            let effects = Arc::new(AtomicUsize::new(0));
+            let mut releases = Vec::new();
+            let mut started = Vec::new();
+            let mut jobs = Vec::new();
+            for _ in 0..2 {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                releases.push(release_tx);
+                started.push(started_rx);
+                let effects = effects.clone();
+                jobs.push(tokio::spawn(super::run_device_side_effect(
+                    cancel.clone(),
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        effects.fetch_add(1, Ordering::SeqCst);
+                    },
+                )));
+            }
+            for ready in started {
+                ready.await.unwrap();
+            }
+            if replace {
+                view.remote_task = Some(make_task());
+            } else {
+                super::interrupt_remote_task(&mut view);
+            }
+            for release in releases {
+                let _ = release.send(());
+            }
+            for job in jobs {
+                assert!(job.await.unwrap().is_none());
+            }
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            if replace {
+                assert!(view.remote_task.is_some());
+            }
+        }
     }
 
     #[test]

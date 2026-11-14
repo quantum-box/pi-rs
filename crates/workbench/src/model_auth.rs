@@ -18,6 +18,7 @@ pub(super) enum Credential {
     ChatGpt,
     Kimi,
     Meta,
+    Xai,
     BedrockProfile(String),
     BedrockChain,
 }
@@ -54,6 +55,7 @@ impl Credential {
             | Self::ChatGpt
             | Self::Kimi
             | Self::Meta
+            | Self::Xai
             | Self::BedrockProfile(_)
             | Self::BedrockChain => None,
         }
@@ -74,6 +76,7 @@ impl Credential {
                 Self::ChatGpt
                     | Self::Kimi
                     | Self::Meta
+                    | Self::Xai
                     | Self::Invalid
                     | Self::BedrockProfile(_)
                     | Self::BedrockChain
@@ -96,6 +99,10 @@ impl Credential {
             Self::Kimi => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::kimi_auth::access(&settings, None, false).await;
+            }
+            Self::Xai => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::xai_auth::access(&settings, None, false).await;
             }
             Self::Meta => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -170,8 +177,10 @@ impl Keys {
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
-                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi || meta)
-                    && entry["type"] == "oauth";
+                let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
+                let oauth =
+                    (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi || meta || xai)
+                        && entry["type"] == "oauth";
                 let key = if chatgpt {
                     serde_json::from_value::<pi_rs::openai::oauth::Credential>(
                         entry["credential"].clone(),
@@ -185,6 +194,17 @@ impl Keys {
                         return None;
                     }
                     Some(Credential::Kimi)
+                } else if xai {
+                    let valid =
+                        serde_json::from_value::<super::xai_auth::Credential>(entry.clone())
+                            .is_ok_and(|credential| {
+                                valid_key(&credential.access) && valid_key(&credential.refresh)
+                            });
+                    Some(if valid {
+                        Credential::Xai
+                    } else {
+                        Credential::Invalid
+                    })
                 } else if meta {
                     let valid =
                         serde_json::from_value::<super::meta_auth::Credential>(entry.clone())
@@ -253,6 +273,8 @@ impl Keys {
                         "kimi-coding"
                     } else if meta {
                         "meta"
+                    } else if xai {
+                        "xai"
                     } else {
                         "openrouter"
                     })
@@ -512,7 +534,7 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
             .get(provider.id())
             .and_then(|value| value["type"].as_str());
         if kind == Some("api_key")
-            || (matches!(provider.id(), "openrouter" | "kimi-coding" | "meta")
+            || (matches!(provider.id(), "openrouter" | "kimi-coding" | "meta" | "xai")
                 && kind == Some("oauth"))
         {
             data.remove(provider.id());
@@ -868,6 +890,39 @@ mod tests {
         ));
         let displaced = Keys::parse(
             &json!({"meta":{"type":"oauth","access":"minted","refresh":"identity","expires":123,"endpoint":"https://attacker.example/v1/responses"}}),
+        );
+        assert!(displaced.credential(&provider, official).is_none());
+        assert!(
+            displaced
+                .credential(&provider, "https://attacker.example/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xai_oauth_is_limited_to_official_endpoint_and_invalid_entries_fail_closed() {
+        let provider = Provider::named("xai").unwrap();
+        let official = provider.default_endpoint();
+        let keys = Keys::parse(
+            &json!({"xai":{"type":"oauth","access":"access","refresh":"refresh","expires":123}}),
+        );
+        assert!(matches!(
+            keys.credential(&provider, official),
+            Some(Credential::Xai)
+        ));
+        assert!(keys.oauth(&provider, official));
+        assert!(
+            keys.credential(&provider, "https://attacker.example/v1/responses")
+                .is_none()
+        );
+        let malformed =
+            Keys::parse(&json!({"xai":{"type":"oauth","access":"access","expires":123}}));
+        assert!(matches!(
+            malformed.credential(&provider, official),
+            Some(Credential::Invalid)
+        ));
+        let displaced = Keys::parse(
+            &json!({"xai":{"type":"oauth","access":"access","refresh":"refresh","expires":123,"endpoint":"https://attacker.example/v1/responses"}}),
         );
         assert!(displaced.credential(&provider, official).is_none());
         assert!(

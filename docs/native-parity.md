@@ -150,9 +150,19 @@ key minting and inference have not been verified.
 
 The native xAI provider uses the pinned Pi Responses catalog and
 `XAI_API_KEY`, with model-specific thinking levels and a provider identity
-separate from OpenAI and ChatGPT. The adapter supports streamed Responses
-events and tool calls through the shared Responses implementation. Loopback
-CLI coverage does not replace live acceptance with an xAI account.
+separate from OpenAI and ChatGPT. `/login xai` and `pi login xai` also support
+Pi's xAI subscription device authorization, pending and slow-down polling,
+Pi-compatible credentials, five-minute expiry skew, and refresh-token rotation.
+The terminal's device-code prompt can open the verification URL and copy the
+code on confirmation while polling continues; cancellation discards the action.
+`/login xai api-key` retains manual API-key entry. OAuth credentials are accepted
+only for the official xAI Responses endpoint; token requests use the fixed xAI
+authorization host, disable redirects, and never print response bodies. Refresh
+is serialized and persisted even if the requesting task is cancelled. The
+terminal retains an in-progress credential commit when cancellation arrives.
+The adapter supports streamed Responses events and tool calls through the shared
+Responses implementation. Loopback fixtures do not replace live login, refresh,
+or inference acceptance with an xAI subscription.
 
 ### Qwen Token Plan checkpoint
 

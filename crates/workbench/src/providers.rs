@@ -371,6 +371,14 @@ impl Deferred {
                 )
                 .await?,
             ),
+            Some(Credential::Xai) if self.http_settings.is_some() => Some(
+                super::xai_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
+            ),
             Some(Credential::Meta) if self.http_settings.is_some() => Some(
                 super::meta_auth::access(
                     self.http_settings.as_ref().expect("settings checked"),

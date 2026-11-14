@@ -41,6 +41,7 @@ mod packages;
 mod pi_messages;
 mod process;
 mod providers;
+mod xai_auth;
 use providers::Provider;
 mod radius_auth;
 mod radius_catalog;
@@ -1137,7 +1138,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1153,7 +1154,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
         provider: String,
     },
     Run {
@@ -1725,6 +1726,13 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "xai" {
+                    xai_auth::login(
+                        &args.settings,
+                        meta_auth::LoginControl::default(),
+                        |url, code| eprintln!("Enter code {code} at {url}"),
+                    )
+                    .await
                 } else if provider == "kimi-coding" {
                     kimi_auth::login(&args.settings, |url, code| {
                         eprintln!("Enter code {code} at {url}")
@@ -1765,6 +1773,8 @@ async fn execute(
         Some(Command::Logout { provider }) => {
             let removed = if provider == "openai-chatgpt" {
                 chatgpt_auth::logout(&args.settings).await?
+            } else if provider == "xai" {
+                xai_auth::logout().await?
             } else if provider == "kimi-coding" {
                 kimi_auth::logout().await?
             } else if provider == "openrouter" {

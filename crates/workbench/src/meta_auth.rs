@@ -288,7 +288,7 @@ impl LoginControl {
     pub(super) fn is_committing(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::SeqCst) == 1
     }
-    fn begin_commit(&self) -> Result<()> {
+    pub(super) fn begin_commit(&self) -> Result<()> {
         self.0
             .compare_exchange(
                 0,
