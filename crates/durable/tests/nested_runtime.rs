@@ -779,3 +779,87 @@ async fn model_selection_survives_reopen_and_keeps_nested_tools_callable() {
         .unwrap();
     assert_eq!(child.count.load(Ordering::SeqCst), 1);
 }
+
+struct PanicAfterEffect(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for PanicAfterEffect {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "parent".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        struct SensitivePayload;
+        impl Drop for SensitivePayload {
+            fn drop(&mut self) {
+                panic!("secret payload destructor");
+            }
+        }
+        self.0.fetch_add(1, Ordering::SeqCst);
+        std::panic::panic_any(SensitivePayload)
+    }
+}
+
+#[tokio::test]
+async fn tool_panic_report_is_redacted_deduplicated_and_never_redispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let opts = Options {
+        model: Arc::new(FakeModel),
+        tools: vec![RegisteredTool {
+            tool: Arc::new(PanicAfterEffect(count.clone())),
+            replay: ReplayPolicy::Safe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open(&db, opts.clone(), &cancel).await.unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let operation = h.blocked(id).unwrap().unwrap().0;
+    let reports = h.extension_reports().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].phase, "tool_execution_panic");
+    assert!(!serde_json::to_string(&reports).unwrap().contains("secret"));
+    let (sent, recv) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let mut dispatcher = h
+        .dispatch_extension_reports(0, std::time::Duration::from_millis(1), move |_| {
+            sent.take().unwrap().send(()).unwrap();
+            async { Err("listener failure".into()) }
+        })
+        .unwrap();
+    recv.await.unwrap();
+    assert!(dispatcher.close().await.is_err());
+    drop(dispatcher);
+    drop(h);
+    let mut h = Harness::open(&db, opts, &cancel).await.unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert_eq!(h.extension_reports().unwrap(), reports);
+    assert_eq!(
+        h.subscribe_extension_reports()
+            .unwrap()
+            .read(0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    h.reconcile(id, operation, Outcome::Succeeded("confirmed".into()))
+        .unwrap();
+    h.resume_conversation(id, &cancel).await.unwrap();
+    assert_eq!(h.extension_reports().unwrap(), reports);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}

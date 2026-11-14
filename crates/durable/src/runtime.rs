@@ -314,6 +314,8 @@ enum Phase {
         content: String,
     },
     Blocked {
+        #[serde(default)]
+        tool_panicked: bool,
         turns: u32,
         calls: Vec<ToolCall>,
         index: usize,
@@ -3683,6 +3685,7 @@ impl Harness {
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
         {
             let (mut c, version) = self.load(id)?;
+            self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 return Ok(());
             }
@@ -3777,6 +3780,7 @@ impl Harness {
                         }
                         ToolRecovery::Reconcile => {
                             c.phase = Phase::Blocked {
+                                tool_panicked: false,
                                 turns,
                                 calls,
                                 index,
@@ -3953,6 +3957,7 @@ impl Harness {
                 ..
             } => {
                 c.phase = Phase::Blocked {
+                    tool_panicked: false,
                     turns,
                     calls,
                     index,
@@ -3971,6 +3976,7 @@ impl Harness {
                 arguments,
             } => {
                 c.phase = Phase::Blocked {
+                    tool_panicked: false,
                     turns,
                     calls,
                     index,
@@ -4108,6 +4114,7 @@ impl Harness {
                 return Err(Error::Interrupted);
             }
             let (mut c, version) = self.load(id)?;
+            self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 if self.settle_abort(c, version, cancel).await? {
                     continue;
@@ -5408,6 +5415,7 @@ impl Harness {
                     let tools = self.resolved_tools(&c)?;
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
+                    let mut tool_panicked = false;
                     let reply = if let Some(reg) = tools.get(&call.name).filter(|_| {
                         c.model_tools
                             .as_ref()
@@ -5486,6 +5494,14 @@ impl Harness {
                                         )
                                         .await;
                                         drop(scope);
+                                        let reply = reply.map(|result| match result {
+                                            Ok(reply) => Ok(reply),
+                                            Err(payload) => {
+                                                tool_panicked = true;
+                                                crate::extension::discard_panic_payload(payload);
+                                                Err(())
+                                            }
+                                        });
                                         match host.seal_and_wait().await {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
@@ -5542,6 +5558,7 @@ impl Harness {
                     match reply.outcome {
                         Outcome::Unknown(reason) => {
                             c.phase = Phase::Blocked {
+                                tool_panicked,
                                 turns,
                                 calls,
                                 index,
@@ -5674,6 +5691,7 @@ impl Harness {
                         }
                         crate::poll::PollResult::Outcome(Outcome::Unknown(reason)) => {
                             c.phase = Phase::Blocked {
+                                tool_panicked: false,
                                 turns,
                                 calls,
                                 index,
@@ -5713,6 +5731,29 @@ impl Harness {
             }
         }
     }
+    // The blocked phase is committed before reporting, so a report write or listener
+    // failure cannot cause tool redispatch. Reopen and reconciliation also repair
+    // a crash between the phase commit and the separately indexed report.
+    fn report_blocked_tool_panic(&self, c: &Conversation) -> Result<(), Error> {
+        if let Phase::Blocked {
+            tool_panicked: true,
+            operation_id,
+            ..
+        } = &c.phase
+        {
+            self.record_extension_reports(
+                c.id,
+                *operation_id,
+                "tool_execution_panic",
+                vec![crate::extension::Report {
+                    extension: "runtime".into(),
+                    operation: "tool_execution_panic".into(),
+                    error: "tool execution panicked; outcome requires reconciliation".into(),
+                }],
+            )?;
+        }
+        Ok(())
+    }
     /// Supply an authoritative outcome for an interrupted or pending operation.
     pub fn reconcile(
         &mut self,
@@ -5729,6 +5770,7 @@ impl Harness {
             ));
         }
         let (mut c, version) = self.load(id)?;
+        self.report_blocked_tool_panic(&c)?;
         let (turns, calls, index, expected, arguments) = match c.phase.clone() {
             Phase::Blocked {
                 turns,
@@ -7546,6 +7588,58 @@ mod scheduler_tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reports[0].error, "first");
     }
+    #[tokio::test]
+    async fn blocked_panic_report_is_recovered_before_resume_or_reconciliation() {
+        for reconcile in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            });
+            let operation = Uuid::new_v4();
+            let id;
+            {
+                let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+                id = h.create_conversation(config()).unwrap();
+                let (mut c, version) = h.load(id).unwrap();
+                c.phase = Phase::Blocked {
+                    tool_panicked: true,
+                    turns: 0,
+                    index: 0,
+                    operation_id: operation,
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reason: "uncertain".into(),
+                    arguments: None,
+                };
+                h.save(&c, Expected::Version(version)).unwrap();
+                assert!(h.extension_reports().unwrap().is_empty());
+            }
+            let mut h = Harness::open_paused(&path, options(model)).unwrap();
+            if reconcile {
+                h.reconcile(id, operation, Outcome::Succeeded("ok".into()))
+                    .unwrap();
+            } else {
+                h.resume_conversation(id, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                h.resume_conversation(id, &CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+            let reports = h.extension_reports().unwrap();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].operation_id, operation);
+            assert_eq!(reports[0].phase, "tool_execution_panic");
+        }
+    }
+
     #[test]
     fn dispatcher_missing_runtime_does_not_poison_harness() {
         let dir = tempfile::tempdir().unwrap();
@@ -7773,6 +7867,7 @@ mod scheduler_tests {
                 arguments: None,
             },
             Phase::Blocked {
+                tool_panicked: false,
                 turns: 0,
                 calls: vec![call.clone()],
                 index: 0,
