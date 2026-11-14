@@ -510,14 +510,15 @@ fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
     Ok(())
 }
 pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
-    let value = entry
-        .get("content")
-        .ok_or_else(|| Error::Session("imported custom message is missing content".into()))?;
-    let content = if let Some(text) = value.as_str() {
+    let value = entry.get("content");
+    let content = if !legacy && value.is_none_or(Value::is_null) {
+        // Pi projects missing or null custom_message content as empty blocks.
+        pi_rs::ContextContent::Blocks(Vec::new())
+    } else if let Some(text) = value.and_then(Value::as_str) {
         pi_rs::ContextContent::Text(text.into())
     } else {
         let blocks = value
-            .as_array()
+            .and_then(Value::as_array)
             .ok_or_else(|| Error::Session("invalid imported custom message content".into()))?;
         let mut result = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -2550,6 +2551,77 @@ mod tests {
         assert_eq!(messages[0]["customType"], "private");
         assert_eq!(messages[0]["display"], false);
         assert_eq!(messages[1]["role"], "hookMessage");
+    }
+
+    #[test]
+    fn sparse_custom_messages_project_empty_and_survive_round_trip() {
+        for explicit_null in [false, true] {
+            let mut custom = json!({"type":"custom_message","id":"custom","parentId":null,"customType":"hint","display":true,"details":{"source":"test"}});
+            if explicit_null {
+                custom["content"] = Value::Null;
+            }
+            let session =
+                import_pi(vec![json!({"type":"session","version":3}), custom.clone()]).unwrap();
+            let record = session.records().iter().find(|record| matches!(&record.event,
+                Event::CustomMessage { message } if message.custom_type == "hint"
+                    && message.display && message.details == Some(json!({"source":"test"}))
+                    && matches!(&message.content, pi_rs::ContextContent::Blocks(blocks) if blocks.is_empty())
+            )).expect("empty custom message");
+            assert!(
+                matches!(session.conversation_at(record.id).unwrap().as_slice(), [Message::User { content }] if content.is_empty())
+            );
+            assert!(session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry == &custom)));
+            let (messages, _) = super::super::rpc_messages::snapshot(&session);
+            assert_eq!(messages[0]["content"], json!([]));
+            assert_eq!(messages[0]["details"], json!({"source":"test"}));
+            let entries = super::super::rpc_entries::Entries::new(&session)
+                .after(None)
+                .unwrap();
+            let raw = &entries["entries"][0];
+            assert_eq!(raw.get("content"), custom.get("content"));
+            assert_eq!(raw["details"], custom["details"]);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("native.jsonl");
+            session.export_jsonl(&path).unwrap();
+            let reopened = read(&path).unwrap();
+            let (messages, _) = super::super::rpc_messages::snapshot(&reopened);
+            assert_eq!(messages[0]["content"], json!([]));
+            assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry == &custom)));
+        }
+        for invalid in [json!(false), json!(42), json!({})] {
+            let entry = json!({"type":"custom_message","id":"bad","parentId":null,"customType":"hint","display":true,"content":invalid});
+            assert!(import_pi(vec![json!({"type":"session","version":3}), entry]).is_err());
+        }
+    }
+
+    #[test]
+    fn sparse_custom_message_edits_remain_branch_local() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"custom_message","id":"custom","parentId":null,"customType":"hint","display":false}),
+            json!({"type":"context_edit","id":"edit","parentId":"custom","targetId":"custom","replacement":{"content":"edited"}}),
+            json!({"type":"message","id":"left","parentId":"edit","message":{"role":"user","content":"left"}}),
+            json!({"type":"message","id":"right","parentId":"custom","message":{"role":"user","content":"right"}}),
+        ]).unwrap();
+        let left = session
+            .records()
+            .iter()
+            .find(
+                |record| matches!(&record.event, Event::User { content, .. } if content == "left"),
+            )
+            .unwrap()
+            .id;
+        assert!(
+            matches!(&session.conversation_at(left).unwrap()[0], Message::User { content } if content == "edited")
+        );
+        assert!(
+            matches!(&session.conversation_at(session.head()).unwrap()[0], Message::User { content } if content.is_empty())
+        );
+        let (messages, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages[0]["content"], json!([]));
+        session.checkout(left).unwrap();
+        let (messages, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages[0]["content"], json!("edited"));
     }
 
     #[test]

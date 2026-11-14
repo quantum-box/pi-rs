@@ -3780,3 +3780,11 @@ or stepping through every record. Filtered-out intermediate records attach to
 nearest visible ancestors for navigation; changing the search clears folds.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
+
+### Sparse custom-message import checkpoint
+
+Pi custom-message entries with missing or null content now import as empty
+content blocks, matching its session-context projection. RPC messages report
+empty blocks while retained source entries preserve whether content was missing
+or null. Tests cover export and reopen, branch-local edits, metadata and invalid
+non-null content. Other specialized message variants remain open.
