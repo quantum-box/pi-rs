@@ -1,5 +1,5 @@
 //! Opt-in task-owned subagent admission. This only persists ownership; it does
-//! not schedule work or propagate cancellation across conversation edges.
+//! not schedule work. Harness abort traversal follows foreground ownership edges.
 use crate::{
     ownership_edge::{self, Edge, Mode},
     runtime::{Config, Conversation, Error, Harness, Scheduler},
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_abort_fails_without_partial_marks_after_reopen() {
+    fn foreground_traversal_persists_and_skips_background() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut h = Harness::open_paused(&path, options()).unwrap();
@@ -316,18 +316,113 @@ mod tests {
             TaskOwner::Conversation(id) => id,
             _ => unreachable!(),
         };
-        h.ensure_task_owned_subagent(task, owner, "child", config(), Mode::Foreground)
+        let child = h
+            .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let background = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
+            .unwrap()
+            .child;
+        let nested = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap();
+        TaskStore::new(h.subagent_store().unwrap())
+            .save(&[Save::Create(&nested)])
             .unwrap();
+        h.request_abort(parent).unwrap();
         drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        assert!(h.request_abort(parent).is_err());
-        assert!(!h.conversation(parent).unwrap().abort_requested);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(h.conversation(parent).unwrap().abort_requested);
+        assert!(h.conversation(child).unwrap().abort_requested);
+        assert!(!h.conversation(background).unwrap().abort_requested);
         let ts = TaskStore::new(h.subagent_store().unwrap());
-        assert!(matches!(
-            crate::task_scheduler::request_abort_subtree(&ts, task),
-            Err(crate::task_scheduler::Error::ForegroundAbortUnsupported)
-        ));
-        assert!(!ts.load(task).unwrap().unwrap().task.abort_requested());
+        assert!(ts.load(task).unwrap().unwrap().task.abort_requested());
+        assert!(
+            ts.load(nested.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
+    #[test]
+    fn task_abort_traverses_foreground_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let child = h
+            .ensure_task_owned_subagent(task, owner, "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        h.request_abort_task(task).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(
+            TaskStore::new(h.subagent_store().unwrap())
+                .load(task)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(h.conversation(child).unwrap().abort_requested);
+    }
+
+    #[test]
+    fn traversal_terminates_on_ownership_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let child = h
+            .ensure_task_owned_subagent(task, owner, "child", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let nested = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        TaskStore::new(store)
+            .save(&[Save::Create(&nested)])
+            .unwrap();
+        let edge = Edge {
+            task: nested.id(),
+            task_owner: TaskOwner::Conversation(child),
+            child: parent,
+            mode: Mode::Foreground,
+        };
+        let prepared = EdgeStore::new(store).prepare_create(&edge).unwrap();
+        store.commit(&prepared.checks, &prepared.mutations).unwrap();
+        h.request_abort(parent).unwrap();
+        assert!(h.conversation(child).unwrap().abort_requested);
+        assert!(
+            TaskStore::new(h.subagent_store().unwrap())
+                .load(nested.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
     }
 
     #[test]
@@ -346,10 +441,7 @@ mod tests {
                 worker.ensure_task_owned_subagent(task, o, "child", config(), Mode::Foreground)
             });
             barrier.wait();
-            let abort = crate::task_scheduler::request_abort_subtree(
-                &TaskStore::new(h.subagent_store().unwrap()),
-                task,
-            );
+            let abort = h.request_abort_task(task);
             let result = admission.join().unwrap();
             let store = h.subagent_store().unwrap();
             let marked = TaskStore::new(store)
@@ -359,7 +451,9 @@ mod tests {
                 .task
                 .abort_requested();
             assert_eq!(marked, abort.is_ok());
-            assert_eq!(result.is_ok(), !marked);
+            if let Ok(a) = &result {
+                assert!(h.conversation(a.child).unwrap().abort_requested);
+            }
             let edges = EdgeStore::new(store).children(task).unwrap();
             assert_eq!(edges.len(), usize::from(result.is_ok()));
             drop(h);

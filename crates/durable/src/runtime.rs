@@ -2031,51 +2031,131 @@ impl Harness {
     /// Persist the abort mark and withdraw the inputs queued at this commit.
     /// The caller must stop any executing worker before driving the mark.
     pub fn request_abort(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_owned_graph(Some(id), None)
+    }
+
+    /// Atomically persist an abort for a task and its foreground owned graph.
+    /// The caller must stop executing workers before driving these marks.
+    pub fn request_abort_task(&mut self, id: Uuid) -> Result<(), Error> {
+        self.abort_owned_graph(None, Some(id))
+    }
+
+    fn abort_owned_graph(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+    ) -> Result<(), Error> {
+        use crate::ownership_edge::{EdgeStore, Mode};
+        use crate::task::TaskOwner;
+        use std::collections::{HashMap, HashSet, VecDeque};
         let owner = self.owner.clone();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
-            let (mut c, version) = self.load(id)?;
-            let live = self.conversation_tasks(id)?;
-            if crate::ownership_edge::reject_foreground_children(
-                self.owner.store(),
-                live.iter().map(|record| record.task.id()),
-            )
-            .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?
-            {
-                return Err(Error::Invalid(
-                    "foreground owned conversation abort is not supported".into(),
-                ));
-            }
-            let mut tasks = Vec::new();
-            for mut record in live
-                .iter()
-                .filter(|record| !record.task.abort_requested())
-                .cloned()
-            {
-                record
-                    .task
-                    .request_abort()
-                    .map_err(|e| Error::Invalid(format!("task abort: {e:?}")))?;
-                tasks.push(record);
-            }
-            for submission in &mut c.submissions {
-                if submission.status == Status::Queued {
-                    submission.status = Status::Unanswered {
-                        reason: "aborted".into(),
-                    };
+            let store = owner.store();
+            let records = crate::task_store::TaskStore::new(store)
+                .list()
+                .map_err(|e| Error::Invalid(format!("task list: {e}")))?;
+            let by_id: HashMap<_, _> = records.iter().map(|r| (r.task.id(), r)).collect();
+            if let Some(id) = task {
+                let root = by_id.get(&id).ok_or(Error::NotFound)?;
+                if root.task.is_terminal() {
+                    return Err(Error::Invalid("task is terminal".into()));
                 }
             }
-            if !matches!(c.phase, Phase::Idle | Phase::FailedIdle)
-                || c.active.is_some()
-                || !live.is_empty()
-            {
-                c.abort_requested = true;
+            let mut conversations = HashSet::new();
+            let mut tasks = HashSet::new();
+            let mut cq = VecDeque::new();
+            let mut tq = VecDeque::new();
+            if let Some(id) = conversation {
+                cq.push_back(id);
             }
-            match self.save_composed_locked(&c, Expected::Version(version), None, &[], &tasks, None)
-            {
+            if let Some(id) = task {
+                tq.push_back(id);
+            }
+            let mut states = Vec::new();
+            let mut edge_checks = Vec::new();
+            while !cq.is_empty() || !tq.is_empty() {
+                while let Some(id) = cq.pop_front() {
+                    if !conversations.insert(id) {
+                        continue;
+                    }
+                    let (state, version) = self.load(id)?;
+                    states.push((state, version));
+                    for r in &records {
+                        if r.task.owner() == &TaskOwner::Conversation(id) && !r.task.is_background()
+                        {
+                            tq.push_back(r.task.id());
+                        }
+                    }
+                }
+                while let Some(id) = tq.pop_front() {
+                    if !tasks.insert(id) {
+                        continue;
+                    }
+                    let record = by_id.get(&id).ok_or(Error::NotFound)?;
+                    for r in &records {
+                        if r.task.owner() == &TaskOwner::Task(id) && !r.task.is_background() {
+                            tq.push_back(r.task.id());
+                        }
+                    }
+                    for edge in EdgeStore::new(store)
+                        .children(id)
+                        .map_err(|e| Error::Invalid(format!("ownership edges: {e}")))?
+                    {
+                        if edge.edge.task_owner != *record.task.owner() {
+                            return Err(Error::Invalid("ownership edge owner mismatch".into()));
+                        }
+                        edge_checks.push(Check {
+                            key: crate::ownership_edge::edge_key(edge.edge.child),
+                            expected: Expected::Version(edge.version),
+                        });
+                        if edge.edge.mode == Mode::Foreground {
+                            cq.push_back(edge.edge.child);
+                        }
+                    }
+                }
+            }
+            let mut updates = Vec::new();
+            for id in &tasks {
+                let mut record = (*by_id[id]).clone();
+                if !record.task.is_terminal() && !record.task.abort_requested() {
+                    record
+                        .task
+                        .request_abort()
+                        .map_err(|e| Error::Invalid(format!("task abort: {e:?}")))?;
+                }
+                updates.push(record);
+            }
+            for (state, _) in &mut states {
+                for submission in &mut state.submissions {
+                    if submission.status == Status::Queued {
+                        submission.status = Status::Unanswered {
+                            reason: "aborted".into(),
+                        };
+                    }
+                }
+                state.abort_requested = true;
+            }
+            let refs: Vec<_> = states
+                .iter()
+                .map(|(s, v)| (s, Expected::Version(*v)))
+                .collect();
+            let mut batch = self.prepare_saves(&refs)?;
+            let task_batch = crate::task_store::TaskStore::new(store)
+                .prepare_save(
+                    &updates
+                        .iter()
+                        .map(crate::task_store::Save::Update)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
+            batch.checks.extend(task_batch.checks);
+            batch.checks.extend(edge_checks);
+            batch.mutations.extend(task_batch.mutations);
+            match self.commit_conversation_save(batch) {
                 Ok(()) => return Ok(()),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                Err(error) => return Err(error),
+                Err(e) => return Err(e),
             }
         }
     }
