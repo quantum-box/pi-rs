@@ -111,6 +111,36 @@ async fn empty_answered_busy_and_reopen_are_idempotent() {
 }
 
 #[tokio::test]
+async fn continue_respects_all_follow_up_mode() {
+    use pi_rs_durable::runtime::{QueueMode, QueueModes};
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Answer(AtomicUsize::new(0), true));
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open_paused(dir.path().join("db"), options(model.clone(), 1)).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.set_queue_modes(
+        id,
+        QueueModes {
+            follow_up_mode: QueueMode::All,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    h.submit(id, None, "first".into()).unwrap();
+    let a = h.submit(id, None, "a".into()).unwrap();
+    let b = h.submit(id, None, "b".into()).unwrap();
+    h.resume(&cancel).await.unwrap();
+    let continuation = h.submit_continue(id, None).unwrap();
+    let c = h.conversation(id).unwrap();
+    for sid in [a, b, continuation] {
+        assert!(matches!(
+            c.submissions.iter().find(|s| s.id == sid).unwrap().status,
+            Status::Running
+        ));
+    }
+}
+
+#[tokio::test]
 async fn continue_after_failure_places_queued_input_and_recovers_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

@@ -3902,6 +3902,7 @@ mod scheduler_tests {
             c.input_modes.insert(id, mode);
             c.submissions.push(Submission {
                 id,
+                kind: SubmissionKind::Input,
                 request_id: None,
                 content: content.into(),
                 status: Status::Queued,
