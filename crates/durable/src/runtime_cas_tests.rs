@@ -1060,7 +1060,8 @@ fn position_fork_uses_first_complete_snapshot_and_survives_reset_reopen() {
         .unwrap()
         .entries;
     let position = entries[0].position.clone();
-    assert!(h.fork_at_position(id, entries[1].position.clone()).is_err());
+    let interior = h.fork_at_position(id, entries[1].position.clone()).unwrap();
+    assert_eq!(h.conversation(interior).unwrap().messages.len(), 2);
     assert!(h.fork_at_position(other, position.clone()).is_err());
     let (mut state, version) = h.load(id).unwrap();
     state.config.model = "later".into();
@@ -1666,4 +1667,91 @@ fn entry_id_fork_rejects_incomplete_snapshot_settings() {
             .unwrap();
         assert!(h.fork_by_entry_id(id, entry.id).is_err());
     }
+}
+
+#[test]
+fn interior_entry_fork_requires_proven_stable_state_and_valid_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "historical".into(),
+            system_prompt: "prompt".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.provider_adapter = Some("adapter".into());
+    h.save(&state, Expected::Version(version)).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.extend([
+        Message::User {
+            content: "first".into(),
+        },
+        Message::User {
+            content: "second".into(),
+        },
+    ]);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let first = entries[1].history.as_ref().unwrap().id;
+    let (mut state, version) = h.load(id).unwrap();
+    state.config.model = "new".into();
+    h.save(&state, Expected::Version(version)).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let child = h.fork_by_entry_id(id, first).unwrap();
+    let fork = h.conversation(child).unwrap();
+    assert_eq!(fork.config.model, "historical");
+    assert_eq!(fork.provider_adapter.as_deref(), Some("adapter"));
+    assert_eq!(
+        fork.messages,
+        vec![Message::User {
+            content: "first".into()
+        }]
+    );
+    let (mut state, version) = h.load(id).unwrap();
+    state.messages.extend([
+        Message::Assistant {
+            content: "".into(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "call".into(),
+            content: "result".into(),
+        },
+        Message::User {
+            content: "after".into(),
+        },
+    ]);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let entries = h
+        .view_positioned(id, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries;
+    let call = entries[2].history.as_ref().unwrap().id;
+    let result = entries[1].history.as_ref().unwrap().id;
+    let before = h.conversation(id).unwrap();
+    assert!(h.fork_by_entry_id(id, call).is_err());
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(h.conversation(id).unwrap()).unwrap()
+    );
+    let child = h.fork_by_entry_id(id, result).unwrap();
+    assert_eq!(
+        h.conversation(child).unwrap().messages,
+        before.messages[..4]
+    );
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(child).unwrap().messages.len(), 4);
 }

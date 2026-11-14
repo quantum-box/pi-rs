@@ -46,20 +46,18 @@ the original operation. External effect
 idempotency remains the tool's and destination's responsibility.
 
 New transcript batches expose immutable per-occurrence message IDs and their
-originating atomic observation commit through positioned views. Only the last
-message of a batch corresponds to a separately captured state boundary; legacy
-batches have no entry metadata and fail closed for position forks. Reset and
-compaction replacement batches assign fresh IDs to their replacement occurrences.
-`fork_by_entry_id` resolves these IDs at complete, proven batch boundaries. It
-rejects interior, legacy, and other-conversation occurrences. See the parity
-document for historical-state and storage limitations.
+originating atomic observation commit through positioned views. New append batches
+also record when fork-relevant state was unchanged across the commit. For such a
+batch, `fork_at_position` and `fork_by_entry_id` can fork an interior message
+using the captured state and its exact message prefix, provided the prefix has a
+complete tool-call/result context. Changes to fork state in the same commit,
+legacy batches without this proof, and interior replacement batches fail closed.
+Replacement batches assign fresh occurrence IDs, and an interior fork currently
+materializes a new transcript with fresh IDs. Inherited foreign occurrences are
+not selectable in the child. See the parity document for remaining limitations.
 
-The runtime can fork a settled conversation at its current state or a supported
-historical snapshot cursor, and performs explicit idle compaction. It also
-supports `fork_at_position` and `fork_by_entry_id` for a message at a complete batch boundary with
-matching complete historical fork metadata; other positions fail closed. The
-first matching observation determines the configuration. This does not recover
-per-message state within a batch or pre-migration legacy history. It also
+The runtime can also fork a settled conversation at its current state or a
+supported historical snapshot cursor, and performs explicit idle compaction. It also
 attempts compaction when a provider reports a context window and the estimated
 request approaches it. Older committed snapshots remain in the observation
 log. `history` and `watch_history` read or poll from an exclusive cursor; slow

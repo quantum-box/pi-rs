@@ -303,6 +303,13 @@ enum TranscriptChange {
         commit: u64,
         origin: Uuid,
     },
+    AppendV3 {
+        messages: Vec<Message>,
+        ids: Vec<Uuid>,
+        commit: u64,
+        origin: Uuid,
+        stable_prefix: usize,
+    },
     ReplaceV2 {
         messages: Vec<Message>,
         ids: Vec<Uuid>,
@@ -323,6 +330,13 @@ impl TranscriptChange {
                 ids,
                 commit,
                 origin,
+            } => (messages, false, Some((ids, commit, origin))),
+            Self::AppendV3 {
+                messages,
+                ids,
+                commit,
+                origin,
+                ..
             } => (messages, false, Some((ids, commit, origin))),
             Self::ReplaceV2 {
                 messages,
@@ -1244,6 +1258,34 @@ impl Harness {
             ),
             _ => Some(TranscriptChange::Replace(state.messages.clone())),
         };
+        // An interior cut is provable only when every forked state field is
+        // unchanged across the entire atomic append. Never infer this for old
+        // batches or replacement snapshots.
+        let stable_prefix = old
+            .filter(|previous| {
+                !create
+                    && state.messages.starts_with(&previous.messages)
+                    && matches!((serde_json::to_value((
+                        &state.config,
+                        &state.queue_modes,
+                        &state.extensions,
+                        &state.provider_adapter,
+                        &state.allowed_tools,
+                        &state.resets,
+                        &state.application_writes,
+                        &state.tool_states,
+                    )), serde_json::to_value((
+                            &previous.config,
+                            &previous.queue_modes,
+                            &previous.extensions,
+                            &previous.provider_adapter,
+                            &previous.allowed_tools,
+                            &previous.resets,
+                            &previous.application_writes,
+                            &previous.tool_states,
+                        ))), (Ok(a), Ok(b)) if a == b)
+            })
+            .map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
         // state cannot be reconstructed. Keep the migration batch unannotated.
         let change = change.map(|change| {
@@ -1251,6 +1293,15 @@ impl Harness {
                 return change;
             }
             match change {
+                TranscriptChange::Append(messages) if stable_prefix.is_some() => {
+                    TranscriptChange::AppendV3 {
+                        ids: messages.iter().map(|_| Uuid::new_v4()).collect(),
+                        messages,
+                        commit,
+                        origin: state.id,
+                        stable_prefix: stable_prefix.unwrap(),
+                    }
+                }
                 TranscriptChange::Append(messages) => TranscriptChange::AppendV2 {
                     ids: messages.iter().map(|_| Uuid::new_v4()).collect(),
                     messages,
@@ -1649,6 +1700,14 @@ impl Harness {
     /// Fork a committed observation cut, including cuts during active work.
     /// Incomplete tool batches and snapshots without historical state fail closed.
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
+        self.fork_at_cut(id, cursor, None)
+    }
+    fn fork_at_cut(
+        &mut self,
+        id: Uuid,
+        cursor: crate::observer::Cursor,
+        prefix: Option<(usize, usize)>,
+    ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
             return Err(crate::fork::Error::InvalidCursor.into());
@@ -1666,6 +1725,16 @@ impl Harness {
             .map(serde_json::from_value)
             .transpose()?;
         self.expand_event(id, &mut value)?;
+        if let Some((len, expected_len)) = prefix {
+            let messages = value
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if messages.len() != expected_len || len > messages.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            messages.truncate(len);
+        }
         let record = crate::observer::Record { cursor, value };
         let point = crate::fork::extract_cut(id, &record)?;
         let state = Conversation {
@@ -1696,7 +1765,7 @@ impl Harness {
                 .transpose()?
                 .unwrap_or_default(),
             messages: point.messages,
-            transcript,
+            transcript: if prefix.is_some() { None } else { transcript },
             submissions: vec![],
             aborted_generations: vec![],
             resets: serde_json::from_value(
@@ -1736,8 +1805,8 @@ impl Harness {
         Ok(state.id)
     }
     /// Fork at the commit that first exposed this complete message batch.
-    /// Positions inside a batch, or without matching complete historical metadata,
-    /// cannot identify the state at that message and are rejected.
+    /// Interior positions require metadata proving unchanged fork state across
+    /// the append; incomplete tool transcripts and legacy metadata are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
         self.load(id)?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
@@ -1747,12 +1816,19 @@ impl Harness {
             .first()
             .ok_or(crate::fork::Error::InvalidCursor)?;
         let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        let stable_prefix = match &change {
+            TranscriptChange::AppendV3 { stable_prefix, .. } => Some(*stable_prefix),
+            _ => None,
+        };
         let (messages, _, metadata) = change.parts()?;
         let (_, commit, origin) = metadata.ok_or(crate::fork::Error::InvalidSnapshot)?;
         if origin != id {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        if messages.is_empty() || position.remaining != Some(messages.len()) {
+        let count = position
+            .remaining
+            .ok_or(crate::fork::Error::InvalidCursor)?;
+        if messages.is_empty() || count == 0 || count > messages.len() {
             return Err(crate::fork::Error::InvalidCursor.into());
         }
         let observer = crate::observer::Observer::new(self.owner.store(), id);
@@ -1800,7 +1876,17 @@ impl Harness {
                             return Err(crate::fork::Error::InvalidSnapshot.into());
                         }
                     }
-                    return self.fork_at(id, record.cursor);
+                    if count == messages.len() {
+                        return self.fork_at(id, record.cursor);
+                    }
+                    let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    let total = prefix
+                        .checked_add(count)
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    let expected_len = prefix
+                        .checked_add(messages.len())
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    return self.fork_at_cut(id, record.cursor, Some((total, expected_len)));
                 }
             }
             if !page.has_more {
@@ -1811,8 +1897,8 @@ impl Harness {
         Err(crate::fork::Error::InvalidSnapshot.into())
     }
     /// Fork at the exact committed boundary of a message occurrence.
-    /// Interior batch messages, legacy entries and entries originating in another
-    /// conversation cannot prove such a boundary and are rejected. Retained
+    /// Interior messages require a proven stable-state append; legacy entries and
+    /// entries originating in another conversation are rejected. Retained
     /// observations are scanned in bounded pages, including across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         self.load(id)?;
@@ -1840,13 +1926,13 @@ impl Harness {
                 let Some(batch) = batch.records.first() else {
                     continue;
                 };
-                let (messages, _, metadata) =
+                let (_, _, metadata) =
                     serde_json::from_value::<TranscriptChange>(batch.value.clone())?.parts()?;
                 let Some((ids, commit, origin)) = metadata else {
                     continue;
                 };
                 if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
-                    if origin != id || commit != record.cursor.0 || index + 1 != messages.len() {
+                    if origin != id || commit != record.cursor.0 {
                         return Err(crate::fork::Error::InvalidSnapshot.into());
                     }
                     return self.fork_at_position(
