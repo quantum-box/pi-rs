@@ -53,10 +53,10 @@ struct Record {
     identity: Identity,
 }
 
-struct Prepared {
-    child: Uuid,
-    checks: Vec<Check>,
-    mutations: Vec<Mutation>,
+pub(crate) struct Prepared {
+    pub(crate) child: Uuid,
+    pub(crate) checks: Vec<Check>,
+    pub(crate) mutations: Vec<Mutation>,
 }
 
 /// Commit staged task documents and a keyed park together. The caller must
@@ -200,7 +200,7 @@ pub(crate) fn admit(
     Ok(prepared.child)
 }
 
-fn prepare(
+pub(crate) fn prepare(
     store: &Store,
     parent: &StoredTask,
     key: &str,

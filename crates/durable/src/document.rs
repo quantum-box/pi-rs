@@ -584,6 +584,7 @@ pub struct TaskDocuments<'a> {
     entries: Option<PendingEntries>,
     signal: OwnedBatch,
     signal_keys: HashSet<(uuid::Uuid, String, String)>,
+    pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn belongs_to(&self, store: &Store, task: &crate::task::Task) -> bool {
@@ -600,11 +601,45 @@ impl<'a> TaskDocuments<'a> {
                 mutations: Vec::new(),
             },
             signal_keys: HashSet::new(),
+            keyed_children: Vec::new(),
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
             writes: HashMap::new(),
         })
     }
+    /// Stage a keyed direct child for this invocation. Nothing is persisted until
+    /// the scheduler commits the handler's transition and documents. The returned
+    /// ID is stable for an existing matching key; candidate IDs need not match.
+    /// A key may be staged once per invocation. Handler errors discard the stage.
+    pub fn stage_keyed_child(
+        &mut self,
+        key: &str,
+        tool: &str,
+        arguments: &Value,
+        child: crate::task::Task,
+    ) -> Result<uuid::Uuid, String> {
+        if self
+            .keyed_children
+            .iter()
+            .any(|(existing, _, _)| existing == key)
+        {
+            return Err("key already staged in this invocation".into());
+        }
+        let parent = crate::task_store::TaskStore::new(self.store)
+            .load(self.task.id())
+            .map_err(|e| e.to_string())?
+            .ok_or("parent missing")?;
+        if parent.task != self.task {
+            return Err("parent changed during invocation".into());
+        }
+        let prepared =
+            crate::keyed_child::prepare(self.store, &parent, key, tool, arguments, &child)
+                .map_err(|e| e.to_string())?;
+        let id = prepared.child;
+        self.keyed_children.push((key.into(), child, prepared));
+        Ok(id)
+    }
+
     pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
         if let Some(value) = self.writes.get(address) {
             return Ok(value.as_ref().map(|value| Document {
@@ -818,6 +853,10 @@ impl<'a> TaskDocuments<'a> {
         Ok(id)
     }
     pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
+        // Only the scheduler can validate and commit staged keyed children.
+        if !self.keyed_children.is_empty() {
+            return Err(Error::InvalidBatch);
+        }
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),

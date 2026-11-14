@@ -776,6 +776,13 @@ impl Scheduler {
             return Ok(true);
         }
         let step = result.map_err(Error::Handler)?;
+        let staged = std::mem::take(&mut documents.keyed_children);
+        for (_, child, _) in &staged {
+            let reg = self.registered(child)?;
+            if reg.version != child.definition_version() || reg.replay_safe != child.replay_safe() {
+                return Err(Error::Registration);
+            }
+        }
         let mut next = running.clone();
         let mut children = Vec::new();
         match step {
@@ -816,7 +823,9 @@ impl Scheduler {
                         if !seen.insert(*id) {
                             return Err(Error::Ownership);
                         }
-                        if !children.iter().any(|c| c.id() == *id) {
+                        if !children.iter().any(|c| c.id() == *id)
+                            && !staged.iter().any(|(_, _, p)| p.child == *id)
+                        {
                             let child = self.ts().load(*id)?.ok_or(Error::Ownership)?;
                             if child.task.owner() != &TaskOwner::Task(next.task.id()) {
                                 return Err(Error::Ownership);
@@ -827,10 +836,15 @@ impl Scheduler {
                 next.task.wait(condition).map_err(Error::Transition)?;
             }
             Step::Succeed(value) => {
+                // Newly staged children are live and cannot be hidden by a terminal parent.
+                if staged.iter().any(|(_, _, p)| !p.mutations.is_empty()) {
+                    return Err(Error::LiveChildren);
+                }
                 self.ensure_no_live_children(next.task.id())?;
                 next.task.succeed(value).map_err(Error::Transition)?;
             }
             Step::Fail(reason) => {
+                // Failed handlers discard staged admissions, like staged documents.
                 self.finish_failed(&running, reason)?;
                 self.poisoned = false;
                 return Ok(true);
@@ -840,13 +854,35 @@ impl Scheduler {
         batch.extend(children.iter().map(Save::Create));
         let mut transaction = crate::document::Transaction::new();
         let document_batch = documents.into_batch()?;
-        let document_keys: HashSet<_> = document_batch
+        let mut document_keys: HashSet<_> = document_batch
             .checks
             .iter()
             .map(|c| c.key.clone())
             .collect();
         transaction.append(document_batch)?;
-        transaction.append(self.ts().prepare_save(&batch)?)?;
+        // One graph batch: the parent transition replaces admission's parent bump.
+        // Both use the captured version, so aborts and competing graph writers
+        // fence the whole transaction, without a self-conflict.
+        let mut graph = self.ts().prepare_save(&batch)?;
+        let parent_key = task_store::key(running.task.id());
+        for (_, _, prepared) in staged {
+            for check in prepared.checks {
+                document_keys.insert(check.key.clone());
+                if !graph.checks.contains(&check) {
+                    graph.checks.push(check);
+                }
+            }
+            for mutation in prepared.mutations {
+                let key = match &mutation {
+                    durable_store::Mutation::Put { key, .. }
+                    | durable_store::Mutation::Delete { key } => key,
+                };
+                if *key != parent_key {
+                    graph.mutations.push(mutation);
+                }
+            }
+        }
+        transaction.append(graph)?;
         match transaction.commit(owner.store()) {
             Ok(()) => {}
             Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
@@ -2399,5 +2435,243 @@ mod tests {
                 .checkpoint(),
             &cp("start")
         );
+    }
+    #[test]
+    fn staged_keyed_child_live_handler_reopens_and_replays_identity() {
+        struct Parent;
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let candidate = if t.checkpoint().phase == "start" {
+                    2
+                } else {
+                    3
+                };
+                let child = task(candidate, TaskOwner::Task(t.id()), "child", true, 5);
+                let id = docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                if t.checkpoint().phase == "start" {
+                    Ok(Step::Wait {
+                        checkpoint: cp("waiting"),
+                        condition: WaitFor::TasksAny(vec![id]),
+                        children: vec![],
+                    })
+                } else {
+                    Ok(Step::Succeed(json!(id.to_string())))
+                }
+            }
+        }
+        fn registry() -> Registry {
+            let mut r = Registry::default();
+            r.register("parent", true, Parent);
+            r.register("child", true, |_: &Task| Ok(Step::Succeed(json!("done"))));
+            r
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            5,
+        );
+        {
+            let mut s = Scheduler::open(&path, registry()).unwrap();
+            s.submit(&parent).unwrap();
+            s.tick(0).unwrap();
+            assert_eq!(
+                s.get(parent.id()).unwrap().unwrap().state(),
+                &TaskState::Waiting(WaitFor::TasksAny(vec![Uuid::from_u128(2)]))
+            );
+            assert!(s.get(Uuid::from_u128(2)).unwrap().is_some());
+        }
+        let mut s = Scheduler::open(&path, registry()).unwrap();
+        for _ in 0..4 {
+            s.tick(0).unwrap();
+        }
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        assert!(s.get(Uuid::from_u128(3)).unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_keyed_child_conflict_and_abort_discard_before_replay() {
+        use crate::document::{Address, TaskDocuments, Transaction};
+        use durable_store::{Expected, Store};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Parent {
+            path: std::path::PathBuf,
+            calls: Arc<AtomicUsize>,
+            abort: bool,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let addr = Address {
+                    scope: "stage".into(),
+                    name: "conflict".into(),
+                    key: "".into(),
+                };
+                docs.get(&addr).unwrap();
+                let child = task(2, TaskOwner::Task(t.id()), "child", true, 5);
+                let id = docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let db = Store::open(&self.path).unwrap();
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &addr,
+                        Expected::Missing,
+                        json!({"external": true}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                    tx.commit(&db).unwrap();
+                    if self.abort {
+                        request_abort_subtree(&TaskStore::new(&db), t.id()).unwrap();
+                    }
+                }
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![id]),
+                    children: vec![],
+                })
+            }
+        }
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tasks.db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = || {
+                let mut r = Registry::default();
+                r.register(
+                    "parent",
+                    true,
+                    Parent {
+                        path: path.clone(),
+                        calls: calls.clone(),
+                        abort,
+                    },
+                );
+                r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+                r
+            };
+            let parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                true,
+                5,
+            );
+            {
+                let mut s = Scheduler::open(&path, registry()).unwrap();
+                s.submit(&parent).unwrap();
+                s.tick(0).unwrap();
+                assert!(s.get(Uuid::from_u128(2)).unwrap().is_none());
+                let current = s.get(parent.id()).unwrap().unwrap();
+                assert_eq!(current.state(), &TaskState::Ready);
+                assert_eq!(current.abort_requested(), abort);
+            }
+            let mut s = Scheduler::open(&path, registry()).unwrap();
+            if !abort {
+                s.tick(0).unwrap();
+                assert!(s.get(Uuid::from_u128(2)).unwrap().is_some());
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                s.tick(0).unwrap();
+                assert!(s.get(Uuid::from_u128(2)).unwrap().is_none());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn staged_keyed_child_parent_version_conflict_reopens_and_replays() {
+        use durable_store::Store;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Parent {
+            path: std::path::PathBuf,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                t: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(t.id()), "child", true, 5);
+                let id = docs.stage_keyed_child("tool-a", "tool", child.input(), child.clone())?;
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let db = Store::open(&self.path).unwrap();
+                    let snapshot = TaskStore::new(&db).load(t.id()).unwrap().unwrap();
+                    crate::keyed_child::admit(
+                        &db,
+                        &snapshot,
+                        "tool-a",
+                        "tool",
+                        child.input(),
+                        &child,
+                    )
+                    .unwrap();
+                }
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![id]),
+                    children: vec![],
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = || {
+            let mut r = Registry::default();
+            r.register(
+                "parent",
+                true,
+                Parent {
+                    path: path.clone(),
+                    calls: calls.clone(),
+                },
+            );
+            r.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            r
+        };
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            5,
+        );
+        {
+            let mut s = Scheduler::open(&path, registry()).unwrap();
+            s.submit(&parent).unwrap();
+            assert!(s.tick(0).is_err());
+            assert!(matches!(s.tick(0), Err(Error::Poisoned)));
+        }
+        let mut s = Scheduler::open(&path, registry()).unwrap();
+        s.tick(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            &TaskState::Waiting(WaitFor::TasksAny(vec![Uuid::from_u128(2)]))
+        );
+        assert!(s.get(Uuid::from_u128(2)).unwrap().is_some());
     }
 }
