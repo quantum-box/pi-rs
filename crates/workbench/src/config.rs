@@ -452,9 +452,6 @@ fn has_trust_requiring_project_resources(workspace: &Path) -> bool {
         if !is_home && directory.join(".agents/skills").exists() {
             return true;
         }
-        if directory.join(".git").exists() {
-            break;
-        }
     }
     false
 }
@@ -764,13 +761,29 @@ mod tests {
             "---\nname: outside-example\ndescription: outside\n---\nOutside",
         )
         .unwrap();
-        // A repository boundary excludes unrelated ancestor skills, but without
-        // one the same ancestor is part of project discovery.
-        assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
+        // Pi's trust scan continues above the repository, even though skill
+        // discovery stops at the repository boundary.
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        let mut args = super::super::Cli::parse_from([
+            "pi",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace.clone();
+        args.trusted = true;
+        args.settings = super::Settings::load(&workspace, true).unwrap();
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("global-example"));
+        assert!(!resources.skills.contains_key("outside-example"));
         std::fs::remove_dir(repo.join(".git")).unwrap();
         assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("outside-example"));
         // Worktrees use a .git file rather than a directory.
         std::fs::write(repo.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(super::project_trust(&workspace, None).unwrap(), None);
+        std::fs::remove_dir_all(home.join("projects/.agents")).unwrap();
         assert_eq!(super::project_trust(&workspace, None).unwrap(), Some(true));
         let inside = workspace.join(".agents/skills");
         std::fs::create_dir_all(&inside).unwrap();
@@ -792,13 +805,6 @@ mod tests {
             super::project_trust(&workspace, Some(true)).unwrap(),
             Some(true)
         );
-        let mut args = super::super::Cli::parse_from([
-            "pi",
-            "--no-mcp",
-            "--no-extensions",
-            "--no-context-files",
-        ]);
-        args.workspace = workspace.clone();
         args.trusted = false;
         args.settings = super::Settings::load(&workspace, false).unwrap();
         let resources = super::super::resources::Resources::load(&args).unwrap();

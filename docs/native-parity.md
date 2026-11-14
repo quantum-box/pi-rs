@@ -376,8 +376,9 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
-Project `.agents/skills` discovery and its trust check include ancestors through
-the first `.git` boundary; without one, they continue toward the filesystem root.
+As in Pi v1.5.0, the project `.agents/skills` trust check scans ancestors to
+the filesystem root, excluding the global home directory. Discovery stops at the
+first `.git` boundary, so an undiscovered skill above it can still prompt trust.
 Explicit skill invocation sends Pi's `<skill>` block with the source location,
 relative-reference directory and body. Frontmatter is removed, and optional
 user text follows the block.
