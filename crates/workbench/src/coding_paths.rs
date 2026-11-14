@@ -177,7 +177,10 @@ pub(super) fn read_variant(path: PathBuf) -> PathBuf {
 
 #[cfg(any(windows, test))]
 fn windows_shell_path(value: &str) -> String {
-    if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
+    if !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains(['\\', '\n', '\r', '\u{2028}', '\u{2029}'])
+    {
         return value.into();
     }
     let path = &value[1..];
@@ -305,6 +308,10 @@ mod tests {
             ("/usr/share", "/usr/share"),
             ("/mnt/case/foo", "/mnt/case/foo"),
             ("/MNT/c/a\\b", "/MNT/c/a\\b"),
+            ("/MNT/c/a\nb", "/MNT/c/a\nb"),
+            ("/MNT/c/a\rb", "/MNT/c/a\rb"),
+            ("/CyGdRiVe/d/a\u{2028}b", "/CyGdRiVe/d/a\u{2028}b"),
+            ("/CyGdRiVe/d/a\u{2029}b", "/CyGdRiVe/d/a\u{2029}b"),
             ("/é/c", "/é/c"),
             ("/c/mixed\\path", "/c/mixed\\path"),
         ] {
