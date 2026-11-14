@@ -4147,7 +4147,10 @@ its terminal settings. When the shell shares Pi's process group without job cont
 session, the editor resumes immediately instead of suspending a job that cannot
 be foregrounded. For a same-session launcher without job control, a separate
 supervisor resumes Pi if it still owns the terminal after one second. A shell
-that takes terminal ownership retains control until it foregrounds Pi. Cancellation restores
+that takes terminal ownership retains control until it foregrounds Pi. A shell
+`bg` resumes Pi's other processes, as upstream does, while the separately
+grouped external editor remains stopped until `fg` returns the terminal; Pi
+upstream instead keeps the editor in its own job group. Cancellation restores
 the original terminal settings; on Windows it also terminates editor wrapper
 descendants through a job object. Interrupts received while an editor
 is active do not disable subsequent terminal interrupt handling.
