@@ -516,7 +516,10 @@ async fn block_handoff_and_queued_reset_preserve_history_and_clear_provider_bloc
     {
         let requests = provider.requests.lock().unwrap();
         assert!(requests[1].blocks.is_empty());
-        assert_eq!(users(&requests[1].request.messages), ["queued reset", "steer"]);
+        assert_eq!(
+            users(&requests[1].request.messages),
+            ["queued reset", "steer"]
+        );
     }
     let c = s.conversation(id).unwrap();
     assert!(c.content_blocks.is_empty());
@@ -594,7 +597,10 @@ async fn block_reset_places_queued_text_atomically_after_new_context() {
     {
         let requests = provider.requests.lock().unwrap();
         assert!(requests[1].blocks.is_empty());
-        assert_eq!(users(&requests[1].request.messages), ["reset note", "queued steer"]);
+        assert_eq!(
+            users(&requests[1].request.messages),
+            ["reset note", "queued steer"]
+        );
     }
     let c = s.conversation(id).unwrap();
     assert!(c.content_blocks.is_empty());
