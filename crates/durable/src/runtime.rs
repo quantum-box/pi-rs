@@ -3816,10 +3816,7 @@ impl Harness {
         let owner = self.owner.clone();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         self.validate_task_tool_registry(&registry)?;
-        let mut scheduler = crate::task_scheduler::Scheduler::attach(
-            self.owner.clone(),
-            registry,
-        )?;
+        let mut scheduler = crate::task_scheduler::Scheduler::attach(self.owner.clone(), registry)?;
         scheduler.bind_harness(self.worker());
         Ok(scheduler)
     }

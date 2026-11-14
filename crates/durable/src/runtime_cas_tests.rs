@@ -2881,7 +2881,11 @@ async fn repeated_background_abort_preserves_running_cleanup_reservation() {
     registry.register_with_abort(
         "job",
         true,
-        |_: &Task| Ok(crate::task_scheduler::Step::Succeed(serde_json::Value::Null)),
+        |_: &Task| {
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
+        },
         move |_: &Task| {
             started_tx.send(()).unwrap();
             release_rx
@@ -2889,7 +2893,9 @@ async fn repeated_background_abort_preserves_running_cleanup_reservation() {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
-            Ok(crate::task_scheduler::Step::Succeed(serde_json::Value::Null))
+            Ok(crate::task_scheduler::Step::Succeed(
+                serde_json::Value::Null,
+            ))
         },
     );
     let driver = h.start_tasks(registry).unwrap();
@@ -2902,7 +2908,10 @@ async fn repeated_background_abort_preserves_running_cleanup_reservation() {
         if current.is_terminal() {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "cleanup did not finish");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup did not finish"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     driver.shutdown().unwrap();
