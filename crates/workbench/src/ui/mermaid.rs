@@ -165,11 +165,19 @@ mod tests {
         assert!(lines.is_some());
         assert!(warning.is_none());
         let (lines, warning) = render(
-            "flowchart LR\nA[Foo]:::highlight --> B[Bar]",
+            "flowchart LR\nA[Foo]:::highlight-->B[Bar]",
             &theme,
             120,
             Mermaid::Final,
         );
+        assert!(lines.is_some());
+        assert!(warning.is_none());
+        let source = "flowchart LR\nA[unfinished";
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Final);
+        assert!(lines.is_none());
+        assert!(warning.as_deref().is_some_and(|warning| warning
+            == "Mermaid diagram not rendered: node \"A\": label is missing its closing `]`"));
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Streaming);
         assert!(lines.is_some());
         assert!(warning.is_none());
     }

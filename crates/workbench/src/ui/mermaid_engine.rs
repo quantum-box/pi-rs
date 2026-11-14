@@ -391,7 +391,7 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
     }
     let id: String = chars.get(id_start..i)?.iter().collect();
 
-    let (shape, label, after) = match chars.get(i) {
+    let (shape, label, after, warning) = match chars.get(i) {
         Some('[') => {
             if chars.get(i + 1) == Some(&'[') {
                 read_shape(chars, i + 2, "]]", Shape::Rect)
@@ -418,8 +418,13 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
             }
         }
         Some('>') => read_shape(chars, i + 1, "]", Shape::Rect),
-        _ => (None, None, i),
+        _ => (None, None, i, None),
     };
+    if let Some(expected) = warning {
+        graph.warnings.push(format!(
+            "node \"{id}\": label is missing its closing `{expected}`"
+        ));
+    }
 
     let shape = shape.unwrap_or(Shape::Rect);
     let label = label.as_deref();
@@ -429,13 +434,21 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
         .get(after..)
         .is_some_and(|rest| rest.starts_with(&[':', ':', ':']))
     {
+        let tag_start = after;
         after += 3;
+        let class_start = after;
         while chars
             .get(after)
             .copied()
             .is_some_and(|c| is_id_char(c) || c == '-')
         {
+            if chars[after] == '-' && parse_link(chars, after).is_some() {
+                break;
+            }
             after += 1;
+        }
+        if after == class_start {
+            after = tag_start;
         }
     }
     Some((idx, after))
@@ -446,7 +459,7 @@ fn read_shape(
     start: usize,
     closer: &str,
     shape: Shape,
-) -> (Option<Shape>, Option<String>, usize) {
+) -> (Option<Shape>, Option<String>, usize, Option<String>) {
     let closer: Vec<char> = closer.chars().collect();
     let mut i = start;
     let mut text = String::new();
@@ -474,12 +487,18 @@ fn read_shape(
                 .is_some_and(|s| s.starts_with(closer.as_slice()))
         {
             let label = clean_label(&text);
-            return (Some(shape), Some(label), i + closer.len());
+            return (Some(shape), Some(label), i + closer.len(), None);
         }
         text.push(c);
         i += 1;
     }
-    (Some(shape), Some(clean_label(&text)), chars.len())
+    let expected: String = closer.iter().collect();
+    (
+        Some(shape),
+        Some(clean_label(&text)),
+        chars.len(),
+        Some(expected),
+    )
 }
 
 fn clean_label(raw: &str) -> String {
