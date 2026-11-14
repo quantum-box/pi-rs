@@ -21,6 +21,11 @@ jobs:
       - run: cargo +1.89.0 clippy --locked -p pi-rs-workbench --all-features --all-targets -- -D warnings
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs share_readiness_wait_is_bounded_and_reports_closed_worker
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_mint_caller_still_persists_new_key
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_caller_still_saves_rotated_refresh_token
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs refresh_persists_rotation_before_minimum_error_and_survives_cancellation
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_refresh_survives_runtime_shutdown_and_persists_rotation
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs rotating_refresh_holds_shared_store_lock_until_persisted
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib cancelled_runtime_persists_rotated_mcp_refresh_token
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
