@@ -7280,38 +7280,40 @@ fn set_foreground(fd: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result
     }
 }
 
-// A stopped process cannot know whether its parent will handle job control.
-// A separate process group resumes Pi only while Pi still owns the terminal.
+// A separate process group stops the Pi job while Pi waits on a pipe. This
+// keeps Pi from running past a pending group stop, and lets the helper resume
+// an unmanaged launcher without touching the parent shell's process group.
 #[cfg(unix)]
-struct EditorResumeWatchdog {
+struct EditorJobSupervisor {
     pid: libc::pid_t,
-    alive: std::os::fd::RawFd,
+    control: std::os::fd::RawFd,
+    response: std::os::fd::RawFd,
 }
 
 #[cfg(unix)]
-impl EditorResumeWatchdog {
-    fn start(fd: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result<Self> {
-        let mut ready_pipe = [0; 2];
-        let mut alive_pipe = [0; 2];
-        if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+impl EditorJobSupervisor {
+    fn start(tty: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result<Self> {
+        let mut response = [0; 2];
+        let mut control = [0; 2];
+        if unsafe { libc::pipe(response.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if unsafe { libc::pipe(alive_pipe.as_mut_ptr()) } != 0 {
+        if unsafe { libc::pipe(control.as_mut_ptr()) } != 0 {
             let error = std::io::Error::last_os_error();
             unsafe {
-                libc::close(ready_pipe[0]);
-                libc::close(ready_pipe[1]);
+                libc::close(response[0]);
+                libc::close(response[1]);
             }
             return Err(error);
         }
-        for descriptor in [ready_pipe[0], ready_pipe[1], alive_pipe[0], alive_pipe[1]] {
-            if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        for fd in [response[0], response[1], control[0], control[1]] {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
                 let error = std::io::Error::last_os_error();
                 unsafe {
-                    libc::close(ready_pipe[0]);
-                    libc::close(ready_pipe[1]);
-                    libc::close(alive_pipe[0]);
-                    libc::close(alive_pipe[1]);
+                    libc::close(response[0]);
+                    libc::close(response[1]);
+                    libc::close(control[0]);
+                    libc::close(control[1]);
                 }
                 return Err(error);
             }
@@ -7321,48 +7323,55 @@ impl EditorResumeWatchdog {
         if pid < 0 {
             let error = std::io::Error::last_os_error();
             unsafe {
-                libc::close(ready_pipe[0]);
-                libc::close(ready_pipe[1]);
-                libc::close(alive_pipe[0]);
-                libc::close(alive_pipe[1]);
+                libc::close(response[0]);
+                libc::close(response[1]);
+                libc::close(control[0]);
+                libc::close(control[1]);
             }
             return Err(error);
         }
         if pid == 0 {
-            // After fork in a multithreaded process, use only libc operations
-            // and _exit: no Rust allocation, locks, or destructors.
+            // After fork from a multithreaded parent, call only libc and _exit.
             unsafe {
-                libc::close(ready_pipe[0]);
-                libc::close(alive_pipe[1]);
-                let nonblocking = libc::fcntl(alive_pipe[0], libc::F_SETFL, libc::O_NONBLOCK) == 0;
-                let ready = u8::from(nonblocking && libc::setpgid(0, 0) == 0);
-                libc::write(ready_pipe[1], (&ready as *const u8).cast(), 1);
-                libc::close(ready_pipe[1]);
-                if ready == 1 {
-                    // Repeated checks handle SIGCONT racing with SIGSTOP.
-                    for attempt in 0..13 {
-                        let mut delay = if attempt == 0 {
-                            libc::timespec {
-                                tv_sec: 1,
-                                tv_nsec: 0,
+                libc::close(response[0]);
+                libc::close(control[1]);
+                let ready = u8::from(libc::setpgid(0, 0) == 0);
+                libc::write(response[1], (&ready as *const u8).cast(), 1);
+                let mut command = 0u8;
+                if ready == 1 && libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 1 {
+                    if libc::fcntl(control[0], libc::F_SETFL, libc::O_NONBLOCK) == 0
+                        && libc::kill(-group, libc::SIGSTOP) == 0
+                    {
+                        // Give a managing shell time to take the terminal. Keep
+                        // waiting while it owns the terminal, including a long
+                        // stopped job; foregrounding Pi permits resumption.
+                        for attempt in 0.. {
+                            let mut delay = if attempt == 0 {
+                                libc::timespec {
+                                    tv_sec: 1,
+                                    tv_nsec: 0,
+                                }
+                            } else {
+                                libc::timespec {
+                                    tv_sec: 0,
+                                    tv_nsec: 250_000_000,
+                                }
+                            };
+                            let mut remaining: libc::timespec = std::mem::zeroed();
+                            while libc::nanosleep(&delay, &mut remaining) != 0 {
+                                delay = remaining;
                             }
-                        } else {
-                            libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: 250_000_000,
+                            if libc::read(control[0], (&mut command as *mut u8).cast(), 1) == 0
+                                || libc::getppid() != parent
+                            {
+                                break;
                             }
-                        };
-                        let mut remaining: libc::timespec = std::mem::zeroed();
-                        while libc::nanosleep(&delay, &mut remaining) != 0 {
-                            delay = remaining;
-                        }
-                        let mut byte = 0u8;
-                        let status = libc::read(alive_pipe[0], (&mut byte as *mut u8).cast(), 1);
-                        if status == 0 || libc::getppid() != parent {
-                            break;
-                        }
-                        if libc::tcgetpgrp(fd) == group {
-                            libc::kill(-group, libc::SIGCONT);
+                            if libc::tcgetpgrp(tty) == group {
+                                libc::kill(-group, libc::SIGCONT);
+                                let done = 1u8;
+                                libc::write(response[1], (&done as *const u8).cast(), 1);
+                                break;
+                            }
                         }
                     }
                 }
@@ -7370,41 +7379,67 @@ impl EditorResumeWatchdog {
             }
         }
         unsafe {
-            libc::close(ready_pipe[1]);
-            libc::close(alive_pipe[0]);
+            libc::close(response[1]);
+            libc::close(control[0]);
         }
-        let mut ready = 0u8;
-        let read = loop {
-            let n = unsafe { libc::read(ready_pipe[0], (&mut ready as *mut u8).cast(), 1) };
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break n;
-        };
-        unsafe {
-            libc::close(ready_pipe[0]);
-        }
-        if read != 1 || ready != 1 {
+        let ready = read_editor_supervisor_byte(response[0]);
+        if !matches!(ready, Ok(1)) {
             unsafe {
+                libc::close(response[0]);
+                libc::close(control[1]);
                 libc::kill(pid, libc::SIGKILL);
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
-                libc::close(alive_pipe[1]);
             }
             return Err(std::io::Error::other(
-                "could not start editor resume watchdog",
+                "could not start editor job supervisor",
             ));
         }
         Ok(Self {
             pid,
-            alive: alive_pipe[1],
+            control: control[1],
+            response: response[0],
         })
     }
+
+    fn stop_and_wait(&self) -> std::io::Result<()> {
+        let command = 1u8;
+        if unsafe { libc::write(self.control, (&command as *const u8).cast(), 1) } != 1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if read_editor_supervisor_byte(self.response)? != 1 {
+            return Err(std::io::Error::other("editor job supervisor stopped"));
+        }
+        Ok(())
+    }
 }
+
 #[cfg(unix)]
-impl Drop for EditorResumeWatchdog {
+fn read_editor_supervisor_byte(fd: std::os::fd::RawFd) -> std::io::Result<u8> {
+    let mut byte = 0u8;
+    loop {
+        let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if n == 1 {
+            return Ok(byte);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "editor job supervisor stopped",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EditorJobSupervisor {
     fn drop(&mut self) {
         unsafe {
-            libc::close(self.alive);
+            libc::close(self.control);
+            libc::close(self.response);
             libc::kill(self.pid, libc::SIGKILL);
             while libc::waitpid(self.pid, std::ptr::null_mut(), 0) < 0
                 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
@@ -7465,6 +7500,7 @@ impl EditorForeground {
         if parent_group <= 0
             || parent_group == group
             || session <= 0
+            || group == session
             || parent_session != session
             || self.previous != group
         {
@@ -7485,7 +7521,7 @@ impl EditorForeground {
         }
         // A parent in the same session may still lack job control. If no shell
         // takes the terminal, wake the stopped job instead of hanging forever.
-        let watchdog = match EditorResumeWatchdog::start(fd, group) {
+        let watchdog = match EditorJobSupervisor::start(fd, group) {
             Ok(watchdog) => watchdog,
             Err(_) => {
                 if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
@@ -7500,15 +7536,9 @@ impl EditorForeground {
                 return Ok(());
             }
         };
-        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // A shell may send SIGCONT without fg; stay stopped until foregrounded.
-        while unsafe { libc::tcgetpgrp(fd) } != group {
-            if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
+        // The helper stops the whole Pi group. Blocking for its response keeps
+        // this thread from running past an asynchronously delivered SIGSTOP.
+        watchdog.stop_and_wait()?;
         drop(watchdog);
         // Restore the editor's terminal state before handing input back.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
@@ -8014,6 +8044,7 @@ mod tests {
         const SUPERVISOR: &str = "PI_RS_EDITOR_TEST_SUPERVISOR";
         let managed = suspend && !shared_group && !test_name.contains("without_supervisor");
         let plain_launcher = test_name.contains("without_job_control_launcher");
+        let worker_case = test_name.contains("pauses_owned_worker");
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -8036,6 +8067,16 @@ mod tests {
             );
             assert!(libc::WIFSTOPPED(status));
             println!("SUPERVISOR_SAW_STOP");
+            if worker_case {
+                let marker = std::path::PathBuf::from(&program).with_extension("worker");
+                let before = std::fs::read(&marker).unwrap().len();
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(
+                    std::fs::read(&marker).unwrap().len(),
+                    before,
+                    "worker advanced while Pi was stopped"
+                );
+            }
             if test_name.contains("supervisor_retains_terminal") {
                 let shell_group = unsafe { libc::getpgrp() };
                 super::set_foreground(0, shell_group).unwrap();
@@ -8083,6 +8124,25 @@ mod tests {
                 assert!(Instant::now() < deadline, "editor did not start");
                 std::thread::sleep(Duration::from_millis(5));
             }
+            let worker_marker = std::path::PathBuf::from(&program).with_extension("worker");
+            let mut test_worker = if worker_case {
+                let worker = std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "while :; do printf x >> \"$1\"; sleep 0.05; done",
+                        "worker",
+                    ])
+                    .arg(&worker_marker)
+                    .spawn()
+                    .unwrap();
+                while !worker_marker.exists() {
+                    assert!(Instant::now() < deadline, "worker did not start");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Some(worker)
+            } else {
+                None
+            };
             if suspend {
                 assert_eq!(
                     unsafe { libc::tcgetpgrp(0) },
@@ -8120,6 +8180,13 @@ mod tests {
                         let mut resumed: libc::termios = unsafe { std::mem::zeroed() };
                         assert_eq!(unsafe { libc::tcgetattr(0, &mut resumed) }, 0);
                         assert_eq!(resumed.c_lflag & (libc::ECHO | libc::ICANON), 0);
+                        if worker_case {
+                            let before = std::fs::read(&worker_marker).unwrap().len();
+                            while std::fs::read(&worker_marker).unwrap().len() <= before {
+                                assert!(Instant::now() < deadline, "worker did not resume");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
                         println!("EDITOR_RESUMED");
                         announced = true;
                     }
@@ -8131,6 +8198,10 @@ mod tests {
                 }
             } else {
                 editor.cancel();
+            }
+            if let Some(worker) = &mut test_worker {
+                let _ = worker.kill();
+                let _ = worker.wait();
             }
             editor
                 ._foreground
@@ -8345,6 +8416,16 @@ mod tests {
     fn editor_suspend_without_supervisor_resumes_without_sigcont() {
         editor_pty_regression(
             "interactive::tests::editor_suspend_without_supervisor_resumes_without_sigcont",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_editor_pauses_owned_worker_until_resume() {
+        editor_pty_regression(
+            "interactive::tests::stopped_editor_pauses_owned_worker_until_resume",
             true,
             false,
         );

@@ -2741,6 +2741,12 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let mut child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_pi"))
             .env("PI_RS_HOME", root.path())
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
             .args([
                 "--workspace",
                 root.path().to_str().unwrap(),

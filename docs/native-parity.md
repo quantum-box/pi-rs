@@ -4141,8 +4141,9 @@ external-editor action and configured keybinding. Editor failures remain
 visible in the dialog without submitting or losing its draft; Escape cancels
 the dialog, and extension cancellation still removes the correlated request.
 If the extension worker exits during editing, its editor is stopped and the
-terminal is restored. On Unix, suspending the external editor suspends the
-parent job and resumes the editor with its terminal settings. When the shell
+terminal is restored. On Unix, suspending the external editor stops Pi's
+process group, including its workers, then resumes the group and editor with
+its terminal settings. When the shell
 shares Pi's process group without job control, or Pi's parent is in a different
 session, the editor resumes immediately instead of suspending a job that cannot
 be foregrounded. For a same-session launcher without job control, a bounded
