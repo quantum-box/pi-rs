@@ -1671,27 +1671,14 @@ mod tests {
             assert_eq!(provider.adapter(), Adapter::Anthropic);
             assert_eq!(profiles.endpoint(&provider), endpoint);
             assert_eq!(builtin_chat::find(name).unwrap().env(), variable);
-            assert_eq!(profiles.model_ids(&provider).len(), 4);
+            assert_eq!(profiles.model_ids(&provider).len(), 2);
             for id in ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"] {
-                let model = profiles.model(&provider, id).unwrap();
-                assert_eq!(model.reasoning, Some(true));
-                assert_eq!(model.adaptive_thinking(), Some(false));
-                assert_eq!(model.supports_images(), Some(false));
-                assert_eq!(model.context_window, Some(204800));
-                assert_eq!(model.max_tokens, Some(131072));
-                assert_eq!(
-                    model.levels(Adapter::Anthropic).unwrap(),
-                    ["off", "minimal", "low", "medium", "high"]
+                assert!(
+                    !profiles
+                        .model_ids(&provider)
+                        .iter()
+                        .any(|model| model == id)
                 );
-                let mut listed = json!({});
-                model.apply_catalog_metadata(&mut listed);
-                let expected_input = match (name, id) {
-                    ("minimax", "MiniMax-M2.7") => 0.3,
-                    ("minimax", _) => 0.6,
-                    ("minimax-cn", "MiniMax-M2.7") => 0.3137,
-                    _ => 0.6275,
-                };
-                assert_eq!(listed["cost"]["input"], expected_input);
             }
             let m3 = profiles.model(&provider, "MiniMax-M3").unwrap();
             assert_eq!(m3.levels(Adapter::Anthropic).unwrap(), ["off", "high"]);

@@ -957,18 +957,8 @@ impl Model for Anthropic {
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
-        let mut outbound = self.authenticate(self.client.post(self.endpoint.clone()).json(&body));
-        if matches!(self.provider.as_ref(), "minimax" | "minimax-cn")
-            && matches!(
-                requested_model.as_str(),
-                "MiniMax-M2.7" | "MiniMax-M2.7-highspeed"
-            )
-            && body["thinking"]["type"] == "enabled"
-            && !self.headers.contains_key("anthropic-beta")
-        {
-            outbound = outbound.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-        }
-        let response = send(outbound).await?;
+        let response =
+            send(self.authenticate(self.client.post(self.endpoint.clone()).json(&body))).await?;
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)

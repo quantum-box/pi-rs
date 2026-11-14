@@ -194,23 +194,23 @@ is underlined and destinations appear in parentheses only when they differ from
 the visible URL or email address. OSC 8 hyperlink capability remains open.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
-`MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled model
-catalogs include M3 and M3.1-Flash reasoning, image, context and pricing
-metadata; the same Anthropic-compatible streaming adapter is used for both
-regions. MiniMax M2.7 and M2.7-highspeed use the pinned text-only catalog and
-budgeted thinking levels, including Pi's interleaved-thinking header. Native
-thinking budgets stay within the agent's configured output-token ceiling. Pi's
-simple API treats its requested maximum as an answer budget and adds thinking
-tokens (bounded by model and context capacity). In pi-rs the adapter receives
-only the hard ceiling: the smaller of the per-request limit and remaining run
-budget, possibly lowered by a context extension. Expanding it would exceed a
-host or extension limit; there is no separate answer budget and headroom to
-expand. Raising both `--max-output-tokens` and `--output-budget` permits a larger
-thinking budget within those limits.
+`MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
+include M3 and M3.1-Flash. Pi also lists M2.7 on these endpoints, but MiniMax's
+current regional Messages and standard API references list only M3 and
+M3.1-Flash as supported, so the direct M2.7 entries are withheld until a
+supported route can be established.
+
 Budgeted Messages requests use Pi's default level budgets or the selected
-`thinkingBudgets` override and summarized thinking display, subject to that
-native ceiling. Overrides must be integers of at least 1,024 tokens, as required
-for Anthropic budgeted thinking; only the selected level is validated.
+`thinkingBudgets` override and summarized thinking display, subject to the
+native output ceiling. Overrides must be integers of at least 1,024 tokens;
+only the selected level is validated. Pi's simple API treats its requested
+maximum as an answer budget and adds thinking tokens (bounded by model and
+context capacity). In pi-rs the adapter receives only the hard ceiling: the
+smaller of the per-request limit and remaining run budget, possibly lowered by
+a context extension. Expanding it would exceed a host or extension limit;
+there is no separate answer budget and headroom to expand. Raising both
+`--max-output-tokens` and `--output-budget` permits a larger thinking budget
+within those limits.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable

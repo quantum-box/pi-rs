@@ -847,26 +847,19 @@ fn minimax_regional_providers_use_the_messages_adapter() {
 }
 
 #[test]
-fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
+fn configured_messages_thinking_budget_respects_native_output_limits() {
     for (provider, model, level, preferred, request_limit, run_limit) in [
         (
-            "minimax",
-            "MiniMax-M2.7",
+            "anthropic",
+            "fixture-budgeted",
             "low",
             1536_u64,
             2048_u32,
             8192_u32,
         ),
-        (
-            "minimax-cn",
-            "MiniMax-M2.7-highspeed",
-            "high",
-            3456,
-            10000,
-            3000,
-        ),
-        ("minimax", "MiniMax-M2.7", "high", 3456, 10000, 10000),
-        ("minimax", "MiniMax-M2.7", "off", 0, 2048, 8192),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 3000),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 10000),
+        ("anthropic", "fixture-budgeted", "off", 0, 2048, 8192),
     ] {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -874,6 +867,7 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
             r#"{"thinkingBudgets":{"low":1536,"high":3456}}"#,
         )
         .unwrap();
+        std::fs::write(root.path().join("models.json"), json!({"providers":{"anthropic":{"models":[{"id":"fixture-budgeted","reasoning":true,"compat":{"forceAdaptiveThinking":false}}]}}}).to_string()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!(
@@ -897,11 +891,7 @@ fn minimax_m27_regional_models_use_budgeted_thinking_without_catalog_probe() {
                 }
                 headers.push_str(&line);
             }
-            assert!(headers.contains("authorization: bearer fixture"));
-            assert_eq!(
-                headers.contains("anthropic-beta: interleaved-thinking-2025-05-14"),
-                level != "off"
-            );
+            assert!(headers.contains("x-api-key: fixture"));
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
