@@ -178,7 +178,9 @@ fn repeated_process_deaths_exhaust_restart_limit_without_losing_checkpoint() {
             assert_eq!(task.state(), &TaskState::Ready);
             assert_eq!(task.restarts(), attempt + 1);
         } else {
-            assert!(matches!(task.state(), TaskState::Failed(reason) if reason.contains("restart limit")));
+            assert!(
+                matches!(task.state(), TaskState::Failed(reason) if reason.contains("restart limit"))
+            );
             assert!(!scheduler.tick(0).unwrap());
         }
     }
