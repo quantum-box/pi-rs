@@ -107,6 +107,8 @@ struct Terminal {
     color_queries: std::collections::VecDeque<ColorQuery>,
     #[cfg(any(unix, windows))]
     color_requery: bool,
+    #[cfg(any(unix, windows))]
+    completed_color_markers: usize,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -138,6 +140,8 @@ impl Terminal {
             color_queries: std::collections::VecDeque::new(),
             #[cfg(any(unix, windows))]
             color_requery: false,
+            #[cfg(any(unix, windows))]
+            completed_color_markers: 0,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -192,9 +196,14 @@ impl Terminal {
     }
     #[cfg(any(unix, windows))]
     fn query_terminal_colors(&mut self) -> Result<()> {
-        // Serialize queries so that replies remain attributable when DA1 is absent.
-        if !self.color_queries.is_empty() {
+        // Never overlap an incomplete query with a new request; OSC replies
+        // contain no query identifier. A complete query may precede its DA1.
+        if let Some(query) = self.color_queries.front() {
             self.color_requery = true;
+            if query.replied == (1 << 18) - 1 {
+                self.completed_color_markers = self.completed_color_markers.saturating_add(1);
+                return self.finish_color_query();
+            }
             return Ok(());
         }
         crate::ui::theme::begin_terminal_palette_query();
@@ -221,6 +230,10 @@ impl Terminal {
         let flag = 1_u32 << target;
         let fresh = query.replied & flag == 0;
         query.replied |= flag;
+        if query.replied == (1 << 18) - 1 && self.color_requery {
+            self.completed_color_markers = self.completed_color_markers.saturating_add(1);
+            self.finish_color_query()?;
+        }
         Ok(is_latest && fresh)
     }
 
@@ -235,7 +248,12 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn receive_color_marker(&mut self) -> Result<()> {
-        self.finish_color_query()
+        if self.completed_color_markers > 0 {
+            self.completed_color_markers -= 1;
+            Ok(())
+        } else {
+            self.finish_color_query()
+        }
     }
 
     #[cfg(any(unix, windows))]
@@ -245,8 +263,8 @@ impl Terminal {
             && !query.quarantined
             && query.started.elapsed() >= Duration::from_secs(2)
         {
-            // OSC replies have no query identifier. Do not issue the next
-            // request until DA1 delimits this one, even after a timeout.
+            // An incomplete query remains isolated until DA1 or all targets
+            // have replied; a timeout alone cannot identify late OSC replies.
             query.quarantined = true;
         }
         Ok(())
@@ -9209,6 +9227,7 @@ mod tests {
                 quarantined: false,
             }]),
             color_requery: true,
+            completed_color_markers: 0,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Kitty,
         });
@@ -9224,10 +9243,13 @@ mod tests {
         }
         assert!(accepted.is_empty());
         assert!(!terminal.accepts_color_reply(16).unwrap());
-        assert!(!terminal.accepts_color_reply(17).unwrap());
         assert!(terminal.color_requery);
-        // Even all old replies cannot start the queued query without its marker.
+        // Seventeen replies are insufficient to start the queued query.
         assert!(terminal.color_queries[0].quarantined);
+        assert!(!terminal.accepts_color_reply(17).unwrap());
+        assert!(!terminal.color_requery);
+        assert_eq!(terminal.completed_color_markers, 1);
+        // The old marker must not finish the newly issued query.
         terminal.receive_color_marker().unwrap();
         assert_eq!(terminal.color_queries.len(), 1);
         assert!(!terminal.color_requery);
@@ -9240,6 +9262,62 @@ mod tests {
         assert!(accepted.iter().all(|(_, source)| *source == "new"));
         terminal.receive_color_marker().unwrap();
         assert!(terminal.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn complete_color_query_allows_requery_without_da1() {
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: (1 << 18) - 1,
+                quarantined: false,
+            }]),
+            color_requery: false,
+            completed_color_markers: 0,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Kitty,
+        });
+        terminal.query_terminal_colors().unwrap();
+        assert_eq!(terminal.completed_color_markers, 1);
+        assert_eq!(terminal.color_queries[0].replied, 0);
+        // A late marker for the completed request cannot end the new query.
+        terminal.receive_color_marker().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        for index in 0..18 {
+            assert!(terminal.accepts_color_reply(index).unwrap());
+        }
+        terminal.receive_color_marker().unwrap();
+        assert!(terminal.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_old_color_marker_does_not_end_incomplete_new_query() {
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: (1 << 18) - 1,
+                quarantined: false,
+            }]),
+            color_requery: false,
+            completed_color_markers: 0,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Kitty,
+        });
+        terminal.query_terminal_colors().unwrap();
+        assert!(terminal.accepts_color_reply(0).unwrap());
+        // The marker could belong to either request; keep the new query open.
+        terminal.receive_color_marker().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        assert!(!terminal.accepts_color_reply(0).unwrap());
+        assert!(terminal.accepts_color_reply(1).unwrap());
     }
 
     #[test]
