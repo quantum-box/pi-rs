@@ -948,6 +948,11 @@ also report their source path. Empty-description checks use ECMAScript whitespac
 semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
 reader gating and custom-prompt precedence.
 
+Skill and prompt-template files decode malformed UTF-8 with replacement, as Pi
+does, so an invalid byte does not hide an otherwise usable resource. The native
+64 KiB resource limit and existing resource trust rules remain in force; source
+files are not rewritten. Tests cover discovery, invocation and the size limit.
+
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
