@@ -414,3 +414,205 @@ async fn tool_handoff_places_steer_in_new_context_before_followup() {
     model.release.add_permits(1);
     s.wait(id).await.unwrap();
 }
+
+struct BlockAdapter {
+    model: Arc<TestModel>,
+    requests: Mutex<Vec<pi_rs_durable::model::DurableRequest>>,
+}
+#[async_trait]
+impl pi_rs_durable::model::ProviderAdapter for BlockAdapter {
+    fn id(&self) -> &str {
+        "block-reset-test/v1"
+    }
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+    ) -> Result<serde_json::Value, Error> {
+        Ok(serde_json::json!({}))
+    }
+    fn validate(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: &serde_json::Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn prepare_durable(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &pi_rs_durable::model::DurableRequest,
+    ) -> Result<serde_json::Value, Error> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(serde_json::json!({}))
+    }
+    fn validate_durable(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &pi_rs_durable::model::DurableRequest,
+        _: &serde_json::Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &ModelRequest,
+        _: serde_json::Value,
+    ) -> Result<ModelStream, Error> {
+        self.model.stream(request.clone()).await
+    }
+}
+
+#[tokio::test]
+async fn block_handoff_and_queued_reset_preserve_history_and_clear_provider_blocks() {
+    use pi_rs_durable::{extension::Registry, runtime::Harness};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let tool_adapter = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
+        HandoffTool(tool.clone()),
+    ));
+    let mut options = opts(model.clone(), tool.clone());
+    options.tools = vec![tool_adapter.register(ReplayPolicy::Safe)];
+    let provider = Arc::new(BlockAdapter {
+        model: model.clone(),
+        requests: Mutex::new(vec![]),
+    });
+    let mut h = Harness::open_paused(&path, options.clone()).unwrap();
+    h.install_provider_adapter(provider.clone()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    let blocks = vec![
+        serde_json::json!({"type":"text", "text":"private"}),
+        serde_json::json!({"type":"image", "data":"aGk=", "mimeType":"image/png"}),
+    ];
+    let occurrence = h.append_user_blocks(id, blocks.clone()).unwrap();
+    drop(h);
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options.clone(),
+        Registry::default(),
+        provider.clone(),
+    )
+    .unwrap();
+    let initial = s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    assert_eq!(
+        provider.requests.lock().unwrap()[0].blocks[&1].message_id,
+        occurrence
+    );
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    let reset = s.reset(id, Some("queued reset".into())).unwrap();
+    s.submit_with_mode(id, None, "steer".into(), InputMode::Steer)
+        .unwrap();
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1].blocks.is_empty());
+        assert_eq!(users(&requests[1].request.messages), ["queued reset", "steer"]);
+    }
+    let c = s.conversation(id).unwrap();
+    assert!(c.content_blocks.is_empty());
+    assert_eq!(
+        c.resets
+            .iter()
+            .map(|r| r.handoff.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("tool handoff"), Some("queued reset")]
+    );
+    assert_eq!(c.resets[1].id, reset);
+    assert!(matches!(
+        c.submissions
+            .iter()
+            .find(|x| x.id == initial)
+            .unwrap()
+            .status,
+        Status::Unanswered { .. }
+    ));
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let historical = s.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(
+        s.conversation(historical).unwrap().content_blocks[&0].blocks,
+        blocks
+    );
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, options).unwrap();
+    assert!(h.conversation(id).unwrap().content_blocks.is_empty());
+    assert_eq!(
+        h.conversation(historical).unwrap().content_blocks[&0].message_id,
+        occurrence
+    );
+    assert_eq!(
+        h.conversation(historical).unwrap().content_blocks[&0].blocks,
+        blocks
+    );
+}
+
+#[tokio::test]
+async fn block_reset_places_queued_text_atomically_after_new_context() {
+    use pi_rs_durable::{extension::Registry, runtime::Harness};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (model, tool) = setup();
+    let options = opts(model.clone(), tool.clone());
+    let provider = Arc::new(BlockAdapter {
+        model: model.clone(),
+        requests: Mutex::new(vec![]),
+    });
+    let mut h = Harness::open_paused(&path, options.clone()).unwrap();
+    h.install_provider_adapter(provider.clone()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    let occurrence = h
+        .append_user_blocks(id, vec![serde_json::json!({"type":"text", "text":"old"})])
+        .unwrap();
+    drop(h);
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options,
+        Registry::default(),
+        provider.clone(),
+    )
+    .unwrap();
+    let initial = s.submit(id, None, "initial".into()).unwrap();
+    acquire(&model.started).await;
+    model.release.add_permits(1);
+    acquire(&tool.started).await;
+    let marker = s.reset(id, Some("reset note".into())).unwrap();
+    s.submit_with_mode(id, None, "queued steer".into(), InputMode::Steer)
+        .unwrap();
+    tool.release.add_permits(1);
+    acquire(&model.started).await;
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1].blocks.is_empty());
+        assert_eq!(users(&requests[1].request.messages), ["reset note", "queued steer"]);
+    }
+    let c = s.conversation(id).unwrap();
+    assert!(c.content_blocks.is_empty());
+    assert_eq!(c.resets.last().unwrap().id, marker);
+    assert!(matches!(
+        c.submissions
+            .iter()
+            .find(|x| x.id == initial)
+            .unwrap()
+            .status,
+        Status::Unanswered { .. }
+    ));
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let historical = s.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(
+        s.conversation(historical).unwrap().content_blocks[&0].message_id,
+        occurrence
+    );
+    s.shutdown().await.unwrap();
+}

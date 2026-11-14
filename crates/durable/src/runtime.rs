@@ -613,6 +613,9 @@ pub struct Conversation {
     /// Reconstructed from the transcript; never serialized in the snapshot.
     #[serde(skip)]
     pub content_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    /// In-memory proof of a reset placed in the current transaction; never persisted.
+    #[serde(skip)]
+    block_reset_proof: Option<BlockResetProof>,
     /// Identity of the active context since its last reset or compaction.
     /// Older persisted conversations acquire one at the next compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -663,6 +666,16 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nested_resume: Option<NestedResume>,
     phase: Phase,
+}
+
+#[derive(Clone, Debug)]
+struct BlockResetProof {
+    previous_context: Option<Uuid>,
+    previous_resets: Vec<crate::reset::Reset>,
+    previous_messages: Vec<Message>,
+    previous_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    placed_resets: Vec<crate::reset::Reset>,
+    messages: Vec<Message>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2098,14 +2111,30 @@ impl Harness {
         let create = old.and_then(|s| s.transcript.as_ref()).is_none();
         if let Some(previous) = old
             && !previous.content_blocks.is_empty()
-            && (!state.messages.starts_with(&previous.messages)
-                || previous
+        {
+            let unchanged = state.messages.starts_with(&previous.messages)
+                && previous
                     .content_blocks
                     .iter()
-                    .any(|(i, b)| state.content_blocks.get(i) != Some(b))
-                || previous.context_generation != state.context_generation)
-        {
-            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                    .all(|(i, b)| state.content_blocks.get(i) == Some(b))
+                && previous.context_generation == state.context_generation
+                && state.resets == previous.resets;
+            let reset = state.block_reset_proof.as_ref().is_some_and(|proof| {
+                proof.previous_context == previous.context_generation
+                    && proof.previous_resets == previous.resets
+                    && proof.previous_messages == previous.messages
+                    && proof.previous_blocks == previous.content_blocks
+                    && !proof.placed_resets.is_empty()
+                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
+                    && state.resets.starts_with(&proof.previous_resets)
+                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
+                    && state.context_generation != previous.context_generation
+                    && state.content_blocks.is_empty()
+                    && state.messages == proof.messages
+            });
+            if !unchanged && !reset {
+                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+            }
         }
         let old_len = old.map_or(0, |s| s.messages.len());
         let mut block_ids = std::collections::HashSet::new();
@@ -2725,6 +2754,7 @@ impl Harness {
             model_tools: None,
             messages: vec![],
             content_blocks: Default::default(),
+            block_reset_proof: None,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
@@ -2994,6 +3024,7 @@ impl Harness {
                 .unwrap_or_default(),
             messages: point.messages,
             content_blocks: blocks,
+            block_reset_proof: None,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: point
                 .documents
@@ -4463,9 +4494,6 @@ impl Harness {
         let marker = crate::reset::Reset::new(Uuid::new_v4(), handoff);
         loop {
             let (mut state, version) = self.load(id)?;
-            if !state.content_blocks.is_empty() {
-                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-            }
             if matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                 && state.active.is_none()
                 && state.pending_resets.is_empty()
@@ -4560,7 +4588,7 @@ impl Harness {
         Ok(page)
     }
     /// Append an ordered user block occurrence to an idle conversation.
-    /// Forking, reset and compaction of block-bearing history are not supported yet.
+    /// Forks and resets preserve earlier blocks; compaction remains unsupported.
     pub fn append_user_blocks(
         &mut self,
         id: Uuid,
@@ -6856,10 +6884,6 @@ impl Harness {
                     else {
                         return Ok(());
                     };
-                    if children.is_empty() && reject_block_handoff(&mut c) {
-                        self.save(&c, Expected::Version(version))?;
-                        continue;
-                    }
                     c.phase = if children.is_empty() {
                         if !calls.is_empty()
                             && c.round_terminates.len() == calls.len()
@@ -6946,10 +6970,6 @@ impl Harness {
                         {
                             terminate = true;
                         }
-                    }
-                    if turns.is_some() && reject_block_handoff(&mut c) {
-                        self.save(&c, Expected::Version(version))?;
-                        continue;
                     }
                     c.phase = if terminate
                         || (turns.is_some()
@@ -9849,17 +9869,6 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         }))
 }
 
-fn reject_block_handoff(c: &mut Conversation) -> bool {
-    if c.content_blocks.is_empty() || !c.round_handoffs.iter().any(Option::is_some) {
-        return false;
-    }
-    c.round_handoffs.clear();
-    c.round_added_tools.clear();
-    c.round_terminates.clear();
-    finish_failure(c, "tool handoff cannot reset ordered content blocks".into());
-    true
-}
-
 fn place_round_handoff(c: &mut Conversation) {
     if let Some(allowed) = &mut c.allowed_tools {
         for name in c.round_added_tools.iter().flatten() {
@@ -9883,6 +9892,19 @@ fn place_round_handoff(c: &mut Conversation) {
 }
 
 fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
+    if !c.content_blocks.is_empty() || c.block_reset_proof.is_some() {
+        let proof = c.block_reset_proof.get_or_insert_with(|| BlockResetProof {
+            previous_context: c.context_generation,
+            previous_resets: c.resets.clone(),
+            previous_messages: c.messages.clone(),
+            previous_blocks: c.content_blocks.clone(),
+            placed_resets: Vec::new(),
+            messages: Vec::new(),
+        });
+        proof.placed_resets.push(marker.clone());
+        proof.messages = marker.message().into_iter().collect();
+    }
+    c.content_blocks.clear();
     c.context_generation = Some(Uuid::new_v4());
     c.occurrence_epoch_proven = true;
     c.messages.clear();
@@ -9958,9 +9980,13 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
         placed = true;
         submission.status = Status::Running;
         c.active.get_or_insert(submission.id);
-        c.messages.push(Message::User {
+        let message = Message::User {
             content: submission.content.clone(),
-        });
+        };
+        c.messages.push(message.clone());
+        if let Some(proof) = &mut c.block_reset_proof {
+            proof.messages.push(message);
+        }
     }
     placed
 }
@@ -10212,13 +10238,8 @@ mod scheduler_tests {
         let (mut changed, version) = h.load(id).unwrap();
         changed.phase = Phase::ModelReady { turns: 0 };
         h.save(&changed, Expected::Version(version)).unwrap();
-        assert!(matches!(
-            h.reset(id, None),
-            Err(Error::Transcript(
-                crate::transcript::Error::UnsupportedContentBlocks
-            ))
-        ));
-        assert!(h.conversation(id).unwrap().pending_resets.is_empty());
+        let reset = h.reset(id, None).unwrap();
+        assert_eq!(h.conversation(id).unwrap().pending_resets[0].id, reset);
         let (mut changed, version) = h.load(id).unwrap();
         changed.messages.clear();
         assert!(matches!(
@@ -10265,6 +10286,226 @@ mod scheduler_tests {
             page.records.last().unwrap().value["content_blocks"]["0"]["message_id"],
             json!(occurrence)
         );
+    }
+
+    #[test]
+    fn block_reset_preserves_historical_occurrences_across_reopen() {
+        use serde_json::json;
+        for handoff in [None, Some(""), Some("summary")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = placement_model();
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let blocks = vec![
+                json!({"type":"text", "text":"before"}),
+                json!({"type":"image", "data":"aGk=", "mimeType":"image/png"}),
+                json!({"type":"text", "text":"after"}),
+            ];
+            let occurrence = h.append_user_blocks(id, blocks.clone()).unwrap();
+            let before = h.conversation(id).unwrap();
+            let histories = h
+                .resolved_occurrences(id, before.transcript.clone().unwrap())
+                .unwrap();
+            let marker = h.reset(id, handoff.map(str::to_owned)).unwrap();
+            let current = h.conversation(id).unwrap();
+            assert!(current.content_blocks.is_empty());
+            assert_eq!(current.resets.last().unwrap().id, marker);
+            assert_eq!(
+                current.messages,
+                handoff
+                    .map(|text| Message::User {
+                        content: text.into()
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            let old_fork = h.fork_by_entry_id(id, occurrence).unwrap();
+            let old = h.conversation(old_fork).unwrap();
+            assert_eq!(old.content_blocks[&0].blocks, blocks);
+            assert_eq!(
+                h.resolved_occurrences(old_fork, old.transcript.unwrap())
+                    .unwrap(),
+                histories
+            );
+            drop(h);
+            let mut h = Harness::open_paused(&path, options(model)).unwrap();
+            let current = h.conversation(id).unwrap();
+            assert!(current.content_blocks.is_empty());
+            assert_eq!(current.resets.last().unwrap().id, marker);
+            let recovered = h.fork_by_entry_id(id, occurrence).unwrap();
+            let recovered = h.conversation(recovered).unwrap();
+            assert_eq!(recovered.content_blocks[&0].message_id, occurrence);
+            assert_eq!(recovered.content_blocks[&0].blocks, blocks);
+            assert_eq!(
+                h.resolved_occurrences(recovered.id, recovered.transcript.unwrap())
+                    .unwrap(),
+                histories
+            );
+            let next = h
+                .append_user_blocks(id, vec![json!({"type":"text", "text":"new context"})])
+                .unwrap();
+            let current = h.conversation(id).unwrap();
+            let index = usize::from(handoff.is_some());
+            assert_eq!(current.content_blocks[&index].message_id, next);
+            assert_ne!(next, occurrence);
+            let active = h
+                .resolved_occurrences(id, current.transcript.unwrap())
+                .unwrap();
+            assert_eq!(active[index].1.as_ref().unwrap().id, next);
+        }
+    }
+
+    #[test]
+    fn block_reset_and_append_race_conflicts_without_losing_history() {
+        use serde_json::json;
+        for reset_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = placement_model();
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let first = h
+                .append_user_blocks(id, vec![json!({"type":"text", "text":"first"})])
+                .unwrap();
+            let (mut planned, version) = h.load(id).unwrap();
+            let mut added = None;
+            if reset_first {
+                let next = Uuid::new_v4();
+                let index = planned.messages.len();
+                planned.messages.push(Message::User {
+                    content: String::new(),
+                });
+                planned.content_blocks.insert(
+                    index,
+                    crate::transcript::MessageContentBlocks {
+                        message_id: next,
+                        blocks: vec![json!({"type":"text", "text":"uncommitted"})],
+                    },
+                );
+                added = Some(next);
+            } else {
+                place_reset(
+                    &mut planned,
+                    crate::reset::Reset::new(Uuid::new_v4(), Some("stale".into())),
+                );
+            }
+            let stale = h
+                .prepare_save(&planned, Expected::Version(version))
+                .unwrap();
+            if reset_first {
+                h.reset(id, Some("winner".into())).unwrap();
+            } else {
+                added = Some(
+                    h.append_user_blocks(id, vec![json!({"type":"text", "text":"second"})])
+                        .unwrap(),
+                );
+            }
+            assert!(matches!(
+                h.commit_conversation_save(stale),
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+            ));
+            if !reset_first {
+                h.reset(id, Some("winner".into())).unwrap();
+            }
+            drop(h);
+            let mut h = Harness::open_paused(&path, options(model)).unwrap();
+            let c = h.conversation(id).unwrap();
+            assert!(c.content_blocks.is_empty());
+            assert_eq!(
+                c.messages,
+                vec![Message::User {
+                    content: "winner".into()
+                }]
+            );
+            let fork = h.fork_by_entry_id(id, first).unwrap();
+            assert_eq!(
+                h.conversation(fork).unwrap().content_blocks[&0].message_id,
+                first
+            );
+            if reset_first {
+                assert!(h.fork_by_entry_id(id, added.unwrap()).is_err());
+            } else {
+                let fork = h.fork_by_entry_id(id, added.unwrap()).unwrap();
+                assert_eq!(h.conversation(fork).unwrap().content_blocks.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn block_reset_rejects_unproven_replacements_and_extra_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.append_user_blocks(id, vec![]).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        place_reset(&mut state, crate::reset::Reset::new(Uuid::new_v4(), None));
+        state.messages.push(Message::User {
+            content: "unproven".into(),
+        });
+        assert!(matches!(
+            h.save(&state, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages.clear();
+        state.content_blocks.clear();
+        state.context_generation = Some(Uuid::new_v4());
+        state
+            .resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+        assert!(matches!(
+            h.save(&state, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut state, version) = h.load(id).unwrap();
+        state
+            .content_blocks
+            .get_mut(&0)
+            .unwrap()
+            .blocks
+            .push(serde_json::json!({"type":"text", "text":"forged"}));
+        place_reset(&mut state, crate::reset::Reset::new(Uuid::new_v4(), None));
+        assert!(matches!(
+            h.save(&state, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut state, version) = h.load(id).unwrap();
+        state
+            .resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+        assert!(matches!(
+            h.save(&state, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let (mut state, version) = h.load(id).unwrap();
+        place_reset(&mut state, crate::reset::Reset::new(Uuid::new_v4(), None));
+        state.messages.push(Message::User {
+            content: String::new(),
+        });
+        state.content_blocks.insert(
+            0,
+            crate::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![],
+            },
+        );
+        assert!(matches!(
+            h.save(&state, Expected::Version(version)),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        assert_eq!(h.conversation(id).unwrap().content_blocks.len(), 1);
     }
 
     #[test]
@@ -10321,7 +10562,7 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
-    async fn block_history_tool_handoff_fails_and_recovers() {
+    async fn block_history_tool_handoff_resets_and_preserves_history() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let model = placement_model();
@@ -10338,15 +10579,26 @@ mod scheduler_tests {
             operation_id: Uuid::new_v4(),
         };
         h.save(&state, Expected::Version(version)).unwrap();
-        h.resume_conversation(id, &CancellationToken::new())
-            .await
-            .unwrap();
+        model.release.add_permits(1);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.resume_conversation(id, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(h);
-        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
         let state = h.conversation(id).unwrap();
-        assert!(matches!(state.phase, Phase::FailedIdle));
+        assert!(matches!(state.phase, Phase::Idle));
         assert!(state.round_handoffs.is_empty());
-        assert_eq!(state.content_blocks[&0].message_id, occurrence);
+        assert!(state.content_blocks.is_empty());
+        assert!(matches!(&state.messages[0], Message::User { content } if content == "handoff"));
+        let historical = h.fork_by_entry_id(id, occurrence).unwrap();
+        assert_eq!(
+            h.conversation(historical).unwrap().content_blocks[&0].message_id,
+            occurrence
+        );
     }
 
     #[test]
@@ -11651,6 +11903,7 @@ mod scheduler_tests {
             model_tools: None,
             messages: vec![],
             content_blocks: Default::default(),
+            block_reset_proof: None,
             context_generation: Some(Uuid::new_v4()),
             occurrence_epoch_proven: true,
             transcript: None,
