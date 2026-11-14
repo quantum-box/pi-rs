@@ -181,6 +181,8 @@ struct ControlState {
 
 struct SessionSnapshot {
     records: Vec<pi_rs::Record>,
+    share_records: Vec<Arc<pi_rs::Record>>,
+    revision: u64,
     entries: Option<super::rpc_entries::Cursor>,
     share_base: Option<super::sessions::ShareContext>,
     share_active: Option<super::sessions::ShareContext>,
@@ -193,8 +195,11 @@ impl SessionSnapshot {
         if let Some(cursor) = &mut entries {
             cursor.advance(&records);
         }
+        let share_records = records.iter().cloned().map(Arc::new).collect();
         Self {
             records,
+            share_records,
+            revision: 0,
             entries,
             share_base: None,
             share_active: None,
@@ -202,6 +207,7 @@ impl SessionSnapshot {
         }
     }
 
+    #[cfg(test)]
     fn share_snapshot(&self) -> Result<super::sessions::ShareSnapshot> {
         if self.share_pending {
             return Err(Error::Config(
@@ -231,6 +237,7 @@ impl SessionSnapshot {
     }
 
     fn track_share_event(&mut self, event: &pi_rs::Notification<'_>, summary: &mut bool) {
+        self.revision = self.revision.wrapping_add(1);
         match event {
             pi_rs::Notification::ModelContext {
                 system_prompt,
@@ -271,12 +278,15 @@ impl SessionSnapshot {
     }
 
     fn settle_share_context(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.share_active = None;
         self.share_pending = false;
     }
 
     fn refresh(&mut self, session: &Session) {
+        self.revision = self.revision.wrapping_add(1);
         self.records = session.records().to_vec();
+        self.share_records = self.records.iter().cloned().map(Arc::new).collect();
         if let Some(cursor) = &mut self.entries {
             cursor.advance(&self.records);
         }
@@ -284,6 +294,7 @@ impl SessionSnapshot {
 
     // The disk read may have completed before an in-flight run settled.
     // Only advance this append-only snapshot when every retained record agrees.
+    #[cfg(test)]
     fn refresh_if_extends(&mut self, session: &Session) {
         let current = session.records();
         if self.records.is_empty() || current.len() < self.records.len() {
@@ -298,11 +309,14 @@ impl SessionSnapshot {
     }
 
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
+        self.revision = self.revision.wrapping_add(1);
         if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
             *existing = record.clone();
+            self.share_records[record.id.saturating_sub(1) as usize] = Arc::new(record.clone());
             return Vec::new();
         }
         self.records.push(record.clone());
+        self.share_records.push(Arc::new(record.clone()));
         self.entries
             .as_mut()
             .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
@@ -314,15 +328,99 @@ fn snapshot_for_share(
     snapshot: &Mutex<SessionSnapshot>,
     current: Option<Session>,
 ) -> Result<super::sessions::ShareSnapshot> {
+    snapshot_for_share_with_hook(active, snapshot, current, || {})
+}
+
+fn snapshot_for_share_with_hook(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+    hook: impl FnOnce(),
+) -> Result<super::sessions::ShareSnapshot> {
+    let changed = || Error::Config("Share context changed; try sharing again".into());
+    let (revision, count, base, selected, pending, emit_entries, idle) = {
+        let state = active.lock().expect("worker control");
+        let snapshot = snapshot.lock().expect("session snapshot");
+        (
+            snapshot.revision,
+            snapshot.share_records.len(),
+            snapshot.share_base.clone(),
+            snapshot.share_active.clone(),
+            snapshot.share_pending,
+            snapshot.entries.is_some(),
+            state.token.is_none() && state.queued == 0,
+        )
+    };
+    if pending {
+        return Err(Error::Config(
+            "Model request context is changing; try sharing again".into(),
+        ));
+    }
+    let mut records = Vec::with_capacity(count);
+    while records.len() < count {
+        let snapshot = snapshot.lock().expect("session snapshot");
+        if snapshot.revision != revision {
+            return Err(changed());
+        }
+        let end = (records.len() + 64).min(count);
+        records.extend_from_slice(&snapshot.share_records[records.len()..end]);
+    }
+    hook();
+    let extends = idle && current.as_ref().is_some_and(|current| {
+        !records.is_empty() && current.records().len() >= records.len()
+            && records.iter().zip(current.records()).all(|(previous, next)| {
+                matches!((serde_json::to_vec(previous.as_ref()), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+            })
+    });
+    let prepared = if extends {
+        Some(SessionSnapshot::new(
+            current.as_ref().expect("checked").records().to_vec(),
+            emit_entries,
+        ))
+    } else {
+        None
+    };
+    let session = if extends {
+        current.expect("checked")
+    } else {
+        Session::from_records(
+            records
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
+        )?
+    };
+    let base = base.ok_or_else(|| Error::Config("share context is not ready".into()))?;
+    let context = selected.unwrap_or_else(|| {
+        let (system_prompt, tools) =
+            session.effective_system_context(&base.system_prompt, base.tools);
+        super::sessions::ShareContext {
+            system_prompt,
+            tools,
+        }
+    });
+    let result = super::sessions::ShareSnapshot {
+        session_id: session.session_id(),
+        head: session.head(),
+        context,
+    };
     let state = active.lock().expect("worker control");
     let mut snapshot = snapshot.lock().expect("session snapshot");
-    if state.token.is_none()
-        && state.queued == 0
-        && let Some(current) = current
-    {
-        snapshot.refresh_if_extends(&current);
+    if snapshot.revision != revision || idle != (state.token.is_none() && state.queued == 0) {
+        return Err(changed());
     }
-    snapshot.share_snapshot()
+    let old = prepared.map(|prepared| {
+        snapshot.revision = snapshot.revision.wrapping_add(1);
+        (
+            std::mem::replace(&mut snapshot.records, prepared.records),
+            std::mem::replace(&mut snapshot.share_records, prepared.share_records),
+            std::mem::replace(&mut snapshot.entries, prepared.entries),
+        )
+    });
+    drop(snapshot);
+    drop(state);
+    drop(old);
+    Ok(result)
 }
 
 async fn share_snapshot_background<F>(
@@ -337,20 +435,22 @@ where
     let permit = slots
         .try_acquire_owned()
         .map_err(|_| Error::Config("Share context is already being read".into()))?;
-    tokio::task::spawn_blocking(move || {
-        // A stuck filesystem read retains the sole permit, so repeated shares
-        // cannot exhaust the worker's blocking pool. Active runs already have
-        // a current in-memory snapshot and never need a disk read here.
-        let _permit = permit;
-        let idle = {
-            let state = active.lock().expect("worker control");
-            state.token.is_none() && state.queued == 0
-        };
-        let current = if idle { read() } else { None };
-        snapshot_for_share(&active, &snapshot, current)
-    })
-    .await
-    .map_err(|_| Error::Config("Share context reader stopped".into()))?
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("share-snapshot".into())
+        .spawn(move || {
+            let _permit = permit;
+            let idle = {
+                let state = active.lock().expect("worker control");
+                state.token.is_none() && state.queued == 0
+            };
+            let current = if idle { read() } else { None };
+            let _ = send.send(snapshot_for_share(&active, &snapshot, current));
+        })
+        .map_err(|_| Error::Config("Share context reader could not start".into()))?;
+    receive
+        .await
+        .map_err(|_| Error::Config("Share context reader stopped".into()))?
 }
 
 struct ShellRunner {
@@ -743,6 +843,7 @@ async fn run_worker(
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.share_base = Some(runtime.share_base());
                 snapshot.share_active = None;
+                snapshot.revision = snapshot.revision.wrapping_add(1);
             }
             share_ready.send_replace(true);
             continue;
@@ -1709,6 +1810,102 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn stalled_share_reader_does_not_delay_runtime_shutdown() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let session = Session::with_store(MemoryStore::default()).unwrap();
+                let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
+                    session.records().to_vec(),
+                    false,
+                )));
+                tokio::spawn(share_snapshot_background(
+                    Arc::new(Mutex::new(ControlState::default())),
+                    snapshot,
+                    Arc::new(tokio::sync::Semaphore::new(1)),
+                    move || {
+                        started_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                        None
+                    },
+                ));
+                tokio::task::yield_now().await;
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            });
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        completed.expect("runtime shutdown waited for a stalled reader");
+    }
+
+    #[test]
+    fn share_preparation_does_not_hold_worker_locks_and_rejects_changes() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        });
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let active = active.clone();
+            let snapshot = snapshot.clone();
+            move || {
+                snapshot_for_share_with_hook(&active, &snapshot, None, || {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let mut state = active
+            .try_lock()
+            .expect("control lock held during preparation");
+        let mut worker = snapshot
+            .try_lock()
+            .expect("snapshot lock held during preparation");
+        state.token = Some(CancellationToken::new());
+        session
+            .append_user_with_images("foreground progress".into(), vec![], None)
+            .unwrap();
+        worker.record(session.records().last().unwrap());
+        state.token = None;
+        drop(worker);
+        drop(state);
+        release_tx.send(()).unwrap();
+        assert!(
+            reader
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert_eq!(
+            snapshot.lock().unwrap().records.len(),
+            session.records().len()
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_share_disk_read_does_not_block_worker_progress() {
