@@ -1501,6 +1501,98 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tool_arguments_use_correctly_rounded_decimal_on_wire() {
+        use pi_rs_core::{Message, Model, ModelRequest, ToolCall};
+        use std::io::{BufRead, Read, Write};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "request did not connect"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut socket = std::io::BufReader::new(socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.expect("request content length")];
+            socket.read_exact(&mut body).unwrap();
+            socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            String::from_utf8(body).unwrap()
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let model =
+                super::Anthropic::new(&format!("http://{address}/messages"), "key").unwrap();
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "id".into(),
+                        name: "c".into(),
+                        arguments: r#"{"x":34450847700860466777e-23}"#.into(),
+                    }],
+                    replay: None,
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let _stream = model.stream(request).await.unwrap();
+        });
+        let wire = worker.join().unwrap();
+        assert!(
+            wire.contains(r#""input":{"x":0.00034450847700860464}"#),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn streamed_tool_argument_decimals_are_rounded_before_replay_and_execution() {
+        let call = super::Call {
+            id: "id".into(),
+            name: "capture".into(),
+            raw: serde_json::json!({"type":"tool_use", "id":"id", "name":"capture", "input":{}}),
+            fragments: r#"{"x":34450847700860466777e-23}"#.into(),
+            complete: true,
+        };
+        let (call, replay) = call.finish().unwrap();
+        let execution = pi_rs_core::parse_tool_arguments(&call.arguments).unwrap();
+        let expected = 0.00034450847700860464_f64.to_bits();
+        assert_eq!(execution["x"].as_f64().unwrap().to_bits(), expected);
+        assert_eq!(replay["input"]["x"].as_f64().unwrap().to_bits(), expected);
+    }
+
+    #[test]
     fn rate_limit_response_classification_and_redaction() {
         use std::io::{Read, Write};
         for (status, body, permanent) in [
