@@ -592,3 +592,167 @@ async fn busy_block_summary_places_after_model_progress() {
     ));
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn independent_summary_after_two_block_resets_recovers_and_respects_abort() {
+    use pi_rs_durable::runtime::{InputMode, Status};
+    for abort in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = model(0);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let adapter = Arc::new(BusyBlockAdapter {
+            started: Semaphore::new(0),
+            release: Arc::new(Semaphore::new(0)),
+        });
+        let id;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            h.install_provider_adapter(adapter.clone()).unwrap();
+            h.install_extension(extension(seen.clone())).unwrap();
+            id = h
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 64,
+                })
+                .unwrap();
+            h.select_provider_adapter(id, true).unwrap();
+            h.select_extensions(id, vec!["block-hook".into()]).unwrap();
+            h.append_user_blocks(id, vec![json!({"type":"text","text":"old".repeat(3000)})])
+                .unwrap();
+            h.append_user_blocks(id, vec![json!({"type":"text","text":"keep"})])
+                .unwrap();
+        }
+        let mut s = Scheduler::open_with_summary_recovery(
+            &path,
+            options(model.clone()),
+            registry(seen.clone()),
+            Some(adapter.clone()),
+            provider(),
+        )
+        .unwrap();
+        s.submit(id, None, "active".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), adapter.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let op = Uuid::new_v4();
+        assert!(s.request_busy_independent_compaction(id, op, 1500).unwrap());
+        started(&model).await;
+        let first_blocks = vec![
+            json!({"type":"text","text":"first"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"tail","textSignature":"opaque"}),
+        ];
+        let (first, first_ids) = s
+            .reset_with_blocks(id, Some("first handoff".into()), vec![first_blocks.clone()])
+            .unwrap();
+        let input = s
+            .submit_with_mode(id, None, "between".into(), InputMode::Steer)
+            .unwrap();
+        let second_blocks = vec![json!({"type":"text","text":"second"})];
+        let (second, second_ids) = s
+            .reset_with_blocks(
+                id,
+                Some("second handoff".into()),
+                vec![second_blocks.clone()],
+            )
+            .unwrap();
+        model.release.add_permits(1);
+        assert_eq!(
+            s.wait_independent_compaction(op).await.unwrap(),
+            IndependentCompactionStatus::Running
+        );
+        let checkpoint = serde_json::to_value(s.conversation(id).unwrap()).unwrap();
+        assert_eq!(
+            checkpoint["pending_independent_summary"]["resets_before"],
+            json!([first, second])
+        );
+        assert_eq!(checkpoint["pending_independent_summary"]["id"], json!(op));
+        s.shutdown().await.unwrap();
+        let mut s = Scheduler::open_with_summary_recovery(
+            &path,
+            options(model.clone()),
+            registry(seen.clone()),
+            Some(adapter.clone()),
+            provider(),
+        )
+        .unwrap();
+        if abort {
+            s.abort_and_wait(id).await.unwrap();
+        } else {
+            adapter.release.add_permits(4);
+            s.wait(id).await.unwrap();
+        }
+        let c = s.conversation(id).unwrap();
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(c.content_blocks[&1].message_id, second_ids[0]);
+        assert_eq!(c.content_blocks[&1].blocks, second_blocks);
+        assert_eq!(
+            s.independent_compaction_status(op).unwrap(),
+            IndependentCompactionStatus::Stale
+        );
+        let queued = c
+            .submissions
+            .iter()
+            .find(|submission| submission.id == input)
+            .unwrap();
+        if abort {
+            assert_eq!(
+                queued.status,
+                Status::Unanswered {
+                    reason: "aborted".into()
+                }
+            );
+            assert!(!c.messages.iter().any(
+                |m| matches!(m, pi_rs_core::Message::User { content } if content == "between")
+            ));
+        } else {
+            let users: Vec<_> = c
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    pi_rs_core::Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(users, vec!["second handoff", "", "between"]);
+            assert!(matches!(queued.status, Status::Done { .. }));
+        }
+        let fork = s.fork_by_entry_id(id, first_ids[0]).unwrap();
+        let intermediate = s.conversation(fork).unwrap();
+        assert_eq!(intermediate.content_blocks[&1].message_id, first_ids[0]);
+        assert_eq!(intermediate.content_blocks[&1].blocks, first_blocks);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        s.shutdown().await.unwrap();
+        let mut reopened = Scheduler::open_with_summary_recovery(
+            &path,
+            options(model.clone()),
+            registry(seen.clone()),
+            Some(adapter.clone()),
+            provider(),
+        )
+        .unwrap();
+        let c = reopened.conversation(id).unwrap();
+        assert_eq!(
+            c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(c.content_blocks[&1].message_id, second_ids[0]);
+        assert_eq!(
+            reopened.independent_compaction_status(op).unwrap(),
+            IndependentCompactionStatus::Stale
+        );
+        let fork = reopened.fork_by_entry_id(id, first_ids[0]).unwrap();
+        assert_eq!(
+            reopened.conversation(fork).unwrap().content_blocks[&1].blocks,
+            first_blocks
+        );
+        reopened.shutdown().await.unwrap();
+    }
+}
