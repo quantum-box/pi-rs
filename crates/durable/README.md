@@ -69,6 +69,24 @@ arbitrarily large and are decoded in full. Bytes, metadata copying and peak
 memory are therefore not independently bounded. Existing history and execution
 paths still hydrate all messages. Store reads are synchronous and may block.
 
+`Harness::watch_view` and `Scheduler::watch_view` attach a pull watch with an
+initial `ConversationView`; `next().await` polls for the next changed bounded
+snapshot, including committed generation progress. The interval must be nonzero.
+Cancel a wait by dropping its future; close or drop the watch to release its store
+ownership. A watch retains the store owner even after the originating handle is
+dropped or the scheduler shuts down, so close it before reopening the database.
+
+This is a latest-state watch, not an audit stream: it has no background queue,
+and any number of commits between reads (including progress changes that later
+revert) can be coalesced or missed. Each returned value replaces the previous
+one. Unlike upstream, it has no Chord operations, callbacks, automatic window
+adjustment, 100-frame queue, end reason, or automatic termination on harness
+close. It observes persisted state only, and synchronous reads can block the
+executor. The view's count and record-visit bounds still apply, but metadata,
+individual batches, and the retained initial snapshot are not byte-bounded.
+For an append-only cursor stream use `watch_history` instead; it covers only
+records explicitly included in that observation log.
+
 Nested tool calls are journaled by parent operation and call order. The standalone
 `NestedHost::call_keyed` API also accepts explicit caller-scoped keys and reuses
 completed results across reordered replay, rejecting a changed tool or arguments.

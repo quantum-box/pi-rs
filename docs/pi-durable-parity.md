@@ -15,6 +15,13 @@ P0 means recovery/effect safety or fundamental execution semantics; P1 means cor
 
 **Current-view checkpoint:** `view` provides a newest-first message window, persisted conversation metadata and committed generation progress; `view_page` walks the captured immutable transcript backwards across later commits. Both message count and record visits are bounded, but individual stored batches and metadata are not byte-bounded. This is a pull snapshot, not upstream's watch, operation stream, automatic window adjustment or complete entry stream. See the durable README for migration and size limitations.
 
+**View-watch checkpoint:** `watch_view` returns the bounded view at attachment
+and polls for changed committed conversation state and generation progress. It
+has no frame queue: slow readers get a replacement snapshot and can miss
+intermediate commits. Unlike upstream's [watch](https://github.com/earendil-works/pi/blob/main/packages/durable/README.md#watching-a-conversation), it has no per-commit Chord operations, callback or end reason,
+and does not end when its originating handle closes. See the durable README for
+ownership, cancellation, memory and persistence limitations.
+
 **Subsequent checkpoint:** Busy reset queues at safe boundaries, provider-overflow compaction and persisted bounded exponential retry were added. A host can attach a background generic task driver to the conversation store, with direct-child all/any/fail-fast waits and local descendant cancellation. A persistent subagent link can resume child admission. Task lifecycle/abort ownership is not yet integrated with conversation execution, reset ordering and tool handoff are incomplete, and subagent links do not yet supply automatic answer reporting or ownership-aware abort.
 
 **Latest checkpoint:** Subagent completion can now be reported automatically to its parent, and reporter-driven conversations continue polling pending tools. Queued submissions can be withdrawn. Conversation extension selections, prompt sections, extension-provided tools, before/after-tool hooks and selected generation hooks are supported; the scheduler can preload an extension registry before automatic recovery. The remaining hooks and hook-created tasks are not yet integrated. Task sleeps can wait for a deadline or any named signal. Subagent cancellation is not yet an ownership-aware cascade. The original table below remains a historical audit and should be read together with these checkpoints.

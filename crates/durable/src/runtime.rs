@@ -371,6 +371,50 @@ pub struct ConversationView {
     pub older: Option<ViewCursor>,
 }
 
+/// A pull-based watch of a bounded conversation view. `initial` is captured at
+/// attachment. Later calls to `next` return the latest changed snapshot; commits
+/// between polls may be coalesced. Dropping a pending `next` is cancellation-safe.
+/// Call `close` (or drop the watch) to release its store ownership.
+pub struct ViewWatch {
+    pub initial: ConversationView,
+    reader: Option<Harness>,
+    id: Uuid,
+    limit: std::num::NonZeroUsize,
+    interval: Duration,
+    last: serde_json::Value,
+}
+
+impl ViewWatch {
+    /// Wait for a changed snapshot, or return `None` after close. A slow reader
+    /// retains no queued frames and sees the latest snapshot on its next poll.
+    pub async fn next(&mut self) -> Result<Option<ConversationView>, Error> {
+        loop {
+            let Some(reader) = self.reader.as_ref() else {
+                return Ok(None);
+            };
+            let view = reader.view(self.id, self.limit)?;
+            let fingerprint = view_fingerprint(&view)?;
+            if fingerprint != self.last {
+                self.last = fingerprint;
+                return Ok(Some(view));
+            }
+            tokio::time::sleep(self.interval).await;
+        }
+    }
+
+    /// Stop watching and release the reader's store ownership. Idempotent.
+    pub fn close(&mut self) {
+        self.reader = None;
+    }
+}
+
+fn view_fingerprint(view: &ConversationView) -> Result<serde_json::Value, Error> {
+    Ok(serde_json::json!({
+        "state": serde_json::to_value(&view.state)?,
+        "live": serde_json::to_value(&view.live)?,
+    }))
+}
+
 /// Opaque position in one immutable conversation transcript snapshot.
 #[derive(Clone, Debug)]
 pub struct ViewCursor {
@@ -1238,6 +1282,28 @@ impl Harness {
             live,
             entries: page.entries,
             older: page.older,
+        })
+    }
+
+    /// Attach a bounded, polling view watch. The interval must be nonzero.
+    pub fn watch_view(
+        &self,
+        id: Uuid,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<ViewWatch, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid("view watch interval must be nonzero".into()));
+        }
+        let initial = self.view(id, limit)?;
+        let last = view_fingerprint(&initial)?;
+        Ok(ViewWatch {
+            initial,
+            reader: Some(self.worker()),
+            id,
+            limit,
+            interval,
+            last,
         })
     }
 
@@ -3892,6 +3958,14 @@ impl Scheduler {
     }
     pub fn view(&self, id: Uuid, limit: std::num::NonZeroUsize) -> Result<ConversationView, Error> {
         self.harness.view(id, limit)
+    }
+    pub fn watch_view(
+        &self,
+        id: Uuid,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<ViewWatch, Error> {
+        self.harness.watch_view(id, limit, interval)
     }
     pub fn view_page(
         &self,

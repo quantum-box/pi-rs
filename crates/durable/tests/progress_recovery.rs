@@ -120,6 +120,14 @@ async fn view_shows_committed_live_partial() {
             max_output_tokens: 100,
         })
         .unwrap();
+    let mut watch = scheduler
+        .watch_view(
+            id,
+            std::num::NonZeroUsize::new(50).unwrap(),
+            std::time::Duration::from_millis(2),
+        )
+        .unwrap();
+    assert!(watch.initial.entries.is_empty());
     scheduler.submit(id, None, "work".into()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
         .await
@@ -130,7 +138,27 @@ async fn view_shows_committed_live_partial() {
     assert!(
         matches!(view.live, Some(pi_rs_durable::progress::State::Running(ref partial)) if partial.text == "uncommitted partial")
     );
+    let watched = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let value = watch.next().await.unwrap().unwrap();
+            if matches!(value.live, Some(pi_rs_durable::progress::State::Running(ref partial)) if partial.text == "uncommitted partial") { break value; }
+        }
+    }).await.unwrap();
+    assert!(
+        watched
+            .entries
+            .iter()
+            .any(|m| matches!(m, Message::User { .. }))
+    );
     scheduler.abort_and_wait(id).await.unwrap();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!ended.state.aborted_generations.is_empty());
+    watch.close();
+    assert!(watch.next().await.unwrap().is_none());
     scheduler.shutdown().await.unwrap();
 }
 struct EscapedModel;
@@ -175,4 +203,60 @@ async fn oversized_escaped_progress_does_not_cancel_a_valid_answer() {
     assert!(
         matches!(&h.conversation(id).unwrap().submissions[0].status,Status::Done{answer} if answer.len()==600_000)
     );
+}
+
+#[tokio::test]
+async fn view_watch_coalesces_and_cancelled_wait_can_resume() {
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(dir.path().join("db"), opts(model), &cancel)
+        .await
+        .unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 100,
+    };
+    let id = h.create_conversation(config.clone()).unwrap();
+    let other = h.create_conversation(config).unwrap();
+    let mut watch = h
+        .watch_view(id, NonZeroUsize::new(1).unwrap(), Duration::from_millis(2))
+        .unwrap();
+    assert!(watch.initial.entries.is_empty());
+    assert!(h.watch_view(id, NonZeroUsize::MIN, Duration::ZERO).is_err());
+    h.submit(other, None, "other".into()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err()
+    );
+    h.submit(id, None, "one".into()).unwrap();
+    h.submit(id, None, "two".into()).unwrap();
+    let latest = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.state.submissions.len(), 2);
+    assert!(latest.entries.len() <= 1);
+    h.submit(id, None, "three".into()).unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.state.submissions.len(), 3);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err()
+    );
+    watch.close();
+    watch.close();
+    assert!(watch.next().await.unwrap().is_none());
 }
