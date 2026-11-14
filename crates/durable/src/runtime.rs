@@ -4727,7 +4727,7 @@ impl Harness {
         Ok(page)
     }
     /// Append an ordered user block occurrence to an idle conversation.
-    /// Forks and resets preserve earlier blocks; compaction remains unsupported.
+    /// Forks, resets, and supported compactions preserve retained block history.
     pub fn append_user_blocks(
         &mut self,
         id: Uuid,
@@ -4786,6 +4786,54 @@ impl Harness {
             .request_manual_compaction(id, keep_recent_tokens, instructions)?
             .is_some())
     }
+    fn prepare_runtime_compaction(
+        &self,
+        c: &Conversation,
+        keep_recent_tokens: usize,
+        instructions: Option<&str>,
+    ) -> Result<Option<crate::compact::Preparation>, Error> {
+        if c.content_blocks.is_empty() {
+            return Ok(crate::compact::prepare(
+                &c.messages,
+                c.config.model.clone(),
+                c.config.max_output_tokens,
+                keep_recent_tokens,
+                instructions,
+            )?);
+        }
+        if !c.extensions.is_empty() || !c.occurrence_epoch_proven || c.transcript.is_none() {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
+        let occurrences = self.resolved_occurrences(c.id, c.transcript.clone().unwrap())?;
+        if occurrences
+            .iter()
+            .map(|(message, _)| message)
+            .ne(c.messages.iter())
+            || c.content_blocks.iter().any(|(index, binding)| {
+                occurrences
+                    .get(*index)
+                    .and_then(|(_, history)| history.as_ref())
+                    .map(|history| history.id)
+                    != Some(binding.message_id)
+            })
+        {
+            return Err(crate::transcript::Error::Corrupt.into());
+        }
+        crate::compact::prepare_with_blocks(
+            &c.messages,
+            c.config.model.clone(),
+            c.config.max_output_tokens,
+            keep_recent_tokens,
+            instructions,
+            &c.content_blocks,
+        )?
+        .map(|preparation| {
+            preparation
+                .bind_blocks(&c.content_blocks)
+                .map_err(Error::from)
+        })
+        .transpose()
+    }
     /// Start an idle manual compaction and return its durable operation ID.
     /// None means there is no older complete turn to compact.
     pub fn request_manual_compaction(
@@ -4805,30 +4853,10 @@ impl Harness {
                 "compaction requires an idle conversation".into(),
             ));
         }
-        let Some(preparation) = crate::compact::prepare(
-            &c.messages,
-            c.config.model.clone(),
-            c.config.max_output_tokens,
-            keep_recent_tokens,
-            instructions,
-        )?
+        let Some(preparation) =
+            self.prepare_runtime_compaction(&c, keep_recent_tokens, instructions)?
         else {
             return Ok(None);
-        };
-        let preparation = if c.content_blocks.is_empty() {
-            preparation
-        } else {
-            let occurrences = self.resolved_occurrences(id, c.transcript.clone().unwrap())?;
-            if c.content_blocks.iter().any(|(index, binding)| {
-                occurrences
-                    .get(*index)
-                    .and_then(|(_, history)| history.as_ref())
-                    .map(|history| history.id)
-                    != Some(binding.message_id)
-            }) {
-                return Err(crate::transcript::Error::Corrupt.into());
-            }
-            preparation.bind_blocks(&c.content_blocks)?
         };
         let preparation = if let Some(source) =
             c.transcript.clone().filter(|_| c.occurrence_epoch_proven)
@@ -5502,20 +5530,29 @@ impl Harness {
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
         {
             let (mut c, version) = self.load(id)?;
-            if !c.content_blocks.is_empty()
-                && matches!(
-                    c.phase,
-                    Phase::CompactionHook { .. }
-                        | Phase::CompactionRunning { .. }
-                        | Phase::CompactionPlacement { .. }
-                )
-                && c.active_manual_compaction.is_none()
-            {
-                return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-            }
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 return Ok(());
+            }
+            if !c.content_blocks.is_empty() && c.active_manual_compaction.is_none() {
+                let valid = match &c.phase {
+                    Phase::CompactionHook { preparation, .. }
+                    | Phase::CompactionReady { preparation, .. }
+                    | Phase::CompactionRunning { preparation, .. }
+                    | Phase::CompactionAbandoned { preparation, .. } => preparation.matches_blocks(
+                        &c.messages,
+                        &c.content_blocks,
+                        c.context_generation,
+                    ),
+                    Phase::CompactionPlacement { result, .. }
+                    | Phase::CompactionAccounting { result, .. } => {
+                        result.matches_blocks(&c.messages, &c.content_blocks, c.context_generation)
+                    }
+                    _ => true,
+                };
+                if !valid {
+                    return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                }
             }
             match c.phase.clone() {
                 Phase::ModelRunning {
@@ -6467,6 +6504,25 @@ impl Harness {
                             finish_manual_compaction(&mut c, ManualCompactionStatus::Stale)?;
                         }
                     } else {
+                        if result.has_blocks() {
+                            if !result.matches_blocks(
+                                &c.messages,
+                                &c.content_blocks,
+                                c.context_generation,
+                            ) {
+                                return Err(
+                                    crate::transcript::Error::UnsupportedContentBlocks.into()
+                                );
+                            }
+                            let (system_end, first_kept) = result.retained_range();
+                            c.content_blocks = project_compaction_blocks(
+                                &c.content_blocks,
+                                system_end,
+                                first_kept,
+                            )?;
+                        } else if !c.content_blocks.is_empty() {
+                            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+                        }
                         c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
                         c.context_generation = Some(Uuid::new_v4());
                     }
@@ -6504,7 +6560,12 @@ impl Harness {
                     } else if turns >= self.options.max_turns {
                         finish_failure(&mut c, "turn limit".into());
                     } else {
-                        if !c.auto_compaction_attempted && c.content_blocks.is_empty() {
+                        if !c.auto_compaction_attempted
+                            && (c.content_blocks.is_empty()
+                                || (c.extensions.is_empty()
+                                    && c.occurrence_epoch_proven
+                                    && c.transcript.is_some()))
+                        {
                             let window = tokio::select! {
                                 _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
                                 window = tokio::time::timeout(Duration::from_secs(5), self.options.model.context_window(&c.config.model)) => window.ok().flatten(),
@@ -6525,21 +6586,27 @@ impl Harness {
                                 let reserve = 16_384u64
                                     .min(window / 4)
                                     .max(u64::from(c.config.max_output_tokens).min(window));
-                                let estimated = pi_rs_core::estimate_request_tokens(&request);
+                                let block_tokens =
+                                    c.content_blocks.values().fold(0u64, |sum, binding| {
+                                        sum.saturating_add(crate::compact::estimate_block_tokens(
+                                            binding,
+                                        ))
+                                    });
+                                let estimated = pi_rs_core::estimate_request_tokens(&request)
+                                    .saturating_add(block_tokens);
                                 if estimated >= window.saturating_sub(reserve) {
                                     c.auto_compaction_attempted = true;
                                     let message_tokens: u64 = c
                                         .messages
                                         .iter()
                                         .map(pi_rs_core::estimate_message_tokens)
-                                        .sum();
+                                        .sum::<u64>()
+                                        .saturating_add(block_tokens);
                                     let overhead = estimated.saturating_sub(message_tokens);
                                     let keep =
                                         window.saturating_sub(reserve).saturating_sub(overhead) / 2;
-                                    if let Some(preparation) = crate::compact::prepare(
-                                        &c.messages,
-                                        c.config.model.clone(),
-                                        c.config.max_output_tokens,
+                                    if let Some(preparation) = self.prepare_runtime_compaction(
+                                        &c,
                                         usize::try_from(keep.min(20_000)).unwrap_or(20_000),
                                         None,
                                     )? {
@@ -6845,7 +6912,7 @@ impl Harness {
                     match decision {
                         ModelFailureDecision::Retry => c.phase = Phase::RetryWait { turns },
                         ModelFailureDecision::Overflow => {
-                            start_overflow_compaction(&mut c, turns, reason)?
+                            start_overflow_compaction(self, &mut c, turns, reason)?
                         }
                         ModelFailureDecision::Stop => finish_failure(&mut c, reason),
                     }
@@ -6962,7 +7029,12 @@ impl Harness {
                         context_window: window.map(u64::from),
                         transient_hint: false,
                     }) {
-                        start_overflow_compaction(&mut c, turns, "model context overflow".into())?;
+                        start_overflow_compaction(
+                            self,
+                            &mut c,
+                            turns,
+                            "model context overflow".into(),
+                        )?;
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     }
@@ -10478,26 +10550,18 @@ fn project_compaction_blocks(
 }
 
 fn start_overflow_compaction(
+    harness: &Harness,
     c: &mut Conversation,
     turns: u32,
     reason: String,
 ) -> Result<(), Error> {
-    if !c.content_blocks.is_empty() {
-        return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-    }
     if c.overflow_compaction_attempted {
         finish_failure(c, reason);
         return Ok(());
     }
     c.overflow_compaction_attempted = true;
     c.auto_compaction_attempted = true;
-    if let Some(preparation) = crate::compact::prepare(
-        &c.messages,
-        c.config.model.clone(),
-        c.config.max_output_tokens,
-        0,
-        None,
-    )? {
+    if let Some(preparation) = harness.prepare_runtime_compaction(c, 0, None)? {
         let generation = *c.context_generation.get_or_insert_with(Uuid::new_v4);
         c.compaction_return_turns = Some(turns);
         c.phase = Phase::CompactionHook {
@@ -11526,6 +11590,404 @@ mod scheduler_tests {
                 .is_err()
         );
         assert!(errors.lock().unwrap().contains_key(&id));
+    }
+
+    struct AutoBlockModel {
+        window: Option<u32>,
+        summaries: std::sync::Mutex<Vec<ModelRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl Model for AutoBlockModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            panic!("adapter required")
+        }
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            self.window
+        }
+        async fn stream_for_summary(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            request: ModelRequest,
+        ) -> Result<ModelStream, pi_rs_core::Error> {
+            self.summaries.lock().unwrap().push(request);
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("checkpoint".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    struct AutoBlockAdapter {
+        calls: AtomicUsize,
+        overflow: bool,
+        requests: std::sync::Mutex<Vec<crate::model::DurableRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::model::ProviderAdapter for AutoBlockAdapter {
+        fn id(&self) -> &str {
+            "test/auto-block"
+        }
+        fn supports_durable_blocks(&self) -> bool {
+            true
+        }
+        async fn prepare(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+        ) -> Result<serde_json::Value, pi_rs_core::Error> {
+            Ok(serde_json::json!({}))
+        }
+        fn validate(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: &serde_json::Value,
+        ) -> Result<(), pi_rs_core::Error> {
+            Ok(())
+        }
+        async fn prepare_durable(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            req: &crate::model::DurableRequest,
+        ) -> Result<serde_json::Value, pi_rs_core::Error> {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(serde_json::json!({}))
+        }
+        fn validate_durable(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &crate::model::DurableRequest,
+            _: &serde_json::Value,
+        ) -> Result<(), pi_rs_core::Error> {
+            Ok(())
+        }
+        async fn dispatch(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: serde_json::Value,
+        ) -> Result<ModelStream, pi_rs_core::Error> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.overflow && n == 0 {
+                return Err(pi_rs_core::Error::Model("context length exceeded".into()));
+            }
+            Ok(stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+    fn auto_options(model: Arc<AutoBlockModel>) -> Options {
+        Options {
+            model,
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        }
+    }
+    #[tokio::test]
+    async fn auto_and_overflow_compact_block_history_then_dispatch_retained_blocks() {
+        use serde_json::json;
+        for overflow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(AutoBlockModel {
+                window: if overflow { None } else { Some(3000) },
+                summaries: std::sync::Mutex::new(vec![]),
+            });
+            let adapter = Arc::new(AutoBlockAdapter {
+                calls: AtomicUsize::new(0),
+                overflow,
+                requests: std::sync::Mutex::new(vec![]),
+            });
+            let (id, kept_id, history, kept);
+            {
+                let mut h = Harness::open_paused(&path, auto_options(model.clone())).unwrap();
+                h.install_provider_adapter(adapter.clone()).unwrap();
+                id = h.create_conversation(config()).unwrap();
+                h.select_provider_adapter(id, true).unwrap();
+                h.append_user_blocks(
+                    id,
+                    vec![
+                        json!({"type":"text","text":"old"}),
+                        json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    ],
+                )
+                .unwrap();
+                kept = vec![
+                    json!({"type":"text","text":"keep"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                    json!({"type":"text","text":"tail","textSignature":"opaque"}),
+                ];
+                kept_id = h.append_user_blocks(id, kept.clone()).unwrap();
+                let (mut c, version) = h.load(id).unwrap();
+                history = h
+                    .resolved_occurrences(id, c.transcript.clone().unwrap())
+                    .unwrap();
+                c.phase = Phase::ModelReady { turns: 0 };
+                h.save(&c, Expected::Version(version)).unwrap();
+            }
+            {
+                let mut h = Harness::open_paused(&path, auto_options(model.clone())).unwrap();
+                h.install_provider_adapter(adapter.clone()).unwrap();
+                h.resume_conversation(id, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                let c = h.conversation(id).unwrap();
+                assert_eq!(c.content_blocks.len(), 1, "overflow={overflow}");
+                let binding = c.content_blocks.values().next().unwrap();
+                assert_eq!(binding.message_id, kept_id);
+                assert_eq!(binding.blocks, kept);
+                let after = h.resolved_occurrences(id, c.transcript.unwrap()).unwrap();
+                assert!(after.iter().any(|entry| *entry == history[1]));
+                assert_eq!(model.summaries.lock().unwrap().len(), 1);
+                assert_eq!(
+                    adapter.calls.load(Ordering::SeqCst),
+                    if overflow { 2 } else { 1 }
+                );
+            }
+            let mut h = Harness::open_paused(&path, auto_options(model.clone())).unwrap();
+            h.install_provider_adapter(adapter.clone()).unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(c.content_blocks.values().next().unwrap().blocks, kept);
+            let requests = adapter.requests.lock().unwrap();
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .blocks
+                    .values()
+                    .any(|b| b.message_id == kept_id && b.blocks == kept)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_block_compaction_runs_from_public_submission() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(AutoBlockModel {
+            window: Some(6000),
+            summaries: std::sync::Mutex::new(vec![]),
+        });
+        let adapter = Arc::new(AutoBlockAdapter {
+            calls: AtomicUsize::new(0),
+            overflow: false,
+            requests: std::sync::Mutex::new(vec![]),
+        });
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), auto_options(model.clone())).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"x".repeat(15000)})])
+            .unwrap();
+        let kept = vec![
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"retained"}),
+        ];
+        let occurrence = h.append_user_blocks(id, kept.clone()).unwrap();
+        let submission = h.submit(id, None, "latest".into()).unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        assert!(
+            c.submissions
+                .iter()
+                .any(|s| s.id == submission && matches!(s.status, Status::Done { .. }))
+        );
+        assert_eq!(model.summaries.lock().unwrap().len(), 1);
+        assert!(
+            c.content_blocks
+                .values()
+                .any(|b| b.message_id == occurrence && b.blocks == kept)
+        );
+        assert!(
+            adapter
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .blocks
+                .values()
+                .any(|b| b.message_id == occurrence && b.blocks == kept)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_block_compaction_running_reopens_and_abort_prevents_replay() {
+        use serde_json::json;
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(AutoBlockModel {
+                window: None,
+                summaries: std::sync::Mutex::new(vec![]),
+            });
+            let adapter = Arc::new(AutoBlockAdapter {
+                calls: AtomicUsize::new(0),
+                overflow: false,
+                requests: std::sync::Mutex::new(vec![]),
+            });
+            let (id, kept_id, kept);
+            {
+                let mut h = Harness::open_paused(&path, auto_options(model.clone())).unwrap();
+                h.install_provider_adapter(adapter.clone()).unwrap();
+                id = h.create_conversation(config()).unwrap();
+                h.select_provider_adapter(id, true).unwrap();
+                h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+                    .unwrap();
+                kept = vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})];
+                kept_id = h.append_user_blocks(id, kept.clone()).unwrap();
+                let (mut c, version) = h.load(id).unwrap();
+                start_overflow_compaction(&h, &mut c, 0, "context length exceeded".into()).unwrap();
+                let Phase::CompactionHook { preparation, .. } = c.phase else {
+                    panic!("missing preparation");
+                };
+                c.phase = Phase::CompactionRunning {
+                    preparation,
+                    request_id: Uuid::new_v4(),
+                    restarts: 0,
+                };
+                h.save(&c, Expected::Version(version)).unwrap();
+                if abort {
+                    h.request_abort(id).unwrap();
+                }
+            }
+            let mut h = Harness::open_paused(&path, auto_options(model.clone())).unwrap();
+            h.install_provider_adapter(adapter.clone()).unwrap();
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(
+                c.content_blocks.values().last().unwrap().message_id,
+                kept_id
+            );
+            assert_eq!(c.content_blocks.values().last().unwrap().blocks, kept);
+            assert_eq!(
+                model.summaries.lock().unwrap().len(),
+                if abort { 0 } else { 1 }
+            );
+            assert_eq!(
+                adapter.calls.load(Ordering::SeqCst),
+                if abort { 0 } else { 1 }
+            );
+            assert_eq!(c.content_blocks.len(), if abort { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_block_placement_loses_abort_race() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(AutoBlockModel {
+            window: None,
+            summaries: std::sync::Mutex::new(vec![]),
+        });
+        let adapter = Arc::new(AutoBlockAdapter {
+            calls: AtomicUsize::new(0),
+            overflow: false,
+            requests: std::sync::Mutex::new(vec![]),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), auto_options(model)).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+            .unwrap();
+        let kept = h
+            .append_user_blocks(
+                id,
+                vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})],
+            )
+            .unwrap();
+        let (mut c, version) = h.load(id).unwrap();
+        start_overflow_compaction(&h, &mut c, 0, "overflow".into()).unwrap();
+        let Phase::CompactionHook { preparation, .. } = c.phase else {
+            panic!("missing preparation");
+        };
+        let result = preparation
+            .finish(CompletedGeneration {
+                content: "checkpoint".into(),
+                calls: vec![],
+                usage: None,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        c.phase = Phase::CompactionPlacement {
+            result: Box::new(result),
+            resets_before: None,
+        };
+        h.save(&c, Expected::Version(version)).unwrap();
+        let (mut candidate, version) = h.load(id).unwrap();
+        let Phase::CompactionPlacement { result, .. } = candidate.phase.clone() else {
+            panic!("missing result");
+        };
+        let (system_end, first_kept) = result.retained_range();
+        candidate.content_blocks =
+            project_compaction_blocks(&candidate.content_blocks, system_end, first_kept).unwrap();
+        candidate.messages = result
+            .apply_in_context(&candidate.messages, candidate.context_generation)
+            .unwrap();
+        candidate.context_generation = Some(Uuid::new_v4());
+        candidate.phase = Phase::ModelReady { turns: 0 };
+        let prepared = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        h.request_abort(id).unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(prepared),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.content_blocks.len(), 2);
+        assert_eq!(c.content_blocks[&1].message_id, kept);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn automatic_block_preparation_rejects_unproven_or_extension_contexts() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(AutoBlockModel {
+            window: None,
+            summaries: std::sync::Mutex::new(vec![]),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), auto_options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"old"})])
+            .unwrap();
+        h.append_user_blocks(id, vec![json!({"type":"text","text":"new"})])
+            .unwrap();
+        let (c, _) = h.load(id).unwrap();
+        let mut unsupported = c.clone();
+        unsupported.occurrence_epoch_proven = false;
+        assert!(matches!(
+            h.prepare_runtime_compaction(&unsupported, 0, None),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
+        let mut unsupported = c;
+        unsupported.extensions.push("unsupported".into());
+        assert!(matches!(
+            h.prepare_runtime_compaction(&unsupported, 0, None),
+            Err(Error::Transcript(
+                crate::transcript::Error::UnsupportedContentBlocks
+            ))
+        ));
     }
 
     struct BlockSummaryModel(std::sync::Mutex<Vec<ModelRequest>>);

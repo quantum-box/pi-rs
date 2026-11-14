@@ -151,6 +151,57 @@ pub fn prepare(
     keep_recent_tokens: usize,
     instructions: Option<&str>,
 ) -> Result<Option<Preparation>> {
+    prepare_inner(
+        messages,
+        model.into(),
+        max_output_tokens,
+        keep_recent_tokens,
+        instructions,
+        None,
+    )
+}
+
+pub(crate) fn prepare_with_blocks(
+    messages: &[Message],
+    model: String,
+    max_output_tokens: u32,
+    keep_recent_tokens: usize,
+    instructions: Option<&str>,
+    blocks: &std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+) -> Result<Option<Preparation>> {
+    prepare_inner(
+        messages,
+        model,
+        max_output_tokens,
+        keep_recent_tokens,
+        instructions,
+        Some(blocks),
+    )
+}
+
+pub(crate) fn estimate_block_tokens(binding: &crate::transcript::MessageContentBlocks) -> u64 {
+    let chars = binding.blocks.iter().fold(0u64, |n, block| {
+        let count = match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map_or(0, |s| s.encode_utf16().count() as u64),
+            Some("image") => 4800,
+            _ => 0,
+        };
+        n.saturating_add(count)
+    });
+    chars.div_ceil(4)
+}
+
+fn prepare_inner(
+    messages: &[Message],
+    model: String,
+    max_output_tokens: u32,
+    keep_recent_tokens: usize,
+    instructions: Option<&str>,
+    blocks: Option<&std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>>,
+) -> Result<Option<Preparation>> {
     validate(messages)?;
     let system_end = messages
         .iter()
@@ -170,7 +221,11 @@ pub fn prepare(
         if bytes >= keep_recent_tokens.saturating_mul(4) {
             break;
         }
-        let message_bytes = serde_json::to_vec(message)?.len();
+        let message_bytes = if let Some(binding) = blocks.and_then(|blocks| blocks.get(&index)) {
+            usize::try_from(estimate_block_tokens(binding).saturating_mul(4)).unwrap_or(usize::MAX)
+        } else {
+            serde_json::to_vec(message)?.len()
+        };
         if budget_start != messages.len()
             && bytes.saturating_add(message_bytes) > keep_recent_tokens.saturating_mul(4)
         {
@@ -199,7 +254,7 @@ pub fn prepare(
         retained_target: None,
         source_blocks: None,
         request: ModelRequest {
-            model: model.into(),
+            model,
             max_output_tokens,
             tools: vec![],
             messages: vec![
@@ -613,6 +668,34 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<CompactionResult>(&serde_json::to_string(&r).unwrap()).unwrap(),
             r
+        );
+    }
+
+    #[test]
+    fn ordered_block_budget_counts_text_and_fixed_image_cost() {
+        let messages = vec![user(&"x".repeat(9000)), user(""), user("latest")];
+        let binding = crate::transcript::MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![
+                serde_json::json!({"type":"text","text":"🦀🦀"}),
+                serde_json::json!({"type":"image","data":"x".repeat(100000),"mimeType":"image/png"}),
+            ],
+        };
+        assert_eq!(estimate_block_tokens(&binding), 1201);
+        let blocks = std::collections::BTreeMap::from([(1, binding)]);
+        assert_eq!(
+            prepare_with_blocks(&messages, "test".into(), 100, 1000, None, &blocks)
+                .unwrap()
+                .unwrap()
+                .first_kept(),
+            2
+        );
+        assert_eq!(
+            prepare_with_blocks(&messages, "test".into(), 100, 1500, None, &blocks)
+                .unwrap()
+                .unwrap()
+                .first_kept(),
+            1
         );
     }
 
