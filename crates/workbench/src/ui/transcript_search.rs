@@ -50,8 +50,7 @@ impl Search {
             end -= 1;
         }
         let text = &text[..end];
-        self.editor
-            .insert(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+        self.editor.insert(&normalize_whitespace(text));
     }
 
     pub fn overlay(&self, theme: &Theme, keys: &Keys, width: usize) -> (Vec<Line>, usize, usize) {
@@ -140,12 +139,7 @@ impl Search {
 
     /// Return the row to reveal after a query change or explicit navigation.
     pub fn update(&mut self, lines: &[Line], top: usize) -> Option<Range<usize>> {
-        let query = self
-            .editor
-            .text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let query = normalize_whitespace(&self.editor.text);
         let query_changed = query != self.query;
         let source_changed = self.rows.len() != lines.len()
             || self.rows.iter().zip(lines).any(|(text, line)| {
@@ -223,6 +217,21 @@ struct Source {
     offset: usize,
 }
 
+// ECMAScript's \s includes U+FEFF and excludes U+0085, unlike Rust's
+// Unicode White_Space predicate. Pi uses this rule for its search query and
+// for deciding whether a rendered grapheme separates corpus runs.
+fn is_js_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value
+        .split(is_js_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
     if query.is_empty() {
         return vec![];
@@ -230,9 +239,7 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
     let mut corpus = String::new();
     let mut source = Vec::new();
     for (row, text) in rows.iter().enumerate() {
-        let mut offset = 0;
-        for word in text.split_whitespace() {
-            offset += text[offset..].find(word).expect("word from source line");
+        let mut append = |offset: usize, word: &str| {
             if !corpus.is_empty() {
                 corpus.push(' ');
             }
@@ -243,7 +250,28 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
                 row,
                 offset,
             });
-            offset += word.len();
+        };
+        if text.is_ascii() {
+            let mut offset = 0;
+            for word in text.split(is_js_whitespace).filter(|word| !word.is_empty()) {
+                offset += text[offset..].find(word).expect("word from source line");
+                append(offset, word);
+                offset += word.len();
+            }
+        } else {
+            let mut start = None;
+            for (offset, glyph) in text.grapheme_indices(true) {
+                if glyph.chars().all(is_js_whitespace) {
+                    if let Some(start) = start.take() {
+                        append(start, &text[start..offset]);
+                    }
+                } else if start.is_none() {
+                    start = Some(offset);
+                }
+            }
+            if let Some(start) = start {
+                append(start, &text[start..]);
+            }
         }
     }
     let pattern = regex::RegexBuilder::new(&regex::escape(query))
@@ -294,6 +322,29 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
 mod tests {
     use super::*;
     use crossterm::style::Color;
+
+    #[test]
+    fn search_uses_ecmascript_whitespace_for_queries_and_corpus() {
+        assert_eq!(normalize_whitespace("  a\u{feff}b  "), "a b");
+        assert_eq!(normalize_whitespace("a\u{85}b"), "a\u{85}b");
+        let rows = vec!["a\u{feff}b".into(), "a\u{85}b".into()];
+        let matches = find_matches(&rows, &normalize_whitespace("a b"));
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].iter().all(|segment| segment.row == 0));
+        let matches = find_matches(&rows, &normalize_whitespace("a\u{85}b"));
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].iter().all(|segment| segment.row == 1));
+        let mut search = Search::default();
+        search.paste("a\u{feff}b\u{85}c");
+        assert_eq!(search.editor.text, "a b\u{85}c");
+    }
+
+    #[test]
+    fn whitespace_with_combining_mark_remains_part_of_a_grapheme() {
+        let rows = vec!["a \u{301}b".into()];
+        assert_eq!(find_matches(&rows, "a \u{301}b").len(), 1);
+        assert!(find_matches(&rows, "a b").is_empty());
+    }
 
     #[test]
     fn finds_a_literal_across_wraps_and_highlights_entire_graphemes() {

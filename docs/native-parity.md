@@ -1741,6 +1741,8 @@ bindings. Unix suspension remains available on WSL.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
+Transcript search normalizes ECMAScript whitespace in queries and rendered
+graphemes, including U+FEFF while preserving U+0085 as searchable text.
 
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed
