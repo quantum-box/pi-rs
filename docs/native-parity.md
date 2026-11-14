@@ -875,7 +875,9 @@ DA1 replies, but uses a shorter timeout and accepts late replies.
 On an appearance notification, native invalidates the previous foreground and
 background so configured light/dark pairs switch immediately even when the
 requery is incomplete. Pi instead continues to prefer a previously reported
-background until fresh colors arrive. The last complete palette is retained.
+background until fresh colors arrive. The active system theme immediately
+returns to indexed colors while the background is unknown; the last complete
+palette is retained for a fresh background report.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom

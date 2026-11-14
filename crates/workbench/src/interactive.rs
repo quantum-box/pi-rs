@@ -3501,6 +3501,17 @@ fn load_resolved_theme(
     Err(error)
 }
 
+#[cfg(any(unix, windows))]
+fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
+    crate::ui::theme::invalidate_terminal_default_colors();
+    let changed = crate::ui::theme::set_appearance(dark);
+    let redraw_system = theme.name == "system";
+    if redraw_system {
+        *theme = Theme::system();
+    }
+    (changed, redraw_system)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
@@ -4300,11 +4311,12 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        crate::ui::theme::invalidate_terminal_default_colors();
+                        let (changed, redraw_system) = apply_terminal_appearance(&mut theme, dark);
+                        dirty |= redraw_system;
                         if let Some(terminal) = &mut _terminal {
                             terminal.query_terminal_colors()?;
                         }
-                        crate::ui::theme::set_appearance(dark)
+                        changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
                         foreground,
@@ -9213,6 +9225,43 @@ mod tests {
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_event_rebuilds_system_theme_before_partial_requery() {
+        const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::appearance_event_rebuilds_system_theme_before_partial_requery"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            begin_terminal_palette_query, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 10, 20);
+        }
+        let mut theme = super::Theme::system();
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
+        let (_, redraw) = super::apply_terminal_appearance(&mut theme, false);
+        assert!(redraw);
+        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        begin_terminal_palette_query();
+        for index in 0..8 {
+            set_terminal_palette(index, index, 30, 40);
+        }
+        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        set_terminal_color(false, 255, 255, 255);
+        let refreshed = super::Theme::system();
+        assert_eq!(refreshed.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
     }
 
     #[cfg(any(unix, windows))]
