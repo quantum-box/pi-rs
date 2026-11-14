@@ -7891,12 +7891,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inherited_editor_follows_shell_job_control() {
+        inherited_editor_shell_case(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_follows_wrapped_shell_job_control() {
+        inherited_editor_shell_case(true);
+    }
+
+    #[cfg(unix)]
+    fn inherited_editor_shell_case(wrapped: bool) {
         use std::io::{Read, Write};
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::{fs::PermissionsExt, process::CommandExt};
         use std::process::Stdio;
         use std::time::{Duration, Instant};
-        const NAME: &str = "interactive::tests::inherited_editor_follows_shell_job_control";
+        let name = if wrapped {
+            "interactive::tests::inherited_editor_follows_wrapped_shell_job_control"
+        } else {
+            "interactive::tests::inherited_editor_follows_shell_job_control"
+        };
         const CHILD: &str = "PI_RS_INHERITED_EDITOR_SHELL";
         if let Some(program) = std::env::var_os(CHILD) {
             let mut editor = super::RunningExternalEditor::start(
@@ -7980,13 +7995,16 @@ mod tests {
             }
         }
         wait_for(&mut master, "PI_TEST_PROMPT> ");
-        writeln!(
-            master,
+        let invocation = format!(
             "{} --exact {} --nocapture",
             shell_words::quote(&std::env::current_exe().unwrap().to_string_lossy()),
-            NAME
-        )
-        .unwrap();
+            name
+        );
+        if wrapped {
+            writeln!(master, "sh -c {}", shell_words::quote(&invocation)).unwrap();
+        } else {
+            writeln!(master, "{invocation}").unwrap();
+        }
         wait_for(&mut master, "EDITOR_READY");
         master.write_all(&[26]).unwrap();
         let stopped = wait_for(&mut master, "PI_TEST_PROMPT> ");
