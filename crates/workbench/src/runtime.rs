@@ -489,71 +489,21 @@ impl Runtime {
     }
 }
 
-/// Bound the caller's wait even when reading or validating the journal blocks.
-/// A timed-out worker is detached; cancellation prevents it from starting
-/// further preparation once a blocking read returns.
-pub(super) async fn standalone_share_snapshot_bounded(
-    args: Cli,
-    timeout: Duration,
-) -> Option<super::sessions::ShareSnapshot> {
-    standalone_share_snapshot_with_reader(args, timeout, |path| Session::snapshot(path)).await
-}
-
-async fn standalone_share_snapshot_with_reader<F>(
-    args: Cli,
-    timeout: Duration,
-    read: F,
-) -> Option<super::sessions::ShareSnapshot>
-where
-    F: FnOnce(&std::path::Path) -> Result<Session> + Send + 'static,
-{
-    if args.trust_pending {
-        return None;
-    }
-    let cancellation = CancellationToken::new();
-    struct CancelOnDrop(CancellationToken);
-    impl Drop for CancelOnDrop {
-        fn drop(&mut self) {
-            self.0.cancel();
-        }
-    }
-    let _cancel = CancelOnDrop(cancellation.clone());
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("pi-share-context".into())
-        .spawn(move || {
-            let result = (|| {
-                let source = read(&args.session)?;
-                if cancellation.is_cancelled() {
-                    return Err(pi_rs::Error::Cancelled);
-                }
-                let executor = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                executor.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => Err(pi_rs::Error::Cancelled),
-                        result = standalone_share_snapshot(&args, &source, &cancellation) => result,
-                    }
-                })
-            })();
-            let _ = sender.send(result);
-        })
-        .ok()?;
-    tokio::time::timeout(timeout, receiver)
-        .await
-        .ok()?
-        .ok()?
-        .ok()
-}
-
-/// Prepare the same idle share context as the interactive worker without
-/// writing lifecycle or resource-discovery records to the source journal.
-async fn standalone_share_snapshot(
+/// Prepare an idle share context in the calling task, using an in-memory copy
+/// so lifecycle and discovery cannot write to the source journal. This waits
+/// for preparation: a detached timeout could leave side effects running after
+/// the share has moved on, including credential refresh and MCP startup.
+pub(super) async fn standalone_share_snapshot(
     args: &Cli,
     source: &Session,
-    cancellation: &CancellationToken,
+) -> Result<super::sessions::ShareSnapshot> {
+    standalone_share_snapshot_after(args, source, std::future::ready(())).await
+}
+
+async fn standalone_share_snapshot_after(
+    args: &Cli,
+    source: &Session,
+    before_configure: impl std::future::Future<Output = ()>,
 ) -> Result<super::sessions::ShareSnapshot> {
     if args.trust_pending {
         return Err(pi_rs::Error::Config("project trust is pending".into()));
@@ -562,14 +512,8 @@ async fn standalone_share_snapshot(
     args.restore_session_model(source);
     super::thinking::adjust(&mut args);
     let mut session = Session::from_records(source.records().to_vec())?;
-    if cancellation.is_cancelled() {
-        return Err(pi_rs::Error::Cancelled);
-    }
-    let mut runtime = configure(&args, false).await?;
+    let mut runtime = configure_after(&args, false, before_configure).await?;
     let result = async {
-        if cancellation.is_cancelled() {
-            return Err(pi_rs::Error::Cancelled);
-        }
         runtime
             .session_lifecycle(
                 &args,
@@ -580,15 +524,9 @@ async fn standalone_share_snapshot(
                 },
             )
             .await;
-        if cancellation.is_cancelled() {
-            return Err(pi_rs::Error::Cancelled);
-        }
         runtime
             .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
             .await?;
-        if cancellation.is_cancelled() {
-            return Err(pi_rs::Error::Cancelled);
-        }
         let base = runtime.share_base();
         let (system_prompt, tools) =
             source.effective_system_context(&base.system_prompt, base.tools);
@@ -698,6 +636,15 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 }
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
+    configure_after(args, interactive_mcp, std::future::ready(())).await
+}
+
+async fn configure_after(
+    args: &Cli,
+    interactive_mcp: bool,
+    before_preparation: impl std::future::Future<Output = ()>,
+) -> Result<Runtime> {
+    before_preparation.await;
     super::packages::prepare(args).await?;
     let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {
@@ -1073,43 +1020,62 @@ mod standalone_share_tests {
     use super::*;
     use clap::Parser;
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_preparation_waits_for_metadata_without_detaching() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+        ])
+        .unwrap();
+        args.workspace = directory.path().to_owned();
+        args.session = path.clone();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(&args, &session, async {
+            let _ = gate.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(11), &mut preparation)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let snapshot = preparation.await.unwrap();
+        assert_eq!(snapshot.session_id, session.session_id());
+        assert_eq!(snapshot.head, session.head());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn blocked_snapshot_read_does_not_block_metadata_deadline() {
+    async fn cancelling_preparation_drops_it_without_starting_configure() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         let session = Session::open(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
         let mut args = Cli::try_parse_from(["pi", "--offline", "--no-trust"]).unwrap();
         args.session = path.clone();
-        let (entered, started) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let (finished, done) = std::sync::mpsc::channel();
-        let began = std::time::Instant::now();
-        let task = tokio::spawn(async move {
-            standalone_share_snapshot_with_reader(args, Duration::from_secs(1), move |path| {
-                entered.send(()).unwrap();
-                released.recv_timeout(Duration::from_secs(5)).unwrap();
-                let result = Session::snapshot(path);
-                finished.send(()).unwrap();
-                result
-            })
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(3), started)
-            .await
-            .unwrap()
-            .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.is_none());
-        assert!(began.elapsed() < Duration::from_secs(4));
-        assert!(done.try_recv().is_err());
-        release.send(()).unwrap();
-        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(&args, &session, async {
+            let _ = gate.await;
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut preparation)
+                .await
+                .is_err()
+        );
+        drop(preparation);
+        assert!(release.send(()).is_err());
         assert_eq!(std::fs::read(path).unwrap(), original);
-        drop(session);
     }
 }
 

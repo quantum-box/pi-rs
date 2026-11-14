@@ -2383,6 +2383,9 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
         *result = endpoint.project_outcome(result);
     }
     let command = endpoint.command("--pi-rs-extension-v2");
+    if cancellation.is_cancelled() {
+        return Err("native extension operation cancelled".into());
+    }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
@@ -2836,6 +2839,9 @@ fn call<T: serde::de::DeserializeOwned>(
         return Err("extension request exceeds 64 MiB".into());
     }
     let command = endpoint.command("--pi-rs-extension-v1");
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err("native extension operation cancelled".into());
+    }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
@@ -3629,6 +3635,35 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_extension_request_does_not_spawn_process() {
+        let endpoint = Endpoint {
+            path: std::env::temp_dir().join("pi-cancelled-extension-does-not-exist"),
+            flags: None,
+            pi_lifecycle_fields: false,
+            text_result_v2: false,
+            structured_text_result: false,
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error =
+            call::<Value>(&endpoint, ProtocolRequest::Describe, Some(&cancellation)).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = call_duplex::<Value>(
+            &endpoint,
+            ProtocolRequest::Describe,
+            Arc::new(DetachedHost),
+            &cancellation,
+            runtime.handle(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+    }
 
     #[test]
     fn legacy_tool_messages_decode_without_status_and_omit_false_on_wire() {

@@ -2018,7 +2018,9 @@ async fn execute(
             let destination = sessions::ShareDestination::configured(&args.settings)?;
             let workspace = args.workspace.clone();
             let snapshot = if destination.is_radius() && !args.trust_pending {
-                runtime::standalone_share_snapshot_bounded(args, Duration::from_secs(10)).await
+                runtime::standalone_share_snapshot(&args, &session)
+                    .await
+                    .ok()
             } else {
                 None
             };

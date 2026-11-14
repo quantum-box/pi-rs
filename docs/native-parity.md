@@ -3387,10 +3387,13 @@ tool catalogs remain selected after the run settles; summary requests do not rep
 the active context. The metadata is not written to the journal, and the 128 MiB share limit includes
 it. Gist sharing continues to export HTML. Standalone `pi share` constructs an
 idle runtime and resolves the branch's effective context on an in-memory copy,
-without appending records to the source journal. It waits at most ten seconds
-for metadata in a separate worker; a blocking read may outlive that wait, and
-cancellation is checked before further preparation. When runtime metadata is unavailable, including missing model
-credentials, startup failure, timeout or pending project trust, Radius uploads
+without appending records to the source journal. Standalone preparation runs in
+the calling task and waits for configuration and discovery to finish; it has no
+metadata deadline, and synchronous filesystem operations cannot be interrupted
+until they return. This avoids abandoning a preparation worker after a timeout.
+An already-started credential refresh may finish to preserve rotated credentials.
+When runtime metadata is unavailable, including missing model credentials, startup
+failure or pending project trust, Radius uploads
 continue without metadata rather than reconstructing it from stale settings.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
