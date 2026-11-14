@@ -472,9 +472,9 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
             "read",
             "--system-prompt",
         ])
+        .arg(&prompt)
         .arg("--extension")
         .arg(&extension)
-        .arg(&prompt)
         .arg("--session")
         .arg(root.path().join("session.jsonl"))
         .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -570,7 +570,17 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
         }
     }
     let _resume = Resume(pid);
-    let mut changed = pi_rs::Session::open(root.path().join("session.jsonl")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut changed = loop {
+        match pi_rs::Session::open(root.path().join("session.jsonl")) {
+            Ok(session) => break session,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("worker did not release session: {error}"),
+        }
+    };
     changed
         .append_user_with_images("changed after hook".into(), Vec::new(), None)
         .unwrap();

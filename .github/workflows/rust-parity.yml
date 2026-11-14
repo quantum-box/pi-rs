@@ -46,6 +46,6 @@ jobs:
       - name: Test real terminal and standalone share flows
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --test share_presentation -- --test-threads=1
       - name: Test live share fallback correlation
-        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs failed_live_share_response_preserves_no_context_fallback
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs failed_live_share_response_requires_authenticated_context
       - name: Test malformed live response remains authenticated
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs malformed_success_keeps_live_authentication_required
