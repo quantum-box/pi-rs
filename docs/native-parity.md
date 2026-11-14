@@ -984,7 +984,10 @@ bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
 waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
-cancellation stop the wait sooner. Waiting counts toward the script deadline,
+cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
+admitting or releasing workers, allowing embedders to change the limit while
+running. Reducing it does not interrupt existing workers; native retains its
+1,024-worker ceiling and uses the default of two for invalid values. Waiting counts toward the script deadline,
 and a cancelled waiter does not release another script's worker. In the Rust
 SDK, `Codemode.timeout` remains a `Duration`;
 its default `Duration::MAX` means no deadline, while other values set a limit.
