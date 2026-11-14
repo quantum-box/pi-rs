@@ -187,6 +187,21 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Foo"));
         assert!(!text.contains("mode"));
+        let (lines, warning) = render(
+            "flowchart LR\nA[Foo]:::status-ok-->B[Bar]",
+            &theme,
+            120,
+            Mermaid::Final,
+        );
+        assert!(warning.is_none());
+        let text = lines
+            .unwrap()
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("Foo") && text.contains("Bar"));
+        assert!(!text.contains("ok"));
         let (_, warning) = render("flowchart LR\nA -->", &theme, 120, Mermaid::Final);
         assert_eq!(
             warning.as_deref(),
