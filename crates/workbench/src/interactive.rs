@@ -7865,6 +7865,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_success_keeps_live_authentication_required() {
+        let id = uuid::Uuid::new_v4();
+        let key = [5; 32];
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id,
+                journal_key: Some(key),
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let (pending, snapshot) = view
+            .take_share_response(&json!({
+                "type":"response", "command":"get_share_context", "id":id,
+                "success":true, "data":{}
+            }))
+            .unwrap();
+        assert_eq!(pending.journal_key, Some(key));
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn failed_live_share_response_preserves_no_context_fallback() {
         let id = uuid::Uuid::new_v4();
         let mut view = super::View {
