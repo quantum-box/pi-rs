@@ -3901,7 +3901,6 @@ mod scheduler_tests {
             let id = Uuid::new_v4();
             c.input_modes.insert(id, mode);
             c.submissions.push(Submission {
-                kind: SubmissionKind::Input,
                 id,
                 kind: SubmissionKind::Input,
                 request_id: None,
