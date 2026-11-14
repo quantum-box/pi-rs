@@ -2541,7 +2541,10 @@ Turning thinking off sends a zero budget when the model supports it. For a
 discrete-level model that cannot disable thinking, an omitted level uses its
 lowest supported mapped level without requesting thought output. Model
 thinking-level mappings are resolved before selecting a budget or discrete
-Google effort, including MINIMAL for Pro models. The configured budgets also enter
+Google effort, including MINIMAL for Pro models. Bundled Google models retain
+Pi v1.5.0 thinking maps, including unsupported levels and disabled fallbacks.
+Configured reasoning models outside known families use the selected budget, or
+-1 for an enabled level and zero when disabled. The configured budgets also enter
 the protected request identity, so changing them invalidates a prior context
 estimate. A loopback fixture checks the configured budget on the actual request;
 live Google service limits and acceptance have not been verified.

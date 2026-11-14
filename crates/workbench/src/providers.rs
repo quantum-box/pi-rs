@@ -1207,12 +1207,20 @@ mod estimation_tests {
     #[tokio::test]
     async fn google_discrete_mappings_and_disabled_fallback_reach_the_wire() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (selected, expected) in [
+        for (selected, profile, expected) in [
             (
                 Some("high"),
+                1,
                 json!({"thinkingLevel":"MINIMAL","includeThoughts":true}),
             ),
-            (None, json!({"thinkingLevel":"HIGH"})),
+            (None, 1, json!({"thinkingLevel":"HIGH"})),
+            (None, 0, json!({"thinkingLevel":"LOW"})),
+            (None, 2, json!({"thinkingBudget":0})),
+            (
+                Some("high"),
+                2,
+                json!({"thinkingBudget":-1,"includeThoughts":true}),
+            ),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1252,9 +1260,28 @@ mod estimation_tests {
             });
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.provider = Provider::Google;
-            args.model = "gemini-3.1-pro-preview".into();
+            args.model = if profile == 2 {
+                "custom-reasoner"
+            } else {
+                "gemini-3.1-pro-preview"
+            }
+            .into();
             args.thinking = selected.map(str::to_owned);
-            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"google":{"modelOverrides":{"gemini-3.1-pro-preview":{"thinkingLevelMap":{"off":null,"minimal":null,"low":"HIGH","high":"MINIMAL"}}}}}})).unwrap();
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&if profile == 1 {
+                json!({"providers":{"google":{"modelOverrides":{"gemini-3.1-pro-preview":{"thinkingLevelMap":{"off":null,"minimal":null,"low":"HIGH","high":"MINIMAL"}}}}}})
+            } else if profile == 2 {
+                json!({"providers":{"google":{"models":[{"id":"custom-reasoner","reasoning":true,"thinkingLevelMap":{"high":"low"}}]}}})
+            } else { json!({}) }).unwrap();
+            if profile == 0 {
+                let model = args
+                    .model_profiles
+                    .model(&args.provider, &args.model)
+                    .unwrap();
+                assert_eq!(
+                    model.levels(Adapter::Google).unwrap(),
+                    vec!["low", "medium", "high"]
+                );
+            }
             let client = Client::Google(
                 pi_rs::google::Google::new(&endpoint, "fixture")
                     .unwrap()

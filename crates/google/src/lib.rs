@@ -771,8 +771,9 @@ impl Model for Google {
         if let Some(limit) = catalog.as_ref().and_then(|entry| entry.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);
         }
-        let supports_thinking = self.reasoning_supported != Some(false)
-            && catalog.as_ref().is_none_or(|entry| entry.reasoning);
+        let supports_thinking = self
+            .reasoning_supported
+            .unwrap_or_else(|| catalog.as_ref().is_none_or(|entry| entry.reasoning));
         let thinking = self.thinking.as_deref();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
@@ -788,8 +789,20 @@ impl Model for Google {
         {
             body["generationConfig"]["thinkingConfig"] =
                 json!({"thinkingLevel":fallback.to_ascii_uppercase()});
-        } else if let Some(config) = body["generationConfig"].get_mut("thinkingConfig") {
-            apply_thinking_budget(config, thinking, self.thinking_budgets.as_ref())?;
+        } else {
+            if body["generationConfig"].get("thinkingConfig").is_none()
+                && self.reasoning_supported == Some(true)
+            {
+                body["generationConfig"]["thinkingConfig"] =
+                    if thinking.is_none_or(|level| level == "off") {
+                        json!({"thinkingBudget":0})
+                    } else {
+                        json!({"thinkingBudget":-1,"includeThoughts":true})
+                    };
+            }
+            if let Some(config) = body["generationConfig"].get_mut("thinkingConfig") {
+                apply_thinking_budget(config, thinking, self.thinking_budgets.as_ref())?;
+            }
         }
         let mut url = self.url(Some(&format!("{model}:streamGenerateContent")));
         url.query_pairs_mut().append_pair("alt", "sse");
@@ -1593,6 +1606,27 @@ mod tests {
                 Some(json!({"thinkingBudget":0})),
             ),
             ("gemini-3.1-pro", None, None, Some(false), None),
+            (
+                "custom-reasoner",
+                None,
+                None,
+                Some(true),
+                Some(json!({"thinkingBudget":0})),
+            ),
+            (
+                "custom-reasoner",
+                Some("low"),
+                None,
+                Some(true),
+                Some(json!({"thinkingBudget":-1,"includeThoughts":true})),
+            ),
+            (
+                "custom-reasoner-config",
+                Some("low"),
+                None,
+                Some(true),
+                Some(json!({"thinkingBudget":1234,"includeThoughts":true})),
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1626,7 +1660,10 @@ mod tests {
                 .with_context_probe(false)
                 .with_thinking(level)
                 .with_disabled_thinking_fallback(fallback)
-                .with_reasoning_support(supported);
+                .with_reasoning_support(supported)
+                .with_thinking_budget_settings(
+                    (model == "custom-reasoner-config").then(|| json!({"low":1234})),
+                );
             let request = ModelRequest {
                 model: model.into(),
                 messages: vec![],
