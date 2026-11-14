@@ -60,6 +60,7 @@ macro_rules! h3_security {
                 Duration::from_secs(10),
                 client
                     .get(&url)
+                    .version(http::Version::HTTP_3)
                     .header("proxy-authorization", "Basic c2VjcmV0")
                     .send(),
             )
@@ -79,10 +80,13 @@ macro_rules! h3_security {
                 .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap();
-            let err = timeout(Duration::from_secs(10), proxied.get(&url).send())
-                .await
-                .unwrap()
-                .unwrap_err();
+            let err = timeout(
+                Duration::from_secs(10),
+                proxied.get(&url).version(http::Version::HTTP_3).send(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
             assert!(
                 format!("{err:?}").contains("HTTP/3 proxy routing is unsupported"),
                 "{err:?}"

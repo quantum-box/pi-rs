@@ -233,7 +233,7 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
 
     fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
         if let Some(routing) = &self.routing {
-            let route = routing
+            let mut route = routing
                 .proxies
                 .iter()
                 .find_map(|proxy| proxy.intercept(req.uri()));
@@ -255,6 +255,18 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
                             || proxy.uri().scheme() == Some(&Scheme::HTTPS))
                 });
             if !forward_proxy {
+                // The connector owns CONNECT headers. Copy caller credentials
+                // only onto the selected HTTP proxy route, never the origin.
+                let tunnel = route.as_ref().is_some_and(|proxy| {
+                    (proxy.uri().scheme() == Some(&Scheme::HTTP)
+                        || proxy.uri().scheme() == Some(&Scheme::HTTPS))
+                        && (proxy.tunnel_http() || req.uri().scheme() == Some(&Scheme::HTTPS))
+                });
+                if tunnel {
+                    if let Some(auth) = req.headers().get(PROXY_AUTHORIZATION).cloned() {
+                        route = route.map(|proxy| proxy.with_caller_auth(auth));
+                    }
+                }
                 req.headers_mut().remove(PROXY_AUTHORIZATION);
             }
             if forward_proxy {

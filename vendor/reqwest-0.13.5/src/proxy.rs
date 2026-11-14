@@ -575,6 +575,13 @@ impl fmt::Debug for Matcher {
 }
 
 impl Intercepted {
+    // The caller's request header takes precedence over configured basic auth
+    // for this route only. Never modify the shared matcher.
+    pub(crate) fn with_caller_auth(mut self, auth: HeaderValue) -> Self {
+        self.extra.auth = Some(auth);
+        self
+    }
+
     pub(crate) fn tunnel_http(&self) -> bool {
         self.extra.tunnel_http
     }

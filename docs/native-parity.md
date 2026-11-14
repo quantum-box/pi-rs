@@ -53,8 +53,9 @@ CONNECT for HTTP as well as HTTPS origins, matching Pi. Externally supplied
 authenticated forward-only proxies retain forward behavior. Proxy decisions are captured per request and route-specific connection pools prevent
 credentials from following a request onto another route. Caller-provided forward
 proxy authorization is bound to the first route across redirects. Caller-provided proxy
-authorization is removed for direct, local-socket and tunneled requests; configure
-tunnel credentials on the proxy itself. HTTP/3 rejects matched proxy routes rather
+authorization is removed for direct and local-socket requests, and passed only
+to the selected proxy for CONNECT. It overrides configured basic authentication;
+configured proxy-specific headers retain their existing precedence. HTTP/3 rejects matched proxy routes rather
 than bypassing them. Other network surfaces need integration.
 
 The `/settings` list remains open after a change, preserving its search and

@@ -39,7 +39,14 @@
 -        }
 -
 -        None
-@@ -589,0 +578,20 @@
+@@ -589,0 +578,27 @@
++    // The caller's request header takes precedence over configured basic auth
++    // for this route only. Never modify the shared matcher.
++    pub(crate) fn with_caller_auth(mut self, auth: HeaderValue) -> Self {
++        self.extra.auth = Some(auth);
++        self
++    }
++
 +    pub(crate) fn http_non_tunnel_basic_auth(&self) -> Option<HeaderValue> {
 +        let scheme = self.uri().scheme();
 +        if scheme == Some(&Scheme::HTTP) || scheme == Some(&Scheme::HTTPS) {
@@ -326,11 +333,11 @@
 +        }
 +        client
 +    }
-@@ -153 +234,43 @@
+@@ -153 +234,55 @@
 -    fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +    fn call(&mut self, mut req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
 +        if let Some(routing) = &self.routing {
-+            let route = routing
++            let mut route = routing
 +                .proxies
 +                .iter()
 +                .find_map(|proxy| proxy.intercept(req.uri()));
@@ -352,6 +359,18 @@
 +                            || proxy.uri().scheme() == Some(&Scheme::HTTPS))
 +                });
 +            if !forward_proxy {
++                // The connector owns CONNECT headers. Copy caller credentials
++                // only onto the selected HTTP proxy route, never the origin.
++                let tunnel = route.as_ref().is_some_and(|proxy| {
++                    (proxy.uri().scheme() == Some(&Scheme::HTTP)
++                        || proxy.uri().scheme() == Some(&Scheme::HTTPS))
++                        && (proxy.tunnel_http() || req.uri().scheme() == Some(&Scheme::HTTPS))
++                });
++                if tunnel {
++                    if let Some(auth) = req.headers().get(PROXY_AUTHORIZATION).cloned() {
++                        route = route.map(|proxy| proxy.with_caller_auth(auth));
++                    }
++                }
 +                req.headers_mut().remove(PROXY_AUTHORIZATION);
 +            }
 +            if forward_proxy {
@@ -371,7 +390,7 @@
 +            let mut client = routing.client(route);
 +            return Box::pin(async move { client.call(req).await.map_err(crate::error::request) });
 +        }
-@@ -156,0 +280,35 @@
+@@ -156,0 +292,35 @@
 +    }
 +}
 +
@@ -407,7 +426,7 @@
 +        }
 +        let mut inner = self.inner.clone();
 +        Box::pin(async move { inner.call(request).await })
-@@ -1008 +1166,12 @@
+@@ -1008 +1178,12 @@
 -        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
 +        let local_transport = connector_builder.uses_local_transport();
 +        let dynamic_routing = !proxies.is_empty() && !local_transport;
@@ -421,18 +440,18 @@
 +            })
 +        });
 +        let hyper_client = builder.build(connector);
-@@ -1010,0 +1180 @@
+@@ -1010,0 +1192 @@
 +            routing,
-@@ -1059 +1229,4 @@
+@@ -1059 +1241,4 @@
 -                        let h3_service = H3Client::new(h3_connector, config.pool_idle_timeout);
 +                        let h3_service = H3ProxyGuard {
 +                            inner: H3Client::new(h3_connector, config.pool_idle_timeout),
 +                            proxies: proxies.clone(),
 +                        };
-@@ -1097,0 +1271,2 @@
+@@ -1097,0 +1283,2 @@
 +                dynamic_routing,
 +                local_transport,
-@@ -2605,2 +2780,8 @@
+@@ -2605,2 +2792,8 @@
 -        self.proxy_auth(&uri, &mut headers);
 -        self.proxy_custom_headers(&uri, &mut headers);
 +        // Local sockets bypass proxy selection and must never inherit proxy
@@ -443,7 +462,7 @@
 +            self.proxy_auth(&uri, &mut headers);
 +            self.proxy_custom_headers(&uri, &mut headers);
 +        }
-@@ -2676,3 +2857,8 @@
+@@ -2676,3 +2869,8 @@
 -            if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) {
 -                headers.insert(PROXY_AUTHORIZATION, header);
 -                break;
@@ -455,7 +474,7 @@
 +                    headers.insert(PROXY_AUTHORIZATION, header);
 +                    break;
 +                }
-@@ -2693,5 +2879,10 @@
+@@ -2693,5 +2891,10 @@
 -            if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) {
 -                iter.iter().for_each(|(key, value)| {
 -                    headers.insert(key, value.clone());
@@ -471,13 +490,13 @@
 +                    });
 +                    break;
 +                }
-@@ -2918 +3109 @@
+@@ -2918 +3121 @@
 -    h3_client: Option<LayeredService<H3Client>>,
 +    h3_client: Option<LayeredService<H3ProxyGuard>>,
-@@ -2925,0 +3117,2 @@
+@@ -2925,0 +3129,2 @@
 +    dynamic_routing: bool,
 +    local_transport: bool,
-@@ -2998 +3191 @@
+@@ -2998 +3203 @@
 -    H3(LayeredFuture<H3Client>),
 +    H3(LayeredFuture<H3ProxyGuard>),
 --- a/src/redirect.rs

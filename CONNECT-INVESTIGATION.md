@@ -106,8 +106,8 @@ versions and update them together with their regression tests. This document
 does not claim acceptance of untested transport or OAuth behavior.
 
 Static and dynamic proxy rules now share per-hop route selection. Local sockets
-bypass proxy headers, and direct and tunneled requests discard caller-provided
-proxy authorization; configure CONNECT credentials on the proxy. HTTP/3 fails
+bypass proxy headers, and direct requests discard caller-provided proxy authorization. Tunnel requests
+pass it only to the selected CONNECT proxy and include it in the route pool key. HTTP/3 fails
 closed when a proxy matches, because its connector does not implement proxy
 routing. These changes are pending public CI and independent review.
 

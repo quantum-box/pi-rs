@@ -444,6 +444,161 @@ mod tests {
         reqwest_mcp
     );
 
+    macro_rules! no_proxy_caller_auth {
+        ($test:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $test() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{Duration, timeout};
+                let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = origin.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = timeout(Duration::from_secs(5), origin.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        timeout(Duration::from_secs(5), socket.read_line(&mut line))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    request
+                });
+                let proxy = $client::Proxy::all("http://127.0.0.1:1")
+                    .unwrap()
+                    .no_proxy($client::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true);
+                let client = $client::Client::builder()
+                    .no_proxy()
+                    .proxy(proxy)
+                    .build()
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(5),
+                    client
+                        .get(format!("http://{address}/"))
+                        .header("proxy-authorization", "Basic c2VjcmV0")
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(response.status().is_success());
+                let request = server.await.unwrap();
+                assert!(
+                    !request.to_ascii_lowercase().contains("proxy-authorization"),
+                    "{request}"
+                );
+            }
+        };
+    }
+    no_proxy_caller_auth!(no_proxy_never_receives_caller_auth, reqwest);
+    no_proxy_caller_auth!(mcp_no_proxy_never_receives_caller_auth, reqwest_mcp);
+
+    macro_rules! tunnel_caller_auth {
+        ($redirect:ident, $concurrent:ident, $client:ident) => {
+            #[tokio::test]
+            async fn $redirect() {
+                use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                async fn exchange(listener: &TcpListener, response: &'static [u8]) -> (String, String) {
+                    let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut connect = String::new();
+                    loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } connect.push_str(&line); }
+                    socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                    let mut origin = String::new();
+                    loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } origin.push_str(&line); }
+                    socket.write_all(response).await.unwrap();
+                    (connect, origin)
+                }
+                let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a_address = a.local_addr().unwrap(); let b_address = b.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let first = exchange(&a, b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let second = exchange(&a, b"HTTP/1.1 302 Found\r\nLocation: /different\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let third = exchange(&b, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    [first, second, third]
+                });
+                let count = Arc::new(AtomicUsize::new(0)); let calls = count.clone();
+                let proxy = $client::Proxy::custom(move |_| {
+                    let address = if calls.fetch_add(1, Ordering::SeqCst) < 2 { a_address } else { b_address };
+                    Some(format!("http://{address}"))
+                }).tunnel_http(true);
+                let client = $client::Client::builder().no_proxy().proxy(proxy).build().unwrap();
+                let response = timeout(Duration::from_secs(10), client.get("http://origin.invalid/first").header("proxy-authorization", "Basic c2VjcmV0").send()).await.unwrap().unwrap();
+                assert!(response.status().is_success());
+                let observed = server.await.unwrap();
+                for (i, (connect, origin)) in observed.iter().enumerate() {
+                    assert_eq!(connect.to_ascii_lowercase().contains("proxy-authorization: basic c2vjcmv0"), i < 2, "{connect}");
+                    assert!(!origin.to_ascii_lowercase().contains("proxy-authorization"), "{origin}");
+                }
+                assert_eq!(count.load(Ordering::SeqCst), 3);
+            }
+            #[tokio::test]
+            async fn $concurrent() {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                use tokio::net::TcpListener;
+                use tokio::time::{timeout, Duration};
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let mut tasks = Vec::new();
+                    for _ in 0..2 {
+                        let (socket, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                        tasks.push(tokio::spawn(async move {
+                            let mut socket = BufReader::new(socket); let mut connect = String::new();
+                            loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } connect.push_str(&line); }
+                            socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                            let mut origin = String::new();
+                            loop { let mut line = String::new(); timeout(Duration::from_secs(5), socket.read_line(&mut line)).await.unwrap().unwrap(); if line == "\r\n" || line.is_empty() { break; } origin.push_str(&line); }
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                            (connect, origin)
+                        }));
+                    }
+                    let mut out = Vec::new(); for task in tasks { out.push(task.await.unwrap()); } out
+                });
+                let client = $client::Client::builder().no_proxy().proxy($client::Proxy::all(format!("http://{address}")).unwrap().tunnel_http(true)).build().unwrap();
+                let one = client.get("http://origin.invalid/one").header("proxy-authorization", "Basic b25l").send();
+                let two = client.get("http://origin.invalid/two").header("proxy-authorization", "Basic dHdv").send();
+                let (one, two) = timeout(Duration::from_secs(10), async { tokio::join!(one, two) }).await.unwrap();
+                assert!(one.unwrap().status().is_success()); assert!(two.unwrap().status().is_success());
+                let observed = server.await.unwrap(); let mut auth = Vec::new();
+                for (connect, origin) in observed {
+                    assert!(!origin.to_ascii_lowercase().contains("proxy-authorization"), "{origin}");
+                    auth.push(connect.to_ascii_lowercase());
+                }
+                assert_eq!(auth.iter().filter(|s| s.contains("proxy-authorization: basic b25l")).count(), 1);
+                assert_eq!(auth.iter().filter(|s| s.contains("proxy-authorization: basic dhdv")).count(), 1);
+            }
+        };
+    }
+    tunnel_caller_auth!(
+        redirect_tunnel_caller_auth_bound_to_proxy,
+        concurrent_tunnel_auth_isolation,
+        reqwest
+    );
+    tunnel_caller_auth!(
+        mcp_redirect_tunnel_caller_auth_bound_to_proxy,
+        mcp_concurrent_tunnel_auth_isolation,
+        reqwest_mcp
+    );
+
     macro_rules! static_proxy_security {
         ($tunnel:ident, $ordered:ident, $local:ident, $client:ident) => {
             #[tokio::test]
@@ -498,6 +653,7 @@ mod tests {
                     .proxy(
                         $client::Proxy::all(format!("http://{address}"))
                             .unwrap()
+                            .basic_auth("configured", "password")
                             .tunnel_http(true),
                     )
                     .build()
@@ -516,6 +672,18 @@ mod tests {
                 let (connect, origin) = server.await.unwrap();
                 assert!(
                     connect.starts_with("CONNECT origin.invalid:80"),
+                    "{connect}"
+                );
+                assert!(
+                    connect
+                        .to_ascii_lowercase()
+                        .contains("proxy-authorization: basic c2vjcmv0"),
+                    "{connect}"
+                );
+                assert!(
+                    !connect
+                        .to_ascii_lowercase()
+                        .contains("y29uzmlndxjlzdpwyxnzd29yza"),
                     "{connect}"
                 );
                 assert!(
