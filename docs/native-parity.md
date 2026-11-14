@@ -861,7 +861,10 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Tests cover reader gating and custom-prompt precedence.
+loading. Declared `SKILL.md` files with missing descriptions report both the
+description problem and any invalid name diagnostics; unreadable skill files
+also report their source path. Tests cover these diagnostics, reader gating and
+custom-prompt precedence.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one

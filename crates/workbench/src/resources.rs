@@ -337,25 +337,23 @@ impl Resources {
                 .join("\n\n")
         };
         for path in skill_roots {
-            match parse_skill(&path) {
-                Ok((name, skill)) => {
-                    validate_skill(&name, &skill, &mut resources.warnings);
-                    match resources.skills.entry(name.clone()) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(skill);
-                        }
-                        std::collections::btree_map::Entry::Occupied(entry)
-                            if !same_resource_file(&entry.get().path, &skill.path) =>
-                        {
-                            resources.collisions.push(ResourceCollision {
-                                kind: CollisionKind::Skill,
-                                name: name.clone(),
-                                loser: skill.path,
-                            });
-                        }
-                        _ => {}
+            match parse_skill(&path, &mut resources.warnings) {
+                Ok(Some((name, skill))) => match resources.skills.entry(name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(skill);
                     }
-                }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if !same_resource_file(&entry.get().path, &skill.path) =>
+                    {
+                        resources.collisions.push(ResourceCollision {
+                            kind: CollisionKind::Skill,
+                            name: name.clone(),
+                            loser: skill.path,
+                        });
+                    }
+                    _ => {}
+                },
+                Ok(None) => {}
                 Err(error) if path.file_name().is_some_and(|name| name == "SKILL.md") => {
                     resources
                         .warnings
@@ -564,27 +562,37 @@ fn validate_skill(name: &str, skill: &Skill, warnings: &mut Vec<String>) {
     }
 }
 
-fn parse_skill(path: &Path) -> Result<(String, Skill)> {
-    let text = read(path)?;
+fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String, Skill)>> {
+    let text = match read(path) {
+        Ok(text) => text,
+        Err(error) => {
+            warnings.push(format!("{}: {error}", path.display()));
+            return Ok(None);
+        }
+    };
     let (metadata, _) = frontmatter(&text)?;
+    let description = metadata.description.filter(|text| !text.trim().is_empty());
+    let declared = path.file_name().is_some_and(|name| name == "SKILL.md");
+    if description.is_none() && !declared {
+        return Ok(None);
+    }
+    if description.is_none() {
+        warnings.push(format!("{}: description is required", path.display()));
+    }
     let name = metadata
         .name
         .filter(|name| !name.is_empty())
         .or_else(|| path.parent()?.file_name()?.to_str().map(str::to_owned))
         .ok_or_else(|| Error::Config("skill name is required".into()))?;
-    let description = metadata
-        .description
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| Error::Config("description is required".into()))?;
-    Ok((
-        name,
-        Skill {
-            path: path.canonicalize()?,
-            description,
-            automatic: !metadata.manual,
-        },
-    ))
+    let skill = Skill {
+        path: path.canonicalize()?,
+        description: description.clone().unwrap_or_default(),
+        automatic: !metadata.manual,
+    };
+    validate_skill(&name, &skill, warnings);
+    Ok(description.map(|_| (name, skill)))
 }
+
 fn parse_prompt(path: &Path) -> Result<Prompt> {
     let (metadata, body) = frontmatter(&read(path)?)?;
     let description = metadata
@@ -1101,10 +1109,9 @@ mod tests {
             format!("---\nname: -Bad--name\ndescription: {description}\n---\nBody"),
         )
         .unwrap();
-        let (name, skill) = parse_skill(&file).unwrap();
-        assert_eq!(name, "-Bad--name");
         let mut warnings = Vec::new();
-        validate_skill(&name, &skill, &mut warnings);
+        let (name, _skill) = parse_skill(&file, &mut warnings).unwrap().unwrap();
+        assert_eq!(name, "-Bad--name");
         assert_eq!(warnings.len(), 4);
         assert!(
             warnings
@@ -1112,6 +1119,56 @@ mod tests {
                 .any(|message| message.contains("exceeds 1024"))
         );
         assert!(warnings.iter().all(|message| message.contains("SKILL.md")));
+    }
+
+    #[test]
+    fn declared_skill_reports_description_and_name_errors_together() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let declared = directory.path().join("SKILL.md");
+        std::fs::write(&declared, "---\nname: -Bad--name\n---\nBody").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill.push(declared.to_string_lossy().into_owned());
+        let resources = Resources::load(&args).unwrap();
+        assert!(!resources.skills.contains_key("-Bad--name"));
+        for message in [
+            "description is required",
+            "invalid characters",
+            "start or end",
+            "consecutive hyphens",
+        ] {
+            assert!(
+                resources
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(message) && warning.contains("SKILL.md")),
+                "missing {message}: {:?}",
+                resources.warnings
+            );
+        }
+        let legacy = directory.path().join("legacy.md");
+        std::fs::write(&legacy, "---\nname: -Bad--name\n---\nBody").unwrap();
+        let mut warnings = Vec::new();
+        assert!(parse_skill(&legacy, &mut warnings).unwrap().is_none());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn unreadable_legacy_skill_reports_read_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vanished.md");
+        let mut warnings = Vec::new();
+        assert!(parse_skill(&path, &mut warnings).unwrap().is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("vanished.md"));
     }
 
     #[test]
@@ -1445,7 +1502,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("SKILL.md");
         std::fs::write(&path, "\u{feff}---\r\nname: fixture\r\ndescription: hidden metadata\r\n---\r\n  skill body  \r\n").unwrap();
-        let (name, skill) = parse_skill(&path).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
         let location = skill.path.display();
         let base = skill.path.parent().unwrap().display();
         let block = format!(
@@ -1511,7 +1568,7 @@ mod tests {
             "---\nname: [invalid]\ndescription: A usable skill\ndisable-model-invocation: 'true'\n---\nBody",
         )
         .unwrap();
-        let (name, skill) = parse_skill(&path).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
         assert_eq!(name, "fallback-name");
         assert!(skill.automatic);
 
@@ -1520,20 +1577,29 @@ mod tests {
             "---\nname: 42\ndescription: A usable skill\n---\nBody",
         )
         .unwrap();
-        assert_eq!(parse_skill(&path).unwrap().0, "fallback-name");
+        assert_eq!(
+            parse_skill(&path, &mut Vec::new()).unwrap().unwrap().0,
+            "fallback-name"
+        );
         std::fs::write(
             &path,
             "---\ndescription: A usable skill\ndisable-model-invocation: true\n---\nBody",
         )
         .unwrap();
-        assert!(!parse_skill(&path).unwrap().1.automatic);
-        std::fs::write(&path, "---\ndescription: [invalid]\n---\nBody").unwrap();
         assert!(
-            parse_skill(&path)
-                .err()
+            !parse_skill(&path, &mut Vec::new())
                 .unwrap()
-                .to_string()
-                .contains("description is required")
+                .unwrap()
+                .1
+                .automatic
+        );
+        std::fs::write(&path, "---\ndescription: [invalid]\n---\nBody").unwrap();
+        let mut warnings = Vec::new();
+        assert!(parse_skill(&path, &mut warnings).unwrap().is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("description is required"))
         );
     }
 }
