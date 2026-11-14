@@ -1,3 +1,4 @@
+use crate::runtime::time as platform_time;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -1727,7 +1728,7 @@ impl Registry {
             .iter()
             .filter(|item| item.handles_resource_discovery())
         {
-            match tokio::time::timeout(
+            match platform_time::timeout(
                 timeout,
                 extension.discover_resources(event, states.get(extension.id())),
             )
@@ -1763,7 +1764,7 @@ impl Registry {
             let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
             let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
             let outcome = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     timeout,
                     extension.discover_resources_with_host(event, states.get(extension.id()), host),
                 );
@@ -1833,13 +1834,13 @@ impl Registry {
         host: Option<Arc<dyn ToolHost>>,
     ) -> bool {
         let deadline =
-            tokio::time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
+            platform_time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
         for extension in self
             .extensions
             .iter()
             .filter(|extension| extension.handles_session_transitions())
         {
-            let error = match tokio::time::timeout_at(deadline, async {
+            let error = match platform_time::timeout_at(deadline, async {
                 match &host {
                     Some(host) => {
                         extension
@@ -2715,7 +2716,7 @@ mod replacement_tests {
         let mut registry = Registry::default();
         registry.register(Arc::new(ResourceMessageHook)).unwrap();
         let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(2),
             registry.discover_resources_in_session(
                 &ResourceDiscoveryEvent {

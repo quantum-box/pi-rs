@@ -89,6 +89,7 @@ without `defaultProvider` are still accepted.
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, coherent local and remote coding/read-only tool factories, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
@@ -242,8 +243,8 @@ form, including multiple keys and explicitly unbound actions.
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
 frontends. The standalone crate is compile-checked for
-`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
-on that target. Preview behavior retains the existing native parser's documented
+`wasm32-unknown-unknown`; the experimental browser SDK supports the text-only
+sessions described above. Preview behavior retains the existing native parser's documented
 differences from Pi's streaming parser.
 
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
@@ -879,7 +880,11 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Tests cover reader gating and custom-prompt precedence.
+loading. Declared `SKILL.md` files with missing descriptions report both the
+description problem and any invalid name diagnostics; unreadable skill files
+also report their source path. Empty-description checks use ECMAScript whitespace
+semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
+reader gating and custom-prompt precedence.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -1330,8 +1335,11 @@ empty directory output and continuation notices.
 
 Single-file `grep` preserves the requested file name in its output when the
 path is a symbolic link, while workspace boundary checks still use the resolved
-target. Focused checks compare the output with Pi v1.5.0 for both linked and
-ordinary files, including context lines.
+target. For explicitly named binary files, NUL bytes are treated as line
+breaks while searching, matching Pi's ripgrep invocation; directory traversal
+continues to skip binary files. Context still comes from the original file, as
+in Pi. Focused checks compare both linked and ordinary files, including context
+lines.
 
 Unrestricted `grep` applies path-containing glob overrides to the absolute
 search paths passed to ripgrep by Pi. Basename globs, negated globs, and

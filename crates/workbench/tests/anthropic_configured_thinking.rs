@@ -51,6 +51,8 @@ fn configured_thinking_controls_wire_without_models_api() {
                     }
                     Err(error) => panic!("accept model request: {error}"),
                 };
+                // Accepted sockets inherit non-blocking mode on Windows.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
