@@ -365,6 +365,19 @@ impl Keys {
             .as_ref()
     }
 
+    // Only unscoped, official-route credentials may supply the account used
+    // to construct Cloudflare's official endpoint.
+    pub(super) fn operation_official_environment(
+        &self,
+        provider: &str,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.entries
+            .get(provider)
+            .filter(|entry| entry.official_routes)?
+            .env
+            .as_ref()
+    }
+
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
         // The provider-key UI binds a Vercel key to its official chat route.

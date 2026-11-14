@@ -23,6 +23,8 @@ pub(super) const TOOL: &str = "pi_model_operation";
 const RESPONSE_LIMIT: usize = 7 * 1024 * 1024;
 const CLASSIFIER_MAX_RETRIES: usize = 2;
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
+const CLOUDFLARE_TEMPLATE: &str =
+    "https://api.cloudflare.com/client/v4/accounts/pi-account-placeholder/ai";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -252,6 +254,7 @@ struct Entry {
     base: Url,
     endpoint: Url,
     api_key: Option<String>,
+    cloudflare_default: bool,
 }
 
 #[derive(Clone, Default)]
@@ -447,6 +450,9 @@ impl Catalogue {
                 let api_key = (key_endpoint.as_ref() == Some(&endpoint))
                     .then(|| provider["apiKey"].as_str().map(str::to_owned))
                     .flatten();
+                let cloudflare_default = name == "cloudflare-workers-ai"
+                    && matches!(api, Api::WorkersAiSystemOne)
+                    && base.as_str().trim_end_matches('/') == CLOUDFLARE_TEMPLATE;
                 result.push(Entry {
                     provider: name.clone(),
                     model: configured,
@@ -454,6 +460,7 @@ impl Catalogue {
                     base,
                     endpoint,
                     api_key,
+                    cloudflare_default,
                 });
             }
         }
@@ -481,7 +488,11 @@ impl Catalogue {
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
                     None => {
-                        let usable = match model.credential(keys) {
+                        let usable = match model
+                            .resolved_cloudflare(keys)
+                            .ok()
+                            .and_then(|model| model.credential(keys))
+                        {
                             Some(credential) => credential.resolve().await.is_ok(),
                             None => false,
                         };
@@ -519,6 +530,7 @@ pub(super) fn official_base(provider: &str) -> Option<&'static str> {
         "typesafe" => Some("https://api.typesafe.ai/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
+        "cloudflare-workers-ai" => Some(CLOUDFLARE_TEMPLATE),
         _ => None,
     }
 }
@@ -561,9 +573,40 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 
 impl Entry {
     fn is_official(&self) -> bool {
-        official_base(&self.provider)
-            .and_then(|base| endpoints(base, self.api.route()).ok())
-            .is_some_and(|(_, endpoint)| endpoint == self.endpoint)
+        self.cloudflare_default
+            || official_base(&self.provider)
+                .and_then(|base| endpoints(base, self.api.route()).ok())
+                .is_some_and(|(_, endpoint)| endpoint == self.endpoint)
+    }
+
+    fn resolved_cloudflare(&self, keys: &Keys) -> Result<Self> {
+        self.resolved_cloudflare_with_env(keys, |name| std::env::var(name).ok())
+    }
+
+    fn resolved_cloudflare_with_env(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let mut entry = self.clone();
+        if self.cloudflare_default {
+            let stored = keys
+                .operation_official_environment(&self.provider)
+                .and_then(|env| env.get("CLOUDFLARE_ACCOUNT_ID"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let account = stored
+                .or_else(|| env("CLOUDFLARE_ACCOUNT_ID"))
+                .filter(|account| {
+                    !account.is_empty()
+                        && account.len() <= 128
+                        && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+                .ok_or_else(|| Error::Config("missing or invalid Cloudflare account ID".into()))?;
+            let base = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai");
+            (entry.base, entry.endpoint) = endpoints(&base, self.api.route())?;
+        }
+        Ok(entry)
     }
 
     fn descriptor(&self) -> Value {
@@ -619,6 +662,7 @@ impl Entry {
                 ("typesafe", true) => "TYPESAFE_API_KEY",
                 ("openrouter", true) => "OPENROUTER_API_KEY",
                 ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
+                ("cloudflare-workers-ai", true) => "CLOUDFLARE_API_KEY",
                 _ => return None,
             };
             env(key)
@@ -941,6 +985,8 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
+        let resolved = entry.resolved_cloudflare(keys)?;
+        let entry = &resolved;
         initialize_image_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
@@ -1259,6 +1305,86 @@ mod tests {
         assert_eq!(body["model"], "typesafe-ai/jev");
         assert_eq!(body["questions"]["ok"]["type"], "noul");
         assert_eq!(result["answers"]["ok"]["probability"], 0.8);
+    }
+
+    #[test]
+    fn builtin_cloudflare_catalogue_resolves_only_safe_official_accounts() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let entries: Vec<_> = catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "cloudflare-workers-ai")
+            .collect();
+        assert_eq!(entries.len(), 5);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.model.id == "typesafe/jev")
+            .unwrap();
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"saved-key","env":{"CLOUDFLARE_ACCOUNT_ID":"account123"}}}),
+        );
+        let resolved = entry
+            .resolved_cloudflare_with_env(&keys, |_| Some("fallback".into()))
+            .unwrap();
+        assert_eq!(
+            resolved.endpoint.as_str(),
+            "https://api.cloudflare.com/client/v4/accounts/account123/ai/run"
+        );
+        assert!(resolved.credential_with_env(&keys, |_| None).is_some());
+        let empty = Keys::parse(&json!({}));
+        assert!(
+            entry
+                .resolved_cloudflare_with_env(&empty, |_| None)
+                .is_err()
+        );
+        for invalid in ["../escape", "account/other", "account?token=x", ""] {
+            assert!(
+                entry
+                    .resolved_cloudflare_with_env(&empty, |_| Some(invalid.into()))
+                    .is_err()
+            );
+        }
+        let ambient = entry
+            .resolved_cloudflare_with_env(&empty, |_| Some("ambient123".into()))
+            .unwrap();
+        assert!(
+            ambient
+                .credential_with_env(&empty, |name| (name == "CLOUDFLARE_API_KEY")
+                    .then(|| "ambient-key".into()))
+                .is_some()
+        );
+        let scoped = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"secret", "endpoint":"https://example.com/v1", "env":{"CLOUDFLARE_ACCOUNT_ID":"wrong"}}}),
+        );
+        let resolved = entry
+            .resolved_cloudflare_with_env(&scoped, |_| Some("ambient123".into()))
+            .unwrap();
+        assert!(resolved.endpoint.as_str().contains("ambient123"));
+        assert!(resolved.credential_with_env(&scoped, |_| None).is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_cloudflare_catalogue_is_available_with_stored_account() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"fixture-key","env":{"CLOUDFLARE_ACCOUNT_ID":"account123"}}}),
+        );
+        let entries = catalogue
+            .list(
+                Kind::Classifier,
+                Some("cloudflare-workers-ai"),
+                None,
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(entries.len(), 5);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["id"] == "typesafe/jev" && entry["contextWindow"] == 32000)
+        );
+        assert!(entries.iter().any(|entry| entry["id"] == "@cf/cloudflare/clef" && entry["cost"]["input"] == 0.24));
     }
 
     #[tokio::test]
@@ -1771,7 +1897,7 @@ mod tests {
         let entry = catalogue
             .0
             .iter()
-            .find(|entry| entry.provider == "cloudflare-workers-ai")
+            .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == "fixture")
             .unwrap();
         assert!(entry.api_key.is_none());
         let keys = Keys::parse(
@@ -1840,7 +1966,9 @@ mod tests {
             let entry = catalogue
                 .0
                 .iter()
-                .find(|entry| entry.provider == "cloudflare-workers-ai")
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "fixture"
+                })
                 .unwrap();
             let keys = Keys::parse(
                 &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"destination-key", "endpoint":entry.endpoint.as_str()}}),
