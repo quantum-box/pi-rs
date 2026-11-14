@@ -352,13 +352,25 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
         Outcome::Succeeded(_)
     ));
     #[cfg(windows)]
-    assert!(
-        matches!(tool.invoke(json!({"pattern":"*", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))
-    );
+    {
+        assert!(
+            matches!(tool.invoke(json!({"pattern":"*", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))
+        );
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"*", "path":"file://xn--n3h/share/a%20b"}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
+    }
     let paths = backend.paths.lock().unwrap();
     assert_eq!(paths[0], root.path().join("with space"));
     assert_eq!(paths[1], root.path().join("plain"));
     #[cfg(unix)]
     assert_eq!(paths[2], root.path().join("literal\\name"));
-    assert_eq!(paths.len(), if cfg!(unix) { 3 } else { 2 });
+    #[cfg(windows)]
+    assert_eq!(paths[2], PathBuf::from(r"\\☃\share\a b"));
+    assert_eq!(paths.len(), 3);
 }

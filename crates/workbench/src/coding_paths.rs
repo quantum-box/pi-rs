@@ -65,55 +65,14 @@ fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Re
         });
     }
     if value.starts_with("file://") {
-        let url = reqwest::Url::parse(value).map_err(|error| Error::Config(error.to_string()))?;
-        validate_file_url_path(url.path(), cfg!(windows))?;
-        return url
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
 }
 
-// Node's fileURLToPath rejects encoded separators before decoding, and its
-// decodeURIComponent rejects malformed escapes and invalid UTF-8. Checking the
-// URL path rather than the whole URL leaves query and fragment semantics intact.
+#[cfg(test)]
 fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
-    let input = path.as_bytes();
-    let escape = |index: usize| -> Option<u8> {
-        let digit = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        };
-        Some(digit(*input.get(index + 1)?)? * 16 + digit(*input.get(index + 2)?)?)
-    };
-    for (index, &character) in input.iter().enumerate() {
-        if character == b'%'
-            && let Some(byte) = escape(index)
-            && (byte == b'/' || (windows && byte == b'\\'))
-        {
-            let message = if windows {
-                "File URL path must not include encoded \\ or / characters"
-            } else {
-                "File URL path must not include encoded / characters"
-            };
-            return Err(Error::Config(message.into()));
-        }
-    }
-    let mut decoded = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input[index] == b'%' {
-            decoded.push(escape(index).ok_or_else(|| Error::Config("URI malformed".into()))?);
-            index += 3;
-        } else {
-            decoded.push(input[index]);
-            index += 1;
-        }
-    }
-    std::str::from_utf8(&decoded).map_err(|_| Error::Config("URI malformed".into()))?;
-    Ok(())
+    pi_rs_file_url::validate_path(path, windows).map_err(Error::Config)
 }
 
 pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
@@ -227,6 +186,19 @@ mod tests {
         }
         assert!(validate_file_url_path("/tmp/a%20b/%E6%97%A5", false).is_ok());
         assert!(validate_file_url_path("/tmp/a%252Fb", false).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_url_decodes_idn_unc_host() {
+        assert_eq!(
+            input("file://xn--n3h/share/a%20b", None).unwrap(),
+            PathBuf::from(r"\\☃\share\a b")
+        );
+        assert_eq!(
+            input("file:///C:/hello", None).unwrap(),
+            PathBuf::from(r"C:\hello")
+        );
     }
 
     #[test]

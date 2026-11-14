@@ -2859,6 +2859,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-rs-file-url"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "url",
+]
+
+[[package]]
 name = "pi-rs-fixture-tools"
 version = "0.1.0"
 dependencies = [
@@ -2938,6 +2946,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2952,6 +2961,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2968,6 +2978,7 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3028,6 +3039,7 @@ dependencies = [
  "palette",
  "pi-rs",
  "pi-rs-extensions",
+ "pi-rs-file-url",
  "pi-rs-fixture-tools",
  "pi-rs-plan-mode",
  "pi-rs-remote-find",

@@ -138,10 +138,7 @@ fn normalize(value: &str, remote_home: Option<&Path>) -> Result<PathBuf> {
         };
     }
     if value.starts_with("file://") {
-        return url::Url::parse(value)
-            .map_err(|error| Error::Config(error.to_string()))?
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
 }

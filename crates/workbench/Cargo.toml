@@ -21,6 +21,7 @@ test = false
 evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 
 [dependencies]
+pi-rs-file-url = { path = "../file-url" }
 arboard = { version = "3.7", features = ["wayland-data-control"] }
 async-trait = "0.1"
 async-stream = "0.3"

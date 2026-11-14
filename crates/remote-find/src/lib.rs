@@ -122,64 +122,10 @@ fn normalize(value: &str, remote_home: Option<&Path>) -> Result<PathBuf> {
         };
     }
     if value.starts_with("file://") {
-        let url = url::Url::parse(value).map_err(|error| Error::Config(error.to_string()))?;
-        #[cfg(not(windows))]
-        if url
-            .host_str()
-            .is_some_and(|host| !host.is_empty() && host != "localhost")
-        {
-            return Err(Error::Config("invalid file URL".into()));
-        }
-        validate_file_url_path(url.path(), cfg!(windows))?;
-        return url
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
 }
-// Node fileURLToPath checks encoded separators before percent-decoding and
-// requires the decoded path to be valid UTF-8. Query and fragment are not paths.
-fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
-    let input = path.as_bytes();
-    let escape = |index: usize| -> Option<u8> {
-        let digit = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        };
-        Some(digit(*input.get(index + 1)?)? * 16 + digit(*input.get(index + 2)?)?)
-    };
-    for (index, &character) in input.iter().enumerate() {
-        if character == b'%'
-            && let Some(byte) = escape(index)
-            && (byte == b'/' || (windows && byte == b'\\'))
-        {
-            return Err(Error::Config(
-                if windows {
-                    "File URL path must not include encoded \\ or / characters"
-                } else {
-                    "File URL path must not include encoded / characters"
-                }
-                .into(),
-            ));
-        }
-    }
-    let mut decoded = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input[index] == b'%' {
-            decoded.push(escape(index).ok_or_else(|| Error::Config("URI malformed".into()))?);
-            index += 3;
-        } else {
-            decoded.push(input[index]);
-            index += 1;
-        }
-    }
-    std::str::from_utf8(&decoded).map_err(|_| Error::Config("URI malformed".into()))?;
-    Ok(())
-}
-
 #[cfg(any(windows, test))]
 fn windows_shell_path(value: &str) -> String {
     if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
@@ -504,11 +450,11 @@ mod tests {
     use super::*;
     #[test]
     fn file_url_windows_separator_rules_follow_node() {
-        assert!(validate_file_url_path("/C:/dir%5cfile", true).is_err());
-        assert!(validate_file_url_path("/C:/dir%2ffile", true).is_err());
-        assert!(validate_file_url_path("/dir%5cfile", false).is_ok());
-        assert!(validate_file_url_path("/dir%f0%9f%98%80", false).is_ok());
-        assert!(validate_file_url_path("/dir%ed%a0%80", false).is_err());
+        assert!(pi_rs_file_url::validate_path("/C:/dir%5cfile", true).is_err());
+        assert!(pi_rs_file_url::validate_path("/C:/dir%2ffile", true).is_err());
+        assert!(pi_rs_file_url::validate_path("/dir%5cfile", false).is_ok());
+        assert!(pi_rs_file_url::validate_path("/dir%f0%9f%98%80", false).is_ok());
+        assert!(pi_rs_file_url::validate_path("/dir%ed%a0%80", false).is_err());
     }
 
     #[test]
