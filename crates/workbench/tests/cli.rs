@@ -2459,8 +2459,16 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
 // fixture connection is read with a bounded blocking timeout, independently
 // of the listener and of any idle peers on the same port.
 fn read_rpc_model_fixture_request(socket: &TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    read_rpc_model_fixture_request_with_hook(socket, |_| Ok(()))
+}
+
+fn read_rpc_model_fixture_request_with_hook(
+    socket: &TcpStream,
+    after_setup: impl FnOnce(&TcpStream) -> std::io::Result<()>,
+) -> std::io::Result<(String, Vec<u8>)> {
     socket.set_nonblocking(false)?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    after_setup(socket)?;
     let mut reader = BufReader::new(socket.try_clone()?);
     let mut request = String::new();
     if reader.read_line(&mut request)? == 0 {
@@ -2491,37 +2499,38 @@ fn read_rpc_model_fixture_request(socket: &TcpStream) -> std::io::Result<(String
 
 #[test]
 fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
-    use std::sync::mpsc;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (socket, _) = listener.accept().unwrap();
     socket.set_nonblocking(true).unwrap();
     let mut reader = BufReader::new(socket.try_clone().unwrap());
     let mut line = String::new();
-    assert_eq!(
-        reader.read_line(&mut line).unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
+    let nonblocking_error = reader.read_line(&mut line).unwrap_err();
+    assert_eq!(nonblocking_error.kind(), std::io::ErrorKind::WouldBlock);
     drop(reader);
-    let (ready, started) = mpsc::channel();
-    let (done, finished) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        ready.send(()).unwrap();
-        done.send(read_rpc_model_fixture_request(&socket)).unwrap();
-    });
-    started.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(matches!(
-        finished.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
-    client
-        .write_all(b"POST /api/show HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
-        .unwrap();
-    let (request, body) = finished
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap()
-        .unwrap();
-    server.join().unwrap();
+    let (request, body) = read_rpc_model_fixture_request_with_hook(&socket, |socket| {
+        // Inspect the actual socket after the production fixture's setup,
+        // before the peer sends any bytes. No reader scheduling is involved.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        #[cfg(windows)]
+        {
+            socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+            let mut probe = BufReader::new(socket.try_clone()?);
+            let mut line = String::new();
+            let timed_out = probe.read_line(&mut line).unwrap_err();
+            assert_eq!(timed_out.kind(), std::io::ErrorKind::TimedOut);
+            assert_ne!(timed_out.raw_os_error(), nonblocking_error.raw_os_error());
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        }
+        client.write_all(b"POST /api/show HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+    })
+    .unwrap();
     assert_eq!(request, "POST /api/show HTTP/1.1\r\n");
     assert_eq!(body, b"{}");
 }
