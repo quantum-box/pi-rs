@@ -32,6 +32,14 @@ use std::{
 };
 use uuid::Uuid;
 
+type InheritedApplicationPrefix = (u64, Uuid, Vec<crate::application_entry::ApplicationEntry>);
+type ApplicationEntryCut = (
+    u64,
+    u64,
+    Vec<crate::application_entry::ApplicationEntry>,
+    Option<InheritedApplicationPrefix>,
+);
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("owner: {0}")]
@@ -2395,15 +2403,7 @@ impl Harness {
         &self,
         id: Uuid,
         entry_id: Uuid,
-    ) -> Result<
-        (
-            u64,
-            u64,
-            Vec<crate::application_entry::ApplicationEntry>,
-            Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
-        ),
-        Error,
-    > {
+    ) -> Result<ApplicationEntryCut, Error> {
         let key = crate::application_entry::key(id);
         let versions = self.owner.store().application_history(&key, 257)?;
         let mut previous: Vec<crate::application_entry::ApplicationEntry> = Vec::new();
